@@ -254,6 +254,12 @@ pub struct MiniMaxH3 {
     /// not as loaded factors: `t2va`/`fl2va` and `ref2va` run different checkpoints, and the DiT is
     /// mapped and released per render, so the install belongs beside the load rather than here.
     adapters: Vec<AdapterSpec>,
+    /// The load shape this generator was loaded at — the same value
+    /// [`crate::memory_strategy::contract_for`] resolves the contract at, captured so the runtime
+    /// admission ([`Self::requested_transformer_window`]) and the declaration cannot disagree:
+    /// rung 4 is `Implemented` on a [`LoadShape::DeferredMaterialization`] spec and `Missing` on a
+    /// resident one, and a request the contract refuses must be refused here too (sc-18662).
+    load_shape: mlx_gen::gen_core::LoadShape,
 }
 
 /// The staged-component id for the **tiered** DiT directory (sc-17150).
@@ -792,6 +798,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         text_encoder_dir,
         dtype,
         adapters: spec.adapters.clone(),
+        load_shape: spec.load_shape,
     }))
 }
 
@@ -862,6 +869,85 @@ impl MiniMaxH3 {
         Ok(dit)
     }
 
+    /// The rung-4 admission for one request (sc-18662): `Some(window)` routes the render through
+    /// the deferred loaders ([`MiniMaxH3Dit::load_dir_deferred`],
+    /// [`MiniMaxH3TextEncoder::from_dir_deferred`]), `None` is the resident staged path.
+    ///
+    /// The guards mirror the contract exactly, because **declaration is not reachability in either
+    /// direction**: a request the contract's `validate_selection` refuses must be refused here even
+    /// when it arrives without going through a request scope, and a request the contract admits
+    /// must not be silently downgraded to the resident path.
+    ///
+    /// * The generator must have been loaded at [`LoadShape::DeferredMaterialization`] — the rung's
+    ///   sole shared prerequisite, and the shape [`crate::memory_strategy::contract_for`] resolves
+    ///   `Implemented` at. On a resident load the rung is `Missing` and streaming is a typed
+    ///   refusal, not a fallback.
+    /// * Adapters are refused. A window rebuilds each block from the staged directory per step, so
+    ///   a LoRA folded into a resident stack (sc-18724) would be silently dropped from every
+    ///   windowed block — a plausible render the adapter barely touched, which is the exact failure
+    ///   `apply_minimax_h3_adapters`' strict matching exists to prevent.
+    /// * The component scope must be [`TransformerComponent::Both`] — the only declared arm.
+    ///   `None` defaults to `Dit` by the shared convention (SC-15794), and `Dit` is deliberately
+    ///   outside this provider's published domain: declaring the DiT alone would leave the
+    ///   conditioning phase, the taller stage at every tier, with no lever (AC3).
+    /// * The window size must be inside the published singleton domain
+    ///   ([`crate::memory_strategy::TRANSFORMER_WINDOW_SIZE`]) — the parameter is measured inert
+    ///   above 1, so any other value would be an advertised lever that does nothing.
+    fn requested_transformer_window(&self, req: &GenerationRequest) -> Result<Option<u32>> {
+        use mlx_gen::gen_core::LoadShape;
+        let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+            return Ok(None);
+        };
+        if self.load_shape != LoadShape::DeferredMaterialization {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: transformer streaming (rung 4) requires a \
+                 LoadShape::DeferredMaterialization load; this generator was loaded resident, \
+                 where the rung is declared Missing"
+            )));
+        }
+        if !self.adapters.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: transformer streaming rebuilds blocks from the staged tier per \
+                 window, so a configured adapter would be silently dropped from every windowed \
+                 block; run adapters on the resident path"
+            )));
+        }
+        let component = memory
+            .transformer_window_component
+            .unwrap_or(mlx_gen::gen_core::TransformerComponent::Dit);
+        if component != mlx_gen::gen_core::TransformerComponent::Both {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: transformer streaming is declared for TransformerComponent::Both \
+                 only — got {component:?}. The conditioning stage is the taller of the two at \
+                 every tier, so a Dit-only window would leave the request peak untouched"
+            )));
+        }
+        let size = memory
+            .transformer_window_size
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE);
+        if size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: transformer window {size} is outside the published domain \
+                 [{}] — the parameter is measured inert above 1, so other values are not \
+                 advertised",
+                crate::memory_strategy::TRANSFORMER_WINDOW_SIZE
+            )));
+        }
+        Ok(Some(size))
+    }
+
+    /// [`Self::load_task_dit`]'s rung-4 twin: defer the 600 block tensors and hold only the I/O
+    /// projections and the refiner. Adapters were already refused by
+    /// [`Self::requested_transformer_window`]; the assertion keeps the two seams from drifting.
+    fn load_task_dit_deferred(&self, task: MiniMaxH3Task) -> Result<MiniMaxH3Dit> {
+        assert!(
+            self.adapters.is_empty(),
+            "{MODEL_ID}: a deferred DiT load with adapters configured — \
+             requested_transformer_window must refuse this before the load is reached"
+        );
+        MiniMaxH3Dit::load_dir_deferred(self.task_dit_dir(task), self.dtype)
+    }
+
     /// Map the text-encoder shards a presentation needs, out of the **resolved** text-encoder
     /// directory — so a staged packed tier ([`TEXT_ENCODER_COMPONENT`], sc-19120) is mapped instead
     /// of the dense root component.
@@ -873,14 +959,56 @@ impl MiniMaxH3 {
         crate::text_encoder::map_shards(&self.text_encoder_dir, with_vision)
     }
 
+    /// Build the request's text encoder at the residency [`Self::requested_transformer_window`]
+    /// admitted: resident over the mapped shards, or deferred with a per-window rebuild (sc-18662).
+    ///
+    /// One constructor for all three conditioning paths, so `t2va` cannot stream while `fl2va` /
+    /// `ref2va` silently stay resident — the windowed walk lives in the encoder's own `run_layers`,
+    /// which every forward variant routes through.
+    fn build_te(
+        &self,
+        w: Option<&Weights>,
+        cfg: &MiniMaxH3TeConfig,
+        window: Option<u32>,
+        cancel: &mlx_gen::gen_core::CancelFlag,
+    ) -> Result<MiniMaxH3TextEncoder> {
+        match window {
+            None => MiniMaxH3TextEncoder::from_weights(
+                w.expect("a resident encoder builds from the mapped shards"),
+                LM_PREFIX,
+                cfg,
+            ),
+            Some(window) => {
+                let mut te = MiniMaxH3TextEncoder::from_dir_deferred(
+                    &self.text_encoder_dir,
+                    LM_PREFIX,
+                    cfg,
+                )?;
+                te.set_block_window(window as usize, cancel.clone())?;
+                Ok(te)
+            }
+        }
+    }
+
     /// Encode the prompt and immediately release the 66.7 GB text encoder.
-    fn encode_prompt(&self, prompt: &str) -> Result<mlx_rs::Array> {
+    fn encode_prompt(
+        &self,
+        prompt: &str,
+        window: Option<u32>,
+        cancel: &mlx_gen::gen_core::CancelFlag,
+    ) -> Result<mlx_rs::Array> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt)?;
 
-        let w = self.map_te_shards(false)?;
+        // Under a deferred load the map is skipped entirely: `from_dir_deferred` reads only
+        // `embed_tokens`, and a retained shard map would keep every layer tensor reachable —
+        // the retained-view hazard `block_stream`'s docs name.
+        let w = match window {
+            None => Some(self.map_te_shards(false)?),
+            Some(_) => None,
+        };
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context = te.forward(&ids, &mask)?;
         // Force it BEFORE the encoder is dropped: under lazy evaluation the context is a graph node
         // holding every weight it was computed from, so dropping first would free nothing and the
@@ -902,6 +1030,8 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         keyframes: &[&mlx_gen::media::Image],
+        window: Option<u32>,
+        cancel: &mlx_gen::gen_core::CancelFlag,
     ) -> Result<(mlx_rs::Array, Vec<i32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let mut w = self.map_te_shards(true)?;
@@ -925,7 +1055,17 @@ impl MiniMaxH3 {
 
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts)?;
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        // Under a window the mapped shards are released before the encoder is built: the deferred
+        // loader reopens the staged directory per window, and a retained shard map would keep every
+        // layer tensor reachable across the whole windowed walk.
+        let w = match window {
+            None => Some(w),
+            Some(_) => {
+                release(w);
+                None
+            }
+        };
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context = te.forward_with_images(
             &ids,
             &mask,
@@ -997,8 +1137,21 @@ impl MiniMaxH3 {
         // identical, so this is the only thing standing between a `ref2va` request and a plausible
         // render off the wrong 66 GB. See [`MiniMaxH3Task`].
         let task = MiniMaxH3Task::resolve(!keyframes.is_empty(), references.is_some())?;
+        // The rung-4 admission (sc-18662), resolved once and carried to every heavy phase — the
+        // conditioning and denoise residency must agree, or half the request streams while the
+        // other half quietly holds a resident stack.
+        let window = self.requested_transformer_window(req)?;
         if let Some(refs) = &references {
-            return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
+            return self.generate_ref2va(
+                req,
+                refs,
+                task,
+                &geometry,
+                &schedule,
+                seed,
+                window,
+                on_progress,
+            );
         }
         let anchors = keyframe_anchors(&keyframes, geometry.joint.num_frames)?;
         // Fitted ONCE, here, and shared by both keyframe paths. The vision tower and the VAE
@@ -1022,12 +1175,12 @@ impl MiniMaxH3 {
         // was read as the DiT's.
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags) = if anchors.is_empty() {
-            let context = self.encode_prompt(&req.prompt)?;
+            let context = self.encode_prompt(&req.prompt, window, &req.cancel)?;
             let tags = vec![crate::denoise::TEXT_TAG; context.shape()[1] as usize];
             (context, tags)
         } else {
             let refs: Vec<&mlx_gen::media::Image> = fitted.iter().collect();
-            self.encode_prompt_grounded(&req.prompt, &refs)?
+            self.encode_prompt_grounded(&req.prompt, &refs, window, &req.cancel)?
         };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1065,7 +1218,10 @@ impl MiniMaxH3 {
 
         // --- 2. denoise ---------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let dit = self.load_task_dit(task)?;
+        let dit = match window {
+            None => self.load_task_dit(task)?,
+            Some(_) => self.load_task_dit_deferred(task)?,
+        };
         let patch = dit.config().patch_size;
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.shape()[1], patch)?
@@ -1078,13 +1234,26 @@ impl MiniMaxH3 {
         let adaln = crate::denoise::adaln_schedule(&schedule)?;
         // The 26.02 GB lever: project the whole schedule's modulation and release `adaln_proj`.
         // Every timestep this run evaluates at is enumerated in `adaln`, so the eviction is safe.
-        let mut model = JointDit::new(
-            dit,
-            layout.clone(),
-            &context,
-            adaln,
-            AdaLnResidency::PrecomputeAndEvict,
-        )?;
+        // Under rung 4 the same projection pass runs windowed instead — a deferred load never held
+        // the projections, so there is nothing to evict (`JointDit::new_windowed`).
+        let mut model = match window {
+            None => JointDit::new(
+                dit,
+                layout.clone(),
+                &context,
+                adaln,
+                AdaLnResidency::PrecomputeAndEvict,
+            )?,
+            Some(w) => JointDit::new_windowed(
+                dit,
+                layout.clone(),
+                &context,
+                adaln,
+                AdaLnResidency::PrecomputeAndEvict,
+                w as usize,
+                req.cancel.clone(),
+            )?,
+        };
         release(context);
 
         let total = schedule.num_evals() as u32;
@@ -1152,6 +1321,7 @@ impl MiniMaxH3 {
         geometry: &RequestGeometry,
         schedule: &JointSchedule,
         seed: u64,
+        window: Option<u32>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         use crate::conditioning::{
@@ -1192,7 +1362,8 @@ impl MiniMaxH3 {
 
         // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
-        let (context, text_tags) = self.encode_prompt_ref2va(&req.prompt, &normalized)?;
+        let (context, text_tags) =
+            self.encode_prompt_ref2va(&req.prompt, &normalized, window, &req.cancel)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -1282,7 +1453,10 @@ impl MiniMaxH3 {
 
         // --- 3. denoise on `transformer_ref` ----------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let dit = self.load_task_dit(task)?;
+        let dit = match window {
+            None => self.load_task_dit(task)?,
+            Some(_) => self.load_task_dit_deferred(task)?,
+        };
         let patch = dit.config().patch_size;
         let layout = ref2va_layout(geometry, &text_tags, &geometries, patch)?;
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed)?;
@@ -1290,13 +1464,24 @@ impl MiniMaxH3 {
         let audio_rows =
             prepend_condition_audio_rows(&layout, condition_audio.as_ref(), &audio_rows)?;
         let adaln = crate::denoise::adaln_schedule(schedule)?;
-        let mut model = JointDit::new(
-            dit,
-            layout.clone(),
-            &context,
-            adaln,
-            AdaLnResidency::PrecomputeAndEvict,
-        )?;
+        let mut model = match window {
+            None => JointDit::new(
+                dit,
+                layout.clone(),
+                &context,
+                adaln,
+                AdaLnResidency::PrecomputeAndEvict,
+            )?,
+            Some(w) => JointDit::new_windowed(
+                dit,
+                layout.clone(),
+                &context,
+                adaln,
+                AdaLnResidency::PrecomputeAndEvict,
+                w as usize,
+                req.cancel.clone(),
+            )?,
+        };
         release(context);
 
         let total = schedule.num_evals() as u32;
@@ -1372,6 +1557,8 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         references: &[Ref2VaReference],
+        window: Option<u32>,
+        cancel: &mlx_gen::gen_core::CancelFlag,
     ) -> Result<(mlx_rs::Array, Vec<i32>)> {
         use crate::reference::{
             sample_video_condition_frames, ReferencePresentation, VIDEO_SAMPLE_FPS,
@@ -1454,7 +1641,16 @@ impl MiniMaxH3 {
 
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation)?;
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        // Same release-before-build as `encode_prompt_grounded`: a retained shard map would defeat
+        // the windowed walk's release.
+        let w = match window {
+            None => Some(w),
+            Some(_) => {
+                release(w);
+                None
+            }
+        };
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context = te.forward_with_references(
             &ids,
             &mask,
@@ -1559,7 +1755,125 @@ mod tests {
             text_encoder_dir: PathBuf::from("/snap/text_encoder"),
             dtype: Dtype::Bfloat16,
             adapters: Vec::new(),
+            // The shape rung 4 is `Implemented` at. NOT `LoadSpec::new`'s default — that is
+            // `EagerMaterialization`; a caller must ask for the deferred shape, and the
+            // resident-load refusal below constructs the eager twin explicitly.
+            load_shape: mlx_gen::gen_core::LoadShape::DeferredMaterialization,
         }
+    }
+
+    /// **The rung-4 admission mirrors the contract in both directions** (sc-18662).
+    ///
+    /// `requested_transformer_window` is the single seam every render's residency decision goes
+    /// through — `generate_impl` resolves it once and threads it to the conditioning, the DiT load
+    /// and the `JointDit` construction on all three routes. Each guard is mutated individually:
+    /// a streamed request must come back `Some(1)` (not `None` — a silent downgrade to the
+    /// resident path would be this test's false green), and each refusal must name its reason.
+    #[test]
+    fn transformer_streaming_is_admitted_and_refused_exactly_as_declared() {
+        use mlx_gen::gen_core::{GenerationMemory, LoadShape, TransformerComponent};
+        let streamed = |memory: GenerationMemory| GenerationRequest {
+            prompt: "a slow pan across a rainy street at night".into(),
+            memory: Some(memory),
+            ..Default::default()
+        };
+        let stream_request = GenerationMemory {
+            stage_residency: true,
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE),
+            transformer_window_component: Some(TransformerComponent::Both),
+            ..Default::default()
+        };
+        let generator = generator_at("/snap/transformer");
+
+        // The happy path admits the published window — `Some`, never a silent `None`.
+        assert_eq!(
+            generator
+                .requested_transformer_window(&streamed(stream_request))
+                .expect("the declared selection must be admitted"),
+            Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)
+        );
+        // An untouched request is byte-for-byte unaffected: no memory block, no window.
+        assert_eq!(
+            generator
+                .requested_transformer_window(&request(576, 320))
+                .expect("a request without a memory block is the resident path"),
+            None
+        );
+        // `stream_transformer_blocks: false` is the resident path even with parameters present.
+        assert_eq!(
+            generator
+                .requested_transformer_window(&streamed(GenerationMemory {
+                    stream_transformer_blocks: false,
+                    ..stream_request
+                }))
+                .expect("an unstreamed selection is the resident path"),
+            None
+        );
+
+        // A resident load genuinely does not have the rung (its contract declares `Missing`).
+        let resident = MiniMaxH3 {
+            load_shape: LoadShape::EagerMaterialization,
+            ..generator_at("/snap/transformer")
+        };
+        let refusal = resident
+            .requested_transformer_window(&streamed(stream_request))
+            .expect_err("a resident load must refuse streaming, not downgrade it")
+            .to_string();
+        assert!(refusal.contains("DeferredMaterialization"), "{refusal}");
+
+        // Adapters would be silently dropped from every windowed block — typed refusal.
+        let adapted = MiniMaxH3 {
+            adapters: vec![AdapterSpec {
+                path: PathBuf::from("/nonexistent.safetensors"),
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+            ..generator_at("/snap/transformer")
+        };
+        let refusal = adapted
+            .requested_transformer_window(&streamed(stream_request))
+            .expect_err("a streamed render with adapters must be refused")
+            .to_string();
+        assert!(refusal.contains("adapter"), "{refusal}");
+
+        // The component defaults to `Dit` (SC-15794), which is deliberately outside this
+        // provider's published domain — so both the explicit and the defaulted forms refuse.
+        for component in [None, Some(TransformerComponent::Dit)] {
+            let refusal = generator
+                .requested_transformer_window(&streamed(GenerationMemory {
+                    transformer_window_component: component,
+                    ..stream_request
+                }))
+                .expect_err("a Dit-only window must be refused (AC3)")
+                .to_string();
+            assert!(refusal.contains("Both"), "{refusal}");
+        }
+
+        // A window outside the measured singleton domain is an advertised lever that does nothing.
+        let refusal = generator
+            .requested_transformer_window(&streamed(GenerationMemory {
+                transformer_window_size: Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE + 1),
+                ..stream_request
+            }))
+            .expect_err("an out-of-domain window must be refused")
+            .to_string();
+        assert!(
+            refusal.contains("outside the published domain"),
+            "{refusal}"
+        );
+        // `None` means the provider's own default and is admitted.
+        assert_eq!(
+            generator
+                .requested_transformer_window(&streamed(GenerationMemory {
+                    transformer_window_size: None,
+                    ..stream_request
+                }))
+                .expect("a defaulted window size uses the provider's constant"),
+            Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)
+        );
     }
 
     /// **`decode_video` consults the request's rung-2 selection, and does so before it maps the

@@ -451,10 +451,16 @@ fn the_in_forward_graph_cut_is_measured_on_both_chunk_axes() {
     // a bit-exact instrument, and because the claim under test is a **sign and an order of
     // magnitude**, not a third decimal place. It is still far tighter than the gap to a saving.
     const DELTA_BAND: f64 = 0.005;
-    for (cell, declared) in rows
-        .iter()
-        .zip(mlx_gen_minimax_h3::memory_strategy::RUNG3_MEASURED_PEAK_DELTAS)
-    {
+    let declared_cells = mlx_gen_minimax_h3::memory_strategy::rung3_cells_for_tier(&tier);
+    assert_eq!(
+        declared_cells.len(),
+        rows.len(),
+        "tier {tier:?} has {} declared cells against {} measured — a tier measured but not declared \
+         leaves the contract's inapplicability reason describing a subset of what was run",
+        declared_cells.len(),
+        rows.len()
+    );
+    for (cell, declared) in rows.iter().zip(declared_cells) {
         let (declared_frames, declared_seq, d_heads, d_rows, d_one_head) = declared;
         assert_eq!(
             (cell.frames, cell.seq),

@@ -467,9 +467,18 @@ fn every_dit_load_site_is_driven_by_the_task() {
             .map(str::trim_start)
             .filter(|l| !l.starts_with("//"))
     };
+    // Two accepted forms since sc-18662: the resident loader and the deferred (rung-4) one. Both
+    // must resolve through `task_dit_dir(task)` — the streamed path reads its own checkpoint per
+    // task exactly like the resident one, or a `ref2va` streamed render would rebuild windows out
+    // of the WRONG 66 GB, plausibly, forever.
     let total = code().filter(|l| l.contains("MiniMaxH3Dit::load")).count();
     let by_task = code()
-        .filter(|l| l.contains("MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)"))
+        .filter(|l| {
+            l.contains("MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)")
+                || l.contains(
+                    "MiniMaxH3Dit::load_dir_deferred(self.task_dit_dir(task), self.dtype)",
+                )
+        })
         .count();
     assert_eq!(
         total,
