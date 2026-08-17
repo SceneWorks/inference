@@ -64,23 +64,30 @@
 //! not an optional Ref2VA extra, they are part of the minimum loadable set".
 //!
 //! This lane probes it only when a request resolves to `ref2va`
-//! ([`crate::model::task_component_dirs`](crate::model)), and the reason is **not** the one the
-//! surrounding prose used to give. The retired claim was "`SceneWorks/minimax-h3-mlx` publishes no
-//! `q4/transformer_ref` (sc-19517)". That premise is **retracted**: the sc-19573 manifest block
-//! ships `q4/transformer_ref/*` with an exact hosted byte count, and the manifest itself flags the
-//! older reasoning as having come "from a premise the engine has never honoured".
+//! ([`crate::model::task_component_dirs`](crate::model)). The justification is deliberately confined
+//! to **three checkable facts about the artifacts**, with no claim about what either engine permits:
 //!
-//! The real reason is the *platform* split, and it is verifiable in the same file: those
-//! `transformer_ref` rows are all `"platforms": ["macos"]`, and the off-Mac (candle) artifact set
-//! sc-19558 defines carries **no `transformer_ref` rows at all** — deliberately, because this
-//! provider default-denies `ref2va` at its conditioning allowlist until sc-17157 lands the port, so
-//! an off-Mac row "would advertise weights for a mode the only off-Mac engine refuses". An
-//! every-load probe here would therefore fail **every** candle load on exactly the platforms this
-//! lane serves, for a partition no candle request can currently reach.
+//! 1. every `transformer_ref` row in `builtin.models.jsonc` is `"platforms": ["macos"]`;
+//! 2. the off-Mac artifact set sc-19558 defines carries **no `transformer_ref` rows at all**; and
+//! 3. SceneWorks' `crates/sceneworks-worker/src/video_jobs/minimax_h3.rs` is
+//!    `#[cfg(target_os = "macos")]` end to end, so no off-Mac dispatch arm exists today.
 //!
-//! **The trigger to close the divergence:** when sc-17157 lands the `transformer_ref` port and the
-//! manifest gains off-Mac `transformer_ref` rows in the same change, this should move to MLX's
-//! every-load probe. Until then the lazy probe is the only one that can succeed.
+//! An off-Mac install therefore has no catalog route to the partition, and an every-load probe would
+//! fail **every** off-Mac load over a directory the catalog never offered.
+//!
+//! **The trigger to close the divergence** is the artifacts, not the engine: if the manifest gains
+//! off-Mac `transformer_ref` rows, this should move to MLX's every-load probe. Why those rows are
+//! absent today is a **catalog** question — confirm it with the catalog owner rather than inferring
+//! it from this crate.
+//!
+//! > **Two retracted premises, so neither is reintroduced.** (a) "`SceneWorks/minimax-h3-mlx`
+//! > publishes no `q4/transformer_ref` (sc-19517)" — false; the sc-19573 block ships it with an exact
+//! > hosted byte count, and the manifest flags that reasoning as coming "from a premise the engine
+//! > has never honoured". (b) "this provider default-denies `ref2va` until sc-17157 lands the port" —
+//! > also false; sc-17157 **landed** (`32204c935`), and [`crate::model`] advertises and admits all
+//! > three reference conditioning kinds. That second claim was paraphrased from a manifest comment
+//! > written before the port, which makes the comment stale too. Neither premise is load-bearing
+//! > above: facts 1-3 are all directly greppable.
 //!
 //! # The tier is an ASSERTION about what is staged, never an instruction
 //!
