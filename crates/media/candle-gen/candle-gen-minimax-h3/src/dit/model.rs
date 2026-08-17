@@ -139,7 +139,7 @@ impl MiniMaxH3Dit {
             ))
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
-        let shards = candle_gen::loader::sorted_safetensors(&dir, "minimax-h3 dit")?;
+        let shards = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 dit")?;
         let w = Weights::from_files(&shards, device, dtype)?;
         let model = Self::from_weights(&w, &cfg, device, dtype)?;
         // Drop the map here rather than at the call site: every tensor in it shares storage with

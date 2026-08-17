@@ -40,19 +40,49 @@
 //! number cannot say which stage it describes, and the answer decides whether a smaller card is
 //! helped by decode tiling (sc-18660) or by nothing at all.
 //!
-//! # Why there is no `q4` / `q8` test yet
+//! # The three tiers, and how a tier run differs from the `bf16` one
 //!
-//! This lane advertises no `supported_quants`: the pre-quantized tiers are packed by the MLX lane's
-//! `convert` and candle has no tier loader for them. [`minimax_h3_vram_bf16`] is therefore the only
-//! honest measurement this crate can take today, and a `vramGbByTier` shipped with a `q4` row would
-//! be a number no candle render can reach. The tier tests land with the tier loader.
+//! This lane advertises `supported_quants: [Q4, Q8]` as of sc-20267 — `crate::tier` resolves the
+//! per-tier component directories and `crate::quant` builds each packed Linear straight from the MLX
+//! affine triple — so all three tiers are now measurable here. There is one `#[ignore]`d test per
+//! tier ([`minimax_h3_vram_bf16`], [`minimax_h3_vram_q4`], [`minimax_h3_vram_q8`]) and protocol rule
+//! 2 applies with full force: **one tier per process**, each run alone.
+//!
+//! A tier run needs the tier **staged**, because MiniMax-H3 never quantizes at load — the DiT's
+//! 66.28 GB of dense bytes plus the growing packed output will not co-reside, so every tier ships
+//! pre-quantized and `spec.quantize` is an *assertion* about what is on disk. Two extra env vars
+//! carry that:
+//!
+//! ```sh
+//! MINIMAX_H3_VRAM_DIR=<snapshot root holding vae/, audio_vae/, tokenizer/> \
+//! MINIMAX_H3_VRAM_TIER=q4 \
+//! MINIMAX_H3_VRAM_DIT_DIR=<the tier's transformer/ dir> \
+//! MINIMAX_H3_VRAM_TE_DIR=<the tier's text_encoder/ dir> \
+//! CANDLE_GEN_OFFLOAD=sequential \
+//!   cargo test -p candle-gen-minimax-h3 --features cuda --release minimax_h3_vram_q4 -- \
+//!     --ignored --nocapture
+//! ```
+//!
+//! Both tier dirs default to `MINIMAX_H3_VRAM_DIR`'s own `transformer/` / `text_encoder/`, which is
+//! the flat-snapshot case and exactly what the `bf16` run wants. The two are staged **independently**
+//! (sc-19120): the manifest ships per-tier text encoders, but the engine deliberately does not couple
+//! the TE's tier to the DiT's, so a measurement of a packed DiT beside a dense TE is a legal
+//! configuration and the probe does not force them to match.
+//!
+//! **What these runs are for, and what they are not.** `crate::memory_strategy`'s per-tier byte
+//! constants are DECLARED from the manifest's hosted subtree sizes, not measured — they are on-disk
+//! tier footprints. These tests are what produce the *runtime* `vramGbByTier` rows, and until they
+//! have been run on an idle CUDA card there is no measured candle ceiling for any tier. The manifest
+//! records that honestly today (`"measured": false`, no `vramGbByTier`), and a row must not be
+//! written from arithmetic.
 
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress, Quant,
+    WeightsSource,
 };
 use candle_gen::testkit::{
     cuda_mempool_used_high_bytes, probe_gpu, reset_cuda_mempool_high_water, used_mib, VramProbe,
@@ -115,7 +145,7 @@ fn frame_std(img: &Image) -> f64 {
         .sqrt()
 }
 
-fn measure(tier: &str) {
+fn measure(tier: &str, quant: Option<Quant>) {
     let dir: PathBuf = env("MINIMAX_H3_VRAM_DIR")
         .expect(
             "MINIMAX_H3_VRAM_DIR must point at a staged MiniMax-H3 snapshot root (real files, not \
@@ -139,8 +169,36 @@ fn measure(tier: &str) {
     // The load spec deliberately asks for **Resident**. This provider forces `Sequential`, and the
     // measurement is only meaningful if that force is what actually happens — so the probe exercises
     // the forcing path rather than politely requesting the policy it wants measured.
-    let spec =
+    let mut spec =
         LoadSpec::new(WeightsSource::Dir(dir.clone())).with_offload_policy(OffloadPolicy::Resident);
+
+    // **Stage the tier, and assert it.** H3 never quantizes at load, so a `q4` number can only be
+    // measured against a pre-quantized `q4` DiT. `spec.quantize` makes it an assertion: if the staged
+    // dir is not really that tier, `crate::tier`'s reconcile fails the load rather than quietly
+    // measuring a different tier and publishing the figure under this one's name.
+    if let Some(q) = quant {
+        spec = spec.with_quant(q);
+    }
+    // Both default to the flat snapshot's own dirs, which is what the `bf16` run wants.
+    let dit_dir: PathBuf = env("MINIMAX_H3_VRAM_DIT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("transformer"));
+    let te_dir: PathBuf = env("MINIMAX_H3_VRAM_TE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("text_encoder"));
+    spec.components.insert(
+        "transformer".to_owned(),
+        WeightsSource::Dir(dit_dir.clone()),
+    );
+    spec.components.insert(
+        "text_encoder".to_owned(),
+        WeightsSource::Dir(te_dir.clone()),
+    );
+    eprintln!(
+        "[h3-vram] staged transformer={} text_encoder={}",
+        dit_dir.display(),
+        te_dir.display()
+    );
 
     let req = GenerationRequest {
         prompt,
@@ -298,10 +356,33 @@ fn measure(tier: &str) {
 
 /// The dense bf16 checkpoint at the shipped 768x1344 canvas and the 124-frame lattice floor.
 ///
-/// The only tier this lane can measure honestly today — see the module docs on why there is no
-/// `q4` / `q8` companion yet.
+/// No `spec.quantize`: `None` means "the caller asserted nothing", which is the correct request for a
+/// dense snapshot. Asserting `Bf16` is not expressible through `spec.quantize` at all — gen-core's
+/// `Quant` has no dense variant — and the resolver treats an absent request as unasserted rather than
+/// as a demand for denseness.
 #[test]
 #[ignore = "sc-17156 VRAM campaign; needs a staged MiniMax-H3 snapshot in MINIMAX_H3_VRAM_DIR + an idle CUDA GPU"]
 fn minimax_h3_vram_bf16() {
-    measure("bf16");
+    measure("bf16", None);
+}
+
+/// The **`q4`** tier at the same geometry (sc-20267).
+///
+/// Needs `MINIMAX_H3_VRAM_DIT_DIR` (and optionally `MINIMAX_H3_VRAM_TE_DIR`) pointed at a
+/// pre-quantized `q4` subtree — see the module docs. `spec.quantize = Q4` makes that an assertion, so
+/// a mis-staged dir fails the load instead of publishing a bf16 number under the `q4` row.
+///
+/// **Run alone.** cudarc's caching allocator never returns pages to the driver, so a second tier
+/// measured in the same process re-reports the first tier's high-water (protocol rule 2).
+#[test]
+#[ignore = "sc-17156 VRAM campaign; needs a staged q4 MiniMax-H3 tier + an idle CUDA GPU; run alone"]
+fn minimax_h3_vram_q4() {
+    measure("q4", Some(Quant::Q4));
+}
+
+/// The **`q8`** tier at the same geometry (sc-20267). Run alone — see [`minimax_h3_vram_q4`].
+#[test]
+#[ignore = "sc-17156 VRAM campaign; needs a staged q8 MiniMax-H3 tier + an idle CUDA GPU; run alone"]
+fn minimax_h3_vram_q8() {
+    measure("q8", Some(Quant::Q8));
 }

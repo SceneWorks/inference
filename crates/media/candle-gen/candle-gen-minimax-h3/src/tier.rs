@@ -3,9 +3,13 @@
 //!
 //! [`crate::quant`] answers "is *this tensor* packed?" from a `.scales` sibling. This module answers
 //! the question one level up: **which directories** does a given tier's DiT, reference DiT and text
-//! encoder come from, and does the tier the caller asked for match the tier actually on disk. It is
-//! inert until the `supported_quants` flip (PR 3 of sc-20267); nothing in [`crate::model`] calls it
-//! yet, and its whole surface is exercised by the unit tests below against tempdir fixtures.
+//! encoder come from, and does the tier the caller asked for match the tier actually on disk.
+//!
+//! **It is live as of PR 3 of sc-20267.** [`crate::model::MiniMaxH3::load`] resolves these paths once
+//! and holds them, and every component a render reads comes from them — the DiT, the reference DiT,
+//! the text-encoder shards, the TE config and the shared vision tower. The unit tests below still
+//! exercise the whole surface against tempdir fixtures; `crate::model`'s own tests drive it through
+//! the **request** path, which is what proves `spec.quantize` really reaches here.
 //!
 //! # The layout is NOT `root/{tier}/component`, and mirroring that is the point
 //!
@@ -146,7 +150,7 @@ pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 
 /// A published MiniMax-H3 weight tier.
 ///
-/// # ⚠️ PR 3 must not map an absent request onto [`Tier::Bf16`]
+/// # ⚠️ An absent request is NOT [`Tier::Bf16`] — and the flip honours that
 ///
 /// This enum can express only an *asserted* tier, and gen-core's `spec.quantize` is an
 /// `Option<Quant>` whose `None` means **"the caller asserted nothing"**. MLX honours that third
@@ -156,12 +160,21 @@ pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 /// [`MiniMaxH3TierPaths::require_dit`] refuses a packed tier under it (see
 /// `a_packed_component_under_a_bf16_request_is_refused`).
 ///
-/// So the `supported_quants` flip must map `spec.quantize` deliberately, **not** by defaulting
-/// `None` to `Bf16` — that would turn "I did not ask" into "I demand dense" and reject every packed
-/// install that loads fine on MLX today. Either add an `Unasserted` variant, or skip the reconcile
-/// entirely when `spec.quantize` is `None` and let the loaders auto-detect (which they already do —
-/// nothing downstream of here reads a tier). Deliberately not wired now: this PR ships the resolver
-/// inert, and picking the shape without the call site in front of you invites the wrong default.
+/// **Resolved in PR 3 (sc-20267) by the second of the two options this warning offered:** no
+/// `Unasserted` variant was added; instead `crate::model`'s `requested_tier` maps `None` to `None` and
+/// the reconcile is **skipped**, through [`MiniMaxH3TierPaths::require_dit_unasserted`]. The loaders
+/// auto-detect from `{base}.scales` regardless, so nothing downstream needs telling. Defaulting `None`
+/// to `Bf16` would have turned "I did not ask" into "I demand dense" and rejected every packed install
+/// that loads fine on MLX today — `crate::model`'s
+/// `an_unasserted_request_admits_a_packed_tier_rather_than_demanding_dense` is the test that holds it.
+///
+/// The group-size validation is deliberately **not** skipped with the reconcile: a mismatched group
+/// derives a legal-looking, wrong bit width instead of failing cleanly (sc-15154), so it is the one
+/// check that must run whether or not a tier was named.
+///
+/// [`Quant::Nvfp4`](candle_gen::gen_core::Quant::Nvfp4) has no mapping here at all and is refused by
+/// name in `crate::model::load`: it reports 4 bits, so mapping it to [`Tier::Q4`] would let it
+/// reconcile *cleanly* against a `q4` marker and render int4-affine under an NVFP4 request.
 ///
 /// The three the rehost publishes, and the complete set: `SceneWorks/minimax-h3-mlx` ships `q4`,
 /// `q8` and `bf16`.

@@ -1496,6 +1496,15 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model-00001-of-00001.safetensors"), []).unwrap();
     }
+    // The text encoder additionally needs its `config.json` (sc-20267): it is a *tiered* component, so
+    // `MiniMaxH3::load` reads the `quantization` marker there to reconcile the staged tier. Dense — no
+    // `quantization` block — which is the `bf16` shape this fixture is. `vae`/`audio_vae` are
+    // tier-agnostic and are still satisfied by a shard alone.
+    std::fs::write(
+        root.join("text_encoder").join("config.json"),
+        r#"{"num_layers": 50}"#,
+    )
+    .unwrap();
     // A real `transformer/` partition at the fixture geometry: the committed tensors plus the
     // diffusers `config.json` the loader parses.
     let f = Golden::load(DIT_FIXTURE);

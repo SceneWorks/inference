@@ -42,7 +42,31 @@
 //! cost is a separate, genuinely tiered quantity. Those measurements were taken on MLX; sc-17156
 //! landed this backend's pipeline but no fitted curve of its own, which is the other reason
 //! `calibration` is `None`.
+//!
+//! # The packed `q4`/`q8` tiers are live on this lane (sc-20267)
+//!
+//! **This crate is no longer bf16-only, and several notes in this file used to say that it was.**
+//! [`crate::quant::lin`] auto-detects the MLX affine triple and builds a packed base with no dense
+//! transient, [`crate::tier`] resolves and reconciles the published `q4` / `q8` / `bf16` subtrees, and
+//! [`crate::dit::block::AdaLnProjection`] is one of the two DiT loaders that pack. Three consequences
+//! land in this module, each carried by code below rather than left in prose:
+//!
+//! * the per-tier asset sizes are declared ([`DIT_Q4_BYTES`] and its three siblings) — **from the
+//!   manifest, not measured**, and their section note says exactly what that costs;
+//! * `resolved_adaln_bytes` finally owes and pays the **marker leg** its old doc promised: it reads
+//!   the staged DiT's own `quantization.bits` and re-derives the projection stack at that width,
+//!   taking `min(marker, footprint)` the way the MLX sibling does;
+//! * **the container is candle's, not MLX's.** A 4-bit MLX pack repacks into GGUF `Q4_1` and an
+//!   8-bit one into `Q8_0` (`candle_gen::quant::repack_packed_weight`), so the packed stack sizes are
+//!   *not* the MLX sibling's at `q4` — see `adaln_stack_bytes`, where that divergence is derived
+//!   rather than reconciled away.
+//!
+//! What has **not** changed: there is still no fitted curve, no calibration identity and no behavior
+//! seam on this lane, so every optimized rung stays `Missing` and no tier makes anything new
+//! admissible. The tiers change what a render *costs*, not what this provider *claims*.
 
+use candle_gen::candle_core::quantized::GgmlDType;
+use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     safetensors_path_bytes, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
     MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
@@ -74,12 +98,79 @@ pub const VIDEO_VAE_BYTES: u64 = 10_415_558_888;
 /// Audio VAE — 1 shard. 0.61 GB.
 pub const AUDIO_VAE_BYTES: u64 = 605_429_340;
 
+// --- DECLARED per-tier asset sizes (sc-20267) --------------------------------------------------
+//
+// **Declared, NOT measured, and NOT runtime peaks.** Every figure in this section is an
+// `estimatedSizeBytes` row copied out of SceneWorks' `config/manifests/builtin.models.jsonc` for
+// repo `SceneWorks/minimax-h3-mlx` at revision `137ce668c55a20bc0935fd1cf2a3de8448abb7f4`. Nothing
+// in this crate measured any of them, no test in this crate can measure them (the tiers are 18-35 GB
+// hosted artifacts), and none of them may be cited as a measurement.
+//
+// # They are HOSTED SUBTREE bytes, so they slightly OVER-declare the safetensors footprint
+//
+// The section above is `.safetensors`-only — precisely what `safetensors_path_bytes` sums at load.
+// The manifest rows are **whole-subtree** bytes, including each tier's sidecars: `config.json`, the
+// seven tokenizer/preprocessor files every tier subtree carries verbatim, and the shard index. The
+// bf16 pair measures that gap exactly rather than leaving it asserted — the manifest's bf16 DiT row
+// is [`MANIFEST_DIT_BF16_SUBTREE_BYTES`] against this crate's measured [`DIT_BF16_BYTES`], i.e.
+// 65,034 B of sidecars on a 66.28 GB component (0.98 ppm). So each figure below is an **upper
+// bound** on its tier's safetensors bytes, by about that much.
+//
+// **Over-declaring an asset floor is the SAFE direction**, and that is why the rows are carried as
+// published rather than adjusted down by a guessed sidecar allowance. Under-declaring a floor admits
+// a render that then OOMs — the failure the whole ladder exists to prevent, and the one the
+// [`DIT_PARTITIONS`] note records this provider having already shipped once. Over-declaring one only
+// leaves a little admission headroom on the table. A hand-guessed correction would trade a bounded,
+// documented, sub-ppm over-declaration for an unbounded error in the direction that OOMs.
+//
+// # These are ON-DISK tier sizes, NOT runtime peaks
+//
+// No stage peak, resident figure or activation transient is declared here, and none may be derived
+// from these numbers. The MLX sibling's `DENOISE_RESIDENT_Q4_BYTES` /
+// `CONDITIONING_STAGE_PEAK_Q4_BYTES` / `CONDITIONING_STAGE_PEAK_Q8_BYTES` constants are deliberately
+// **not** mirrored into this crate: they were measured on MLX/Metal, against MLX's allocator and its
+// lazy materialization, so they are facts about that backend rather than about this one. The CUDA
+// vram probe is what measures this lane's real runtime peaks, later and off this crate; until it has,
+// this lane declares no peak at all — which is the same absence that keeps `calibration` `None`.
+
+/// One 33 B DiT partition on the published **`q4`** tier — 18.78 GB. **Declared from the manifest**;
+/// see the section note above for why it is an upper bound on the safetensors bytes.
+pub const DIT_Q4_BYTES: u64 = 18_780_109_783;
+
+/// One 33 B DiT partition on the published **`q8`** tier — 35.30 GB. **Declared from the manifest**;
+/// see the section note above.
+pub const DIT_Q8_BYTES: u64 = 35_302_064_357;
+
+/// The packed **`q4`** Qwen3-VL-32B text encoder (sc-19120) — 18.72 GB. **Declared from the
+/// manifest**; see the section note above.
+///
+/// Staged **independently of the DiT's tier** — `crate::tier::MiniMaxH3TierPaths::require_text_encoder`
+/// takes no [`crate::tier::Tier`] at all — so a `q4` DiT beside a dense encoder is a legal install and
+/// this constant is not implied by [`DIT_Q4_BYTES`].
+pub const TEXT_ENCODER_Q4_BYTES: u64 = 18_722_713_964;
+
+/// The packed **`q8`** Qwen3-VL-32B text encoder (sc-19120) — 33.72 GB. **Declared from the
+/// manifest**; see [`TEXT_ENCODER_Q4_BYTES`] for the independence note.
+pub const TEXT_ENCODER_Q8_BYTES: u64 = 33_723_765_614;
+
+/// The manifest's **bf16 DiT subtree** row, declared for exactly one purpose: to size the sidecar gap
+/// between a whole-subtree manifest figure and this crate's measured `.safetensors` sum.
+///
+/// It is the one tier where both accountings exist, so it is the only place the over-declaration in
+/// the four constants above can be *quantified* rather than merely admitted:
+/// `MANIFEST_DIT_BF16_SUBTREE_BYTES − DIT_BF16_BYTES = 65_034` B. Not an asset fact — the contract
+/// never reads it, and [`DIT_BF16_BYTES`] remains the bf16 figure everything here uses.
+pub const MANIFEST_DIT_BF16_SUBTREE_BYTES: u64 = 66_280_569_250;
+
 /// Exact bytes the AdaLN precompute-and-evict drops, asserted against the loader in
 /// [`crate::dit::adaln`]. Declared here so both backends' contracts carry the same figure, and
 /// carried into the contract as a typed resident-component exclusion by the private `adaln_component`
 /// (sc-18665).
 ///
-/// This is the **bf16** figure. The private `resolved_adaln_bytes` is what the contract declares.
+/// This is the **bf16** figure, and as of sc-20267 it is one of three: the packed `q4` and `q8` tiers
+/// hold the same 50 projections in a GGUF container, and the private `adaln_stack_bytes` derives each
+/// width from the shipped configuration. The private `resolved_adaln_bytes` is what the contract
+/// declares, and it is `min(marker, footprint)` over both legs.
 pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 
 /// Bytes of the modulation table the precompute keeps in the projections' place, at the longest
@@ -94,9 +185,15 @@ pub const ADALN_EVICTED_BYTES: u64 = 26_020_915_200;
 /// deliver. Identical to the MLX sibling's figure, and for the same reason the two DiT footprints
 /// are identical: this is a property of the checkpoint's schedule domain, not of a backend.
 ///
-/// **It does NOT scale with a tier.** The table is the projections' *output*, so its element type
-/// is the block's compute dtype rather than any packed width. The resident side scales; this does
-/// not. See the private `resolved_adaln_bytes`.
+/// **It does NOT scale with a tier, and sc-20267 leaves that claim standing rather than revising
+/// it.** The table is the projections' *output*, so its element type is the block's **compute** dtype
+/// rather than any packed width — [`crate::dit::block::AdaLnProjection`] holds that dtype explicitly
+/// and casts the activation to it on either tier, so a packed base emits the identical bf16 table a
+/// dense one does. The resident side genuinely scales now that the packed tiers are live (26.02 GB
+/// bf16 → 13.83 GB `q8` → 8.14 GB `q4`, all derived by the private `adaln_stack_bytes`) while this
+/// figure stays at 3.87 GB across all three, which is exactly why the two quantities are declared
+/// separately and why one factor must never be applied to both. See the private
+/// `resolved_adaln_bytes`.
 pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
 
 /// Contract-stable identity of the evictable AdaLN sub-stack, so a consumer can find the
@@ -148,25 +245,50 @@ impl ComponentBytes {
         };
         // The larger of the two DiT partitions this snapshot carries — see [`DIT_PARTITIONS`]. A
         // staged override is honored per partition, exactly as the single-partition form did.
-        let dit = DIT_PARTITIONS
+        //
+        // **The winning partition's DIRECTORY is carried out alongside its bytes, and that is a
+        // requirement rather than a convenience** (sc-20267): `resolved_adaln_bytes` now reads a
+        // `quantization` marker out of the resolved DiT dir, so handing it an arbitrary one of the two
+        // would read a tier marker off a partition that is not the one being charged. The pair is
+        // taken as a unit for that reason.
+        //
+        // `.rev()` before `max_by_key` breaks a tie toward [`BASE_DIT_PARTITION`], which is the order
+        // [`DIT_PARTITIONS`] documents: `Iterator::max_by_key` keeps the LAST maximum, and the two
+        // partitions are byte-identical on a flat snapshot. It costs nothing on a well-formed install
+        // — `crate::convert` packs `transformer/` and `transformer_ref/` at the same width, so their
+        // markers agree — but leaving the choice to iteration order would make the declaration depend
+        // on it.
+        let (dit_dir, dit) = DIT_PARTITIONS
             .iter()
+            .rev()
             .map(|partition| {
                 let dir = match spec.components.get(*partition) {
                     Some(WeightsSource::Dir(staged)) => staged.clone(),
                     _ => root.join(partition),
                 };
-                safetensors_path_bytes(dir)
+                let bytes = safetensors_path_bytes(&dir);
+                (dir, bytes)
             })
-            .max()
-            .unwrap_or(0);
+            .max_by_key(|(_, bytes)| *bytes)
+            .expect("DIT_PARTITIONS is a non-empty array");
+        // The condition encoder honors its own staged override too (sc-19120 / sc-20267). It did NOT
+        // before, and the omission was the [`DIT_PARTITIONS`] failure in a second place: the TE's tier
+        // is staged **independently** of the DiT's, so a split `q4` install stages
+        // `crate::tier::TEXT_ENCODER_COMPONENT` outside the snapshot and may carry no
+        // `root/text_encoder` at all — which measured 0 and published an 18.72 GB under-declaration of
+        // the largest single component this family loads. `safetensors_path_bytes` on an absent
+        // directory returns 0, so the flat-snapshot path is unchanged.
+        let text_encoder = match spec.components.get(crate::tier::TEXT_ENCODER_COMPONENT) {
+            Some(WeightsSource::Dir(staged)) => staged.clone(),
+            _ => root.join(crate::tier::TEXT_ENCODER_COMPONENT),
+        };
         Self {
-            text_encoder: safetensors_path_bytes(root.join("text_encoder")),
+            text_encoder: safetensors_path_bytes(text_encoder),
             dit,
-            // Scaled to the partition that was actually charged, whichever of the two won the max —
-            // the AdaLN stack is the same fraction of either partition, and declaring the flat bf16
-            // figure against a smaller staged winner would declare a sub-stack larger than the stack
-            // containing it.
-            adaln: resolved_adaln_bytes(dit),
+            // Resolved against the partition that was actually charged, whichever of the two won the
+            // max — see [`resolved_adaln_bytes`] for both legs. Declaring the flat bf16 figure against
+            // a smaller staged winner would declare a sub-stack larger than the stack containing it.
+            adaln: resolved_adaln_bytes(&dit_dir, dit),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
         }
@@ -197,26 +319,162 @@ impl ComponentBytes {
 /// contract at all. `a_staged_dit_component_is_charged_at_its_own_size` proves this lane really can
 /// resolve a smaller staged DiT, so the hazard is reachable here and not merely theoretical.
 ///
-/// **Only the footprint leg, and that is a backend difference rather than an omission.** The MLX
-/// sibling takes `min(marker, footprint)`, where the marker leg reads a staged tier's own
-/// `config.json` `quantization.bits` and re-derives the stack at that width. This crate has **no
-/// packed tier at all** — `crate::dit` loads dense, there is no `quantize`/`packed_quant_bits`
-/// path — so there is no marker to read and no packed width to derive. If a packed candle tier ever
-/// lands, this is the function that owes it a marker leg, because the footprint leg is never exact:
-/// the dense f32 I/O heads and norms do not shrink with a tier, so a whole-DiT ratio over-declares
-/// the projections' own share, and an over-declared saving is the OOM direction.
+/// **Two legs as of sc-20267, and the SMALLER wins.** The old note here said this crate had "no packed
+/// tier at all" and named this function as the one that would owe a marker leg if one ever landed. One
+/// has: [`crate::quant::lin`] builds a packed base from the MLX affine triple and
+/// [`crate::tier`] resolves the published `q4` / `q8` subtrees, so the debt is paid rather than
+/// restated.
 ///
-/// Containment holds unconditionally: [`ADALN_EVICTED_BYTES`] is 39.3 % of [`DIT_BF16_BYTES`], so
-/// the scaled value is always strictly below `dit_bytes`.
-fn resolved_adaln_bytes(dit_bytes: u64) -> u64 {
+/// * the **marker** leg reads the staged DiT dir's own `config.json` `quantization.bits` — through
+///   `crate::tier::MiniMaxH3TierPaths::staged_bits`, which is the *same* parse
+///   `crate::tier::reconcile_tier` treats as decisive about which tier is staged, so the contract and
+///   the loader cannot disagree about a tier — and re-derives the stack at that width through
+///   [`adaln_stack_bytes`]. Exact at every published tier. A **missing or unreadable** marker falls
+///   back to the bf16 [`ADALN_EVICTED_BYTES`], never to zero and never to an error: this function is
+///   called while building a contract, an `Err` here would mean a render that cannot resolve a
+///   contract at all, and a zero would declare an eviction that excludes nothing.
+/// * the **footprint** leg is unchanged — the bf16 stack scaled by the resolved DiT's share of the
+///   bf16 DiT. Never exact: the f32 I/O heads, `context_embedder`, `norm_out.linear` and every norm
+///   that `mlx_gen_minimax_h3::convert::DENSE_BY_POLICY` leaves dense **in every tier** do not shrink,
+///   so a whole-DiT ratio over-declares the projections' own share. But it reads nothing except a
+///   number `ComponentBytes::resolve` already holds.
+///
+/// Taking the minimum is what makes this **safe** rather than merely accurate, because each leg closes
+/// the other's failure: marker alone reports the full 26.02 GB for a packed tier whose marker is
+/// missing, and footprint alone over-declares the eviction — and an over-declared *saving* is the OOM
+/// direction, the same asymmetry [`ADALN_MODULATION_TABLE_MAX_BYTES`] is chosen on.
+///
+/// Containment holds unconditionally either way: [`ADALN_EVICTED_BYTES`] is 39.3 % of
+/// [`DIT_BF16_BYTES`], so the footprint leg is always strictly below `dit_bytes` and a minimum taken
+/// against it is therefore below it too.
+///
+/// # Which leg actually binds — and it is NOT the same leg the MLX sibling's binds at `q4`
+///
+/// Both legs are live at both packed tiers, and the winner differs by tier because the two legs scale
+/// differently. At the published footprints:
+///
+/// | tier | marker leg | footprint leg | this lane declares |
+/// |---|---:|---:|---|
+/// | `q8` | 13,828,147,200 | 13,859,158,645 | **marker**, by 31.0 MB |
+/// | `q4` | 8,138,188,800 | 7,372,841,379 | **footprint**, by 765.3 MB |
+///
+/// So at `q4` the marker leg is the *larger* of the two here, and `min` discards it. That is not the
+/// marker leg failing — it is the safe direction working. `resident_bytes` is the quantity the
+/// eviction is netted out of, so a smaller value declares a *smaller* saving and therefore a *larger*
+/// steady-state charge; taking the tighter bound can only make admission more conservative.
+///
+/// The MLX sibling's `q4` marker is 7,325,337,600 — 47.5 MB **below** the same footprint leg — so its
+/// `q4` declaration comes from its marker where this one comes from its footprint. The two lanes
+/// therefore disagree about which leg binds at `q4`, for exactly the container reason
+/// [`adaln_stack_bytes`] documents, and neither is wrong. Do not "reconcile" them.
+fn resolved_adaln_bytes(dit_dir: &std::path::Path, dit_bytes: u64) -> u64 {
     if dit_bytes == 0 {
         // Nothing was resolved, so there is no footprint to scale to and the declaration falls back
         // to the architecture fact. `conformance_errors` skips sub-stack containment against zero
         // asset facts for exactly this case.
         return ADALN_EVICTED_BYTES;
     }
+    // `.ok().flatten()`: an unreadable or unparseable config.json and a dense tier both mean "no
+    // packed width to derive", and both take the bf16 fallback. A contract build has no channel for
+    // the difference, and the fallback is the conservative answer for either.
+    let marked = crate::tier::MiniMaxH3TierPaths::staged_bits(dit_dir)
+        .ok()
+        .flatten()
+        .map_or(ADALN_EVICTED_BYTES, adaln_stack_bytes);
     // u128 because `ADALN_EVICTED_BYTES · DIT_BF16_BYTES` is ~1.7e21 and overflows u64.
-    (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes) / u128::from(DIT_BF16_BYTES)) as u64
+    let scaled = (u128::from(ADALN_EVICTED_BYTES) * u128::from(dit_bytes)
+        / u128::from(DIT_BF16_BYTES)) as u64;
+    marked.min(scaled)
+}
+
+/// The GGUF container candle **repacks** an MLX pack of `bits` width into — `Q4_1` at 4 bits, `Q8_0`
+/// at 8, and `None` for a width the repack does not serve.
+///
+/// Mirrors `candle_gen::quant::repack_packed_weight`'s own match, which is the only authority on this:
+/// it is the function every packed load on this lane goes through. Deliberately **not**
+/// `candle_gen::quant::ggml_dtype`, whose `Quant::Q4` arm is `Q4_0` — that is the in-place dense fold's
+/// container, and its own doc records that "the **packed** path uses `Q4_1` instead". Confusing the two
+/// would under-declare a `q4` stack by the f16 minimum `Q4_1` carries per block and `Q4_0` does not.
+fn packed_container(bits: i32) -> Option<GgmlDType> {
+    match bits {
+        4 => Some(GgmlDType::Q4_1),
+        8 => Some(GgmlDType::Q8_0),
+        _ => None,
+    }
+}
+
+/// Device bytes the 50-block `adaln_proj` stack holds on a tier packed at `bits`.
+///
+/// The same accounting `crate::quant::lin` records into `TieredLinear::base_bytes` and
+/// [`crate::dit::block::AdaLnProjection::nbytes`] reports on a *loaded* projection, done from the
+/// shipped configuration instead of from a device tensor, because a contract is resolved before
+/// anything is loaded. Per block: the repacked GGUF blocks over the `[out, in]` weight, plus the dense
+/// `{base}.bias` row, which `crate::quant::lin` loads at the compute dtype on **either** tier.
+/// `bits >= 16` is the dense arm — the unpacked bf16 `weight` + `bias`, i.e. [`ADALN_EVICTED_BYTES`],
+/// derived here rather than returned as the constant so a configuration change moves both together.
+///
+/// The block size and per-block byte cost are read off [`GgmlDType`] rather than typed, so the figures
+/// track whatever candle's container actually costs.
+///
+/// # This backend's container is NOT the MLX triple, and that is the point
+///
+/// The MLX lane's packed stack is `out · in · bits / 8` code bytes plus a bf16 `scales` **and**
+/// `biases` entry per 64-element input group. Candle holds neither: the repack folds the MLX
+/// scales/biases *into* the GGUF blocks, so what is resident is `blocks · type_size` and nothing else.
+/// The two agree at `q8` and diverge at `q4`, both for the same reason:
+///
+/// | tier | candle container | per 32 weights | this crate | MLX sibling |
+/// |---|---|---:|---:|---:|
+/// | `q8` | `Q8_0` | 32 codes + one f16 scale = 34 B | 13,828,147,200 B | 13,828,147,200 B |
+/// | `q4` | `Q4_1` | 16 codes + f16 scale + f16 min = 20 B | 8,138,188,800 B | 7,325,337,600 B |
+///
+/// `q8` coinciding is arithmetic luck: `Q8_0`'s 2 B per 32 elements happens to equal MLX's 4 B per
+/// 64-element group summed across its two metadata tensors. `q4` does **not** coincide, because `Q4_1`
+/// carries its f16 scale and f16 minimum per **32** elements where MLX carries them per **64** — twice
+/// the metadata density over the same codes, so candle's `q4` stack is ~11.1 % larger.
+///
+/// **That divergence is real and correct, and must not be "fixed" to match MLX.** It is a fact about
+/// which container each backend keeps resident, not a discrepancy between two accounts of one thing —
+/// the contract carries a [`MemoryBackendRealization`] precisely so the two lanes may differ here.
+/// Copying MLX's 7.33 GB across would under-declare what this backend actually holds, and an
+/// under-declared resident is the OOM direction.
+fn adaln_stack_bytes(bits: i32) -> u64 {
+    let config = crate::dit::MiniMaxH3DitConfig::default();
+    let out = config.adaln_out_features() as u64;
+    let inp = config.time_embed_dim as u64;
+    let blocks = config.num_layers as u64;
+    // `bits >= 16` lands here through [`packed_container`]'s `None`, alongside every width
+    // `repack_packed_weight` would refuse at load. Either way the dense bf16 stack is the conservative
+    // answer, and it is the one `resolved_adaln_bytes`'s marker fallback needs.
+    let Some(dtype) = packed_container(bits) else {
+        return blocks * (out * inp + out) * compute_dtype_bytes();
+    };
+    blocks * packed_projection_bytes(dtype, out, inp)
+}
+
+/// Bytes one **packed** `[out, in]` projection holds on this lane: the repacked GGUF blocks, plus the
+/// dense `{base}.bias` row that `crate::quant::lin` loads at the compute dtype on either tier.
+///
+/// Factored out of [`adaln_stack_bytes`] — which is only this, times the block count — for one reason:
+/// it is the quantity `crate::quant::lin` records into `TieredLinear::base_bytes` at load, so
+/// `the_packed_stack_arithmetic_is_the_loaders_own_accounting` can drive a **real** packed load at a
+/// geometry a unit test can materialize and compare against this function. The shipped 96768x2688
+/// stack is 8-14 GB of codes and cannot be built in-process, so the agreement has to be shown on the
+/// formula rather than on the shipped tensors; sharing the formula is what makes that a property
+/// instead of two restatements of the same guess.
+fn packed_projection_bytes(dtype: GgmlDType, out: u64, inp: u64) -> u64 {
+    let codes = (out * inp / dtype.block_size() as u64) * dtype.type_size() as u64;
+    codes + out * compute_dtype_bytes()
+}
+
+/// Bytes per element of the DiT's compute dtype.
+///
+/// bf16, which is both the dense weight's element size (the `· 2` [`ADALN_EVICTED_BYTES`] is derived
+/// with) and the width `crate::quant::lin` casts the dense `{base}.bias` to on the packed path. Read
+/// off [`DType`] rather than typed as `2` so the declaration names the dtype it means. A function
+/// rather than a `const` only because `DType::size_in_bytes` is not `const fn`.
+fn compute_dtype_bytes() -> u64 {
+    DType::BF16.size_in_bytes() as u64
 }
 
 /// The AdaLN projection stack as a typed, evictable intra-transformer component (sc-18665).
@@ -332,11 +590,34 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             // DiT loads as a whole stack. sc-18662 builds one.
             host_to_device_block_materialization: false,
             // Answered even though rung 4 is `Missing`, because the field is deliberately not
-            // optional. It is accurate for the loader as it exists: this crate has no packed tier
-            // and therefore no MLX-affine → GGML repack seam, so a window would be a mapped read
-            // plus a host-to-device copy of bytes already in the accelerator's form. **sc-18662
-            // must re-verify this** if a packed candle tier ever lands — that is the change that
-            // turns a conforming realization into a `HostFormatConversion` one.
+            // optional.
+            //
+            // **The premise this used to rest on is gone.** It read "this crate has no packed tier
+            // and therefore no MLX-affine → GGML repack seam", and named a packed candle tier
+            // landing as "the change that turns a conforming realization into a
+            // `HostFormatConversion` one". sc-20267 landed that tier: `crate::quant::lin` routes
+            // every packed projection through `candle_gen::quant::repack_packed_weight`, which is
+            // host-side work proportional to the weight.
+            //
+            // The declaration is unchanged all the same, on two grounds that are stated here rather
+            // than left implicit, because the old comment's own prediction says otherwise:
+            //
+            // 1. **there is no window path here to characterize.**
+            //    `host_to_device_block_materialization` above is `false` and rung 4 is `Missing` —
+            //    the DiT loads as a whole stack — so this field describes a counterfactual either
+            //    way, and `conformance_errors` only reads it when rung 4 is `Implemented`.
+            // 2. **`DeviceFormatTransfer` is the obligation, and it is reachable.** The enum's own
+            //    doc calls `HostFormatConversion` a transitional state a conforming rung SHOULD not
+            //    be in, and says of exactly this repack that "nothing about Candle prevents it: the
+            //    conversion is content-addressed by the source tensor and can be done once, ahead of
+            //    the render, into a device-format artifact a window then maps and copies". Every
+            //    other packed-tier candle provider in this workspace declares the same value.
+            //
+            // **sc-18662 still owns re-verifying this**, and the obligation is now sharper rather
+            // than conditional: whatever window loader it builds must do the repack ahead of the
+            // render, or it must change this field to `HostFormatConversion` and name its own
+            // removal story. Building a per-window repack and leaving this value is the one
+            // outcome the field exists to prevent.
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies: strategies(),
@@ -1068,6 +1349,350 @@ mod tests {
         assert_eq!(AUDIO_VAE_BYTES, 605_429_340);
     }
 
+    // --- sc-20267: the DECLARED per-tier asset sizes ---------------------------------------------
+
+    /// The four per-tier figures are the manifest's `estimatedSizeBytes` rows, byte for byte, and
+    /// they are held to their GB figures through the same window the measured facts are.
+    ///
+    /// **Nothing here measures anything.** These are `SceneWorks/minimax-h3-mlx` @ `137ce668` manifest
+    /// rows; a test in this crate cannot verify an 18-35 GB hosted subtree, so what is pinned is that
+    /// the transcription has not drifted and that the byte and GB spellings agree.
+    #[test]
+    fn the_declared_tier_sizes_are_the_manifest_rows() {
+        assert_eq!(DIT_Q4_BYTES, 18_780_109_783);
+        assert_eq!(DIT_Q8_BYTES, 35_302_064_357);
+        assert_eq!(TEXT_ENCODER_Q4_BYTES, 18_722_713_964);
+        assert_eq!(TEXT_ENCODER_Q8_BYTES, 33_723_765_614);
+        assert_within(DIT_Q4_BYTES, 18.78, "q4 DiT partition (declared)");
+        assert_within(DIT_Q8_BYTES, 35.30, "q8 DiT partition (declared)");
+        assert_within(TEXT_ENCODER_Q4_BYTES, 18.72, "q4 text encoder (declared)");
+        assert_within(TEXT_ENCODER_Q8_BYTES, 33.72, "q8 text encoder (declared)");
+    }
+
+    /// **The over-declaration is quantified rather than merely admitted.**
+    ///
+    /// The declared tier figures are whole-subtree bytes while every measured constant in this module
+    /// is `.safetensors`-only, so the declared ones are upper bounds. bf16 is the one tier where both
+    /// accountings exist, and the gap there is the sidecar allowance the packed rows also carry: if a
+    /// re-capture ever moved this materially, the "sub-ppm upper bound" claim in the section note would
+    /// be wrong and the four constants would need re-deriving rather than nudging.
+    #[test]
+    fn the_declared_tier_sizes_over_declare_only_by_the_sidecars() {
+        let gap = MANIFEST_DIT_BF16_SUBTREE_BYTES - DIT_BF16_BYTES;
+        assert_eq!(gap, 65_034, "the bf16 DiT subtree's sidecar allowance");
+        const {
+            assert!(
+                MANIFEST_DIT_BF16_SUBTREE_BYTES > DIT_BF16_BYTES,
+                "a whole-subtree figure cannot be below the safetensors sum inside it"
+            );
+        }
+        // Sub-ppm, which is what makes carrying the rows unadjusted the right trade — see the section
+        // note on why the over-declaration direction is the safe one.
+        assert!(
+            gap * 1_000_000 < DIT_BF16_BYTES,
+            "{gap} B on {DIT_BF16_BYTES} B is no longer sub-ppm; re-read the section note"
+        );
+    }
+
+    /// Coherence: `q4 < q8 < bf16` on both tiered components. A transposed pair or a copy-paste
+    /// between rows would publish a floor for the wrong tier, and no other assertion here would see it.
+    #[test]
+    fn the_declared_tier_sizes_are_ordered_by_tier() {
+        const {
+            assert!(DIT_Q4_BYTES < DIT_Q8_BYTES);
+            assert!(DIT_Q8_BYTES < DIT_BF16_BYTES);
+            assert!(TEXT_ENCODER_Q4_BYTES < TEXT_ENCODER_Q8_BYTES);
+            assert!(
+                TEXT_ENCODER_Q8_BYTES < TEXT_ENCODER_BYTES,
+                "the packed q8 encoder must sit below the dense one it replaces"
+            );
+        }
+        // ...and the two components are independently tiered (sc-19120), so their rows must not have
+        // been filled in from each other.
+        assert_ne!(DIT_Q4_BYTES, TEXT_ENCODER_Q4_BYTES);
+        assert_ne!(DIT_Q8_BYTES, TEXT_ENCODER_Q8_BYTES);
+    }
+
+    /// **The MLX lane's `q4` AdaLN figure, mirrored here for one purpose: to assert this lane does NOT
+    /// equal it.** See [`adaln_stack_bytes`] for why.
+    const MLX_ADALN_Q4_BYTES: u64 = 7_325_337_600;
+
+    /// The packed AdaLN stack sizes, derived from the GGUF container candle actually keeps resident.
+    #[test]
+    fn the_packed_adaln_stack_sizes_come_from_the_gguf_container() {
+        // The dense arm is derived, not returned as the constant, so a config change moves both.
+        assert_eq!(
+            adaln_stack_bytes(16),
+            ADALN_EVICTED_BYTES,
+            "bits >= 16 is the dense bf16 stack"
+        );
+        assert_eq!(adaln_stack_bytes(32), ADALN_EVICTED_BYTES);
+        // A width the repack does not serve takes the same conservative arm rather than deriving a
+        // container that does not exist.
+        assert_eq!(adaln_stack_bytes(2), ADALN_EVICTED_BYTES);
+        assert_eq!(adaln_stack_bytes(0), ADALN_EVICTED_BYTES);
+
+        // Q8_0: 32 codes + one f16 scale per 32 weights = 34 B/block, plus the dense bias row.
+        assert_eq!(adaln_stack_bytes(8), 13_828_147_200);
+        // Q4_1: 16 code bytes + an f16 scale AND an f16 minimum per 32 weights = 20 B/block.
+        assert_eq!(adaln_stack_bytes(4), 8_138_188_800);
+
+        assert!(adaln_stack_bytes(4) < adaln_stack_bytes(8));
+        assert!(adaln_stack_bytes(8) < adaln_stack_bytes(16));
+
+        // The q8 figure COINCIDES with the MLX sibling's `ADALN_EVICTED_Q8_BYTES`, and that is
+        // arithmetic luck rather than a shared derivation: Q8_0's 2 B of metadata per 32 elements
+        // happens to equal MLX's two bf16 metadata tensors at 4 B per 64-element group.
+        assert_eq!(
+            adaln_stack_bytes(8),
+            13_828_147_200,
+            "the same number mlx_gen_minimax_h3::memory_strategy::ADALN_EVICTED_Q8_BYTES declares"
+        );
+        // The q4 figure DIVERGES, and the divergence is the correct answer rather than a defect to
+        // reconcile: Q4_1 carries its f16 scale and f16 minimum per 32 elements where the MLX pack
+        // carries them per 64, so candle holds ~11.1% more metadata over the same codes. Copying MLX's
+        // figure across would under-declare what this backend actually keeps resident.
+        assert!(
+            adaln_stack_bytes(4) > MLX_ADALN_Q4_BYTES,
+            "candle's Q4_1 stack ({}) must exceed the MLX triple's ({MLX_ADALN_Q4_BYTES}) — twice the \
+             per-group metadata density over the same codes",
+            adaln_stack_bytes(4)
+        );
+
+        // The containers are read off GgmlDType rather than hand-typed, and the mapping is the
+        // repack's, NOT `candle_gen::quant::ggml_dtype`'s (whose Q4 arm is the dense fold's Q4_0).
+        assert_eq!(packed_container(4), Some(GgmlDType::Q4_1));
+        assert_eq!(packed_container(8), Some(GgmlDType::Q8_0));
+        assert_eq!(packed_container(16), None);
+        assert_ne!(
+            packed_container(4),
+            Some(GgmlDType::Q4_0),
+            "Q4_0 is the in-place dense fold's container and carries no per-block minimum"
+        );
+    }
+
+    /// **The stack arithmetic is the LOADER's own accounting, not a parallel restatement of it.**
+    ///
+    /// The shipped 96768x2688 projection is 8-14 GB of codes and cannot be materialized in-process, so
+    /// the property is shown on the shared [`packed_projection_bytes`] at a geometry that can be: a real
+    /// `crate::quant::lin` load of a synthetic MLX Q4 triple, whose `TieredLinear::base_bytes` is the
+    /// figure [`crate::dit::block::AdaLnProjection::nbytes`] reports at render time. Because
+    /// [`adaln_stack_bytes`] is exactly that function times the block count, agreement here is
+    /// agreement at the shipped geometry too.
+    #[test]
+    fn the_packed_stack_arithmetic_is_the_loaders_own_accounting() {
+        use candle_gen::candle_core::{Device, Tensor};
+        use candle_gen::Weights;
+
+        let (out, inp) = (64usize, 128usize);
+        let mut map = std::collections::HashMap::new();
+        crate::quant::testkit::insert_packed(&mut map, "adaln_proj", out, inp, 1);
+        map.insert(
+            "adaln_proj.bias".to_owned(),
+            Tensor::zeros(out, DType::BF16, &Device::Cpu).expect("bias row"),
+        );
+        let loaded = crate::quant::lin(
+            &Weights::from_map(map),
+            crate::quant::DIT,
+            "adaln_proj",
+            true,
+            DType::BF16,
+        )
+        .expect("a packed projection load");
+        assert!(loaded.linear.is_packed(), "the fixture must load packed");
+        assert_eq!(
+            loaded.linear.quant_dtype(),
+            Some(GgmlDType::Q4_1),
+            "a 4-bit MLX pack repacks into Q4_1 — the container adaln_stack_bytes derives from"
+        );
+        assert_eq!(
+            loaded.base_bytes as u64,
+            packed_projection_bytes(GgmlDType::Q4_1, out as u64, inp as u64),
+            "the declaration's per-projection arithmetic must equal what the loader records"
+        );
+        // ...and the shipped stack really is that function times the block count, so the agreement
+        // above transfers.
+        let config = crate::dit::MiniMaxH3DitConfig::default();
+        assert_eq!(
+            adaln_stack_bytes(4),
+            config.num_layers as u64
+                * packed_projection_bytes(
+                    GgmlDType::Q4_1,
+                    config.adaln_out_features() as u64,
+                    config.time_embed_dim as u64,
+                )
+        );
+        assert_eq!(compute_dtype_bytes(), 2, "the DiT computes at bf16");
+    }
+
+    /// Write the `quantization` marker `mlx_gen_minimax_h3::convert` puts in a packed component's
+    /// `config.json` — the exact shape `crate::tier`'s own fixtures write, and the only thing the
+    /// marker leg reads.
+    fn write_tier_marker(component_dir: &Path, bits: i32) {
+        std::fs::write(
+            component_dir.join("config.json"),
+            format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+        )
+        .expect("tier marker");
+    }
+
+    /// A snapshot carrying one DiT partition at `bytes`, optionally marked at a packed width.
+    fn staged_contract(
+        bytes: u64,
+        bits: Option<i32>,
+    ) -> (tempfile::TempDir, MemoryProviderContract) {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[(BASE_DIT_PARTITION, bytes)]);
+        if let Some(bits) = bits {
+            write_tier_marker(&root.path().join(BASE_DIT_PARTITION), bits);
+        }
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        (root, contract)
+    }
+
+    /// **The marker leg, driven end to end** — and it binds at `q8`, where the derived stack is
+    /// genuinely tighter than the footprint ratio.
+    ///
+    /// `min(marker, footprint)` is asymmetric on purpose, so this pins *which* leg wins at each shipped
+    /// tier rather than only that the pair is wired: at `q8` the marker wins by 31 MB, and at `q4` the
+    /// footprint wins by 765 MB because candle's `Q4_1` container is denser in metadata than the MLX
+    /// pack the ratio was calibrated on. Both are the tighter bound, which is the whole contract of
+    /// this function.
+    #[test]
+    fn the_marker_leg_binds_where_it_is_the_tighter_bound() {
+        // q8, marked: the marker leg wins.
+        let (_root, marked_q8) = staged_contract(DIT_Q8_BYTES, Some(8));
+        let (_bare_root, bare_q8) = staged_contract(DIT_Q8_BYTES, None);
+        assert_eq!(
+            marked_q8.asset_facts.transformer_bytes, bare_q8.asset_facts.transformer_bytes,
+            "the two differ ONLY in the marker, never in the footprint"
+        );
+        assert_eq!(
+            marked_q8.resident_components()[0].resident_bytes,
+            adaln_stack_bytes(8)
+        );
+        assert!(
+            marked_q8.resident_components()[0].resident_bytes
+                < bare_q8.resident_components()[0].resident_bytes,
+            "a marked q8 tier must declare a SMALLER stack than the footprint ratio alone: {} vs {}",
+            marked_q8.resident_components()[0].resident_bytes,
+            bare_q8.resident_components()[0].resident_bytes
+        );
+
+        // q4, marked: the FOOTPRINT leg wins, because candle's Q4_1 stack is the larger of the two.
+        // This is `min` doing its job — the smaller declaration excludes less and so charges more.
+        let (_q4_root, marked_q4) = staged_contract(DIT_Q4_BYTES, Some(4));
+        let (_bare_q4_root, bare_q4) = staged_contract(DIT_Q4_BYTES, None);
+        assert!(
+            adaln_stack_bytes(4) > bare_q4.resident_components()[0].resident_bytes,
+            "the q4 marker leg is expected to be the LARGER one on this lane"
+        );
+        assert_eq!(
+            marked_q4.resident_components()[0].resident_bytes,
+            bare_q4.resident_components()[0].resident_bytes,
+            "at q4 the footprint leg is tighter, so the marker must be discarded"
+        );
+
+        // A marker that is decisive in the other direction: a q4 marker over a bf16-sized footprint is
+        // the mislabelled/partially-staged install the footprint leg alone would charge 26.02 GB for.
+        let (_mixed_root, mixed) = staged_contract(DIT_BF16_BYTES, Some(4));
+        assert_eq!(
+            mixed.resident_components()[0].resident_bytes,
+            adaln_stack_bytes(4),
+            "the marker is authoritative about the tier; the footprint is only a ratio"
+        );
+        assert!(mixed.resident_components()[0].resident_bytes < ADALN_EVICTED_BYTES);
+
+        // An unreadable/absent marker falls back to bf16, NEVER to zero and never to an error — a
+        // contract that cannot resolve is a render that cannot run.
+        assert_eq!(
+            resolved_adaln_bytes(Path::new("/nonexistent/transformer"), DIT_BF16_BYTES),
+            ADALN_EVICTED_BYTES
+        );
+        assert_eq!(
+            resolved_adaln_bytes(Path::new("/nonexistent/transformer"), 0),
+            ADALN_EVICTED_BYTES,
+            "the weights-free arm keeps the architecture fact"
+        );
+    }
+
+    /// **Containment at every tier**, which is a hard contract failure rather than a tidiness one:
+    /// `conformance_errors` refuses a sub-stack larger than the stack containing it, and
+    /// `Registry::memory_strategy_contract` turns that into a render that cannot resolve a contract at
+    /// all. The eviction must also stay clear of the floor where it would exclude nothing.
+    #[test]
+    fn the_resolved_adaln_stack_stays_inside_the_resolved_dit_at_every_tier() {
+        for (label, bytes, bits) in [
+            ("q4 marked", DIT_Q4_BYTES, Some(4)),
+            ("q4 unmarked", DIT_Q4_BYTES, None),
+            ("q8 marked", DIT_Q8_BYTES, Some(8)),
+            ("q8 unmarked", DIT_Q8_BYTES, None),
+            ("bf16", DIT_BF16_BYTES, None),
+        ] {
+            let (_root, contract) = staged_contract(bytes, bits);
+            let resident = contract.resident_components()[0].resident_bytes;
+            assert_eq!(contract.asset_facts.transformer_bytes, bytes, "{label}");
+            assert!(
+                resident < contract.asset_facts.transformer_bytes,
+                "{label}: a sub-stack ({resident}) cannot exceed the stack containing it ({bytes})"
+            );
+            assert!(
+                ADALN_MODULATION_TABLE_MAX_BYTES < resident,
+                "{label}: the eviction must stay clear of the floor where it excludes nothing"
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{label}: {:?}",
+                contract.conformance_errors()
+            );
+        }
+    }
+
+    /// **A staged text encoder is charged at its own size** (sc-19120 / sc-20267).
+    ///
+    /// The TE's tier is staged **independently** of the DiT's, so a split `q4` install stages
+    /// `text_encoder` outside the snapshot and may carry no `root/text_encoder` at all. `resolve` used
+    /// to size `root.join("text_encoder")` unconditionally, so that install was charged **zero** for the
+    /// largest single component this family loads — the same 66 GB under-declaration the
+    /// [`DIT_PARTITIONS`] note records, in a second place.
+    #[test]
+    fn a_staged_text_encoder_is_charged_at_its_own_size() {
+        // A split install: no `text_encoder/` under the root at all.
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[(BASE_DIT_PARTITION, DIT_Q4_BYTES)]);
+        let staged = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(
+            staged.path(),
+            &[(crate::tier::TEXT_ENCODER_COMPONENT, TEXT_ENCODER_Q4_BYTES)],
+        );
+
+        let unstaged =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert_eq!(
+            unstaged.asset_facts.conditioning_bytes, 0,
+            "the snapshot genuinely carries no text encoder, so the staged case below is not vacuous"
+        );
+
+        let contract = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                crate::tier::TEXT_ENCODER_COMPONENT,
+                WeightsSource::Dir(staged.path().join(crate::tier::TEXT_ENCODER_COMPONENT)),
+            ),
+        )
+        .expect("contract");
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes, TEXT_ENCODER_Q4_BYTES,
+            "a staged packed encoder must be charged, not measured as absent"
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            TEXT_ENCODER_Q4_BYTES + DIT_Q4_BYTES,
+            "and it must reach the floor the formula reads"
+        );
+        assert!(contract.conformance_errors().is_empty());
+    }
+
     #[test]
     fn a_staged_dit_component_is_charged_at_its_own_size() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1412,7 +2037,9 @@ mod tests {
             tiered.resident_components()[0].resident_bytes,
             7_372_786_768,
             "the footprint leg: ADALN_EVICTED_BYTES scaled by the resolved DiT's share of the bf16 \
-             DiT. This lane has no packed tier and therefore no marker leg — see resolved_adaln_bytes"
+             DiT. The staged dir here carries NO quantization marker, so the marker leg falls back to \
+             the bf16 figure and `min` takes the footprint — see resolved_adaln_bytes, and \
+             the_marker_leg_binds_where_it_is_the_tighter_bound for the case where the marker wins"
         );
         assert!(
             tiered.conformance_errors().is_empty(),

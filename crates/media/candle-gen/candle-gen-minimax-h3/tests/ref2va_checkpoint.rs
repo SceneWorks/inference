@@ -70,11 +70,19 @@ const PROBE: &str = "proj_in.bias";
 /// not of the snapshot. See `a_ref2va_request_without_the_reference_partition_is_refused`.
 const COMPONENTS: [&str; 4] = ["text_encoder", BASE_DIT_PARTITION, "vae", "audio_vae"];
 
-/// One component directory, with the `.safetensors` shard a component is only satisfied by.
+/// One component directory, with the `.safetensors` shard a component is only satisfied by **and** the
+/// `config.json` every component ships.
+///
+/// The `config.json` is load-bearing since sc-20267: `MiniMaxH3::load` resolves the tier and requires
+/// each tiered component's marker file — the one whose `quantization` block says which tier is staged,
+/// and the one `MiniMaxH3Dit::load_from_dir` opens at render time regardless. A component directory
+/// without it is the interrupted-download shape, so a fixture lacking one is not a well-formed
+/// snapshot. Written dense (no `quantization` block), which is the `bf16` tier's shape.
 fn stage(root: &Path, component: &str) {
     let dir = root.join(component);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("model-00001-of-00001.safetensors"), []).unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"num_layers": 50}"#).unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -333,12 +341,18 @@ fn call_spans(src: &str, anchor: &str) -> Vec<String> {
 /// * and it asserts the bare partition literals never appear outside their `const` declarations.
 #[test]
 fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
-    const ANCHOR: &str = "MiniMaxH3Dit::load(";
+    // `load_from_dir` since sc-20267: the DiT is mapped from the RESOLVED tier directory rather than
+    // from `root` + a partition name, so the anchor moved with the call.
+    const ANCHOR: &str = "MiniMaxH3Dit::load_from_dir(";
+    /// The `root`-joining wrapper. It must have **zero** call sites in production: a render arm that
+    /// used it would silently ignore a staged tier and map `root/transformer` instead.
+    const FLAT_WRAPPER: &str = "MiniMaxH3Dit::load(";
     /// The seam both render arms map their DiT through — it folds the staged LoRA on the way.
     const SEAM: &str = "self.load_task_dit(";
     let sources = production_sources();
 
     let mut sites: Vec<(String, String)> = Vec::new();
+    let mut flat_sites: Vec<(String, String)> = Vec::new();
     let mut seam_calls: Vec<(String, String)> = Vec::new();
     let mut resolve_calls = 0usize;
     for (path, src) in &sources {
@@ -350,6 +364,9 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         );
         for span in call_spans(src, ANCHOR) {
             sites.push((path.clone(), span));
+        }
+        for span in call_spans(src, FLAT_WRAPPER) {
+            flat_sites.push((path.clone(), span));
         }
         for span in call_spans(src, SEAM) {
             seam_calls.push((path.clone(), span));
@@ -367,9 +384,16 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         sites.len()
     );
     assert!(
-        sites[0].1.contains("partition,"),
-        "the seam's own DiT load must take the `partition` it was handed, not a literal: {:?}",
+        sites[0].1.contains("partition_dir(partition)"),
+        "the seam's own DiT load must resolve the `partition` it was handed through `partition_dir` \
+         — a literal path, or `root` + partition, ignores the staged tier: {:?}",
         sites[0]
+    );
+    // ...and the flat `root`-joining wrapper is off the render path entirely.
+    assert!(
+        flat_sites.is_empty(),
+        "the `{FLAT_WRAPPER}` wrapper joins `root` + partition, so a call site here would map \
+         root/transformer and ignore a staged tier: {flat_sites:?}"
     );
 
     // ── two render arms, both reaching it with the task's partition.

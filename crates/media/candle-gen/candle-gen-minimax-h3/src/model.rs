@@ -197,24 +197,22 @@ pub const REFERENCE_DIT_PARTITION: &str = "transformer_ref";
 /// [`REFERENCE_DIT_PARTITION`] is deliberately **not** here — see [`task_component_dirs`].
 const TIER_AGNOSTIC_COMPONENT_DIRS: [&str; 2] = ["vae", "audio_vae"];
 
-/// Every component directory a flat (untiered) snapshot must carry — the four
-/// [`MiniMaxH3::load`] ends up requiring when nothing is staged, since an unstaged tier resolves to
-/// `root/transformer` and `root/text_encoder`.
+/// The `LoadSpec::components` keys this provider **recognizes** as staging overrides (sc-20267).
 ///
-/// Retained as the **flat-layout** statement of the requirement: it is what a snapshot needs to hold
-/// to load with no component overrides, which is what the load-refusal tests drive and what the
-/// staging helpers build. The load path itself iterates
-/// [`TIER_AGNOSTIC_COMPONENT_DIRS`] plus the two resolved tier dirs, so a staged tier is not held to
-/// the root.
+/// The two tiered components, and only those: the manifest ships per-tier `transformer` and
+/// `text_encoder` subtrees, and staging them is how a caller selects a tier. Everything else is still
+/// refused by `reject_unknown_components` — a caller who stages a `vae` believing it will be read gets
+/// a typed error rather than a silently ignored directory.
 ///
-/// `#[cfg(test)]` because that is now its only consumer — production reads the resolved dirs. It stays
-/// as one declaration of the flat-layout set rather than four literals repeated across the tests.
-#[cfg(test)]
-const REQUIRED_COMPONENT_DIRS: [&str; 4] = [
+/// **Recognized is not required.** [`descriptor`]'s `required_components` stays empty: an unstaged
+/// component resolves to the flat `root/<name>` layout, which is the ordinary upstream-snapshot shape.
+///
+/// [`REFERENCE_DIT_PARTITION`] is deliberately absent — it is never staged directly, it is derived as
+/// the resolved DiT's sibling. Accepting it as a key would let a caller stage a reference partition
+/// from a *different* tier than the base one.
+const KNOWN_COMPONENTS: &[&str] = &[
+    crate::tier::DIT_COMPONENT,
     crate::tier::TEXT_ENCODER_COMPONENT,
-    BASE_DIT_PARTITION,
-    "vae",
-    "audio_vae",
 ];
 
 /// The component directories a given task reads, on top of [`TIER_AGNOSTIC_COMPONENT_DIRS`] and the
@@ -320,7 +318,7 @@ fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
             dir.display()
         )));
     }
-    let shards = std::fs::read_dir(&dir)
+    let shards = std::fs::read_dir(dir)
         .map_err(|e| CandleError::Msg(format!("{MODEL_ID}: read {}: {e}", dir.display())))?
         .filter_map(std::result::Result::ok)
         .filter(|e| {
@@ -557,7 +555,12 @@ impl MiniMaxH3 {
     /// [`crate::tier::MiniMaxH3TierPaths`] is what keeps a later render from re-deriving a different
     /// answer, which is how the DiT and the vision tower beside it could end up on different tiers.
     pub fn load(spec: &LoadSpec) -> Result<Self> {
-        reject_unknown_components(spec, &[], MODEL_ID)?;
+        // **The two tiered components are now RECOGNIZED staging keys** (sc-20267). The allowlist was
+        // `&[]`, which refused every component override — including the two the manifest's per-tier
+        // subtrees exist to be staged as, so a tier could not have been handed to this provider at all.
+        // They are recognized, not *required*: `descriptor().required_components` stays empty, because
+        // an unstaged component falls back to the flat `root/<name>` layout rather than failing.
+        reject_unknown_components(spec, KNOWN_COMPONENTS, MODEL_ID)?;
         let root = match &spec.weights {
             WeightsSource::Dir(p) => p.clone(),
             WeightsSource::File(p) => p
@@ -739,7 +742,7 @@ impl MiniMaxH3 {
     /// `tests/turbo_lora.rs::the_render_seam_folds_the_staged_adapter_onto_the_dit` calls this and
     /// reads the residual back off the returned model.
     ///
-    /// The partition is mapped to its **resolved tier directory** through [`Self::partition_dir`],
+    /// The partition is mapped to its **resolved tier directory** through `Self::partition_dir`,
     /// so a staged tier's DiT is denoised from rather than the root's.
     pub fn load_task_dit(&self, partition: &str) -> Result<MiniMaxH3Dit> {
         let mut dit =
@@ -778,10 +781,8 @@ impl MiniMaxH3 {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
         let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
-        let shards = candle_gen::loader::sorted_safetensors(
-            &self.tiers.text_encoder_dir,
-            "minimax-h3 te",
-        )?;
+        let shards =
+            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
         let w =
@@ -821,10 +822,8 @@ impl MiniMaxH3 {
         crate::dit::release_device_memory(&self.device)?;
 
         let (ids, mask, tags) = tok.encode_fl2va(prompt, &grounded.counts, &self.device)?;
-        let shards = candle_gen::loader::sorted_safetensors(
-            &self.tiers.text_encoder_dir,
-            "minimax-h3 te",
-        )?;
+        let shards =
+            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
         let w =
@@ -1414,10 +1413,8 @@ impl MiniMaxH3 {
         }
 
         let (ids, mask, tags) = tok.encode_ref2va(prompt, &presentation, &self.device)?;
-        let shards = candle_gen::loader::sorted_safetensors(
-            &self.tiers.text_encoder_dir,
-            "minimax-h3 te",
-        )?;
+        let shards =
+            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
         let w =
@@ -1923,6 +1920,26 @@ candle_gen::register_generators! {
 
 #[cfg(test)]
 mod tests {
+    /// Every component directory a flat (untiered) snapshot must carry — the four
+    /// [`MiniMaxH3::load`] ends up requiring when nothing is staged, since an unstaged tier resolves
+    /// to `root/transformer` and `root/text_encoder`.
+    ///
+    /// The **flat-layout** statement of the requirement: what a snapshot must hold to load with no
+    /// component overrides, which is what the load-refusal tests drive and what the staging helpers
+    /// build. Production iterates [`TIER_AGNOSTIC_COMPONENT_DIRS`] plus the two *resolved* tier dirs
+    /// instead, so a staged tier is never held to the root.
+    ///
+    /// Declared **inside** this module rather than at file scope with a `#[cfg(test)]` attribute:
+    /// `production_source` splits model.rs at the first `\n#[cfg(test)]\n`, so a file-scope one would
+    /// truncate every source-scan guard in this module to the code above it — which is exactly what
+    /// `body_of` caught when it was written that way.
+    const REQUIRED_COMPONENT_DIRS: [&str; 4] = [
+        crate::tier::TEXT_ENCODER_COMPONENT,
+        BASE_DIT_PARTITION,
+        "vae",
+        "audio_vae",
+    ];
+
     use super::*;
 
     /// **The offload policy is forced, not echoed** — the tripwire the measured `vramGbByTier`
@@ -2199,7 +2216,11 @@ mod tests {
     /// production source is inside a tabled staging function or inside a delegated helper. A new
     /// heavy component must be added here *and* to [`staged_phases`], or the two disagree loudly.
     const MAP_ANCHORS: &[&str] = &[
-        "MiniMaxH3Dit::load(",
+        // `load_from_dir` since sc-20267 — the DiT is mapped from the RESOLVED tier directory, so the
+        // anchor moved with it. `MiniMaxH3Dit::load(` is the flat-layout wrapper and no longer appears
+        // on any render path; `the_dit_is_mapped_from_the_resolved_tier_dir` pins that, so this scan
+        // cannot go back to watching a name production stopped using.
+        "MiniMaxH3Dit::load_from_dir(",
         "MiniMaxH3VideoVae::load(",
         "MiniMaxH3VideoVae::load_decode_only(",
         "load_vision_tower(",
@@ -2583,11 +2604,42 @@ mod tests {
         root
     }
 
-    /// One component directory with a single (empty) `.safetensors` shard in it.
+    /// One component directory with a single (empty) `.safetensors` shard and a **dense**
+    /// `config.json` in it.
+    ///
+    /// The `config.json` is not decoration: since sc-20267 `MiniMaxH3::load` resolves the tier and
+    /// requires each tiered component's `config.json` — the marker file whose `quantization` block
+    /// says which tier is staged, and the file `MiniMaxH3Dit::load_from_dir` would open at render time
+    /// anyway. `mlx_gen_minimax_h3::model::load` probes it eagerly too. A component with no
+    /// `config.json` is the interrupted-download shape, so a fixture without one is not a
+    /// well-formed snapshot.
     fn stage_component(root: &Path, component: &str) {
-        let dir = root.join(component);
-        std::fs::create_dir_all(&dir).unwrap();
+        stage_component_at(&root.join(component), None);
+    }
+
+    /// [`stage_component`] at an explicit directory, optionally carrying a **packed** tier marker at
+    /// `bits` and [`candle_gen::quant::MLX_GROUP_SIZE`].
+    ///
+    /// `None` writes a dense config (no `quantization` block) — the `bf16` tier's shape.
+    fn stage_component_at(dir: &Path, packed_bits: Option<i32>) {
+        std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("model-00001-of-00001.safetensors"), []).unwrap();
+        let config = match packed_bits {
+            Some(bits) => format!(
+                r#"{{"quantization": {{"bits": {bits}, "group_size": {}}}}}"#,
+                candle_gen::quant::MLX_GROUP_SIZE
+            ),
+            None => r#"{"num_layers": 50}"#.to_owned(),
+        };
+        std::fs::write(dir.join("config.json"), config).unwrap();
+    }
+
+    /// A staged **packed tier** DiT directory outside the snapshot root, as a component override — the
+    /// split-install shape the manifest's per-tier subtrees produce.
+    fn staged_tier_dit(tmp: &tempfile::TempDir, tier: &str, bits: i32) -> PathBuf {
+        let dir = tmp.path().join("tiers").join(tier).join(BASE_DIT_PARTITION);
+        stage_component_at(&dir, Some(bits));
+        dir
     }
 
     /// A staged root that also carries the `ref2va` reference partition.
@@ -2977,23 +3029,151 @@ mod tests {
         .is_none());
     }
 
-    /// **A tier request is REFUSED, not silently rendered dense.**
+    /// **A `q4` request RESOLVES the `q4` tier** — the inversion of the refusal this crate shipped
+    /// before sc-20267, which turned every tier request into `Error::Unsupported`.
     ///
-    /// `supported_quants: &[]` is likewise enforced nowhere in gen-core. Mutating this guard away
-    /// makes a `q4` request load the dense bf16 checkpoint and return a render the caller believes
-    /// is quantized.
+    /// This asserts on the **seam**, with non-default evidence, rather than on "it loaded": a load
+    /// that silently ignored `spec.quantize` would also return `Ok`. So the staged tier dir is placed
+    /// OUTSIDE the snapshot root and both halves are read back — `tier_paths().dit_dir` must be the
+    /// staged path (not `root/transformer`, which is also present and dense), and `requested_tier()`
+    /// must be `Q4`. A resolver that fell back to the root would produce a different path, and a
+    /// mapping that dropped the request would produce `None`.
     #[test]
-    fn a_quantize_request_is_refused_rather_than_silently_rendered_dense() {
+    fn a_q4_request_resolves_the_q4_tier_and_loads_packed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A complete flat DENSE snapshot, plus a packed q4 DiT staged elsewhere. The two disagree, so
+        // whichever one the provider resolved is observable.
+        let root = staged_root(&tmp);
+        let staged = staged_tier_dit(&tmp, "q4", 4);
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged.clone()),
+        );
+        // **Through the REGISTRY entry point first.** That is where the deleted refusal lived, so this
+        // is the assertion that actually inverts the old test — a bare `MiniMaxH3::load` call still
+        // passes with the wholesale `spec.quantize` refusal put back, which is the mutation that caught
+        // this test's first draft.
+        load(&spec).expect("a q4 request must be ADMITTED at the registry entry point");
+
+        let provider =
+            MiniMaxH3::load(&spec).expect("a q4 request over a staged q4 tier must load");
+
+        assert_eq!(
+            provider.requested_tier(),
+            Some(crate::tier::Tier::Q4),
+            "the request must reach the resolver as an asserted tier, not be dropped"
+        );
+        assert_eq!(
+            provider.tier_paths().dit_dir,
+            staged,
+            "the DiT must come from the STAGED tier dir, not from root/transformer"
+        );
+        assert_ne!(
+            provider.tier_paths().dit_dir,
+            root.join(BASE_DIT_PARTITION),
+            "a resolver that fell back to the root would render the dense checkpoint under a q4 request"
+        );
+        // The reference partition is the staged dir's SIBLING, so a split install is probed where the
+        // directory actually is rather than under the snapshot root.
+        assert_eq!(
+            provider.tier_paths().reference_dit_dir,
+            staged.with_file_name(REFERENCE_DIT_PARTITION)
+        );
+        // ...and the tier-agnostic components still resolve against the root.
+        assert_eq!(provider.tier_paths().shared_root, root);
+
+        // The marker really was read: the same staged dir under a q8 request is refused, so the
+        // reconcile is doing work rather than accepting anything.
+        let mut q8 = LoadSpec::new(WeightsSource::Dir(root)).with_quant(Quant::Q8);
+        q8.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged),
+        );
+        let err = match MiniMaxH3::load(&q8) {
+            Ok(_) => panic!("a q8 request over a staged q4 tier must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("on-disk tier is authoritative"),
+            "{err}"
+        );
+    }
+
+    /// **`spec.quantize == None` is the third state, and it must NOT become `Tier::Bf16`.**
+    ///
+    /// A packed tier staged with no assertion loads — which is what MLX does
+    /// (`reconcile_tier` admits `(Some(_), None)`) and what every pre-sc-19120 install needs, since
+    /// the loaders recover the tier from `{base}.scales` regardless. Mapping `None` onto `Bf16` would
+    /// make this a refusal and reject those installs.
+    #[test]
+    fn an_unasserted_request_admits_a_packed_tier_rather_than_demanding_dense() {
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
+        let staged = staged_tier_dit(&tmp, "q4", 4);
 
-        load(&LoadSpec::new(WeightsSource::Dir(root.clone())))
-            .expect("the bare spec must load — otherwise the refusal below proves nothing");
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged.clone()),
+        );
+        assert!(spec.quantize.is_none(), "the premise of this test");
+        let provider =
+            MiniMaxH3::load(&spec).expect("a packed tier under NO assertion must be admitted");
+        assert_eq!(
+            provider.requested_tier(),
+            None,
+            "an absent request must stay absent — Bf16 is a positive assertion of denseness"
+        );
+        assert_eq!(provider.tier_paths().dit_dir, staged);
 
-        let spec =
-            LoadSpec::new(WeightsSource::Dir(root)).with_quant(candle_gen::gen_core::Quant::Q4);
+        // The group size is still validated on the unasserted path, because a mismatched group derives
+        // a legal-looking wrong bit width instead of failing cleanly (sc-15154).
+        let bad = tmp
+            .path()
+            .join("tiers")
+            .join("bad")
+            .join(BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("model-00001-of-00001.safetensors"), []).unwrap();
+        std::fs::write(
+            bad.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 32}}"#,
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(staged_root(&tmp)));
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(bad),
+        );
+        let err = match MiniMaxH3::load(&spec) {
+            Ok(_) => panic!("a group-32 tier must be refused even with no asserted tier"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("group_size 32"), "{err}");
+    }
+
+    /// **`Nvfp4` is refused by name, not mapped onto the `q4` tier.**
+    ///
+    /// It reports `bits() == 4`, so mapping it to `Tier::Q4` would let it reconcile *cleanly* against
+    /// a `q4` marker and render int4-affine under an NVFP4 request — the silent numerics swap epic
+    /// 11037's SC#5 forbids. The refusal must be the typed `Unsupported` at the registry boundary.
+    #[test]
+    fn an_nvfp4_request_is_refused_rather_than_reconciled_against_a_q4_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let staged = staged_tier_dit(&tmp, "q4", 4);
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root)).with_quant(Quant::Nvfp4);
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged),
+        );
         let err = match load(&spec) {
-            Ok(_) => panic!("a tier request must be refused, not silently rendered dense"),
+            Ok(_) => {
+                panic!("an NVFP4 request must be refused — this family publishes no NVFP4 tier")
+            }
             Err(e) => e,
         };
         assert!(
@@ -3001,7 +3181,137 @@ mod tests {
             "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("no tier loader"), "{msg}");
+        assert!(
+            msg.contains("Nvfp4"),
+            "the refusal must name the tier: {msg}"
+        );
+        assert!(
+            msg.contains("E2M1") || msg.contains("different numerics"),
+            "the refusal must say WHY it is not a q4 substitute: {msg}"
+        );
+        // And the advertised set agrees with the refusal.
+        assert!(!descriptor()
+            .capabilities
+            .supported_quants
+            .contains(&Quant::Nvfp4));
+    }
+
+    /// **The DiT is mapped from the RESOLVED tier dir, and the flat wrapper is off the render path.**
+    ///
+    /// `MAP_ANCHORS` watches `MiniMaxH3Dit::load_from_dir(`. If a render path ever went back to the
+    /// `root`-joining `MiniMaxH3Dit::load(` wrapper, that scan would silently stop covering it *and*
+    /// a staged tier would be ignored in favour of `root/transformer`. Both halves are asserted:
+    /// the wrapper does not appear in production source, and `partition_dir` really returns the
+    /// staged dirs.
+    #[test]
+    fn the_dit_is_mapped_from_the_resolved_tier_dir() {
+        let src = production_source();
+        assert!(
+            src.contains("MiniMaxH3Dit::load_from_dir("),
+            "the render path must map the DiT from a resolved directory"
+        );
+        assert!(
+            !src.contains("MiniMaxH3Dit::load("),
+            "the `root`-joining wrapper must not appear on any render path — it would ignore a \
+             staged tier and fall back to root/transformer"
+        );
+
+        // ...and the mapping really is the staged dir, per partition.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let staged = staged_tier_dit(&tmp, "q4", 4);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged.clone()),
+        );
+        let provider = MiniMaxH3::load(&spec).expect("load");
+        assert_eq!(provider.partition_dir(BASE_DIT_PARTITION).unwrap(), staged);
+        assert_eq!(
+            provider.partition_dir(REFERENCE_DIT_PARTITION).unwrap(),
+            staged.with_file_name(REFERENCE_DIT_PARTITION),
+            "the reference partition is the staged DiT's sibling"
+        );
+        assert!(
+            provider.partition_dir("vae").is_err(),
+            "a non-partition name is a programming error, not a silent fallback"
+        );
+    }
+
+    /// **The DiT, the text encoder and the VAEs may come from THREE DIFFERENT roots.**
+    ///
+    /// Not a hypothetical: the SceneWorks catalog's off-Mac tier install stages the DiT and the text
+    /// encoder from the `SceneWorks/minimax-h3-mlx` rehost while the VAEs and tokenizer come from
+    /// `MiniMaxAI/MiniMax-H3`, because only the two large components are published per tier. So a tier
+    /// load must never assume one shared snapshot root, and the two tiered components must be resolved
+    /// **independently of each other** (sc-19120) as well as of the root.
+    #[test]
+    fn the_two_tiered_components_resolve_from_separate_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The snapshot root carries ONLY the tier-agnostic components — no transformer/, no
+        // text_encoder/. This is the off-Mac split-install shape.
+        let root = tmp.path().join("shared");
+        for c in TIER_AGNOSTIC_COMPONENT_DIRS {
+            stage_component(&root, c);
+        }
+        let dit = tmp
+            .path()
+            .join("rehost")
+            .join("q4")
+            .join(BASE_DIT_PARTITION);
+        stage_component_at(&dit, Some(4));
+        // The TE is packed at q8 while the DiT is q4 — a legal configuration, because the engine
+        // deliberately does NOT couple the two tiers (sc-19120). If it did, this load would fail.
+        let te = tmp
+            .path()
+            .join("rehost")
+            .join("q8")
+            .join(crate::tier::TEXT_ENCODER_COMPONENT);
+        stage_component_at(&te, Some(8));
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
+        spec.components.insert(
+            crate::tier::DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(dit.clone()),
+        );
+        spec.components.insert(
+            crate::tier::TEXT_ENCODER_COMPONENT.to_owned(),
+            WeightsSource::Dir(te.clone()),
+        );
+        let provider = MiniMaxH3::load(&spec)
+            .expect("three roots must load — the catalog's off-Mac tier install is exactly this");
+
+        assert_eq!(provider.tier_paths().dit_dir, dit);
+        assert_eq!(provider.tier_paths().text_encoder_dir, te);
+        assert_eq!(provider.tier_paths().shared_root, root);
+        assert!(
+            !root.join(BASE_DIT_PARTITION).exists(),
+            "the premise: the root really has no DiT, so a root-relative resolver would have failed"
+        );
+        // The asserted q4 applies to the DiT only. The TE's own tier is auto-detected from its
+        // `.scales`, which is why `require_text_encoder` takes no `Tier`.
+        assert_eq!(provider.requested_tier(), Some(crate::tier::Tier::Q4));
+        assert_eq!(
+            crate::tier::MiniMaxH3TierPaths::staged_bits(&te).unwrap(),
+            Some(8),
+            "a q8 text encoder beside a q4 DiT is legal and is NOT reconciled against it"
+        );
+    }
+
+    /// A **dense** snapshot under an explicit `q4` request is refused — H3 does not quantize at load.
+    #[test]
+    fn a_tier_request_over_a_dense_snapshot_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_quant(Quant::Q4);
+        let err = match MiniMaxH3::load(&spec) {
+            Ok(_) => panic!("a q4 request over a dense snapshot cannot be satisfied"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("does not quantize at load"),
+            "{err}"
+        );
     }
 
     /// **Every `LoadSpec` slot this provider does not read is refused, and each is proven alone.**
@@ -3435,7 +3745,17 @@ mod tests {
         // LoKr stays false and is enforced twice in real code (by kind in `load`, by file content
         // in the installer) precisely because this flag refuses nothing on its own.
         assert!(!d.capabilities.supports_lokr);
-        assert!(d.capabilities.supported_quants.is_empty());
+        // **The tier loader IS ported** (sc-20267) — `crate::tier` resolves the per-tier component
+        // dirs and `crate::quant` builds the packed bases. Like `supports_lora` this is only an
+        // advertisement; the enforcement is the reconcile plus the `Nvfp4` refusal in `load`.
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8],
+            "the two tiers `mlx_gen_minimax_h3::convert` publishes and this lane reads"
+        );
+        // `Nvfp4` is deliberately absent: it reports 4 bits, so advertising it would let an NVFP4
+        // request reconcile against a `q4` marker and render the wrong tier silently.
+        assert!(!d.capabilities.supported_quants.contains(&Quant::Nvfp4));
         // The residency lifecycle IS wired — and forced — so the discovery signal says so. This is
         // the bit a consumer reads to know whether `OffloadPolicy::Sequential` bounds the peak here
         // or is a silent no-op; `false` would tell the fit-gate to size this render at the SUM of
