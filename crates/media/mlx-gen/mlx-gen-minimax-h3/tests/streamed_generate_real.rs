@@ -220,6 +220,16 @@ fn the_streamed_request_peak_is_the_declared_one() {
             declared / 1e9,
             measured / 1e9
         );
+        // **The band's shape.** Two-sided in ratio space, but multiplicatively asymmetric: this
+        // admits a `RUNG4_REQUEST_PEAK_Q4_BYTES` up to `1/(1 − 0.25) − 1 ≈ 33 %` above what the
+        // hardware reproduces (a constant inflated +30 % deviates only 23.1 %), while `measured`
+        // may exceed `declared` by at most 25 %. Ratio-form bands elsewhere in this rung — the
+        // resident/windowed pairs in `tests/block_window_real.rs` — are additionally blind to
+        // proportional drift, where both constants move by the same factor and cancel; that class
+        // is caught only here, because assertion 1 above bounds the request peak *absolutely*
+        // against `CONDITIONING_STAGE_PEAK_BYTES` rather than as a quotient. Absolute per-constant
+        // bounds are the stronger form throughout and belong with sc-17153's re-measurement of
+        // these cells, which produces the fresh absolute numbers to bound against.
         assert!(
             (measured / declared - 1.0).abs() < 0.25,
             "the streamed q4 request peaked at {measured} B against a declared {declared} B — \

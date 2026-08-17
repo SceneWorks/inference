@@ -1,7 +1,8 @@
 //! Rung 4 — **bounded transformer residency** for MiniMax-H3 on MLX (sc-18662).
 //!
 //! Window scheduling, loop order, release discipline and the cancellation contract stay in
-//! [`gen_core::block_window`] / [`mlx_gen::block_residency::run_windowed`]. What lives here is the
+//! [`gen_core::block_window`](mlx_gen::gen_core::block_window) /
+//! [`mlx_gen::block_residency::run_windowed`]. What lives here is the
 //! family's own half: how a window of MiniMax-H3 blocks is reconstructed from a staged component
 //! directory, and the two places this model differs from every image family that has adopted the
 //! rung before it.
@@ -15,7 +16,8 @@
 //! output**, so no correctness assertion anywhere could see it.
 //!
 //! [`DitBlock::from_weights_body_only`] is therefore what a denoise window materializes: ten tensors
-//! per block, not twelve. [`window_bytes_body_only_is_the_residency_bound`] pins the difference in
+//! per block, not twelve. `window_bytes_body_only_is_the_residency_bound` (this module's own unit
+//! tests) pins the difference in
 //! bytes rather than trusting the loader's shape.
 //!
 //! # Difference 2 — the precompute itself has to be windowed
@@ -27,13 +29,14 @@
 //!
 //! [`precompute_adaln_windowed`] runs the projection pass through the same shared driver, holding
 //! `window` projections at a time and forcing each window's tables before it releases. The eval is
-//! load-bearing for the reason [`gen_core::block_window`] gives: MLX is lazy, and an unevaluated
+//! load-bearing for the reason [`gen_core::block_window`](mlx_gen::gen_core::block_window) gives:
+//! MLX is lazy, and an unevaluated
 //! table still references the projection it came from.
 //!
 //! # The per-window cost obligation
 //!
-//! [`gen_core::memory_strategy::MemoryWindowMaterialization`] requires a window to be a transfer of
-//! bytes already in the accelerator's form. This satisfies it structurally, and by construction
+//! [`gen_core::memory_strategy::MemoryWindowMaterialization`](mlx_gen::gen_core::memory_strategy::MemoryWindowMaterialization)
+//! requires a window to be a transfer of bytes already in the accelerator's form. This satisfies it structurally, and by construction
 //! rather than by assertion: [`Weights::from_dir`] hands out lazily-mapped MLX handles, and the two
 //! loaders a window calls — [`crate::quant::lin`] and `as_dtype` — perform **no conversion** on the
 //! staged tier. A packed `q4`/`q8` base is used in its published affine form (`cast_weights` no-ops
@@ -67,8 +70,10 @@ use crate::text_encoder::{MiniMaxH3TeConfig, Qwen3DecoderLayer};
 ///
 /// Holds a path and a dtype and nothing else — deliberately no [`Weights`] handle. A view retained
 /// across windows keeps every materialized buffer alive through its own map, so the release frees
-/// nothing; [`gen_core::block_window::BlockWindowBackend::open_view`] says so and
-/// [`a_retained_view_defeats_the_bound`] would be the test that catches it if this struct grew one.
+/// nothing;
+/// [`gen_core::block_window::BlockWindowBackend::open_view`](mlx_gen::gen_core::block_window::BlockWindowBackend::open_view)
+/// says so, and `a_retained_view_defeats_the_bound` would be the test that catches it if this
+/// struct grew one.
 #[derive(Clone, Debug)]
 pub struct DitBlockStream {
     dir: PathBuf,
@@ -284,7 +289,8 @@ mod tests {
 /// generic would abstract over four fields and hide the one thing worth reading, which is *what a
 /// window of this stack costs*.
 ///
-/// **This arm is why rung 4 can be declared [`TransformerComponent::Both`]**
+/// **This arm is why rung 4 can be declared
+/// [`TransformerComponent::Both`](mlx_gen::gen_core::memory_strategy::TransformerComponent::Both)**
 /// (`gen_core::memory_strategy`). Declaring `Dit` alone would leave the conditioning phase — which
 /// was the model's binding stage until sc-19120's packed tiers, and is still the taller of the two
 /// at every tier — entirely untouched.

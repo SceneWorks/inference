@@ -95,7 +95,8 @@ impl MiniMaxH3Dit {
     }
 
     /// Load **only** the 38 non-block tensors and describe the 600 block ones — rung 4's
-    /// [`LoadShape::DeferredMaterialization`] loader (sc-18662).
+    /// [`LoadShape::DeferredMaterialization`](mlx_gen::gen_core::LoadShape::DeferredMaterialization)
+    /// loader (sc-18662).
     ///
     /// The 17 input/output projections and the 21-tensor token refiner stay resident for the whole
     /// request; see [`crate::block_stream`] for why windowing them would cost more than it bounds.

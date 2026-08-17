@@ -116,7 +116,7 @@
 //! shared prerequisite is that shape, so a resident load genuinely does not have it. Both loaders
 //! now exist ([`crate::dit::MiniMaxH3Dit::load_dir_deferred`],
 //! [`crate::text_encoder::MiniMaxH3TextEncoder::from_dir_deferred`]), so the contract honours the
-//! spec's shape rather than pinning one; see [`resolved_load_shape`].
+//! spec's shape rather than pinning one; see `resolved_load_shape` (private to this module).
 //!
 //! **Measured on both arms, separately, because `TransformerComponent::Both` is two claims**
 //! (`tests/block_window_real.rs`):
@@ -443,7 +443,7 @@ pub const AUDIO_VAE_IS_OUT_OF_SCOPE_FOR_TILING: bool = true;
 /// the whole 50-block stack no matter what a caller asks for. It is no longer: `load_dir_deferred`
 /// and `MiniMaxH3TextEncoder::from_dir_deferred` implement
 /// [`LoadShape::DeferredMaterialization`] for both transformers, so the contract now **honours the
-/// spec's shape** through [`resolved_load_shape`] instead of pinning one.
+/// spec's shape** through `resolved_load_shape` instead of pinning one.
 pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
 
 /// The load shape this contract is resolved at — the spec's, because both are now implemented.

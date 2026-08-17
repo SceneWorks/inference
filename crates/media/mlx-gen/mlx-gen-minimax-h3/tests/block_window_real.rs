@@ -215,6 +215,15 @@ fn the_text_encoder_arm_is_measured_per_window() {
         / mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES as f64;
     let measured = (resident_peak as f64) / (floor_peak as f64);
     eprintln!("  TE arm declared {declared:.2}x, measured {measured:.2}x");
+    // **What this band does and does not catch (sc-18662 review).** It is two-sided in ratio space
+    // but *multiplicatively asymmetric*: `|measured/declared − 1| < 0.25` lets `declared` run up to
+    // `1/(1 − 0.25) − 1 ≈ 33 %` above `measured` before it reds, while `measured` may only run 25 %
+    // above `declared`. A constant inflated by, say, +30 % scores a deviation of 23.1 % and passes.
+    // It is also blind to *proportional* drift: `RUNG4_TE_RESIDENT_PEAK_BYTES` and
+    // `RUNG4_TE_WINDOWED_PEAK_BYTES` moving by the same factor cancel in the quotient, and only the
+    // absolute request-peak bound in `tests/streamed_generate_real.rs` sees that. Absolute
+    // per-constant bounds are the stronger form; they belong with sc-17153's re-measurement of these
+    // very cells, which is where the fresh absolute numbers to bound against come from.
     assert!(
         (measured / declared - 1.0).abs() < 0.25,
         "the TE arm measured {measured:.2}x against a declared {declared:.2}x — \
@@ -318,6 +327,13 @@ fn the_dit_arm_is_measured_per_window_and_tier() {
     let declared = declared_resident as f64 / declared_windowed as f64;
     let measured = (resident_peak as f64) / (floor_peak as f64);
     eprintln!("  DiT arm {tier} declared {declared:.2}x, measured {measured:.2}x");
+    // Same asymmetry as the TE arm, and it applies per tier. The band is two-sided in ratio space
+    // but multiplicatively asymmetric — a `RUNG4_DIT_MEASURED_PEAKS` row inflated up to
+    // `1/(1 − 0.25) − 1 ≈ 33 %` above what the hardware reproduces still passes (a +30 % constant
+    // deviates 23.1 %). Proportional drift of a row's resident/windowed pair cancels in the
+    // quotient entirely and is caught only by the absolute request-peak bound in
+    // `tests/streamed_generate_real.rs`. Absolute per-constant bounds are the stronger form and
+    // belong with sc-17153's re-measurement of these cells.
     assert!(
         (measured / declared - 1.0).abs() < 0.25,
         "the {tier} DiT arm measured {measured:.2}x against a declared {declared:.2}x — \
