@@ -703,11 +703,20 @@ impl Seedvr2Pipeline {
 
     /// Upscale one preprocessed frame `(1,3,1,H,W)` by spatial tiling: run the full encode → DiT →
     /// decode path on each overlapping `tile`-px tile (one-step Euler, same-seed noise) and feather-
-    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame. The accumulator is evaluated per tile,
-    /// so the transient peak is **one tile's activations** plus the **two full-frame f32 accumulators**
-    /// (`acc` `(1,3,1,H,W)` + `wsum` `(1,1,1,H,W)`) held across the whole loop — i.e. the bound is
-    /// `max-tile working set + 4·H·W·f32` (the per-tile `eval` keeps tile activations from stacking,
-    /// but the two frame-sized buffers are resident throughout, sc-6894). Public for the gate.
+    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame via the crate-private `fold_spatial_tiles`.
+    ///
+    /// Every accumulator is evaluated per tile, so tile activations never stack (sc-6894) and the
+    /// resident set is the **two full-frame f32 accumulators** — `acc` `(1,3,1,H,W)` + `wsum`
+    /// `(1,1,1,H,W)` = `4·H·W·f32` — held across the whole loop, **plus the two row accumulators**
+    /// `row_acc` `(1,3,1,th,W)` + `row_wsum` `(1,1,1,th,W)` = `4·th·W·f32`, live only while a row of
+    /// tiles is open (sc-18320). The bound is therefore
+    /// `max-tile working set + 4·(H + th)·W·f32` — at the shipped square tiles `th ≈ tile`, so the
+    /// row pair adds `tile/H` of the frame pair, not a second copy of it.
+    ///
+    /// The *transient* peak improved even so: the predecessor padded each weighted tile **and** its
+    /// feather weight to the full frame and added both, so it allocated four extra frame-sized buffers
+    /// per tile on top of that resident set; the fold's per-tile placements are row-sized. Public for
+    /// the gate.
     pub fn run_frame_tiled(
         &self,
         processed: &Array,
@@ -873,6 +882,18 @@ fn fold_spatial_tiles(
         eval(live)?;
         on_step(tile_idx + 1, n_tiles);
     }
+    // A plan that is not the expected product grid — or a misderived `row_len` — would leave a row
+    // open, and the trailing band would vanish from BOTH accumulators, so the divide would still
+    // succeed and quietly return a frame missing its last strip. Refuse instead. (The shared fold
+    // carries the same invariant as a `debug_assert`; this one is checked in release too, because
+    // `row_len` here is derived from the plan's layout rather than handed down by the loop bounds.)
+    if row_acc.is_some() || row_wsum.is_some() {
+        return Err(Error::Msg(
+            "seedvr2 tiled upscale: the tile plan left a row unclosed — it is not the row-major \
+             product grid `plan_spatial_tiles` emits"
+                .into(),
+        ));
+    }
     let acc = acc.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
     let wsum = wsum.ok_or_else(|| Error::Msg("seedvr2 tiled upscale: plan had no tiles".into()))?;
     Ok(divide(&acc, &wsum)?)
@@ -1036,6 +1057,37 @@ mod tests {
                 t.x1
             );
         }
+    }
+
+    /// sc-18320: a plan that is not the row-major product grid leaves a row open, and the trailing
+    /// band would vanish from BOTH accumulators — so the divide would still succeed and quietly return
+    /// a frame missing its last strip. Refuse instead. Cannot happen with `plan_spatial_tiles` today;
+    /// the guard exists because `row_len` is derived from the plan's layout rather than handed down by
+    /// the loop bounds, so a future plan shape could silently violate it.
+    #[test]
+    fn spatial_fold_refuses_a_plan_that_leaves_a_row_open() {
+        let (height, width) = (200, 296);
+        let mut plan = video::plan_spatial_tiles(height, width, 128, 32);
+        plan.pop().expect("a non-empty plan");
+        let result = fold_spatial_tiles(
+            &plan,
+            height,
+            width,
+            |t| {
+                let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+                let ones = vec![1.0f32; (3 * th * tw) as usize];
+                let weight = vec![1.0f32; (th * tw) as usize];
+                Ok((
+                    Array::from_slice(&ones, &[1, 3, 1, th, tw]),
+                    Array::from_slice(&weight, &[1, 1, 1, th, tw]),
+                ))
+            },
+            &mut |_, _| {},
+        );
+        assert!(
+            matches!(result, Err(Error::Msg(ref m)) if m.contains("left a row unclosed")),
+            "an incomplete grid must be refused, got {result:?}"
+        );
     }
 
     /// sc-18320: a cancel raised by the tile closure aborts the fold rather than being swallowed by

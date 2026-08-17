@@ -260,6 +260,15 @@ pub fn accumulate_along_axis(
     extent: i32,
     out_len: i32,
 ) -> Result<Array> {
+    // `extent` is what the caller claims it is placing. The fully-covered fast path below returns `x`
+    // verbatim, so a wrong `extent` would otherwise mis-shape the stage silently instead of erroring.
+    let actual = x.shape()[axis as usize];
+    if actual != extent {
+        return Err(Error::Msg(format!(
+            "vae tiled decode: placing {extent} elements along axis {axis} of an array whose extent \
+             there is {actual}"
+        )));
+    }
     let placed = if offset == 0 && extent == out_len {
         x.clone()
     } else {
@@ -867,10 +876,12 @@ mod tests {
         crate::array::contiguous(&divide(&output, &maximum(&weights, scalar(1e-8))?)?)
     }
 
-    /// A ragged, overlapping **video** plan: temporal AND both spatial axes tile, the last tile of
-    /// every axis is short, and every axis carries a real trapezoidal mask from the shipped geometry.
-    fn ragged_video_plan() -> (Array, TilePlan, [i32; 3]) {
-        let vae = VaeTiling::WAN; // spatial ×8, temporal ×4, causal
+    /// A ragged, overlapping three-axis **video** plan for `vae`, built through the real
+    /// [`TilingConfig::plan`] so every axis carries the shipped trapezoidal mask. The spatial axes are
+    /// ragged (their last tile is short); whether the TEMPORAL axis is ragged, and which output
+    /// mapping it uses, is `vae`'s to decide — see [`ragged_video_plan`] and
+    /// [`ragged_causal_video_plan`].
+    fn ragged_plan_for(vae: VaeTiling, f: i32, h: i32, w: i32) -> (Array, TilePlan, [i32; 3]) {
         let cfg = TilingConfig {
             spatial: Some(SpatialTiling {
                 tile_px: 4 * vae.spatial_scale,
@@ -881,12 +892,16 @@ mod tests {
                 overlap_frames: vae.temporal_scale,
             }),
         };
-        let (f, h, w) = (7, 9, 11);
         assert!(cfg.needs_tiling(vae, f, h, w));
         let plan = cfg.plan(vae, f, h, w);
         assert!(
             plan.t.len() > 1 && plan.h.len() > 1 && plan.w.len() > 1,
             "the fixture must tile all three axes"
+        );
+        assert!(
+            plan.h.last().unwrap().out_stop - plan.h.last().unwrap().out_start
+                < plan.h[0].out_stop - plan.h[0].out_start,
+            "the spatial axes must be ragged"
         );
         // NCTHW, channel axis 1, tiled axes [2, 3, 4].
         let shape = [1, 2, f, h, w];
@@ -901,17 +916,67 @@ mod tests {
         (Array::from_slice(&values, &shape), plan, [2, 3, 4])
     }
 
+    /// The **non-causal** temporal geometry — Wan 2.1 z16, whose temporal axis tiles exactly like a
+    /// spatial one (`out_f = f·4`, `left_from_0 = false`). Its three temporal tiles are equal-length;
+    /// only the spatial axes are ragged here.
+    fn ragged_video_plan() -> (Array, TilePlan, [i32; 3]) {
+        let (denorm, plan, axes) = ragged_plan_for(VaeTiling::WAN, 7, 9, 11);
+        const { assert!(!VaeTiling::WAN.causal_temporal) };
+        assert_eq!(plan.out_f, 7 * VaeTiling::WAN.temporal_scale);
+        (denorm, plan, axes)
+    }
+
+    /// The **causal** temporal geometry — Wan 2.2 z48, the mapping LTX and WAN22 actually ship
+    /// (`out_f = 1 + (f−1)·scale`, every tile after the first starting one latent frame early, and the
+    /// `left_from_0` mask convention that fades a tile in from exactly 0 rather than from the first
+    /// interior step).
+    ///
+    /// This geometry is structurally different from the non-causal one in three ways the fold has to
+    /// survive: temporal tiles are RAGGED in output length even when equal in latent length, their
+    /// output spans are not `latent·scale`, and the leading mask sample is a true zero. It is also the
+    /// only fixture where the synthetic decode's `f·scale` frames exceed the plan's declared span, so
+    /// it drives the `at = min(decoded, declared)` truncation on the temporal axis for real.
+    fn ragged_causal_video_plan() -> (Array, TilePlan, [i32; 3]) {
+        let (denorm, plan, axes) = ragged_plan_for(VaeTiling::WAN22, 7, 9, 11);
+        const { assert!(VaeTiling::WAN22.causal_temporal) };
+        assert_eq!(plan.out_f, 1 + (7 - 1) * VaeTiling::WAN22.temporal_scale);
+        assert!(
+            plan.t.iter().skip(1).any(|t| t.mask[0] == 0.0),
+            "a causal temporal tile must fade in from exactly 0"
+        );
+        assert!(
+            plan.t
+                .iter()
+                .any(|t| t.out_stop - t.out_start != plan.t[0].out_stop - plan.t[0].out_start),
+            "the causal temporal axis must be ragged in output length"
+        );
+        (denorm, plan, axes)
+    }
+
     /// A decode closure that is **not** tile-consistent: it upsamples to the plan's scales and then
     /// offsets by a statistic of the tile it was handed, so neighbouring tiles genuinely disagree in
     /// their overlap and the blend weights plus their normalizer are load-bearing. A fold that
     /// mis-places a tile, drops a mask, or mis-normalizes cannot pass by reconstructing a
     /// partition-of-unity identity.
     fn seam_bearing_decode(tile: &Array) -> Result<Array> {
-        let up = Array::repeat_axis::<f32>(tile.clone(), 4, 2)?;
-        let up = Array::repeat_axis::<f32>(up, 8, 3)?;
-        let up = Array::repeat_axis::<f32>(up, 8, 4)?;
-        let bias = tile.mean(None)?;
-        add(&up, &bias).map_err(Into::into)
+        seam_bearing_decode_for(VaeTiling::WAN)(tile)
+    }
+
+    /// Block-upsample an NCTHW tile to `vae`'s temporal and spatial scales.
+    fn block_upsample(tile: &Array, vae: VaeTiling) -> Result<Array> {
+        let up = Array::repeat_axis::<f32>(tile.clone(), vae.temporal_scale, 2)?;
+        let up = Array::repeat_axis::<f32>(up, vae.spatial_scale, 3)?;
+        Ok(Array::repeat_axis::<f32>(up, vae.spatial_scale, 4)?)
+    }
+
+    /// [`seam_bearing_decode`] at an arbitrary VAE's scales, so the causal and non-causal temporal
+    /// geometries can be driven by the same decode.
+    fn seam_bearing_decode_for(vae: VaeTiling) -> impl Fn(&Array) -> Result<Array> + Copy {
+        move |tile: &Array| {
+            let up = block_upsample(tile, vae)?;
+            let bias = tile.mean(None)?;
+            add(&up, &bias).map_err(Into::into)
+        }
     }
 
     /// `max_abs_rgb_u8` — the shipped decode-quality corpus's metric: `clip(x·0.5 + 0.5, 0, 1)·255`
@@ -950,6 +1015,46 @@ mod tests {
             max_abs_rgb_u8(&folded, &reference),
             0,
             "the fold moved an admitted pixel"
+        );
+        let max = folded
+            .as_slice::<f32>()
+            .iter()
+            .zip(reference.as_slice::<f32>())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 1e-5,
+            "re-association must stay at float-rounding scale: max|Δ|={max:.3e}"
+        );
+    }
+
+    /// sc-18320 acceptance (b), on the **causal** temporal mapping LTX and WAN22 ship.
+    ///
+    /// [`fold_matches_the_pad_to_full_accumulator`] drives Wan 2.1's non-causal temporal axis, which
+    /// tiles exactly like a spatial one. The causal mapping is a different geometry — `out_stop =
+    /// 1 + (end−1)·scale`, every tile after the first starting one latent frame early, a `left_from_0`
+    /// mask whose first sample is a true zero, and output spans that differ between tiles even when
+    /// their latent spans do not. It also makes the synthetic decode overshoot the plan's declared
+    /// temporal span, so this is the fixture that drives the `at = min(decoded, declared)` truncation
+    /// on the temporal axis. The fold must reproduce the predecessor there too.
+    #[test]
+    fn fold_matches_the_pad_to_full_accumulator_on_a_causal_temporal_plan() {
+        let (denorm, plan, axes) = ragged_causal_video_plan();
+        let decode = seam_bearing_decode_for(VaeTiling::WAN22);
+        let reference = pad_to_full_reference(&denorm, &plan, axes, decode).unwrap();
+        let folded = tiled_decode(&denorm, &plan, axes, None, decode).unwrap();
+        reference.eval().unwrap();
+        folded.eval().unwrap();
+        assert_eq!(folded.shape(), reference.shape());
+        assert_eq!(
+            folded.shape()[axes[0] as usize],
+            plan.out_f,
+            "the causal temporal axis must assemble to 1 + (f−1)·scale"
+        );
+        assert_eq!(
+            max_abs_rgb_u8(&folded, &reference),
+            0,
+            "the fold moved an admitted pixel on the causal geometry"
         );
         let max = folded
             .as_slice::<f32>()
@@ -1012,6 +1117,13 @@ mod tests {
         // Placed at offset 1 of a 7-long axis 2: only axis 2 grows.
         let grown = accumulate_along_axis(None, &x, 2, 1, 3, 7).unwrap();
         assert_eq!(grown.shape(), &[1, 2, 7, 4]);
+        // A claimed extent that does not match the array is refused — the fully-covered fast path
+        // below returns the input verbatim, so an unchecked mismatch would mis-shape a stage silently.
+        let mismatch = accumulate_along_axis(None, &x, 2, 0, 5, 7);
+        assert!(
+            matches!(mismatch, Err(Error::Msg(ref m)) if m.contains("whose extent there is 3")),
+            "a wrong extent must be refused, got {mismatch:?}"
+        );
         // A fully covered axis is returned as-is — no padded copy at all.
         let untouched = accumulate_along_axis(None, &x, 2, 0, 3, 3).unwrap();
         assert_eq!(untouched.shape(), x.shape());
