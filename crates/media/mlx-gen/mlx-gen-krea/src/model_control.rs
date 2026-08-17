@@ -451,11 +451,16 @@ fn load_native_control_heavy(
     })
 }
 
-/// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
-/// residencies): bf16 activation precision, a base snapshot dir, and the required pose overlay. Quant is
-/// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
-/// leaving activations bf16 — so there is no quant rejection here.
-pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+/// The **source-independent** load axes the pose-control composition accepts: bf16 activation
+/// precision, only the base-snapshot and alternate-decoder components, and an executable Wan decoder
+/// selection. Quant is allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both
+/// pack only the base DiT/TE, leaving activations bf16 — so there is no quant rejection here.
+///
+/// Split out of [`validate_control_spec`] (sc-18451) so the weights-free registry surface can apply
+/// exactly these axes. That surface's witness is a synthetic snapshot path carrying neither the base
+/// snapshot component nor the pose overlay, so it cannot run the presence checks below; sharing this
+/// one function is what stops the published declaration from admitting an axis the loader refuses.
+pub(crate) fn validate_control_load_axes(spec: &LoadSpec) -> Result<()> {
     spec.validate_prepared_file_pins()?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
@@ -469,6 +474,14 @@ pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
         KREA_2_TURBO_CONTROL_ID,
     )?;
     mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
+    Ok(())
+}
+
+/// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
+/// residencies): the [`validate_control_load_axes`] axes plus a base snapshot dir and the required pose
+/// overlay.
+pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+    validate_control_load_axes(spec)?;
     let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if matches!(spec.weights, WeightsSource::File(_))

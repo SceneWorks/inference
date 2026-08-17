@@ -8,6 +8,28 @@
 //! attention/windowing to the reopenable 28-block base DiT reduced request peak from 15.574 GiB to
 //! 9.200 GiB (40.9%) with zero pixel delta. The overlay remains explicitly resident in
 //! `resident_components`; only the base DiT advertises `TransformerComponent::Dit` windowing.
+//!
+//! # Declaration vs measurement (sc-18451)
+//!
+//! The two axes are independent here exactly as they are for the Lens and SD3.5 families:
+//!
+//! * **Support** — the rungs the pose-control engine can execute for this `(provider, LoadSpec)`.
+//!   Derived from the loader's own predicates (`streamable_base_transformer` is the contract-side
+//!   spelling of `crate::model::resolve_load_plan` plus the residency/materialization gates), never
+//!   from the measured-route key.
+//! * **Calibration identity** — whether a *measurement* backs the route. SC-15517 measured **q4 and
+//!   nothing else** (SceneWorks' `krea_2_turbo_control` calibration plan is q4-only), so
+//!   [`MEMORY_CALIBRATION_FINGERPRINT`] attaches to the q4 snapshot composition alone. The bf16 and
+//!   q8 bases, the imported single-file DiT, and the additive Wan terminal decoder publish **no**
+//!   calibration, which [`mlx_gen::gen_core::standard_memory_strategy_safety_check`] admits only
+//!   under an explicit [`mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated`] authority.
+//!
+//! Before sc-18451 the measured key was stamped unconditionally — on every tier, on the imported
+//! file route, on the unmeasured Wan composite, and on the weights-free registry surface — so an
+//! admission handshake against an unmeasured route succeeded under `Calibrated` authority. The
+//! weights-free declaration surface now substitutes the source-owned
+//! [`STATIC_BEHAVIOR_FINGERPRINT`], which is never a measurement and never appears on a contract
+//! built from a real load.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 #[cfg(test)]
@@ -23,17 +45,97 @@ use mlx_gen::gen_core::{
 
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-control-mlx-full-ladder-512-64-attn64m-window1-2026-08-03-v2";
-/// The Wan terminal decoder is an unmeasured composite with the base and control branch. Keep it off
-/// the native calibration identity so admission uses composite asset facts plus conservative
-/// headroom and the estimate margin.
-pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
-    "krea-control-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+/// Static, weights-free identity for the registry declaration walk. Never a production calibration.
+///
+/// A contract built from a real load leaves an unmeasured route's calibration `None` so admission has
+/// to name an explicit estimate authority. The weights-free surface cannot do that: the shared
+/// conformance walk builds its run context through
+/// [`mlx_gen::gen_core::standard_memory_behavior_context`], which requires *some* identity. This
+/// constant supplies one whose value is structural, keyed per resolved tier and residency policy so a
+/// context assembled for one selector can never hand its handshake to another.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-control-mlx-registry-behavior-v1";
 
-fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
-    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
-        WAN_DECODER_CALIBRATION_FINGERPRINT
-    } else {
-        MEMORY_CALIBRATION_FINGERPRINT
+/// The exact composition SC-15517 measured, and nothing else.
+///
+/// The evidence is a **q4** snapshot artifact (`SceneWorks/krea-2-turbo-mlx@d009674…:q4` plus the
+/// pose overlay) decoded by the native Qwen VAE. Three neighbouring routes are deliberately excluded:
+/// * an unmeasured **bf16 or q8** base — the pose branch even packs to a different tier there
+///   (`crate::memory::control_branch_quant_bits`), so the envelope is not the measured one;
+/// * the **imported single-file** DiT, whose dequantized-to-bf16 residency is a different load source
+///   and has no promoted cell (the evidence matrix has no load-source axis);
+/// * the additive **Wan terminal decoder**, an unmeasured composite with the base and control branch.
+///
+/// Each of those publishes no calibration at all rather than a fabricated identity, which is what
+/// forces conservative asset-facts + headroom estimation instead of a handshake that silently passes.
+///
+/// **Low-rank adapters are an accepted axis of this identity, not an exclusion.** A q4 base carrying
+/// a Raw-trained LoRA/LoKr keeps the measured key even though SC-15517's arms ran without one. That
+/// is deliberate and matches the rest of the family: the base ladder's own
+/// `crate::block_memory_strategy` fingerprint is likewise adapter-independent (its sc-16352 table
+/// measured the q4 LoRA and LoKr arms against the same key), and SceneWorks selects a promoted record
+/// by provider, tier, mode, overlay and geometry — never by adapter set — so an adapter-keyed split
+/// here would strand every adapter render on an estimate for no evidentiary gain. The adapter's own
+/// residency cost is already priced structurally, and a dense `.diff` patch is excluded from rung 4
+/// separately because it mutates the resident base rather than because of the calibration identity.
+fn measured_calibration(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<Option<MemoryCalibrationIdentity>> {
+    if matches!(spec.weights, mlx_gen::WeightsSource::File(_))
+        || spec.components.contains_key(mlx_gen::VAE_COMPONENT)
+    {
+        return Ok(None);
+    }
+    // The same seam `registered_safety_check` reads for the loaded tier, so the declared calibration
+    // and the admitted tier cannot disagree: a prepacked q4 turnkey and a dense snapshot packed at
+    // load both resolve to `Quant::Q4` here, and nothing else does.
+    let measured =
+        crate::model::effective_base_quant_tier(spec, provider_id)? == Some(mlx_gen::Quant::Q4);
+    Ok(measured
+        .then(|| MemoryCalibrationIdentity::new(MEMORY_CALIBRATION_FINGERPRINT, spec.load_shape)))
+}
+
+/// Per-selector static behavior identity for the weights-free declaration surface.
+///
+/// `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens, so every component
+/// spelled into the identity is already one.
+fn static_behavior_identity(
+    tier: &str,
+    offload_policy: mlx_gen::OffloadPolicy,
+    load_shape: mlx_gen::gen_core::LoadShape,
+) -> MemoryCalibrationIdentity {
+    let policy = match offload_policy {
+        mlx_gen::OffloadPolicy::Resident => "resident",
+        mlx_gen::OffloadPolicy::Sequential => "sequential",
+    };
+    MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{tier}-{policy}"),
+        load_shape,
+    )
+}
+
+/// The already-resolved artifact tier named by a registry surface selector.
+fn selector_tier_token(tier: mlx_gen::gen_core::MemoryContractSurfaceTier) -> &'static str {
+    match tier {
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16 => "bf16",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => "q4",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => "q8",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => "nvfp4",
+    }
+}
+
+/// The tier a bare weights-free `LoadSpec` names, for the fixture seam that has no selector.
+///
+/// Deliberately the same vocabulary [`selector_tier_token`] produces, so a dense bf16 witness gets
+/// one identity whichever seam built it. The resolver refuses a non-bf16 activation precision, so
+/// only this seam can ever see `fp32`, and it must not collapse onto the dense bf16 token.
+fn spec_tier_token(spec: &LoadSpec) -> &'static str {
+    match (spec.precision, spec.quantize) {
+        (mlx_gen::Precision::Fp32, _) => "fp32",
+        (_, None) => "bf16",
+        (_, Some(mlx_gen::Quant::Q4)) => "q4",
+        (_, Some(mlx_gen::Quant::Q8)) => "q8",
+        (_, Some(mlx_gen::Quant::Nvfp4)) => "nvfp4",
     }
 }
 pub const DECODE_TILE_EDGE: u32 = 512;
@@ -70,10 +172,16 @@ pub fn memory_strategy_contract(
         asset_facts,
         resident_components,
         streamable_base_transformer(spec, provider_id)?,
+        // A production contract never fabricates an identity: an unmeasured tier stays uncalibrated
+        // so admission has to name an explicit estimate authority for it.
+        measured_calibration(provider_id, spec)?,
     )
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
+///
+/// This is the fixture seam, reached with a caller-supplied witness `LoadSpec` rather than a registry
+/// surface selector, so its behavior identity is keyed on that spec's own tier and residency axes.
 pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -84,6 +192,60 @@ pub(crate) fn weights_free_memory_strategy_contract(
         MemoryAssetFacts::default(),
         Vec::new(),
         streamable_base_transformer(spec, provider_id)?,
+        Some(static_behavior_identity(
+            spec_tier_token(spec),
+            spec.offload_policy,
+            spec.load_shape,
+        )),
+    )
+}
+
+/// Resolve the pose-control catalog surface from its explicit already-packed artifact tier.
+///
+/// The control route's weights-free witness is a nonexistent snapshot path, so the production
+/// [`streamable_base_transformer`] predicate reads `packed_quant_bits` there, finds no marker, and
+/// concludes that a Q4/Q8 witness must be packed *at load* — which withdraws rung 4 from exactly the
+/// two prepacked tiers a shipped turnkey provides, and from q4 in particular, the only tier this
+/// route's measured evidence covers (sc-15517). The selector names the already-resolved artifact
+/// tier, so this resolver publishes the source-derived load eligibility from that instead, exactly as
+/// [`crate::block_memory_strategy::weights_free_memory_strategy_surface_contract`] does for the four
+/// base routes. It deliberately retains zero asset facts; proving the selected snapshot marker and
+/// tensor inventory remains production contract construction's job.
+pub(crate) fn weights_free_memory_strategy_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    if provider_id != crate::KREA_2_TURBO_CONTROL_ID {
+        return Err(CoreError::Unsupported(format!(
+            "unknown Krea pose-control memory provider {provider_id}"
+        )));
+    }
+    crate::block_memory_strategy::surface_selector_matches_spec(surface)?;
+    crate::model_control::validate_control_load_axes(&surface.spec)
+        .map_err(|error| CoreError::Msg(error.to_string()))?;
+    let streamable = matches!(
+        surface.resolved_artifact_tier(),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q8
+    ) && matches!(
+        surface.spec.offload_policy,
+        mlx_gen::OffloadPolicy::Sequential
+    ) && matches!(
+        surface.spec.load_shape,
+        mlx_gen::gen_core::LoadShape::DeferredMaterialization
+    ) && !crate::model::adapters_have_diff_patch_for_spec(&surface.spec)?;
+    memory_strategy_contract_with_asset_facts(
+        provider_id,
+        &surface.spec,
+        MemoryAssetFacts::default(),
+        Vec::new(),
+        streamable,
+        Some(static_behavior_identity(
+            selector_tier_token(surface.resolved_artifact_tier()),
+            surface.selector.offload_policy,
+            surface.selector.load_shape,
+        )),
     )
 }
 
@@ -93,6 +255,7 @@ fn memory_strategy_contract_with_asset_facts(
     asset_facts: MemoryAssetFacts,
     resident_components: Vec<MemoryResidentComponent>,
     streamable_transformer: bool,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
     let staged_residency = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential);
@@ -192,10 +355,7 @@ fn memory_strategy_contract_with_asset_facts(
                 resident_components,
             }
         },
-        calibration: Some(MemoryCalibrationIdentity::new(
-            calibration_fingerprint(spec),
-            spec.load_shape,
-        )),
+        calibration,
         asset_facts,
         runtime: MemoryRuntimeSemantics::default(),
     })
@@ -207,11 +367,14 @@ fn memory_strategy_contract_with_asset_facts(
 /// consumed and dropped), the text encoder and VAE come from the resident base tier, and the pose
 /// overlay loads dense — the native DiT is dense in memory, and a dense base carries a dense branch
 /// (`crate::memory::control_branch_quant_bits(None)`), so the overlay bytes are its stored bytes.
-/// Same `provider_id` + calibration fingerprint as the snapshot control contract: implementation and
-/// provider evidence stay on one identity. The evidence matrix has no load-source axis, though, so a
-/// `Dir`-measured rung-4 cell must not be reported as a `File` measurement until this re-openable path
-/// is measured directly. The loader's reopenable mechanism stays available for its source smoke, but
-/// the registry contract must pass `streamable = false` until File evidence is promoted.
+/// Same `provider_id` as the snapshot control contract — the implementation, phase model, and
+/// non-transformer components are the same, so promoted evidence is never orphaned onto a bespoke
+/// "imported" provider identity. It carries **no calibration identity**, though: the evidence matrix
+/// has no load-source axis, so a `Dir`-measured cell must not be reported as a `File` measurement
+/// until this re-openable path is measured directly (sc-18451 — before it, the measured fingerprint
+/// was stamped here and the handshake passed under `Calibrated` authority). That withholding is now
+/// expressed twice, consistently: no calibration, and `streamable = false` for the registry contract.
+/// The loader's reopenable mechanism stays available for its source smoke.
 pub(crate) fn native_memory_strategy_contract_from_spec(
     provider_id: &str,
     spec: &LoadSpec,
@@ -313,6 +476,8 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         asset_facts,
         resident_components,
         streamable,
+        // The imported single-file route has no promoted measurement; see the doc comment above.
+        None,
     )
 }
 
@@ -631,10 +796,11 @@ mod tests {
 
     #[test]
     fn native_control_contract_keeps_the_builtin_provider_identity_and_components() {
-        // The imported single-file pose-control contract must resolve evidence through the SAME
-        // provider identity as the snapshot lane: same provider_id, same calibration fingerprint,
-        // same resident pose-branch component — never a bespoke "imported" identity that would
-        // orphan promoted evidence. Resident-only: no staged residency, no windowing.
+        // The imported single-file pose-control contract must resolve through the SAME provider
+        // identity as the snapshot lane: same provider_id, same resident pose-branch component —
+        // never a bespoke "imported" identity that would orphan promoted evidence. It publishes no
+        // calibration, because the evidence matrix has no load-source axis and this route has never
+        // been measured (sc-18451). Resident-only: no staged residency, no windowing.
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
@@ -647,8 +813,8 @@ mod tests {
             native_memory_strategy_contract("krea_2_turbo_control", &dit, &root, &overlay).unwrap();
         assert_eq!(contract.provider_id, "krea_2_turbo_control");
         assert_eq!(
-            contract.calibration.as_ref().unwrap().fingerprint,
-            MEMORY_CALIBRATION_FINGERPRINT
+            contract.calibration, None,
+            "an unmeasured load source must not inherit the Dir-measured identity"
         );
         let components = contract.resident_components();
         assert_eq!(components.len(), 1);
@@ -699,12 +865,17 @@ mod tests {
         write_control(&overlay);
         let donor = tmp.path().join("wan-vae.safetensors");
         write_control(&donor);
-        let spec =
-            LoadSpec::new(WeightsSource::Dir(root)).with_control(WeightsSource::File(overlay));
+        // Q4 is the tier SC-15517 measured, so this pair isolates the decoder axis: the ONLY
+        // difference between the two contracts is the additive Wan terminal decoder.
+        let spec = LoadSpec::new(WeightsSource::Dir(root))
+            .with_quant(Quant::Q4)
+            .with_control(WeightsSource::File(overlay));
         let native = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         let composite = memory_strategy_contract(
             "krea_2_turbo_control",
-            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+            &spec
+                .clone()
+                .with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
         )
         .unwrap();
         assert_eq!(
@@ -716,13 +887,22 @@ mod tests {
             native.asset_facts.base_bytes + 256
         );
         assert_eq!(
-            composite.calibration.as_ref().unwrap().fingerprint,
-            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            composite.calibration, None,
             "native control measurements must not authorize the composite decoder path"
         );
         assert_eq!(
             native.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
+        );
+        // The measured identity is q4-only: the same composition on a dense base is a different,
+        // unmeasured envelope (the pose branch alone packs to a different tier there).
+        let mut dense = spec;
+        dense.quantize = None;
+        assert_eq!(
+            memory_strategy_contract("krea_2_turbo_control", &dense)
+                .unwrap()
+                .calibration,
+            None
         );
     }
 
@@ -849,7 +1029,9 @@ mod tests {
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
-        let calibration = contract.calibration.as_ref().unwrap();
+        // A prepacked q8 pose base is a real, loadable route with NO promoted measurement: the tier
+        // gate below still binds exactly, but nothing hands it the q4 evidence key.
+        assert_eq!(contract.calibration, None);
         let context_for = |quant| MemoryRunContext {
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
@@ -861,9 +1043,9 @@ mod tests {
                     component_precision_floors: &[],
                 },
             },
-            calibration_abi: calibration.abi,
-            calibration_fingerprint: calibration.fingerprint.clone(),
-            load_shape: calibration.load_shape,
+            calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: String::new(),
+            load_shape: spec.load_shape,
             mode: MemoryMode::TextToImage,
             has_reference: false,
             use_pid: false,
@@ -1049,5 +1231,332 @@ mod tests {
             assert_eq!(loader, expected, "loader validation for {case}");
             assert_eq!(contract, loader, "contract/loader parity for {case}");
         }
+    }
+
+    fn control_surface(
+        tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
+        offload_policy: mlx_gen::OffloadPolicy,
+        load_shape: mlx_gen::gen_core::LoadShape,
+    ) -> mlx_gen::gen_core::MemoryContractSurfaceSpec {
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == tier
+                    && surface.selector.offload_policy == offload_policy
+                    && surface.selector.load_shape == load_shape
+            })
+            .expect("the MLX surface set publishes every tier x policy x shape selector")
+    }
+
+    fn prepacked_q4_surface() -> mlx_gen::gen_core::MemoryContractSurfaceSpec {
+        control_surface(
+            mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+            mlx_gen::OffloadPolicy::Sequential,
+            mlx_gen::gen_core::LoadShape::DeferredMaterialization,
+        )
+    }
+
+    fn respec(
+        surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+        spec: LoadSpec,
+    ) -> mlx_gen::gen_core::MemoryContractSurfaceSpec {
+        mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: surface.selector,
+            spec,
+        }
+    }
+
+    /// sc-18451: the pose-control route reached the registry with no selector-aware resolver, so its
+    /// weights-free surface derived streamability by asking `packed_quant_bits` about a snapshot path
+    /// that does not exist. Every already-packed tier therefore looked like a load-time quantize and
+    /// rung 4 was withdrawn — including q4, the only tier this route's evidence covers. The selector
+    /// names the resolved artifact tier, so all three prepacked tiers must now reach rung 4 on the
+    /// residency/materialization shape the loader actually streams under.
+    #[test]
+    fn control_selector_surfaces_publish_every_prepacked_tier_at_rung_four() {
+        let provider_id = crate::KREA_2_TURBO_CONTROL_ID;
+        let mut identities = std::collections::BTreeSet::new();
+        let mut streamable_selectors = std::collections::BTreeSet::new();
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            let contract =
+                weights_free_memory_strategy_surface_contract(provider_id, &surface).unwrap();
+            let expected = surface.selector.offload_policy == mlx_gen::OffloadPolicy::Sequential
+                && surface.selector.load_shape
+                    == mlx_gen::gen_core::LoadShape::DeferredMaterialization;
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                if expected {
+                    MemoryStrategySupport::Implemented
+                } else {
+                    MemoryStrategySupport::Missing
+                },
+                "{}",
+                surface.selector.id()
+            );
+            if expected {
+                streamable_selectors.insert(surface.selector.id());
+                assert_eq!(
+                    contract.engaged_composition(MemoryStrategy::BoundedTransformerResidency),
+                    vec![
+                        MemoryStrategy::Resident,
+                        MemoryStrategy::StagedResidency,
+                        MemoryStrategy::BoundedDecode,
+                        MemoryStrategy::BoundedAttention,
+                        MemoryStrategy::BoundedTransformerResidency,
+                    ],
+                    "{}",
+                    surface.selector.id()
+                );
+            }
+            assert_eq!(contract.provider_id, provider_id);
+            assert_eq!(contract.asset_facts, Default::default());
+            let fingerprint = &contract.calibration.as_ref().unwrap().fingerprint;
+            assert!(
+                fingerprint.starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{}: {fingerprint}",
+                surface.selector.id()
+            );
+            assert_ne!(
+                fingerprint, MEMORY_CALIBRATION_FINGERPRINT,
+                "the declaration surface must never publish the measured identity"
+            );
+            assert!(contract.conformance_errors().is_empty());
+            identities.insert(format!(
+                "{fingerprint}:{:?}",
+                contract.calibration.as_ref().unwrap().load_shape
+            ));
+        }
+        // Shape, not a population: every selector resolves to its own identity, and the tiers that
+        // reach rung 4 are exactly the three shipped ones on the sequential+deferred shape.
+        assert_eq!(
+            identities.len(),
+            mlx_gen::gen_core::mlx_memory_contract_surface_specs().len(),
+            "one static behavior identity per selector"
+        );
+        assert_eq!(
+            streamable_selectors,
+            [
+                "bf16:sequential:deferred",
+                "q4:sequential:deferred",
+                "q8:sequential:deferred"
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// The resolver is what recovers the prepacked tiers: the fixture seam has no selector and still
+    /// reads the witness path, so it keeps reporting the withdrawn rung. Pinning both sides here is
+    /// what makes the regression visible if the resolver registration is ever dropped again.
+    #[test]
+    fn control_surface_resolver_recovers_the_rung_the_fixture_seam_cannot_see() {
+        let surface = prepacked_q4_surface();
+        let rung = |contract: &MemoryProviderContract| {
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support
+                .clone()
+        };
+        let fixture =
+            weights_free_memory_strategy_contract(crate::KREA_2_TURBO_CONTROL_ID, &surface.spec)
+                .unwrap();
+        assert_eq!(rung(&fixture), MemoryStrategySupport::Missing);
+        let resolved =
+            weights_free_memory_strategy_surface_contract(crate::KREA_2_TURBO_CONTROL_ID, &surface)
+                .unwrap();
+        assert_eq!(rung(&resolved), MemoryStrategySupport::Implemented);
+        assert!(resolved.lifecycle.transformer_window_materialization);
+        assert_eq!(
+            resolved
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_components,
+            vec![TransformerComponent::Dit],
+            "the pose branch stays resident; only the reopenable base DiT is windowed"
+        );
+        assert_eq!(
+            resolved
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_sizes,
+            vec![TRANSFORMER_WINDOW_SIZE]
+        );
+    }
+
+    /// Each guard is mutated ALONE against the otherwise-valid q4 sequential deferred witness, so a
+    /// removed guard cannot hide behind another one still rejecting.
+    #[test]
+    fn control_surface_resolver_fails_closed_on_each_mutated_axis() {
+        let valid = prepacked_q4_surface();
+        assert!(weights_free_memory_strategy_surface_contract(
+            crate::KREA_2_TURBO_CONTROL_ID,
+            &valid
+        )
+        .is_ok());
+
+        assert!(
+            weights_free_memory_strategy_surface_contract("krea_2_turbo", &valid).is_err(),
+            "a base provider id must not be handed the pose-control ladder"
+        );
+
+        let mut tier_mismatch = respec(&valid, valid.spec.clone());
+        tier_mismatch.spec.quantize = Some(Quant::Q8);
+        let mut file_source = respec(&valid, valid.spec.clone());
+        file_source.spec.weights = WeightsSource::File("/krea.safetensors".into());
+        let mut policy_mismatch = respec(&valid, valid.spec.clone());
+        policy_mismatch.spec.offload_policy = mlx_gen::OffloadPolicy::Resident;
+        let mut shape_mismatch = respec(&valid, valid.spec.clone());
+        shape_mismatch.spec.load_shape = mlx_gen::gen_core::LoadShape::EagerMaterialization;
+        let mut precision = respec(&valid, valid.spec.clone());
+        precision.spec.precision = Precision::Fp32;
+        let mut unknown_component = respec(&valid, valid.spec.clone());
+        unknown_component.spec.components.insert(
+            "unknown".into(),
+            WeightsSource::File("/unknown.safetensors".into()),
+        );
+
+        for (case, mutated) in [
+            ("tier_mismatch", tier_mismatch),
+            ("file_source", file_source),
+            ("policy_mismatch", policy_mismatch),
+            ("shape_mismatch", shape_mismatch),
+            ("precision", precision),
+            ("unknown_component", unknown_component),
+        ] {
+            assert!(
+                weights_free_memory_strategy_surface_contract(
+                    crate::KREA_2_TURBO_CONTROL_ID,
+                    &mutated
+                )
+                .is_err(),
+                "{case} must be refused by the resolver"
+            );
+        }
+
+        // Supported compositions stay admissible, and a dense `.diff` patch is a TRUTHFUL
+        // non-streamable contract rather than a resolver error: it mutates the resident base, so the
+        // window cannot be rebuilt from the pristine snapshot.
+        let tmp = tempfile::tempdir().unwrap();
+        let wan_vae = respec(
+            &valid,
+            valid.spec.clone().with_component(
+                mlx_gen::VAE_COMPONENT,
+                WeightsSource::File(tmp.path().join("wan-vae.safetensors")),
+            ),
+        );
+        assert_eq!(
+            weights_free_memory_strategy_surface_contract(crate::KREA_2_TURBO_CONTROL_ID, &wan_vae)
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+
+        let dense_diff = tmp.path().join("dense-diff.safetensors");
+        let mut header = br#"{"transformer_blocks.0.attn.to_q.diff":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(0.0_f32.to_le_bytes());
+        std::fs::write(&dense_diff, bytes).unwrap();
+        let diff = respec(
+            &valid,
+            valid
+                .spec
+                .clone()
+                .with_adapters(vec![mlx_gen::AdapterSpec::new(
+                    dense_diff,
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )]),
+        );
+        assert_eq!(
+            weights_free_memory_strategy_surface_contract(crate::KREA_2_TURBO_CONTROL_ID, &diff)
+                .expect("a dense diff patch is a truthful contract, not a resolver error")
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
+        );
+    }
+
+    /// sc-18451: the measured SC-15517 identity belongs to the q4 snapshot route and nothing else.
+    #[test]
+    fn only_the_measured_q4_snapshot_route_carries_the_measured_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prepacked_q4 = tmp.path().join("prepacked-q4");
+        write_snapshot(&prepacked_q4);
+        std::fs::write(
+            prepacked_q4.join("transformer/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let dense = tmp.path().join("dense");
+        write_snapshot(&dense);
+        let overlay = tmp.path().join("control.safetensors");
+        write_control(&overlay);
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_control(&donor);
+
+        let control = |root: &std::path::Path| {
+            LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+                .with_control(WeightsSource::File(overlay.clone()))
+        };
+        let fingerprint = |spec: &LoadSpec| {
+            memory_strategy_contract(crate::KREA_2_TURBO_CONTROL_ID, spec)
+                .unwrap()
+                .calibration
+                .map(|calibration| calibration.fingerprint)
+        };
+
+        // A shipped prepacked q4 turnkey and a dense snapshot packed at load are the same measured
+        // tier, resolved through the same seam admission reads.
+        assert_eq!(
+            fingerprint(&control(&prepacked_q4)).as_deref(),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+        assert_eq!(
+            fingerprint(&control(&dense).with_quant(Quant::Q4)).as_deref(),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+        for (case, spec) in [
+            ("dense", control(&dense)),
+            ("q8", control(&dense).with_quant(Quant::Q8)),
+            (
+                "wan_composite",
+                control(&prepacked_q4)
+                    .with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor.clone())),
+            ),
+        ] {
+            assert_eq!(fingerprint(&spec), None, "{case} is an unmeasured route");
+        }
+
+        // The measured identity still separates the two materialization shapes it was captured
+        // under, exactly as the base ladder does.
+        let eager = control(&prepacked_q4);
+        let deferred = eager
+            .clone()
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+        let identity = |spec: &LoadSpec| {
+            memory_strategy_contract(crate::KREA_2_TURBO_CONTROL_ID, spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+        };
+        assert_eq!(
+            identity(&eager).fingerprint,
+            identity(&deferred).fingerprint
+        );
+        assert_ne!(identity(&eager).load_shape, identity(&deferred).load_shape);
     }
 }
