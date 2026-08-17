@@ -1100,21 +1100,30 @@ impl Flux2 {
                 // joint `[txt, target, ref…]` DiT sequence, making the denoise activation-bound — a
                 // 2-reference 1024² edit peaks ~104 GB, over the 96 GB budget (sc-6124). Above the
                 // single-reference ceiling, bound the per-step activation high-water with
-                // `eval_per_block` (bit-exact, so the edit's pixels are unchanged). Shorter sequences
-                // (T2I, single-reference edit, pose) stay on `MemoryConfig::OFF` → the shipped forward is
-                // byte-identical. Env-overridable (`MemoryConfig::from_env`) so a deployment can tune
-                // chunking without a recompile.
+                // a per-block evaluation cadence (bit-exact, so the edit's pixels are unchanged).
+                // Shorter sequences (T2I, single-reference edit, pose) stay on `MemoryConfig::OFF` →
+                // the shipped forward is byte-identical. Env-overridable (`MemoryConfig::from_env`)
+                // so a deployment can tune chunking without a recompile.
+                //
+                // sc-18317: the request's typed execution selections are overlaid LAST, so epic
+                // 18304's planner outranks both the sequence-length gate and the environment for the
+                // two knobs it selects — while a request that selects neither leaves this route
+                // byte-for-byte as it was. The values are already domain-admitted by the shared
+                // request floor against `chunk::EXECUTION_SURFACE`, so nothing is re-derived here.
                 let total_seq = prompt_embeds.shape()[1] as usize
                     + lat_h * lat_w
                     + reference
                         .as_ref()
                         .map(|(r, _)| r.shape()[1] as usize)
                         .unwrap_or(0);
-                let mem = MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
-                    MemoryConfig::LONG_SEQ
-                } else {
-                    MemoryConfig::OFF
-                });
+                let mem = MemoryConfig::with_request(
+                    MemoryConfig::from_env(if total_seq > LONG_SEQ_TOKEN_THRESHOLD {
+                        MemoryConfig::LONG_SEQ
+                    } else {
+                        MemoryConfig::OFF
+                    }),
+                    req.memory.as_ref(),
+                );
 
                 // For an edit, the transformer's image input/ids are `[target, ref]` (or `[target]` only
                 // on a cached KV step); its output keeps the image stream, of which we take the leading

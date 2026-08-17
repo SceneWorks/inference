@@ -453,6 +453,11 @@ impl Flux2Variant {
                 audio_languages: vec![],
                 audio_edit_modes: vec![],
                 size_floor: SizeFloor::RangeChecked,
+                // sc-18317: the typed graph-evaluation cadence + FFN chunk this family's MMDiT
+                // forward consumes (`chunk::MemoryConfig`). Declared here, on every base FLUX.2
+                // descriptor, because `model.rs`'s denoise threads the request through
+                // `MemoryConfig::with_request` on every route — gated long-sequence edit or not.
+                execution: crate::chunk::EXECUTION_SURFACE,
             },
         }
     }

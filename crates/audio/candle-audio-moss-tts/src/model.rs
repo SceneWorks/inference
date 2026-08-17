@@ -158,6 +158,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_session: false,
             max_speakers: Some(MAX_SPEAKERS),
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

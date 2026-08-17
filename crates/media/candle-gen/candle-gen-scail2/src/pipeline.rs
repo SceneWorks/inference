@@ -179,6 +179,7 @@ pub fn descriptor() -> ModelDescriptor {
             size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
                 multiple: DIM_ALIGN,
             },
+            execution: Default::default(),
         },
     }
 }

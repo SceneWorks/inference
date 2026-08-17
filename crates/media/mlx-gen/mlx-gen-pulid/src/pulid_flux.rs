@@ -114,6 +114,7 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

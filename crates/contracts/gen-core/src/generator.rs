@@ -6,6 +6,7 @@
 //! [`ModelDescriptor`] property plus a [`GenerationOutput`] variant — *not* a per-modality
 //! trait split (which breaks on multi-modal models).
 
+use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
 use crate::voice_embed::VoiceEmbedding;
@@ -532,6 +533,39 @@ pub struct GenerationMemory {
     /// GiB decode floor, and the encoder's weights are 7.440 GiB of that — so the window has real
     /// work to do there, while q4 is already decode-bound and gains nothing.
     pub transformer_window_component: Option<crate::memory_strategy::TransformerComponent>,
+
+    // --- Typed execution domains (sc-18317, epic 18304 P2) --------------------------------------
+    //
+    // The parameters above say how the five-rung memory LADDER runs. These three say how one forward
+    // pass is SCHEDULED, which is a different axis: none of them sheds or bounds a component's
+    // residency, none has a place in the ladder's cost order, and none is engaged by a rung. Each
+    // existed before this story as a per-provider ad hoc knob with no shared vocabulary, so a planner
+    // could not discover it and a caller could not be told it had been ignored.
+    //
+    // Same `Option` convention as the SC-15510 parameters: `None` (the `Default`) is the provider's
+    // own historical constant, so a request that sets none of them is byte-for-byte the pre-sc-18317
+    // render on every provider. Unlike the ladder parameters these are NOT gated on a rung boolean —
+    // they are independent of the ladder — so each is validated on its own against the provider's
+    // declared `Capabilities::execution` surface, and a value a provider cannot honour is a typed
+    // refusal at the shared floor rather than a silently different schedule.
+    // See [`crate::execution_domains`] for the domains, the refusal semantics, and the per-domain
+    // equivalence classes (cadence and CFG batching are bit-identical; FFN chunking is numerically
+    // equivalent).
+    /// Blocks per forced lazy-graph evaluation inside the denoise forward. `None` ⇒ the provider's
+    /// own evaluation schedule (for every provider today, its historical whole-forward or
+    /// per-block constant). See [`GraphEvalCadence`] — in particular that
+    /// this is the *within-forward block* cadence and never the output-identity-bearing per-step
+    /// latent evaluation.
+    pub graph_eval_cadence: Option<GraphEvalCadence>,
+    /// Sequence rows per chunk of a chunked FFN intermediate. `None` ⇒ the provider's whole-sequence
+    /// FFN. The one domain here that is *numerically* equivalent rather than bit-identical
+    /// ([`FfnChunk`]), so a selector that must not perturb pixels leaves it unset.
+    pub ffn_chunk: Option<FfnChunk>,
+    /// Whether classifier-free guidance runs as one doubled-batch forward or two batch-1 forwards.
+    /// `None` ⇒ the provider's own convention (batched, for every CFG provider in this workspace).
+    /// See [`CfgBatching`]: batched CFG doubles exactly the transients rungs 2-4
+    /// exist to bound, which is why it is a planner-selectable axis.
+    pub cfg_batching: Option<CfgBatching>,
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
@@ -1947,6 +1981,25 @@ pub struct Capabilities {
     /// `false`; this is static descriptor truth and must not be copied into request evidence
     /// composition.
     pub unconditionally_engages_staged_residency: bool,
+    /// The typed **execution domains** this provider honours on
+    /// [`GenerationRequest::memory`] (sc-18317): graph-evaluation cadence, FFN chunking, and CFG
+    /// batching. See [`crate::execution_domains`].
+    ///
+    /// `Default` declares every domain [`ExecutionValueDomain::Unsupported`](crate::ExecutionValueDomain::Unsupported),
+    /// which is the fail-closed state — every existing descriptor keeps today's behaviour with no
+    /// edit, and a request that names a knob the provider does not implement is a typed
+    /// [`Error::Unsupported`] at the shared floor instead of a silently different execution schedule.
+    ///
+    /// # Why it lives on `Capabilities` rather than on `MemoryProviderContract`
+    ///
+    /// These knobs are not ladder rungs, and the two surfaces have different coverage: the memory
+    /// contract is adopted per *memory-strategy* provider (the Candle Kolors lane, for one, has no
+    /// contract at all yet still owns a CFG-batching convention), whereas every generator has a
+    /// `Capabilities` and every generator's `validate` runs the shared floor. Declaring here is
+    /// therefore the only placement where the refusal cannot be forgotten by a provider — the same
+    /// reason [`supports_multi_speaker`](Self::supports_multi_speaker) and the audio surface live
+    /// here. A planner reading the descriptor sees the domains beside the rest of the surface.
+    pub execution: ExecutionSurface,
 }
 
 /// Generous upper sanity caps for the unbounded counter knobs (F-004). Not model limits — each model
@@ -2121,6 +2174,12 @@ impl Capabilities {
                 }
             }
         }
+        // Typed execution domains (sc-18317). Gated here, on the shared floor, for the same reason
+        // the audio surface is: a per-provider check is a check a provider can forget, and a
+        // forgotten one means the knob is silently ignored — the exact defect the typed domains
+        // exist to remove. Unset fields validate vacuously, so this is inert for every request that
+        // does not select an execution schedule.
+        self.execution.validate(id, req.memory.as_ref())?;
         if req.count == 0 || req.count > self.max_count {
             return Err(Error::Msg(format!(
                 "{id}: count {} out of range 1..={}",
@@ -2574,6 +2633,7 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_domains::{CfgBatchingDomain, ExecutionValueDomain};
 
     #[test]
     fn staged_residency_availability_preserves_the_two_independent_capabilities() {
@@ -2666,6 +2726,12 @@ mod tests {
                 attention_chunk_size: None,
                 transformer_window_size: None,
                 transformer_window_component: None,
+                // sc-18317's typed execution domains. `None` is the provider's own historical
+                // schedule for each, which is what keeps an untouched request byte-for-byte the
+                // pre-sc-18317 render.
+                graph_eval_cadence: None,
+                ffn_chunk: None,
+                cfg_batching: None,
                 calibration_error_phase: None,
                 calibration_fault_harness_authorized: false,
             }
@@ -2799,6 +2865,151 @@ mod tests {
             max_count: 1,
             ..Default::default()
         }
+    }
+
+    /// **sc-18317: the typed execution domains are fail-closed at the shared floor.**
+    ///
+    /// The defect this closes is the pre-story state of all three knobs: a per-provider ad hoc
+    /// parameter a caller could not set, could not discover, and — had it been threaded through the
+    /// request without a declaration — would have been silently dropped by every provider that does
+    /// not implement it. So the floor's contract is exactly two things: an unset field is inert, and
+    /// a set field on a non-declaring descriptor is a typed `Unsupported` naming the field and the
+    /// remedy.
+    #[test]
+    fn execution_domains_are_refused_by_name_on_a_non_declaring_descriptor() {
+        let unsupported = caps();
+        assert!(
+            unsupported.execution.is_inert(),
+            "the default capability surface must declare no execution domain"
+        );
+
+        for (label, memory) in [
+            (
+                "graph_eval_cadence",
+                GenerationMemory {
+                    graph_eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ffn_chunk",
+                GenerationMemory {
+                    ffn_chunk: Some(FfnChunk::new(4096).unwrap()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cfg_batching",
+                GenerationMemory {
+                    cfg_batching: Some(CfgBatching::Sequential),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let request = GenerationRequest {
+                memory: Some(memory),
+                ..base_req()
+            };
+            let error = unsupported
+                .validate_request("m", &request)
+                .expect_err("a non-declaring descriptor must refuse a selected execution domain");
+            assert!(
+                matches!(error, Error::Unsupported(_)),
+                "{label} must be a capability gap, not a range error: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(label), "{label}: {message}");
+            assert!(
+                message.contains("unset"),
+                "{label} refusal must name the remedy: {message}"
+            );
+            // The size-skipping floors run every non-spatial check, so the gate must be reached
+            // through them too — a provider on the auto-size convention must not lose the refusal.
+            assert!(
+                unsupported
+                    .validate_request_skip_size("m", &request)
+                    .is_err(),
+                "{label} must also be refused on the size-skipping floor"
+            );
+            assert!(
+                unsupported.validate_request_audio("m", &request).is_err(),
+                "{label} must also be refused on the audio floor"
+            );
+        }
+    }
+
+    /// The other half: a declaring descriptor admits exactly its declared values, and the ladder
+    /// parameters are untouched by the execution gate.
+    #[test]
+    fn execution_domains_admit_declared_values_and_leave_the_ladder_alone() {
+        let declaring = Capabilities {
+            execution: ExecutionSurface {
+                graph_eval_cadence_blocks: ExecutionValueDomain::ANY_POSITIVE,
+                ffn_chunk_rows: ExecutionValueDomain::Candidates(vec![2048]),
+                cfg_batching: CfgBatchingDomain::Modes(vec![CfgBatching::Batched]),
+            },
+            ..caps()
+        };
+        assert!(declaring.execution.declaration_errors().is_empty());
+
+        let admitted = GenerationRequest {
+            memory: Some(GenerationMemory {
+                graph_eval_cadence: Some(GraphEvalCadence::new(4).unwrap()),
+                ffn_chunk: Some(FfnChunk::new(2048).unwrap()),
+                cfg_batching: Some(CfgBatching::Batched),
+                ..Default::default()
+            }),
+            ..base_req()
+        };
+        declaring
+            .validate_request("m", &admitted)
+            .expect("every declared value must reach the provider");
+
+        let off_grid = GenerationRequest {
+            memory: Some(GenerationMemory {
+                ffn_chunk: Some(FfnChunk::new(2047).unwrap()),
+                ..Default::default()
+            }),
+            ..base_req()
+        };
+        let message = declaring
+            .validate_request("m", &off_grid)
+            .expect_err("an off-domain chunk must be refused")
+            .to_string();
+        assert!(
+            message.contains("[2048]"),
+            "domain must be named: {message}"
+        );
+
+        let unimplemented_mode = GenerationRequest {
+            memory: Some(GenerationMemory {
+                cfg_batching: Some(CfgBatching::Sequential),
+                ..Default::default()
+            }),
+            ..base_req()
+        };
+        assert!(
+            declaring
+                .validate_request("m", &unimplemented_mode)
+                .is_err(),
+            "a mode the provider does not implement must be refused even though CFG batching is \
+             declared"
+        );
+
+        // An unset execution selection carrying a ladder rung still validates on the inert surface:
+        // the execution gate is independent of the memory ladder.
+        let ladder_only = GenerationRequest {
+            memory: Some(GenerationMemory {
+                stage_residency: true,
+                chunk_attention: true,
+                attention_chunk_size: Some(128),
+                ..Default::default()
+            }),
+            ..base_req()
+        };
+        caps()
+            .validate_request("m", &ladder_only)
+            .expect("the execution gate must not touch ladder parameters");
     }
 
     #[test]

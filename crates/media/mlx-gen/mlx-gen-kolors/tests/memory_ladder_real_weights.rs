@@ -479,6 +479,7 @@ fn measure_end_to_end_phased(
             &mut |_: Progress| {},
             &mlx_gen::PreviewSink::default(),
             plan,
+            mlx_gen::gen_core::CfgBatching::Batched,
         )
         .expect("denoise");
     let image =
@@ -598,6 +599,7 @@ fn production_latent(dir: &std::path::Path, tier: &str, edge: u32) -> mlx_rs::Ar
             &mut |_: Progress| {},
             &mlx_gen::PreviewSink::default(),
             mlx_gen_sdxl::SdxlForwardPlan::UNBOUNDED,
+            mlx_gen::gen_core::CfgBatching::Batched,
         )
         .expect("denoise");
     mlx_rs::transforms::eval([&latents]).expect("eval latent");

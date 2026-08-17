@@ -395,10 +395,13 @@ impl Pipeline {
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
         // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
         // (it threads `components`); the shared helper owns only the identical CFG-concat convention.
-        let (context, pooled, batch) =
-            common::cfg_batch_context(&req.prompt, negative, use_guide, |p| {
-                self.encode(components, p)
-            })?;
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            negative,
+            use_guide,
+            common::resolve_cfg_batching(req),
+            |p| self.encode(components, p),
+        )?;
         let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
 
         // The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attention 2048) is step-invariant, so

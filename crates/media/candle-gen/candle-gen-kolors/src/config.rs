@@ -119,6 +119,16 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            // sc-18317: Kolors runs real classifier-free guidance, and the one convention this lane
+            // implements is the doubled `[uncond, cond]` batch `common::cfg_batch_context` builds.
+            // Declaring the single mode makes it planner-selectable and makes `sequential` a refusal
+            // by name at the shared floor rather than a silently batched run.
+            execution: candle_gen::gen_core::ExecutionSurface {
+                cfg_batching: candle_gen::gen_core::CfgBatchingDomain::Modes(
+                    crate::common::CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..candle_gen::gen_core::ExecutionSurface::default()
+            },
         },
     }
 }
@@ -171,6 +181,87 @@ impl ChatGlmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **sc-18317 — the declared CFG-batching domain is reachable, and the two domains this lane has
+    /// no mechanism for are refused.**
+    ///
+    /// The production `validate` delegates the shared contract to `Capabilities::validate_request`
+    /// (asserted separately), so admitting/refusing here is admitting/refusing on the `generate` path.
+    /// `Batched` is admitted because `common::cfg_batch_context` genuinely consumes it; `Sequential` is refused because the
+    /// ChatGLM3 conditioning and the vendored SDXL denoise runs guidance as one batch; and the cadence / FFN-chunk domains are refused because this
+    /// family has no such mechanism at all — the truthful state, not an oversight.
+    #[test]
+    fn execution_domains_are_declared_exactly_where_this_lane_consumes_them() {
+        let caps = descriptor().capabilities;
+        assert!(caps.execution.declaration_errors().is_empty());
+        assert!(caps.execution.cfg_batching.is_supported());
+        assert!(!caps.execution.graph_eval_cadence_blocks.is_supported());
+        assert!(!caps.execution.ffn_chunk_rows.is_supported());
+
+        let request = |memory| candle_gen::gen_core::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(1),
+            memory: Some(memory),
+            ..Default::default()
+        };
+
+        caps.validate_request(
+            "kolors",
+            &request(candle_gen::gen_core::GenerationMemory {
+                cfg_batching: Some(candle_gen::gen_core::CfgBatching::Batched),
+                ..Default::default()
+            }),
+        )
+        .expect("the implemented mode must be admitted");
+
+        for (label, memory) in [
+            (
+                "cfg_batching",
+                candle_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(candle_gen::gen_core::CfgBatching::Sequential),
+                    ..Default::default()
+                },
+            ),
+            (
+                "graph_eval_cadence",
+                candle_gen::gen_core::GenerationMemory {
+                    graph_eval_cadence: Some(candle_gen::gen_core::GraphEvalCadence::EVERY_BLOCK),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ffn_chunk",
+                candle_gen::gen_core::GenerationMemory {
+                    ffn_chunk: Some(candle_gen::gen_core::FfnChunk::new(2048).unwrap()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = caps
+                .validate_request("kolors", &request(memory))
+                .expect_err("an unimplemented execution selection must be refused");
+            assert!(
+                matches!(error, candle_gen::gen_core::Error::Unsupported(_)),
+                "{label} must be a capability gap: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(label), "{label}: {message}");
+            assert!(
+                message.contains("unset"),
+                "{label} refusal must name the remedy: {message}"
+            );
+        }
+
+        // And an unset selection still validates — the default-preservation half.
+        caps.validate_request(
+            "kolors",
+            &request(candle_gen::gen_core::GenerationMemory::default()),
+        )
+        .expect("an unset execution selection must validate");
+    }
 
     #[test]
     fn descriptor_advertises_txt2img_and_reference_img2img() {

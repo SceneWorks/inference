@@ -191,6 +191,7 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }
@@ -255,6 +256,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
         },
     }
 }

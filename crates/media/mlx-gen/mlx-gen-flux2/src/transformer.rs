@@ -854,6 +854,22 @@ impl Flux2Transformer {
         inputs: &Flux2ForwardInputs,
         control: (&Flux2ControlBranch, &Array, f32),
     ) -> Result<Array> {
+        self.forward_with_control_mem(inputs, control, &MemoryConfig::OFF)
+    }
+
+    /// As [`Self::forward_with_control`], with an explicit [`MemoryConfig`] (sc-18317).
+    ///
+    /// The control route shares the base double/single stacks, so it shares their activation levers;
+    /// it did not share the sc-6266 wiring because that story only gated the multi-reference edit
+    /// sequence. This is the seam the dev-control generate path threads the request's typed execution
+    /// selections through. `MemoryConfig::OFF` here is byte-identical to
+    /// [`Self::forward_with_control`], which is why that method remains the shim.
+    pub fn forward_with_control_mem(
+        &self,
+        inputs: &Flux2ForwardInputs,
+        control: (&Flux2ControlBranch, &Array, f32),
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
         self.forward_inner(
             inputs.hidden_states,
             inputs.encoder_hidden_states,
@@ -863,7 +879,7 @@ impl Flux2Transformer {
             inputs.guidance,
             None,
             Some(control),
-            &MemoryConfig::OFF,
+            mem,
             AttentionPlan::UNBOUNDED,
             None,
         )
@@ -947,7 +963,7 @@ impl Flux2Transformer {
                         &cos,
                         &sin,
                         cache.map(|c| (c, idx)),
-                        mem.ffn_seq_chunk,
+                        mem.ffn_chunk_rows(),
                         attention_plan,
                     )?;
                     if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
@@ -955,7 +971,7 @@ impl Flux2Transformer {
                             img = add(&img, &multiply(&hints[n], scalar(*scale))?)?;
                         }
                     }
-                    if mem.eval_per_block {
+                    if mem.evaluates_after_block(idx) {
                         mlx_rs::transforms::eval([&img, &txt])?;
                     }
                 }
@@ -989,7 +1005,7 @@ impl Flux2Transformer {
                                 &cos,
                                 &sin,
                                 cache.map(|c| (c, idx)),
-                                mem.ffn_seq_chunk,
+                                mem.ffn_chunk_rows(),
                                 attention_plan,
                             )?;
                         }
@@ -1017,7 +1033,7 @@ impl Flux2Transformer {
                         cache.map(|c| (c, idx)),
                         attention_plan,
                     )?;
-                    if mem.eval_per_block {
+                    if mem.evaluates_after_block(idx) {
                         mlx_rs::transforms::eval([&hidden])?;
                     }
                 }
@@ -1301,7 +1317,36 @@ impl Flux2ControlTransformer {
         control_context: &Array,
         control_context_scale: f32,
     ) -> Result<Array> {
-        self.base.forward_with_control(
+        self.forward_with_mem(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            control_context,
+            control_context_scale,
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// As [`Self::forward`], with an explicit [`MemoryConfig`] (sc-18317) so the dev-control generate
+    /// path can honour a request's typed graph-evaluation cadence / FFN chunk. `MemoryConfig::OFF` is
+    /// byte-identical to [`Self::forward`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mem(
+        &self,
+        hidden_states: &Array,
+        encoder_hidden_states: &Array,
+        img_ids: &Array,
+        txt_ids: &Array,
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Array,
+        control_context_scale: f32,
+        mem: &MemoryConfig,
+    ) -> Result<Array> {
+        self.base.forward_with_control_mem(
             &Flux2ForwardInputs {
                 hidden_states,
                 encoder_hidden_states,
@@ -1311,6 +1356,7 @@ impl Flux2ControlTransformer {
                 guidance,
             },
             (&self.branch, control_context, control_context_scale),
+            mem,
         )
     }
 }

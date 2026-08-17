@@ -32,6 +32,7 @@ use mlx_gen::{
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
+use crate::chunk::MemoryConfig;
 use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request, Flux2TextOwned};
 use crate::pipeline::{
@@ -107,6 +108,10 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            // sc-18317: the dev-control route shares the base double/single stacks, so it shares
+            // their activation levers; `generate` threads the request through
+            // `MemoryConfig::with_request` into `Flux2ControlTransformer::forward_with_mem`.
+            execution: crate::chunk::EXECUTION_SURFACE,
         },
     }
 }
@@ -473,8 +478,14 @@ impl Flux2DevControl {
                     // `predict` closure. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma
                     // convention). Cancellation, the per-step `eval`, and progress live in
                     // `run_flow_sampler`.
+                    // sc-18317: the request's typed execution selections (graph-evaluation cadence /
+                    // FFN chunk) overlay the control route's historical `OFF` base. An unset
+                    // selection leaves `OFF`, so this route stays byte-for-byte the pre-sc-18317
+                    // forward; the env knobs stay scoped to the base route they were introduced on
+                    // (sc-6266), so nothing here changes for a deployment that only sets those.
+                    let mem = MemoryConfig::with_request(MemoryConfig::OFF, req.memory.as_ref());
                     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-                        heavy.transformer.forward(
+                        heavy.transformer.forward_with_mem(
                             latents,
                             &prompt_embeds,
                             &latent_ids,
@@ -483,6 +494,7 @@ impl Flux2DevControl {
                             embedded_guidance,
                             &control_context,
                             control_scale,
+                            &mem,
                         )
                     };
                     let denoise_sigmas = &sched.sigmas[start_step..];
