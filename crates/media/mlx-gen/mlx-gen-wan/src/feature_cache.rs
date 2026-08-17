@@ -475,6 +475,141 @@ mod tests {
             .collect()
     }
 
+    /// Per-row f32 values of a `[1, total, dim]` token stream.
+    fn row_values(x: &Array, total: usize) -> Vec<Vec<f32>> {
+        let flat = mlx_gen::array::contiguous(&x.as_dtype(Dtype::Float32).expect("f32"))
+            .expect("contiguous");
+        flat.eval().expect("eval");
+        let flat = flat.as_slice::<f32>().to_vec();
+        let per_row = flat.len() / total;
+        (0..total)
+            .map(|i| flat[i * per_row..(i + 1) * per_row].to_vec())
+            .collect()
+    }
+
+    /// **A surviving token's update is the one the exact block would have applied.**
+    ///
+    /// This is the assertion that pins the *key/value* half of the mechanism, and it is the reason
+    /// pruning is a bounded approximation rather than an arbitrary one. Self-attention's keys and values
+    /// come from the full token stream, so a kept token's query attends over exactly the same keys it
+    /// would have in the exact block — and its cross-attention and FFN inputs are unchanged too. So the
+    /// kept rows of a pruned block must match the exact block's rows — not bit-exactly, because `Sq`
+    /// changes and MLX's fused Metal SDPA is tile-specialized by that dimension, so the same arithmetic
+    /// runs in a different order. Measured worst relative |Δ| on this fixture is ~2.4e-3, squarely the
+    /// bf16 class this crate's own parity suites gate at 2e-2; the bound below is 1e-2 relative, tight
+    /// enough that a pruned key set (which moves a kept token's output far further) fails it.
+    ///
+    /// Prune the keys as well and a kept token sees a different key set, which moves its output far
+    /// beyond that — which is what makes this test, rather than the pass-through test, the one that
+    /// catches a key-side regression.
+    #[test]
+    fn a_surviving_token_gets_the_update_the_exact_block_would_have_applied() {
+        let h = harness();
+        let (tokens, grid) = h
+            .transformer
+            .patch_embed_tokens(&h.latent)
+            .expect("patch grid");
+        let total = grid.0 * grid.1 * grid.2;
+        let stride = mlx_gen::gen_core::TokenDropStride::EVERY_SECOND_TOKEN;
+        let keep = crate::token_pruning::TokenKeepSet::new(stride, total).expect("keep set");
+
+        let exact = h
+            .transformer
+            .block_forward_for_test(0, &tokens, TIMESTEPS[0], &h.cross_kv[0], &h.cos, &h.sin)
+            .expect("exact block");
+        let pruned = h
+            .transformer
+            .block_forward_pruned_for_test(
+                0,
+                &tokens,
+                TIMESTEPS[0],
+                &h.cross_kv[0],
+                &h.cos,
+                &h.sin,
+                &keep,
+            )
+            .expect("pruned block");
+
+        let exact_rows = row_values(&exact, total);
+        let pruned_rows = row_values(&pruned, total);
+        // Scale the tolerance to the block's own output magnitude so the bound means the same thing on
+        // this fixture as it would at production scale. The ULP-class difference is many orders below
+        // this; a pruned key set is not.
+        let scale = exact_rows
+            .iter()
+            .flatten()
+            .fold(0f32, |acc, v| acc.max(v.abs()))
+            .max(1e-6);
+        let tolerance = scale * 1e-2;
+        let mut worst = 0f32;
+        for index in 0..total {
+            if !stride.keeps_token(index) {
+                continue;
+            }
+            for (got, want) in pruned_rows[index].iter().zip(exact_rows[index].iter()) {
+                worst = worst.max((got - want).abs());
+            }
+        }
+        assert!(
+            worst <= tolerance,
+            "a kept token must get the exact block's update (full keys/values): worst |Δ| {worst} \
+             exceeds {tolerance} (scale {scale})"
+        );
+    }
+
+    /// **Per-token time modulation is refused on the pruned path.**
+    ///
+    /// `e0..e5` would have to be gathered in lockstep with the tokens, and `apply_head` broadcasts the
+    /// modulation against the token axis, so a mismatch is a silent broadcast rather than an error. The
+    /// TI2V mask-blend route declares no pruning and the provider refuses a non-exact plan there; this
+    /// is the local backstop, and it needs its own test because the provider-level refusal cannot reach
+    /// this code.
+    #[test]
+    fn per_token_time_modulation_is_refused_on_the_pruned_path() {
+        let h = harness();
+        let (tokens, grid) = h
+            .transformer
+            .patch_embed_tokens(&h.latent)
+            .expect("patch grid");
+        let total = grid.0 * grid.1 * grid.2;
+        let keep = crate::token_pruning::TokenKeepSet::new(
+            mlx_gen::gen_core::TokenDropStride::EVERY_SECOND_TOKEN,
+            total,
+        )
+        .expect("keep set");
+        let t_tokens = Array::from_slice(&vec![TIMESTEPS[0]; total], &[1, total as i32]);
+        let error = h
+            .transformer
+            .block_forward_pruned_per_token_for_test(
+                0,
+                &tokens,
+                &t_tokens,
+                &h.cross_kv[0],
+                &h.cos,
+                &h.sin,
+                &keep,
+            )
+            .expect_err("a per-token modulation must be refused on the pruned path");
+        assert!(
+            error.to_string().contains("per-token time modulation"),
+            "{error}"
+        );
+
+        // The scalar modulation on the same inputs succeeds, so the refusal is about the modulation
+        // shape rather than about the fixture.
+        h.transformer
+            .block_forward_pruned_for_test(
+                0,
+                &tokens,
+                TIMESTEPS[0],
+                &h.cross_kv[0],
+                &h.cos,
+                &h.sin,
+                &keep,
+            )
+            .expect("a scalar modulation must be accepted");
+    }
+
     /// **A warmup step prunes nothing, and the un-pruned forward is byte-identical to the exact one.**
     ///
     /// The driver-level off proof for pruning: `denoise_approx` consults the contract's own
@@ -1004,11 +1139,17 @@ mod tests {
         assert!(cache.reuse(&longer).is_err(), "L must match");
     }
 
+    /// The retained residual holds the right values.
+    ///
+    /// Deliberately **not** titled as a proof of the evaluation barrier. `capture`'s
+    /// `eval` is load-bearing for residency — an unevaluated residual is a graph node still referencing
+    /// the block weights, so rung 4's windowed materialization would free nothing — but MLX exposes no
+    /// public way to ask whether an array is materialized, and `as_slice` evaluates implicitly, so
+    /// deleting that `eval` is a mutation no test in this workspace can catch. The same is true of the
+    /// two identical barriers already in `transformer.rs` and `block_stream.rs`, which are held by
+    /// comment for the same reason. What this test does pin is the residual's contents.
     #[test]
-    fn the_retained_residual_is_materialized_at_capture() {
-        // The rung-4 interaction: a retained residual that is still a lazy graph node keeps the block
-        // weights alive. `capture` evaluates it, so reading it back needs no further eval — which is
-        // what `as_slice` on an unevaluated array could not give.
+    fn the_retained_residual_holds_the_captured_delta() {
         let mut cache = cache(2, 0);
         let x_in = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let x_out = Array::from_slice(&[4.0f32, 6.0], &[2]);

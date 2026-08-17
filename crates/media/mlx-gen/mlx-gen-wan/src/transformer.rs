@@ -1777,6 +1777,40 @@ impl WanTransformer {
         self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
     }
 
+    /// One block's **exact** forward at the same modulation `block_forward_pruned_for_test` uses — the
+    /// control the pruning full-key assertion compares against.
+    #[cfg(test)]
+    pub(crate) fn block_forward_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t: f32,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed(t)?;
+        self.blocks[index].forward(x, &e0, kv, cos, sin)
+    }
+
+    /// One block's pruned forward under a **per-token** time modulation, to reach the guard that refuses
+    /// it. `t_tokens` is `[1, L]`, the TI2V mask-blend shape.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_forward_pruned_per_token_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t_tokens: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed_tokens(t_tokens)?;
+        self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
+    }
+
     pub fn forward_cached(
         &self,
         latent: &Array,
