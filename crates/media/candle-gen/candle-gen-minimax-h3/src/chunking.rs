@@ -5,7 +5,8 @@
 //! tensors, so the whole plan can be asserted directly, and it is a line-for-line twin of
 //! `mlx-gen-minimax-h3`'s so the two backends cannot disagree about the frame plan. (One deliberate
 //! divergence: [`TemporalGeometry::from_parts`] here additionally refuses
-//! `token_drop >= tokens_chunk_size` — the wrapped-modulo plan the twin still silently accepts.)
+//! `token_drop >= tokens_chunk_size` — the wrapped-modulo plan the twin still silently accepts
+//! (scheduled for the Wave-2 mlx PR).)
 //!
 //! ## Why the decode is chunked at all
 //!
