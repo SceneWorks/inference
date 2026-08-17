@@ -83,6 +83,42 @@ fn resolve_frames(req: &GenerationRequest) -> Result<ResolvedFrames> {
     })
 }
 
+/// Refuse the [`Conditioning::VideoClip`] knob Krea Realtime does not implement (sc-20265).
+///
+/// The variant's `strength` **is** honored here — it drives the strength-controlled AR init
+/// ([`crate::t2v::generate_v2v`]), which is why `run` binds it on the v2v route. `frame_idx` is the
+/// other half of the payload and it is **not**: it names the output latent frame an in-context clip
+/// is appended at, and Krea Realtime is autoregressive — the source clip seeds the rolling causal KV
+/// cache from step zero and the model generates forward from there. There is no output timeline to
+/// splice a clip into partway through, so an offset has nothing to mean.
+///
+/// Until sc-20265 it was read past silently: `run`'s route match binds `VideoClip { frames,
+/// strength, .. }` and the `..` swallowed it. The sc-19571 rule is that a control either works or is
+/// refused with a clear error, so this is the refusal for the half that does not work.
+///
+/// It fires **only on a non-default value** — `frame_idx = 0` (the contract default, and what
+/// SceneWorks sends today) passes through unchanged, and `strength` is untouched at any value.
+///
+/// Checked over **every** clip rather than the first: `run` routes on the first `VideoClip`, so a
+/// bad value on clip two would otherwise be the one silently dropped.
+///
+/// Typed [`Error::Unsupported`], not [`Error::Msg`]: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
+fn reject_unimplemented_video_clip_knobs(req: &GenerationRequest) -> Result<()> {
+    for clip in req.video_clips() {
+        if clip.frame_idx != 0 {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID} does not implement VideoClip frame_idx (got {}); remove it or leave it \
+                 at the default 0 — Krea Realtime is autoregressive: the source clip seeds the \
+                 rolling causal KV cache from step zero, so there is no output position to splice \
+                 it at. (VideoClip strength IS honored and is unaffected.)",
+                clip.frame_idx
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,
 /// autoregressive self-forcing **text-to-video**; **CFG off** → no negative prompt / no guidance; a
 /// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
@@ -323,6 +359,10 @@ impl KreaRealtime {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
+        // sc-20265 — refuse the per-clip knob this engine does not implement rather than binding it
+        // under a `..` and dropping it. Both `validate` and `run` route through here, so the
+        // pre-flight and the render cannot disagree.
+        reject_unimplemented_video_clip_knobs(req)?;
         resolve_frames(req)
     }
 
@@ -890,5 +930,77 @@ mod tests {
             rejected_progress, 0,
             "no Loading progress proves the oversized source was rejected before staging"
         );
+    }
+
+    /// sc-20265 — `VideoClip.frame_idx` was silently swallowed by `run`'s `VideoClip { frames,
+    /// strength, .. }` bind. A non-default offset is now the typed `Unsupported`, naming the field
+    /// and the model, on BOTH the pre-flight and the run seam (both route through
+    /// `validate_and_resolve_frames`).
+    #[test]
+    fn non_default_video_clip_frame_idx_is_refused_by_name() {
+        let provider = unloaded();
+        let mut offset = v2v_request(5);
+        if let Conditioning::VideoClip { frame_idx, .. } = &mut offset.conditioning[0] {
+            *frame_idx = 3;
+        }
+
+        let err = Generator::validate(&provider, &offset)
+            .expect_err("a non-default frame_idx must be refused");
+        assert!(
+            matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+            "typed Unsupported, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("frame_idx"), "names the field: {msg}");
+        assert!(msg.contains(MODEL_ID), "names the model: {msg}");
+
+        // The run seam refuses it too, before any staging.
+        let mut progress = 0;
+        let run_error = provider
+            .run(&offset, &mut |_| progress += 1)
+            .expect_err("run must refuse it too");
+        assert!(matches!(run_error, Error::Unsupported(_)), "{run_error:?}");
+        assert!(run_error.to_string().contains("frame_idx"));
+        assert_eq!(
+            progress, 0,
+            "no Loading progress proves the refusal ran before staging"
+        );
+
+        // Every clip is inspected, not just the one `run` routes on.
+        let mut second = v2v_request(5);
+        second.conditioning.insert(
+            0,
+            Conditioning::VideoClip {
+                frames: Vec::new(),
+                frame_idx: 0,
+                strength: 1.0,
+            },
+        );
+        if let Conditioning::VideoClip { frame_idx, .. } = &mut second.conditioning[1] {
+            *frame_idx = 9;
+        }
+        assert!(Generator::validate(&provider, &second).is_err());
+    }
+
+    /// sc-20265 — the refusal is scoped to `frame_idx` alone. `strength` IS honored (it drives the
+    /// AR init), so a NON-default strength must keep validating; and the default `frame_idx = 0` —
+    /// what SceneWorks sends today — is untouched.
+    #[test]
+    fn video_clip_strength_is_untouched_and_default_frame_idx_still_passes() {
+        let provider = unloaded();
+        // `v2v_request` already carries a non-default strength of 0.5 at frame_idx 0.
+        let honored = v2v_request(5);
+        assert!(matches!(
+            honored.conditioning[0],
+            Conditioning::VideoClip { strength, .. } if strength == 0.5
+        ));
+        Generator::validate(&provider, &honored)
+            .expect("a non-default VideoClip strength must still validate — Krea honors it");
+
+        let mut default_strength = v2v_request(5);
+        if let Conditioning::VideoClip { strength, .. } = &mut default_strength.conditioning[0] {
+            *strength = 1.0;
+        }
+        Generator::validate(&provider, &default_strength).expect("the defaults still validate");
     }
 }

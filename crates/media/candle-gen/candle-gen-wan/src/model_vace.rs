@@ -41,7 +41,8 @@ use crate::rope::WanRope;
 use crate::scheduler::Sampler;
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
-    build_vace_control, denoise_vace, prepare_masks, prepare_video_latents, WanVaceTransformer,
+    build_vace_control, denoise_vace, prepare_masks, prepare_video_latents, vace_control_scales,
+    WanVaceTransformer,
 };
 /// Concrete z16 VAE assigned to the VACE route.
 pub type ProviderVae = crate::vae16::WanVae16;
@@ -207,8 +208,18 @@ impl Pipeline {
         let control = build_vace_control(&video_latents, &mask_latents)?;
         let (_, _, t_total, h_lat, w_lat) = control.dims5()?;
 
-        // Per-vace-layer control scale (diffusers `conditioning_scale`); default 1.0.
-        let scales = vec![req.control_scale.unwrap_or(1.0); self.vace_cfg.vace_layers.len()];
+        // Per-vace-layer control scale (diffusers `conditioning_scale`); default 1.0. sc-20261:
+        // VACE exposes ONE conditioning scale for the whole hint stack, so the requested
+        // `masking_strength` weights the mask/video control by multiplying it — the mechanism the
+        // dual-expert sibling (`model_vace_fun.rs`) already used, now shared via
+        // [`vace_control_scales`] so the two routes cannot drift. `masking_strength = 1.0` (the
+        // contract default) leaves this byte-identical to the pre-sc-20261 expression.
+        //
+        // The whole vector is resolved by the shared seam rather than being assembled here, so the
+        // honor wiring has one testable definition; `render_binds_scales_to_the_shared_resolver`
+        // pins this line to it (a call site that rebuilt the vec inline would silently un-honor the
+        // knob while every unit test on the seam stayed green).
+        let scales = vace_control_scales(req, self.vace_cfg.vace_layers.len());
 
         // RoPE for the (ref-extended) token grid.
         let (pt, ph, pw) = self.vace_cfg.base.patch;
@@ -326,6 +337,26 @@ impl Generator for WanVaceGenerator {
                     .into(),
             )
         })?;
+        // sc-20261 — `masking_strength` and `start_frame` were silently dropped on this route while
+        // the dual-expert sibling (`model_vace_fun.rs`) already honored the first and refused the
+        // second. These are that sibling's checks verbatim, so a request gets the same answer from
+        // both candle VACE routes. `masking_strength` reaches the render through
+        // [`weighted_control_scale`], and the range is load-bearing there: it multiplies the
+        // per-vace-layer conditioning scale, so a negative or >1 value would invert or over-drive
+        // every hint injection rather than weight it.
+        if !clip.masking_strength.is_finite() || !(0.0..=1.0).contains(&clip.masking_strength) {
+            return Err(gen_core::Error::Msg(format!(
+                "wan-vace: masking_strength must be finite and in [0,1] (got {})",
+                clip.masking_strength
+            )));
+        }
+        if clip.start_frame != 0 {
+            return Err(gen_core::Error::Unsupported(
+                "wan-vace currently applies ControlClip only at start_frame=0".into(),
+            ));
+        }
+        // `mode` is already realized in the worker-rasterized control mask; all replacement modes
+        // therefore use the same VACE mask path here (the sibling's rule, unchanged).
         if clip.frames.len() != clip.mask.len() {
             return Err(gen_core::Error::Msg(format!(
                 "wan-vace: control frames ({}) and mask frames ({}) length mismatch",
@@ -467,6 +498,7 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
     use candle_gen::gen_core::ReplacementMode;
 
     #[test]
@@ -623,6 +655,192 @@ mod tests {
                 .contains("maximum combined temporal conditioning budget is 257"),
             "{error}"
         );
+    }
+
+    /// sc-20261 — `masking_strength` is no longer silently dropped on the single-expert route: it
+    /// reaches the render through the per-vace-layer conditioning scale, the same seam the
+    /// dual-expert sibling uses.
+    ///
+    /// The assertion is deliberately made with a **non-default** strength on both halves of the
+    /// seam. `masking_strength = 1.0` is the identity for this mechanism, so an assert at the
+    /// default would pass against the old silently-dropping expression too — a false green.
+    #[test]
+    fn masking_strength_weights_the_control_scale() {
+        // A non-default strength scales an explicit control_scale...
+        assert!((weighted_control_scale(Some(0.5), 0.4) - 0.2).abs() < f32::EPSILON);
+        // ...and, with no explicit control_scale, IS the scale (rather than the dropped 1.0).
+        assert!((weighted_control_scale(None, 0.25) - 0.25).abs() < f32::EPSILON);
+        // The pre-sc-20261 behaviour was `control_scale.unwrap_or(1.0)` alone; a non-default
+        // strength must move the value away from it, or the knob is still inert.
+        assert_ne!(weighted_control_scale(Some(0.5), 0.4), 0.5);
+        assert_ne!(weighted_control_scale(None, 0.25), 1.0);
+        // The contract default is the identity, so a default request is byte-identical.
+        assert_eq!(weighted_control_scale(Some(0.75), 1.0), 0.75);
+        assert_eq!(weighted_control_scale(None, 1.0), 1.0);
+
+        // And the range the seam depends on is enforced at validate, not left to poison the hints.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
+        let with_strength = |strength: f32| {
+            let mut req = control_req();
+            if let Conditioning::ControlClip {
+                masking_strength, ..
+            } = &mut req.conditioning[0]
+            {
+                *masking_strength = strength;
+            }
+            req
+        };
+        // A non-default but in-range strength validates (the knob is honored, not refused).
+        assert!(g.validate(&with_strength(0.4)).is_ok());
+        assert!(g.validate(&with_strength(0.0)).is_ok());
+        for invalid in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            let err = g
+                .validate(&with_strength(invalid))
+                .expect_err("out-of-range masking_strength must be rejected");
+            assert!(
+                err.to_string().contains("masking_strength"),
+                "names the field: {err}"
+            );
+        }
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — the same claim asserted at the **resolution the
+    /// render actually binds**: request in, per-vace-layer `scales` vector out. The scalar
+    /// [`weighted_control_scale`] can be right while a call site bypasses it, so the seam under test
+    /// is the whole vector.
+    ///
+    /// Non-default strengths throughout: at `masking_strength = 1.0` the resolved vector equals the
+    /// pre-sc-20261 `req.control_scale.unwrap_or(1.0)` broadcast, so an assert at the default is a
+    /// false green.
+    #[test]
+    fn resolved_control_scales_move_with_a_non_default_masking_strength() {
+        let with = |control_scale: Option<f32>, strength: f32| {
+            let mut req = control_req();
+            req.control_scale = control_scale;
+            if let Conditioning::ControlClip {
+                masking_strength, ..
+            } = &mut req.conditioning[0]
+            {
+                *masking_strength = strength;
+            }
+            req
+        };
+        // The pre-sc-20261 vector, for contrast — what a call site that dropped the knob resolves.
+        let dropped =
+            |req: &gen_core::GenerationRequest, n: usize| vec![req.control_scale.unwrap_or(1.0); n];
+
+        // Explicit control_scale × non-default strength.
+        let req = with(Some(0.5), 0.4);
+        let got = vace_control_scales(&req, 3);
+        assert_eq!(got.len(), 3, "one scale per vace layer");
+        assert!(
+            got.iter().all(|s| (s - 0.2).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 3), "the knob must move the whole vector");
+
+        // No explicit control_scale: the strength IS the scale, not the dropped 1.0.
+        let req = with(None, 0.25);
+        let got = vace_control_scales(&req, 2);
+        assert!(
+            got.iter().all(|s| (s - 0.25).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 2));
+
+        // The contract default is the identity — a default request resolves byte-identically to
+        // the pre-sc-20261 expression, so nothing already rendering changes.
+        for (cs, n) in [(Some(0.75_f32), 4_usize), (None, 4)] {
+            let req = with(cs, 1.0);
+            assert_eq!(vace_control_scales(&req, n), dropped(&req, n));
+        }
+        // A request with no ControlClip at all falls back to the default strength.
+        let mut bare = control_req();
+        bare.conditioning.clear();
+        bare.control_scale = Some(0.6);
+        assert_eq!(vace_control_scales(&bare, 2), vec![0.6, 0.6]);
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — bind the two candle VACE **call sites** to
+    /// [`vace_control_scales`].
+    ///
+    /// A unit test on the resolver cannot observe the call site: reverting either route's `scales`
+    /// binding to the pre-sc-20261 `vec![req.control_scale.unwrap_or(1.0); n]` un-honors
+    /// `masking_strength` while every arithmetic assertion above stays green. Neither route is
+    /// drivable without real weights (the scales are resolved after the VAE encode), so the binding
+    /// is pinned in the source instead — the same shape as `mlx-llm`'s
+    /// `multi_frame_attention_has_no_quadratic_mask_allocation`.
+    #[test]
+    fn render_binds_scales_to_the_shared_resolver() {
+        for (file, source) in [
+            ("model_vace.rs", include_str!("model_vace.rs")),
+            ("model_vace_fun.rs", include_str!("model_vace_fun.rs")),
+        ] {
+            let body = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("production body precedes the test module");
+            assert!(
+                body.contains("vace_control_scales(req, self.vace_cfg.vace_layers.len())"),
+                "{file}: `scales` must be resolved by the shared seam"
+            );
+            assert!(
+                !body.contains("control_scale.unwrap_or("),
+                "{file}: the pre-sc-20261 expression must not be reachable at the call site"
+            );
+        }
+    }
+
+    /// sc-20261 — `start_frame` was silently dropped here while the dual-expert sibling refused it.
+    /// Mirror the sibling: a non-zero offset is the typed `Unsupported`, and `0` still validates.
+    #[test]
+    fn validate_refuses_non_zero_start_frame_like_the_sibling() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
+        // The default offset is unchanged.
+        assert!(g.validate(&control_req()).is_ok());
+
+        let mut offset = control_req();
+        if let Conditioning::ControlClip { start_frame, .. } = &mut offset.conditioning[0] {
+            *start_frame = 1;
+        }
+        let err = g
+            .validate(&offset)
+            .expect_err("start_frame != 0 must be refused");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "typed Unsupported, got {err:?}"
+        );
+        assert!(err.to_string().contains("start_frame"), "names it: {err}");
+    }
+
+    /// sc-20261 — `mode` is realized in the worker-rasterized mask, so every replacement mode keeps
+    /// taking the same VACE mask path (the sibling's documented rule). Not a refusal.
+    #[test]
+    fn every_replacement_mode_still_validates() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID_VACE, &spec)
+            .unwrap();
+        for m in [
+            ReplacementMode::FaceOnly,
+            ReplacementMode::FullPersonKeepOutfit,
+            ReplacementMode::FullPersonReplaceOutfit,
+        ] {
+            let mut req = control_req();
+            if let Conditioning::ControlClip { mode, .. } = &mut req.conditioning[0] {
+                *mode = m;
+            }
+            assert!(g.validate(&req).is_ok(), "{m:?} must still validate");
+        }
     }
 
     #[test]

@@ -116,6 +116,53 @@ pub struct Seedvr2Generator {
     pipe: Mutex<Option<std::sync::Arc<Seedvr2Pipeline>>>,
 }
 
+/// Refuse the [`Conditioning::VideoClip`] knobs SeedVR2 does not implement (sc-20263).
+///
+/// SeedVR2 is a one-step **super-resolution upscaler**: a `VideoClip` is the LR source frame
+/// sequence, consumed whole through `generate_video`. It has no denoise mask and no output timeline
+/// to place a clip on, so neither field this variant carries has a mechanism here:
+///
+/// * `strength` is the `1 − strength` denoise mask of the LTX in-context append path. A one-step
+///   upscale runs a single deterministic pass over the LR frames — there is no multi-step denoise
+///   for a mask to gate.
+/// * `frame_idx` is the output latent frame the clip is appended at. SeedVR2 emits one upscaled
+///   frame per input frame in order; the clip *is* the timeline, so there is no offset to honor.
+///
+/// Until sc-20263 both were read off the request and thrown away — `generate` binds only
+/// `clip.frames`. The sc-19571 rule is that a control either works or is refused with a clear
+/// error, so this is the refusal, and it fires **only on a non-default value**: the contract
+/// defaults (`strength = 1.0`, `frame_idx = 0`) pass through unchanged.
+///
+/// Checked over **every** clip rather than the first: `generate` takes the first NON-empty clip, so
+/// a bad value on clip two would otherwise be the one silently dropped.
+///
+/// Byte-for-byte the MLX sibling's `reject_unimplemented_video_clip_knobs`. Typed
+/// [`gen_core::Error::Unsupported`], not `Msg`: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
+fn reject_unimplemented_video_clip_knobs(
+    id: &str,
+    req: &GenerationRequest,
+) -> gen_core::Result<()> {
+    for clip in req.video_clips() {
+        if clip.strength != 1.0 {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id} does not implement VideoClip strength (got {}); remove it or leave it at the \
+                 default 1.0 — SeedVR2 is a one-step upscale with no denoise mask to weight",
+                clip.strength
+            )));
+        }
+        if clip.frame_idx != 0 {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id} does not implement VideoClip frame_idx (got {}); remove it or leave it at \
+                 the default 0 — SeedVR2 upscales the clip in order and has no output timeline to \
+                 offset it against",
+                clip.frame_idx
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The LR input image carried by the request's `Reference` conditioning.
 fn reference_image(req: &GenerationRequest) -> Option<&Image> {
     req.conditioning.iter().find_map(|c| match c {
@@ -168,6 +215,7 @@ impl Generator for Seedvr2Generator {
                 self.descriptor.id, req.width, req.height
             )));
         }
+        reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
         Ok(())
     }
 
@@ -406,5 +454,114 @@ mod tests {
         // A single-file weights source is still rejected.
         let file = LoadSpec::new(WeightsSource::File("/w.safetensors".into()));
         assert!(load_with(&file, MODEL_ID).is_err());
+    }
+
+    fn frame() -> Image {
+        Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 16 * 16 * 3],
+        }
+    }
+
+    /// An upscale request whose (single) VideoClip carries the given sc-20263 knob values.
+    fn clip_request(frame_idx: i32, strength: f32) -> GenerationRequest {
+        GenerationRequest {
+            width: 32,
+            height: 32,
+            count: 1,
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![frame()],
+                frame_idx,
+                strength,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A lazily-loaded generator — `validate` runs entirely before any weight is touched, so the
+    /// bogus snapshot dir never matters.
+    fn unloaded() -> Box<dyn Generator> {
+        load_with(
+            &LoadSpec::new(WeightsSource::Dir("/nonexistent-seedvr2".into())),
+            MODEL_ID,
+        )
+        .expect("the seedvr2 loader is lazy")
+    }
+
+    /// sc-20263 — `VideoClip.strength` and `frame_idx` were silently dropped (`generate` binds only
+    /// `clip.frames`). Each is now a typed `Unsupported` naming the field and the model, raised
+    /// through `Generator::validate` — the seam `generate` calls first.
+    ///
+    /// Non-default values throughout: at the contract defaults the refusal must not fire, which the
+    /// companion test pins.
+    #[test]
+    fn non_default_video_clip_knobs_are_refused_by_name() {
+        let g = unloaded();
+        for (req, field) in [
+            (clip_request(0, 0.6), "strength"),
+            (clip_request(4, 1.0), "frame_idx"),
+        ] {
+            let err = g
+                .validate(&req)
+                .expect_err("a non-default knob must be refused");
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "{field}: typed Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field}: names the field: {msg}");
+            assert!(msg.contains(MODEL_ID), "{field}: names the model: {msg}");
+        }
+    }
+
+    /// sc-20263 — the refusal must inspect **every** clip, not the first. `generate` selects the
+    /// first NON-empty clip, so a bad value on clip two is exactly the one that would otherwise
+    /// stay silently dropped.
+    #[test]
+    fn a_bad_knob_on_the_second_clip_is_still_refused() {
+        let req = GenerationRequest {
+            width: 32,
+            height: 32,
+            count: 1,
+            conditioning: vec![
+                Conditioning::VideoClip {
+                    frames: Vec::new(),
+                    frame_idx: 0,
+                    strength: 1.0,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![frame()],
+                    frame_idx: 7,
+                    strength: 1.0,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = unloaded()
+            .validate(&req)
+            .expect_err("clip two's frame_idx must be refused");
+        assert!(err.to_string().contains("frame_idx"), "got: {err}");
+    }
+
+    /// sc-20263 — the refusal fires only on a value a caller actually set. The contract defaults
+    /// (`strength = 1.0`, `frame_idx = 0`) — every request SceneWorks builds today — validate, as
+    /// does an image-upscale request that carries no clip at all.
+    #[test]
+    fn default_video_clip_knobs_still_pass_unchanged() {
+        let g = unloaded();
+        g.validate(&clip_request(0, 1.0))
+            .expect("a default-valued VideoClip must still validate");
+        g.validate(&GenerationRequest {
+            width: 32,
+            height: 32,
+            count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: frame(),
+                strength: None,
+            }],
+            ..Default::default()
+        })
+        .expect("an image upscale carries no clip and is unaffected");
     }
 }

@@ -411,6 +411,9 @@ impl Generator for BerniniRenderer {
         }
         // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095.
         validate_bernini_geometry(id, req)?;
+        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
+        // same conditioning through the same encode path, so they must give the same answer.
+        crate::bernini::reject_unimplemented_video_clip_knobs(id, req)?;
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode with no source silently renders text-only; a text-only mode with a source drops it.
         let has_video = req

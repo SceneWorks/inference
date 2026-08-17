@@ -401,6 +401,9 @@ impl BerniniRenderer {
         // `1 + 4·k` frame rule — mirrored from candle's `validate_bernini_geometry` so the same
         // request gets the same rejection on both backends.
         validate_bernini_geometry(self.descriptor.id, req)?;
+        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
+        // same conditioning through the same encode path, so they must give the same answer.
+        crate::bernini::reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
         Ok(())
     }
 
