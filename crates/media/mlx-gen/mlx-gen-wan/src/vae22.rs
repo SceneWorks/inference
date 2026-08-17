@@ -1367,7 +1367,7 @@ impl Wan22Vae {
     ///
     /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
     /// — including the spatial self-attention — run **once** on the full latent
-    /// ([`Decoder3d::forward_middle`]); only the spatially-local tail is tiled. This previously ran
+    /// (`Decoder3d::forward_middle`); only the spatially-local tail is tiled. This previously ran
     /// the whole decoder per tile, so every spatial tile's `middle.1` softmax attended over its own
     /// crop's token set instead of the frame's. The middle blocks are shape-preserving at latent
     /// resolution, so the tile plan is unchanged.

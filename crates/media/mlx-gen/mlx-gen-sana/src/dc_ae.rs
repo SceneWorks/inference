@@ -461,7 +461,7 @@ impl DcAeDecoder {
     /// The stored stage order is shallow→deep and the SANA-1.0 autoencoder is `[R,R,R,E,E,E]`, so
     /// this counts the leading `Res` run (3). The deep `EfficientVit` stages are the **head**:
     /// their ReLU-linear attention contracts over **every** `H·W` token
-    /// ([`LinearAttn::forward`]'s `matmul(v, kᵀ)` and `sum_axes(&k, &[3])`), so evaluating one on a
+    /// (`LinearAttn::forward`'s `matmul(v, kᵀ)` and `sum_axes(&k, &[3])`), so evaluating one on a
     /// crop aggregates over that crop instead of the image — the same defect class as a per-tile
     /// GroupNorm. Robust to any shallow-`Res` / deep-`EfficientVit` split (the DC-AE family
     /// invariant); a config with no leading `Res` run yields 0 and forces a single-pass decode.

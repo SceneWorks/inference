@@ -196,7 +196,7 @@ impl QwenVae {
     /// (the single-pass [`decode`](Self::decode) doesn't clamp either — the `[-1,1]` clamp is applied
     /// later by the engine's `decoded_to_image`), so the tiled output matches the untiled one to within
     /// the blend tolerance — the *conv-halo* seam term described on
-    /// [`Decoder3D::forward_upsample_tail`], which the shipped 64 px overlap attenuates rather than
+    /// `Decoder3D::forward_upsample_tail`, which the shipped 64 px overlap attenuates rather than
     /// eliminates. It is never a per-tile normalization or attention term: that is the sc-19753
     /// property, pinned by `tests/vae_tiling_normalization_proof.rs`.
     pub fn decode_tiled(

@@ -349,7 +349,7 @@ pub struct GlobalGroupNorm {
 
 impl GlobalGroupNorm {
     /// Capture dense GroupNorm statistics for an NCHW rank-4 activation. `weight`/`bias` are the
-    /// `[C]` affine parameters, exactly as [`candle_nn::group_norm`] loads them.
+    /// `[C]` affine parameters, exactly as [`fn@candle_nn::group_norm`] loads them.
     pub fn new(
         x: &Tensor,
         weight: &Tensor,

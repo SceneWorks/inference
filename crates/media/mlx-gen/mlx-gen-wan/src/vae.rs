@@ -741,7 +741,7 @@ impl WanVae {
     ///
     /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
     /// — including its spatial self-attention — run **once** on the full latent
-    /// ([`Decoder3d::forward_middle`]); only the spatially-local upsample tail is tiled. The
+    /// (`Decoder3d::forward_middle`); only the spatially-local upsample tail is tiled. The
     /// reference `WanVAE.decode_tiled` (`models/wan/tiling.py`) hoists just the denormalize and runs
     /// the *whole* decoder per tile, so every spatial tile's `middle.1` softmax attended only to its
     /// own crop's tokens. This port deliberately diverges from the reference there: the earlier
@@ -749,7 +749,8 @@ impl WanVae {
     /// but the middle attention is a spatial global reduction that the norms audit missed.
     ///
     /// The middle blocks are shape-preserving at latent resolution, so the tile plan is unchanged —
-    /// the same [`TilePlan`] now partitions the middle feature map instead of the latent. The
+    /// the same [`TilePlan`](mlx_gen::tiling::TilePlan) now partitions the middle feature map instead
+    /// of the latent. The
     /// full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so peak
     /// memory stays bounded by one tile's tail.
     ///

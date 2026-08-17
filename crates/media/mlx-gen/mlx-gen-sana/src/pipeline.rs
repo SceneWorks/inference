@@ -271,7 +271,7 @@ fn decode_to_image_with_tiling(
 /// for any future quality-first move.
 ///
 /// **sc-19753 — that sweep measured a superseded mechanism.** Every row above was captured while
-/// [`decode_tiled`] tiled the *whole* decoder, so each tile's nine `EfficientVit` blocks aggregated
+/// `decode_tiled` tiled the *whole* decoder, so each tile's nine `EfficientVit` blocks aggregated
 /// their ReLU-linear attention over that tile's tokens instead of the image. That is why widening
 /// the overlap to 96 px only floored at meanD ~3.0 instead of converging: overlap width cannot fix
 /// a per-tile global reduction. The attention now runs once in the dense head and only the

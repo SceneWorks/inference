@@ -686,7 +686,7 @@ const _: i32 = LATENT_CHANNELS; // documented; channel counts come from the chec
 /// Weights-free synthetic FLUX.2 VAE, for tiled-decode regressions (sc-19753).
 ///
 /// `#[doc(hidden)]` test instrumentation rather than a `#[cfg(test)]` module because **Lens shares
-/// this exact decode path** ([`mlx_gen_lens::vae::decode_with_tiling`] hands its packed grid to
+/// this exact decode path** (`mlx_gen_lens::vae::decode_with_tiling` hands its packed grid to
 /// [`Flux2Vae::decode_packed_latents_tiled`]), and a downstream crate cannot reach another crate's
 /// `cfg(test)` items. Sharing the builder is what lets the Lens-side proof drive the real seam
 /// instead of restating a copy of it that could drift.
@@ -763,7 +763,7 @@ pub mod tiling_fixture {
     }
 
     /// A structurally faithful synthetic FLUX.2 VAE: the real block/resnet counts
-    /// ([`BLOCK_OUT`], [`LAYERS_PER_BLOCK`]) at one narrow channel width.
+    /// (`BLOCK_OUT`, `LAYERS_PER_BLOCK`) at one narrow channel width.
     pub fn weights() -> Weights {
         let blocks = BLOCK_OUT.len();
         let mut tensors = HashMap::new();
