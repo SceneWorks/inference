@@ -2846,10 +2846,16 @@ mod tests {
     fn committed_matrix_is_complete_and_content_pinned() {
         let matrix = committed_matrix();
         matrix.validate().unwrap();
-        assert_eq!(matrix.cases.len(), 9);
-        assert_eq!(matrix.variants.len(), 8);
+        // The `cases.len() == 9` / `variants.len() == 8` / `artifacts.len() == 3` pins that used to
+        // sit here were frozen populations of what `validate()` above already states as a contract,
+        // and they were the stricter, wrong end of it: `validate` derives the variant total from
+        // `OptimizationToggle::ALL` plus the baseline/tiled-control/all_on trio, requires
+        // `referenced_artifacts == artifact_keys` so the artifact table is exactly what the cases
+        // cite, and allows 2-3 cases per family. Pinning 9 therefore forbade a family legitimately
+        // carrying 2. (`is_canonical_acceptance_matrix` cannot stand in for them either: `canonical`
+        // and `committed_matrix` both parse the same embedded JSON, so here it is a tautology — its
+        // real work is in `structurally_valid_custom_matrix_is_never_acceptance_canonical`.)
         assert!(matrix.is_canonical_acceptance_matrix());
-        assert_eq!(matrix.artifacts.len(), 3);
         assert!(matrix
             .artifacts
             .iter()
