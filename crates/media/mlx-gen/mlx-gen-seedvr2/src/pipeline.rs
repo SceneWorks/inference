@@ -10,9 +10,10 @@
 //! text encoder), bundled in the crate (`data/neg_embed.safetensors`) and loaded at construction.
 
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
+use mlx_gen::vae_tiling::accumulate_along_axis;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, pad, subtract};
+use mlx_rs::ops::{concatenate_axis, divide, multiply, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
@@ -748,9 +749,19 @@ impl Seedvr2Pipeline {
         let (height, width) = (sh[3], sh[4]);
         let plan = video::plan_spatial_tiles(height, width, tile, overlap);
         let n_tiles = plan.len();
+        // `plan_spatial_tiles` emits a product grid with x varying fastest, so a row of tiles closes
+        // every `row_len` entries. That lets the assembly below fold x into a row strip and only then
+        // fold the strip into the frame (sc-18320) — the full-frame accumulators are touched once per
+        // row instead of once per tile, and no weighted tile is ever padded to the full frame.
+        let row_len = plan
+            .first()
+            .map(|first| plan.iter().filter(|t| t.y0 == first.y0).count().max(1))
+            .unwrap_or(1);
         let ts = Array::from_f32(TIMESTEP);
         let mut acc: Option<Array> = None; // (1,3,1,H,W)
         let mut wsum: Option<Array> = None; // (1,1,1,H,W)
+        let mut row_acc: Option<Array> = None; // (1,3,1,th,W)
+        let mut row_wsum: Option<Array> = None; // (1,1,1,th,W)
         for (tile_idx, t) in plan.iter().enumerate() {
             // Per-tile cancel — the per-tile `eval` at the end of each iter (below) makes the
             // prior tile's compute materialized, so this check is effective (sc-5551).
@@ -784,25 +795,55 @@ impl Seedvr2Pipeline {
                 overlap,
             );
             let weight = Array::from_slice(&wvec, &[1, 1, 1, th, tw]).as_dtype(self.dtype)?;
-            let pad_spec = [
-                (0, 0),
-                (0, 0),
-                (0, 0),
-                (t.y0, height - t.y1),
-                (t.x0, width - t.x1),
-            ];
-            let wdec = pad(&multiply(&decoded, &weight)?, &pad_spec[..], None, None)?;
-            let wpad = pad(&weight, &pad_spec[..], None, None)?;
-            acc = Some(match acc {
-                Some(a) => add(&a, &wdec)?,
-                None => wdec,
-            });
-            wsum = Some(match wsum {
-                Some(a) => add(&a, &wpad)?,
-                None => wpad,
-            });
+            // Fold along x into the row strip; the placement pad spans the x axis only.
+            row_acc = Some(accumulate_along_axis(
+                row_acc.take(),
+                &multiply(&decoded, &weight)?,
+                4,
+                t.x0,
+                tw,
+                width,
+            )?);
+            row_wsum = Some(accumulate_along_axis(
+                row_wsum.take(),
+                &weight,
+                4,
+                t.x0,
+                tw,
+                width,
+            )?);
+            // Close the finished row into the frame along y.
+            if (tile_idx + 1) % row_len == 0 {
+                let strip = row_acc.take().expect("the row opened above");
+                let strip_weight = row_wsum.take().expect("the row opened above");
+                acc = Some(accumulate_along_axis(
+                    acc.take(),
+                    &strip,
+                    3,
+                    t.y0,
+                    th,
+                    height,
+                )?);
+                wsum = Some(accumulate_along_axis(
+                    wsum.take(),
+                    &strip_weight,
+                    3,
+                    t.y0,
+                    th,
+                    height,
+                )?);
+            }
             // materialize so the just-processed tile's activations (and prior graph) are freed.
-            eval([acc.as_ref().unwrap(), wsum.as_ref().unwrap()])?;
+            let live: Vec<&Array> = [
+                row_acc.as_ref(),
+                row_wsum.as_ref(),
+                acc.as_ref(),
+                wsum.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            eval(live)?;
             // F-164: report this completed tile (1-based) against the tile count for liveness.
             on_step(tile_idx + 1, n_tiles);
         }
