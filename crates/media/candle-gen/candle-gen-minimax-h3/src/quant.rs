@@ -48,8 +48,8 @@
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::candle_nn::Linear;
-use candle_gen::quant::{AdaptLinear, QLinear, MLX_GROUP_SIZE as GROUP_SIZE};
+use candle_gen::candle_nn::{Embedding, Linear};
+use candle_gen::quant::{AdaptLinear, QEmbedding, QLinear, MLX_GROUP_SIZE as GROUP_SIZE};
 use candle_gen::{CandleError, Result, Weights};
 
 /// A loaded projection plus the device bytes its **frozen base** holds.
@@ -164,6 +164,85 @@ pub fn lin(w: &Weights, base: &str, bias: bool, dtype: DType) -> Result<TieredLi
     Ok(TieredLinear {
         linear: AdaptLinear::from_dense(Linear::new(weight, dense_bias), in_features, out),
         base_bytes,
+    })
+}
+
+/// A loaded token embedding plus the device bytes its table holds.
+///
+/// The embedding analogue of [`TieredLinear`], and recorded at load for the same reason: a packed
+/// table never materializes densely and [`candle_gen::quant::QEmbedding`] exposes no byte accessor.
+pub struct TieredEmbedding {
+    /// The shared dense-or-packed token table.
+    pub embedding: QEmbedding,
+    /// Device bytes the table holds (the GGUF blocks when packed, the dense table otherwise).
+    pub base_bytes: usize,
+    /// The table's `hidden` width — recoverable from a packed table only via its scales, so it is
+    /// captured here rather than re-derived at the call site.
+    pub hidden: usize,
+}
+
+/// Load `{base}.weight` as a shared [`candle_gen::quant::QEmbedding`] — **packed** when
+/// `{base}.scales` is present, else **dense**.
+///
+/// The token table is a genuine pack target: `mlx_gen_minimax_h3::convert::TE_PACK_SUFFIXES` names
+/// `.embed_tokens`, so a published packed text-encoder tier ships this tensor as u32 codes. A raw
+/// `Weights::require` would hand those codes back as if they were a float table and report nothing
+/// at all — the sc-14980 class — so the detect has to live here rather than at the call site.
+///
+/// `dtype` is the **store** dtype the gathered rows come back as, matching the dense path exactly
+/// (`candle-gen-boogu`'s Qwen3-VL precedent, sc-9410): the caller widens to the compute dtype after
+/// the gather, not before.
+///
+/// # The packed forward dequantizes the whole table
+///
+/// [`candle_gen::quant::QEmbedding`]'s quantized forward dequantizes the full `[vocab, hidden]`
+/// table before index-selecting, so the packed path trades a permanent dense table for a transient
+/// one. That is the shared seam's established behaviour (boogu runs the identical path for this same
+/// Qwen3-VL tower) and it is bounded: conditioning runs **once per render**, not once per step. The
+/// resident saving is real; the transient is the documented cost of it.
+pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
+    let weight_key = format!("{base}.weight");
+    let scales_key = format!("{base}.scales");
+
+    if w.contains(&scales_key) {
+        let wq = w.require(&weight_key)?;
+        if wq.dtype() != DType::U32 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 te {base}: `{scales_key}` marks this table packed, but `{weight_key}` \
+                 loaded as {:?} rather than U32 — the packed code stream must reach the repack at \
+                 its native width, and a float cast has already destroyed it",
+                wq.dtype()
+            )));
+        }
+        let scales = w.require(&scales_key)?;
+        let biases = w.require(&format!("{base}.biases"))?;
+        let (_vocab, groups) = scales.dims2()?;
+        let hidden = groups * GROUP_SIZE;
+        let device = wq.device().clone();
+        let embedding =
+            QEmbedding::from_packed_dtype_gs(&wq, &scales, &biases, &device, dtype, GROUP_SIZE)?;
+        let base_bytes = match &embedding {
+            QEmbedding::Quantized { table, .. } => table.storage_size_in_bytes(),
+            QEmbedding::Dense(_) => {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 te {base}: the packed repack produced a dense embedding"
+                )))
+            }
+        };
+        return Ok(TieredEmbedding {
+            embedding,
+            base_bytes,
+            hidden,
+        });
+    }
+
+    let weight = w.require(&weight_key)?.to_dtype(dtype)?;
+    let (_vocab, hidden) = weight.dims2()?;
+    let base_bytes = dense_bytes(&weight);
+    Ok(TieredEmbedding {
+        embedding: QEmbedding::Dense(Embedding::new(weight, hidden)),
+        base_bytes,
+        hidden,
     })
 }
 

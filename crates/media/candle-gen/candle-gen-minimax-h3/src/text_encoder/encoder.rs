@@ -36,9 +36,10 @@ use candle_gen::candle_core::{DType, IndexOp, Tensor};
 use candle_gen::grounding::{
     causal_mask, mrope_cos_sin, repeat_kv, replace_seq, slice_seq, Rotary,
 };
+use candle_gen::quant::AdaptLinear;
 use candle_gen::{CandleError, Result, Weights};
 
-use crate::nn::{linear_nb, rms_weighted, silu};
+use crate::nn::{rms_weighted, silu};
 
 use super::{MiniMaxH3TeConfig, TE_COMPUTE_DTYPE};
 
@@ -50,30 +51,61 @@ use super::{MiniMaxH3TeConfig, TE_COMPUTE_DTYPE};
 /// `t2va`. A presentation past it is a typed error, never a silent truncation.
 pub const MAX_TEXT_POSITIONS: usize = 16_384;
 
-/// `y = x · Wᵀ` for a bias-less Qwen3 projection stored `[out, in]`.
+/// `y = x · Wᵀ` for a bias-less Qwen3 projection stored `[out, in]` — **dense or MLX-packed**.
 ///
 /// A newtype rather than a bare `Tensor` so the four attention projections and the three MLP ones
 /// cannot be transposed past each other at a call site, and so `nbytes` has one home.
+///
+/// # Every projection this type loads is a pack target, and that is the whole surface
+///
+/// The seven bases routed through here — `self_attn.{q,k,v,o}_proj` and `mlp.{gate,up,down}_proj` —
+/// are exactly the seven Qwen3 decoder entries in
+/// `mlx_gen_minimax_h3::convert::TE_PACK_SUFFIXES`, so this one loader mirrors the converter's
+/// entire decoder-side pack set. The tensors the converter leaves dense (`TE_DENSE_BY_POLICY`: the
+/// q/k norms and the two layer norms) are read by their own `require` calls, each fronted by
+/// [`crate::quant::guard_dense`].
 #[derive(Debug, Clone)]
 struct Proj {
-    weight: Tensor,
+    inner: AdaptLinear,
+    /// Device bytes the frozen base holds, recorded at load — a packed base has no dense weight to
+    /// measure afterwards. See [`crate::quant::TieredLinear`].
+    base_bytes: usize,
 }
 
 impl Proj {
+    /// Load `{key}` — **packed** when `{key}.scales` is present, else dense at `dtype`.
     fn load(w: &Weights, key: &str, dtype: DType) -> Result<Self> {
+        let loaded = crate::quant::lin(w, key, false, dtype)?;
         Ok(Self {
-            weight: w.require(&format!("{key}.weight"))?.to_dtype(dtype)?,
+            inner: loaded.linear,
+            base_bytes: loaded.base_bytes,
         })
     }
 
     /// Upcasting forward: the weight is cast to the activation dtype per matmul, so a bf16 store
     /// computes f32 (see the module docs).
+    ///
+    /// The activation is flattened to 2-D first, exactly as [`crate::dit::layers::LinearNoBias`]
+    /// does and for the same reason: this preserves [`crate::nn::linear_nb`]'s rank contract, which
+    /// the shared seam does not have — [`AdaptLinear`]'s dense base is a `candle_nn::Linear`, whose
+    /// forward special-cases ranks 2-4 and falls through to a same-rank `matmul` otherwise. Folding
+    /// every leading dim into the GEMM's `M` is additionally the *same* single large-`M` GEMM
+    /// `linear_nb` issued, so the dense forward keeps its previous shape as well as its previous
+    /// result.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        linear_nb(x, &self.weight)
+        let dims = x.dims().to_vec();
+        let in_features = *dims.last().expect("Proj::forward: x has no axes");
+        let rows = x.elem_count() / in_features;
+        let y = self
+            .inner
+            .forward_upcast(&x.reshape((rows, in_features))?)?;
+        let mut out_dims = dims;
+        *out_dims.last_mut().expect("Proj::forward: x has no axes") = self.inner.out_features();
+        Ok(y.reshape(out_dims)?)
     }
 
     fn nbytes(&self) -> usize {
-        self.weight.elem_count() * self.weight.dtype().size_in_bytes()
+        self.base_bytes
     }
 }
 
@@ -96,6 +128,13 @@ impl Qwen3Attention {
     fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         // The q/k norms are `[head_dim]` vectors, ~0.5 KB each. Kept f32 so `rms_weighted` runs
         // f32-on-f32 whatever the projection store is — bit-identical to an all-f32 load.
+        //
+        // `.q_norm` / `.k_norm` are named in `mlx_gen_minimax_h3::convert::TE_DENSE_BY_POLICY`, so
+        // they are dense in every tier and read here with a raw `require` + `to_dtype`. That cast is
+        // the unguarded surface: handed u32 codes it produces floats from a bit pattern and reports
+        // nothing (sc-14980). `guard_dense` makes a tier that ever packed them a loud load error.
+        crate::quant::guard_dense(w, &format!("{prefix}.q_norm"))?;
+        crate::quant::guard_dense(w, &format!("{prefix}.k_norm"))?;
         let q_norm = w
             .require(&format!("{prefix}.q_norm.weight"))?
             .to_dtype(DType::F32)?;
@@ -209,6 +248,10 @@ struct Qwen3DecoderLayer {
 
 impl Qwen3DecoderLayer {
     fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
+        // Both layer norms are `TE_DENSE_BY_POLICY` entries read through a raw `require` — guarded
+        // for the same reason the q/k norms above are.
+        crate::quant::guard_dense(w, &format!("{prefix}.input_layernorm"))?;
+        crate::quant::guard_dense(w, &format!("{prefix}.post_attention_layernorm"))?;
         Ok(Self {
             // f32 norm weights, for the same reason the q/k norms are f32.
             input_ln: w
@@ -237,7 +280,10 @@ impl Qwen3DecoderLayer {
 
 /// MiniMax-H3's Qwen3-VL-32B condition encoder.
 pub struct MiniMaxH3TextEncoder {
-    embed_tokens: Tensor,
+    /// The token table — **dense or MLX-packed**. `.embed_tokens` is a
+    /// `mlx_gen_minimax_h3::convert::TE_PACK_SUFFIXES` entry, so a published packed tier ships it as
+    /// u32 codes; [`crate::quant::embed`] detects that on the `.scales` sibling.
+    embed_tokens: crate::quant::TieredEmbedding,
     layers: Vec<Qwen3DecoderLayer>,
     rotary: Rotary,
     /// 0-indexed decoder layer whose output is the context (`select_hidden - 1`).
@@ -293,8 +339,20 @@ impl MiniMaxH3TextEncoder {
                 dtype,
             )?);
         }
-        let embed_tokens = w.require(&format!("{prefix}.embed_tokens.weight"))?;
-        let device = embed_tokens.device().clone();
+        // The store dtype is passed through so the gathered rows come back exactly as the dense path
+        // produced them; `embed` widens to the compute dtype after the gather, not before.
+        let embed_tokens = crate::quant::embed(w, &format!("{prefix}.embed_tokens"), dtype)?;
+        // A packed table is a `QTensor` with no `Tensor` to ask for a device, so the rotary table is
+        // built on the device the *weights* are on — falling back to the `embed_tokens` weight
+        // itself, which exists on both paths (a float table, or the u32 code stream) and is what a
+        // `Weights::from_map` fixture carries.
+        let device = match w.device() {
+            Some(d) => d.clone(),
+            None => w
+                .require(&format!("{prefix}.embed_tokens.weight"))?
+                .device()
+                .clone(),
+        };
         Ok(Self {
             embed_tokens,
             layers,
@@ -319,7 +377,7 @@ impl MiniMaxH3TextEncoder {
     /// The conditioning stage's resident cost, readable without a profiler — which is what makes
     /// the staged-residency tripwire able to assert on the *encoder* rather than on a proxy.
     pub fn nbytes(&self) -> usize {
-        self.embed_tokens.elem_count() * self.embed_tokens.dtype().size_in_bytes()
+        self.embed_tokens.base_bytes
             + self
                 .layers
                 .iter()
@@ -498,8 +556,8 @@ impl MiniMaxH3TextEncoder {
     fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
         let flat = input_ids.reshape(b * s)?.to_dtype(DType::U32)?;
-        let rows = self.embed_tokens.index_select(&flat, 0)?;
-        let hidden = self.embed_tokens.dim(1)?;
+        let rows = self.embed_tokens.embedding.forward(&flat)?;
+        let hidden = self.embed_tokens.hidden;
         Ok(rows.reshape((b, s, hidden))?.to_dtype(TE_COMPUTE_DTYPE)?)
     }
 
@@ -702,6 +760,116 @@ mod tests {
         Weights::from_map(m)
     }
 
+    /// A **packable** tiny tower: every projection's input width is 64, so the MLX group-64 pack is
+    /// expressible. [`tiny_cfg`]'s hidden of 8 cannot be packed at all (the group does not divide
+    /// it), which is why the packed tests need their own shape rather than reusing that fixture.
+    fn packable_cfg() -> MiniMaxH3TeConfig {
+        MiniMaxH3TeConfig {
+            hidden_size: 64,
+            num_layers: 3,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            intermediate_size: 64,
+            select_hidden: 2,
+            vocab_size: 64,
+            ..tiny_cfg()
+        }
+    }
+
+    /// The seven per-layer bases [`Proj`] loads — exactly the Qwen3 decoder entries in
+    /// `mlx_gen_minimax_h3::convert::TE_PACK_SUFFIXES`, paired with their `[out, in]`.
+    fn packable_projections(cfg: &MiniMaxH3TeConfig) -> Vec<(String, usize, usize)> {
+        let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+        let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
+        vec![
+            ("self_attn.q_proj".into(), nh * hd, hidden),
+            ("self_attn.k_proj".into(), nkv * hd, hidden),
+            ("self_attn.v_proj".into(), nkv * hd, hidden),
+            ("self_attn.o_proj".into(), hidden, nh * hd),
+            ("mlp.gate_proj".into(), inter, hidden),
+            ("mlp.up_proj".into(), inter, hidden),
+            ("mlp.down_proj".into(), hidden, inter),
+        ]
+    }
+
+    /// Build a text-encoder weight map for [`packable_cfg`].
+    ///
+    /// When `packed`, every [`Proj`] base and the token table are written as MLX packed triples and
+    /// the returned map additionally carries the **dequantized affine grid** each one decodes to,
+    /// under the plain `{base}.weight` key — that grid is the dense reference the packed forward is
+    /// measured against (it is what the tier's producer quantized; the unquantized weight is a
+    /// different tensor and would only measure quantization error).
+    ///
+    /// The norms are dense in both fixtures: `.q_norm` / `.k_norm` / `.input_layernorm` /
+    /// `.post_attention_layernorm` are `TE_DENSE_BY_POLICY` entries.
+    fn packable_weights(
+        cfg: &MiniMaxH3TeConfig,
+        packed: bool,
+    ) -> (Weights, HashMap<String, Tensor>) {
+        let dev = Device::Cpu;
+        let hd = cfg.head_dim;
+        let t = |shape: &[usize], seed: f32| {
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.2)
+                .collect();
+            Tensor::from_vec(v, shape, &dev).unwrap()
+        };
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        let mut grids: HashMap<String, Tensor> = HashMap::new();
+
+        // The token table — a pack target (`.embed_tokens`).
+        if packed {
+            let grid = crate::quant::testkit::insert_packed(
+                &mut m,
+                "lm.embed_tokens",
+                cfg.vocab_size,
+                cfg.hidden_size,
+                1,
+            );
+            grids.insert("lm.embed_tokens.weight".into(), grid);
+        } else {
+            m.insert(
+                "lm.embed_tokens.weight".into(),
+                t(&[cfg.vocab_size, cfg.hidden_size], 0.1),
+            );
+        }
+
+        for i in 0..cfg.num_layers {
+            let p = format!("lm.layers.{i}");
+            let s = i as f32;
+            // Dense by policy, in every tier.
+            m.insert(
+                format!("{p}.input_layernorm.weight"),
+                t(&[cfg.hidden_size], s + 0.4),
+            );
+            m.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                t(&[cfg.hidden_size], s + 0.5),
+            );
+            m.insert(format!("{p}.self_attn.q_norm.weight"), t(&[hd], s + 1.0));
+            m.insert(format!("{p}.self_attn.k_norm.weight"), t(&[hd], s + 1.1));
+            // Pack targets.
+            for (n, (suffix, out, in_)) in packable_projections(cfg).into_iter().enumerate() {
+                let base = format!("{p}.{suffix}");
+                if packed {
+                    let grid = crate::quant::testkit::insert_packed(
+                        &mut m,
+                        &base,
+                        out,
+                        in_,
+                        i * 7 + n + 2,
+                    );
+                    grids.insert(format!("{base}.weight"), grid);
+                } else {
+                    m.insert(format!("{base}.weight"), t(&[out, in_], s + n as f32 * 0.1));
+                }
+            }
+        }
+        (Weights::from_map(m), grids)
+    }
+
     fn ids(v: &[u32]) -> Tensor {
         Tensor::from_vec(v.to_vec(), (1, v.len()), &Device::Cpu).unwrap()
     }
@@ -712,6 +880,156 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// **Detection.** A `.scales` sibling packs every one of the seven decoder projections and the
+    /// token table; the dense-by-policy norms stay dense. This is the candle mirror of
+    /// `mlx_gen_minimax_h3::convert::is_te_pack_target` over the surface this crate loads.
+    #[test]
+    fn a_packed_tier_packs_every_projection_and_the_token_table() {
+        let cfg = packable_cfg();
+        let (w, _) = packable_weights(&cfg, true);
+        let te = MiniMaxH3TextEncoder::from_weights(&w, "lm", &cfg, DType::F32).unwrap();
+
+        assert!(
+            te.embed_tokens.embedding.is_quantized(),
+            "`.embed_tokens` is a TE_PACK_SUFFIXES entry — it must load packed"
+        );
+        assert_eq!(te.layers.len(), cfg.select_hidden);
+        for (i, layer) in te.layers.iter().enumerate() {
+            for (name, p) in [
+                ("q_proj", &layer.attn.q_proj),
+                ("k_proj", &layer.attn.k_proj),
+                ("v_proj", &layer.attn.v_proj),
+                ("o_proj", &layer.attn.o_proj),
+                ("gate_proj", &layer.mlp.gate),
+                ("up_proj", &layer.mlp.up),
+                ("down_proj", &layer.mlp.down),
+            ] {
+                assert!(
+                    p.inner.is_packed(),
+                    "layer {i} {name} must load packed from its `.scales` sibling"
+                );
+                assert_eq!(
+                    p.inner.matmul_strategy(),
+                    Some(candle_gen::quant::MatmulStrategy::DequantDense),
+                    "sc-7702: layer {i} {name} must dequantize the WEIGHT, never quantize the \
+                     activation"
+                );
+            }
+            // The norms are dense in every tier, so they are plain tensors, not projections.
+            assert_eq!(layer.attn.q_norm.dtype(), DType::F32);
+            assert_eq!(layer.input_ln.dtype(), DType::F32);
+        }
+
+        // The packed tower is materially smaller than the dense one it decodes to.
+        let (dense_w, _) = packable_weights(&cfg, false);
+        let dense = MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
+        assert!(
+            te.nbytes() < dense.nbytes(),
+            "packed {} must be smaller than dense {}",
+            te.nbytes(),
+            dense.nbytes()
+        );
+    }
+
+    /// **Numerics.** The packed tower reproduces a dense tower built from the *same dequantized
+    /// grids*, on relative max-abs — never cosine, which is scale-invariant and therefore blind to a
+    /// mis-decoded group scale (the defect class the packed path can produce).
+    #[test]
+    fn the_packed_te_forward_matches_its_dense_grid() {
+        let cfg = packable_cfg();
+        let (packed_w, grids) = packable_weights(&cfg, true);
+
+        // The dense reference: the packed fixture with each packed triple replaced by the affine
+        // grid it decodes to.
+        let mut dense_map: HashMap<String, Tensor> = HashMap::new();
+        for k in packed_w.keys() {
+            if k.ends_with(".scales") || k.ends_with(".biases") {
+                continue;
+            }
+            let t = match grids.get(k) {
+                Some(grid) => grid.clone(),
+                None => packed_w.require(k).unwrap(),
+            };
+            dense_map.insert(k.clone(), t);
+        }
+        let dense_w = Weights::from_map(dense_map);
+
+        let packed = MiniMaxH3TextEncoder::from_weights(&packed_w, "lm", &cfg, DType::F32).unwrap();
+        let dense = MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
+        assert!(packed.embed_tokens.embedding.is_quantized());
+        assert!(!dense.embed_tokens.embedding.is_quantized());
+
+        let tokens = ids(&[1, 4, 9, 2, 11]);
+        let mask = ones_mask(5);
+        let got = packed.forward(&tokens, &mask).unwrap();
+        let want = dense.forward(&tokens, &mask).unwrap();
+        let drift = crate::quant::testkit::rel_max_abs(&got, &want);
+        println!("[te] packed vs dense-grid rel-max-abs = {drift:.3e}");
+        assert!(
+            drift < 5e-3,
+            "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
+        );
+    }
+
+    /// **The guard.** A packed triple under a dense-by-policy TE key is refused loudly, naming the
+    /// key — the sc-14980 class. Asserted on each of the four dense-by-policy suffixes this crate
+    /// reads, individually, so a guard dropped from any one of them is caught.
+    #[test]
+    fn a_packed_tensor_under_a_dense_by_policy_te_key_is_refused() {
+        let cfg = packable_cfg();
+        for dense_key in [
+            "lm.layers.0.self_attn.q_norm",
+            "lm.layers.0.self_attn.k_norm",
+            "lm.layers.0.input_layernorm",
+            "lm.layers.0.post_attention_layernorm",
+        ] {
+            let (w, _) = packable_weights(&cfg, false);
+            let mut map: HashMap<String, Tensor> = w
+                .keys()
+                .map(|k| (k.clone(), w.require(k).unwrap()))
+                .collect();
+            // Pack a tensor the policy says is dense in every tier.
+            crate::quant::testkit::insert_packed(&mut map, dense_key, 64, 64, 3);
+            let msg = match MiniMaxH3TextEncoder::from_weights(
+                &Weights::from_map(map),
+                "lm",
+                &cfg,
+                DType::F32,
+            ) {
+                Ok(_) => panic!("a packed `{dense_key}` must be refused, not loaded"),
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains(dense_key), "{msg}");
+            assert!(msg.contains("MLX-PACKED"), "{msg}");
+        }
+    }
+
+    /// A packed token table whose `.weight` is not a u32 code stream is a typed error, not a silent
+    /// repack of whatever floats happened to be there.
+    #[test]
+    fn a_packed_marker_over_a_float_token_table_is_refused() {
+        let cfg = packable_cfg();
+        let (w, _) = packable_weights(&cfg, true);
+        let mut map: HashMap<String, Tensor> = w
+            .keys()
+            .map(|k| (k.clone(), w.require(k).unwrap()))
+            .collect();
+        map.insert(
+            "lm.embed_tokens.weight".into(),
+            Tensor::zeros((cfg.vocab_size, 8), DType::F32, &Device::Cpu).unwrap(),
+        );
+        let msg = match MiniMaxH3TextEncoder::from_weights(
+            &Weights::from_map(map),
+            "lm",
+            &cfg,
+            DType::F32,
+        ) {
+            Ok(_) => panic!("a float table under a packed marker must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("rather than U32"), "{msg}");
     }
 
     /// The tap runs exactly `select_hidden` layers and stops — no final norm, no `lm_head`.
