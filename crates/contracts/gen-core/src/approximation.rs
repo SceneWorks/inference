@@ -7,9 +7,14 @@
 //! [`Capabilities::validate_request`](crate::Capabilities::validate_request) rather than letting a
 //! provider silently ignore a selection. The difference is the *equivalence class*: every execution
 //! domain is bit-identical or numerically equivalent by construction, so a planner may select one
-//! freely. Nothing here is. A denoise feature cache reuses a transformer block's output from an
-//! earlier step, so the trajectory it produces is a **different** trajectory — cheaper, and worse by
-//! an amount only measurement can state.
+//! freely. Nothing here is. A denoise feature cache reuses the block stack's output from an earlier
+//! step and token pruning skips a strided subset of the tokens' per-block updates, so the trajectory
+//! each produces is a **different** trajectory — cheaper, and worse by an amount only measurement can
+//! state.
+//!
+//! Two mechanisms ship, and they are orthogonal: the cache decides **which steps** run the block stack,
+//! pruning decides **which tokens** the stack updates. A request may select either or both, and each is
+//! declared, gated and refused on its own terms.
 //!
 //! That single difference drives the two properties this module has and `execution_domains`
 //! deliberately excludes.
@@ -23,13 +28,17 @@
 //!   whose `None` (the `Default`) is the pre-sc-18322 request, and
 //!   [`ApproximationRequest::default()`] selects nothing.
 //! * [`ApproximationPlan::Exact`] — the one value [`ApproximationSurface::resolve`] can return today
-//!   — is a variant with **no fields**. There is no plan that carries an approximation configured to
-//!   do nothing, so "off" cannot be expressed as a traversal of the approximate code path.
+//!   — is a variant with **no fields**, and `resolve` never returns
+//!   [`Approximate`](ApproximationPlan::Approximate) with every mechanism `None`. There is no plan that
+//!   carries an approximation configured to do nothing, so "off" cannot be expressed as a traversal of
+//!   the approximate code path.
 //! * [`CacheReuseInterval`] rejects `1` as hard as it rejects `0`. An interval of one step means
 //!   "recompute every step", which is arithmetically the exact path — but reached *through* the cache,
 //!   with its bookkeeping, its allocations and its evaluation schedule. Admitting it would create a
 //!   second encoding of off whose byte-identity nobody could prove, so the type refuses it and the
-//!   only way to be off is to not select.
+//!   only way to be off is to not select. [`TokenDropStride`] refuses `1` for the mirror-image reason:
+//!   a stride of one drops *every* token, so it is not a weaker approximation of the block, it is the
+//!   block's absence — and "drop nothing" is again the selection being absent.
 //!
 //! The consumer-side half of the guarantee is that a provider branches on
 //! [`ApproximationPlan::is_exact`] exactly once, at the top of its denoise, and the `Exact` arm is
@@ -43,7 +52,9 @@
 //! a user to find. So the contract makes measurement a *precondition of selection*, not a convention:
 //! an approximate selection is admitted only when the request carries a
 //! [`CharacterizationRef`] **and** the provider's surface carries the
-//! [`CharacterizationBinding`] that vouches for it.
+//! [`CharacterizationBinding`] that vouches for it. The precondition is shared by every mechanism,
+//! because the reason for it is: a result-changing lever may not be selected without a measurement of
+//! what it costs.
 //!
 //! No quality-characterization artifact format ships yet — that is epic 18304's terminal measurement
 //! campaign, which runs once at epic end. This module therefore defines the **seam** and nothing
@@ -83,7 +94,7 @@ use crate::{Error, Result};
 ///
 /// One step apart means "recompute every step" — the exact path — so it is not an interval. See the
 /// module docs: off is absence, never a parameter value.
-const MIN_REUSE_INTERVAL: u32 = 2;
+pub const MIN_REUSE_INTERVAL: u32 = 2;
 
 /// How many denoise steps apart a cached transformer feature is **recomputed**.
 ///
@@ -260,6 +271,149 @@ impl FeatureCacheDomain {
     }
 }
 
+/// The smallest drop stride that is actually an approximation. See [`TokenDropStride`].
+pub const MIN_DROP_STRIDE: u32 = 2;
+
+/// One in every `stride` latent tokens is **dropped** from a transformer block's per-token work.
+///
+/// A diffusion transformer applies the same per-token work — the attention query side and the
+/// feed-forward — to every token of the patchified latent. Neighbouring tokens are spatially adjacent
+/// patches and carry heavily overlapping information, so evaluating a strided subset and letting the
+/// rest pass through the block unchanged trades a fraction of the block's arithmetic for a slightly
+/// coarser update.
+///
+/// `2` drops half the tokens — the most aggressive stride — and larger strides drop fewer and are
+/// closer to exact, so this axis runs *opposite* to [`CacheReuseInterval`]'s. `1` and `0` are both
+/// rejected: `1` would drop every token (the block would become the identity, which is not an
+/// approximation of it), and `0` is not a stride. "Drop nothing" is the selection being **absent**,
+/// never a stride value — the same discipline the module docs describe for the cache.
+///
+/// A stride is deliberately not a *ratio*: a ratio would make the dropped count depend on the token
+/// count, and therefore on the request geometry, so the same selection would mean different things at
+/// different resolutions and no characterization could cover it. A stride is geometry-independent, and
+/// — critically — it is derived from position rather than from tensor *values*, so the surviving token
+/// count is known before the forward and nothing has to be read back from the accelerator to decide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TokenDropStride(NonZeroU32);
+
+impl TokenDropStride {
+    /// Drop every second token — the most aggressive stride.
+    pub const EVERY_SECOND_TOKEN: Self = Self(match NonZeroU32::new(MIN_DROP_STRIDE) {
+        Some(stride) => stride,
+        None => unreachable!(),
+    });
+
+    /// Drop one token in every `stride`.
+    pub fn new(stride: u32) -> Result<Self> {
+        if stride < MIN_DROP_STRIDE {
+            return Err(Error::Msg(format!(
+                "token drop stride must be >= {MIN_DROP_STRIDE} (got {stride}); a stride of 1 would \
+                 drop every token, and dropping none is the approximation being unset"
+            )));
+        }
+        Ok(Self(NonZeroU32::new(stride).expect("checked >= 2")))
+    }
+
+    /// Tokens per dropped token.
+    pub const fn stride(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Whether the token at zero-based sequence position `index` survives.
+    ///
+    /// The single decision point every consumer shares, so a provider cannot build a keep-set with one
+    /// phase and a restore map with another. Position `0` always survives, so the first token of the
+    /// sequence is never the dropped one at any stride.
+    pub const fn keeps_token(self, index: usize) -> bool {
+        !(index + 1).is_multiple_of(self.stride() as usize)
+    }
+
+    /// How many of `total` tokens survive this stride.
+    pub const fn kept_count(self, total: usize) -> usize {
+        total - total / self.stride() as usize
+    }
+}
+
+/// One request's selected token-pruning policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenPruningPolicy {
+    /// One token in every `drop_stride` is dropped from each block's per-token work.
+    pub drop_stride: TokenDropStride,
+    /// Leading denoise steps that prune nothing.
+    pub warmup: CacheWarmupSteps,
+}
+
+impl TokenPruningPolicy {
+    /// A policy with no warmup.
+    pub const fn new(drop_stride: TokenDropStride) -> Self {
+        Self {
+            drop_stride,
+            warmup: CacheWarmupSteps::NONE,
+        }
+    }
+
+    /// This policy with `warmup` leading un-pruned steps.
+    pub const fn with_warmup(mut self, warmup: CacheWarmupSteps) -> Self {
+        self.warmup = warmup;
+        self
+    }
+
+    /// Whether step `index` prunes at all. Warmup steps run the exact block stack, for the same reason
+    /// the cache's warmup does: the head of the trajectory decides composition.
+    pub const fn prunes_step(&self, index: usize) -> bool {
+        index >= self.warmup.steps() as usize
+    }
+}
+
+/// The production domain of a provider's token pruning. Same shape and same rationale as
+/// [`FeatureCacheDomain`] — a closed candidate list, because an approximate operating point without a
+/// measurement behind it is not a claim a provider can honestly make.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TokenPruningDomain {
+    /// The provider has no token pruning. Every selection is refused.
+    #[default]
+    Unsupported,
+    /// Exactly these drop strides are implemented, with warmup up to `max_warmup_steps`.
+    Implemented {
+        /// Drop strides the provider implements. Each must be >= [`MIN_DROP_STRIDE`].
+        drop_strides: Vec<u32>,
+        /// The largest warmup the provider honours.
+        max_warmup_steps: u32,
+    },
+}
+
+impl TokenPruningDomain {
+    /// Whether the provider declares the mechanism at all.
+    pub const fn is_supported(&self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    /// Whether `policy` sits inside the declared domain.
+    pub fn accepts(&self, policy: &TokenPruningPolicy) -> bool {
+        match self {
+            Self::Unsupported => false,
+            Self::Implemented {
+                drop_strides,
+                max_warmup_steps,
+            } => {
+                drop_strides.contains(&policy.drop_stride.stride())
+                    && policy.warmup.steps() <= *max_warmup_steps
+            }
+        }
+    }
+
+    /// Human-readable domain for a refusal message.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unsupported => "unsupported".to_owned(),
+            Self::Implemented {
+                drop_strides,
+                max_warmup_steps,
+            } => format!("drop strides {drop_strides:?}, warmup <= {max_warmup_steps}"),
+        }
+    }
+}
+
 /// The **artifact-family seam** for quality characterization — uninhabited today, on purpose.
 ///
 /// Epic 18304's terminal measurement campaign owns what a quality-characterization artifact *is*: the
@@ -273,7 +427,7 @@ impl FeatureCacheDomain {
 ///
 /// Having **no** variants is what makes the shipped state honest. [`CharacterizationBinding::Bound`]
 /// carries one of these, so no binding value can be constructed, so no provider can declare that
-/// selection is allowed, so [`ApproximationSurface::validate`] refuses every approximate selection —
+/// selection is allowed, so [`ApproximationSurface::resolve`] refuses every approximate selection —
 /// by the shape of the types rather than by a check someone could delete. Adding the campaign's
 /// variant is the whole of the future change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -288,9 +442,9 @@ impl CharacterizationFamily {
     pub fn validate(
         &self,
         reference: &CharacterizationRef,
-        policy: &FeatureCachePolicy,
+        selection: &ApproximationRequest,
     ) -> Result<()> {
-        let _ = (reference, policy);
+        let _ = (reference, selection);
         match *self {}
     }
 
@@ -393,6 +547,8 @@ impl CharacterizationBinding {
 pub struct ApproximationSurface {
     /// Denoise-feature-cache policies this provider's denoise implements.
     pub denoise_feature_cache: FeatureCacheDomain,
+    /// Token-pruning policies this provider's transformer blocks implement.
+    pub token_pruning: TokenPruningDomain,
     /// Which characterization artifact family, if any, this provider will accept a reference against.
     pub characterization: CharacterizationBinding,
 }
@@ -406,14 +562,24 @@ impl ApproximationSurface {
                 intervals,
                 max_warmup_steps,
             },
+            token_pruning: TokenPruningDomain::Unsupported,
             characterization: CharacterizationBinding::Unbound,
         }
+    }
+
+    /// This surface additionally declaring token pruning over `drop_strides`.
+    pub fn with_token_pruning(mut self, drop_strides: Vec<u32>, max_warmup_steps: u32) -> Self {
+        self.token_pruning = TokenPruningDomain::Implemented {
+            drop_strides,
+            max_warmup_steps,
+        };
+        self
     }
 
     /// `true` when the provider declares no approximate mechanism at all — every selection is refused
     /// for the absent mechanism.
     pub const fn is_inert(&self) -> bool {
-        !self.denoise_feature_cache.is_supported()
+        !self.denoise_feature_cache.is_supported() && !self.token_pruning.is_supported()
     }
 
     /// Whether an approximate selection could be **admitted** on this provider — declaration *and* a
@@ -446,7 +612,7 @@ impl ApproximationSurface {
         let Some(request) = request else {
             return Ok(ApproximationPlan::Exact);
         };
-        let Some(policy) = request.denoise_feature_cache else {
+        if request.selects_nothing() {
             // A reference with nothing to characterize means the caller believes they selected a
             // mechanism and did not. Refusing is the only way they find out.
             if request.characterization.is_some() {
@@ -456,29 +622,54 @@ impl ApproximationSurface {
                 )));
             }
             return Ok(ApproximationPlan::Exact);
-        };
-        if !self.denoise_feature_cache.is_supported() {
-            return Err(Error::Unsupported(format!(
-                "{id}: a denoise feature cache was selected, but this provider declares no denoise \
-                 feature cache mechanism. Leave approximation unset to run the provider's exact \
-                 denoise."
-            )));
         }
-        if !self.denoise_feature_cache.accepts(&policy) {
-            return Err(Error::Unsupported(format!(
-                "{id}: denoise feature cache (interval {} steps, warmup {}) is outside the declared \
-                 production domain {}. Select a declared policy, or leave approximation unset for \
-                 the provider's exact denoise.",
-                policy.reuse_interval.steps(),
-                policy.warmup.steps(),
-                self.denoise_feature_cache.describe()
-            )));
+        // Per-mechanism gates first: an absent mechanism and an out-of-domain value have different
+        // fixes from each other AND from the characterization gate below, so each is reported on its
+        // own terms before the shared precondition.
+        if let Some(policy) = request.denoise_feature_cache {
+            if !self.denoise_feature_cache.is_supported() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: a denoise feature cache was selected, but this provider declares no \
+                     denoise feature cache mechanism. Leave approximation unset to run the \
+                     provider's exact denoise."
+                )));
+            }
+            if !self.denoise_feature_cache.accepts(&policy) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: denoise feature cache (interval {} steps, warmup {}) is outside the \
+                     declared production domain {}. Select a declared policy, or leave \
+                     approximation unset for the provider's exact denoise.",
+                    policy.reuse_interval.steps(),
+                    policy.warmup.steps(),
+                    self.denoise_feature_cache.describe()
+                )));
+            }
         }
-        // The characterization binding. Both refusals below are reachable today; the admitting path
-        // past them is not, because `CharacterizationBinding::Bound` has no inhabitant.
+        if let Some(policy) = request.token_pruning {
+            if !self.token_pruning.is_supported() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: token pruning was selected, but this provider declares no token pruning \
+                     mechanism. Leave approximation unset to run the provider's exact denoise."
+                )));
+            }
+            if !self.token_pruning.accepts(&policy) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: token pruning (drop stride {}, warmup {}) is outside the declared \
+                     production domain {}. Select a declared policy, or leave approximation unset \
+                     for the provider's exact denoise.",
+                    policy.drop_stride.stride(),
+                    policy.warmup.steps(),
+                    self.token_pruning.describe()
+                )));
+            }
+        }
+        // The characterization binding, shared by every mechanism because the precondition is the
+        // same one: a result-changing lever may not be selected without a measurement of what it
+        // costs. Both refusals below are reachable today; the admitting path past them is not,
+        // because `CharacterizationBinding::Bound` has no inhabitant.
         let Some(reference) = request.characterization.as_ref() else {
             return Err(Error::Unsupported(format!(
-                "{id}: a denoise feature cache changes the output, so it may only be selected \
+                "{id}: an approximate mechanism changes the output, so it may only be selected \
                  alongside a quality-characterization artifact reference. Supply \
                  approximation.characterization, or leave approximation unset for the provider's \
                  exact denoise."
@@ -493,8 +684,11 @@ impl ApproximationSurface {
                 reference.artifact_id()
             )));
         };
-        family.validate(reference, &policy)?;
-        Ok(ApproximationPlan::FeatureCache(policy))
+        family.validate(reference, request)?;
+        Ok(ApproximationPlan::Approximate {
+            denoise_feature_cache: request.denoise_feature_cache,
+            token_pruning: request.token_pruning,
+        })
     }
 
     /// Static declaration coherence. An empty result means the surface is internally consistent; it
@@ -529,6 +723,27 @@ impl ApproximationSurface {
                 errors.push("denoise_feature_cache declares duplicate intervals".to_owned());
             }
         }
+        if let TokenPruningDomain::Implemented { drop_strides, .. } = &self.token_pruning {
+            if drop_strides.is_empty() {
+                errors.push(
+                    "token_pruning declares an empty drop-stride list; use Unsupported to declare \
+                     the mechanism absent"
+                        .to_owned(),
+                );
+            }
+            if drop_strides.iter().any(|stride| *stride < MIN_DROP_STRIDE) {
+                errors.push(format!(
+                    "token_pruning declares a drop stride below {MIN_DROP_STRIDE}, which no \
+                     TokenDropStride can hold"
+                ));
+            }
+            let mut unique = drop_strides.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != drop_strides.len() {
+                errors.push("token_pruning declares duplicate drop strides".to_owned());
+            }
+        }
         errors
     }
 }
@@ -544,6 +759,10 @@ pub struct ApproximationRequest {
     /// Select the provider's denoise feature cache with this policy. `None` (the `Default`) is the
     /// provider's exact denoise.
     pub denoise_feature_cache: Option<FeatureCachePolicy>,
+    /// Select the provider's token pruning with this policy. `None` (the `Default`) is the provider's
+    /// exact denoise. Independent of the cache above — the two compose, because one decides *which
+    /// steps* run the block stack and the other decides *which tokens* the stack updates.
+    pub token_pruning: Option<TokenPruningPolicy>,
     /// The quality-characterization artifact this selection is backed by. Required whenever any
     /// mechanism above is selected — see the module docs — and refused when supplied alone.
     pub characterization: Option<CharacterizationRef>,
@@ -556,13 +775,22 @@ impl ApproximationRequest {
     pub fn feature_cache(policy: FeatureCachePolicy) -> Self {
         Self {
             denoise_feature_cache: Some(policy),
-            characterization: None,
+            ..Self::default()
+        }
+    }
+
+    /// A request selecting `policy` and nothing else. Refused today, like
+    /// [`feature_cache`](Self::feature_cache).
+    pub fn token_pruning(policy: TokenPruningPolicy) -> Self {
+        Self {
+            token_pruning: Some(policy),
+            ..Self::default()
         }
     }
 
     /// Whether this selects no approximate mechanism (the exact path).
     pub const fn selects_nothing(&self) -> bool {
-        self.denoise_feature_cache.is_none()
+        self.denoise_feature_cache.is_none() && self.token_pruning.is_none()
     }
 }
 
@@ -577,22 +805,56 @@ pub enum ApproximationPlan {
     /// The provider's exact denoise, byte-for-byte the pre-sc-18322 path.
     #[default]
     Exact,
-    /// Run the denoise feature cache with this policy. Unreachable from a request today; a family's
-    /// `#[cfg(test)]` bypass is the only producer.
-    FeatureCache(FeatureCachePolicy),
+    /// Run at least one approximate mechanism. `resolve` never produces this variant with every field
+    /// `None` — that state is [`Exact`](Self::Exact) — so entering the approximate arm always means at
+    /// least one mechanism engages. Unreachable from a request today; a family's `#[cfg(test)]` bypass
+    /// is the only producer.
+    Approximate {
+        /// The denoise feature cache, if selected.
+        denoise_feature_cache: Option<FeatureCachePolicy>,
+        /// Token pruning, if selected.
+        token_pruning: Option<TokenPruningPolicy>,
+    },
 }
 
 impl ApproximationPlan {
+    /// A plan running exactly the denoise feature cache.
+    pub const fn feature_cache_only(policy: FeatureCachePolicy) -> Self {
+        Self::Approximate {
+            denoise_feature_cache: Some(policy),
+            token_pruning: None,
+        }
+    }
+
+    /// A plan running exactly token pruning.
+    pub const fn token_pruning_only(policy: TokenPruningPolicy) -> Self {
+        Self::Approximate {
+            denoise_feature_cache: None,
+            token_pruning: Some(policy),
+        }
+    }
+
     /// Whether this is the exact path. The one branch a provider needs.
     pub const fn is_exact(&self) -> bool {
         matches!(self, Self::Exact)
+    }
+
+    /// The token-pruning policy, if this plan selects one.
+    pub const fn token_pruning(&self) -> Option<&TokenPruningPolicy> {
+        match self {
+            Self::Exact => None,
+            Self::Approximate { token_pruning, .. } => token_pruning.as_ref(),
+        }
     }
 
     /// The feature-cache policy, if this plan selects one.
     pub const fn feature_cache(&self) -> Option<&FeatureCachePolicy> {
         match self {
             Self::Exact => None,
-            Self::FeatureCache(policy) => Some(policy),
+            Self::Approximate {
+                denoise_feature_cache,
+                ..
+            } => denoise_feature_cache.as_ref(),
         }
     }
 }
@@ -632,7 +894,7 @@ mod tests {
         // "off" that a provider could execute by walking the cache with inert parameters.
         assert!(ApproximationPlan::default().is_exact());
         assert_eq!(ApproximationPlan::default().feature_cache(), None);
-        let approximate = ApproximationPlan::FeatureCache(policy());
+        let approximate = ApproximationPlan::feature_cache_only(policy());
         assert!(!approximate.is_exact());
         assert_eq!(approximate.feature_cache(), Some(&policy()));
     }
@@ -722,6 +984,7 @@ mod tests {
 
         let request = ApproximationRequest {
             denoise_feature_cache: Some(policy()),
+            token_pruning: None,
             characterization: Some(
                 CharacterizationRef::new("wan-t2v-1.3b-cache-2026-08", "sha256:deadbeef").unwrap(),
             ),
@@ -803,6 +1066,7 @@ mod tests {
         let surface = declaring();
         let dangling = ApproximationRequest {
             denoise_feature_cache: None,
+            token_pruning: None,
             characterization: Some(CharacterizationRef::new("artifact", "sha256:0").unwrap()),
         };
         let error = surface
@@ -815,6 +1079,173 @@ mod tests {
         assert!(
             error.to_string().contains("no approximate selection"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_drop_stride_of_one_is_rejected_because_it_would_drop_everything() {
+        // The same discipline the reuse interval has, on the opposite-running axis: 1 is not "prune
+        // nothing", it is "prune everything", and neither 1 nor 0 may be silently clamped into a
+        // stride the caller did not ask for.
+        assert!(TokenDropStride::new(0).is_err());
+        let one = TokenDropStride::new(1).expect_err("a stride of 1 drops every token");
+        assert!(one.to_string().contains("drop every token"), "{one}");
+        assert!(one.to_string().contains("unset"), "remedy missing: {one}");
+        assert_eq!(
+            TokenDropStride::new(2).unwrap(),
+            TokenDropStride::EVERY_SECOND_TOKEN
+        );
+        assert_eq!(TokenDropStride::new(9).unwrap().stride(), 9);
+    }
+
+    #[test]
+    fn the_keep_set_is_positional_and_its_count_matches_the_phase() {
+        // One decision point for both the keep-set and the restore map, so they cannot disagree; and
+        // `kept_count` must equal what walking `keeps_token` produces, because a provider sizes its
+        // gathered tensor from the former and fills it from the latter.
+        for stride in [2u32, 3, 4] {
+            let stride = TokenDropStride::new(stride).unwrap();
+            for total in [0usize, 1, 5, 8, 17, 100] {
+                let kept = (0..total).filter(|i| stride.keeps_token(*i)).count();
+                assert_eq!(
+                    kept,
+                    stride.kept_count(total),
+                    "stride {} at total {total}",
+                    stride.stride()
+                );
+            }
+            assert!(
+                stride.keeps_token(0),
+                "the first token must never be the dropped one"
+            );
+        }
+        let every_second = TokenDropStride::EVERY_SECOND_TOKEN;
+        let kept: Vec<usize> = (0..6).filter(|i| every_second.keeps_token(*i)).collect();
+        assert_eq!(kept, vec![0, 2, 4]);
+        let by_three = TokenDropStride::new(3).unwrap();
+        let kept: Vec<usize> = (0..7).filter(|i| by_three.keeps_token(*i)).collect();
+        assert_eq!(kept, vec![0, 1, 3, 4, 6]);
+    }
+
+    #[test]
+    fn token_pruning_warmup_steps_prune_nothing() {
+        let policy = TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN)
+            .with_warmup(CacheWarmupSteps::new(2));
+        let pruning: Vec<bool> = (0..5).map(|step| policy.prunes_step(step)).collect();
+        assert_eq!(pruning, vec![false, false, true, true, true]);
+        let no_warmup = TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN);
+        assert!(no_warmup.prunes_step(0), "no warmup prunes from step 0");
+    }
+
+    #[test]
+    fn token_pruning_is_refused_on_its_own_terms() {
+        let pruning = TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN);
+
+        // A surface declaring only the CACHE must refuse pruning for the ABSENT MECHANISM — not for
+        // the missing characterization, and not by falling through to the cache's domain check.
+        let cache_only = declaring();
+        let text = cache_only
+            .resolve("prov", Some(&ApproximationRequest::token_pruning(pruning)))
+            .expect_err("a cache-only surface must refuse pruning")
+            .to_string();
+        assert!(
+            text.contains("declares no token pruning mechanism"),
+            "{text}"
+        );
+
+        // A surface declaring both refuses for the characterization instead.
+        let both = declaring().with_token_pruning(vec![2, 4], 3);
+        assert!(both.declaration_errors().is_empty());
+        assert!(!both.is_inert());
+        assert!(!both.is_selectable());
+        let text = both
+            .resolve("prov", Some(&ApproximationRequest::token_pruning(pruning)))
+            .expect_err("still uncharacterized")
+            .to_string();
+        assert!(
+            text.contains("quality-characterization artifact reference"),
+            "{text}"
+        );
+
+        // And an out-of-domain stride is refused for the domain, with the domain named.
+        let off_grid = TokenPruningPolicy::new(TokenDropStride::new(3).unwrap());
+        let text = both
+            .resolve("prov", Some(&ApproximationRequest::token_pruning(off_grid)))
+            .expect_err("an undeclared stride must be refused")
+            .to_string();
+        assert!(text.contains("drop strides [2, 4]"), "{text}");
+        let over_warmup = pruning.with_warmup(CacheWarmupSteps::new(4));
+        let text = both
+            .resolve(
+                "prov",
+                Some(&ApproximationRequest::token_pruning(over_warmup)),
+            )
+            .expect_err("an over-cap warmup must be refused")
+            .to_string();
+        assert!(text.contains("warmup <= 3"), "{text}");
+    }
+
+    #[test]
+    fn the_two_mechanisms_are_independent_and_the_plan_carries_both() {
+        // The cache decides WHICH STEPS run the stack, pruning decides WHICH TOKENS the stack updates,
+        // so a plan must be able to carry either or both — and `Exact` must still be the only shape
+        // that carries nothing.
+        let cache = policy();
+        let pruning = TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN);
+        let both = ApproximationPlan::Approximate {
+            denoise_feature_cache: Some(cache),
+            token_pruning: Some(pruning),
+        };
+        assert!(!both.is_exact());
+        assert_eq!(both.feature_cache(), Some(&cache));
+        assert_eq!(both.token_pruning(), Some(&pruning));
+
+        let cache_only = ApproximationPlan::feature_cache_only(cache);
+        assert_eq!(cache_only.feature_cache(), Some(&cache));
+        assert_eq!(cache_only.token_pruning(), None);
+
+        let pruning_only = ApproximationPlan::token_pruning_only(pruning);
+        assert_eq!(pruning_only.feature_cache(), None);
+        assert_eq!(pruning_only.token_pruning(), Some(&pruning));
+
+        assert_eq!(ApproximationPlan::Exact.token_pruning(), None);
+        assert_eq!(ApproximationPlan::Exact.feature_cache(), None);
+
+        // An empty selection is `Exact`, never `Approximate { None, None }` — the invariant that makes
+        // "entered the approximate arm" mean "at least one mechanism engages".
+        let surface = declaring().with_token_pruning(vec![2], 0);
+        assert_eq!(
+            surface
+                .resolve("prov", Some(&ApproximationRequest::default()))
+                .unwrap(),
+            ApproximationPlan::Exact
+        );
+    }
+
+    #[test]
+    fn a_malformed_token_pruning_declaration_is_a_declaration_error() {
+        let surface = ApproximationSurface::default().with_token_pruning(vec![1, 2, 2], 0);
+        let errors = surface.declaration_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("token_pruning") && error.contains("below 2")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("token_pruning") && error.contains("duplicate")),
+            "{errors:?}"
+        );
+        let empty = ApproximationSurface::default().with_token_pruning(Vec::new(), 0);
+        assert!(
+            empty
+                .declaration_errors()
+                .iter()
+                .any(|error| error.contains("empty drop-stride list")),
+            "{:?}",
+            empty.declaration_errors()
         );
     }
 
@@ -840,6 +1271,7 @@ mod tests {
                 intervals: Vec::new(),
                 max_warmup_steps: 0,
             },
+            token_pruning: TokenPruningDomain::Unsupported,
             characterization: CharacterizationBinding::Unbound,
         };
         assert!(

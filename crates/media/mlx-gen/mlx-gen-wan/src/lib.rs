@@ -64,6 +64,7 @@ pub mod pth;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod token_pruning;
 pub mod training;
 pub mod transformer;
 pub mod vace;
@@ -120,6 +121,7 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
+pub use token_pruning::TokenKeepSet;
 pub use vae::{OwnedWanSingleFrameDecoder, WanSingleFrameDecoder, WanVideoDecoder};
 
 /// Load the request-selected Wan z16 image decoder from `LoadSpec.components["vae"]`.

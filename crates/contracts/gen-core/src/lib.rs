@@ -51,7 +51,8 @@ pub mod weightsmeta;
 pub use approximation::{
     ApproximationPlan, ApproximationRequest, ApproximationSurface, CacheReuseInterval,
     CacheWarmupSteps, CharacterizationBinding, CharacterizationFamily, CharacterizationRef,
-    FeatureCacheDomain, FeatureCachePolicy,
+    FeatureCacheDomain, FeatureCachePolicy, TokenDropStride, TokenPruningDomain,
+    TokenPruningPolicy, MIN_DROP_STRIDE, MIN_REUSE_INTERVAL,
 };
 pub use audio_dsp::{
     db_to_linear, measure_loudness, measure_track_loudness, mixdown, LoudnessStats, MixClip,

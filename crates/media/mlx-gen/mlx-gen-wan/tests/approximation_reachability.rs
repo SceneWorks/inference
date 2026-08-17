@@ -1,7 +1,8 @@
 //! **sc-18322 — the declared Wan approximate capabilities, and the weights-free proof that selection
 //! is refused rather than silently ignored.**
 //!
-//! Epic 18304's P7 adds one *result-changing* mechanism — a denoise feature cache — behind a contract
+//! Epic 18304's P7 adds two *result-changing* mechanisms — a denoise feature cache and token pruning —
+//! behind a contract
 //! that binds selection to a quality characterization. Since no characterization artifact family
 //! exists yet, the shipped state is **declared + implemented + refused**, and the defect class this
 //! file guards is different from the execution-domain suites' by exactly that:
@@ -25,7 +26,7 @@
 use mlx_gen::gen_core::{
     ApproximationPlan, ApproximationRequest, CacheReuseInterval, CacheWarmupSteps,
     CharacterizationRef, Error, FeatureCacheDomain, FeatureCachePolicy, GenerationRequest,
-    ModelDescriptor,
+    ModelDescriptor, TokenDropStride, TokenPruningDomain, TokenPruningPolicy,
 };
 
 /// The dense 5B — the only Wan provider whose denoise route implements the cache.
@@ -54,6 +55,11 @@ fn probe_request(approximation: Option<ApproximationRequest>) -> GenerationReque
 
 fn policy(interval: u32, warmup: u32) -> FeatureCachePolicy {
     FeatureCachePolicy::new(CacheReuseInterval::new(interval).expect("declared interval"))
+        .with_warmup(CacheWarmupSteps::new(warmup))
+}
+
+fn pruning(stride: u32, warmup: u32) -> TokenPruningPolicy {
+    TokenPruningPolicy::new(TokenDropStride::new(stride).expect("declared stride"))
         .with_warmup(CacheWarmupSteps::new(warmup))
 }
 
@@ -91,6 +97,14 @@ fn exactly_the_dense_5b_declares_a_coherent_denoise_feature_cache() {
                     max_warmup_steps: 8,
                 },
                 "the dense 5B's declared domain must be the mechanism's implemented operating points"
+            );
+            assert_eq!(
+                surface.token_pruning,
+                TokenPruningDomain::Implemented {
+                    drop_strides: vec![2, 3, 4],
+                    max_warmup_steps: 8,
+                },
+                "the dense 5B declares token pruning over the strides its blocks implement"
             );
         } else {
             // The MoE 14B providers swap experts mid-trajectory and VACE runs two sequential B=1
@@ -180,6 +194,7 @@ fn a_declared_selection_is_refused_for_want_of_a_characterization() {
         // gate. The refusal must be the binding one, naming the reference it could not validate.
         let request = probe_request(Some(ApproximationRequest {
             denoise_feature_cache: Some(policy(2, 0)),
+            token_pruning: None,
             characterization: Some(
                 CharacterizationRef::new("wan-5b-trunk-cache", "sha256:0").expect("reference"),
             ),
@@ -213,6 +228,69 @@ fn a_declared_selection_is_refused_for_want_of_a_characterization() {
 }
 
 #[test]
+fn a_declared_token_pruning_selection_is_refused_on_its_own_terms() {
+    let descriptors = descriptors();
+    let declaring = descriptors
+        .iter()
+        .find(|descriptor| descriptor.id == DECLARING_ID)
+        .expect("the dense 5B must be registered");
+
+    // Every declared corner reaches the characterization gate rather than the domain gate.
+    for (stride, warmup) in [(2, 0), (3, 4), (4, 8)] {
+        let request = probe_request(Some(ApproximationRequest::token_pruning(pruning(
+            stride, warmup,
+        ))));
+        let error = declaring
+            .capabilities
+            .validate_request(declaring.id, &request)
+            .expect_err("a declared-but-uncharacterized pruning selection must be refused");
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "a capability gap, not a range error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("quality-characterization artifact reference"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("declares no token pruning mechanism"),
+            "a declared mechanism must not be refused as absent: {message}"
+        );
+    }
+
+    // An undeclared stride is refused for the domain, with the domain named.
+    let message = declaring
+        .capabilities
+        .validate_request(
+            declaring.id,
+            &probe_request(Some(ApproximationRequest::token_pruning(pruning(5, 0)))),
+        )
+        .expect_err("an undeclared stride must be refused")
+        .to_string();
+    assert!(
+        message.contains("drop strides [2, 3, 4]"),
+        "the domain must be named: {message}"
+    );
+
+    // Both mechanisms at once is still one refusal, and it names the shared precondition.
+    let both = probe_request(Some(ApproximationRequest {
+        denoise_feature_cache: Some(policy(2, 0)),
+        token_pruning: Some(pruning(2, 0)),
+        characterization: None,
+    }));
+    let message = declaring
+        .capabilities
+        .validate_request(declaring.id, &both)
+        .expect_err("composing both mechanisms is still uncharacterized")
+        .to_string();
+    assert!(
+        message.contains("quality-characterization artifact reference"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_non_declaring_wan_provider_refuses_a_selection_as_an_absent_mechanism() {
     let mut checked = 0usize;
     for descriptor in descriptors() {
@@ -220,27 +298,38 @@ fn a_non_declaring_wan_provider_refuses_a_selection_as_an_absent_mechanism() {
             continue;
         }
         checked += 1;
-        let request = probe_request(Some(ApproximationRequest::feature_cache(policy(2, 0))));
-        let error = descriptor
-            .capabilities
-            .validate_request(descriptor.id, &request)
-            .expect_err("a provider with no feature cache must refuse a selection");
-        assert!(
-            matches!(error, Error::Unsupported(_)),
-            "{}: a capability gap, not a range error: {error:?}",
-            descriptor.id
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("declares no denoise feature cache mechanism"),
-            "{}: the refusal must name the absent mechanism: {message}",
-            descriptor.id
-        );
-        assert!(
-            message.contains("unset"),
-            "{}: the refusal must name the remedy: {message}",
-            descriptor.id
-        );
+        for (selection, absent) in [
+            (
+                ApproximationRequest::feature_cache(policy(2, 0)),
+                "declares no denoise feature cache mechanism",
+            ),
+            (
+                ApproximationRequest::token_pruning(pruning(2, 0)),
+                "declares no token pruning mechanism",
+            ),
+        ] {
+            let request = probe_request(Some(selection));
+            let error = descriptor
+                .capabilities
+                .validate_request(descriptor.id, &request)
+                .expect_err("a provider with no such mechanism must refuse a selection");
+            assert!(
+                matches!(error, Error::Unsupported(_)),
+                "{}: a capability gap, not a range error: {error:?}",
+                descriptor.id
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(absent),
+                "{}: the refusal must name the absent mechanism: {message}",
+                descriptor.id
+            );
+            assert!(
+                message.contains("unset"),
+                "{}: the refusal must name the remedy: {message}",
+                descriptor.id
+            );
+        }
     }
     assert!(
         checked > 0,
@@ -253,7 +342,10 @@ fn every_unwired_denoise_route_refuses_a_non_exact_plan_by_name() {
     // The provider-side backstop for the routes the mechanism is NOT wired into. Unreachable today —
     // the shared floor refuses every selection first — so it is asserted directly here, which is the
     // only way it can be gated at all before a characterization artifact exists.
-    let plan = ApproximationPlan::FeatureCache(policy(2, 0));
+    let plan = ApproximationPlan::Approximate {
+        denoise_feature_cache: Some(policy(2, 0)),
+        token_pruning: Some(pruning(2, 0)),
+    };
     for route in [
         "TI2V mask-blend",
         "curated unified solver",

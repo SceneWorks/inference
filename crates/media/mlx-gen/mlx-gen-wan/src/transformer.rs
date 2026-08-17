@@ -474,36 +474,65 @@ impl SelfAttention {
     /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
     /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
     fn forward(&self, x_mod: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+        self.forward_split(x_mod, cos, sin, x_mod, cos, sin)
+    }
+
+    /// Self-attention with the **query side and the key/value side supplied separately** — the seam
+    /// sc-18322's token pruning needs.
+    ///
+    /// [`forward`](Self::forward) is `forward_split(x, cos, sin, x, cos, sin)`: the same tensors in the
+    /// same ops in the same order, so the un-pruned path is byte-identical to the pre-sc-18322 body by
+    /// construction rather than by comparison.
+    ///
+    /// Pruning passes a gathered `[B, L', dim]` query stream (with its RoPE tables gathered to the same
+    /// `L'`) against the **full** `[B, L, dim]` key/value stream, so every surviving query still attends
+    /// over every token — see [`crate::token_pruning`] for why that bound matters. The fused MLX SDPA
+    /// already runs with `Sq != Sk` on the rung-3 query-chunking path, and each query row's softmax is
+    /// over all keys and independent of the other rows, so a *subset* of query rows is as sound as a
+    /// contiguous *block* of them. Returns `[B, L', dim]` — the caller restores full length.
+    fn forward_split(
+        &self,
+        x_q: &Array,
+        cos_q: &Array,
+        sin_q: &Array,
+        x_kv: &Array,
+        cos_kv: &Array,
+        sin_kv: &Array,
+    ) -> Result<Array> {
         // Matmuls run bf16 (the reference's `x.astype(w_dtype)`); the f32 residual is restored by the
         // block's modulation. q/k get full-dim bf16 RMSNorm before the head split; RoPE applies in
         // f32 on bf16 cos/sin then casts back to bf16 for the bf16 SDPA.
-        let xw = bf16(x_mod)?;
+        let xq = bf16(x_q)?;
+        let xkv = bf16(x_kv)?;
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
-        let b = x_mod.shape()[0];
-        let s = x_mod.shape()[1];
+        let b = x_q.shape()[0];
+        let sq = x_q.shape()[1];
+        let skv = x_kv.shape()[1];
 
-        let q = rms_norm(&self.q.forward(&xw)?, &self.norm_q, self.eps)?;
-        let k = rms_norm(&self.k.forward(&xw)?, &self.norm_k, self.eps)?;
+        let q = rms_norm(&self.q.forward(&xq)?, &self.norm_q, self.eps)?;
+        let k = rms_norm(&self.k.forward(&xkv)?, &self.norm_k, self.eps)?;
         let q = bf16(&crate::rope::rope_apply(
-            &f32(&q.reshape(&[b, s, n, d])?)?,
-            cos,
-            sin,
+            &f32(&q.reshape(&[b, sq, n, d])?)?,
+            cos_q,
+            sin_q,
         )?)?
         .transpose_axes(&[0, 2, 1, 3])?;
         let k = bf16(&crate::rope::rope_apply(
-            &f32(&k.reshape(&[b, s, n, d])?)?,
-            cos,
-            sin,
+            &f32(&k.reshape(&[b, skv, n, d])?)?,
+            cos_kv,
+            sin_kv,
         )?)?
         .transpose_axes(&[0, 2, 1, 3])?;
         let v = self
             .v
-            .forward(&xw)?
-            .reshape(&[b, s, n, d])?
+            .forward(&xkv)?
+            .reshape(&[b, skv, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
         let out = sdpa_maybe_checkpoint(&q, &k, &v, self.scale, self.ckpt_sdpa, self.attn_budget)?;
-        let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, sq, n * d])?;
         self.o.forward(&out)
     }
 
@@ -896,6 +925,72 @@ impl Block {
         let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
         let y = self.ffn_fc2.forward(&y)?;
         gated(&x, &y, &e5)
+    }
+
+    /// [`forward`](Self::forward) with **token pruning** (sc-18322): each of the block's three sublayer
+    /// contributions is computed only for the tokens `keep` selects, and the dropped tokens pass through
+    /// **bit-exactly**.
+    ///
+    /// The pass-through exactness is a property of Wan's residual structure rather than a tolerance:
+    /// every residual here is `x + gate·y` or `x + y`, and [`TokenKeepSet::restore`] fills a dropped
+    /// row's `y` with an exact zero, so that row leaves the block holding precisely the bits it entered
+    /// with. Each sublayer restores full length immediately after its output projection — before the
+    /// residual add, and after the projection because the projections carry biases, so a zero-filled
+    /// *input* would emerge as the bias rather than as zero.
+    ///
+    /// Self-attention's key/value side reads the **full** stream, so surviving queries still attend over
+    /// every token; cross-attention's K/V come from the text context and never depended on the latent
+    /// token count.
+    ///
+    /// Per-token time modulation (`L_e == L`, the TI2V mask-blend) is **refused**: `e0..e5` would have to
+    /// be gathered in lockstep and `apply_head` broadcasts the modulation against the token axis, so a
+    /// mismatch there is a silent broadcast rather than an error. That route declares no pruning and
+    /// refuses a non-exact plan at the provider (`pipeline::refuse_unwired_approximation`); this guard is
+    /// the local backstop.
+    pub(crate) fn forward_pruned(
+        &self,
+        x: &Array,
+        e: &Array,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;
+        let m = add(&self.modulation, e)?;
+        let l_e = m.shape()[1];
+        if l_e != 1 {
+            return Err(Error::Msg(format!(
+                "wan: token pruning does not support per-token time modulation (L_e={l_e}); the TI2V \
+                 mask-blend route declares no pruning"
+            )));
+        }
+        let p = split(&m, 6, 2)?;
+        let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+        let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+        let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+        // Self-attention: queries from the kept rows, keys/values from the whole stream.
+        let x_mod = modulate(&ln(x, self.eps)?, &e1, &e0)?;
+        let x_mod_keep = keep.gather(&x_mod, 1)?;
+        let (cos_keep, sin_keep) = (keep.gather(cos, 0)?, keep.gather(sin, 0)?);
+        let y =
+            self.self_attn
+                .forward_split(&x_mod_keep, &cos_keep, &sin_keep, &x_mod, cos, sin)?;
+        let x = gated(x, &keep.restore(&y)?, &e2)?;
+
+        // Cross-attention: the text K/V are token-count independent, so only the query side prunes.
+        let x_cross = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), self.eps)?;
+        let x_cross_keep = keep.gather(&x_cross, 1)?;
+        let y = self.cross_attn.forward(&x_cross_keep, kv)?;
+        let x = add(&x, &keep.restore(&y)?)?;
+
+        // Gated-GELU FFN — per-token by construction, so a row subset is exactly that row subset.
+        let x_mod = modulate(&ln(&x, self.eps)?, &e4, &e3)?;
+        let x_mod_keep = keep.gather(&x_mod, 1)?;
+        let y = gelu_ffn(&self.ffn_fc1.forward(&bf16(&x_mod_keep)?)?)?;
+        let y = self.ffn_fc2.forward(&y)?;
+        gated(&x, &keep.restore(&y)?, &e5)
     }
 
     /// **Causal cached** block forward — the Krea Realtime AR delta (sc-8436, S3). Identical wiring to
@@ -1586,6 +1681,7 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
         trunk: Option<&mut crate::feature_cache::TrunkCache>,
+        prune: Option<&crate::token_pruning::TokenKeepSet>,
     ) -> Result<Vec<Array>> {
         // Patchify + embed once; cast to bf16 to start the block stream (reference casts to w_dtype).
         let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
@@ -1593,26 +1689,39 @@ impl WanTransformer {
         let dim = self.cfg.dim as i32;
         let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
         // Broadcast the shared patch embedding across the CFG batch (the reference's `broadcast_to`).
-        let mut x = if batch > 1 {
+        let x = if batch > 1 {
             broadcast_to(&x1, &[batch as i32, l, dim])?
         } else {
             x1
         };
 
-        let x = match trunk {
-            // The pre-sc-18322 path, unchanged: run every block over the carried stream.
-            None => {
-                for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
-                    x = block.forward(&x, e0, kv, cos, sin)?;
-                }
-                x
-            }
-            Some(cache) => {
-                if cache.recomputes()? {
-                    let x_in = x.clone();
+        // One block-stack traversal, with or without pruning. Every block restores full token length
+        // before returning, so the two approximate mechanisms compose without either knowing about the
+        // other and `apply_head` / `unpatchify` below see the shape they always saw (sc-18322).
+        let run_blocks = |mut x: Array| -> Result<Array> {
+            match prune {
+                // The pre-sc-18322 block loop, unchanged.
+                None => {
                     for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
                         x = block.forward(&x, e0, kv, cos, sin)?;
                     }
+                }
+                Some(keep) => {
+                    for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+                        x = block.forward_pruned(&x, e0, kv, cos, sin, keep)?;
+                    }
+                }
+            }
+            Ok(x)
+        };
+
+        let x = match trunk {
+            // The pre-sc-18322 path, unchanged.
+            None => run_blocks(x)?,
+            Some(cache) => {
+                if cache.recomputes()? {
+                    let x_in = x.clone();
+                    let x = run_blocks(x)?;
                     cache.capture(&x_in, &x)?;
                     x
                 } else {
@@ -1647,6 +1756,27 @@ impl WanTransformer {
         Ok(out)
     }
 
+    /// Drive **one** block's pruned forward directly (sc-18322).
+    ///
+    /// The pass-through exactness of a dropped token is only observable at a *block's* own output — by
+    /// the time the stack finishes, every token has been touched by some block's full-stream key/value
+    /// side. `#[cfg(test)]`, like the mechanism's other bypasses.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_forward_pruned_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+        t: f32,
+        kv: &(Array, Array),
+        cos: &Array,
+        sin: &Array,
+        keep: &crate::token_pruning::TokenKeepSet,
+    ) -> Result<Array> {
+        let (_, e0) = self.time_embed(t)?;
+        self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
+    }
+
     pub fn forward_cached(
         &self,
         latent: &Array,
@@ -1656,7 +1786,7 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
     ) -> Result<Vec<Array>> {
-        self.forward_cached_approx(latent, t, cross_kv, cos, sin, batch, None)
+        self.forward_cached_approx(latent, t, cross_kv, cos, sin, batch, None, None)
     }
 
     /// [`forward_cached`](Self::forward_cached) carrying the sc-18322 **denoise feature cache**.
@@ -1674,9 +1804,10 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
         trunk: Option<&mut crate::feature_cache::TrunkCache>,
+        prune: Option<&crate::token_pruning::TokenKeepSet>,
     ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed(t)?;
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, trunk)
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, trunk, prune)
     }
 
     /// Full DiT forward for a single latent (B=1). `latent`: `[C, F, H, W]` (f32). `t`: integer-valued
@@ -1806,7 +1937,7 @@ impl WanTransformer {
         // step, so a residual captured under one blend state is not the same quantity a later step
         // needs. `Wan::generate` refuses a non-exact plan on that route by name rather than silently
         // running it exactly. See `crate::feature_cache`.
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, None)
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, None, None)
     }
 
     /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`Self::forward_tokens_cached`]

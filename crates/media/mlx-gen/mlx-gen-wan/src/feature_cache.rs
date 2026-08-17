@@ -1,5 +1,8 @@
-//! **Denoise feature caching for the dense Wan DiT** — the approximate-capability mechanism of
-//! sc-18322 (epic 18304 P7), gated on [`gen_core::approximation`](mlx_gen::gen_core::approximation).
+//! **Denoise feature caching for the dense Wan DiT** — the first of sc-18322's two approximate
+//! mechanisms (epic 18304 P7), gated on
+//! [`gen_core::approximation`](mlx_gen::gen_core::approximation). Its sibling,
+//! [`crate::token_pruning`], is orthogonal: this module decides *which steps* run the block stack, that
+//! one decides *which tokens* the stack updates, and a plan may carry both.
 //!
 //! # What is cached, and why *this* quantity
 //!
@@ -52,7 +55,7 @@
 //! 1. the contract refuses every approximate selection until a quality-characterization artifact
 //!    family exists, and the binding that would admit one is uninhabited; and
 //! 2. [`TrunkCache`]'s only constructor is `#[cfg(test)]`, so even a caller holding an
-//!    [`ApproximationPlan::FeatureCache`](mlx_gen::gen_core::ApproximationPlan::FeatureCache) cannot
+//!    [`ApproximationPlan::Approximate`](mlx_gen::gen_core::ApproximationPlan::Approximate) cannot
 //!    turn it into a cache outside this crate's own unit tests.
 //!
 //! # Cancel and evaluation discipline
@@ -72,7 +75,7 @@
 //! below pin both halves: cancellation requested at a *reuse* step is observed at that step, and the
 //! progress callback fires once per step for every step regardless of reuse.
 //!
-//! The captured `Δ` is itself evaluated at capture (see [`TrunkCache::capture`]) — an unevaluated
+//! The captured `Δ` is itself evaluated at capture (see `TrunkCache::capture`) — an unevaluated
 //! residual would be a graph node still referencing the block weights, which is the hazard
 //! `transformer.rs`'s windowed-forward barrier exists to prevent, and a cache that reintroduced it
 //! would silently defeat memory-ladder rung 4.
@@ -210,7 +213,7 @@ mod tests {
     fn cache(interval: u32, warmup: u32) -> TrunkCache {
         let policy = FeatureCachePolicy::new(CacheReuseInterval::new(interval).unwrap())
             .with_warmup(CacheWarmupSteps::new(warmup));
-        TrunkCache::from_plan_for_test(&ApproximationPlan::FeatureCache(policy))
+        TrunkCache::from_plan_for_test(&ApproximationPlan::feature_cache_only(policy))
             .expect("a feature-cache plan must yield a cache")
     }
 
@@ -279,8 +282,13 @@ mod tests {
     }
 
     /// Raw little-endian f32 bytes of an evaluated array — bit-identity, not a tolerance.
+    ///
+    /// Routed through `mlx_gen::array::contiguous` because `as_slice` reads the **physical** buffer: a
+    /// gather or transpose result's logical order need not match it, and comparing physical buffers
+    /// would report a difference that is not one (or, worse, miss one that is).
     fn bytes(a: &Array) -> Vec<u8> {
-        let a = a.as_dtype(Dtype::Float32).expect("f32");
+        let a = mlx_gen::array::contiguous(&a.as_dtype(Dtype::Float32).expect("f32"))
+            .expect("contiguous");
         a.eval().expect("eval");
         a.as_slice::<f32>()
             .iter()
@@ -309,7 +317,7 @@ mod tests {
                 .expect("exact forward");
             let got = h
                 .transformer
-                .forward_cached_approx(&h.latent, t, &h.cross_kv, &h.cos, &h.sin, 1, None)
+                .forward_cached_approx(&h.latent, t, &h.cross_kv, &h.cos, &h.sin, 1, None, None)
                 .expect("off-path forward");
             assert_eq!(expected.len(), got.len());
             for (index, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
@@ -320,6 +328,321 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Token pruning, over the same fixture and the same real block stack. It lives beside the cache's
+    // suite because the two mechanisms share the harness and one of the tests below is specifically
+    // about them composing.
+    // ---------------------------------------------------------------------------------------------
+
+    fn pruning(stride: u32, warmup: u32) -> mlx_gen::gen_core::TokenPruningPolicy {
+        mlx_gen::gen_core::TokenPruningPolicy::new(
+            mlx_gen::gen_core::TokenDropStride::new(stride).unwrap(),
+        )
+        .with_warmup(mlx_gen::gen_core::CacheWarmupSteps::new(warmup))
+    }
+
+    /// **A pruned forward differs from the exact one, and only in the dropped tokens' updates.**
+    ///
+    /// Two claims in one, because either alone would be satisfiable by a broken mechanism: pruning must
+    /// change the prediction (or it is inert), and it must keep the prediction's shape (or nothing
+    /// downstream — `apply_head`, `unpatchify`, the feature cache's shape guard — still works).
+    #[test]
+    fn a_pruned_forward_changes_the_prediction_and_keeps_its_shape() {
+        let h = harness();
+        let (_, grid) = h
+            .transformer
+            .patch_embed_tokens(&h.latent)
+            .expect("patch grid");
+        let total = grid.0 * grid.1 * grid.2;
+        let mut exercised = 0usize;
+        for stride in [2u32, 3, 4] {
+            let declared = mlx_gen::gen_core::TokenDropStride::new(stride).unwrap();
+            // The fixture's grid is tiny, so a wide stride may drop nothing at this token count. Such a
+            // stride has nothing to assert here — it is exactly the exact path — so skip it rather than
+            // assert a difference that cannot exist.
+            if declared.kept_count(total) == total {
+                continue;
+            }
+            exercised += 1;
+            let keep = crate::token_pruning::TokenKeepSet::new(declared, total).expect("keep set");
+            assert!(
+                keep.kept() < total as i32 && keep.kept() > 0,
+                "stride {stride} must drop some tokens and keep some"
+            );
+            let exact = h
+                .transformer
+                .forward_cached(&h.latent, TIMESTEPS[0], &h.cross_kv, &h.cos, &h.sin, 1)
+                .expect("exact forward");
+            let pruned = h
+                .transformer
+                .forward_cached_approx(
+                    &h.latent,
+                    TIMESTEPS[0],
+                    &h.cross_kv,
+                    &h.cos,
+                    &h.sin,
+                    1,
+                    None,
+                    Some(&keep),
+                )
+                .expect("pruned forward");
+            assert_eq!(
+                exact[0].shape(),
+                pruned[0].shape(),
+                "stride {stride}: a pruned forward must restore the full token count"
+            );
+            assert_ne!(
+                bytes(&exact[0]),
+                bytes(&pruned[0]),
+                "stride {stride}: pruning must change the prediction — an identical result would mean \
+                 the keep-set never reached the block loop"
+            );
+        }
+        assert!(
+            exercised > 0,
+            "the fixture's {total}-token grid must admit at least one dropping stride"
+        );
+    }
+
+    /// **A dropped token passes through a block bit-exactly.**
+    ///
+    /// The load-bearing property of the whole mechanism, asserted at the one place it is observable: a
+    /// block's own output. Wan's residuals are `x + gate·y` and `x + y`, and the restore fills a dropped
+    /// row's `y` with an exact zero, so the dropped rows of `forward_pruned`'s output must equal the
+    /// dropped rows of its *input* byte for byte — while the kept rows must not (or the block did
+    /// nothing at all).
+    #[test]
+    fn a_dropped_token_leaves_a_block_holding_exactly_the_bits_it_entered_with() {
+        let h = harness();
+        let (tokens, grid) = h
+            .transformer
+            .patch_embed_tokens(&h.latent)
+            .expect("patch grid");
+        let total = grid.0 * grid.1 * grid.2;
+        let stride = mlx_gen::gen_core::TokenDropStride::EVERY_SECOND_TOKEN;
+        let keep = crate::token_pruning::TokenKeepSet::new(stride, total).expect("keep set");
+
+        let x_in = tokens;
+        let out = h
+            .transformer
+            .block_forward_pruned_for_test(
+                0,
+                &x_in,
+                TIMESTEPS[0],
+                &h.cross_kv[0],
+                &h.cos,
+                &h.sin,
+                &keep,
+            )
+            .expect("pruned block");
+        assert_eq!(
+            out.shape(),
+            x_in.shape(),
+            "a block must restore full length"
+        );
+
+        // Compare row by row. `contiguous` first, for the same physical-buffer reason `bytes` does.
+        let rows_in = row_bytes(&x_in, total);
+        let rows_out = row_bytes(&out, total);
+        let mut changed = 0usize;
+        for index in 0..total {
+            if stride.keeps_token(index) {
+                if rows_in[index] != rows_out[index] {
+                    changed += 1;
+                }
+            } else {
+                assert_eq!(
+                    rows_in[index], rows_out[index],
+                    "token {index} is dropped, so it must leave the block byte-identical"
+                );
+            }
+        }
+        assert!(
+            changed > 0,
+            "the kept tokens must actually be updated — otherwise the pass-through assertion above is \
+             vacuous"
+        );
+    }
+
+    /// Per-row little-endian f32 bytes of a `[1, total, dim]` token stream.
+    fn row_bytes(x: &Array, total: usize) -> Vec<Vec<u8>> {
+        let flat = bytes(x);
+        let per_row = flat.len() / total;
+        (0..total)
+            .map(|i| flat[i * per_row..(i + 1) * per_row].to_vec())
+            .collect()
+    }
+
+    /// **A warmup step prunes nothing, and the un-pruned forward is byte-identical to the exact one.**
+    ///
+    /// The driver-level off proof for pruning: `denoise_approx` consults the contract's own
+    /// `prunes_step`, so a policy whose warmup covers the whole trajectory must produce byte-for-byte
+    /// the exact `denoise` result — same code path, nothing gathered, nothing scattered.
+    #[test]
+    fn a_policy_whose_warmup_covers_the_trajectory_is_byte_identical_to_the_exact_denoise() {
+        let h = harness();
+        let cfg = tiny_cfg();
+        let cancel = mlx_gen::CancelFlag::default();
+        let steps = 4;
+        let mut ignored = |_: usize| {};
+        let exact = crate::pipeline::denoise(
+            &h.transformer,
+            crate::scheduler::SolverKind::UniPC,
+            cfg.num_train_timesteps,
+            steps,
+            cfg.sample_shift,
+            1.0,
+            &h.ctx,
+            None,
+            &h.latent,
+            &cancel,
+            &mut ignored,
+        )
+        .expect("exact denoise");
+
+        let mut ignored = |_: usize| {};
+        let warmed = crate::pipeline::denoise_approx(
+            &h.transformer,
+            crate::scheduler::SolverKind::UniPC,
+            cfg.num_train_timesteps,
+            steps,
+            cfg.sample_shift,
+            1.0,
+            &h.ctx,
+            None,
+            &h.latent,
+            &cancel,
+            &mut ignored,
+            None,
+            Some(pruning(2, steps as u32)),
+        )
+        .expect("all-warmup denoise");
+        assert_eq!(
+            bytes(&exact),
+            bytes(&warmed),
+            "a fully-warmed-up pruning policy must not perturb a single bit"
+        );
+
+        // And with warmup 0 the same policy DOES change the trajectory, so the equality above is about
+        // the phase rather than about pruning being inert.
+        let mut ignored = |_: usize| {};
+        let pruned = crate::pipeline::denoise_approx(
+            &h.transformer,
+            crate::scheduler::SolverKind::UniPC,
+            cfg.num_train_timesteps,
+            steps,
+            cfg.sample_shift,
+            1.0,
+            &h.ctx,
+            None,
+            &h.latent,
+            &cancel,
+            &mut ignored,
+            None,
+            Some(pruning(2, 0)),
+        )
+        .expect("pruned denoise");
+        assert_eq!(exact.shape(), pruned.shape());
+        assert_ne!(bytes(&exact), bytes(&pruned));
+    }
+
+    /// **Cancellation is observed on a pruned step, and progress does not skip one.**
+    ///
+    /// Pruning changes what a step computes, not how a step is committed — the cancel check, the
+    /// per-step `eval` and the progress callback are the same straight-line statements outside the
+    /// branch. Asserted against both mechanisms at once, since a step can be reused *and* pruned.
+    #[test]
+    fn cancellation_and_progress_survive_a_step_that_both_reuses_and_prunes() {
+        let h = harness();
+        let cfg = tiny_cfg();
+        let cancel = mlx_gen::CancelFlag::default();
+        let mut trunk = cache(2, 0);
+        let mut completed = Vec::new();
+        let mut on_step = |i: usize| {
+            completed.push(i);
+            if i == 3 {
+                cancel.cancel();
+            }
+        };
+        let error = crate::pipeline::denoise_approx(
+            &h.transformer,
+            crate::scheduler::SolverKind::UniPC,
+            cfg.num_train_timesteps,
+            6,
+            cfg.sample_shift,
+            1.0,
+            &h.ctx,
+            None,
+            &h.latent,
+            &cancel,
+            &mut on_step,
+            Some(&mut trunk),
+            Some(pruning(2, 0)),
+        )
+        .expect_err("a cancelled denoise must not return a latent");
+        assert!(matches!(error, Error::Canceled), "{error:?}");
+        assert_eq!(
+            completed,
+            vec![1, 2, 3],
+            "the loop must stop at the step following the cancellation, reuse and pruning included"
+        );
+    }
+
+    /// **The two mechanisms compose**, and each contributes: cache+prune differs from either alone.
+    #[test]
+    fn the_cache_and_pruning_compose_into_a_third_distinct_trajectory() {
+        let h = harness();
+        let cfg = tiny_cfg();
+        let cancel = mlx_gen::CancelFlag::default();
+        let run = |trunk: Option<&mut TrunkCache>,
+                   prune: Option<mlx_gen::gen_core::TokenPruningPolicy>| {
+            let mut ignored = |_: usize| {};
+            crate::pipeline::denoise_approx(
+                &h.transformer,
+                crate::scheduler::SolverKind::UniPC,
+                cfg.num_train_timesteps,
+                5,
+                cfg.sample_shift,
+                1.0,
+                &h.ctx,
+                None,
+                &h.latent,
+                &cancel,
+                &mut ignored,
+                trunk,
+                prune,
+            )
+            .expect("denoise")
+        };
+        let exact = run(None, None);
+        let cache_only = run(Some(&mut cache(2, 0)), None);
+        let prune_only = run(None, Some(pruning(2, 0)));
+        let both = run(Some(&mut cache(2, 0)), Some(pruning(2, 0)));
+
+        for (name, latents) in [
+            ("cache", &cache_only),
+            ("prune", &prune_only),
+            ("both", &both),
+        ] {
+            assert_eq!(exact.shape(), latents.shape(), "{name}: shape preserved");
+            assert_ne!(
+                bytes(&exact),
+                bytes(latents),
+                "{name}: must change the result"
+            );
+        }
+        assert_ne!(
+            bytes(&cache_only),
+            bytes(&both),
+            "adding pruning on top of the cache must change the result"
+        );
+        assert_ne!(
+            bytes(&prune_only),
+            bytes(&both),
+            "adding the cache on top of pruning must change the result"
+        );
     }
 
     /// **The mechanism is real, and only where the policy says.**
@@ -354,6 +677,7 @@ mod tests {
                     &h.sin,
                     1,
                     Some(&mut cache),
+                    None,
                 )
                 .expect("cached forward");
             assert_eq!(
@@ -472,6 +796,7 @@ mod tests {
             &cancel,
             &mut on_step,
             Some(&mut trunk),
+            None,
         )
         .expect_err("a cancelled denoise must not return a latent");
         assert!(
@@ -514,6 +839,7 @@ mod tests {
                 &cancel,
                 &mut on_step,
                 Some(&mut trunk),
+                None,
             )
             .expect("cached denoise");
             assert_eq!(
@@ -565,6 +891,7 @@ mod tests {
             &cancel,
             &mut ignored,
             Some(&mut trunk),
+            None,
         )
         .expect("cached denoise");
 

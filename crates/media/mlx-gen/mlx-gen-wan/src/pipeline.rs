@@ -883,7 +883,7 @@ fn predict(
     guidance: f32,
     y: Option<&Array>,
 ) -> Result<Array> {
-    predict_approx(transformer, latents, t, cache, guidance, y, None)
+    predict_approx(transformer, latents, t, cache, guidance, y, None, None)
 }
 
 /// [`predict`] carrying the sc-18322 denoise feature cache. `trunk: None` is exactly [`predict`].
@@ -896,6 +896,7 @@ fn predict_approx(
     guidance: f32,
     y: Option<&Array>,
     trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    prune: Option<&crate::token_pruning::TokenKeepSet>,
 ) -> Result<Array> {
     let x = match y {
         Some(y) => concatenate_axis(&[latents, y], 0)?,
@@ -909,6 +910,7 @@ fn predict_approx(
         &cache.sin,
         cache.batch,
         trunk,
+        prune,
     )?;
     if cache.batch == 2 {
         // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
@@ -951,6 +953,7 @@ pub fn denoise(
         init_noise,
         cancel,
         on_step,
+        None,
         None,
     )
 }
@@ -1011,6 +1014,7 @@ pub fn denoise_approx(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
     mut trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    prune: Option<mlx_gen::gen_core::TokenPruningPolicy>,
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
@@ -1026,6 +1030,18 @@ pub fn denoise_approx(
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
 
+    // The token-pruning keep-set, built ONCE for this generate's token count and shared by every block
+    // of every pruned step (sc-18322). It is positional, so it depends only on the patch grid — nothing
+    // is read back from the accelerator to decide it, and the surviving count is known before the first
+    // forward. `None` when nothing selected pruning, which is every production request.
+    let keep = match prune {
+        Some(policy) => Some(crate::token_pruning::TokenKeepSet::new(
+            policy.drop_stride,
+            grid.0 * grid.1 * grid.2,
+        )?),
+        None => None,
+    };
+
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
         // Honor the engine cancellation contract (sc-5551, the video sibling of chroma's sc-5514):
@@ -1040,6 +1056,12 @@ pub fn denoise_approx(
         if let Some(cache) = trunk.as_deref_mut() {
             cache.begin_step(i);
         }
+        // Pruning's own phase decision, from the same loop and the contract's own predicate: a warmup
+        // step passes `None` and therefore runs the untouched block loop.
+        let keep_this_step = match (&keep, prune) {
+            (Some(keep), Some(policy)) if policy.prunes_step(i) => Some(keep),
+            _ => None,
+        };
         let pred = predict_approx(
             transformer,
             &latents,
@@ -1048,6 +1070,7 @@ pub fn denoise_approx(
             guidance,
             None,
             trunk.as_deref_mut(),
+            keep_this_step,
         )?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's

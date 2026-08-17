@@ -4,7 +4,7 @@
 //! channel-concat image conditioning, in_dim 36 — sc-2681), plus their registry self-registration.
 //!
 //! The 5B [`Wan`] struct runs the complete dense pipeline (sc-2680) — [`Wan::generate`]: UMT5-XXL
-//! encode → the dense [`denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
+//! encode → the dense [`crate::pipeline::denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
 //! multi-keyframe) → z48 VAE decode → RGB8 frames, with Q4/Q8 + LoRA. The shared [`Wan14b`] struct
 //! serves both A14B variants — [`Wan14b::generate`] runs the
 //! complete pipeline: UMT5-XXL encode → (I2V only) build the channel-concat conditioning `y` →
@@ -222,7 +222,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// unconstructible) is what refuses selection until one exists. Warmup is capped at 8 steps because the
 /// native Wan trajectories run 20-50 steps and a warmup past a third of them leaves nothing to reuse.
 pub(crate) fn approximation_surface() -> ApproximationSurface {
-    ApproximationSurface::feature_cache(vec![2, 3, 4], 8)
+    ApproximationSurface::feature_cache(vec![2, 3, 4], 8).with_token_pruning(vec![2, 3, 4], 8)
 }
 
 /// The denoise feature cache a resolved plan asks for — the provider-side bridge from contract to
@@ -231,7 +231,7 @@ pub(crate) fn approximation_surface() -> ApproximationSurface {
 /// Deliberately two definitions rather than one with an inner `cfg`, so the production answer is
 /// visibly and unconditionally `None`: [`TrunkCache`]'s only constructor is `#[cfg(test)]`, so a
 /// production build cannot reach the uncharacterized path even if it somehow held a
-/// [`ApproximationPlan::FeatureCache`]. That is the second of two independent locks — the first is the
+/// [`ApproximationPlan::Approximate`]. That is the second of two independent locks — the first is the
 /// contract refusing every approximate selection for want of a characterization artifact.
 #[cfg(not(test))]
 fn trunk_cache(_plan: &ApproximationPlan) -> Option<TrunkCache> {
@@ -241,6 +241,18 @@ fn trunk_cache(_plan: &ApproximationPlan) -> Option<TrunkCache> {
 #[cfg(test)]
 fn trunk_cache(plan: &ApproximationPlan) -> Option<TrunkCache> {
     TrunkCache::from_plan_for_test(plan)
+}
+
+/// The token-pruning policy a resolved plan asks for — the second provider-side bridge, locked exactly
+/// like [`trunk_cache`] (sc-18322).
+#[cfg(not(test))]
+fn token_pruning(_plan: &ApproximationPlan) -> Option<mlx_gen::gen_core::TokenPruningPolicy> {
+    None
+}
+
+#[cfg(test)]
+fn token_pruning(plan: &ApproximationPlan) -> Option<mlx_gen::gen_core::TokenPruningPolicy> {
+    plan.token_pruning().copied()
 }
 
 /// The projection width the UMT5 text encoder packs to on a quantized tier: **Q8** (sc-12831). Q8 is
@@ -549,7 +561,7 @@ impl Wan {
     /// then **stages** the phases to bound memory: (1) UMT5 encode the prompt (+ neg, unless CFG is
     /// off); (1b, TI2V) load the z48 vae22, encode the conditioning image → `z_img`, build the
     /// first-frame mask + per-token mask, blend the noise init; (2) load the 5B DiT (merge adapters,
-    /// quantize), embed the contexts, run the dense [`denoise`] (T2V) or [`denoise_ti2v`] mask-blend
+    /// quantize), embed the contexts, run the dense [`crate::pipeline::denoise`] (T2V) or [`denoise_ti2v`] mask-blend
     /// loop; (3) load the vae22 decoder → RGB8 frames. CFG runs with the single guidance scale.
     fn generate_impl(
         &self,
@@ -842,6 +854,7 @@ impl Wan {
                     // production constructor, so `trunk` is `None` in every non-test build — the plan
                     // being `Exact` is the contract-level reason, this is the mechanism-level one.
                     let mut trunk = trunk_cache(&approximation);
+                    let prune = token_pruning(&approximation);
                     denoise_approx(
                         &dit,
                         kind,
@@ -855,6 +868,7 @@ impl Wan {
                         &req.cancel,
                         &mut on_step,
                         trunk.as_mut(),
+                        prune,
                     )?
                 }
             }
