@@ -179,6 +179,17 @@ impl TilePlan {
                  tile is silently truncated and stitched with overlaps it no longer matches"
             )));
         }
+        // The axis itself must be latent-expressible too. An encode canvas that is not a whole
+        // number of latent cells has no latent grid at all — without this guard the failure
+        // surfaces as a bare candle narrow error from deep inside the encoder's downsampling
+        // instead of a statement about the request, and `encode_clip` is public API.
+        if !length.is_multiple_of(spatial_compression_ratio) {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 tiling: axis length {length} px is not a whole multiple of the \
+                 {spatial_compression_ratio}x spatial compression ratio, so it has no latent grid \
+                 to tile over"
+            )));
+        }
         // The reference's `tile_size >= length` short circuit returns ONE tile spanning the whole
         // axis — `[length]`, not `[tile_size]`. That is what makes tiling inert (bit-identical to
         // an untiled pass) below one tile, rather than padding the canvas out to a full tile.
@@ -753,14 +764,31 @@ mod tests {
     /// the sub-tile geometries the committed fixtures use.
     #[test]
     fn a_sub_tile_axis_is_one_full_length_span() {
-        for length in [16, 64, 240, 255, 256] {
+        for length in [16, 64, 240, 256] {
             let plan = TilePlan::split(length, 256, 64, 16).unwrap();
             assert!(plan.is_single_span(), "{length} px must not tile");
             assert_eq!(plan.starts, vec![0]);
             assert_eq!(plan.lengths, vec![length], "the single tile spans the axis");
             assert!(plan.overlaps.is_empty());
         }
-        assert!(!TilePlan::split(257, 256, 64, 16).unwrap().is_single_span());
+        assert!(!TilePlan::split(272, 256, 64, 16).unwrap().is_single_span());
+    }
+
+    /// An axis that is not a whole number of latent cells is refused with a typed error rather
+    /// than surfacing as a bare candle narrow error from inside the encoder — `encode_clip` is
+    /// public API and this is the guard it fails through.
+    #[test]
+    fn split_rejects_an_axis_the_latent_grid_cannot_express() {
+        for length in [255, 257, 100] {
+            let e = TilePlan::split(length, 256, 64, 16)
+                .expect_err(&format!("{length} px must be rejected at ratio 16"))
+                .to_string();
+            assert!(e.contains("no latent grid"), "{e}");
+        }
+        // The guard binds before the sub-tile short circuit, like the geometry guards do.
+        assert!(TilePlan::split(15, 256, 64, 16).is_err());
+        // …and a ratio-aligned axis of the same magnitude is accepted.
+        assert!(TilePlan::split(256, 256, 64, 16).is_ok());
     }
 
     /// **A tile geometry the latent grid cannot express is refused, not truncated.**

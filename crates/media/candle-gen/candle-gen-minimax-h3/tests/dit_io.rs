@@ -377,6 +377,70 @@ fn the_whole_model_reproduces_the_reference_velocity() {
     );
 }
 
+/// **The AdaLN bounds check is on the production path**, not only in `block.rs`'s unit test of the
+/// helper.
+///
+/// `forward_packed` hoists `check_adaln_indices` out of the 50-block loop — it is a blocking D2H
+/// readback and all the blocks gather the same index tensor — which leaves the call as a single
+/// deletable line. Deleting it does not make a bad index *pass*: candle's own `index_select` still
+/// refuses the gather on the backends that bounds-check. It downgrades the failure from an error
+/// naming the modulation table to an opaque kernel one, which is exactly the regression the
+/// hoisting invited, so the rejection is asserted here through `forward_packed` itself.
+#[test]
+fn forward_packed_rejects_an_out_of_range_adaln_index() {
+    let f = fixture();
+    let cfg = dit_fixture_config();
+    let dit = MiniMaxH3Dit::from_weights(&model_weights(&f), &cfg, &dev(), DType::F32).unwrap();
+
+    let temb = f.tensor("in.temb");
+    let video_rows = f.tensor("in.model.video_rows");
+    let audio_rows = f.tensor("in.model.audio_rows");
+    let text_rows = dit.embed_context(&f.tensor("in.refiner.context")).unwrap();
+    let timestep_indices = f.indices("layout.timestep_indices");
+    let tables = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)
+        .unwrap()
+        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .unwrap();
+    let norm_out = dit.projections().norm_out.modulation(&temb).unwrap();
+    let text_indices = f.u32_vec("layout.text_indices");
+    let video_indices = f.u32_vec("layout.video_indices");
+    let audio_indices = f.u32_vec("layout.audio_indices");
+
+    // The table `forward_packed` derives for the resident path: one row per timestep per modality.
+    let rows = temb.dims()[0] * MODALITY_NUM;
+    // The reachable caller mistake: `adaln_indices` is `timestep_indices · MODALITY_NUM + tag`, so
+    // one stale timestep index lands exactly one row past the end.
+    let mut bad = f.u32_vec("layout.adaln_indices");
+    assert!(
+        bad.iter().all(|&i| (i as usize) < rows),
+        "the fixture's own indices must be in range before the perturbation"
+    );
+    bad[0] = rows as u32;
+    let adaln = Tensor::from_vec(bad, (timestep_indices.dims()[0],), &dev()).unwrap();
+
+    let packed = PackedForward {
+        video_rows: &video_rows,
+        audio_rows: &audio_rows,
+        text_rows: &text_rows,
+        adaln_indices: &adaln,
+        timestep_indices: &timestep_indices,
+        tables: &tables,
+        text_indices: &text_indices,
+        video_indices: &video_indices,
+        audio_indices: &audio_indices,
+    };
+
+    let e = dit
+        .forward_packed(&packed, BlockModulation::Temb(&temb), &norm_out)
+        .expect_err("an out-of-range adaln index must not reach the blocks")
+        .to_string();
+    println!("  out-of-range adaln index (row {rows} of {rows}) -> {e}");
+    assert!(
+        e.contains("outside the modulation table") && e.contains(&rows.to_string()),
+        "the rejection must name the modulation table and its row count, got: {e}"
+    );
+}
+
 /// The **cached** modulation path reproduces the same whole-model velocity as the resident one.
 ///
 /// This is the numeric-identity half of the AdaLN acceptance criterion, at whole-model scale: an

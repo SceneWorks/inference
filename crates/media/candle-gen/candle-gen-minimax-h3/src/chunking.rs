@@ -3,7 +3,10 @@
 //! This is the part of the port with the most room to be subtly wrong — the transformer blocks
 //! themselves are conventional. It is deliberately kept as **pure integer arithmetic** with no
 //! tensors, so the whole plan can be asserted directly, and it is a line-for-line twin of
-//! `mlx-gen-minimax-h3`'s so the two backends cannot disagree about the frame plan.
+//! `mlx-gen-minimax-h3`'s so the two backends cannot disagree about the frame plan. (One deliberate
+//! divergence: [`TemporalGeometry::from_parts`] here additionally refuses
+//! `token_drop >= tokens_chunk_size` — the wrapped-modulo plan the twin still silently accepts
+//! (scheduled for the Wave-2 mlx PR).)
 //!
 //! ## Why the decode is chunked at all
 //!
@@ -94,6 +97,19 @@ impl TemporalGeometry {
         // trip through `usize` is exact — and `usize::div_ceil` is stable where `i32`'s is not
         // (`int_roundings`), which is why this is not simply `clip_length.div_ceil(vae_ratio_t)`.
         let tokens_chunk_size = (clip_length as usize).div_ceil(vae_ratio_t as usize) as i32;
+        // The drop is a tail of ONE clip's tokens (`klvae.py` drops `token_drop` off each encoded
+        // clip of `tokens_chunk_size`), so `token_drop >= tokens_chunk_size` describes an encode
+        // that kept nothing. The modulo below would silently WRAP it — `token_drop = 5` at chunk 5
+        // gives `token_overlap = 0`, the same plan as `token_drop = 0` — producing a
+        // self-consistent decode that reconstructs none of the dropped frames. Refuse it instead.
+        if token_drop >= tokens_chunk_size {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 temporal geometry: token_drop {token_drop} must be smaller than \
+                 tokens_chunk_size {tokens_chunk_size} (ceil({clip_length} / {vae_ratio_t})) — the \
+                 drop is a tail of one clip's tokens, and a drop of a whole clip or more leaves \
+                 nothing to reconstruct the seam from"
+            )));
+        }
         let frame_pre_padding = neg_mod(clip_length, vae_ratio_t);
         let token_overlap = neg_mod(token_drop, tokens_chunk_size);
         Ok(Self {
@@ -454,33 +470,25 @@ mod tests {
         }
     }
 
-    /// A `token_drop` that is a MULTIPLE of `tokens_chunk_size` gives `token_overlap = 0` while
-    /// still asking for two splits — so split 1 has no frames left. The plan must count it as
-    /// zero rather than negative, and `MiniMaxH3VideoVae::decode_temporal` skips it to match.
+    /// A `token_drop` of a whole chunk or more is REFUSED, not wrapped. `neg_mod` would silently
+    /// alias `token_drop = 5` at chunk size 5 onto the `token_drop = 0` plan — `token_overlap = 0`,
+    /// two splits with an empty second one — a self-consistent decode that reconstructs none of the
+    /// dropped frames. Before this guard `from_parts(17, 5, 4)` built exactly that plan.
     #[test]
-    fn a_token_drop_that_zeroes_the_overlap_yields_an_empty_second_split() {
-        let g = TemporalGeometry::from_parts(17, 5, 4).unwrap();
-        assert_eq!(g.token_overlap, 0);
-        assert_eq!(g.frame_overlap, 0);
-        assert_eq!(
-            g.split_count(),
-            2,
-            "token_drop > 0 still asks for two splits"
-        );
-
-        let plan = TemporalPlan::new(g, 7).unwrap();
-        for span in &plan.chunks {
-            let clip_frames = span.tokens() * g.vae_ratio_t;
-            let (s0, e0) = plan.split_span(clip_frames, 0);
-            assert_eq!(e0 - s0, g.clip_length, "split 0 still emits a full clip");
-            let (s1, e1) = plan.split_span(clip_frames, 1);
-            assert!(s1 >= e1, "split 1 must be empty when there is no overlap");
+    fn a_token_drop_of_a_whole_chunk_or_more_is_rejected() {
+        // tokens_chunk_size = ceil(17 / 4) = 5.
+        for drop in [5, 6, 10] {
+            let e = TemporalGeometry::from_parts(17, drop, 4)
+                .expect_err(&format!("token_drop {drop} must be rejected"))
+                .to_string();
+            assert!(e.contains("tokens_chunk_size"), "{e}");
         }
-        assert_eq!(
-            plan.total_frames,
-            plan.chunks.len() as i32 * g.clip_length,
-            "no seam frames are produced"
-        );
+        // The largest legal drop still builds, with a genuine (non-wrapped) overlap.
+        let g = TemporalGeometry::from_parts(17, 4, 4).unwrap();
+        assert_eq!(g.token_overlap, 1);
+        // …so `token_drop > 0` now implies a non-empty seam: the empty-second-split plan is
+        // unreachable from `from_parts`.
+        assert!(g.frame_overlap > 0);
     }
 
     #[test]

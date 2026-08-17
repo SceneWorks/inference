@@ -143,11 +143,13 @@
 //! Three things this slice owns. **Nothing quantizes at load** — [`model::load`] *reconciles*
 //! `spec.quantize` against the staged tier's `config.json` marker and refuses to pack 66_280_430_080
 //! dense bytes on the way in, so a tier is a hosting decision rather than an install-time peak.
-//! **Only the DiT is tiered**: the text encoder, both VAEs and the tokenizer are dense in every tier
-//! and shared, so a tiered install is the upstream root plus one redirected
-//! [`model::DIT_COMPONENT`]. And the dense-by-policy set is a **correctness** boundary, not a size
-//! trade — [`dit::heads`] reads those tensors with a raw `Weights::require`, which would load u32
-//! codes as floats with no error at all (sc-14980).
+//! **Two components tier**: the DiT ([`model::DIT_COMPONENT`]) and, since sc-19120, the text
+//! encoder ([`model::TEXT_ENCODER_COMPONENT`], packed tiers that took the conditioning stage from
+//! 53.07 GB dense to 14.43 GB at q4) — each redirected individually, so a tiered install is the
+//! upstream root plus one or both redirected components at independent tiers. Both VAEs and the
+//! tokenizer are dense in every tier and shared. And the dense-by-policy set is a **correctness**
+//! boundary, not a size trade — [`dit::heads`] reads those tensors with a raw `Weights::require`,
+//! which would load u32 codes as floats with no error at all (sc-14980).
 //!
 //! ## LoRA adapters and the turbo alpha (sc-18724)
 //!
@@ -166,9 +168,6 @@
 //! stubbed; and the `_comfyui_` twin of each file is a different module shape (fused `qkv_proj`,
 //! swapped SwiGLU halves), detected on the keys and **converted** (sc-19443) rather than
 //! half-applied — folding one un-converted is shape-valid and numerically wrong.
-//!
-//! Not in this crate yet: either CNN encoder, `fl2va` conditioning (sc-17148), Ref2VA's
-//! `transformer_ref` (sc-17149) and sequential residency (sc-17151).
 
 pub mod adapters;
 pub mod alias_free;

@@ -67,13 +67,16 @@
 //! a 165 000-sample track; moving a frame instead would take `num_frames` off the lattice that
 //! [`JointGeometry::validate`] exists to protect.
 //!
-//! **This crate has no pipeline yet (sc-17156 owns it), so nothing here calls these functions.**
-//! They are stated in this module rather than left for that slice precisely so it inherits the MLX
-//! lane's decision instead of re-deriving one: `scripts/check-workspace.py::check_cross_backend_geometry`
-//! compares every `pub const` in this file against `mlx-gen-minimax-h3`'s, so
-//! [`AUDIO_SAMPLES_PER_LATENT`] and [`MAX_DELIVERED_AV_RESIDUAL_SECONDS`] cannot drift apart —
-//! which is the failure sc-19419 shipped with `SIZE_MULTIPLE` while both crates' own tests stayed
-//! green (sc-19425).
+//! The pipeline (sc-17156) consumes these through [`crate::pipeline`] — the mux path's
+//! `RequestGeometry::delivered_audio_samples` delegates to [`delivered_audio_samples`] here, so
+//! this module is the single owner of the AV quantities rather than one of two readers.
+//! ([`decoded_audio_samples`] is the reference-side quantity: the tests gate the delivered/decoded
+//! residual with it, while production only ever needs the delivered length.) The module predates
+//! the pipeline deliberately, so it inherited the MLX lane's decisions instead of re-deriving
+//! them: `scripts/check-workspace.py::check_cross_backend_geometry` compares every `pub const` in
+//! this file against `mlx-gen-minimax-h3`'s, so [`AUDIO_SAMPLES_PER_LATENT`] and
+//! [`MAX_DELIVERED_AV_RESIDUAL_SECONDS`] cannot drift apart — which is the failure sc-19419
+//! shipped with `SIZE_MULTIPLE` while both crates' own tests stayed green (sc-19425).
 //!
 //! # Duration does not buy memory back (sc-17152)
 //!

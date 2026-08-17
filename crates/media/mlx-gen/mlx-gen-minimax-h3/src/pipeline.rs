@@ -264,8 +264,10 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 /// needed and there is no duration in range that silently renders shorter than it asked for
 /// (sc-17152 — see [`MAX_DURATION_SECONDS`] for why 15.0 s is not in range).
 ///
-/// Alignment is upward at both ends, so a caller that asks for 5.1 s gets 124 frames (5.1667 s) and
-/// one that asks for 14.3 s gets 345 (14.375 s) — always at or above the request, never below.
+/// Alignment is upward within the range, so a caller that asks for 5.2 s gets 141 frames (5.875 s)
+/// and one that asks for 14.3 s gets 345 (14.375 s) — always at or above the request, never below.
+/// (5.1 s is **refused** by the range gate above, not aligned: the range's floor is the lattice's
+/// own 5.1667 s, and this crate's tests pin 5.0 s as a refusal.)
 pub fn align_frames_for_duration(seconds: f32) -> Result<i32> {
     if !seconds.is_finite() {
         return Err(Error::Msg(format!(

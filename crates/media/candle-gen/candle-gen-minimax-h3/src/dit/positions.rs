@@ -44,7 +44,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::{CandleError, Result};
 
 /// Rotary time per *frame* of a latent, before the per-latent frame counts:
-/// `24 fps / 40 audio-latents-per-second`. `_ROPE_FRAME_RESCALE`.
+/// `40 audio-latents-per-second / 24 fps` — the shared clock runs at 40 rotary units per second,
+/// so each of the 24 frames in a second advances it by 40/24 = 5/3. `_ROPE_FRAME_RESCALE`.
 pub const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 
 /// Frames each latent frame stands for. `_ROPE_FRAMES_PER_LATENT`, indexed **cyclically** by the

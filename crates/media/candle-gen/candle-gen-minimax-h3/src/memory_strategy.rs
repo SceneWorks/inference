@@ -29,11 +29,11 @@
 //!
 //! # Why the asset facts are the full four components anyway
 //!
-//! `conditioning_bytes` charges the 66.71 GB Qwen3-VL-32B text encoder even though this crate
-//! cannot yet execute it. Asset facts are the render's byte floor, not a capability claim: a
-//! candle render of this family needs the conditioner, and a contract that declared zero there
-//! would publish a floor small enough to admit a request that cannot possibly run. Capability
-//! lives in `strategies`, where every optimized rung is honestly `Missing`.
+//! `conditioning_bytes` charges the 66.71 GB Qwen3-VL-32B text encoder, which this crate executes
+//! through [`crate::text_encoder`] (sc-17155). Asset facts are the render's byte floor, not a
+//! capability claim: a candle render of this family needs the conditioner, and a contract that
+//! declared zero there would publish a floor small enough to admit a request that cannot possibly
+//! run. Capability lives in `strategies`, where every optimized rung is honestly `Missing`.
 //!
 //! # Stage attribution
 //!

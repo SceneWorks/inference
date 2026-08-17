@@ -91,10 +91,9 @@
 //!
 //! # Rule 4 — the conditioner applies no chat template
 //!
-//! Not a tensor-layout rule and not reachable from this crate yet (the text encoder is sc-17155's
-//! neighbourhood), but the same class of silent divergence: every MiniMax-H3 presentation
-//! (`t2va`, `fl2va`, `ref2va`) tokenizes with `tokenizer(text, add_special_tokens=False)` and **no
-//! chat template** (sc-18741).
+//! Not a tensor-layout rule, but the same class of silent divergence, and live in this crate's own
+//! [`crate::text_encoder`] (sc-17155): every MiniMax-H3 presentation (`t2va`, `fl2va`, `ref2va`)
+//! tokenizes with `tokenizer(text, add_special_tokens=False)` and **no chat template** (sc-18741).
 //!
 //! [`mlx_gen_minimax_h3::layout`]: https://github.com/SceneWorks/inference/blob/main/crates/media/mlx-gen/mlx-gen-minimax-h3/src/layout.rs
 

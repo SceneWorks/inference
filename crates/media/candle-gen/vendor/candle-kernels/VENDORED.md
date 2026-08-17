@@ -70,7 +70,10 @@ manual step, not a formality — nothing else will catch a re-vendor that drops 
 
 Two related facts recorded by sc-19545, neither of them enforced by anything:
 
-* `CUDA_COMPUTE_CAP` must stay **80** at all 15 CI sites (13 in `real-weights.yml`, 2 in `ci.yml`).
+* `CUDA_COMPUTE_CAP` must stay **80** at all 16 sites that pin it: 15 workflow env sites (13 in
+  `real-weights.yml`, 2 in `ci.yml`) plus the defaulted `export` in
+  `scripts/ci/cuda-check-local.sh` (the lane's local reproduction; `check-cuda.ps1`'s
+  `-ComputeCap` parameter defaults to 80 as well but is a manual knob, not a pinned site).
   It is the ladder's bottom rung, not a description of the hardware; raising it to the runner's own
   120 deletes the sm_80 rung here and lifts the dense PTX floor to `compute_120`.
 * **Datacenter Blackwell sm_100 (B100/B200) is not covered** by the ladder below — major 10 is

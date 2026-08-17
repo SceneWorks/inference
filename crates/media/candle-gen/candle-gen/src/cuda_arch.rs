@@ -71,8 +71,10 @@ impl FatbinLadder {
     /// **A missing baseline is treated as unknown, not as absent.** A `--features cuda` build with
     /// no `CUDA_COMPUTE_CAP` set lets cudaforge auto-detect the cap off the build host, so a rung
     /// exists that this process cannot name. Reporting the ladder without it could warn about a
-    /// device that is in fact served. All 15 CI sites set the variable, so this is the local
-    /// hand-build case; it resolves to silence rather than a false alarm.
+    /// device that is in fact served. Every automated build sets the variable — 15 workflow env
+    /// sites (13 in `real-weights.yml`, 2 in `ci.yml`) plus the defaulted export in
+    /// `scripts/ci/cuda-check-local.sh`, 16 pinned sites in all — so this is the local hand-build
+    /// case; it resolves to silence rather than a false alarm.
     fn parse(sass_csv: &str, ptx_csv: &str, baseline_csv: &str) -> Self {
         fn csv(raw: &str) -> Vec<u32> {
             raw.split(',')
