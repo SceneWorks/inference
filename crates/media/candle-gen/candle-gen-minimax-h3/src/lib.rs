@@ -128,6 +128,7 @@ pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod quant;
 pub mod reference;
 pub mod rope;
 pub mod spatial_tiling;
