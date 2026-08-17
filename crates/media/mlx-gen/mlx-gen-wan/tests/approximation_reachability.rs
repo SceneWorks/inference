@@ -455,38 +455,80 @@ fn crate_source(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+/// A crate source file with every comment line removed.
+///
+/// Load-bearing, and the reason is a bug this very gate shipped with: the first revision scanned the
+/// 160 characters before `fn from_plan_for_test` for the text `#[cfg(test)]`, and `TokenPruner`'s own
+/// doc comment says "`#[cfg(test)]`, mirroring …" 127 characters back. Deleting the real attribute left
+/// the doc match inside the window, so the gate passed and the mutation it exists to kill survived — on
+/// the exact type it was written for. Prose about an attribute must never be able to satisfy an
+/// assertion about the attribute.
+fn crate_code(relative: &str) -> String {
+    crate_source(relative)
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.starts_with("//"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The region of `source` belonging to the **last** `impl <ty> {` block, up to the next top-level
+/// `impl`/`fn` or the end of file.
+///
+/// Deliberately not `rfind` over the whole file for a call site: that silently assumes one impl is
+/// textually last, so reordering impls retargets the check at unrelated code. Scoping to a named block
+/// and asserting *ordering within it* is the property that a real regression must violate.
+fn last_impl_block<'a>(source: &'a str, header: &str) -> &'a str {
+    let start = source
+        .rfind(header)
+        .unwrap_or_else(|| panic!("no `{header}` block in this file"));
+    let rest = &source[start + header.len()..];
+    let end = rest
+        .match_indices("\nimpl ")
+        .map(|(at, _)| at)
+        .chain(rest.match_indices("\nfn ").map(|(at, _)| at))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn neither_mechanism_has_a_production_constructor() {
     // MAJOR 4: `TokenPruner` shipped with a `pub` keep-set constructor and a re-export, so a production
     // build could assemble the mechanism by hand and run it with no plan at all — bypassing the contract
     // entirely. Only `TrunkCache` had the second lock.
+    //
+    // Asserted as one CONTIGUOUS token sequence over comment-stripped code, so nothing between the
+    // attribute and the signature — a doc line, another attribute, a stray `pub` alias — can satisfy it.
+    // Adjacency is the smallest thing a real regression has to break: relaxing the visibility, dropping
+    // the `cfg`, or slipping anything in between all move these tokens apart.
     for (file, ty) in [
         ("src/token_pruning.rs", "TokenPruner"),
         ("src/feature_cache.rs", "TrunkCache"),
     ] {
-        let source = crate_source(file);
-        let marker = "fn from_plan_for_test";
-        let at = source
-            .find(marker)
-            .unwrap_or_else(|| panic!("{file}: {ty} must have a from_plan_for_test constructor"));
-        let preceding = &source[..at];
+        let code = crate_code(file);
         assert!(
-            preceding.trim_end().ends_with("pub(crate)")
-                || preceding.trim_end().ends_with("pub(crate) "),
-            "{file}: {ty}'s plan constructor must be pub(crate)"
+            code.contains("fn from_plan_for_test"),
+            "{file}: {ty} must have a from_plan_for_test constructor"
         );
-        // The `#[cfg(test)]` must be on the constructor itself, i.e. within the few lines above it.
-        let window_start = preceding.len().saturating_sub(160);
         assert!(
-            preceding[window_start..].contains("#[cfg(test)]"),
-            "{file}: {ty}'s plan constructor must be #[cfg(test)] — without it a production build can \
-             reach the uncharacterized mechanism"
+            code.contains("#[cfg(test)]\n    pub(crate) fn from_plan_for_test"),
+            "{file}: {ty}'s plan constructor must be exactly `#[cfg(test)] pub(crate)`, with nothing \
+             between the two — without that a production build can reach the uncharacterized mechanism"
+        );
+        // And there is only the one, so a second, unguarded constructor cannot hide beside it.
+        assert_eq!(
+            code.matches("fn from_plan_for_test").count(),
+            1,
+            "{file}: {ty} must have exactly one plan constructor"
         );
     }
 
-    // And the keep-set must not be re-exported: it is the piece a caller would need to assemble a
-    // pruned forward without going through `TokenPruner`.
-    let lib = crate_source("src/lib.rs");
+    // The keep-set must not be re-exported: it is the piece a caller would need to assemble a pruned
+    // forward without going through `TokenPruner`.
+    let lib = crate_code("src/lib.rs");
     assert!(
         !lib.contains("pub use token_pruning::TokenKeepSet"),
         "TokenKeepSet must not be re-exported — TokenPruner is the only reachable pruning surface"
@@ -502,7 +544,7 @@ fn every_unwired_denoise_route_has_a_refusal_call_site() {
     // MINOR 5: the helper's doc asserted a guard on three routes, but the MoE routes had no call site at
     // all — `Wan14b::generate_impl` never resolved a plan. The helper takes the route name as a string,
     // so no test of the helper can distinguish "this route refuses" from "this string round-trips".
-    let model = crate_source("src/model.rs");
+    let model = crate_code("src/model.rs");
     for route in [
         "TI2V mask-blend",
         "curated unified solver",
@@ -519,16 +561,66 @@ fn every_unwired_denoise_route_has_a_refusal_call_site() {
         "exactly the three unwired routes call the refusal — a fourth call site, or a missing one, \
          means the guard's documented coverage has drifted from the code"
     );
-    // The A14B refusal must sit before any weight is opened, which is what makes it a guard rather than
-    // a late error. `validate` is the first statement of `generate_impl`; the refusal is the second.
-    let a14b = model
-        .rfind("refuse_unwired_approximation(")
-        .expect("the MoE call site");
-    let validate_before = model[..a14b]
-        .rfind("self.validate(req)?;")
-        .expect("validate precedes the refusal");
+
+    // The A14B refusal must run BEFORE any loading work, which is what makes it a guard rather than a
+    // late error. Asserted as an ordering inside `Wan14b`'s own `generate_impl` — not as a line distance
+    // from a `rfind` over the whole file, which assumed that impl was textually last and left about
+    // three lines of headroom before an added comment would have reddened it.
+    let wan14b = last_impl_block(&model, "impl Wan14b {");
+    let generate = wan14b
+        .find("fn generate_impl(")
+        .expect("Wan14b must have a generate_impl");
+    let body = &wan14b[generate..];
+    let validate = body
+        .find("self.validate(req)?;")
+        .expect("Wan14b::generate_impl must validate");
+    let refusal = body
+        .find("refuse_unwired_approximation(")
+        .expect("Wan14b::generate_impl must refuse an unwired approximate plan");
     assert!(
-        model[validate_before..a14b].lines().count() < 12,
-        "the MoE refusal must follow validate immediately, before any loading work"
+        validate < refusal,
+        "the MoE refusal must follow the shared floor, not precede it"
+    );
+    // Nothing that loads or embeds may run between them. Naming the operations is more precise than a
+    // line budget: a comment is free, an expert load is not.
+    let between = &body[validate..refusal];
+    for forbidden in ["load_", "embed_text", "denoise", "Weights::"] {
+        assert!(
+            !between.contains(forbidden),
+            "`{forbidden}` runs between the shared floor and the MoE refusal — the refusal must come \
+             before any loading work"
+        );
+    }
+}
+
+#[test]
+fn every_mechanism_bridge_refuses_a_policy_inert_over_the_trajectory() {
+    // MINOR 2 of cycle 2: `refuse_inert_over_trajectory` has a direct test with discriminating controls,
+    // but nothing pinned that the bridges still CALL it — the same compile-time-fact class as the two
+    // gates above, and the cheapest to cover, since deleting a call cannot fail any behavioural test.
+    //
+    // Four bridges: `trunk_cache` and `token_pruner`, each in a `cfg(test)` and a `cfg(not(test))`
+    // definition. The call must be the FIRST statement of each — the guard has to run before the
+    // mechanism is constructed, not after — which contiguity expresses exactly.
+    let model = crate_code("src/model.rs");
+    assert_eq!(
+        model
+            .matches("{\n    refuse_inert_over_trajectory(id, plan, steps)?;")
+            .count(),
+        4,
+        "each of the four mechanism bridges (trunk_cache and token_pruner, cfg(test) and \
+         cfg(not(test))) must open with the inert-policy refusal"
+    );
+    for bridge in ["fn trunk_cache(", "fn token_pruner("] {
+        assert_eq!(
+            model.matches(bridge).count(),
+            2,
+            "{bridge} must have exactly its cfg(test) and cfg(not(test)) definitions — a third would \
+             not be covered by the count above"
+        );
+    }
+    assert!(
+        model.contains("fn refuse_inert_over_trajectory("),
+        "the guard the bridges call must be defined here"
     );
 }
