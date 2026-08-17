@@ -813,7 +813,7 @@ impl JointDit {
                 layout.num_text_tokens()
             )));
         }
-        let tables = dit.rope.tables(layout.position_ids(), dit.dtype)?;
+        let tables = dit.rope.tables(layout.position_ids())?;
 
         // One `temb` for both tables, captured rather than re-embedded — a second
         // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
