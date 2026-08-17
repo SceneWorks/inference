@@ -8,8 +8,8 @@
 //! provider silently ignore a selection. The difference is the *equivalence class*: every execution
 //! domain is bit-identical or numerically equivalent by construction, so a planner may select one
 //! freely. Nothing here is. A denoise feature cache reuses the block stack's output from an earlier
-//! step and token pruning skips a strided subset of the tokens' per-block updates, so the trajectory
-//! each produces is a **different** trajectory — cheaper, and worse by an amount only measurement can
+//! step and token pruning skips a *rotating* strided subset of the tokens' per-block updates, so the
+//! trajectory each produces is a **different** trajectory — cheaper, and worse by an amount only measurement can
 //! state.
 //!
 //! Two mechanisms ship, and they are orthogonal: the cache decides **which steps** run the block stack,
@@ -39,12 +39,20 @@
 //!   only way to be off is to not select. [`TokenDropStride`] refuses `1` for the mirror-image reason:
 //!   a stride of one drops *every* token, so it is not a weaker approximation of the block, it is the
 //!   block's absence — and "drop nothing" is again the selection being absent.
+//! * A **warmup that covers the whole trajectory** is the one remaining way to encode off inside an
+//!   `Approximate` plan, because the step count is not known when a policy is gated (a request may leave
+//!   `steps` to the model's default). Neither policy type can reject it alone, so each exposes
+//!   `is_inert_over(steps)` and the *provider* refuses such a policy once it knows the count. Without
+//!   that, "an approximate plan changed the output" would be false for a plan sitting squarely inside a
+//!   declared domain — the defect rejecting interval `1` exists to prevent, arriving through another door.
 //!
 //! The consumer-side half of the guarantee is that a provider branches on
 //! [`ApproximationPlan::is_exact`] exactly once, at the top of its denoise, and the `Exact` arm is
 //! the untouched pre-existing code. That is what the family's tensor-level test proves: with the plan
-//! `Exact`, every step of a multi-step run is **bit-identical** to an independent stateless call to
-//! the same block stack — no cross-step state, no reordering, no perturbation.
+//! `Exact`, every step of a multi-step run is **bit-identical** to a *verbatim transcription* of the
+//! pre-existing block stack — not to the production entry point, which now delegates through the same
+//! code and so could not disagree with it. See `mlx_gen_wan::transformer`'s
+//! `forward_cached_pre_sc18322_control`.
 //!
 //! # 2. Selection is bound to a quality characterization, so today it is *structurally* impossible
 //!
@@ -209,6 +217,18 @@ impl FeatureCachePolicy {
     pub const fn recomputes_step(&self, index: usize) -> bool {
         self.reuse_interval.recomputes_step(index, self.warmup)
     }
+
+    /// Whether this policy would reuse **nothing** over a `steps`-step trajectory.
+    ///
+    /// The step count is not known when a policy is built or gated — a request may leave `steps` to the
+    /// model's default — so this is the predicate a *provider* applies once it knows. It matters because
+    /// a warmup that covers the whole trajectory is a second encoding of *off*: it produces an
+    /// `Approximate` plan whose result is bit-identical to the exact path, which is precisely what
+    /// rejecting a reuse interval of `1` exists to prevent. A provider refuses it rather than running it,
+    /// so "an approximate plan changed the output" stays true by construction.
+    pub fn is_inert_over(&self, steps: usize) -> bool {
+        !(0..steps).any(|step| !self.recomputes_step(step))
+    }
 }
 
 /// The production domain of a provider's denoise feature cache.
@@ -279,8 +299,24 @@ pub const MIN_DROP_STRIDE: u32 = 2;
 /// A diffusion transformer applies the same per-token work — the attention query side and the
 /// feed-forward — to every token of the patchified latent. Neighbouring tokens are spatially adjacent
 /// patches and carry heavily overlapping information, so evaluating a strided subset and letting the
-/// rest pass through the block unchanged trades a fraction of the block's arithmetic for a slightly
-/// coarser update.
+/// rest pass through the block unchanged trades a fraction of the block's arithmetic for a coarser
+/// update.
+///
+/// # The keep-set MUST rotate, and that is part of the contract
+///
+/// A *fixed* keep-set is not a coarser update, it is a **frozen** one. If the same positions are dropped
+/// by every block of every step, a dropped position receives no contribution from the transformer at all
+/// — its value stays whatever the patch embedding produced, for the entire trajectory. At stride 2 that
+/// freezes half the latent grid, and it also means every surviving query attends over keys and values
+/// that are stale for those positions in every block after the first. That is a different mechanism from
+/// the one this type describes, and a much worse one.
+///
+/// So a conforming implementation must **rotate the phase** ([`keeps_token_at_phase`](Self::keeps_token_at_phase))
+/// across the units it prunes over, such that no position is dropped by every unit. A position is
+/// dropped at exactly one phase out of `stride`, so rotating over the block index (and the step index)
+/// gives every position a contribution from `stride - 1` of every `stride` blocks, and bounds key/value
+/// staleness to a single block rather than the whole stack.
+/// [`rotation_phases`](Self::rotation_phases) is how many distinct keep-sets that needs.
 ///
 /// `2` drops half the tokens — the most aggressive stride — and larger strides drop fewer and are
 /// closer to exact, so this axis runs *opposite* to [`CacheReuseInterval`]'s. `1` and `0` are both
@@ -319,18 +355,45 @@ impl TokenDropStride {
         self.0.get()
     }
 
-    /// Whether the token at zero-based sequence position `index` survives.
+    /// Whether the token at zero-based sequence position `index` survives **at rotation phase
+    /// `phase`**.
     ///
     /// The single decision point every consumer shares, so a provider cannot build a keep-set with one
-    /// phase and a restore map with another. Position `0` always survives, so the first token of the
-    /// sequence is never the dropped one at any stride.
-    pub const fn keeps_token(self, index: usize) -> bool {
-        !(index + 1).is_multiple_of(self.stride() as usize)
+    /// phase and a restore map with another. The phase shifts which residue class is dropped, so a
+    /// position dropped at one phase survives at all the others — see the type docs for why rotating is
+    /// mandatory rather than optional.
+    pub const fn keeps_token_at_phase(self, index: usize, phase: usize) -> bool {
+        !(index + 1 + phase).is_multiple_of(self.stride() as usize)
     }
 
-    /// How many of `total` tokens survive this stride.
+    /// [`keeps_token_at_phase`](Self::keeps_token_at_phase) at phase 0, where position `0` survives.
+    pub const fn keeps_token(self, index: usize) -> bool {
+        self.keeps_token_at_phase(index, 0)
+    }
+
+    /// How many distinct keep-sets a full rotation needs — one per residue class, i.e. `stride`.
+    ///
+    /// A provider builds this many keep-sets once per generate and indexes them by its rotation unit,
+    /// rather than rebuilding an index vector per block per step.
+    pub const fn rotation_phases(self) -> usize {
+        self.stride() as usize
+    }
+
+    /// How many of `total` tokens survive at `phase`.
+    ///
+    /// Phase-dependent when `total` is not a multiple of the stride, which is why it takes the phase
+    /// rather than assuming phase 0.
+    pub const fn kept_count_at_phase(self, total: usize, phase: usize) -> usize {
+        let stride = self.stride() as usize;
+        // Dropped positions in `0..total` are those with `(i + 1 + phase) % stride == 0`, i.e. the
+        // multiples of `stride` in `(phase, total + phase]`.
+        let dropped = (total + phase) / stride - phase / stride;
+        total - dropped
+    }
+
+    /// [`kept_count_at_phase`](Self::kept_count_at_phase) at phase 0.
     pub const fn kept_count(self, total: usize) -> usize {
-        total - total / self.stride() as usize
+        self.kept_count_at_phase(total, 0)
     }
 }
 
@@ -362,6 +425,13 @@ impl TokenPruningPolicy {
     /// the cache's warmup does: the head of the trajectory decides composition.
     pub const fn prunes_step(&self, index: usize) -> bool {
         index >= self.warmup.steps() as usize
+    }
+
+    /// Whether this policy would prune **nothing** over a `steps`-step trajectory — the same
+    /// second-encoding-of-off hazard [`FeatureCachePolicy::is_inert_over`] describes, and refused by a
+    /// provider for the same reason.
+    pub fn is_inert_over(&self, steps: usize) -> bool {
+        !(0..steps).any(|step| self.prunes_step(step))
     }
 }
 
@@ -839,6 +909,29 @@ impl ApproximationPlan {
         matches!(self, Self::Exact)
     }
 
+    /// The mechanisms this plan actually selects, as stable labels — for a refusal that must say *what*
+    /// it is refusing rather than naming whichever mechanism the message's author happened to have in
+    /// mind. Empty for [`Exact`](Self::Exact).
+    pub fn selected_mechanisms(&self) -> Vec<&'static str> {
+        let mut selected = Vec::new();
+        if self.feature_cache().is_some() {
+            selected.push("denoise feature cache");
+        }
+        if self.token_pruning().is_some() {
+            selected.push("token pruning");
+        }
+        selected
+    }
+
+    /// The selected mechanisms as a comma-joined phrase, for message interpolation.
+    pub fn describe_selection(&self) -> String {
+        let selected = self.selected_mechanisms();
+        if selected.is_empty() {
+            return "the exact path".to_owned();
+        }
+        selected.join(" + ")
+    }
+
     /// The token-pruning policy, if this plan selects one.
     pub const fn token_pruning(&self) -> Option<&TokenPruningPolicy> {
         match self {
@@ -1125,6 +1218,126 @@ mod tests {
         let by_three = TokenDropStride::new(3).unwrap();
         let kept: Vec<usize> = (0..7).filter(|i| by_three.keeps_token(*i)).collect();
         assert_eq!(kept, vec![0, 1, 3, 4, 6]);
+    }
+
+    #[test]
+    fn every_position_survives_at_all_but_one_rotation_phase() {
+        // The property that makes rotation a fix rather than a reshuffle: a position is dropped at
+        // exactly ONE phase out of `stride`, so rotating over any unit with at least two distinct
+        // phases guarantees no position is ever starved. A non-rotating implementation is the
+        // degenerate case this pins against.
+        for stride in [2u32, 3, 4] {
+            let declared = TokenDropStride::new(stride).unwrap();
+            assert_eq!(declared.rotation_phases(), stride as usize);
+            for index in 0..24usize {
+                let dropped_at: Vec<usize> = (0..declared.rotation_phases())
+                    .filter(|phase| !declared.keeps_token_at_phase(index, *phase))
+                    .collect();
+                assert_eq!(
+                    dropped_at.len(),
+                    1,
+                    "stride {stride}, position {index}: must be dropped at exactly one phase, was \
+                     dropped at {dropped_at:?}"
+                );
+            }
+        }
+        // Phase 0 is the historical (and only documented) alignment, so it must keep position 0.
+        assert!(TokenDropStride::EVERY_SECOND_TOKEN.keeps_token(0));
+    }
+
+    #[test]
+    fn the_kept_count_matches_the_phase_walk_at_every_phase() {
+        // `kept_count_at_phase` is closed-form; the keep-set is built by walking `keeps_token_at_phase`.
+        // A disagreement between the two is how a restore map ends up sized for a different phase than
+        // the gather it pairs with, which would write one token's update into another's row.
+        for stride in [2u32, 3, 5] {
+            let declared = TokenDropStride::new(stride).unwrap();
+            for total in [0usize, 1, 2, 7, 16, 31, 100] {
+                for phase in 0..declared.rotation_phases() {
+                    let walked = (0..total)
+                        .filter(|i| declared.keeps_token_at_phase(*i, phase))
+                        .count();
+                    assert_eq!(
+                        walked,
+                        declared.kept_count_at_phase(total, phase),
+                        "stride {stride}, total {total}, phase {phase}"
+                    );
+                }
+            }
+            assert_eq!(
+                declared.kept_count(9),
+                declared.kept_count_at_phase(9, 0),
+                "the phase-0 shorthand must agree with the general form"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trajectory_covering_warmup_is_inert_and_says_so() {
+        // The third encoding of off, and the reason a PROVIDER has to refuse it: the policy is inside
+        // its declared domain and the plan is `Approximate`, but the result would be bit-identical to
+        // the exact path. `is_inert_over` is what lets the provider tell.
+        let cache = FeatureCachePolicy::new(CacheReuseInterval::EVERY_OTHER_STEP)
+            .with_warmup(CacheWarmupSteps::new(8));
+        assert!(
+            cache.is_inert_over(4),
+            "warmup 8 over 4 steps reuses nothing"
+        );
+        assert!(cache.is_inert_over(8));
+        assert!(
+            !cache.is_inert_over(10),
+            "10 steps reach past the warmup, so step 9 reuses"
+        );
+        assert!(
+            cache.is_inert_over(0),
+            "a zero-step trajectory reuses nothing"
+        );
+
+        // The tight corner: warmup 1 over 2 steps. Step 0 is warmup, step 1 is the priming
+        // recomputation, so nothing reuses even though warmup < steps — which is why the predicate walks
+        // the phase instead of comparing warmup to steps.
+        let tight = FeatureCachePolicy::new(CacheReuseInterval::EVERY_OTHER_STEP)
+            .with_warmup(CacheWarmupSteps::new(1));
+        assert!(tight.is_inert_over(2), "steps 0 and 1 both recompute");
+        assert!(!tight.is_inert_over(3), "step 2 reuses");
+
+        let pruning = TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN)
+            .with_warmup(CacheWarmupSteps::new(5));
+        assert!(pruning.is_inert_over(5));
+        assert!(!pruning.is_inert_over(6));
+        assert!(
+            !TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN).is_inert_over(1),
+            "no warmup prunes from step 0"
+        );
+    }
+
+    #[test]
+    fn a_plan_names_the_mechanisms_it_actually_selects() {
+        // So a refusal reports what is being refused rather than whichever mechanism the message's
+        // author had in mind.
+        assert!(ApproximationPlan::Exact.selected_mechanisms().is_empty());
+        assert_eq!(
+            ApproximationPlan::Exact.describe_selection(),
+            "the exact path"
+        );
+
+        let cache = ApproximationPlan::feature_cache_only(policy());
+        assert_eq!(cache.describe_selection(), "denoise feature cache");
+
+        let pruning = ApproximationPlan::token_pruning_only(TokenPruningPolicy::new(
+            TokenDropStride::EVERY_SECOND_TOKEN,
+        ));
+        assert_eq!(pruning.describe_selection(), "token pruning");
+
+        let both = ApproximationPlan::Approximate {
+            denoise_feature_cache: Some(policy()),
+            token_pruning: Some(TokenPruningPolicy::new(TokenDropStride::EVERY_SECOND_TOKEN)),
+        };
+        assert_eq!(
+            both.describe_selection(),
+            "denoise feature cache + token pruning"
+        );
+        assert_eq!(both.selected_mechanisms().len(), 2);
     }
 
     #[test]

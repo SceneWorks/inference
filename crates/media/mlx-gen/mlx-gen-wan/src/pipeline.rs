@@ -896,7 +896,7 @@ fn predict_approx(
     guidance: f32,
     y: Option<&Array>,
     trunk: Option<&mut crate::feature_cache::TrunkCache>,
-    prune: Option<&crate::token_pruning::TokenKeepSet>,
+    prune: Option<&crate::token_pruning::TokenPruner>,
 ) -> Result<Array> {
     let x = match y {
         Some(y) => concatenate_axis(&[latents, y], 0)?,
@@ -972,8 +972,14 @@ pub fn denoise(
 ///   midpoint), so "the previous step's residual" is ambiguous — and the step index the cache keys on
 ///   never reaches the predict closure.
 /// * **MoE expert swap** changes transformers mid-trajectory, so a residual captured under the
-///   high-noise expert is meaningless under the low-noise one, and retaining it across the swap would
-///   also keep the outgoing expert's weights alive.
+///   high-noise expert is meaningless under the low-noise one, a rotation phase captured under one is
+///   not the other's, and retaining either across the swap would keep the outgoing expert's weights
+///   alive.
+///
+/// Each of those three has a live call site: `Wan::generate_impl`'s TI2V and curated arms, and
+/// `Wan14b::generate_impl`, which covers every A14B route because every A14B route swaps experts. The
+/// refusal names the plan's **actually selected** mechanisms rather than a fixed string, so a
+/// pruning-only plan is not refused with the cache's name.
 ///
 /// Unreachable today — the shared floor refuses every approximate selection before a provider is
 /// called, so no plan reaching here can be anything but `Exact`. It exists so that the day a
@@ -988,8 +994,9 @@ pub fn refuse_unwired_approximation(
         return Ok(());
     }
     Err(Error::Unsupported(format!(
-        "{id}: the {route} denoise route does not implement the denoise feature cache. Leave \
-         approximation unset for this route's exact denoise."
+        "{id}: the {route} denoise route does not implement {}. Leave approximation unset for this \
+         route's exact denoise.",
+        plan.describe_selection()
     )))
 }
 
@@ -1014,7 +1021,7 @@ pub fn denoise_approx(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
     mut trunk: Option<&mut crate::feature_cache::TrunkCache>,
-    prune: Option<mlx_gen::gen_core::TokenPruningPolicy>,
+    mut prune: Option<&mut crate::token_pruning::TokenPruner>,
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
@@ -1030,18 +1037,6 @@ pub fn denoise_approx(
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
 
-    // The token-pruning keep-set, built ONCE for this generate's token count and shared by every block
-    // of every pruned step (sc-18322). It is positional, so it depends only on the patch grid — nothing
-    // is read back from the accelerator to decide it, and the surviving count is known before the first
-    // forward. `None` when nothing selected pruning, which is every production request.
-    let keep = match prune {
-        Some(policy) => Some(crate::token_pruning::TokenKeepSet::new(
-            policy.drop_stride,
-            grid.0 * grid.1 * grid.2,
-        )?),
-        None => None,
-    };
-
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
         // Honor the engine cancellation contract (sc-5551, the video sibling of chroma's sc-5514):
@@ -1056,10 +1051,14 @@ pub fn denoise_approx(
         if let Some(cache) = trunk.as_deref_mut() {
             cache.begin_step(i);
         }
-        // Pruning's own phase decision, from the same loop and the contract's own predicate: a warmup
-        // step passes `None` and therefore runs the untouched block loop.
-        let keep_this_step = match (&keep, prune) {
-            (Some(keep), Some(policy)) if policy.prunes_step(i) => Some(keep),
+        // Pruning declares the step for the same reason the cache does — it keys its per-block rotation
+        // on it — and its warmup decision comes from the contract's own predicate, so a warmup step
+        // passes `None` and runs the untouched block loop.
+        if let Some(pruner) = prune.as_deref_mut() {
+            pruner.begin_step(i);
+        }
+        let prune_this_step = match prune.as_deref() {
+            Some(pruner) if pruner.prunes_step(i) => Some(pruner),
             _ => None,
         };
         let pred = predict_approx(
@@ -1070,7 +1069,7 @@ pub fn denoise_approx(
             guidance,
             None,
             trunk.as_deref_mut(),
-            keep_this_step,
+            prune_this_step,
         )?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's

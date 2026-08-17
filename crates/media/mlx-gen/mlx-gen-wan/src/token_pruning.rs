@@ -4,7 +4,8 @@
 //! # What is dropped, and what is deliberately *not*
 //!
 //! A pruned step evaluates each block's **per-token work** on a strided subset of the latent tokens and
-//! lets the rest pass through the block unchanged. Wan's block is three residual adds
+//! lets the rest pass through the block unchanged. The subset **rotates** — see the next section, which
+//! is the difference between a coarser update and a frozen one. Wan's block is three residual adds
 //! (`transformer::Block::forward`), every one of which is either gated by an adaLN gate or a plain
 //! `add`, so a token whose sublayer contributions are all zero emerges **exactly** as it entered — the
 //! pass-through is bit-exact by the residual structure, not by an approximation of it.
@@ -26,16 +27,17 @@
 //! `mar::scatter_rows` uses. Nothing here needs a Metal kernel that does not already ship.
 //!
 //! The keep-set is **positional**: it comes from
-//! [`TokenDropStride::keeps_token`](mlx_gen::gen_core::TokenDropStride::keeps_token) and the token
-//! count, never from tensor values. So the surviving count is known before the forward, no statistic is
+//! [`TokenDropStride::keeps_token_at_phase`](mlx_gen::gen_core::TokenDropStride::keeps_token_at_phase),
+//! the token count and the rotation phase — never from tensor values. So the surviving count is known before the forward, no statistic is
 //! read back from the accelerator mid-forward (which would be a full GPU sync per block per step), and
 //! the shape entering each block is a function of the request geometry alone. Wan compiles its
 //! elementwise glue `shapeless`, so a new token count is a compile-cache hit rather than a retrace.
 //!
 //! # Byte-identical when off
 //!
-//! Threaded as `Option<&TokenKeepSet>`. With `None` — every production caller — `Block::forward` runs
-//! unchanged and nothing in this module is constructed or called. The pruned path is a *separate* block
+//! Threaded as `Option<&TokenPruner>`. With `None` — every production caller, since a production build
+//! cannot construct one — `Block::forward` runs unchanged and nothing in this module is constructed or
+//! called. The pruned path is a *separate* block
 //! entry point (`Block::forward_pruned`), so the exact path's instruction sequence is not merely
 //! equivalent to what it was, it is the same code.
 //!
@@ -48,11 +50,36 @@
 //! inside the block leaves every one of those assumptions untouched, so the two approximate mechanisms
 //! compose without either knowing about the other.
 //!
+//! # The keep-set rotates per block and per step, and it has to
+//!
+//! An earlier revision of this module built **one** keep-set per generate and handed it to every block
+//! of every pruned step. That is not a coarser update, it is a frozen one: a dropped position received no
+//! contribution from any block, so the value entering block *k* was always the raw patch embedding and,
+//! at stride 2, half the latent grid was frozen for the whole trajectory. It also made every surviving
+//! query in blocks 1..N attend over key/value rows that were stale for those positions — so the
+//! full-key soundness argument above only ever held at block 0.
+//!
+//! [`TokenPruner`] therefore carries **one keep-set per rotation phase** (`stride` of them, built once
+//! per generate) and selects `(step + block) % stride`. A position is dropped at exactly one phase out of
+//! `stride`, so:
+//!
+//! * within one step it is updated by `stride - 1` of every `stride` blocks — never zero;
+//! * key/value staleness for a dropped position is bounded to **one block**, not the whole stack; and
+//! * the pattern also shifts step to step, so no position is disadvantaged across the trajectory.
+//!
+//! The contract states the requirement rather than leaving it to a provider
+//! ([`TokenDropStride::keeps_token_at_phase`](mlx_gen::gen_core::TokenDropStride::keeps_token_at_phase)),
+//! because a fixed keep-set is not a conforming implementation of the declared mechanism.
+//!
 //! # Not reachable from a request
 //!
-//! Same two locks as the feature cache: the contract refuses every approximate selection until a
-//! characterization artifact family exists, and [`TokenKeepSet`]'s construction from a plan is
-//! `#[cfg(test)]` at the provider bridge.
+//! The same two locks as the feature cache. First, the contract refuses every approximate selection until
+//! a characterization artifact family exists. Second — and this is the lock an earlier revision of this
+//! module was missing — [`TokenPruner`] has **no constructor outside `cfg(test)`**, and it is the only
+//! type the pub entry points ([`crate::pipeline::denoise_approx`],
+//! [`WanTransformer::forward_cached_approx`](crate::transformer::WanTransformer::forward_cached_approx))
+//! accept. [`TokenKeepSet`] is `pub(crate)`-constructed and unexported, so a production build cannot
+//! reach the mechanism by assembling the pieces by hand and bypassing the contract entirely.
 
 use mlx_rs::ops::{concatenate_axis, zeros_dtype};
 use mlx_rs::Array;
@@ -62,11 +89,15 @@ use mlx_gen::Error;
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// The positional keep-set for one forward: which token rows survive, and how to put them back.
+/// The positional keep-set for **one rotation phase**: which token rows survive, and how to put them
+/// back.
 ///
-/// Built once per forward from the stride and the token count — cheap (two `i32` vectors of length `L`,
-/// ~148 KiB at the 5B's production geometry) and shared by every block of that forward, so the gather
-/// index is not rebuilt 30 times.
+/// One of these per phase is built once per generate by [`TokenPruner`] — cheap (two `i32` vectors of
+/// length `L`, ~148 KiB at the 5B's production geometry, times `stride` phases) — so no index vector is
+/// rebuilt per block or per step.
+///
+/// Constructed only within this crate: [`TokenPruner`] is the reachable surface, and it has no production
+/// constructor at all.
 #[derive(Debug)]
 pub struct TokenKeepSet {
     /// Total tokens in the unpruned stream.
@@ -85,19 +116,24 @@ impl TokenKeepSet {
     /// The keep-set `stride` selects out of `total` tokens.
     ///
     /// Both index vectors come from the contract's single
-    /// [`keeps_token`](TokenDropStride::keeps_token) decision, so the gather and the restore cannot
-    /// disagree about which rows survived — a disagreement that would silently write one token's update
-    /// into another's row rather than failing.
-    pub fn new(stride: TokenDropStride, total: usize) -> Result<Self> {
+    /// [`keeps_token_at_phase`](TokenDropStride::keeps_token_at_phase) decision, so the gather and the
+    /// restore cannot disagree about which rows survived — a disagreement that would silently write one
+    /// token's update into another's row rather than failing.
+    // Dead in a production build BY DESIGN, and that is the lock rather than an oversight: the only
+    // caller chain is `TokenPruner::from_plan_for_test`, which is `#[cfg(test)]`. If this ever stops
+    // being dead in a `not(test)` build, the mechanism has become production-reachable without a
+    // characterization artifact — which is the state this whole story exists to prevent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(stride: TokenDropStride, total: usize, phase: usize) -> Result<Self> {
         if total == 0 {
             return Err(Error::Msg(
                 "wan: token pruning needs at least one token".into(),
             ));
         }
-        let mut keep: Vec<i32> = Vec::with_capacity(stride.kept_count(total));
+        let mut keep: Vec<i32> = Vec::with_capacity(stride.kept_count_at_phase(total, phase));
         let mut restore: Vec<i32> = Vec::with_capacity(total);
         for index in 0..total {
-            if stride.keeps_token(index) {
+            if stride.keeps_token_at_phase(index, phase) {
                 restore.push(keep.len() as i32);
                 keep.push(index as i32);
             } else {
@@ -112,7 +148,7 @@ impl TokenKeepSet {
             // would make the block the identity, and MLX would report a shape error somewhere far from
             // the cause.
             return Err(Error::Msg(format!(
-                "wan: a drop stride of {} leaves no tokens out of {total}",
+                "wan: a drop stride of {} at phase {phase} leaves no tokens out of {total}",
                 stride.stride()
             )));
         }
@@ -131,12 +167,14 @@ impl TokenKeepSet {
     }
 
     /// Surviving token count.
-    pub fn kept(&self) -> i32 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn kept(&self) -> i32 {
         self.kept
     }
 
     /// Total token count this keep-set was built for.
-    pub fn total(&self) -> i32 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn total(&self) -> i32 {
         self.total
     }
 
@@ -146,7 +184,7 @@ impl TokenKeepSet {
     /// erroring, which the workspace has been bitten by before (silently-garbage seeded KV) — so the
     /// axis length is checked here rather than trusted. The index vector itself is in range by
     /// construction.
-    pub fn gather(&self, x: &Array, axis: i32) -> Result<Array> {
+    pub(crate) fn gather(&self, x: &Array, axis: i32) -> Result<Array> {
         let len = x.shape()[axis as usize];
         if len != self.total {
             return Err(Error::Msg(format!(
@@ -169,7 +207,7 @@ impl TokenKeepSet {
     /// Implemented as one `concatenate_axis` + one `take_axis`, the primitive-free scatter idiom: append
     /// a single zero row to the computed block, then gather with the restore map, whose dropped entries
     /// all point at that row.
-    pub fn restore(&self, y: &Array) -> Result<Array> {
+    pub(crate) fn restore(&self, y: &Array) -> Result<Array> {
         let shape = y.shape();
         if shape.len() != 3 {
             return Err(Error::Msg(format!(
@@ -188,6 +226,105 @@ impl TokenKeepSet {
     }
 }
 
+/// The per-generate token-pruning schedule: one [`TokenKeepSet`] per rotation phase, plus the step the
+/// driver is currently on.
+///
+/// This is the **only** type the crate's public pruning entry points accept, and it has **no constructor
+/// outside `cfg(test)`** — the second of the two locks that keep the uncharacterized mechanism out of a
+/// production build (the first being the contract refusing every selection). Keeping the keep-sets behind
+/// it is also what makes the rotation non-optional: a caller cannot hand a single fixed keep-set to the
+/// block loop, because the block loop asks *this* for a phase.
+#[derive(Debug)]
+pub struct TokenPruner {
+    policy: mlx_gen::gen_core::TokenPruningPolicy,
+    /// One keep-set per rotation phase, indexed by `(step + block) % phases.len()`.
+    phases: Vec<TokenKeepSet>,
+    /// The step index the driver declared, as [`crate::feature_cache::TrunkCache`] does and for the same
+    /// reason: the step lives in the loop that has one, never derived from a timestep.
+    step: Option<usize>,
+}
+
+impl TokenPruner {
+    /// Build the pruner a plan asks for over a `total`-token stream — `None` for a plan that selects no
+    /// pruning.
+    ///
+    /// `#[cfg(test)]`, mirroring [`TrunkCache::from_plan_for_test`](crate::feature_cache::TrunkCache).
+    #[cfg(test)]
+    pub(crate) fn from_plan_for_test(
+        plan: &mlx_gen::gen_core::ApproximationPlan,
+        total: usize,
+    ) -> Result<Option<Self>> {
+        match plan.token_pruning() {
+            None => Ok(None),
+            Some(policy) => Ok(Some(Self::build(*policy, total)?)),
+        }
+    }
+
+    /// The shared builder. Private, so `cfg(test)` is the only door in — and therefore dead in a
+    /// production build, which is the lock itself. See [`TokenKeepSet::new`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn build(policy: mlx_gen::gen_core::TokenPruningPolicy, total: usize) -> Result<Self> {
+        let phases = (0..policy.drop_stride.rotation_phases())
+            .map(|phase| TokenKeepSet::new(policy.drop_stride, total, phase))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            policy,
+            phases,
+            step: None,
+        })
+    }
+
+    /// Declare the denoise step the next forward belongs to.
+    pub(crate) fn begin_step(&mut self, index: usize) {
+        self.step = Some(index);
+    }
+
+    /// Whether step `index` prunes at all, per the declared policy's warmup.
+    pub(crate) fn prunes_step(&self, index: usize) -> bool {
+        self.policy.prunes_step(index)
+    }
+
+    /// The keep-set for `block` at the declared step — the rotation, in one place.
+    ///
+    /// The phase is `(step + block) % stride`, so a position dropped by one block is kept by its
+    /// neighbours and the whole pattern also advances step to step. Refuses if the driver never declared
+    /// a step, for the same reason the feature cache does: a silent default of 0 would freeze the
+    /// rotation at one phase and quietly reintroduce the starvation this exists to prevent.
+    pub(crate) fn keep_for_block(&self, block: usize) -> Result<&TokenKeepSet> {
+        let step = self.step.ok_or_else(|| {
+            Error::Msg(
+                "wan: token pruning used before the step loop declared a step index; call \
+                 TokenPruner::begin_step once per denoise step"
+                    .into(),
+            )
+        })?;
+        let phase = (step + block) % self.phases.len();
+        self.phases
+            .get(phase)
+            .ok_or_else(|| Error::Msg(format!("wan: token pruning has no phase {phase}")))
+    }
+
+    /// How many rotation phases this pruner carries.
+    #[cfg(test)]
+    pub(crate) fn phase_count(&self) -> usize {
+        self.phases.len()
+    }
+}
+
+#[cfg(test)]
+impl TokenKeepSet {
+    /// The surviving positions, in order. The index array is a contiguous 1-D `from_slice`, so reading
+    /// it back needs no `contiguous` round-trip.
+    pub(crate) fn kept_positions(&self) -> Vec<i32> {
+        self.keep.as_slice::<i32>().to_vec()
+    }
+
+    /// Whether `position` survives this phase.
+    pub(crate) fn keeps(&self, position: usize) -> bool {
+        self.kept_positions().contains(&(position as i32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,7 +332,22 @@ mod tests {
     use mlx_rs::Dtype;
 
     fn keep_set(stride: u32, total: usize) -> TokenKeepSet {
-        TokenKeepSet::new(TokenDropStride::new(stride).unwrap(), total).expect("keep set")
+        keep_set_at(stride, total, 0)
+    }
+
+    fn keep_set_at(stride: u32, total: usize, phase: usize) -> TokenKeepSet {
+        TokenKeepSet::new(TokenDropStride::new(stride).unwrap(), total, phase).expect("keep set")
+    }
+
+    fn pruner(stride: u32, total: usize) -> TokenPruner {
+        TokenPruner::from_plan_for_test(
+            &ApproximationPlan::token_pruning_only(TokenPruningPolicy::new(
+                TokenDropStride::new(stride).unwrap(),
+            )),
+            total,
+        )
+        .expect("pruner")
+        .expect("a pruning plan must yield a pruner")
     }
 
     /// Logical f32 rows of an array.
@@ -211,39 +363,103 @@ mod tests {
         a.as_slice::<f32>().to_vec()
     }
 
-    /// The provider bridge's `cfg(test)` shape, mirrored here so the plan → mechanism step is covered.
-    fn from_plan(plan: &ApproximationPlan, total: usize) -> Option<TokenKeepSet> {
-        plan.token_pruning()
-            .map(|policy| TokenKeepSet::new(policy.drop_stride, total).expect("keep set"))
+    #[test]
+    fn an_exact_plan_yields_no_pruner() {
+        assert!(
+            TokenPruner::from_plan_for_test(&ApproximationPlan::Exact, 8)
+                .expect("exact resolves")
+                .is_none()
+        );
+        assert_eq!(pruner(2, 8).phase_count(), 2, "one keep-set per phase");
+        assert_eq!(pruner(3, 9).phase_count(), 3);
+    }
+
+    /// **The rotation, and the starvation it exists to prevent.**
+    ///
+    /// A fixed keep-set drops the same positions in every block of every step, so those positions
+    /// receive nothing from the transformer at all. This asserts the property that rules that out: for
+    /// every step and every position there is a block whose phase keeps it — and, tighter, a position is
+    /// skipped by at most one block in any run of `stride` consecutive blocks.
+    #[test]
+    fn no_position_is_starved_by_the_block_rotation() {
+        for stride in [2u32, 3, 4] {
+            let total = 12usize;
+            let mut pruner = pruner(stride, total);
+            for step in 0..5usize {
+                pruner.begin_step(step);
+                for position in 0..total {
+                    let kept_by: Vec<usize> = (0..stride as usize)
+                        .filter(|block| {
+                            let keep = pruner.keep_for_block(*block).expect("phase");
+                            keep.keeps(position)
+                        })
+                        .collect();
+                    assert_eq!(
+                        kept_by.len(),
+                        stride as usize - 1,
+                        "stride {stride}, step {step}, position {position}: must be updated by all \
+                         but one of every {stride} blocks, was updated by {kept_by:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The phase must actually advance with BOTH the step and the block, or the rotation degenerates.
+    #[test]
+    fn the_phase_advances_with_the_step_and_with_the_block() {
+        let total = 8usize;
+        let mut pruner = pruner(2, total);
+        pruner.begin_step(0);
+        let block0_step0 = pruner.keep_for_block(0).expect("phase").kept_positions();
+        let block1_step0 = pruner.keep_for_block(1).expect("phase").kept_positions();
+        assert_ne!(
+            block0_step0, block1_step0,
+            "consecutive blocks must use different phases"
+        );
+        pruner.begin_step(1);
+        let block0_step1 = pruner.keep_for_block(0).expect("phase").kept_positions();
+        assert_ne!(
+            block0_step0, block0_step1,
+            "the same block must use a different phase on the next step"
+        );
+        assert_eq!(
+            block1_step0, block0_step1,
+            "the phase is (step + block) % stride, so these two coincide"
+        );
     }
 
     #[test]
-    fn an_exact_plan_yields_no_keep_set() {
-        assert!(from_plan(&ApproximationPlan::Exact, 8).is_none());
-        assert!(from_plan(
-            &ApproximationPlan::token_pruning_only(TokenPruningPolicy::new(
-                TokenDropStride::EVERY_SECOND_TOKEN
-            )),
-            8
-        )
-        .is_some());
+    fn a_forward_before_the_driver_declares_a_step_is_refused() {
+        // Same guard as the feature cache's, and for a sharper reason: a silent default of step 0 would
+        // freeze the rotation's step component and re-create half the starvation.
+        let pruner = pruner(2, 8);
+        let error = pruner
+            .keep_for_block(0)
+            .expect_err("a pruner with no declared step must refuse");
+        assert!(error.to_string().contains("begin_step"), "{error}");
     }
 
     #[test]
     fn the_keep_set_matches_the_contracts_phase_and_count() {
         for stride in [2u32, 3, 5] {
             let total = 17usize;
-            let set = keep_set(stride, total);
             let declared = TokenDropStride::new(stride).unwrap();
-            assert_eq!(set.total(), total as i32);
-            assert_eq!(set.kept(), declared.kept_count(total) as i32);
-            let expected: Vec<i32> = (0..total)
-                .filter(|i| declared.keeps_token(*i))
-                .map(|i| i as i32)
-                .collect();
-            assert_eq!(set.keep.as_slice::<i32>(), expected.as_slice());
+            for phase in 0..declared.rotation_phases() {
+                let set = keep_set_at(stride, total, phase);
+                assert_eq!(set.total(), total as i32);
+                assert_eq!(
+                    set.kept(),
+                    declared.kept_count_at_phase(total, phase) as i32
+                );
+                let expected: Vec<i32> = (0..total)
+                    .filter(|i| declared.keeps_token_at_phase(*i, phase))
+                    .map(|i| i as i32)
+                    .collect();
+                assert_eq!(set.keep.as_slice::<i32>(), expected.as_slice());
+            }
         }
-        assert!(TokenKeepSet::new(TokenDropStride::EVERY_SECOND_TOKEN, 0).is_err());
+        assert!(TokenKeepSet::new(TokenDropStride::EVERY_SECOND_TOKEN, 0, 0).is_err());
     }
 
     #[test]

@@ -480,9 +480,14 @@ impl SelfAttention {
     /// Self-attention with the **query side and the key/value side supplied separately** — the seam
     /// sc-18322's token pruning needs.
     ///
-    /// [`forward`](Self::forward) is `forward_split(x, cos, sin, x, cos, sin)`: the same tensors in the
-    /// same ops in the same order, so the un-pruned path is byte-identical to the pre-sc-18322 body by
-    /// construction rather than by comparison.
+    /// [`forward`](Self::forward) is `forward_split(x, cos, sin, x, cos, sin)`, and the
+    /// **single-cast** guard below is what makes that delegation free rather than a hidden regression:
+    /// when the query and key/value inputs are the same tensor, the bf16 cast runs **once** and the
+    /// result is shared, exactly as the pre-sc-18322 body's one `xw` did. Two casts would have added a
+    /// duplicate full `[B, L, dim]` bf16 transient per block per step — ~227 MiB at the dense 5B's
+    /// production geometry — to the production path of every Wan MLX provider, in the one lane where
+    /// memory is the binding constraint. The values would have agreed, so no parity test would have
+    /// caught it.
     ///
     /// Pruning passes a gathered `[B, L', dim]` query stream (with its RoPE tables gathered to the same
     /// `L'`) against the **full** `[B, L, dim]` key/value stream, so every surviving query still attends
@@ -502,8 +507,8 @@ impl SelfAttention {
         // Matmuls run bf16 (the reference's `x.astype(w_dtype)`); the f32 residual is restored by the
         // block's modulation. q/k get full-dim bf16 RMSNorm before the head split; RoPE applies in
         // f32 on bf16 cos/sin then casts back to bf16 for the bf16 SDPA.
-        let xq = bf16(x_q)?;
-        let xkv = bf16(x_kv)?;
+        //
+        let (xq, xkv, _casts) = split_attention_casts(x_q, x_kv)?;
         let (n, d) = (self.num_heads as i32, self.head_dim as i32);
         let b = x_q.shape()[0];
         let sq = x_q.shape()[1];
@@ -1681,7 +1686,7 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
         trunk: Option<&mut crate::feature_cache::TrunkCache>,
-        prune: Option<&crate::token_pruning::TokenKeepSet>,
+        prune: Option<&crate::token_pruning::TokenPruner>,
     ) -> Result<Vec<Array>> {
         // Patchify + embed once; cast to bf16 to start the block stream (reference casts to w_dtype).
         let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
@@ -1706,8 +1711,14 @@ impl WanTransformer {
                         x = block.forward(&x, e0, kv, cos, sin)?;
                     }
                 }
-                Some(keep) => {
-                    for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+                Some(pruner) => {
+                    // The rotation happens HERE, per block: `keep_for_block` selects the
+                    // `(step + block) % stride` phase, so no position is dropped by every block of a
+                    // step and key/value staleness is bounded to one block (sc-18322, see
+                    // `crate::token_pruning`).
+                    for (index, (block, kv)) in self.blocks.iter().zip(cross_kv.iter()).enumerate()
+                    {
+                        let keep = pruner.keep_for_block(index)?;
                         x = block.forward_pruned(&x, e0, kv, cos, sin, keep)?;
                     }
                 }
@@ -1811,6 +1822,68 @@ impl WanTransformer {
         self.blocks[index].forward_pruned(x, &e0, kv, cos, sin, keep)
     }
 
+    /// **The pre-sc-18322 cached forward, copied verbatim, as an independent test control.**
+    ///
+    /// A byte-identity claim needs a reference the production code cannot influence. Comparing
+    /// [`forward_cached`](Self::forward_cached) against
+    /// [`forward_cached_approx`](Self::forward_cached_approx)`(.., None, None)` cannot do that — the
+    /// former is a one-line delegation to the latter, so both sides run the same instructions and the
+    /// comparison holds no matter what either does. This is the honest control: the block loop, the
+    /// block body and the self-attention body as they stood at `2a42ab64c`, transcribed, calling **none**
+    /// of the sc-18322 code paths.
+    ///
+    /// Test-side duplication is the point — production keeps its single path, and this copy diverging
+    /// from it is exactly what the comparison is for. It is `#[cfg(test)]`, so it costs a production
+    /// build nothing.
+    #[cfg(test)]
+    pub(crate) fn forward_cached_pre_sc18322_control(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+    ) -> Result<Vec<Array>> {
+        let (e, e0) = self.time_embed(t)?;
+        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let dim = self.cfg.dim as i32;
+        let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
+        let mut x = if batch > 1 {
+            broadcast_to(&x1, &[batch as i32, l, dim])?
+        } else {
+            x1
+        };
+
+        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+            x = control_block_forward(block, &x, &e0, kv, cos, sin)?;
+        }
+
+        let x = self.apply_head(&x, &e)?;
+        let op = x.shape()[2];
+        if batch == 1 {
+            let xb = x.reshape(&[l, op])?;
+            return Ok(vec![unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?]);
+        }
+        let mut out = Vec::with_capacity(batch);
+        for part in split(&x, batch as i32, 0)? {
+            let xb = part.reshape(&[l, op])?;
+            out.push(unpatchify(
+                &xb,
+                grid,
+                self.cfg.out_dim,
+                self.cfg.patch_size,
+            )?);
+        }
+        Ok(out)
+    }
+
     pub fn forward_cached(
         &self,
         latent: &Array,
@@ -1838,7 +1911,7 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
         trunk: Option<&mut crate::feature_cache::TrunkCache>,
-        prune: Option<&crate::token_pruning::TokenKeepSet>,
+        prune: Option<&crate::token_pruning::TokenPruner>,
     ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed(t)?;
         self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, trunk, prune)
@@ -1993,4 +2066,128 @@ impl WanTransformer {
             Error::Msg("wan: forward_tokens_cached produced no output for batch=1".into())
         })
     }
+}
+
+/// **`Block::forward` as it stood at `2a42ab64c`, transcribed verbatim** — the test control for
+/// sc-18322's byte-identity claim. See
+/// [`WanTransformer::forward_cached_pre_sc18322_control`] for why a transcription rather than a call.
+///
+/// The only edit from the original is `self` becoming the `block` parameter and the self-attention call
+/// going to [`control_self_attn_forward`] instead of `SelfAttention::forward` (which is now a
+/// delegation). Nothing else may change here: if production's block body legitimately changes, this
+/// copy must be updated in the same commit, and the failing comparison is the prompt to do it.
+#[cfg(test)]
+fn control_block_forward(
+    block: &Block,
+    x: &Array,
+    e: &Array,
+    kv: &(Array, Array),
+    cos: &Array,
+    sin: &Array,
+) -> Result<Array> {
+    let dim = block.self_attn.num_heads as i32 * block.self_attn.head_dim as i32;
+    let m = add(&block.modulation, e)?;
+    let l_e = m.shape()[1];
+    let p = split(&m, 6, 2)?;
+    let v = |i: usize| -> Result<Array> { Ok(p[i].reshape(&[1, l_e, dim])?) };
+    let (e0, e1, e2) = (v(0)?, v(1)?, v(2)?);
+    let (e3, e4, e5) = (v(3)?, v(4)?, v(5)?);
+
+    // Self-attention.
+    let x_mod = modulate(&ln(x, block.eps)?, &e1, &e0)?;
+    let y = control_self_attn_forward(&block.self_attn, &x_mod, cos, sin)?;
+    let x = gated(x, &y, &e2)?;
+
+    // Cross-attention (affine LayerNorm on context-side query, no modulation).
+    let x_cross = layer_norm(&x, Some(&block.norm3_w), Some(&block.norm3_b), block.eps)?;
+    let x = add(&x, &block.cross_attn.forward(&x_cross, kv)?)?;
+
+    // Gated-GELU FFN (bf16 matmuls; the reference's `x.astype(w_dtype)`).
+    let x_mod = modulate(&ln(&x, block.eps)?, &e4, &e3)?;
+    let y = gelu_ffn(&block.ffn_fc1.forward(&bf16(&x_mod)?)?)?;
+    let y = block.ffn_fc2.forward(&y)?;
+    gated(&x, &y, &e5)
+}
+
+/// **`SelfAttention::forward` as it stood at `2a42ab64c`, transcribed verbatim** — note the single
+/// `xw` cast, which is the property MAJOR 1's fix restores on the production path.
+#[cfg(test)]
+fn control_self_attn_forward(
+    attn: &SelfAttention,
+    x_mod: &Array,
+    cos: &Array,
+    sin: &Array,
+) -> Result<Array> {
+    let xw = bf16(x_mod)?;
+    let (n, d) = (attn.num_heads as i32, attn.head_dim as i32);
+    let b = x_mod.shape()[0];
+    let s = x_mod.shape()[1];
+
+    let q = rms_norm(&attn.q.forward(&xw)?, &attn.norm_q, attn.eps)?;
+    let k = rms_norm(&attn.k.forward(&xw)?, &attn.norm_k, attn.eps)?;
+    let q = bf16(&crate::rope::rope_apply(
+        &f32(&q.reshape(&[b, s, n, d])?)?,
+        cos,
+        sin,
+    )?)?
+    .transpose_axes(&[0, 2, 1, 3])?;
+    let k = bf16(&crate::rope::rope_apply(
+        &f32(&k.reshape(&[b, s, n, d])?)?,
+        cos,
+        sin,
+    )?)?
+    .transpose_axes(&[0, 2, 1, 3])?;
+    let v = attn
+        .v
+        .forward(&xw)?
+        .reshape(&[b, s, n, d])?
+        .transpose_axes(&[0, 2, 1, 3])?;
+
+    let out = sdpa_maybe_checkpoint(&q, &k, &v, attn.scale, attn.ckpt_sdpa, attn.attn_budget)?;
+    let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
+    attn.o.forward(&out)
+}
+
+/// The bf16 cast selection [`SelfAttention::forward_split`] performs on its two input streams
+/// (sc-18322).
+///
+/// Its whole reason to exist as a named function is that it is the **only** observable of MAJOR 1's
+/// regression: casting the same tensor twice produces equal arrays, so no value comparison can see it —
+/// only object identity can, and only if a test can call exactly what production calls. Extracting it
+/// here is what makes `the_unpruned_self_attention_casts_its_input_once` a real test rather than a
+/// restatement of the condition.
+///
+/// When the two streams are the same tensor — the un-pruned path — the cast runs once and the handle is
+/// shared, reproducing the pre-sc-18322 body's single `xw`. `Array::clone` is a refcount bump on the
+/// same `mlx_array`, not a buffer copy. A pruned caller can never hit the shared branch, because its
+/// query stream is a freshly gathered tensor.
+pub(crate) fn split_attention_casts(
+    x_q: &Array,
+    x_kv: &Array,
+) -> Result<(Array, Array, AttentionCasts)> {
+    let xq = bf16(x_q)?;
+    if std::ptr::eq(x_q, x_kv) {
+        // `Array::clone` copies the handle and shares the underlying array, so this performs no second
+        // cast and allocates no second transient.
+        let xkv = xq.clone();
+        return Ok((xq, xkv, AttentionCasts::Shared));
+    }
+    let xkv = bf16(x_kv)?;
+    Ok((xq, xkv, AttentionCasts::Separate))
+}
+
+/// How many bf16 casts [`split_attention_casts`] performed — the **outcome**, returned rather than
+/// re-derivable, because that is the only way a test can observe MAJOR 1's regression.
+///
+/// Handle identity cannot serve: mlx-rs's `Array::clone` mints a fresh `mlx_array` around the same
+/// underlying array, so a shared cast and a duplicate cast are indistinguishable by pointer. Values
+/// cannot serve either — a duplicate cast of the same tensor is equal to the original. Returning the
+/// decision is what makes "the un-pruned path casts once" an assertion about the code that runs rather
+/// than a restatement of its condition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionCasts {
+    /// One cast, shared by the query and key/value sides — the un-pruned path.
+    Shared,
+    /// One cast per side — the pruned path, whose query stream is a distinct gathered tensor.
+    Separate,
 }

@@ -121,7 +121,7 @@ pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
-pub use token_pruning::TokenKeepSet;
+pub use token_pruning::TokenPruner;
 pub use vae::{OwnedWanSingleFrameDecoder, WanSingleFrameDecoder, WanVideoDecoder};
 
 /// Load the request-selected Wan z16 image decoder from `LoadSpec.components["vae"]`.

@@ -338,37 +338,57 @@ fn a_non_declaring_wan_provider_refuses_a_selection_as_an_absent_mechanism() {
 }
 
 #[test]
-fn every_unwired_denoise_route_refuses_a_non_exact_plan_by_name() {
-    // The provider-side backstop for the routes the mechanism is NOT wired into. Unreachable today —
-    // the shared floor refuses every selection first — so it is asserted directly here, which is the
-    // only way it can be gated at all before a characterization artifact exists.
-    let plan = ApproximationPlan::Approximate {
-        denoise_feature_cache: Some(policy(2, 0)),
-        token_pruning: Some(pruning(2, 0)),
-    };
-    for route in [
-        "TI2V mask-blend",
-        "curated unified solver",
-        "MoE expert swap",
+fn the_unwired_route_helper_names_the_route_and_the_selected_mechanisms() {
+    // Renamed from a claim it could not support. This exercises the HELPER, not any route's use of it:
+    // it takes an arbitrary `route` string, so a green result here proves the message is well formed,
+    // never that some route calls it. Which routes call it is
+    // `every_a14b_route_refuses_a_non_exact_plan` (below) plus the two `Wan::generate_impl` arms, whose
+    // coverage is a source fact rather than a weights-free assertion.
+    //
+    // What it does pin, and what MINOR 6 was: the refusal names the plan's ACTUALLY SELECTED mechanisms
+    // rather than a fixed string, so a pruning-only plan is not refused with the cache's name.
+    for (plan, expected) in [
+        (
+            ApproximationPlan::feature_cache_only(policy(2, 0)),
+            "denoise feature cache",
+        ),
+        (
+            ApproximationPlan::token_pruning_only(pruning(2, 0)),
+            "token pruning",
+        ),
+        (
+            ApproximationPlan::Approximate {
+                denoise_feature_cache: Some(policy(2, 0)),
+                token_pruning: Some(pruning(2, 0)),
+            },
+            "denoise feature cache + token pruning",
+        ),
     ] {
-        let error = mlx_gen_wan::refuse_unwired_approximation(DECLARING_ID, route, &plan)
-            .expect_err("an unwired route must refuse a non-exact plan");
-        assert!(
-            matches!(error, mlx_gen::Error::Unsupported(_)),
-            "{route}: a capability gap, not a range error: {error:?}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains(route),
-            "the route must be named: {message}"
-        );
-        assert!(
-            message.contains("does not implement the denoise feature cache"),
-            "{message}"
-        );
+        for route in [
+            "TI2V mask-blend",
+            "curated unified solver",
+            "MoE expert swap",
+        ] {
+            let error = mlx_gen_wan::refuse_unwired_approximation(DECLARING_ID, route, &plan)
+                .expect_err("an unwired route must refuse a non-exact plan");
+            assert!(
+                matches!(error, mlx_gen::Error::Unsupported(_)),
+                "{route}: a capability gap, not a range error: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(route),
+                "the route must be named: {message}"
+            );
+            assert!(
+                message.contains(expected),
+                "the refusal must name the selected mechanisms ({expected}): {message}"
+            );
+        }
     }
-    // And the exact plan passes on every one of them, so the check above is about the plan rather
-    // than about the route names.
+
+    // And the exact plan passes on every route, so the checks above are about the plan rather than
+    // about the route names.
     for route in [
         "TI2V mask-blend",
         "curated unified solver",
@@ -376,5 +396,41 @@ fn every_unwired_denoise_route_refuses_a_non_exact_plan_by_name() {
     ] {
         mlx_gen_wan::refuse_unwired_approximation(DECLARING_ID, route, &ApproximationPlan::Exact)
             .unwrap_or_else(|error| panic!("{route} must admit the exact plan: {error}"));
+    }
+}
+
+#[test]
+fn every_a14b_route_refuses_a_non_exact_plan_before_touching_weights() {
+    // MAJOR 5: `Wan14b::generate_impl` previously never resolved a plan, so the MoE routes had NO call
+    // site for the refusal the helper's docs claimed. It resolves one now, at the top of `generate_impl`
+    // and before any weight is opened — which is what makes this assertion possible without weights.
+    //
+    // Today it necessarily reports the shared floor's refusal (the contract admits no approximate
+    // selection at all), so what is proven here is that an approximate selection cannot reach an A14B
+    // denoise: the request is refused, by name, on the way in. The provider-side `MoE expert swap`
+    // refusal sits immediately behind it for the day selection becomes possible.
+    let a14b: Vec<ModelDescriptor> = descriptors()
+        .into_iter()
+        .filter(|descriptor| descriptor.id != DECLARING_ID)
+        .collect();
+    assert!(
+        !a14b.is_empty(),
+        "the registry must expose the non-dense Wan providers"
+    );
+    for descriptor in a14b {
+        for selection in [
+            ApproximationRequest::feature_cache(policy(2, 0)),
+            ApproximationRequest::token_pruning(pruning(2, 0)),
+        ] {
+            let error = descriptor
+                .capabilities
+                .validate_request(descriptor.id, &probe_request(Some(selection)))
+                .expect_err("an expert-swap provider must refuse an approximate selection");
+            assert!(
+                matches!(error, Error::Unsupported(_)),
+                "{}: {error:?}",
+                descriptor.id
+            );
+        }
     }
 }

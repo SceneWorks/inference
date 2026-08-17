@@ -45,6 +45,7 @@ use crate::pipeline::{
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
+use crate::token_pruning::TokenPruner;
 use crate::transformer::WanTransformer;
 
 /// Concrete z48 VAE assigned to the TI2V-5B route.
@@ -233,26 +234,87 @@ pub(crate) fn approximation_surface() -> ApproximationSurface {
 /// production build cannot reach the uncharacterized path even if it somehow held a
 /// [`ApproximationPlan::Approximate`]. That is the second of two independent locks — the first is the
 /// contract refusing every approximate selection for want of a characterization artifact.
+/// Both bridges first run [`refuse_inert_over_trajectory`], because the step count is only known here.
 #[cfg(not(test))]
-fn trunk_cache(_plan: &ApproximationPlan) -> Option<TrunkCache> {
-    None
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
 }
 
 #[cfg(test)]
-fn trunk_cache(plan: &ApproximationPlan) -> Option<TrunkCache> {
-    TrunkCache::from_plan_for_test(plan)
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(TrunkCache::from_plan_for_test(plan))
 }
 
-/// The token-pruning policy a resolved plan asks for — the second provider-side bridge, locked exactly
-/// like [`trunk_cache`] (sc-18322).
+/// The token pruner a resolved plan asks for — the second provider-side bridge, locked exactly like
+/// [`trunk_cache`] (sc-18322). `total` is the generate's patchified token count, which the rotation
+/// phases are built over.
 #[cfg(not(test))]
-fn token_pruning(_plan: &ApproximationPlan) -> Option<mlx_gen::gen_core::TokenPruningPolicy> {
-    None
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    _total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
 }
 
 #[cfg(test)]
-fn token_pruning(plan: &ApproximationPlan) -> Option<mlx_gen::gen_core::TokenPruningPolicy> {
-    plan.token_pruning().copied()
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    TokenPruner::from_plan_for_test(plan, total)
+}
+
+/// Refuse an approximate policy that would engage on **no step** of this request's trajectory
+/// (sc-18322).
+///
+/// The last way to encode *off* inside an `Approximate` plan. A warmup is gated against the declared
+/// `max_warmup_steps` without knowing the step count — a request may leave `steps` to the model's default
+/// — so a policy well inside its declared domain can still cover the whole trajectory and produce a
+/// result bit-identical to the exact path. That is exactly the second-encoding-of-off defect that
+/// rejecting a reuse interval of `1` exists to prevent, and letting it through here would make the
+/// contract's own "an approximate plan changed the output" claim false.
+///
+/// This is the one place the step count and the policy are both in hand, so it is the one place the
+/// refusal can be made. Unreachable today (no plan reaching a provider can be anything but `Exact`), and
+/// it fails closed the day selection becomes possible.
+pub(crate) fn refuse_inert_over_trajectory(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+) -> Result<()> {
+    if let Some(policy) = plan.feature_cache() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected denoise feature cache (interval {} steps, warmup {}) reuses \
+                 nothing over this request's {steps} steps, so it would produce the exact result \
+                 through the approximate path. Lower the warmup, raise the step count, or leave \
+                 approximation unset.",
+                policy.reuse_interval.steps(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    if let Some(policy) = plan.token_pruning() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected token pruning (drop stride {}, warmup {}) prunes nothing over \
+                 this request's {steps} steps, so it would produce the exact result through the \
+                 approximate path. Lower the warmup, raise the step count, or leave approximation \
+                 unset.",
+                policy.drop_stride.stride(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The projection width the UMT5 text encoder packs to on a quantized tier: **Q8** (sc-12831). Q8 is
@@ -850,11 +912,19 @@ impl Wan {
                         })
                     };
                     // The one wired route: native dense T2V, one forward per step over one
-                    // transformer, with the step index in hand (sc-18322). `TrunkCache` has no
-                    // production constructor, so `trunk` is `None` in every non-test build — the plan
-                    // being `Exact` is the contract-level reason, this is the mechanism-level one.
-                    let mut trunk = trunk_cache(&approximation);
-                    let prune = token_pruning(&approximation);
+                    // transformer, with the step index in hand (sc-18322). Neither `TrunkCache` nor
+                    // `TokenPruner` has a production constructor, so both are `None` in every non-test
+                    // build — the plan being `Exact` is the contract-level reason, this is the
+                    // mechanism-level one. The step count is only known here, which is why the
+                    // inert-over-the-trajectory refusal lives in these two bridges.
+                    let grid = dit.patch_grid(&latents_init);
+                    let mut trunk = trunk_cache(self.descriptor.id, &approximation, steps)?;
+                    let mut prune = token_pruner(
+                        self.descriptor.id,
+                        &approximation,
+                        steps,
+                        grid.0 * grid.1 * grid.2,
+                    )?;
                     denoise_approx(
                         &dit,
                         kind,
@@ -868,7 +938,7 @@ impl Wan {
                         &req.cancel,
                         &mut on_step,
                         trunk.as_mut(),
-                        prune,
+                        prune.as_mut(),
                     )?
                 }
             }
@@ -1417,6 +1487,21 @@ impl Wan14b {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        // Every A14B route is an expert-swap route: the trajectory changes transformers at the
+        // boundary, so a retained trunk residual or a rotation phase captured under the high-noise
+        // expert is meaningless under the low-noise one (and retaining it would keep the outgoing
+        // expert's weights alive). This provider therefore declares no approximate mechanism, and
+        // refuses a non-exact plan **by name** here rather than by omission — resolving the plan is
+        // what makes that refusal exist at all, and its absence was why the guard's doc claimed a
+        // coverage it did not have (sc-18322).
+        refuse_unwired_approximation(
+            self.descriptor.id,
+            "MoE expert swap",
+            &self
+                .descriptor
+                .capabilities
+                .approximation_plan(self.descriptor.id, req)?,
+        )?;
         let cfg = &self.config;
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
