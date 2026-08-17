@@ -3,10 +3,10 @@
 //! This is the part of the port with the most room to be subtly wrong — the transformer blocks
 //! themselves are conventional. It is deliberately kept as **pure integer arithmetic** with no
 //! tensors, so the whole plan can be asserted directly, and it is a line-for-line twin of
-//! `mlx-gen-minimax-h3`'s so the two backends cannot disagree about the frame plan. (One deliberate
-//! divergence: [`TemporalGeometry::from_parts`] here additionally refuses
-//! `token_drop >= tokens_chunk_size` — the wrapped-modulo plan the twin still silently accepts
-//! (scheduled for the Wave-2 mlx PR).)
+//! `mlx-gen-minimax-h3`'s so the two backends cannot disagree about the frame plan — including
+//! [`TemporalGeometry::from_parts`]'s refusal of `token_drop >= tokens_chunk_size`, the
+//! wrapped-modulo plan both lanes used to accept silently. That refusal landed here first; the twin
+//! was reconciled to it in the Wave-2 numerics PR, so the divergence no longer exists.
 //!
 //! ## Why the decode is chunked at all
 //!

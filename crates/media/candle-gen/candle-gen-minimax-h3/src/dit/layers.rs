@@ -32,10 +32,13 @@
 //!
 //! # The SwiGLU intermediate is chunked for the same i32 reason as the attention
 //!
-//! That ceiling is now **guarded, not merely observed**. At the shipped geometry a 15 s render packs
-//! ~94k rows, so `[1, 94000, 28672]` is ~2.70e9 elements — past `i32::MAX` (2.147e9) in a single
-//! unchunked GEMM, which is exactly the corruption class `candle_gen::ATTN_SCORES_BUDGET` exists to
-//! prevent on the score tensor. [`DitFeedForward::forward`] therefore runs the projection over
+//! That ceiling is now **guarded, not merely observed**. At the same ~104k rows the paragraph above
+//! derives (the 345-frame lattice ceiling on the 1344×768 canvas), `[1, 104000, 28672]` is ~2.98e9
+//! elements — past `i32::MAX` (2.147e9) in a single unchunked GEMM, which is exactly the corruption
+//! class `candle_gen::ATTN_SCORES_BUDGET` exists to prevent on the score tensor. Unlike the
+//! attention's ~6.1e11, this one is only ~1.4× over the limit: a **silent-corruption** ceiling
+//! rather than an out-of-memory one, which is why it went unguarded.
+//! [`DitFeedForward::forward`] therefore runs the projection over
 //! blocks of **token rows** through the same shared planner the attention path uses
 //! ([`candle_gen::attention::AttentionBudget::query_block_rows`], sc-15796) at the same 1e9 setting
 //! ([`FFN_INTERMEDIATE_BUDGET`]), so the two guards cannot plan different boundaries from the same
@@ -471,7 +474,7 @@ impl DitFeedForward {
     /// `w2( silu(gate) · value )`, over token blocks bounded by [`FFN_INTERMEDIATE_BUDGET`].
     ///
     /// The `[1, S, 2·ffn_dim]` intermediate this writes is the **widest single tensor in the whole
-    /// model** — `[1, 94000, 28672]` ≈ 2.70e9 elements at a 15 s render, past `i32::MAX` — which is
+    /// model** — `[1, 104000, 28672]` ≈ 2.98e9 elements at the lattice ceiling, past `i32::MAX` — which is
     /// the element-count ceiling on this lane rather than anything in the attention (sc-17152). See
     /// the module doc for why the token axis is the exact split and why the equivalence is
     /// tolerance-level rather than bitwise.
@@ -708,13 +711,16 @@ mod tests {
         assert_eq!(rel_max_abs(&a, &b), 0.0, "byte-identical to the bare span");
     }
 
-    /// **The shipped ceiling, as arithmetic.** `[1, 94000, 28672]` is ~2.70e9 elements — over
+    /// **The shipped ceiling, as arithmetic.** `[1, 104000, 28672]` is ~2.98e9 elements — over
     /// `i32::MAX` — and this proves the plan splits it into blocks that each stay under the budget,
     /// cover the sequence exactly once, and never exceed `i32::MAX`. Pure `usize`/`u64`: allocating
-    /// the tensor would need ~10.8 GB at f32, and the point is the plan, not the bytes.
+    /// the tensor would need ~11.9 GB at f32, and the point is the plan, not the bytes.
+    ///
+    /// `SEQ` is the module doc's ~104k packed rows at the 345-frame lattice ceiling (102,816 video
+    /// + 1,150 audio + the text rows), rounded down — the plan only gets *more* chunked above it.
     #[test]
     fn the_shipped_ffn_intermediate_is_planned_below_i32_max() {
-        const SEQ: usize = 94_000;
+        const SEQ: usize = 104_000;
         const WIDTH: usize = 28_672; // 2 · ffn_dim
         let unchunked = SEQ as u64 * WIDTH as u64;
         assert!(

@@ -399,7 +399,7 @@ fn forward_packed_rejects_an_out_of_range_adaln_index() {
     let timestep_indices = f.indices("layout.timestep_indices");
     let tables = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)
         .unwrap()
-        .tables(&f.tensor("layout.position_ids"), DType::F32)
+        .tables(&f.tensor("layout.position_ids"))
         .unwrap();
     let norm_out = dit.projections().norm_out.modulation(&temb).unwrap();
     let text_indices = f.u32_vec("layout.text_indices");
