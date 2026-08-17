@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.release.ensure_model_snapshot import ensure_snapshot, is_hf_cache_snapshot
+from scripts.release.ensure_model_snapshot import ensure_snapshot, hf_cache_root
 from scripts.release.verify_model_snapshot import (
     MARKER,
     snapshot_inventory,
@@ -240,16 +240,21 @@ class SnapshotPathExpansionTests(unittest.TestCase):
 
 
 class CacheResidentSnapshotTests(unittest.TestCase):
-    """A snapshot path INSIDE a Hugging Face cache is verify-only; it is never a download target.
+    """A cache-resident snapshot is materialized THROUGH the cache, never into it via `local_dir`.
 
     Run 32025783719's Windows CUDA lane pointed `local_dir` at
     `E:\\huggingface\\hub\\models--MiniMaxAI--MiniMax-H3\\snapshots\\939557dc...`, so
     `huggingface_hub` resolved each blob into that very directory and then copied it onto itself:
-    `shutil.SameFileError` on `audio_vae/config.json`.
+    `shutil.SameFileError` on `audio_vae/config.json`. The cache-correct fetch passes `cache_dir`
+    (the hub root) and NO `local_dir`, which writes blob, ref and snapshot symlink together and
+    lands the result at the same path the lane asked for.
     """
 
+    def cache_snapshot(self, root: Path) -> Path:
+        return root / "hub" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+
     def make_cache_snapshot(self, root: Path) -> Path:
-        snapshot = root / "hub" / "models--example--test-model" / "snapshots" / MODEL["revision"]
+        snapshot = self.cache_snapshot(root)
         snapshot.mkdir(parents=True)
         return snapshot
 
@@ -258,16 +263,20 @@ class CacheResidentSnapshotTests(unittest.TestCase):
         (snapshot / "config.json").write_text("{}", encoding="utf-8")
         (snapshot / "weights/model.safetensors").write_bytes(b"fixture")
 
-    def test_recognizes_only_the_hub_repo_layout(self) -> None:
-        self.assertTrue(
-            is_hf_cache_snapshot(Path("/c/hub/models--org--name/snapshots/deadbeef")),
+    def test_recovers_the_hub_root_from_only_the_repo_layout(self) -> None:
+        self.assertEqual(
+            hf_cache_root(Path("/c/hub/models--org--name/snapshots/deadbeef")),
+            Path("/c/hub"),
         )
         # `HF_HUB_CACHE` need not be called `hub`; the models--*/snapshots pair is the marker.
-        self.assertTrue(is_hf_cache_snapshot(Path("/mnt/w/models--org--name/snapshots/deadbeef")))
-        self.assertFalse(is_hf_cache_snapshot(Path("/opt/models/minimax-h3/snapshots/deadbeef")))
-        self.assertFalse(is_hf_cache_snapshot(Path("/c/hub/models--org--name/blobs/deadbeef")))
+        self.assertEqual(
+            hf_cache_root(Path("/mnt/w/models--org--name/snapshots/deadbeef")),
+            Path("/mnt/w"),
+        )
+        self.assertIsNone(hf_cache_root(Path("/opt/models/minimax-h3/snapshots/deadbeef")))
+        self.assertIsNone(hf_cache_root(Path("/c/hub/models--org--name/blobs/deadbeef")))
         # The cache's own `snapshots/` directory names no revision, so it is not a snapshot.
-        self.assertFalse(is_hf_cache_snapshot(Path("/c/hub/models--org--name/snapshots")))
+        self.assertIsNone(hf_cache_root(Path("/c/hub/models--org--name/snapshots")))
 
     def test_complete_cache_resident_snapshot_is_accepted_without_downloading(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -281,39 +290,109 @@ class CacheResidentSnapshotTests(unittest.TestCase):
             # Nothing is written into the cache -- not even the materialization marker.
             self.assertFalse((snapshot / MARKER).exists())
 
-    def test_incomplete_cache_resident_snapshot_refuses_and_names_what_is_missing(self) -> None:
+    def test_incomplete_cache_resident_snapshot_heals_through_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = self.make_cache_snapshot(Path(temporary))
             (snapshot / "config.json").write_text("{}", encoding="utf-8")
             calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.fill(snapshot)
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download))
+            self.assertEqual(
+                calls,
+                [
+                    {
+                        "repo_id": MODEL["repository"],
+                        "revision": MODEL["revision"],
+                        "cache_dir": str(Path(temporary) / "hub"),
+                        "token": False,
+                    }
+                ],
+            )
+            self.assertNotIn("local_dir", calls[0])
+            verify_snapshot(MODEL, snapshot)
+            # The cache names the revision in the directory itself; nothing is stamped into it.
+            self.assertFalse((snapshot / MARKER).exists())
+
+    def test_absent_cache_resident_snapshot_heals_through_the_cache(self) -> None:
+        # The fresh-runner state: the revision directory does not exist yet. `local_dir` would
+        # still resolve the blob into this path and then copy it onto itself.
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.cache_snapshot(Path(temporary))
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                snapshot.mkdir(parents=True)
+                self.fill(snapshot)
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["cache_dir"], str(Path(temporary) / "hub"))
+            self.assertNotIn("local_dir", calls[0])
+            verify_snapshot(MODEL, snapshot)
+
+    def test_cache_heal_carries_the_manifest_allow_list_and_credential(self) -> None:
+        # The allow-list is scoped by the MODEL, so a cache-resident target must not silently
+        # become a whole-repo fetch. Same for the gated-checkpoint credential opt-in.
+        model = {
+            **MODEL,
+            "download_files": ["config.json", "weights/model.safetensors"],
+            "requires_auth": True,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.cache_snapshot(Path(temporary))
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                snapshot.mkdir(parents=True)
+                self.fill(snapshot)
+
+            self.assertTrue(ensure_snapshot(model, snapshot, download))
+            self.assertEqual(calls[0]["allow_patterns"], model["download_files"])
+            self.assertIs(calls[0]["token"], True)
+
+    def test_cache_heal_that_does_not_satisfy_the_pin_still_refuses(self) -> None:
+        # The backstop: the cache-correct fetch ran and the snapshot is STILL short, so there is
+        # no "run it by hand" repair left to suggest.
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                # An under-publishing revision: config.json lands, the weights never do.
+                (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
             with self.assertRaises(RuntimeError) as raised:
-                ensure_snapshot(MODEL, snapshot, lambda **kwargs: calls.append(kwargs))
+                ensure_snapshot(MODEL, snapshot, download)
             message = str(raised.exception)
-            self.assertEqual(calls, [])
-            self.assertIn("inside a Hugging Face cache", message)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("still does not satisfy the pin after", message)
             self.assertIn("missing: weights/model.safetensors", message)
-            self.assertIn("huggingface-cli download example/test-model", message)
             self.assertIn(MODEL["revision"], message)
 
-    def test_absent_cache_resident_snapshot_refuses_rather_than_seeding_the_cache(self) -> None:
-        # The revision directory does not exist yet, which is the state a fresh runner is in. The
-        # download would still resolve the blob into this path and copy it onto itself.
+    def test_cache_heal_reports_a_failing_download_against_the_cache_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            snapshot = (
-                Path(temporary)
-                / "hub"
-                / "models--example--test-model"
-                / "snapshots"
-                / MODEL["revision"]
-            )
-            calls = []
-            with self.assertRaisesRegex(RuntimeError, "inside a Hugging Face cache"):
-                ensure_snapshot(MODEL, snapshot, lambda **kwargs: calls.append(kwargs))
-            self.assertEqual(calls, [])
-            self.assertFalse(snapshot.exists())
+            snapshot = self.make_cache_snapshot(Path(temporary))
 
-    def test_plain_materialize_directory_still_downloads(self) -> None:
-        # The control: an identical shortfall OUTSIDE any hub layout keeps the download path.
+            def download(**kwargs) -> None:
+                raise OSError("no route to host")
+
+            with self.assertRaises(RuntimeError) as raised:
+                ensure_snapshot(MODEL, snapshot, download)
+            message = str(raised.exception)
+            self.assertIn("cache-correct fetch into", message)
+            self.assertIn(str(Path(temporary) / "hub"), message)
+            self.assertIn("no route to host", message)
+
+    def test_plain_materialize_directory_still_uses_local_dir(self) -> None:
+        # The control: an identical shortfall OUTSIDE any hub layout keeps the `local_dir` path,
+        # the revision marker and the post-download verification.
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = Path(temporary) / "materialize" / MODEL["revision"]
             snapshot.mkdir(parents=True)
@@ -327,6 +406,10 @@ class CacheResidentSnapshotTests(unittest.TestCase):
             self.assertTrue(ensure_snapshot(MODEL, snapshot, download))
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["local_dir"], str(snapshot))
+            self.assertNotIn("cache_dir", calls[0])
+            self.assertEqual(
+                (snapshot / MARKER).read_text(encoding="utf-8"), MODEL["revision"] + "\n"
+            )
             verify_snapshot(MODEL, snapshot)
 
 

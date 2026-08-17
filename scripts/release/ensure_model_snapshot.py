@@ -17,76 +17,38 @@ else:
 Download = Callable[..., Any]
 
 
-def is_hf_cache_snapshot(snapshot: Path) -> bool:
-    """Return true when the path is a Hugging Face cache's own `models--*/snapshots/<revision>`.
+def hf_cache_root(snapshot: Path) -> Path | None:
+    """Return the hub-cache root owning this path, or None for a plain materialize directory.
 
-    The hub cache owns that layout: blobs live in a sibling `blobs/`, `snapshots/<revision>/`
-    holds symlinks into them, and `refs/` records what resolves where. Downloading into it with
-    `local_dir` pointed at the snapshot directory makes `huggingface_hub` copy each freshly
-    cached blob onto itself (`shutil.SameFileError`), and any file that did not collide would be
-    written outside the cache's bookkeeping.
+    A hub cache lays a repo out as `<root>/models--<org>--<name>/{blobs,refs,snapshots}`, so the
+    root is simply the grandparent of the `snapshots/<revision>` directory. Recovering it is what
+    makes the cache-resident case self-healing rather than an operator chore: `snapshot_download`
+    given `cache_dir=<root>` and NO `local_dir` writes *through* the cache -- blob, ref and
+    snapshot symlink together -- and lands the result at exactly this path.
+
+    That is the distinction the Windows CUDA lane fell down on. `local_dir=<this path>` makes
+    `huggingface_hub` resolve each blob into the cache (i.e. into this very directory) and then
+    copy it to `local_dir`, which is the same file: `shutil.SameFileError`. Anything that did not
+    collide would land outside the cache's own bookkeeping.
 
     The `models--<org>--<name>/snapshots/<revision>` pair is the whole test; a `hub/` ancestor is
     NOT required, because `HF_HUB_CACHE` can put that layout under any directory name.
     """
     parts = snapshot.parts
-    return any(
-        part == "snapshots"
-        and index >= 1
-        and index + 1 < len(parts)
-        and parts[index - 1].startswith("models--")
-        for index, part in enumerate(parts)
-    )
+    for index, part in enumerate(parts):
+        if part != "snapshots" or index < 1 or index + 1 >= len(parts):
+            continue
+        if parts[index - 1].startswith("models--"):
+            # `Path(*parts[:0])` is `.`, the right root for a cache named relative to the cwd.
+            return Path(*parts[: index - 1])
+    return None
 
 
-def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
-    """Return true after downloading, or false when an existing snapshot is valid."""
-    try:
-        verify_snapshot(model, snapshot)
-        return False
-    except RuntimeError as initial_error:
-        # `except ... as` unbinds the name at the end of the clause, so the reason has to be
-        # carried out by hand for the refusal below to be able to name what was wrong.
-        shortfall = str(initial_error)
-        if snapshot.exists() and not snapshot.is_dir():
-            raise initial_error
-        if snapshot.is_dir():
-            marker = snapshot / MARKER
-            actual_revision = snapshot.name
-            if marker.is_file():
-                actual_revision = marker.read_text(encoding="utf-8").strip()
-            if actual_revision != model["revision"]:
-                raise initial_error
-
-    # A COMPLETE cache-resident snapshot already returned above, from `verify_snapshot`. Reaching
-    # here with a cache path means the pinned revision is absent or short of `expected_files`, and
-    # the download that would follow is the one that exploded on the Windows CUDA box: `local_dir`
-    # aimed at `<cache>/hub/models--*/snapshots/<revision>` resolved the blob into that very
-    # directory and then copied it onto itself. Refuse with the missing set instead -- the cache is
-    # `huggingface_hub`'s to write, and a lane that spent hours materializing into it would leave
-    # an unreferenced snapshot behind either way.
-    if is_hf_cache_snapshot(snapshot):
-        raise RuntimeError(
-            f"{model['key']} snapshot path is inside a Hugging Face cache "
-            f"({snapshot}) and does not satisfy the pin: {shortfall}. "
-            "Refusing to download into the cache's own snapshots directory -- "
-            "huggingface_hub would copy each blob onto itself (shutil.SameFileError) and "
-            "bypass the cache's blobs/refs bookkeeping. Either populate the cache on the "
-            f"runner with `huggingface-cli download {model['repository']} "
-            f"--revision {model['revision']}`, which writes through it, or point this lane's "
-            "snapshot variable at a plain directory outside any models--*/snapshots/* layout "
-            "and let this script materialize it."
-        )
-
-    snapshot.parent.mkdir(parents=True, exist_ok=True)
-    print(
-        f"materializing {model['repository']}@{model['revision']} in {snapshot.resolve()}",
-        flush=True,
-    )
-    download_kwargs = {
+def _download_kwargs(model: dict) -> dict:
+    """Return the manifest-derived kwargs shared by the cache-heal and plain-directory fetches."""
+    kwargs = {
         "repo_id": model["repository"],
         "revision": model["revision"],
-        "local_dir": str(snapshot),
         # Public release fixtures stay explicitly anonymous. Gated checkpoints
         # opt in to the runner's configured Hugging Face credential without
         # placing the token in the workflow or command line.
@@ -98,10 +60,86 @@ def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
     # training checkpoints + weight variants the inference stack never loads). Absent ⇒ whole-repo
     # download, the default for every other model. `verify_snapshot` still enforces `expected_files`,
     # so an under-fetch (a needed file left off the list) fails loudly right after download.
+    #
+    # The allow-list is scoped by the MODEL, not by where the bytes land, so a cache-resident
+    # target is constrained identically -- an MMAudio-shaped row must not become a whole-repo
+    # fetch just because the lane points at a cache.
     allow_patterns = model.get("download_files")
     if allow_patterns:
-        download_kwargs["allow_patterns"] = list(allow_patterns)
-    download(**download_kwargs)
+        kwargs["allow_patterns"] = list(allow_patterns)
+    return kwargs
+
+
+def _heal_in_cache(model: dict, snapshot: Path, cache_root: Path, download: Download) -> bool:
+    """Materialize a cache-resident snapshot through the cache itself, then re-verify.
+
+    The refusal below is a BACKSTOP, not the ordinary path: it fires only when the cache-correct
+    fetch has already run and the pin is still unsatisfied, so it can no longer be repaired by
+    telling the operator to run the fetch by hand.
+    """
+    print(
+        f"materializing {model['repository']}@{model['revision']} through the Hugging Face "
+        f"cache at {cache_root} (cache_dir, no local_dir)",
+        flush=True,
+    )
+    try:
+        download(cache_dir=str(cache_root), **_download_kwargs(model))
+    except Exception as error:
+        raise RuntimeError(
+            f"{model['key']} snapshot at {snapshot} is cache-resident and the cache-correct "
+            f"fetch into {cache_root} failed: {error}. Check that "
+            f"{model['repository']}@{model['revision']} is reachable from this runner's "
+            "credential and that the volume has room, or point this lane's snapshot variable "
+            "at a plain directory outside any models--*/snapshots/* layout."
+        ) from error
+    # Nothing is written into the snapshot directory by hand -- no revision marker. The cache
+    # names the revision in the directory itself, and `verify_snapshot` reads it from there.
+    try:
+        verify_snapshot(model, snapshot)
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{model['key']} snapshot at {snapshot} still does not satisfy the pin after "
+            f"materializing through the Hugging Face cache at {cache_root}: {error}. The "
+            "cache-correct fetch already ran, so this is not the SameFileError shape it "
+            f"replaced -- verify that {model['repository']}@{model['revision']} publishes "
+            "every path in the manifest's expected_files (and that download_files, if set, "
+            "covers them), or point this lane's snapshot variable at a plain directory "
+            "outside any models--*/snapshots/* layout."
+        ) from error
+    return True
+
+
+def ensure_snapshot(model: dict, snapshot: Path, download: Download) -> bool:
+    """Return true after downloading, or false when an existing snapshot is valid."""
+    try:
+        verify_snapshot(model, snapshot)
+        return False
+    except RuntimeError as initial_error:
+        if snapshot.exists() and not snapshot.is_dir():
+            raise initial_error
+        if snapshot.is_dir():
+            marker = snapshot / MARKER
+            actual_revision = snapshot.name
+            if marker.is_file():
+                actual_revision = marker.read_text(encoding="utf-8").strip()
+            if actual_revision != model["revision"]:
+                raise initial_error
+
+    # A COMPLETE snapshot already returned above, from `verify_snapshot`. Reaching here means the
+    # pinned revision is absent or short of `expected_files`, and WHERE it lives decides how it is
+    # fetched. A cache-resident target is materialized through the cache; only a plain directory
+    # takes `local_dir`, which is what exploded on the Windows CUDA box when it was aimed at
+    # `<cache>/hub/models--*/snapshots/<revision>`.
+    cache_root = hf_cache_root(snapshot)
+    if cache_root is not None:
+        return _heal_in_cache(model, snapshot, cache_root, download)
+
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"materializing {model['repository']}@{model['revision']} in {snapshot.resolve()}",
+        flush=True,
+    )
+    download(local_dir=str(snapshot), **_download_kwargs(model))
     (snapshot / MARKER).write_text(model["revision"] + "\n", encoding="utf-8")
     try:
         verify_snapshot(model, snapshot)
