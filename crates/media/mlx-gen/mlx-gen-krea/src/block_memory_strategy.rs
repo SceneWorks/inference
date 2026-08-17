@@ -219,7 +219,13 @@ pub(crate) fn weights_free_memory_strategy_contract(
     )
 }
 
-fn surface_selector_matches_spec(
+/// The witness self-check every Krea surface resolver runs first: the explicit resolved artifact tier
+/// must agree with the witness `LoadSpec`, the source must be a provisioned snapshot directory, and
+/// the selector's residency/materialization axes must be the ones the spec carries.
+///
+/// Shared with the pose-control resolver in [`crate::memory_strategy`] (sc-18451) so the two families
+/// cannot drift into different notions of a well-formed witness.
+pub(crate) fn surface_selector_matches_spec(
     surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
 ) -> CoreResult<()> {
     let tier_matches = match surface.resolved_artifact_tier() {
