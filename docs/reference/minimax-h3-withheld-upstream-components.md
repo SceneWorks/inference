@@ -38,6 +38,10 @@ read and its own manifest entry — not a change to these crates' conditioning p
 
 **Withheld.** "Up to 2K" is a property of the hosted product, not of these weights.
 
+**Upstream commitment.** MiniMax staff publicly committed, in discussion #39 on `MiniMaxAI/MiniMax-H3`
+(undated), to open-source `H3-Regenerate-2K` "once this set of technologies becomes stable" — no date
+given, nothing published as of the 2026-08-17 re-check.
+
 **What the port does.** It *enforces* a canvas envelope rather than merely advertising one, in two
 separate places that are not the same constraint. The per-edge bound is `Capabilities::max_size`,
 checked at the shared capability floor in `gen-core/src/generator.rs`. The area bound is
