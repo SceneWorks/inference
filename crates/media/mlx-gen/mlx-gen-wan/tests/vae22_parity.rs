@@ -283,19 +283,36 @@ fn vae22_bounded_decode_is_closer_to_dense_than_whole_decoder_tiling() {
 
     // The retired route: tile the *whole* decoder. Denormalization is a per-channel affine, so
     // denormalizing inside each tile (what `decode` does) reconstructs it exactly from public API.
+    //
+    // The tiled axes must be the **channels-last** `[1, 2, 3]` this VAE actually uses, matching the
+    // production path: `decode` emits `[1, T', H', W', 3]`, so the driver's `[t, h, w]` indices have
+    // to be 1/2/3 on both the input it slices and the output it places. Feeding it a channels-first
+    // `[1, z, T, H, W]` on axes `[2, 3, 4]` assembles a `[1, T', H'... ]`-shaped nonsense tensor
+    // instead — which is what the shape assertion below now catches.
     let plan = cfg.plan(Wan22Vae::VAE_TILING, sh[1], sh[2], sh[3]);
-    let czthw_to_tile = dec_in.reshape(&[1, sh[0], sh[1], sh[2], sh[3]]).unwrap();
-    let legacy =
-        mlx_gen::vae_tiling::tiled_decode(&czthw_to_tile, &plan, [2, 3, 4], None, |tile| {
-            let ts = tile.shape();
-            let out = vae.decode(&tile.reshape(&[ts[1], ts[2], ts[3], ts[4]])?)?;
-            let os = out.shape();
-            Ok(out.reshape(&[os[0], os[1], os[2], os[3], os[4]])?)
-        });
+    let cl_latent = dec_in
+        .transpose_axes(&[1, 2, 3, 0])
+        .unwrap()
+        .reshape(&[1, sh[1], sh[2], sh[3], sh[0]])
+        .unwrap();
+    let legacy = mlx_gen::vae_tiling::tiled_decode(&cl_latent, &plan, [1, 2, 3], None, |tile| {
+        let ts = tile.shape();
+        let czthw = tile
+            .reshape(&[ts[1], ts[2], ts[3], ts[4]])?
+            .transpose_axes(&[3, 0, 1, 2])?;
+        vae.decode(&czthw)
+    });
 
     let (_, bounded_rel) = diff(bounded.as_slice::<f32>(), dense.as_slice::<f32>());
     match legacy {
         Ok(legacy) => {
+            // `diff` zips two slices, so a same-rank geometry mismatch would silently truncate the
+            // comparison and quietly weaken the claim below rather than fail.
+            assert_eq!(
+                legacy.shape(),
+                dense.shape(),
+                "the legacy-shape reconstruction must produce the dense decode's geometry"
+            );
             let (_, legacy_rel) = diff(legacy.as_slice::<f32>(), dense.as_slice::<f32>());
             println!("[vae22 vs dense] legacy={legacy_rel:.3e} bounded={bounded_rel:.3e}");
             assert!(
