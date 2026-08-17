@@ -17,7 +17,7 @@
 
 use candle_gen::candle_core::{DType, Device, Error as CoreError, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
-use candle_gen::gen_core::CancelFlag;
+use candle_gen::gen_core::{CancelFlag, GenerationRequest};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::WanVaceConfig;
@@ -449,6 +449,19 @@ pub fn build_vace_control(video_latents: &Tensor, mask_latents: &Tensor) -> Resu
 /// single-expert route too.
 pub(crate) fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
     control_scale.unwrap_or(1.0) * masking_strength
+}
+
+/// The full per-vace-layer scale vector a request resolves to — the value both candle VACE routes
+/// hand the VACE transformer as `scales` (sc-20261).
+///
+/// This is the whole resolution, request in / vector out, so the honor wiring is testable without
+/// weights: [`weighted_control_scale`] alone is arithmetic that a call site can bypass, while this
+/// is the exact expression `model_vace.rs` / `model_vace_fun.rs` bind `scales` to. A missing
+/// `ControlClip` resolves to the contract default strength `1.0` (the identity), so a non-clip
+/// route is unchanged.
+pub(crate) fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -> Vec<f32> {
+    let masking_strength = req.control_clip().map_or(1.0, |c| c.masking_strength);
+    vec![weighted_control_scale(req.control_scale, masking_strength); vace_layers]
 }
 
 /// VACE CFG denoise loop — mirrors the candle base Wan denoise (`FlowScheduler` per step), but each step

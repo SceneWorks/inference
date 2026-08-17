@@ -25,7 +25,7 @@ use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
     build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
-    weighted_control_scale, WanVaceTransformer,
+    vace_control_scales, WanVaceTransformer,
 };
 use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
@@ -265,11 +265,10 @@ impl Pipeline {
             control,
             // VACE exposes one conditioning scale for the whole hint stack. Multiplying it by the
             // requested masking strength weights the mask/video control without thresholding a soft
-            // mask away in `prepare_video_latents`.
-            scales: vec![
-                weighted_control_scale(req.control_scale, clip.masking_strength);
-                self.vace_cfg.vace_layers.len()
-            ],
+            // mask away in `prepare_video_latents`. Resolved by the shared `vace.rs` seam so this
+            // route and the single-expert one cannot drift; pinned by
+            // `render_binds_scales_to_the_shared_resolver`.
+            scales: vace_control_scales(req, self.vace_cfg.vace_layers.len()),
             pos,
             neg,
             cos,
@@ -695,6 +694,7 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
 

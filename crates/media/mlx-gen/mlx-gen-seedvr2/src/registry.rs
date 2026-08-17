@@ -518,4 +518,35 @@ mod tests {
         };
         assert!(reject_unimplemented_video_clip_knobs(MODEL_ID, &image_only).is_ok());
     }
+
+    /// sc-20263 (adversarial-review follow-up) — bind the refusal's **call site** in
+    /// `validate_impl`.
+    ///
+    /// The tests above call the helper directly, which leaves the wiring unbound: deleting the
+    /// `reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?` line puts the knobs back to
+    /// being silently dropped with every assertion above still green. The candle-bernini trick of
+    /// driving the registered `Generator` weights-free does NOT transfer here — MLX SeedVR2's
+    /// `load_with` calls `Seedvr2Pipeline::load`, which materializes the DiT and VAE safetensors
+    /// eagerly, so there is no config-only snapshot root that yields a `Generator` (all three
+    /// registered ids share that one loader). The binding is therefore pinned in the source, the
+    /// same shape as `mlx-llm`'s `multi_frame_attention_has_no_quadratic_mask_allocation`.
+    #[test]
+    fn validate_impl_is_wired_to_the_refusal() {
+        let source = include_str!("registry.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production body precedes the test module");
+        let validate = body
+            .split("fn validate_impl(")
+            .nth(1)
+            .expect("validate_impl is defined")
+            .split("fn generate_impl(")
+            .next()
+            .expect("validate_impl precedes generate_impl");
+        assert!(
+            validate.contains("reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?"),
+            "validate_impl must run the sc-20263 refusal:\n{validate}"
+        );
+    }
 }

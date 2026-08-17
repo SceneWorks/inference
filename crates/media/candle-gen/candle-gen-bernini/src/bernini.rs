@@ -1617,6 +1617,66 @@ mod tests {
         assert!(err.to_string().contains("frame_idx"), "got: {err}");
     }
 
+    /// sc-20264 (adversarial-review follow-up) — the refusal is pinned **through
+    /// `Generator::validate`**, not by calling the helper.
+    ///
+    /// A helper-only test leaves the wiring unbound: deleting the
+    /// `reject_unimplemented_video_clip_knobs(id, req)?` line from either provider's `validate`
+    /// keeps every helper assertion green while the knobs go back to being silently dropped. Both
+    /// candle bernini ids load lazily from a nonexistent dir (`registers_and_resolves`), so the real
+    /// registered `Generator` is drivable here without weights — the same way the scail2 / seedvr2 /
+    /// krea / VACE refusals are pinned.
+    #[test]
+    fn generator_validate_refuses_non_default_video_clip_knobs_on_both_ids() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        // 5 frames: `1 + 4·k`, so the clip clears the shape guard that runs first and the refusal
+        // is what the request actually trips.
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: (0..5)
+                .map(|_| Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0u8; 16 * 16 * 3],
+                })
+                .collect(),
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 256,
+            height: 256,
+            frames: Some(5),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            let g = registry.load(id, &spec).expect("lazy load");
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = g
+                    .validate(&req(conditioning))
+                    .expect_err("a non-default knob must be refused at validate");
+                assert!(
+                    matches!(err, gen_core::Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+            // The contract defaults must NOT be refused by this check — whatever else validate
+            // decides about the request, it must not be these fields.
+            if let Err(e) = g.validate(&req(clip(0, 1.0))) {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("does not implement VideoClip"),
+                    "{id}: default knobs must pass the refusal: {msg}"
+                );
+            }
+        }
+    }
+
     /// sc-20264 — the refusal fires only on a value a caller actually set. The contract defaults
     /// (`strength = 1.0`, `frame_idx = 0`) — every request SceneWorks builds today — pass through,
     /// as does a request carrying no clip at all.

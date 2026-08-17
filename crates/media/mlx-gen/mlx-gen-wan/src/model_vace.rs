@@ -46,7 +46,7 @@ use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
-    prepare_video_latents, weighted_control_scale, WanVaceTransformer,
+    prepare_video_latents, vace_control_scales, WanVaceTransformer,
 };
 
 /// Concrete z16 VAE assigned to both VACE routes.
@@ -207,10 +207,12 @@ fn vace_prep(
     // now shared by both MLX routes because they both run this `vace_prep`. `masking_strength =
     // 1.0` (the contract default) is the identity, so a default request is byte-identical to
     // pre-sc-20261. The `[0,1]` range this depends on is enforced in `validate_vace_clip`.
-    let scales = vec![
-        weighted_control_scale(req.control_scale, clip.masking_strength);
-        config.vace_layers.len()
-    ];
+    //
+    // The whole vector is resolved by the shared `vace.rs` seam rather than being assembled here,
+    // so the honor wiring has one testable definition; `vace_prep_binds_scales_to_the_shared_
+    // resolver` pins this line to it (a call site that rebuilt the vec inline would silently
+    // un-honor the knob while every unit test on the seam stayed green).
+    let scales = vace_control_scales(req, config.vace_layers.len());
 
     // Seeded init noise [z16, T_lat(+num_ref), h, w].
     let key = random::key(seed)?;
@@ -1044,6 +1046,7 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
     use mlx_gen::{Conditioning, OffloadPolicy, ReplacementMode};
 
     fn test_config() -> WanVaceConfig {
@@ -1328,6 +1331,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — the same claim asserted at the **resolution
+    /// `vace_prep` actually binds**: request in, per-vace-layer `scales` vector out. The scalar
+    /// [`weighted_control_scale`] can be right while a call site bypasses it, so the seam under test
+    /// is the whole vector.
+    ///
+    /// Non-default strengths throughout: at `masking_strength = 1.0` the resolved vector equals the
+    /// pre-sc-20261 `req.control_scale.unwrap_or(1.0)` broadcast, so an assert at the default is a
+    /// false green.
+    #[test]
+    fn resolved_control_scales_move_with_a_non_default_masking_strength() {
+        let with = |control_scale: Option<f32>, strength: f32| {
+            let mut req = clip_request_with(strength, 0, ReplacementMode::FaceOnly);
+            req.control_scale = control_scale;
+            req
+        };
+        // The pre-sc-20261 vector, for contrast — what a call site that dropped the knob resolves.
+        let dropped = |req: &GenerationRequest, n: usize| vec![req.control_scale.unwrap_or(1.0); n];
+
+        // Explicit control_scale × non-default strength.
+        let req = with(Some(0.5), 0.4);
+        let got = vace_control_scales(&req, 3);
+        assert_eq!(got.len(), 3, "one scale per vace layer");
+        assert!(
+            got.iter().all(|s| (s - 0.2).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 3), "the knob must move the whole vector");
+
+        // No explicit control_scale: the strength IS the scale, not the dropped 1.0.
+        let req = with(None, 0.25);
+        let got = vace_control_scales(&req, 2);
+        assert!(
+            got.iter().all(|s| (s - 0.25).abs() < f32::EPSILON),
+            "{got:?}"
+        );
+        assert_ne!(got, dropped(&req, 2));
+
+        // The contract default is the identity — a default request resolves byte-identically to
+        // the pre-sc-20261 expression, so nothing already rendering changes.
+        for cs in [Some(0.75_f32), None] {
+            let req = with(cs, 1.0);
+            assert_eq!(vace_control_scales(&req, 4), dropped(&req, 4));
+        }
+        // A request with no ControlClip at all falls back to the default strength.
+        let mut bare = with(Some(0.4), 0.4);
+        bare.conditioning.clear();
+        bare.control_scale = Some(0.6);
+        assert_eq!(vace_control_scales(&bare, 2), vec![0.6, 0.6]);
+    }
+
+    /// sc-20261 (adversarial-review follow-up) — bind the MLX VACE **call site** to
+    /// [`vace_control_scales`].
+    ///
+    /// A unit test on the resolver cannot observe the call site: reverting `vace_prep`'s `scales`
+    /// binding to the pre-sc-20261 `vec![req.control_scale.unwrap_or(1.0); n]` un-honors
+    /// `masking_strength` while every arithmetic assertion above stays green. `vace_prep` is not
+    /// drivable without real weights (the scales are resolved after the VAE encode), so the binding
+    /// is pinned in the source instead — the same shape as `mlx-llm`'s
+    /// `multi_frame_attention_has_no_quadratic_mask_allocation`. Both MLX VACE routes share this
+    /// one `vace_prep`, so this pins the wiring for `wan_vace` and `wan2_2_vace_fun_14b` together.
+    #[test]
+    fn vace_prep_binds_scales_to_the_shared_resolver() {
+        let source = include_str!("model_vace.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production body precedes the test module");
+        assert!(
+            body.contains("vace_control_scales(req, config.vace_layers.len())"),
+            "`scales` must be resolved by the shared seam"
+        );
+        assert!(
+            !body.contains("control_scale.unwrap_or("),
+            "the pre-sc-20261 expression must not be reachable at the call site"
+        );
     }
 
     /// sc-20261 — `start_frame` was silently dropped on both MLX VACE routes while the candle

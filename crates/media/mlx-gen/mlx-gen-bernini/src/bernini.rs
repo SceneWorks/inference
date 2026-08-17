@@ -1330,6 +1330,86 @@ mod tests {
         assert!(err.to_string().contains("frame_idx"), "got: {err}");
     }
 
+    /// A weights-free snapshot root both MLX bernini ids will `load` from.
+    ///
+    /// Unlike candle, neither MLX `load` is lazy past its config: each reads `config.json` and
+    /// rejects a non-dual-expert model before constructing the Generator, so a bare `/nonexistent`
+    /// dir silently resolves to the 5B preset and fails. A dir holding only the two-key dual-expert
+    /// `config.json` is enough — `BerniniKnobs::from_dir` treats an absent sidecar as defaults, and
+    /// no safetensors is touched until `generate`. That makes the registered `Generator` drivable
+    /// through `validate` here with no weights at all.
+    fn weightless_snapshot_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"model_type": "t2v", "dim": 5120, "dual_model": true}"#,
+        )
+        .expect("write config.json");
+        dir
+    }
+
+    /// sc-20264 (adversarial-review follow-up) — the refusal is pinned **through
+    /// `Generator::validate`**, not by calling the helper.
+    ///
+    /// A helper-only test leaves the wiring unbound: deleting the
+    /// `reject_unimplemented_video_clip_knobs(...)` line from either provider's validate body keeps
+    /// every helper assertion green while the knobs go back to being silently dropped. Both MLX
+    /// bernini ids are drivable weights-free off [`weightless_snapshot_root`], so this pins the real
+    /// registered `Generator` the way the candle sibling does.
+    #[test]
+    fn generator_validate_refuses_non_default_video_clip_knobs_on_both_ids() {
+        let root = weightless_snapshot_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        let registry = crate::provider_registry().unwrap();
+        // 5 frames: `1 + 4·k`, so the clip clears the shape guards that run first and the refusal
+        // is what the request actually trips.
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: (0..5)
+                .map(|_| Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0u8; 16 * 16 * 3],
+                })
+                .collect(),
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 256,
+            height: 256,
+            frames: Some(5),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            let g = registry
+                .load(id, &spec)
+                .unwrap_or_else(|e| panic!("{id}: weights-free load: {e}"));
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = g
+                    .validate(&req(conditioning))
+                    .expect_err("a non-default knob must be refused at validate");
+                assert!(
+                    matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+            // The contract defaults must NOT be refused by this check — whatever else validate
+            // decides about the request, it must not be these fields.
+            if let Err(e) = g.validate(&req(clip(0, 1.0))) {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("does not implement VideoClip"),
+                    "{id}: default knobs must pass the refusal: {msg}"
+                );
+            }
+        }
+    }
+
     /// sc-20264 — the refusal fires only on a value a caller actually set. The contract defaults
     /// (`strength = 1.0`, `frame_idx = 0`) — every request SceneWorks builds today — pass through,
     /// as does a request carrying no clip at all.
