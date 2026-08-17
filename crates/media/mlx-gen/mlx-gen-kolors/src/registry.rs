@@ -155,6 +155,7 @@ pub fn descriptor() -> ModelDescriptor {
                 ),
                 ..mlx_gen::gen_core::ExecutionSurface::default()
             },
+            approximation: Default::default(),
         },
     }
 }

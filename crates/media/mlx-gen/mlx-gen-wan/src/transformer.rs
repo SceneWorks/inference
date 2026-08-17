@@ -1568,6 +1568,13 @@ impl WanTransformer {
     /// [`forward_tokens_cached`](Self::forward_tokens_cached) paths differ **only** in how they build
     /// `(e, e0)` (scalar `time_embed` vs per-token `time_embed_tokens`), so they precompute it and pass
     /// it in here — keeping the ~45-line body in one place so the TI2V path can't silently diverge.
+    ///
+    /// `trunk` is the sc-18322 **denoise feature cache**, and `None` — the state every pre-existing
+    /// caller is in — is byte-for-byte the pre-sc-18322 body: the `is_some` below is the only added
+    /// instruction, and the block loop, its inputs and its dtypes are untouched. When present the block
+    /// stack is either run and its aggregate residual retained, or skipped and the retained residual
+    /// reapplied, per the declared policy. See [`crate::feature_cache`] — including why the
+    /// evaluation/cancel discipline is unaffected (the step loop owns both, outside this branch).
     #[allow(clippy::too_many_arguments)]
     fn forward_with_modulation(
         &self,
@@ -1578,6 +1585,7 @@ impl WanTransformer {
         cos: &Array,
         sin: &Array,
         batch: usize,
+        trunk: Option<&mut crate::feature_cache::TrunkCache>,
     ) -> Result<Vec<Array>> {
         // Patchify + embed once; cast to bf16 to start the block stream (reference casts to w_dtype).
         let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
@@ -1591,9 +1599,27 @@ impl WanTransformer {
             x1
         };
 
-        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
-            x = block.forward(&x, e0, kv, cos, sin)?;
-        }
+        let x = match trunk {
+            // The pre-sc-18322 path, unchanged: run every block over the carried stream.
+            None => {
+                for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+                    x = block.forward(&x, e0, kv, cos, sin)?;
+                }
+                x
+            }
+            Some(cache) => {
+                if cache.recomputes()? {
+                    let x_in = x.clone();
+                    for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+                        x = block.forward(&x, e0, kv, cos, sin)?;
+                    }
+                    cache.capture(&x_in, &x)?;
+                    x
+                } else {
+                    cache.reuse(&x)?
+                }
+            }
+        };
 
         let x = self.apply_head(&x, e)?; // [batch, L, out_dim·∏patch] f32
         let op = x.shape()[2];
@@ -1630,8 +1656,27 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
     ) -> Result<Vec<Array>> {
+        self.forward_cached_approx(latent, t, cross_kv, cos, sin, batch, None)
+    }
+
+    /// [`forward_cached`](Self::forward_cached) carrying the sc-18322 **denoise feature cache**.
+    ///
+    /// `trunk: None` is exactly [`forward_cached`](Self::forward_cached) — that is how the byte-identity
+    /// of the off path is guaranteed rather than asserted: there is one body, and the off path is the
+    /// arm of it that existed before. See [`crate::feature_cache`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached_approx(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+        trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed(t)?;
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, trunk)
     }
 
     /// Full DiT forward for a single latent (B=1). `latent`: `[C, F, H, W]` (f32). `t`: integer-valued
@@ -1756,7 +1801,12 @@ impl WanTransformer {
         batch: usize,
     ) -> Result<Vec<Array>> {
         let (e, e0) = self.time_embed_tokens(t_tokens)?;
-        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
+        // The per-token TI2V mask-blend route is deliberately NOT wired for the sc-18322 feature cache
+        // (`None`): its post-step re-blend mixes the conditioning latent back into the trajectory every
+        // step, so a residual captured under one blend state is not the same quantity a later step
+        // needs. `Wan::generate` refuses a non-exact plan on that route by name rather than silently
+        // running it exactly. See `crate::feature_cache`.
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch, None)
     }
 
     /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`Self::forward_tokens_cached`]

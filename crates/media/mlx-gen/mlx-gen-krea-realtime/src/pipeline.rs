@@ -167,6 +167,7 @@ pub fn descriptor() -> ModelDescriptor {
             // on a 16px grid or integer division would silently render a smaller clip.
             size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
             execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

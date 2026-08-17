@@ -109,6 +109,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `DitMemoryConfig` consumes. `generate` threads the request through
             // `DitMemoryConfig::with_request` on top of `SCAIL2_MEM_DEFAULT`.
             execution: crate::generate::EXECUTION_SURFACE,
+            approximation: Default::default(),
         },
     }
 }
