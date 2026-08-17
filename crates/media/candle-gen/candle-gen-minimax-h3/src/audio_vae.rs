@@ -353,6 +353,11 @@ impl BigVgan {
         dtype: DType,
     ) -> Result<Self> {
         let h = &cfg.bigvgan;
+        // Loading iterates `resblock_kernel_sizes.zip(resblock_dilation_sizes)`, which silently
+        // truncates to the shorter list on a length mismatch — a runnable vocoder with resblocks
+        // missing. `validate` rejects that (and the other inexpressible geometries) up front;
+        // `from_source_files` already ran it, but this loader is public and takes any config.
+        h.validate()?;
         let conv_pre = Conv1d::weight_normed(w, &format!("{prefix}.conv_pre"), 3, 1, true, dtype)?;
         let mut ups = Vec::with_capacity(h.num_upsamples());
         for (i, (&rate, &kernel)) in h
@@ -500,6 +505,10 @@ impl MiniMaxH3AudioVae {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        // `from_source_files` validates on parse, but this loader is public and takes any config —
+        // run the same checks so a hand-built or mutated one fails here rather than decoding
+        // through a degenerate `latents_std` or a zip-truncated resblock grid.
+        cfg.validate()?;
         let dec_in = w.require("dec_in_proj.weight")?.to_dtype(dtype)?;
         let shape = dec_in.dims().to_vec();
         // `nn.Conv1d(latent_channels, latent_dim, 1)`.
@@ -707,6 +716,51 @@ mod tests {
         assert!(!names
             .iter()
             .any(|n| n == "decoder.resblocks.20.activations.6.act.alpha"));
+    }
+
+    /// The `from_weights` loaders validate the config before touching a single tensor —
+    /// previously only `from_source_files` did, so a hand-built config with mismatched
+    /// kernel/dilation lists reached `BigVgan::from_weights`, whose `zip` silently truncated the
+    /// resblock grid to the shorter list.
+    #[test]
+    fn from_weights_validates_the_config_before_reading_tensors() {
+        let empty = Weights::from_map(std::collections::HashMap::new());
+        let dev = candle_gen::candle_core::Device::Cpu;
+
+        // Mismatched resblock kernel/dilation lists — the zip-truncation case.
+        let mut cfg = MiniMaxH3AudioVaeConfig::default();
+        cfg.bigvgan.resblock_dilation_sizes.pop();
+        let e = BigVgan::from_weights(&empty, "decoder", &cfg, DType::F32)
+            .expect_err("a kernel/dilation length mismatch must be refused")
+            .to_string();
+        assert!(e.contains("kernel/dilation"), "{e}");
+        assert!(
+            MiniMaxH3AudioVae::from_weights(&empty, &cfg, &dev, DType::F32).is_err(),
+            "the whole-VAE loader must refuse it too"
+        );
+
+        // A degenerate latents_std reaches the decode loader the same way.
+        let mut cfg = MiniMaxH3AudioVaeConfig::default();
+        cfg.latents_std[0] = 0.0;
+        let e = MiniMaxH3AudioVae::from_weights(&empty, &cfg, &dev, DType::F32)
+            .expect_err("a zero latents_std entry must be refused")
+            .to_string();
+        assert!(e.contains("latents_std"), "{e}");
+
+        // The valid default config gets past validation and fails on the (empty) weights instead,
+        // so the guard rejects the config and not the loader.
+        let e = MiniMaxH3AudioVae::from_weights(
+            &empty,
+            &MiniMaxH3AudioVaeConfig::default(),
+            &dev,
+            DType::F32,
+        )
+        .expect_err("empty weights cannot load")
+        .to_string();
+        assert!(
+            !e.contains("latents_std") && !e.contains("kernel/dilation"),
+            "{e}"
+        );
     }
 
     /// `use_bias_at_final = true` would add exactly one tensor — proof the flag reaches the

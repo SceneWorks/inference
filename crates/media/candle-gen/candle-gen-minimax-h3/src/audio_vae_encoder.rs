@@ -921,6 +921,13 @@ impl MiniMaxH3AudioVaeEncoder {
                  power of two, which diffusers rejects"
             )));
         }
+        // The shared half of the guard the decode loader runs: `from_source_files` validates on
+        // parse, but this loader is public and takes any config. Deliberately NOT the full
+        // `validate()` — that also validates the BigVGAN decoder block, which the encode half
+        // never reads and the committed encode parity fixture deliberately leaves nonsensical.
+        // After the encoder-specific checks above so that a config wrong in both ways is
+        // attributed to the encoder-side defect first.
+        cfg.validate_shared()?;
         let hop = hop_length(&cfg.encoder_rates)?;
 
         let encoder = DacEncoder::from_weights(w, "encoder", cfg, dtype)?;
@@ -1112,6 +1119,31 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// The encode-half loader runs the shared config validation before reading a single tensor —
+    /// previously only `from_source_files` validated, so a hand-built config reached the loader
+    /// unchecked. Deliberately NOT the full `validate()`: the BigVGAN block belongs to the decode
+    /// half the encoder never reads, and the committed encode parity fixture leaves it nonsensical
+    /// on purpose, so a decoder-block defect must NOT refuse an encoder load.
+    #[test]
+    fn encoder_from_weights_validates_the_shared_config_first() {
+        let empty = Weights::from_map(std::collections::HashMap::new());
+        let dev = Device::Cpu;
+        let mut cfg = MiniMaxH3AudioVaeConfig::default();
+        cfg.latents_std[3] = f32::NAN;
+        let e = MiniMaxH3AudioVaeEncoder::from_weights(&empty, &cfg, &dev, DType::F32)
+            .expect_err("a degenerate latents_std must be refused")
+            .to_string();
+        assert!(e.contains("latents_std"), "{e}");
+
+        // A decoder-only defect does not block the encode half.
+        let mut cfg = MiniMaxH3AudioVaeConfig::default();
+        cfg.bigvgan.resblock_dilation_sizes.pop();
+        let e = MiniMaxH3AudioVaeEncoder::from_weights(&empty, &cfg, &dev, DType::F32)
+            .expect_err("empty weights still cannot load")
+            .to_string();
+        assert!(!e.contains("kernel/dilation"), "{e}");
     }
 
     /// The weight-norm fusion is `g · v / ‖v‖` with the norm over every axis **but the first** —

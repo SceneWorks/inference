@@ -109,6 +109,13 @@ use crate::dit::config::MODALITY_NUM;
 /// length, and the **exact bit pattern** of every timestep. Bit patterns rather than values because
 /// a cache row is only reusable for a timestep that is bitwise the one it was built from — see
 /// [`TimestepSchedule::index_of`].
+///
+/// **A future-seam hook, wired to nothing in production today.** [`crate::dit::JointDit`] builds a
+/// fresh cache per request and consumes the schedule doing so, so there is no held-cache path that
+/// could go stale — the staleness this key detects only becomes reachable if a cache is ever
+/// retained across requests (the natural lever if per-request precompute cost ever matters). It is
+/// kept, with [`AdaLnCache::is_current_for`], so that seam starts from a bitwise-exact currency
+/// check instead of re-deriving one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScheduleKey(u64, u64);
 
@@ -601,6 +608,10 @@ impl AdaLnCache {
     /// Whether this cache can serve `schedule`, i.e. whether the schedule is bitwise the one it was
     /// built from. A changed step count, a changed sigma shift or a changed solver all produce a
     /// different [`ScheduleKey`] and therefore a `false` here.
+    ///
+    /// **Unwired in production today** — see [`ScheduleKey`]: [`crate::dit::JointDit`] builds a
+    /// fresh cache per request, so nothing currently holds a cache long enough for this to answer
+    /// `false`. It is the check a cross-request cache-reuse seam must run before serving.
     pub fn is_current_for(&self, schedule: &TimestepSchedule) -> bool {
         self.schedule.key() == schedule.key()
     }

@@ -15,8 +15,10 @@
 //! rather than all at once (`ATTN_SCORES_BUDGET`, the shared i32-overflow-safe helper from
 //! sc-9116).
 //!
-//! The consequence is stated rather than glossed: at the shipped geometry a 15 s render packs
-//! ~94k rows over 56 heads, where the full score tensor would be ~2.0e12 elements — past `i32::MAX`
+//! The consequence is stated rather than glossed: at the shipped 1344×768 canvas the 345-frame
+//! lattice ceiling (14.375 s — 15 s has no legal frame count) packs ~104k rows — 102 latent frames
+//! × 42×24 patches = 102,816 video rows, plus 1,150 audio and the text rows — over 56 heads, where
+//! the full score tensor would be `56 · (1.04e5)²` ≈ **6.1e11 elements**, ~280× past `i32::MAX`
 //! and far past any card — so the budgeted split is **not optional on this lane** the way MLX's
 //! streaming kernel makes it optional there. sc-17152 additionally measured chunked SDPA on MLX at
 //! **+50.3 % peak and ~3× wall**, so its conclusion ("do not chunk") is an MLX result and must not

@@ -158,8 +158,12 @@ impl RequestGeometry {
     }
 
     /// Samples **per channel** the delivered soundtrack carries — see [`fit_audio_to_video`].
+    ///
+    /// Delegates to [`crate::denoise::delivered_audio_samples`] rather than restating the
+    /// arithmetic: the geometry module owns the AV mux quantities, and an inline copy here is
+    /// exactly the two-readers-drift shape this crate keeps finding.
     pub fn delivered_audio_samples(&self) -> usize {
-        (self.duration_seconds() * f64::from(AUDIO_SAMPLE_RATE)).round() as usize
+        crate::denoise::delivered_audio_samples(self.joint.num_frames)
     }
 }
 
