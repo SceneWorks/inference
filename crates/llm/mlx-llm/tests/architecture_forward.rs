@@ -13,9 +13,25 @@
 //! edits this same decoder loop to add Gemma 4's per-layer attention, and any drift it introduces
 //! into the uniform architectures fails here.
 //!
-//! Assertions are **exact** — not a tolerance. These are the same kernels running the same graph on
-//! the same device, so anything other than bit-equality is a real change in what the decoder
-//! computes.
+//! **Precision contract.** The comparison is exact — at the precision this backend actually
+//! computes in. The decoder's compute dtype is bf16, so both sides are compared as bf16 bit
+//! patterns, and for seven of the eight architectures (whose logits *are* bf16) that is plain
+//! f32 bit-equality.
+//!
+//! Gemma-2 is the exception and the reason this is spelled out: its final-logit soft-cap is applied
+//! in f32, so its logits escape as f32 and expose MLX's Metal GEMM, which this repo already knows is
+//! reproducible only to ~1e-3 (`mlx_metal_matmul_reduced_precision`, and the tile-shape dependence
+//! behind `sdpa`'s own 2e-3 tolerances). An earlier revision of this file asserted raw f32
+//! bit-equality and passed on an idle machine but failed on the loaded CI runner, on gemma2 index 0,
+//! by 1.5e-3 (`1.0900694` vs `1.0915667`) — GPU contention, not a code change. Both of those round
+//! to the same bf16 value.
+//!
+//! So each value must match as bf16 **and** stay inside the documented Metal band. The pair is
+//! deliberate: bf16 equality is the real gate (a 1% attention-scale change moves the bf16 bits), and
+//! the band stops a drift larger than a bf16 ULP from hiding behind a lucky rounding.
+//!
+//! `candle-llm`'s mirror of this file runs on a deterministic CPU kernel and does assert raw f32
+//! bit-equality; the two files differ here for that reason alone.
 //!
 //! Regenerate (only ever against a known-good tree, and say so in the commit):
 //!
@@ -538,6 +554,24 @@ fn run_forward(case: &Case) -> Vec<f32> {
     out
 }
 
+/// How far apart two runs of the same MLX graph may land, as a fraction of the row's magnitude.
+///
+/// MLX's Metal GEMM picks its tiling from the problem shape and machine state, so an f32 result is
+/// reproducible only to about a thousandth — the same band `primitives::attention`'s own tests use.
+/// Observed on the CI runner under load: 1.4e-3 relative on Gemma-2's f32 soft-capped logits.
+const METAL_GEMM_BAND: f32 = 5e-3;
+
+/// The bf16 bit pattern `x` rounds to (round-to-nearest-even), i.e. the value at the precision the
+/// decoder computes in.
+fn bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) as u16) | 0x0040;
+    }
+    let lsb = (b >> 16) & 1;
+    (((b + 0x7fff + lsb) >> 16) & 0xffff) as u16
+}
+
 fn host(a: &Array) -> Vec<f32> {
     a.as_dtype(Dtype::Float32)
         .unwrap()
@@ -545,10 +579,10 @@ fn host(a: &Array) -> Vec<f32> {
         .to_vec()
 }
 
-/// **The regression gate.** Every architecture's full forward output, exactly as the base branch
-/// produced it.
+/// **The regression gate.** Every architecture's full forward output, as the base branch produced
+/// it — matched at the decoder's compute precision (see the precision contract above).
 #[test]
-fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
+fn every_architecture_forward_matches_the_base_branch() {
     let cases = cases();
 
     if std::env::var("SC18769_WRITE_FORWARD_GOLDEN").is_ok() {
@@ -587,20 +621,27 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
             .collect();
         let got = run_forward(case);
         assert_eq!(got.len(), want.len(), "{}: logit count", case.name);
-        // Exact, not approximate: same kernels, same graph, same device.
-        if let Some((i, (g, w))) = got
-            .iter()
-            .zip(&want)
-            .enumerate()
-            .find(|(_, (g, w))| g.to_bits() != w.to_bits())
-        {
-            panic!(
-                "{name}: forward output moved at index {i}: got {g} ({got_bits:#x}), the base \
-                 branch produced {w} ({want_bits:#x}). The shared decoder or config changed this \
+        let scale = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            // The gate: identical at the decoder's own compute precision.
+            assert_eq!(
+                bf16_bits(*g),
+                bf16_bits(*w),
+                "{}: forward output moved at index {i}: got {g} (bf16 {:#06x}), the base branch \
+                 produced {w} (bf16 {:#06x}). The shared decoder or config changed this \
                  architecture's numerics.",
-                name = case.name,
-                got_bits = g.to_bits(),
-                want_bits = w.to_bits(),
+                case.name,
+                bf16_bits(*g),
+                bf16_bits(*w),
+            );
+            // The net under it: no drift wider than a bf16 ULP may hide behind a lucky rounding.
+            assert!(
+                (g - w).abs() <= METAL_GEMM_BAND * scale,
+                "{}: forward output at index {i} drifted {} (got {g}, base {w}) — beyond the \
+                 documented Metal GEMM reproducibility band of {} for this row",
+                case.name,
+                (g - w).abs(),
+                METAL_GEMM_BAND * scale,
             );
         }
     }
