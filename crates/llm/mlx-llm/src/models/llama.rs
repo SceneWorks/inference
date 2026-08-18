@@ -120,14 +120,20 @@ impl CausalLm {
             };
             load_proj(&wkey, bias)
         };
-        // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
+        // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
         // `rms_norm` applies it. (Llama / Qwen3 / Qwen3-VL / GLM-4 norm weights are standard RMSNorm
         // — used verbatim, including Qwen3-VL's `Qwen3VLTextRMSNorm`, which is plain `weight · x`;
-        // its small early-layer block-norm weights are genuine, verified by real-weights coherence.)
-        let gemma = cfg.architecture.is_gemma2();
+        // its small early-layer block-norm weights are genuine, verified by real-weights coherence.
+        // **Gemma 4** is also verbatim: `Gemma4UnifiedRMSNorm` multiplies by the stored weight, whose
+        // initializer is ones, so folding +1 in would corrupt every norm — hence `norm_unit_offset`
+        // rather than the broader `is_gemma`.)
+        let norm_offset = cfg.architecture.norm_unit_offset();
+        // The two things every Gemma generation shares: the √hidden embedding scale and the GeGLU
+        // (`gelu_pytorch_tanh`) MLP.
+        let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Array> {
             let t = req_bf16(key)?;
-            if gemma {
+            if norm_offset {
                 Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
             } else {
                 Ok(t)
@@ -577,6 +583,54 @@ impl CausalLm {
         let last_h = take_last(&h, s)?; // [b, 1, hidden]
         let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
         Ok(logits.reshape(&[b, self.cfg.vocab_size])?)
+    }
+
+    /// Run a forward step over token ids and return **every layer's** hidden states rather than
+    /// logits — the `output_hidden_states=True` stack a *text encoder* consumes (LTX-2.5 stacks all
+    /// of them into its feature extractor; only a language-model head wants logits).
+    ///
+    /// See [`CausalLm::hidden_states_from_embeds`] for the returned layout.
+    pub fn hidden_states(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Array>> {
+        let embeds = self.embed(input_ids)?;
+        self.hidden_states_from_embeds(&embeds, cache, offset)
+    }
+
+    /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
+    ///
+    /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's
+    /// `output_hidden_states` layout:
+    ///
+    /// * `[0]` — the input embeddings (post embedding-scale), i.e. the first layer's input.
+    /// * `[i]` for `1 <= i < num_layers` — the output of decoder layer `i - 1`.
+    /// * `[num_layers]` — the **final-normed** output of the last layer (HF ties the last entry to
+    ///   `last_hidden_state`, which is post-`model.norm`), *not* the raw layer output.
+    ///
+    /// Getting that last entry wrong is invisible in a decode smoke test — logits go through the
+    /// same norm either way — but silently shifts every feature an encoder consumer builds.
+    pub fn hidden_states_from_embeds(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Array>> {
+        let s = input_embeds.shape()[1];
+        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        let mut h = input_embeds.clone();
+        out.push(h.clone());
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &cos, &sin, AttnMask::Causal, cache, i)?;
+            out.push(h.clone());
+        }
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
+        }
+        Ok(out)
     }
 
     /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and

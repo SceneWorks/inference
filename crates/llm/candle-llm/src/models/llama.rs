@@ -104,12 +104,18 @@ impl CausalLm {
             };
             Projection::load_with_bias(req(wkey)?, bias, quant)
         };
-        // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
-        // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim.)
-        let gemma = cfg.architecture.is_gemma2();
+        // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
+        // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim — and so are
+        // **Gemma 4's**: `Gemma4UnifiedRMSNorm` multiplies by the stored weight, whose initializer
+        // is ones, so folding +1 in would corrupt every norm. Hence `norm_unit_offset` rather than
+        // the broader `is_gemma`.)
+        let norm_offset = cfg.architecture.norm_unit_offset();
+        // The two things every Gemma generation shares: the sqrt(hidden) embedding scale and the
+        // GeGLU (`gelu_pytorch_tanh`) MLP.
+        let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Tensor> {
             let t = req(key)?;
-            if gemma {
+            if norm_offset {
                 Ok(t.affine(1.0, 1.0)?)
             } else {
                 Ok(t)
@@ -432,6 +438,56 @@ impl CausalLm {
         self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
     }
 
+    /// Run a forward step over token ids and return **every layer's** hidden states rather than
+    /// logits — the `output_hidden_states=True` stack a *text encoder* consumes (LTX-2.5 stacks all
+    /// of them into its feature extractor; only a language-model head wants logits).
+    ///
+    /// See [`CausalLm::hidden_states_from_embeds`] for the returned layout.
+    pub fn hidden_states(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Tensor>> {
+        let embeds = self.embed(input_ids)?;
+        self.hidden_states_from_embeds(&embeds, cache, offset)
+    }
+
+    /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
+    ///
+    /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's
+    /// `output_hidden_states` layout:
+    ///
+    /// * `[0]` — the input embeddings (post embedding-scale), i.e. the first layer's input.
+    /// * `[i]` for `1 <= i < num_layers` — the output of decoder layer `i - 1`.
+    /// * `[num_layers]` — the **final-normed** output of the last layer (HF ties the last entry to
+    ///   `last_hidden_state`, which is post-`model.norm`), *not* the raw layer output.
+    ///
+    /// Getting that last entry wrong is invisible in a decode smoke test — logits go through the
+    /// same norm either way — but silently shifts every feature an encoder consumer builds.
+    pub fn hidden_states_from_embeds(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Tensor>> {
+        let s = input_embeds.dim(1)? as i32;
+        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            &cos,
+            &sin,
+            AttnMask::Causal,
+            Some(&mut out),
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        }
+        Ok(out)
+    }
+
     /// Embed token ids `[1, S]` → `[1, S, hidden]` in the compute dtype — the Qwen3-VL multimodal
     /// splice point (image/video-token rows are overwritten with the vision tower's merged features).
     pub fn embed_input_ids(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -676,7 +732,25 @@ impl CausalLm {
         sin: &Tensor,
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
+        self.run_decoder_stack_collecting(input_embeds, cache, cos, sin, mask, None)
+    }
+
+    /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — the one
+    /// loop, so the hidden-state-stack forward cannot drift from the logits forward (device hops,
+    /// mask carrying, and RoPE-table placement included).
+    fn run_decoder_stack_collecting(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: AttnMask<'_>,
+        mut collect: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
         let mut h = input_embeds.clone();
+        if let Some(sink) = collect.as_deref_mut() {
+            sink.push(h.clone());
+        }
         // The hidden state and the RoPE tables follow each layer onto its device; an explicit additive
         // mask (batched decode) is carried across too. All `to_device`s are no-op clones for a model
         // whose layers share one device, so the common path pays nothing.
@@ -702,8 +776,14 @@ impl CausalLm {
                 AttnMask::Causal => AttnMask::Causal,
                 AttnMask::None => AttnMask::None,
                 AttnMask::Additive(_) => AttnMask::Additive(mask_d.as_ref().unwrap()),
+                // Rebuilt per layer from `(q_len, k_len)` on whichever device the layer sits on,
+                // so there is nothing to carry across the device hop.
+                AttnMask::SlidingCausal { window } => AttnMask::SlidingCausal { window },
             };
             h = layer.forward(&h, &cos_d, &sin_d, layer_mask, cache, i)?;
+            if let Some(sink) = collect.as_deref_mut() {
+                sink.push(h.clone());
+            }
         }
         Ok(h)
     }

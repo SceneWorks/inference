@@ -30,6 +30,18 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     Ok(normed.broadcast_mul(&wf)?.to_dtype(orig)?)
 }
 
+/// **Scale-free** RMSNorm: `x / sqrt(mean(x^2) + eps)`, with no learned weight — Gemma 4's value
+/// norm (`Gemma4UnifiedRMSNorm(..., with_scale=False)`), which normalizes the value heads without a
+/// parameter of its own. Computed in f32 and cast back, exactly like [`rms_norm`].
+pub fn rms_norm_unscaled(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let orig = x.dtype();
+    let xf = x.to_dtype(DType::F32)?;
+    let last = xf.rank() - 1;
+    let mean = xf.sqr()?.mean_keepdim(last)?;
+    let denom = (mean + eps)?.sqrt()?;
+    Ok(xf.broadcast_div(&denom)?.to_dtype(orig)?)
+}
+
 /// SiLU / swish activation.
 pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok(candle_nn::ops::silu(x)?)
