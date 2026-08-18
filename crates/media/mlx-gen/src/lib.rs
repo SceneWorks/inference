@@ -33,6 +33,10 @@ pub mod attention;
 // Bounded transformer residency (SC-15750): ladder rung 4, likewise shared — see the module docs for
 // the lazy-graph trap that makes a hand-rolled version silently save nothing.
 pub mod block_residency;
+// Production capability switches for the shared optimization surface (sc-18316/sc-18318): P1
+// retained compilation and P3 exact epilogues default ON in production, with the benchmark keeping
+// A/B authority and a truthful opt-out for any path that cannot run one.
+pub mod capability;
 pub mod error;
 pub mod img2img;
 pub mod memory;

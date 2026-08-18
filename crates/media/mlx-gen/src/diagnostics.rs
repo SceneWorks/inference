@@ -13,6 +13,18 @@
 //! MLX generation is synchronous and SceneWorks serializes work on the process-default Metal
 //! device.  Thread-local ownership therefore gives each request an isolated collector without a
 //! process-global lock or a cross-request toggle.  Nested scopes are rejected rather than merged.
+//!
+//! # Toggles versus capabilities (sc-18316 / sc-18318)
+//!
+//! Two members of [`BENCHMARK_TOGGLES`] — [`RETAINED_COMPILATION`] and [`EXACT_EPILOGUES`] — are no
+//! longer benchmark-only requests: they are real [`crate::capability`] switches whose production
+//! default is **on**.  A diagnostic scope keeps A/B authority over them because the P6 matrix
+//! contract already treats a variant's requested-toggle set as an *exact and exclusive*
+//! specification (`validate_toggle_receipts` rejects "toggle-free variants" that emit any toggle
+//! receipt at all).  [`capability_override`] therefore reports membership in both directions for a
+//! scope opened with [`CapabilityAuthority::Override`], while [`begin_observed_request`] opens a
+//! collector that only *records* — it leaves the production default in force, so what it observes is
+//! the production path rather than a path the observer selected.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -220,9 +232,22 @@ enum CounterKey {
     ),
 }
 
+/// How an active diagnostic scope relates to the production [`crate::capability`] switches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilityAuthority {
+    /// The requested-toggle set is an exact, exclusive specification: a capability-backed toggle is
+    /// forced **on** by membership and **off** by absence, overriding the production default in both
+    /// directions. This is what the P6 A/B matrix needs and what its receipt validator enforces.
+    Override,
+    /// The scope records receipts only. Capability resolution keeps the production default, so the
+    /// receipts describe the path production would have taken with no scope installed at all.
+    Observe,
+}
+
 struct Collector {
     request_id: String,
     family: String,
+    capability_authority: CapabilityAuthority,
     requested_toggles: BTreeSet<&'static str>,
     decode_control: Option<BenchmarkDecodeControl>,
     counters: BTreeMap<CounterKey, u64>,
@@ -255,11 +280,37 @@ pub struct DiagnosticScope {
 }
 
 /// Begin diagnostics for one synchronous render request.
+///
+/// This is an [`CapabilityAuthority::Override`] scope with an empty toggle set, so every
+/// capability-backed toggle is forced **off** for its lifetime — the P6 "toggle-free" baseline.
+/// To record receipts for the production defaults instead, use [`begin_observed_request`].
 pub fn begin_request(
     request_id: impl Into<String>,
     family: impl Into<String>,
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
     begin_request_with_toggles(request_id, family, &[])
+}
+
+/// Begin a collector that **observes** the production path instead of selecting one.
+///
+/// Every other constructor in this module carries [`CapabilityAuthority::Override`]: its
+/// requested-toggle set decides whether each capability-backed toggle runs, which is exactly what
+/// the benchmark's A/B matrix needs and exactly what makes it useless as a reachability proof — the
+/// scope, not production, chose the path. This constructor installs the same collector with
+/// [`CapabilityAuthority::Observe`], so [`crate::capability::enabled`] keeps returning the
+/// production default and the receipts describe the arm a production render actually takes.
+pub fn begin_observed_request(
+    request_id: impl Into<String>,
+    family: impl Into<String>,
+) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    install_collector(
+        request_id,
+        family,
+        CapabilityAuthority::Observe,
+        &[],
+        None,
+        None,
+    )
 }
 
 /// Begin diagnostics and expose the requested benchmark toggles to provider code on this render
@@ -319,6 +370,24 @@ fn begin_request_with_toggles_and_phase_observer(
     decode_control: Option<BenchmarkDecodeControl>,
     phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
 ) -> Result<DiagnosticScope, ScopeAlreadyActive> {
+    install_collector(
+        request_id,
+        family,
+        CapabilityAuthority::Override,
+        requested_toggles,
+        decode_control,
+        phase_observer,
+    )
+}
+
+fn install_collector(
+    request_id: impl Into<String>,
+    family: impl Into<String>,
+    capability_authority: CapabilityAuthority,
+    requested_toggles: &[&'static str],
+    decode_control: Option<BenchmarkDecodeControl>,
+    phase_observer: Option<Box<dyn FnMut(BenchmarkPhaseBoundary)>>,
+) -> Result<DiagnosticScope, ScopeAlreadyActive> {
     COLLECTOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
@@ -327,6 +396,7 @@ fn begin_request_with_toggles_and_phase_observer(
         *slot = Some(Collector {
             request_id: request_id.into(),
             family: family.into(),
+            capability_authority,
             requested_toggles: requested_toggles.iter().copied().collect(),
             decode_control,
             counters: BTreeMap::new(),
@@ -340,11 +410,37 @@ fn begin_request_with_toggles_and_phase_observer(
 
 /// Whether the active benchmark request selected `toggle`. Always `false` in production requests
 /// that did not install a diagnostic scope.
+///
+/// This is the correct predicate for the three benchmark-only toggles
+/// ([`FUSED_ATTENTION_PRIMITIVES`], [`INDEXED_DECODE_ACCUMULATOR`], [`GEOMETRY_AWARE_DECODE`]). It is
+/// **not** how the two capability-backed toggles resolve — see [`capability_override`] and
+/// [`crate::capability::enabled`], whose production default is on.
 pub fn toggle_requested(toggle: &str) -> bool {
     COLLECTOR.with(|slot| {
         slot.borrow()
             .as_ref()
             .is_some_and(|collector| collector.requested_toggles.contains(toggle))
+    })
+}
+
+/// The active scope's A/B decision for a capability-backed `toggle`, or `None` when the production
+/// default stands.
+///
+/// `Some(true)`/`Some(false)` are returned only for an [`CapabilityAuthority::Override`] scope, where
+/// membership of the requested set is an exact and exclusive specification. An
+/// [`CapabilityAuthority::Observe`] scope and the no-scope production case both return `None`.
+pub fn capability_override(toggle: &str) -> Option<bool> {
+    debug_assert!(
+        BENCHMARK_TOGGLES.contains(&toggle),
+        "capability_override is only defined for the benchmark toggle surface"
+    );
+    COLLECTOR.with(|slot| {
+        let slot = slot.borrow();
+        let collector = slot.as_ref()?;
+        match collector.capability_authority {
+            CapabilityAuthority::Override => Some(collector.requested_toggles.contains(toggle)),
+            CapabilityAuthority::Observe => None,
+        }
     })
 }
 
@@ -467,7 +563,13 @@ impl DiagnosticScope {
                 .borrow_mut()
                 .take()
                 .expect("an active diagnostic scope owns one collector");
-            if collector.requested_toggles.contains(EXACT_EPILOGUES)
+            // The P3 terminal receipt is derived whenever the capability was in force for this
+            // request: because an Override scope requested it, or because an Observe scope let the
+            // production default stand. An all-fallback or empty request still terminates
+            // Fallback/Unavailable, so an observed request cannot certify a path it never took.
+            let epilogues_in_force = collector.requested_toggles.contains(EXACT_EPILOGUES)
+                || collector.capability_authority == CapabilityAuthority::Observe;
+            if epilogues_in_force
                 && !collector.counters.keys().any(|key| {
                     matches!(key, CounterKey::Toggle(toggle, _) if *toggle == EXACT_EPILOGUES)
                 })

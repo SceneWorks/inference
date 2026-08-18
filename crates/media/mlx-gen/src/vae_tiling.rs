@@ -741,6 +741,127 @@ mod tests {
         );
     }
 
+    /// sc-18318 reachability through a **production decode seam**, not a hand-built scope.
+    ///
+    /// [`tiled_conv2d_3x3_nhwc`] is the shipped bounded VAE-decode loop: it calls
+    /// [`crate::nn::conv2d`] per halo-expanded tile and runs the caller's GroupNorm→SiLU preprocess
+    /// inside it — three of the six P3 operations, on the real code path a bounded decode executes.
+    /// Driving it under an observation scope (which records without overriding) shows a production
+    /// decode taking the native epilogues; before the promotion every one of these was composed
+    /// because nothing in production ever installed the toggle. The bounded-versus-dense tracking
+    /// assertion doubles as the numeric-safety check: the fused epilogues must not move the decode.
+    #[test]
+    fn a_production_bounded_decode_reaches_the_exact_epilogues() {
+        use crate::diagnostics::{self, DiagnosticCounter, ToggleDisposition};
+
+        let (batch, height, width, channels, out_channels) = (1, 7, 9, 32, 3);
+        let values = (0..batch * height * width * channels)
+            .map(|i| (i as f32 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let x = Array::from_slice(&values, &[batch, height, width, channels]);
+        let norm_weight = Array::from_slice(
+            &(0..channels)
+                .map(|i| 0.7 + i as f32 * 0.013)
+                .collect::<Vec<_>>(),
+            &[channels],
+        );
+        let norm_bias = Array::from_slice(
+            &(0..channels)
+                .map(|i| (i as f32 * 0.31).cos() * 0.08)
+                .collect::<Vec<_>>(),
+            &[channels],
+        );
+        let conv_weight = Array::from_slice(
+            &(0..out_channels * 3 * 3 * channels)
+                .map(|i| (i as f32 * 0.037).sin() * 0.025)
+                .collect::<Vec<_>>(),
+            &[out_channels, 3, 3, channels],
+        );
+        let conv_bias = Array::from_slice(&[0.02f32, -0.03, 0.01], &[out_channels]);
+
+        let decode = || {
+            let global = GlobalGroupNorm::new(&x, &norm_weight, &norm_bias, 4, 1e-5).unwrap();
+            let tiled =
+                tiled_conv2d_3x3_nhwc(&x, &conv_weight, Some(&conv_bias), 5, None, |tile| {
+                    crate::nn::silu(&global.apply(tile)?)
+                })
+                .unwrap();
+            let dense_norm = crate::nn::group_norm(&x, &norm_weight, &norm_bias, 4, 1e-5).unwrap();
+            let dense = crate::nn::conv2d(
+                &crate::nn::silu(&dense_norm).unwrap(),
+                &conv_weight,
+                Some(&conv_bias),
+                1,
+                1,
+            )
+            .unwrap();
+            tiled.eval().unwrap();
+            dense.eval().unwrap();
+            (tiled, dense)
+        };
+
+        let composed = {
+            let _opt_out = crate::capability::CapabilityOptOut::install(
+                crate::capability::PipelineCapability::ExactEpilogues,
+            );
+            decode()
+        };
+
+        let scope =
+            diagnostics::begin_observed_request("vae-tiling-p3-production", "test").unwrap();
+        let (tiled, dense) = decode();
+        let report = scope.finish();
+
+        // The bounded decode still tracks the dense layer, and the fused decode is bit-identical to
+        // the composed one it replaces — both tiled and dense.
+        let max_diff = |a: &Array, b: &Array| {
+            a.as_slice::<f32>()
+                .iter()
+                .zip(b.as_slice::<f32>())
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            max_diff(&tiled, &dense) < 2e-4,
+            "fused bounded decode diverged from the dense layer"
+        );
+        assert_eq!(
+            max_diff(&tiled, &composed.0),
+            0.0,
+            "the P3 epilogues changed a bounded decode's output"
+        );
+        assert_eq!(
+            max_diff(&dense, &composed.1),
+            0.0,
+            "the P3 epilogues changed a dense decode's output"
+        );
+
+        for operation in [
+            diagnostics::EXACT_CONV2D_BIAS,
+            diagnostics::EXACT_SILU,
+            diagnostics::EXACT_GROUP_NORM_AFFINE,
+        ] {
+            assert!(
+                report.counters.iter().any(|counter| matches!(
+                    counter,
+                    DiagnosticCounter::ExactEpilogue {
+                        operation: recorded,
+                        disposition: ToggleDisposition::Applied,
+                        reason: None,
+                        count,
+                    } if *recorded == operation && *count > 0
+                )),
+                "a production decode must apply {operation}; receipts were {:?}",
+                report.counters
+            );
+        }
+        assert!(report.counters.contains(&DiagnosticCounter::Toggle {
+            toggle: diagnostics::EXACT_EPILOGUES,
+            disposition: ToggleDisposition::Applied,
+            count: 1,
+        }));
+    }
+
     /// sc-19753: layer-wise convolution tiling must use the dense activation's GroupNorm
     /// statistics. A whole-tail tiled decoder instead normalizes every crop independently and is
     /// exactly the bug this regression guards against. Position-dependent values make those local
