@@ -97,25 +97,84 @@ pub fn register_providers(
         .register_activation_memory(KLEIN_ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::KLEIN_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: FLUX2_KLEIN_9B_ID,
             contract: |spec| memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_ID, spec),
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(FLUX2_KLEIN_9B_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::KLEIN_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_EDIT_REGISTRATION)
         .register_memory_strategy(model::KLEIN_EDIT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: FLUX2_KLEIN_9B_EDIT_ID,
             contract: |spec| {
                 memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_EDIT_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_EDIT_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(
+                        FLUX2_KLEIN_9B_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model::KLEIN_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::KLEIN_KV_EDIT_REGISTRATION)
+        .register_memory_strategy(model::KLEIN_KV_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_KLEIN_9B_KV_EDIT_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_klein_contract(FLUX2_KLEIN_9B_KV_EDIT_ID, spec)
+            },
+        })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: FLUX2_KLEIN_9B_KV_EDIT_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_klein_surface_contract(
+                        FLUX2_KLEIN_9B_KV_EDIT_ID,
+                        surface,
+                    )
+                },
+            },
+        )
+        .register_memory_behavior(model::KLEIN_KV_EDIT_MEMORY_BEHAVIOR)
         .register_generator(model::DEV_REGISTRATION)
         .register_memory_strategy(model::DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_DEV_ID,
+            contract: memory_strategy::registered_dev_t2i_contract,
+        })
         .register_generator(model::DEV_EDIT_REGISTRATION)
         .register_memory_strategy(model::DEV_EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: FLUX2_DEV_EDIT_ID,
+            contract: memory_strategy::registered_dev_contract,
+        })
         .register_generator(model_control::DEV_CONTROL_REGISTRATION)
+        .register_memory_strategy(model_control::DEV_CONTROL_MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(
+            mlx_gen::gen_core::ResidentOnlyMemoryContractRegistration {
+                surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+                provider_id: FLUX2_DEV_CONTROL_ID,
+                contract: memory_strategy::registered_dev_control_contract,
+            },
+        )
 }
 
 /// Build the complete explicit MLX FLUX.2 provider catalog.
@@ -215,8 +274,10 @@ mod explicit_registry_tests {
             );
         gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
         assert!(registry
-            .memory_strategy_contract(super::FLUX2_KLEIN_9B_KV_EDIT_ID, &spec)
-            .unwrap()
-            .is_none());
+            .memory_strategy_registrations()
+            .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
+        assert!(registry
+            .memory_behavior_registrations()
+            .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
     }
 }

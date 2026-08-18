@@ -30,9 +30,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use mlx_rs::ops::{
-    add, concatenate_axis, divide, maximum, mean_axes, multiply, pad, subtract, sum_axes,
-};
+use mlx_rs::ops::{add, concatenate_axis, divide, mean_axes, multiply, pad, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv3d, silu};
@@ -610,10 +608,18 @@ impl LtxVideoVae {
     /// into overlapping spatial/temporal tiles, decodes each, and trapezoidally blends them. Falls
     /// back to the single-pass [`decode`](Self::decode) when `cfg` does not fire for these dims.
     ///
-    /// `cancel` (F-051): checked once per tile. The per-tile `eval` below already materializes the
+    /// `cancel` (F-051): checked once per tile. The per-tile `eval` already materializes the
     /// accumulators, so the check observes real progress (no lazy-eval false green — the check runs
     /// after the tile's compute is forced), and a cancel during the minutes-long full-envelope decode
     /// is honored within one tile rather than the whole video. Returns [`Error::Canceled`] on trip.
+    ///
+    /// The assembly itself is the shared
+    /// [`tiled_decode_with_hooks`](mlx_gen::vae_tiling::tiled_decode_with_hooks) (sc-18320): LTX
+    /// carried a private copy of the same slice/blend/place/accumulate loop, so the two drifted
+    /// independently — the sc-19655 per-tile cache release lived only here, and the sc-18320
+    /// per-axis fold would have had to be written twice. The hooks are what LTX actually needs from
+    /// its own copy: force every live accumulator, then hand MLX's dead buffers back to the OS with
+    /// only those accumulators live.
     pub fn decode_tiled(
         &self,
         latent: &Array,
@@ -627,131 +633,20 @@ impl LtxVideoVae {
         }
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        Self::decode_tiled_plan(
+        mlx_gen::vae_tiling::tiled_decode_with_hooks(
             latent,
             &plan,
-            cancel,
+            [2, 3, 4],
+            Some(cancel),
             |tile| self.decoder.decode(tile),
-            |output, weights| {
-                output.eval()?;
-                weights.eval()?;
+            |accumulators| {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
                 Ok(())
             },
             mlx_rs::memory::clear_cache,
         )
-    }
-
-    /// Execute the tiled assembly with an injected tile decoder and cache release.
-    ///
-    /// Keeping this weights-free seam lets the per-tile release order stay mutation-tested. The
-    /// callback runs after the tile-local arrays have dropped but while the two current full-output
-    /// accumulators remain live, so MLX returns only dead decoder/assembly buffers to the OS.
-    fn decode_tiled_plan(
-        latent: &Array,
-        plan: &mlx_gen::tiling::TilePlan,
-        cancel: &CancelFlag,
-        mut decode_tile: impl FnMut(&Array) -> Result<Array>,
-        mut materialize_accumulators: impl FnMut(&Array, &Array) -> Result<()>,
-        mut release_dead_buffers: impl FnMut(),
-    ) -> Result<Array> {
-        // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
-        // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.
-        let mut output: Option<Array> = None; // [b, 3, out_f, out_h, out_w]
-        let mut weights: Option<Array> = None; // [1, 1, out_f, out_h, out_w]
-
-        for t in &plan.t {
-            for hh in &plan.h {
-                for ww in &plan.w {
-                    if cancel.is_cancelled() {
-                        let had_accumulators = output.is_some() || weights.is_some();
-                        drop(output.take());
-                        drop(weights.take());
-                        if had_accumulators {
-                            release_dead_buffers();
-                        }
-                        return Err(Error::Canceled);
-                    }
-                    let tile_result = (|| -> Result<()> {
-                        let tile = slice_axis(latent, 2, t.start, t.end)?;
-                        let tile = slice_axis(&tile, 3, hh.start, hh.end)?;
-                        let tile = slice_axis(&tile, 4, ww.start, ww.end)?;
-                        let dec = decode_tile(&tile)?; // [b, 3, td, hd, wd]
-
-                        let ds = dec.shape();
-
-                        // sc-12748: the sc-12438 over-bound refusal is RETIRED here (as in the shared
-                        // `mlx_gen::vae_tiling::tiled_decode`). The `[b, 3, out_f, out_h, out_w]` output is
-                        // assembled with `pad`+`add`+`divide` and read back via `contiguous`'s `reshape`
-                        // (+`as_slice`) — all probe-verified int64-safe above `i32::MAX` on this pin (MLX
-                        // 0.32.0 #3524 conv + the sc-12746 pad/concat copy-gate patch;
-                        // `mlx-gen/tests/mlx_write_bound_probe.rs`). So a decode whose assembled RGB output
-                        // crosses the bound now RENDERS instead of erroring — validated on real LTX weights in
-                        // `vae_decode_sweep::over_bound_output_matches_below_bound_reference`. `from_slice`
-                        // remains i32-capped but this loop never takes it (`check_output_writable` is retained
-                        // as an uncalled latent tripwire for future code that would — sc-12926).
-                        let at = ds[2].min(t.out_stop - t.out_start);
-                        let ah = ds[3].min(hh.out_stop - hh.out_start);
-                        let aw = ds[4].min(ww.out_stop - ww.out_start);
-
-                        // 1-D masks → outer product [1, 1, at, ah, aw].
-                        let tm = Array::from_slice(&t.mask[..at as usize], &[1, 1, at, 1, 1]);
-                        let hm = Array::from_slice(&hh.mask[..ah as usize], &[1, 1, 1, ah, 1]);
-                        let wm = Array::from_slice(&ww.mask[..aw as usize], &[1, 1, 1, 1, aw]);
-                        let blend = multiply(&multiply(&tm, &hm)?, &wm)?;
-
-                        let dec = slice_axis(&dec, 2, 0, at)?;
-                        let dec = slice_axis(&dec, 3, 0, ah)?;
-                        let dec = slice_axis(&dec, 4, 0, aw)?;
-                        let weighted = multiply(&dec, &blend)?; // [b, 3, at, ah, aw]
-
-                        // Place at (out_start) offsets via zero-pad to the full output shape.
-                        let pads = [
-                            (0, 0),
-                            (0, 0),
-                            (t.out_start, plan.out_f - (t.out_start + at)),
-                            (hh.out_start, plan.out_h - (hh.out_start + ah)),
-                            (ww.out_start, plan.out_w - (ww.out_start + aw)),
-                        ];
-                        let weighted_full = pad(&weighted, &pads[..], None, None)?;
-                        let blend_full = pad(&blend, &pads[..], None, None)?;
-
-                        output = Some(match output.take() {
-                            None => weighted_full,
-                            Some(acc) => add(&acc, &weighted_full)?,
-                        });
-                        weights = Some(match weights.take() {
-                            None => blend_full,
-                            Some(acc) => add(&acc, &blend_full)?,
-                        });
-                        // Keep the lazy graph + peak memory bounded (mirrors the reference mx.eval).
-                        materialize_accumulators(
-                            output.as_ref().unwrap(),
-                            weights.as_ref().unwrap(),
-                        )?;
-                        Ok(())
-                    })();
-                    // The inner scope has dropped every tile-local handle. On success, evict their
-                    // dead buffers while the current accumulators stay active. On failure, drop the
-                    // accumulators too so the same release leaves no tile-owned cache residue.
-                    match tile_result {
-                        Ok(()) => release_dead_buffers(),
-                        Err(error) => {
-                            drop(output.take());
-                            drop(weights.take());
-                            release_dead_buffers();
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-        }
-
-        let output =
-            output.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
-        let weights =
-            weights.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
-        let normed = divide(&output, &maximum(&weights, scalar(1e-8))?)?;
-        contiguous(&normed)
     }
 
     /// Whether the VAE can encode — either the encoder is already built or a lazy source is set.
@@ -794,18 +689,20 @@ mod tests {
         let decode_events = std::rc::Rc::clone(&events);
         let materialize_events = std::rc::Rc::clone(&events);
         let release_events = std::rc::Rc::clone(&events);
-        let got = LtxVideoVae::decode_tiled_plan(
+        let got = mlx_gen::vae_tiling::tiled_decode_with_hooks(
             &latent,
             &plan,
-            &CancelFlag::default(),
+            [2, 3, 4],
+            None,
             move |tile| {
                 decode_events.borrow_mut().push("decode");
                 synthetic_spatial_decode(tile)
             },
-            move |output, weights| {
+            move |accumulators: &[&Array]| {
                 materialize_events.borrow_mut().push("materialize");
-                output.eval()?;
-                weights.eval()?;
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
                 Ok(())
             },
             move || release_events.borrow_mut().push("release"),
@@ -841,17 +738,19 @@ mod tests {
         cancel.cancel();
         let decodes = std::cell::Cell::new(0usize);
         let releases = std::cell::Cell::new(0usize);
-        let canceled = LtxVideoVae::decode_tiled_plan(
+        let canceled = mlx_gen::vae_tiling::tiled_decode_with_hooks(
             &latent,
             &plan,
-            &cancel,
+            [2, 3, 4],
+            Some(&cancel),
             |tile| {
                 decodes.set(decodes.get() + 1);
                 synthetic_spatial_decode(tile)
             },
-            |output, weights| {
-                output.eval()?;
-                weights.eval()?;
+            |accumulators: &[&Array]| {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
                 Ok(())
             },
             || releases.set(releases.get() + 1),
@@ -861,12 +760,13 @@ mod tests {
         assert_eq!(releases.get(), 0, "no tile means no release callback");
 
         let releases = std::cell::Cell::new(0usize);
-        let failed = LtxVideoVae::decode_tiled_plan(
+        let failed = mlx_gen::vae_tiling::tiled_decode_with_hooks(
             &latent,
             &plan,
-            &CancelFlag::default(),
+            [2, 3, 4],
+            None,
             |_tile| Err(Error::Msg("synthetic decoder failure".into())),
-            |_output, _weights| unreachable!("failed decode cannot produce accumulators"),
+            |_: &[&Array]| unreachable!("failed decode cannot produce accumulators"),
             || releases.set(releases.get() + 1),
         );
         assert!(
@@ -884,18 +784,20 @@ mod tests {
         let decode_events = std::rc::Rc::clone(&events);
         let materialize_events = std::rc::Rc::clone(&events);
         let release_events = std::rc::Rc::clone(&events);
-        let canceled = LtxVideoVae::decode_tiled_plan(
+        let canceled = mlx_gen::vae_tiling::tiled_decode_with_hooks(
             &latent,
             &plan,
-            &cancel,
+            [2, 3, 4],
+            Some(&cancel),
             |tile| {
                 decode_events.borrow_mut().push("decode");
                 synthetic_spatial_decode(tile)
             },
-            |output, weights| {
+            |accumulators: &[&Array]| {
                 materialize_events.borrow_mut().push("materialize");
-                output.eval()?;
-                weights.eval()?;
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
                 Ok(())
             },
             || {
@@ -918,10 +820,11 @@ mod tests {
         let materialize_events = std::rc::Rc::clone(&events);
         let release_events = std::rc::Rc::clone(&events);
         let decodes = std::cell::Cell::new(0usize);
-        let failed = LtxVideoVae::decode_tiled_plan(
+        let failed = mlx_gen::vae_tiling::tiled_decode_with_hooks(
             &latent,
             &plan,
-            &CancelFlag::default(),
+            [2, 3, 4],
+            None,
             |tile| {
                 decodes.set(decodes.get() + 1);
                 decode_events.borrow_mut().push("decode");
@@ -931,10 +834,11 @@ mod tests {
                     synthetic_spatial_decode(tile)
                 }
             },
-            |output, weights| {
+            |accumulators: &[&Array]| {
                 materialize_events.borrow_mut().push("materialize");
-                output.eval()?;
-                weights.eval()?;
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
                 Ok(())
             },
             || release_events.borrow_mut().push("release"),
@@ -946,6 +850,236 @@ mod tests {
             events.borrow().as_slice(),
             ["decode", "materialize", "release", "decode", "release"],
             "the failed tile skips materialization and gets only the one fail-closed cleanup release"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-19753 — the LTX decoder's tiling is normalization-correct BY CONSTRUCTION; proof below.
+    //
+    // The sc-19753 rule is that globally-scoped ops (GroupNorm, spatial-softmax attention,
+    // squeeze-and-excite / global pools) must run once on the whole latent and only spatially-local
+    // work may be tiled. `LtxVideoVae::decode_tiled` tiles the WHOLE decoder — which is safe only
+    // because this decoder has no globally-scoped op at all: it contains no attention (grep the
+    // decoder half of this file), and its only normalization is [`pixel_norm`], whose reduction is
+    // `sum_axes(x·x, &[1], true)` — the CHANNEL axis alone, per (b, t, h, w) position. Everything
+    // else is convs, depth-to-space, unpatchify, SiLU and residual adds, all spatially local.
+    //
+    // These tests prove that rather than asserting it, each with its executed mutation control.
+    // ------------------------------------------------------------------------------------------
+
+    /// `a[:, :, :, :, 0..width]` — a left-hand spatial crop on the W axis.
+    fn crop_w(a: &Array, width: i32) -> Array {
+        contiguous(&slice_axis(a, 4, 0, width).unwrap()).unwrap()
+    }
+
+    fn max_abs_delta(left: &Array, right: &Array) -> f32 {
+        left.as_slice::<f32>()
+            .iter()
+            .zip(right.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// A position-dependent NCTHW tensor whose *amplitude* grows across W, so a spatial reduction
+    /// taken over a left-hand crop is visibly different from one taken over the whole tensor (a
+    /// merely additive ramp barely moves a mean-square, and would make the controls below toothless).
+    fn ramped(shape: [i32; 5]) -> Array {
+        let (h, w) = (shape[3], shape[4]);
+        let count: i32 = shape.iter().product();
+        let data = (0..count)
+            .map(|i| {
+                let y = (i / w % h) as f32;
+                let x = (i % w) as f32;
+                (((i as f32) * 0.071).sin() + y * 0.31) * (1.0 + 0.6 * x)
+            })
+            .collect::<Vec<_>>();
+        Array::from_slice(&data, &shape)
+    }
+
+    /// The **mutation control** used throughout: [`pixel_norm`] with its channel-axis reduction
+    /// replaced by a GroupNorm-shaped reduction over (C, H, W). Everything else is identical.
+    fn spatially_normalized(x: &Array, eps: f32) -> Result<Array> {
+        let sumsq = mean_axes(&multiply(x, x)?, &[1, 3, 4], true)?;
+        let denom = add(&sumsq, scalar(eps))?.sqrt()?;
+        Ok(divide(x, &denom)?)
+    }
+
+    /// **`pixel_norm` commutes with spatial cropping; a spatial reduction does not.** This is the
+    /// whole sc-19753 argument for LTX in one assertion: the decoder's only normalization is a
+    /// per-position channel reduction, so a tile normalizes exactly as the dense decode would.
+    ///
+    /// Measured on `[1, 6, 3, 7, 11]` cropped to `W = 0..5`: the real `pixel_norm` commutes to
+    /// **0.0** (bit-exact), while the executed control — the identical op with a GroupNorm-shaped
+    /// (C, H, W) reduction — breaks commutation by **1.485e0**. Without the control the 0.0 would be
+    /// satisfied by any implementation; with it, the assertion has teeth.
+    #[test]
+    fn pixel_norm_commutes_with_cropping_but_a_spatial_reduction_does_not() {
+        let x = ramped([1, 6, 3, 7, 11]);
+
+        let cropped_dense = crop_w(&pixel_norm(&x, DEC_NORM_EPS).unwrap(), 5);
+        let norm_of_crop = pixel_norm(&crop_w(&x, 5), DEC_NORM_EPS).unwrap();
+        cropped_dense.eval().unwrap();
+        norm_of_crop.eval().unwrap();
+        assert_eq!(cropped_dense.shape(), norm_of_crop.shape());
+        assert_eq!(
+            max_abs_delta(&cropped_dense, &norm_of_crop),
+            0.0,
+            "pixel_norm reduces the channel axis only, so it must commute with spatial cropping"
+        );
+
+        let cropped_mutant = crop_w(&spatially_normalized(&x, DEC_NORM_EPS).unwrap(), 5);
+        let mutant_of_crop = spatially_normalized(&crop_w(&x, 5), DEC_NORM_EPS).unwrap();
+        cropped_mutant.eval().unwrap();
+        mutant_of_crop.eval().unwrap();
+        let broken = max_abs_delta(&cropped_mutant, &mutant_of_crop);
+        println!("pixel_norm commutation = 0.0; spatial-reduction control = {broken:.3e}");
+        assert!(
+            broken > 1e-1,
+            "the spatial-reduction control must break commutation, got max|Δ|={broken:.3e} — the \
+             assertion above would then be proving nothing"
+        );
+    }
+
+    /// **The real `DecResBlock` is spatially local**: decoding a crop reproduces the dense result
+    /// exactly outside the crop's conv halo (two `k=3` convs ⇒ radius 2 columns), so a tile's
+    /// interior is bit-identical to the dense decode's. Driven on the shipped block, not a stand-in.
+    ///
+    /// The **executed mutation control** rebuilds the same block with `pixel_norm` swapped for the
+    /// GroupNorm-shaped reduction and nothing else changed: its halo interior then moves by
+    /// **2.791e0** against the real block's **0.0**. That is what distinguishes "the port's
+    /// normalization is per-position" from "the port merely happens to agree here".
+    #[test]
+    fn dec_res_block_is_spatially_local_but_a_spatially_normalized_variant_is_not() {
+        use std::collections::HashMap;
+
+        const CH: i32 = 4;
+        const CROP: i32 = 7;
+        /// Two `k=3` convs ⇒ each output column depends on ±2 input columns.
+        const HALO: i32 = 2;
+
+        let mut tensors = HashMap::new();
+        for (index, name) in ["conv1", "conv2"].iter().enumerate() {
+            let count = CH * 3 * 3 * 3 * CH;
+            let w = (0..count)
+                .map(|i| ((i + index as i32 * 37) as f32 * 0.053).sin() * 0.11)
+                .collect::<Vec<_>>();
+            tensors.insert(
+                format!("b.{name}.conv.weight"),
+                Array::from_slice(&w, &[CH, 3, 3, 3, CH]),
+            );
+            tensors.insert(
+                format!("b.{name}.conv.bias"),
+                Array::from_slice(
+                    &(0..CH)
+                        .map(|i| (i as f32 * 0.7 + index as f32).cos() * 0.02)
+                        .collect::<Vec<_>>(),
+                    &[CH],
+                ),
+            );
+        }
+        let block = DecResBlock::from_weights(&Weights::from_map(tensors), "b").unwrap();
+        let x = ramped([1, CH, 3, 9, 13]);
+
+        // The real block: the crop's halo interior is bit-identical to the dense result.
+        let dense = block.forward(&x).unwrap();
+        let of_crop = block.forward(&crop_w(&x, CROP)).unwrap();
+        let dense_window = crop_w(&dense, CROP - HALO);
+        let crop_window = crop_w(&of_crop, CROP - HALO);
+        dense_window.eval().unwrap();
+        crop_window.eval().unwrap();
+        assert_eq!(crop_window.shape(), dense_window.shape());
+        let local = max_abs_delta(&dense_window, &crop_window);
+
+        // The control: the identical block with a spatial reduction is no longer crop-local.
+        let mutated = |input: &Array| -> Result<Array> {
+            let h = silu(&spatially_normalized(input, DEC_NORM_EPS)?)?;
+            let h = block.conv1.forward(&h, false)?;
+            let h = silu(&spatially_normalized(&h, DEC_NORM_EPS)?)?;
+            let h = block.conv2.forward(&h, false)?;
+            Ok(add(&h, input)?)
+        };
+        let mutant_dense = crop_w(&mutated(&x).unwrap(), CROP - HALO);
+        let mutant_crop = crop_w(&mutated(&crop_w(&x, CROP)).unwrap(), CROP - HALO);
+        mutant_dense.eval().unwrap();
+        mutant_crop.eval().unwrap();
+        let mutated_delta = max_abs_delta(&mutant_dense, &mutant_crop);
+
+        println!(
+            "DecResBlock crop-locality = {local:.3e}; spatial-norm control = {mutated_delta:.3e}"
+        );
+        assert_eq!(
+            local, 0.0,
+            "the shipped DecResBlock must be exactly crop-local outside its conv halo"
+        );
+        assert!(
+            mutated_delta > 1e-1,
+            "the spatial-reduction control must destroy crop-locality, got \
+             max|Δ|={mutated_delta:.3e}"
+        );
+    }
+
+    /// **The real tiling driver reassembles a per-position-normalizing decoder exactly.** Runs
+    /// [`mlx_gen::vae_tiling::tiled_decode_with_hooks`] — the same slice → decode →
+    /// trapezoidal-blend → fold loop `decode_tiled` uses — over a tile decoder that applies the shipped
+    /// [`pixel_norm`] and then the ×32 spatial expansion, and compares against the dense equivalent.
+    ///
+    /// Measured: the `pixel_norm` decoder reassembles to max|Δ| = **2.384e-7** across a genuinely
+    /// split plan (f32 blend round-off; the blend is a convex combination of identical per-position
+    /// values), while the executed control (the same driver, same plan, same blend, with the
+    /// GroupNorm-shaped reduction substituted) diverges by **2.021e-1** — six orders of magnitude
+    /// larger. The plan is asserted to split, so neither number is measured against an untiled
+    /// fall-through.
+    ///
+    /// **Executed mutation** (the real [`pixel_norm`] widened to a (C, H, W) reduction): the exact
+    /// route degrades 2.384e-7 → **2.021e-1** and this test goes RED.
+    #[test]
+    fn tiled_assembly_is_exact_for_a_pixel_norm_decoder_and_wrong_for_a_spatial_one() {
+        let (latent, plan) = synthetic_tiled_case();
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(
+            tiles > 1,
+            "the plan must genuinely split, got {tiles} tile(s)"
+        );
+
+        let run = |normalize: &dyn Fn(&Array) -> Result<Array>| -> (Array, Array) {
+            let dense = synthetic_spatial_decode(&normalize(&latent).unwrap()).unwrap();
+            let tiled = mlx_gen::vae_tiling::tiled_decode_with_hooks(
+                &latent,
+                &plan,
+                [2, 3, 4],
+                None,
+                |tile| synthetic_spatial_decode(&normalize(tile).unwrap()),
+                |accumulators: &[&Array]| {
+                    for accumulator in accumulators {
+                        accumulator.eval()?;
+                    }
+                    Ok(())
+                },
+                || {},
+            )
+            .unwrap();
+            dense.eval().unwrap();
+            tiled.eval().unwrap();
+            (dense, tiled)
+        };
+
+        let (dense, tiled) = run(&|x| pixel_norm(x, DEC_NORM_EPS));
+        assert_eq!(tiled.shape(), dense.shape());
+        let exact = max_abs_delta(&dense, &tiled);
+
+        let (mutant_dense, mutant_tiled) = run(&|x| spatially_normalized(x, DEC_NORM_EPS));
+        let broken = max_abs_delta(&mutant_dense, &mutant_tiled);
+
+        println!("tiled pixel_norm assembly = {exact:.3e}; spatial-norm control = {broken:.3e}");
+        assert!(
+            exact < 1e-5,
+            "a per-position normalization must reassemble exactly under tiling, got \
+             max|Δ|={exact:.3e}"
+        );
+        assert!(
+            broken > 1e-1,
+            "the spatial-reduction control must break tiled reassembly, got max|Δ|={broken:.3e} — \
+             the bound above would then be proving nothing"
         );
     }
 

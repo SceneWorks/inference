@@ -30,23 +30,58 @@ const MAX_LENGTH: usize = 512;
 
 /// Load the Qwen tokenizer with the Z-Image chat-template + padding policy.
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: MAX_LENGTH,
-            pad_token_id: PAD_TOKEN_ID,
-            chat_template: ChatTemplate::QwenInstruct,
-            pad_to_max_length: true,
-        },
-    )
-    .map_err(Into::into)
+    let source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_tokenizer(&source)
+}
+
+pub(crate) fn load_validated_tokenizer(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextTokenizer> {
+    let tokenizer = source.tokenizer_source().ok_or_else(|| {
+        mlx_gen::Error::Unsupported(
+            "Z-Image tokenizer parsing requires a retained encoder-source receipt".into(),
+        )
+    })?;
+    load_tokenizer_from_receipt(tokenizer)
+}
+
+pub(crate) fn load_tokenizer_from_receipt(
+    source: &mlx_gen::gen_core::ValidatedTokenizerSource,
+) -> Result<TextTokenizer> {
+    source.read_unchanged(|path| {
+        TextTokenizer::from_file(
+            path,
+            TokenizerConfig {
+                max_length: MAX_LENGTH,
+                pad_token_id: PAD_TOKEN_ID,
+                chat_template: ChatTemplate::QwenInstruct,
+                pad_to_max_length: true,
+            },
+        )
+        .map_err(Into::into)
+    })
 }
 
 /// Load the Qwen3-style text encoder (prompt → `cap_feats`). The checkpoint keys are prefixed
 /// `model.` (the encoder's own modules); no other remap is needed.
 pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    load_text_encoder_from_weights(w)
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_text_encoder(&selected)
+}
+
+pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<TextEncoder> {
+    let w = weights_from_source(source)?;
+    let encoder = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())?;
+    w.materialize_accessed()?;
+    Ok(encoder)
+}
+
+pub(crate) fn load_validated_text_encoder(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextEncoder> {
+    source.read_unchanged(load_text_encoder_from_source)
 }
 
 /// The **streamable** encoder for rung 4's text-encoder scope (SC-15794): it records the re-openable
@@ -58,14 +93,32 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 /// shape with no phase reload, so the repeated materialization is an explicit load-shape cost rather
 /// than an accidental rung-4 fallback.
 pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
-    let dir = root.join("text_encoder");
-    let w = Weights::from_dir(&dir)?;
-    TextEncoder::from_streamable_source(
-        &w,
-        mlx_gen::WeightsSource::Dir(dir),
-        "model",
-        &ZTextEncoderConfig::z_image(),
-    )
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    load_validated_text_encoder_streamable(&selected)
+}
+
+pub(crate) fn load_validated_text_encoder_streamable(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<TextEncoder> {
+    source.read_unchanged(|weights| {
+        let w = weights_from_source(weights)?;
+        let encoder = TextEncoder::from_validated_streamable_source(
+            &w,
+            source.clone(),
+            "model",
+            &ZTextEncoderConfig::z_image(),
+        )?;
+        w.materialize_accessed()?;
+        Ok(encoder)
+    })
+}
+
+fn weights_from_source(source: &WeightsSource) -> Result<Weights> {
+    match source {
+        WeightsSource::Dir(path) => Weights::from_dir(path),
+        WeightsSource::File(path) => Weights::from_file(path),
+    }
 }
 
 /// The in-memory / ComfyUI-normalized path: no re-openable source, so no stream. The contract declares

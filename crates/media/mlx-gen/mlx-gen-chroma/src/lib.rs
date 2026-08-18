@@ -40,23 +40,50 @@ pub fn register_providers(
         .register_generator(model::HD_REGISTRATION)
         .register_memory_strategy(model::HD_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: CHROMA1_HD_ID,
             contract: |spec| memory_strategy::weights_free_contract(CHROMA1_HD_ID, spec),
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_HD_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_surface_contract(CHROMA1_HD_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::HD_MEMORY_BEHAVIOR)
         .register_generator(model::BASE_REGISTRATION)
         .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: CHROMA1_BASE_ID,
             contract: |spec| memory_strategy::weights_free_contract(CHROMA1_BASE_ID, spec),
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_BASE_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_surface_contract(CHROMA1_BASE_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
         .register_generator(model::FLASH_REGISTRATION)
         .register_memory_strategy(model::FLASH_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: CHROMA1_FLASH_ID,
             contract: |spec| memory_strategy::weights_free_contract(CHROMA1_FLASH_ID, spec),
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: CHROMA1_FLASH_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_surface_contract(CHROMA1_FLASH_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::FLASH_MEMORY_BEHAVIOR)
 }
 

@@ -22,10 +22,12 @@
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::CfgBatching;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiffusionSampler,
-    DiscreteModelSampling, Error, Image, PreviewSink, Progress, Result, Scheduler,
+    DiscreteModelSampling, Error, GenerationRequest, Image, PreviewSink, Progress, Result,
+    Scheduler,
 };
 
 use mlx_gen_sdxl::{
@@ -46,15 +48,23 @@ use crate::tokenizer::KolorsTokenizer;
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: i32 = 8;
 
+/// The Kolors/SDXL U-Net has three resolution blocks and two exact downsample/upsample skip joins.
+/// Combined with the `/8` VAE, each production image axis must be divisible by `8 * 2² = 32`.
+pub const PRODUCTION_SPATIAL_MULTIPLE: i32 = SPATIAL_SCALE * 4;
+
 /// Reject degenerate dimensions at the public struct-API boundary (F-020). The registered
-/// `KolorsGenerator::generate_impl` runs `validate_request` (multiple-of-8), but the `pub fn
-/// generate*`/`img2img` struct methods beneath it do not — a non-multiple-of-8 or non-positive
-/// dimension would otherwise silently produce a wrong latent shape (`width / SPATIAL_SCALE` truncates)
-/// or crash deep in an MLX op. Inert on every valid request (registry dims are always multiples of 8).
+/// `KolorsGenerator::generate_impl` runs `validate_request`, but the `pub fn generate*`/`img2img`
+/// struct methods beneath it do not. A non-positive dimension, a non-multiple of the VAE scale, or
+/// a VAE-valid dimension that becomes odd inside the U-Net would otherwise truncate or crash deep
+/// in an MLX concatenate.
 fn validate_dims(height: i32, width: i32) -> Result<()> {
-    if height <= 0 || width <= 0 || height % SPATIAL_SCALE != 0 || width % SPATIAL_SCALE != 0 {
+    if height <= 0
+        || width <= 0
+        || height % PRODUCTION_SPATIAL_MULTIPLE != 0
+        || width % PRODUCTION_SPATIAL_MULTIPLE != 0
+    {
         return Err(Error::Msg(format!(
-            "kolors: height and width must be positive multiples of {SPATIAL_SCALE} (got {height}x{width})"
+            "kolors: height and width must be positive multiples of {PRODUCTION_SPATIAL_MULTIPLE} (got {height}x{width})"
         )));
     }
     Ok(())
@@ -102,6 +112,35 @@ pub fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     Array::from_slice(&v, &[batch, 6])
 }
 
+/// The CFG batching modes this family implements (sc-18317) — the doubled-batch single forward, and
+/// nothing else. Published on every Kolors descriptor's `Capabilities::execution` so a request
+/// selecting `Sequential` is a typed refusal at the shared floor instead of a silently batched run.
+pub(crate) const CFG_BATCHING_MODES: [CfgBatching; 1] = [CfgBatching::Batched];
+
+/// The mode one request runs: its explicit selection, or this family's own convention when unset.
+///
+/// `None` ⇒ [`CfgBatching::Batched`], which is exactly what every Kolors denoise did before
+/// sc-18317 — so an untouched request is byte-for-byte unaffected. The value is already
+/// domain-admitted by `Capabilities::validate_request`; this only resolves the default.
+pub(crate) fn resolve_cfg_batching(req: &GenerationRequest) -> CfgBatching {
+    req.memory
+        .and_then(|memory| memory.cfg_batching)
+        .unwrap_or(CfgBatching::Batched)
+}
+
+/// Fail closed on a batching mode this family does not implement.
+fn require_batched_cfg(batching: CfgBatching) -> Result<()> {
+    if batching.is_batched() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "kolors: cfg_batching={} is not implemented — the ChatGLM3 conditioning assembly and the \
+         shared SDXL denoise run guidance as one [cond, uncond] batch. Select \
+         cfg_batching=batched, or leave memory.cfg_batching unset.",
+        batching.label()
+    )))
+}
+
 /// Assemble the U-Net conditioning batch (`context`, `pooled`, `time_ids`) so its batch dim matches
 /// what `mlx_gen_sdxl::denoise*` feeds the U-Net latents (sc-9091, F-005). The shared engine only
 /// CFG-batches the latents to B=2 when `cfg > 1.0` (`denoise_core`, sdxl pipeline.rs); with
@@ -115,14 +154,23 @@ pub fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
 ///
 /// Before this gate the assemblies unconditionally built B=2 conditioning, so a CFG-off request handed
 /// the U-Net B=1 latents with B=2 conditioning and the attention reshape failed mid-denoise.
+///
+/// `batching` is the request's resolved [`CfgBatching`] mode (sc-18317). Kolors implements
+/// [`CfgBatching::Batched`] only — the doubled batch above is the whole guided path, and the shared
+/// SDXL `denoise_core` this feeds reads row 0 / row 1 out of one forward. A `Sequential` mode is
+/// refused **here**, at the deepest consumer, as well as at the shared request floor: the floor is
+/// what makes the refusal reachable from every entry point, and this check is what makes it
+/// impossible for a future caller to reach the assembly with a mode it does not implement.
 fn cfg_conditioning(
     pos: &(Array, Array),
     neg: Option<&(Array, Array)>,
     cfg: f32,
     height: i32,
     width: i32,
+    batching: CfgBatching,
 ) -> Result<(Array, Array, Array)> {
     use mlx_rs::ops::concatenate_axis;
+    require_batched_cfg(batching)?;
     if cfg > 1.0 {
         // CFG batch order is [positive, negative] — `mlx_gen_sdxl::denoise*` reads row 0 as the text
         // (cond) and row 1 as the uncond.
@@ -156,8 +204,9 @@ fn cfg_conditioning(
 /// this is only the shape-preserving CFG duplication so it is a pure, synthetic-array-testable gate
 /// shared by every control mode (`denoise_controlnet_latents`, `denoise_controlnet_ip_latents`, and
 /// the curated path) — the per-mode branch that could silently regress the B=1/B=2 contract.
-fn cfg_batch_control_image(cimg: &Array, cfg: f32) -> Result<Array> {
+fn cfg_batch_control_image(cimg: &Array, cfg: f32, batching: CfgBatching) -> Result<Array> {
     use mlx_rs::ops::concatenate_axis;
+    require_batched_cfg(batching)?;
     if cfg > 1.0 {
         Ok(concatenate_axis(&[cimg, cimg], 0)?)
     } else {
@@ -173,8 +222,9 @@ fn cfg_batch_control_image(cimg: &Array, cfg: f32) -> Result<Array> {
 ///
 /// `ip_tokens` is `[1, N, 2048]` (from `IpImageEncoder::tokens`). Pure + synthetic-array-testable,
 /// shared by every IP mode (`denoise_ip_latents`, `denoise_controlnet_ip_latents`, curated path).
-fn cfg_batch_ip_tokens(ip_tokens: &Array, cfg: f32) -> Result<Array> {
+fn cfg_batch_ip_tokens(ip_tokens: &Array, cfg: f32, batching: CfgBatching) -> Result<Array> {
     use mlx_rs::ops::{concatenate_axis, zeros};
+    require_batched_cfg(batching)?;
     if cfg > 1.0 {
         let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
         Ok(concatenate_axis(&[ip_tokens, &zero], 0)?)
@@ -421,8 +471,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -458,8 +510,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -505,8 +559,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -544,8 +600,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -581,8 +639,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -628,8 +688,10 @@ impl KolorsHeavy {
             on_progress,
             &PreviewSink::default(),
             // The inert-preview wrappers are the pre-ladder struct API (the parity gates call
-            // them); SC-15521 keeps them byte-identical by passing the unbounded plan.
+            // them); SC-15521 keeps them byte-identical by passing the unbounded plan
+            // and this family's own batched-CFG convention (sc-18317).
             SdxlForwardPlan::UNBOUNDED,
+            CfgBatching::Batched,
         )
     }
 
@@ -654,6 +716,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): `run_steps = Some(keep-1)` truncates the schedule so the
         // solver stops at the VP-capture σ; `None` runs the full schedule byte-identically.
@@ -662,7 +728,8 @@ impl KolorsHeavy {
             Some(rs) => sampler.truncate_to(rs),
             None => sampler,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         let d = Denoiser::with_plan(&self.unet, &sampler, plan);
@@ -702,6 +769,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (already strength-sliced) schedule to `keep-1`
         // steps when `run_steps = Some`; `None` runs the full sliced schedule byte-identically. The
@@ -711,7 +782,8 @@ impl KolorsHeavy {
             Some(rs) => sampler.truncate_to(rs),
             None => sampler,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
         // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
         let latents = sampler.add_noise(init_latents, noise)?;
 
@@ -769,6 +841,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         use mlx_rs::ops::{add, multiply};
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
@@ -810,14 +886,15 @@ impl KolorsHeavy {
             }
             None => run_sigmas,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
 
         // ControlNet branch: preprocess + CFG-batch the control image, then embed it once (the
         // conditioning embedding is step-invariant, F-069) — exactly as `denoise_controlnet_latents`.
         let controls: Vec<ControlContext> = match control {
             Some((controlnet, control_image, scale)) => {
                 let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-                let cimg = cfg_batch_control_image(&cimg, cfg)?;
+                let cimg = cfg_batch_control_image(&cimg, cfg, cfg_batching)?;
                 vec![ControlContext {
                     cond_embed: controlnet.embed_cond(&cimg)?,
                     controlnet,
@@ -831,7 +908,7 @@ impl KolorsHeavy {
         // (the uncond gets no image conditioning) when guidance is on; the image tokens alone when off
         // — exactly as `denoise_ip_latents`.
         let ip_batched = match ip_tokens {
-            Some((tokens, scale)) => Some((cfg_batch_ip_tokens(tokens, cfg)?, scale)),
+            Some((tokens, scale)) => Some((cfg_batch_ip_tokens(tokens, cfg, cfg_batching)?, scale)),
             None => None,
         };
 
@@ -886,6 +963,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -894,12 +975,13 @@ impl KolorsHeavy {
             Some(rs) => sampler.truncate_to(rs),
             None => sampler,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         // The ControlNet sees the same CFG-batched input as the U-Net (cfg>1 ⇒ [cond, uncond]).
         let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-        let cimg = cfg_batch_control_image(&cimg, cfg)?;
+        let cimg = cfg_batch_control_image(&cimg, cfg, cfg_batching)?;
         let cc = ControlContext {
             // The conditioning embedding is step-invariant, computed once per denoise here (F-069).
             // Under the registry's count loop this runs once per image rather than once per run; the
@@ -947,6 +1029,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
         // runs the full schedule byte-identically.
@@ -955,12 +1041,13 @@ impl KolorsHeavy {
             Some(rs) => sampler.truncate_to(rs),
             None => sampler,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         // IP-Adapter image tokens, batched to match the U-Net latents: [image tokens, zeros] under CFG
         // (the uncond row gets no image conditioning); the image tokens alone when guidance is off.
-        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
+        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg, cfg_batching)?;
 
         let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         denoise_ip_registered(
@@ -1020,6 +1107,10 @@ impl KolorsHeavy {
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
         plan: SdxlForwardPlan<'_>,
+        // The request's resolved CFG batching mode (sc-18317). The plain non-preview
+        // wrappers pass `CfgBatching::Batched`, this family's own pre-story convention, so
+        // they stay byte-identical.
+        cfg_batching: CfgBatching,
     ) -> Result<Array> {
         // PiD from_ldm early-stop (sc-8049): truncate the (strength-sliced) schedule to `keep-1` steps
         // when `run_steps = Some`; `None` runs the full sliced schedule byte-identically.
@@ -1028,13 +1119,14 @@ impl KolorsHeavy {
             Some(rs) => sampler.truncate_to(rs),
             None => sampler,
         };
-        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
+        let (conditioning, pooled, time_ids) =
+            cfg_conditioning(pos, neg, cfg, height, width, cfg_batching)?;
         // Seed the img2img init (raw `x₀ + noise·σ_start`), as in `denoise_img2img_latents`.
         let latents = sampler.add_noise(init_latents, noise)?;
 
         // The ControlNet sees the same CFG-batched control image as the U-Net (cfg>1 ⇒ [cond, uncond]).
         let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-        let cimg = cfg_batch_control_image(&cimg, cfg)?;
+        let cimg = cfg_batch_control_image(&cimg, cfg, cfg_batching)?;
         let cc = ControlContext {
             cond_embed: controlnet.embed_cond(&cimg)?,
             controlnet,
@@ -1044,7 +1136,7 @@ impl KolorsHeavy {
         // Batch the IP tokens to match the latents: a zeros uncond row (the uncond gets no image
         // conditioning) under CFG; the image tokens alone when guidance is off — as in
         // `denoise_ip_latents`.
-        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
+        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg, cfg_batching)?;
 
         let d = Denoiser::with_plan(&self.unet, &sampler, plan);
         // `control_encoder = conditioning`: the Kolors ControlNet cross-attends to the ChatGLM3 text
@@ -1346,7 +1438,7 @@ impl Kolors {
     }
 
     /// Full T2I: seed the RNG, draw the initial noise, encode the prompt + negative prompt, denoise,
-    /// and VAE-decode. `height`/`width` are pixels (multiples of 8). `cfg` ≤ 1 disables guidance.
+    /// and VAE-decode. `height`/`width` are pixels (multiples of 32). `cfg` ≤ 1 disables guidance.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -1588,19 +1680,19 @@ mod tests {
     use super::*;
     use mlx_rs::ops::indexing::IndexOp;
 
-    /// F-020: the struct-API dim guard rejects non-positive / non-multiple-of-8 dimensions (which the
+    /// F-020: the struct-API dim guard rejects non-positive and U-Net-invalid dimensions (which the
     /// registry validates but the `pub fn generate*` methods previously did not).
     #[test]
     fn validate_dims_rejects_degenerate_dimensions() {
         assert!(validate_dims(1024, 768).is_ok());
-        assert!(validate_dims(8, 8).is_ok());
+        assert!(validate_dims(32, 32).is_ok());
         assert!(
-            validate_dims(513, 512).is_err(),
-            "513 is not a multiple of 8"
+            validate_dims(520, 512).is_err(),
+            "520 is VAE-valid but not a multiple of 32"
         );
         assert!(
-            validate_dims(512, 510).is_err(),
-            "510 is not a multiple of 8"
+            validate_dims(512, 520).is_err(),
+            "520 is VAE-valid but not a multiple of 32"
         );
         assert!(validate_dims(0, 512).is_err(), "0 is non-positive");
         assert!(validate_dims(512, -8).is_err(), "negative width");
@@ -1621,7 +1713,8 @@ mod tests {
         let pos = synthetic_cond(1.0);
         let neg = synthetic_cond(-1.0);
         let (ctx, pooled, time_ids) =
-            cfg_conditioning(&pos, Some(&neg), 5.0, 1024, 768).expect("cfg-on assembly");
+            cfg_conditioning(&pos, Some(&neg), 5.0, 1024, 768, CfgBatching::Batched)
+                .expect("cfg-on assembly");
         assert_eq!(ctx.shape(), &[2, 4, 8], "context is the [pos, neg] batch");
         assert_eq!(pooled.shape(), &[2, 8], "pooled is the [pos, neg] batch");
         assert_eq!(time_ids.shape(), &[2, 6], "time_ids batches to 2 under CFG");
@@ -1639,7 +1732,8 @@ mod tests {
         let neg = synthetic_cond(-1.0);
         for cfg in [1.0f32, 0.0, 0.5] {
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).expect("cfg-off assembly");
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched)
+                    .expect("cfg-off assembly");
             assert_eq!(
                 ctx.shape(),
                 &[1, 4, 8],
@@ -1661,10 +1755,97 @@ mod tests {
     fn cfg_conditioning_off_needs_no_negative() {
         let pos = synthetic_cond(1.0);
         let (ctx, pooled, time_ids) =
-            cfg_conditioning(&pos, None, 1.0, 512, 512).expect("cfg-off needs no negative");
+            cfg_conditioning(&pos, None, 1.0, 512, 512, CfgBatching::Batched)
+                .expect("cfg-off needs no negative");
         assert_eq!(ctx.shape(), &[1, 4, 8]);
         assert_eq!(pooled.shape(), &[1, 8]);
         assert_eq!(time_ids.shape(), &[1, 6]);
+    }
+
+    // --- sc-18317: the typed CFG-batching domain ------------------------------------------------
+
+    /// **Default preservation.** An unset selection resolves to the family's own pre-story
+    /// convention, so every existing render is byte-for-byte unaffected; an explicit selection is
+    /// what the planner sets and is returned verbatim.
+    #[test]
+    fn unset_cfg_batching_resolves_to_this_families_own_convention() {
+        let bare = GenerationRequest::default();
+        assert_eq!(resolve_cfg_batching(&bare), CfgBatching::Batched);
+
+        // A request carrying only ladder levers must not change the CFG mode either.
+        let ladder = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_cfg_batching(&ladder), CfgBatching::Batched);
+
+        for mode in CfgBatching::ALL {
+            let selected = GenerationRequest {
+                memory: Some(mlx_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(mode),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_cfg_batching(&selected),
+                mode,
+                "an explicit selection must survive resolution verbatim"
+            );
+        }
+    }
+
+    /// **Fail closed at the deepest consumer.** The shared floor already refuses an undeclared mode,
+    /// but every one of the three batch assemblies must refuse it too — that is what makes it
+    /// structurally impossible for a future caller to reach an assembly with a mode this family does
+    /// not implement and get a silently batched run instead of an error.
+    #[test]
+    fn every_batch_assembly_refuses_an_unimplemented_cfg_mode() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        let unimplemented = CfgBatching::Sequential;
+        assert!(
+            !CFG_BATCHING_MODES.contains(&unimplemented),
+            "this test's premise is that the mode is undeclared"
+        );
+
+        let errors = vec![
+            cfg_conditioning(&pos, Some(&neg), 5.0, 1024, 768, unimplemented).unwrap_err(),
+            cfg_batch_control_image(&synthetic_control_image(1.0), 5.0, unimplemented).unwrap_err(),
+            cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), 5.0, unimplemented).unwrap_err(),
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(
+                message.contains("cfg_batching=sequential"),
+                "the refusal must name the rejected mode: {message}"
+            );
+            assert!(
+                message.contains("cfg_batching=batched") || message.contains("unset"),
+                "the refusal must name the remedy: {message}"
+            );
+        }
+
+        // …and the declared mode still runs, so the guard is specific rather than a blanket refusal.
+        cfg_conditioning(&pos, Some(&neg), 5.0, 1024, 768, CfgBatching::Batched)
+            .expect("the declared mode must still assemble");
+    }
+
+    /// The declared descriptor domain and the assemblies' guard must be the same set — a declaration
+    /// that admits a mode `require_batched_cfg` rejects is exactly the declaration-without-
+    /// reachability defect this story exists to close.
+    #[test]
+    fn the_declared_cfg_domain_is_exactly_what_the_assemblies_accept() {
+        for mode in CfgBatching::ALL {
+            assert_eq!(
+                CFG_BATCHING_MODES.contains(&mode),
+                require_batched_cfg(mode).is_ok(),
+                "{mode:?}: declaration and consumption disagree"
+            );
+        }
     }
 
     // --- sc-9343: per-mode control-image + IP-token batch-shape contract ------------------------
@@ -1710,7 +1891,7 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(ctx.shape(), &[b, 4, 8], "base context B at cfg={cfg}");
             assert_eq!(pooled.shape(), &[b, 8], "base pooled B at cfg={cfg}");
             assert_eq!(time_ids.shape(), &[b, 6], "base time_ids B at cfg={cfg}");
@@ -1726,7 +1907,7 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(ctx.shape(), &[b, 4, 8], "img2img context B at cfg={cfg}");
             assert_eq!(pooled.shape(), &[b, 8], "img2img pooled B at cfg={cfg}");
             assert_eq!(time_ids.shape(), &[b, 6], "img2img time_ids B at cfg={cfg}");
@@ -1741,7 +1922,7 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(ctx.shape(), &[b, 4, 8], "controlnet context B at cfg={cfg}");
             assert_eq!(pooled.shape(), &[b, 8], "controlnet pooled B at cfg={cfg}");
             assert_eq!(
@@ -1750,7 +1931,9 @@ mod tests {
                 "controlnet time_ids B at cfg={cfg}"
             );
 
-            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            let cimg =
+                cfg_batch_control_image(&synthetic_control_image(1.0), cfg, CfgBatching::Batched)
+                    .unwrap();
             assert_eq!(
                 cimg.shape(),
                 &[b, 2, 2, 3],
@@ -1768,12 +1951,13 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(ctx.shape(), &[b, 4, 8], "ip context B at cfg={cfg}");
             assert_eq!(pooled.shape(), &[b, 8], "ip pooled B at cfg={cfg}");
             assert_eq!(time_ids.shape(), &[b, 6], "ip time_ids B at cfg={cfg}");
 
-            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            let tokens =
+                cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg, CfgBatching::Batched).unwrap();
             assert_eq!(tokens.shape(), &[b, 4, 8], "ip tokens B at cfg={cfg}");
             if cfg > 1.0 {
                 // Row 0 is the image tokens (tag 1.0 → 4*8), row 1 the zeros uncond (0.0).
@@ -1796,7 +1980,7 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(
                 ctx.shape(),
                 &[b, 4, 8],
@@ -1813,13 +1997,16 @@ mod tests {
                 "controlnet_ip time_ids B at cfg={cfg}"
             );
 
-            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            let cimg =
+                cfg_batch_control_image(&synthetic_control_image(1.0), cfg, CfgBatching::Batched)
+                    .unwrap();
             assert_eq!(
                 cimg.shape(),
                 &[b, 2, 2, 3],
                 "controlnet_ip control image B at cfg={cfg}"
             );
-            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            let tokens =
+                cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg, CfgBatching::Batched).unwrap();
             assert_eq!(
                 tokens.shape(),
                 &[b, 4, 8],
@@ -1838,19 +2025,22 @@ mod tests {
         for cfg in CFG_CASES {
             let b = expected_batch(cfg);
             let (ctx, pooled, time_ids) =
-                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768, CfgBatching::Batched).unwrap();
             assert_eq!(ctx.shape(), &[b, 4, 8], "curated context B at cfg={cfg}");
             assert_eq!(pooled.shape(), &[b, 8], "curated pooled B at cfg={cfg}");
             assert_eq!(time_ids.shape(), &[b, 6], "curated time_ids B at cfg={cfg}");
 
             // The curated path threads control + IP through the SAME gates (sc-7297).
-            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            let cimg =
+                cfg_batch_control_image(&synthetic_control_image(1.0), cfg, CfgBatching::Batched)
+                    .unwrap();
             assert_eq!(
                 cimg.shape(),
                 &[b, 2, 2, 3],
                 "curated control image B at cfg={cfg}"
             );
-            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            let tokens =
+                cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg, CfgBatching::Batched).unwrap();
             assert_eq!(tokens.shape(), &[b, 4, 8], "curated tokens B at cfg={cfg}");
         }
     }

@@ -42,6 +42,8 @@ pub const MODEL_ID: &str = "scail2_14b";
 /// plain single-scale CFG; packed-token conditioning + per-source RoPE + CLIP image cross-attn).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -103,6 +105,11 @@ pub fn descriptor() -> ModelDescriptor {
             audio_voices: vec![],
             audio_languages: vec![],
             audio_edit_modes: vec![],
+            // sc-18317: the graph-evaluation cadence + FFN chunk this provider's shared Wan
+            // `DitMemoryConfig` consumes. `generate` threads the request through
+            // `DitMemoryConfig::with_request` on top of `SCAIL2_MEM_DEFAULT`.
+            execution: crate::generate::EXECUTION_SURFACE,
+            approximation: Default::default(),
         },
     }
 }
@@ -478,6 +485,8 @@ impl Scail2 {
             fps: req.fps.unwrap_or(DEFAULT_FPS),
             segment_len: SEGMENT_LEN,
             segment_overlap: SEGMENT_OVERLAP,
+            // sc-18317: carry the request's typed execution selections into the engine-internal job.
+            memory: req.memory,
         };
         crate::generate::generate(
             &self.root,
@@ -495,6 +504,62 @@ impl Scail2 {
 mod tests {
     use super::*;
     use mlx_gen::ReplacementMode;
+
+    /// **sc-18317 — the declared execution domains are exactly the ones this provider consumes.**
+    ///
+    /// SCAIL-2 consumes the shared Wan `DitMemoryConfig`'s graph-evaluation cadence and FFN chunk
+    /// (`generate::SCAIL2_MEM_DEFAULT` ships a non-`OFF` production value for both), so both numeric
+    /// domains are declared and admitted on the production `validate` path. CFG batching is refused:
+    /// the shared Wan solver exposes no batching axis. The attention query chunk is deliberately not a
+    /// request domain at all — bounding attention scratch is the memory ladder's rung 3.
+    #[test]
+    fn execution_domains_are_declared_exactly_where_this_provider_consumes_them() {
+        let caps = descriptor().capabilities;
+        assert!(caps.execution.declaration_errors().is_empty());
+        assert!(caps.execution.graph_eval_cadence_blocks.is_supported());
+        assert!(caps.execution.ffn_chunk_rows.is_supported());
+        assert!(!caps.execution.cfg_batching.is_supported());
+
+        // The resolve-downstream sentinel: SCAIL-2 sizes from its driving frames.
+        let request = |memory| mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 0,
+            height: 0,
+            count: 1,
+            steps: Some(1),
+            memory: Some(memory),
+            ..Default::default()
+        };
+
+        caps.validate_request(
+            MODEL_ID,
+            &request(mlx_gen::gen_core::GenerationMemory {
+                graph_eval_cadence: Some(mlx_gen::gen_core::GraphEvalCadence::new(5).unwrap()),
+                ffn_chunk: Some(mlx_gen::gen_core::FfnChunk::new(8192).unwrap()),
+                ..Default::default()
+            }),
+        )
+        .expect("both declared domains must be admitted on the production floor");
+        caps.validate_request(
+            MODEL_ID,
+            &request(mlx_gen::gen_core::GenerationMemory::default()),
+        )
+        .expect("an unset execution selection must validate");
+
+        let error = caps
+            .validate_request(
+                MODEL_ID,
+                &request(mlx_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(mlx_gen::gen_core::CfgBatching::Batched),
+                    ..Default::default()
+                }),
+            )
+            .expect_err("SCAIL-2 must refuse a CFG batching selection");
+        assert!(matches!(error, mlx_gen::gen_core::Error::Unsupported(_)));
+        let message = error.to_string();
+        assert!(message.contains("cfg_batching"), "{message}");
+        assert!(message.contains("unset"), "{message}");
+    }
 
     #[test]
     fn declares_unconditional_staged_residency_without_a_selectable_control() {

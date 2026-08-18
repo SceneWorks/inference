@@ -64,6 +64,55 @@ pub const DECODE_OVERLAP: u32 = 256;
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1];
 
+/// Resolve the exact Mage route a memory declaration is being built for.
+///
+/// A declaration that cannot name its route is not a declaration: it would publish one of the six
+/// ladders under an id no loader serves. Every contract entry point resolves through here so the
+/// published surface and the loaded generator agree on which of the six checkpoints is in play.
+pub fn variant_for(provider_id: &str) -> CoreResult<MageVariant> {
+    MageVariant::from_id(provider_id)
+        .ok_or_else(|| CoreError::Unsupported(format!("unknown Mage-Flow provider {provider_id}")))
+}
+
+/// Authenticate every [`LoadSpec`] axis a Mage memory route is allowed to carry.
+///
+/// Mage has no control branch, no IP-Adapter, no PiD decoder, no InstantID identity stack and no
+/// externally supplied text encoder — [`load`] never reads those fields, so a spec that sets one is
+/// asking for a route this engine does not implement. Declaring the ladder anyway would publish a
+/// contract that admission could select and no load could honour, which is exactly the
+/// declaration-without-reachability defect this route family exists to close. Adapters stay
+/// allowed: they are forward-time residuals Mage genuinely installs, and the shared contract
+/// builder already sizes the adapter stack into the predicted peak.
+pub fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<MageVariant> {
+    let variant = variant_for(provider_id)?;
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: Mage-Flow memory routes require a snapshot directory, not a single file"
+        )));
+    }
+    if spec.precision != Precision::Bf16
+        || !matches!(spec.quantize, None | Some(Quant::Q4) | Some(Quant::Q8))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: Mage-Flow memory routes execute the bf16, Q4 and Q8 tiers only"
+        )));
+    }
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: Mage-Flow memory routes do not load control, IP-Adapter, PiD, identity \
+             or external text-encoder components"
+        )));
+    }
+    mlx_gen::gen_core::reject_unknown_components(spec, REQUIRED_COMPONENTS, FAMILY)?;
+    Ok(variant)
+}
+
 /// Build the eager Mage shared-memory contract. Every executable eager rung is declared here;
 /// snapshot-backed language-model and DiT block windows additionally require the deferred load
 /// shape exposed by [`memory_strategy_contract_for_spec`].
@@ -78,10 +127,16 @@ pub fn memory_strategy_contract(provider_id: &str, _tier: Option<Quant>) -> Memo
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
+///
+/// This is the legacy single-`LoadSpec` conformance probe. It derives streamability by probing the
+/// caller's (absent) snapshot, so it can only ever witness the dense shape;
+/// [`weights_free_memory_surface_contract`] is the authoritative finite surface for generated
+/// capability facts because it reads the selector's already-resolved artifact tier instead.
 pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     let streamable = streamable_spec(spec)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
@@ -89,6 +144,85 @@ pub(crate) fn weights_free_memory_strategy_contract(
         Default::default(),
         spec.load_shape,
         streamable,
+    ))
+}
+
+/// Whether the selector's already-resolved catalog artifact reaches Mage's rung-4 windows.
+///
+/// **The resolved tier is an output fact, not a load-time conversion request.** Every shipped Mage
+/// tier is prepacked under `<variant snapshot>/<tier>/`, so a Q4 or Q8 install reaches production
+/// with a matching component marker and [`crate::pipeline::load_time_quant_bits`] returns `None` —
+/// the same dense-equivalent shape the bf16 tier presents. Deriving streamability by probing the
+/// weights-free fixture path instead reports "needs load-time quantization" for Q4/Q8 and erases
+/// both shipped tiers from the published ladder, which is precisely how Mage came to look like it
+/// had no rung 4 at all.
+///
+/// **Mage never reads [`LoadSpec::offload_policy`]** — `assemble` builds a
+/// [`Residency::request_scoped`] pipeline and staging/streaming are selected per request by
+/// `GenerationRequest::memory`. Both offload policies therefore reach the same ladder, and
+/// restricting the declaration to `Sequential` would under-report a rung the Resident-policy route
+/// genuinely engages. The load shape is the real gate: only
+/// [`mlx_gen::LoadShape::DeferredMaterialization`] leaves the snapshot reopenable for bounded
+/// text/DiT residency.
+fn surface_streamable(surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec) -> bool {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    matches!(
+        surface.resolved_artifact_tier(),
+        MemoryContractSurfaceTier::Bf16
+            | MemoryContractSurfaceTier::Q4
+            | MemoryContractSurfaceTier::Q8
+    ) && surface.spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+        && surface.spec.adapters.is_empty()
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+}
+
+/// Reject a surface whose declared selector disagrees with the `LoadSpec` it ships.
+///
+/// The selector is what downstream capability facts record. If the two could drift, the published
+/// tier would be a label rather than a fact about the artifact the route resolves.
+fn surface_selector_matches_spec(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<()> {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    let tier_matches = match surface.resolved_artifact_tier() {
+        MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(CoreError::Unsupported(format!(
+            "Mage-Flow memory surface selector '{}' does not match its registry LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Resolve one finite registry surface from the selector's explicit artifact tier.
+///
+/// This is the authoritative declaration seam for all six Mage routes: it publishes the complete
+/// ladder, including rung 4, on exactly the selectors the engine reaches, without opening weights.
+pub fn weights_free_memory_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    surface_selector_matches_spec(surface)?;
+    validate_load_contract(provider_id, &surface.spec)?;
+    Ok(memory_strategy_contract_with_adapters(
+        provider_id,
+        &surface.spec.adapters,
+        Default::default(),
+        surface.spec.load_shape,
+        surface_streamable(surface),
     ))
 }
 
@@ -110,6 +244,19 @@ fn streamable_spec(spec: &LoadSpec) -> CoreResult<bool> {
         return Ok(false);
     };
     let dirs = resolve_component_dirs(root, spec)?;
+    streamable_resolved_components(spec, &dirs)
+}
+
+/// Whether the exact component directories selected by the loader can be reopened for bounded
+/// text/transformer residency.  Keeping this seam directory-based is load-bearing for imported
+/// fine-tunes: their `spec.weights` is already the transformer component directory, whereas the
+/// ordinary snapshot resolver would incorrectly append another `transformer/` child.
+fn streamable_resolved_components(spec: &LoadSpec, dirs: &MageComponentDirs) -> CoreResult<bool> {
+    if spec.load_shape != mlx_gen::LoadShape::DeferredMaterialization
+        || adapters_have_diff_patch(&spec.adapters)
+    {
+        return Ok(false);
+    }
     let bits = spec.quantize.map(Quant::bits);
     Ok(
         crate::pipeline::load_time_quant_bits(&dirs.text_encoder, bits, "mage_flow")?.is_none()
@@ -126,12 +273,27 @@ pub fn memory_strategy_contract_for_spec(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(
             "mage_flow memory facts require a snapshot directory".to_owned(),
         ));
     };
     let dirs = resolve_component_dirs(root, spec)?;
+    memory_strategy_contract_for_resolved_components(provider_id, spec, &dirs)
+}
+
+/// Build the load-exact contract from the same already-resolved directories the executable loader
+/// consumes.  This avoids reinterpreting an imported TransformerDirectory as a snapshot root.
+fn memory_strategy_contract_for_resolved_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+    dirs: &MageComponentDirs,
+) -> CoreResult<MemoryProviderContract> {
+    // `assemble` builds the loaded generator's contract here, so authenticating the spec on this
+    // path is what keeps a loaded Mage generator from exposing a ladder the declaration surface
+    // would refuse.
+    validate_load_contract(provider_id, spec)?;
     let project =
         |path: &Path, select: &dyn Fn(&str) -> bool, apply_floor: bool| -> CoreResult<u64> {
             projected_safetensors_bytes(path, |tensor| {
@@ -159,7 +321,7 @@ pub fn memory_strategy_contract_for_spec(
         dit: project(&dirs.transformer, &crate::convert::is_dit_target, true)?,
         vae: project(&dirs.vae, &|_| false, false)?,
     };
-    let streamable = streamable_spec(spec)?;
+    let streamable = streamable_resolved_components(spec, dirs)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
         &spec.adapters,
@@ -369,6 +531,15 @@ impl MageVariant {
         Self::EditBase,
         Self::EditTurbo,
     ];
+
+    /// Inverse of [`Self::id`]. Declaration surfaces are keyed by provider id, so every memory
+    /// route resolves its variant here rather than accepting an unrecognised id and publishing a
+    /// ladder nothing loads.
+    pub fn from_id(provider_id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|variant| variant.id() == provider_id)
+    }
 }
 
 /// Every registered Mage-Flow id, in registration order.
@@ -430,6 +601,8 @@ const EDIT_IDENTITY_SHA256: &str =
 /// the published configs.
 pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         // The text encoder (8.875 GB) and VAE (0.345 GB) are BIT-IDENTICAL across all six Mage
         // variants — only the 8.232 GB DiT differs — so the SceneWorks mirrors host them once in a
@@ -497,6 +670,14 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
             ))
         }
     };
+    // A full Base fine-tune is the transformer component directory itself, not a published
+    // diffusers snapshot root. The exact imported-source registry route targets `mage_flow_base`,
+    // so dispatch that structural shape to the fine-tuned loader before published-checkpoint
+    // identity validation. Published snapshots keep both files under `transformer/` and therefore
+    // cannot collide with this gate.
+    if variant == MageVariant::Base && is_finetuned_transformer_dir(root) {
+        return load_finetuned(variant, spec);
+    }
     match variant {
         MageVariant::Base => verify_checkpoint_identity(
             root,
@@ -549,6 +730,20 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
     assemble(variant, spec, dirs)
 }
 
+fn is_finetuned_transformer_dir(root: &std::path::Path) -> bool {
+    ["config.json", "diffusion_pytorch_model.safetensors"]
+        .into_iter()
+        .all(|name| {
+            // Rehosted/Hugging Face snapshots commonly expose blob-backed symlink entries. The
+            // worker has already confined the resolved transformer directory; follow each child to
+            // verify the loader-visible object is a regular file instead of rejecting valid cache
+            // layouts solely because their directory entry is a symlink.
+            std::fs::metadata(root.join(name))
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+}
+
 /// Construct a Mage-Flow generator from a caller-owned **fine-tuned transformer** (sc-15036,
 /// epic 14034 F6) — the artifact a full base fine-tune (sc-14056) writes.
 ///
@@ -572,9 +767,9 @@ pub fn load(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>>
 ///    sampling regime (steps / CFG / distillation) and the edit-vs-generate input assembly the
 ///    fine-tune inherits.
 ///
-/// Deliberately kept off the registry `load(id, spec)` path (like Krea's
-/// `load_from_native_dit_file`): a fine-tune is a caller-owned artifact at an arbitrary path, not
-/// a published id, so it is reached through this explicit API rather than by resolving an id.
+/// Also reached by the exact `TransformerDirectory` imported-source registration. Ordinary
+/// `mage_flow_base` snapshot loads remain unchanged because their config and weights live under
+/// `transformer/`, while this shape has both files at the supplied root.
 pub fn load_finetuned(variant: MageVariant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(
@@ -638,6 +833,10 @@ fn assemble(
     spec: &LoadSpec,
     dirs: MageComponentDirs,
 ) -> Result<Box<dyn Generator>> {
+    // Compute the contract from the exact component directories selected above.  In particular, a
+    // fine-tune's transformer is `spec.weights` itself, not `<spec.weights>/transformer`.
+    let memory_strategy_contract =
+        memory_strategy_contract_for_resolved_components(variant.id(), spec, &dirs)?;
     let part = if variant.is_edit() {
         crate::vae::VaePart::Both
     } else {
@@ -670,7 +869,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
-        memory_strategy_contract: memory_strategy_contract_for_spec(variant.id(), spec)?,
+        memory_strategy_contract,
         residency,
     }))
 }
@@ -902,7 +1101,7 @@ fn request_context_error(
             Some(mlx_gen::gen_core::MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier,
-                component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+                component_precision_floors: crate::quant::active_component_precision_floors(tier),
             }),
             Some(&route_gate),
         )
@@ -1356,7 +1555,9 @@ fn registered_valid_fixture(
         mlx_gen::gen_core::MemoryNumericTier {
             precision: spec.precision,
             quant: spec.quantize,
-            component_precision_floors: crate::quant::COMPONENT_PRECISION_FLOORS,
+            component_precision_floors: crate::quant::active_component_precision_floors(
+                spec.quantize,
+            ),
         },
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: if variant.is_edit() {
@@ -1449,6 +1650,33 @@ mage_memory_registration!(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn finetuned_shape_accepts_blob_backed_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("blobs");
+        let transformer = tmp.path().join("transformer");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(blobs.join("config"), b"{}").unwrap();
+        std::fs::write(blobs.join("weights"), b"safetensors").unwrap();
+        symlink(blobs.join("config"), transformer.join("config.json")).unwrap();
+        symlink(
+            blobs.join("weights"),
+            transformer.join("diffusion_pytorch_model.safetensors"),
+        )
+        .unwrap();
+
+        assert!(is_finetuned_transformer_dir(&transformer));
+        std::fs::remove_file(blobs.join("weights")).unwrap();
+        assert!(
+            !is_finetuned_transformer_dir(&transformer),
+            "a broken blob link must remain fail-closed"
+        );
+    }
+
     fn write_memory_safetensors(path: &Path, entries: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0usize;
         let mut header = serde_json::Map::new();
@@ -1482,6 +1710,42 @@ mod tests {
                 &[("probe", "BF16", &[1], 2)],
             );
         }
+    }
+
+    #[test]
+    fn finetuned_contract_projects_the_supplied_transformer_directory_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transformer = tmp.path().join("trained-transformer");
+        let text_encoder = tmp.path().join("shared-text-encoder");
+        let vae = tmp.path().join("shared-vae");
+        for dir in [&transformer, &text_encoder, &vae] {
+            std::fs::create_dir_all(dir).unwrap();
+            write_memory_safetensors(
+                &dir.join("diffusion_pytorch_model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        std::fs::write(transformer.join("config.json"), "{}").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(transformer.clone()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(text_encoder.clone()),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae.clone()));
+        let dirs = MageComponentDirs {
+            transformer: transformer.clone(),
+            text_encoder,
+            vae,
+        };
+
+        let contract =
+            memory_strategy_contract_for_resolved_components("mage_flow_base", &spec, &dirs)
+                .unwrap();
+
+        assert_eq!(contract.asset_facts.transformer_bytes, 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 2);
+        assert!(!transformer.join("transformer").exists());
     }
 
     #[test]
@@ -1814,6 +2078,7 @@ mod tests {
             * 1_000_000_000.0)
             .round() as u64;
         let valid = MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
@@ -1934,6 +2199,70 @@ mod tests {
     }
 
     #[test]
+    fn registered_receipts_bind_only_floors_active_for_the_loaded_tier() {
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/weights-free-mage".into()));
+            spec.quantize = quant;
+            let contract = weights_free_memory_strategy_contract("mage_flow", &spec).unwrap();
+            let context = registered_valid_fixture(
+                MageVariant::Rl,
+                &spec,
+                &contract,
+                MemoryStrategy::StagedResidency,
+            )
+            .unwrap()
+            .remove(0)
+            .context;
+            assert_eq!(
+                context.selection.tier.component_precision_floors,
+                crate::quant::active_component_precision_floors(quant),
+                "fixture receipt must be tier-exact for {quant:?}"
+            );
+            assert_eq!(
+                memory_strategy_safety_check_for(
+                    "mage_flow",
+                    MageVariant::Rl,
+                    quant,
+                    &contract,
+                    &context,
+                ),
+                MemorySafetyDecision::Accept
+            );
+
+            if quant != Some(Quant::Q4) {
+                let mut over_bound = context.clone();
+                over_bound.selection.tier.component_precision_floors =
+                    crate::quant::COMPONENT_PRECISION_FLOORS;
+                assert!(matches!(
+                    memory_strategy_safety_check_for(
+                        "mage_flow",
+                        MageVariant::Rl,
+                        quant,
+                        &contract,
+                        &over_bound,
+                    ),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            } else {
+                let mut under_bound = context.clone();
+                under_bound.selection.tier.component_precision_floors = &[];
+                assert!(matches!(
+                    memory_strategy_safety_check_for(
+                        "mage_flow",
+                        MageVariant::Rl,
+                        quant,
+                        &contract,
+                        &under_bound,
+                    ),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("does not match loaded tier")
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn resident_scope_reapplies_request_state_after_cancel_cleanup() {
         let selection = MemorySelection {
             strategy: MemoryStrategy::Resident,
@@ -1953,6 +2282,7 @@ mod tests {
         };
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let context = MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
@@ -2852,5 +3182,394 @@ mod tests {
         validate_generation_request(&descriptor, &batch).unwrap();
         batch.count += 1;
         assert!(validate_generation_request(&descriptor, &batch).is_err());
+    }
+
+    /// SC-18610: the published surface for **every** Mage route, on **every** shipped tier.
+    ///
+    /// Before this, the declaration derived streamability by probing the weights-free fixture path,
+    /// so Q4 and Q8 — the tiers a constrained Mac actually installs — published rung 4 as `Missing`
+    /// even though the engine implements it for them.
+    #[test]
+    fn every_mage_route_publishes_the_complete_ladder_on_every_shipped_tier() {
+        use mlx_gen::gen_core::{MemoryContractSurfaceTier, MemoryStrategySupport};
+        use std::collections::BTreeSet;
+
+        let expected_rung_four: BTreeSet<&str> = [
+            "bf16:resident:deferred",
+            "bf16:sequential:deferred",
+            "q4:resident:deferred",
+            "q4:sequential:deferred",
+            "q8:resident:deferred",
+            "q8:sequential:deferred",
+        ]
+        .into_iter()
+        .collect();
+
+        for variant in MageVariant::ALL {
+            let provider_id = variant.id();
+            let surfaces = mlx_gen::gen_core::mlx_memory_contract_surface_specs();
+            assert_eq!(surfaces.len(), 12, "{provider_id}");
+            let mut rung_four = BTreeSet::new();
+            for surface in &surfaces {
+                let contract = weights_free_memory_surface_contract(provider_id, surface)
+                    .unwrap_or_else(|error| {
+                        panic!("{provider_id} {}: {error}", surface.selector.id())
+                    });
+                assert_eq!(contract.provider_id, provider_id);
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{provider_id} {}",
+                    surface.selector.id()
+                );
+                assert_eq!(
+                    contract.asset_facts,
+                    Default::default(),
+                    "a weights-free surface must publish no measured bytes"
+                );
+                assert_eq!(contract.load_shape, surface.selector.load_shape);
+                for strategy in [
+                    MemoryStrategy::Resident,
+                    MemoryStrategy::StagedResidency,
+                    MemoryStrategy::BoundedDecode,
+                    MemoryStrategy::BoundedAttention,
+                ] {
+                    assert_eq!(
+                        contract.capability(strategy).unwrap().support,
+                        MemoryStrategySupport::Implemented,
+                        "{provider_id} {} {strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+                let rung4 = contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap();
+                if rung4.support == MemoryStrategySupport::Implemented {
+                    assert_eq!(rung4.parameters.transformer_window_sizes, [1]);
+                    assert_eq!(
+                        rung4.parameters.transformer_window_components,
+                        [mlx_gen::gen_core::TransformerComponent::Both]
+                    );
+                    assert!(contract.lifecycle.transformer_window_materialization);
+                    rung_four.insert(surface.selector.id());
+                } else {
+                    assert_eq!(rung4.support, MemoryStrategySupport::Missing);
+                    assert!(!contract.lifecycle.transformer_window_materialization);
+                }
+                // Every shipped MLX tier must be one of the three the engine executes; a fourth
+                // would silently ride the `matches!` arm in `surface_streamable`.
+                assert!(matches!(
+                    surface.resolved_artifact_tier(),
+                    MemoryContractSurfaceTier::Bf16
+                        | MemoryContractSurfaceTier::Q4
+                        | MemoryContractSurfaceTier::Q8
+                ));
+            }
+            assert_eq!(
+                rung_four.iter().copied().collect::<BTreeSet<_>>(),
+                expected_rung_four,
+                "{provider_id} must publish rung 4 on every shipped tier under both offload policies"
+            );
+        }
+    }
+
+    /// Mage never reads [`LoadSpec::offload_policy`]: staging and streaming are per-request flags on
+    /// a [`Residency::request_scoped`] pipeline. The declaration must track the load shape, which is
+    /// what actually decides whether the snapshot stays reopenable.
+    #[test]
+    fn surface_rung_four_tracks_load_shape_not_offload_policy() {
+        use mlx_gen::gen_core::MemoryStrategySupport;
+
+        let rung_four = |selector_id: &str| {
+            let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                .into_iter()
+                .find(|surface| surface.selector.id() == selector_id)
+                .unwrap();
+            weights_free_memory_surface_contract("mage_flow_edit", &surface)
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support
+                .clone()
+        };
+        // Offload policy alone never moves the rung.
+        assert_eq!(
+            rung_four("q4:resident:deferred"),
+            MemoryStrategySupport::Implemented
+        );
+        assert_eq!(
+            rung_four("q4:sequential:deferred"),
+            MemoryStrategySupport::Implemented
+        );
+        // Load shape alone always does.
+        assert_eq!(
+            rung_four("q4:resident:eager"),
+            MemoryStrategySupport::Missing
+        );
+        assert_eq!(
+            rung_four("q4:sequential:eager"),
+            MemoryStrategySupport::Missing
+        );
+    }
+
+    /// Each unsupported axis is mutated on its own: asserting the whole set at once would prove the
+    /// set is rejected without proving any individual guard fires.
+    #[test]
+    fn declaration_rejects_every_unsupported_route_and_load_axis_individually() {
+        let base = || {
+            LoadSpec::new(WeightsSource::Dir("/weights-free-mage".into()))
+                .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+        };
+        assert!(validate_load_contract("mage_flow", &base()).is_ok());
+        assert!(validate_load_contract("mage_flow_not_a_route", &base()).is_err());
+        assert!(validate_load_contract("flux1_dev", &base()).is_err());
+
+        let mut cases: Vec<LoadSpec> =
+            vec![
+                LoadSpec::new(WeightsSource::File("/weights.safetensors".into()))
+                    .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization),
+            ];
+        let mut fp32 = base();
+        fp32.precision = Precision::Fp32;
+        cases.push(fp32);
+        cases.push(base().with_quant(Quant::Nvfp4));
+        let mut control = base();
+        control.control = Some(WeightsSource::File("/control.safetensors".into()));
+        cases.push(control);
+        let mut extra_control = base();
+        extra_control
+            .extra_controls
+            .push(WeightsSource::File("/extra-control.safetensors".into()));
+        cases.push(extra_control);
+        let mut ip_adapter = base();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir("/ip".into()));
+        cases.push(ip_adapter);
+        cases.push(base().with_pid(
+            WeightsSource::File("/pid.safetensors".into()),
+            WeightsSource::Dir("/gemma".into()),
+        ));
+        let mut identity = base();
+        identity.identity = Some(Default::default());
+        cases.push(identity);
+        let mut text_encoder = base();
+        text_encoder.text_encoder = Some(WeightsSource::Dir("/external-text".into()));
+        cases.push(text_encoder);
+        let mut unknown_component = base();
+        unknown_component.components.insert(
+            "unexpected".to_owned(),
+            WeightsSource::Dir("/unexpected".into()),
+        );
+        cases.push(unknown_component);
+
+        for spec in cases {
+            assert!(
+                validate_load_contract("mage_flow", &spec).is_err(),
+                "unsupported axis must be refused by the declaration"
+            );
+            // The refusal is typed identically on the declaration, the finite surface, and the
+            // production seam, so no path can publish a ladder another path would reject.
+            assert!(weights_free_memory_strategy_contract("mage_flow", &spec).is_err());
+            assert!(memory_strategy_contract_for_spec("mage_flow", &spec).is_err());
+            let surface = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+                selector: mlx_gen::gen_core::MemoryContractSurfaceSelector {
+                    tier: mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                    offload_policy: spec.offload_policy,
+                    load_shape: spec.load_shape,
+                },
+                spec,
+            };
+            assert!(weights_free_memory_surface_contract("mage_flow", &surface).is_err());
+        }
+    }
+
+    /// A selector that disagrees with its own `LoadSpec` would publish the tier as a label rather
+    /// than a fact about the artifact the route resolves.
+    #[test]
+    fn surface_selector_must_agree_with_its_load_spec() {
+        use mlx_gen::gen_core::{MemoryContractSurfaceSpec, MemoryContractSurfaceTier};
+
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            let tier = surface.resolved_artifact_tier();
+            for crossed_tier in [
+                MemoryContractSurfaceTier::Bf16,
+                MemoryContractSurfaceTier::Q4,
+                MemoryContractSurfaceTier::Q8,
+                MemoryContractSurfaceTier::Nvfp4,
+            ] {
+                if crossed_tier == tier {
+                    continue;
+                }
+                let mut selector = surface.selector;
+                selector.tier = crossed_tier;
+                let crossed = MemoryContractSurfaceSpec {
+                    selector,
+                    spec: surface.spec.clone(),
+                };
+                assert!(
+                    weights_free_memory_surface_contract("mage_flow", &crossed).is_err(),
+                    "{tier:?} spec must not be published as {crossed_tier:?}"
+                );
+            }
+            let mut selector = surface.selector;
+            selector.offload_policy = match selector.offload_policy {
+                mlx_gen::OffloadPolicy::Resident => mlx_gen::OffloadPolicy::Sequential,
+                mlx_gen::OffloadPolicy::Sequential => mlx_gen::OffloadPolicy::Resident,
+            };
+            assert!(weights_free_memory_surface_contract(
+                "mage_flow",
+                &MemoryContractSurfaceSpec {
+                    selector,
+                    spec: surface.spec.clone(),
+                }
+            )
+            .is_err());
+            let mut selector = surface.selector;
+            selector.load_shape = match selector.load_shape {
+                mlx_gen::LoadShape::EagerMaterialization => {
+                    mlx_gen::LoadShape::DeferredMaterialization
+                }
+                mlx_gen::LoadShape::DeferredMaterialization => {
+                    mlx_gen::LoadShape::EagerMaterialization
+                }
+            };
+            assert!(weights_free_memory_surface_contract(
+                "mage_flow",
+                &MemoryContractSurfaceSpec {
+                    selector,
+                    spec: surface.spec,
+                }
+            )
+            .is_err());
+        }
+    }
+
+    /// Declaration is not reachability. This drives the exact seam `assemble` uses to build a
+    /// loaded generator's contract — for **all six** routes, over a prepacked Q4 snapshot shaped
+    /// like the shipped `<variant>/<tier>/` install — and proves the loaded contract carries the
+    /// same rung 4 the finite surface publishes, then executes the admitted selection into the
+    /// tensor-neutral request controls the pipeline actually reads.
+    #[test]
+    fn every_loaded_mage_route_reaches_the_declared_rung_four() {
+        use mlx_gen::gen_core::{MemoryNumericTier, MemoryStrategySupport};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_memory_snapshot(&root);
+        // Prepacked Q4 markers on the weight-bearing components: the shipped tier shape, in which
+        // `load_time_quant_bits` is `None` and the snapshot stays reopenable.
+        for component in ["text_encoder", "transformer"] {
+            std::fs::write(
+                root.join(component).join("config.json"),
+                r#"{"quantization":{"bits":4,"group_size":64}}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("vae").join("config.json"), "{}").unwrap();
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_quant(Quant::Q4)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        let dirs = resolve_component_dirs(&root, &spec).unwrap();
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: crate::quant::active_component_precision_floors(Some(
+                Quant::Q4,
+            )),
+        };
+
+        for variant in MageVariant::ALL {
+            let provider_id = variant.id();
+            let loaded =
+                memory_strategy_contract_for_resolved_components(provider_id, &spec, &dirs)
+                    .unwrap();
+            assert_eq!(loaded.provider_id, provider_id);
+            assert_eq!(
+                loaded
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Implemented,
+                "{provider_id} must reach the rung its surface declares"
+            );
+            // The declared surface and the loaded contract agree rung for rung.
+            let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                .into_iter()
+                .find(|surface| surface.selector.id() == "q4:sequential:deferred")
+                .unwrap();
+            let declared = weights_free_memory_surface_contract(provider_id, &surface).unwrap();
+            for strategy in [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ] {
+                assert_eq!(
+                    declared.capability(strategy).unwrap().support,
+                    loaded.capability(strategy).unwrap().support,
+                    "{provider_id} {strategy:?} declaration and loaded contract disagree"
+                );
+            }
+
+            // Executable: the route's own registered behavior opens a scope for the rung and
+            // resolves it into the request controls Mage's generate path reads.
+            let mut fixture = registered_valid_fixture(
+                variant,
+                &spec,
+                &loaded,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                fixture.context.mode,
+                if variant.is_edit() {
+                    MemoryMode::Edit
+                } else {
+                    MemoryMode::TextToImage
+                },
+                "{provider_id}"
+            );
+            assert_eq!(
+                fixture.context.geometry.reference_count,
+                u32::from(variant.is_edit()),
+                "{provider_id}"
+            );
+            assert!(loaded
+                .representative_selection(MemoryStrategy::BoundedTransformerResidency, tier, false)
+                .is_ok());
+            let mut scope =
+                registered_begin_request(provider_id, variant, &spec, &loaded, &fixture.context)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{provider_id} must open a rung-4 request scope"));
+            scope.configure_request(&mut fixture.request).unwrap();
+            let memory = fixture.request.memory.unwrap_or_else(|| {
+                panic!("{provider_id} rung-4 scope must configure request memory")
+            });
+            assert!(memory.stream_transformer_blocks, "{provider_id}");
+            assert!(memory.stage_residency, "{provider_id}");
+            assert!(memory.tile_vae_decode, "{provider_id}");
+            assert!(memory.chunk_attention, "{provider_id}");
+            assert_eq!(memory.transformer_window_size, Some(1), "{provider_id}");
+
+            // A sibling route's context must not authorize this one: the mode gate separates the
+            // edit trio from the generate trio.
+            let mut crossed = fixture.context.clone();
+            crossed.mode = if variant.is_edit() {
+                MemoryMode::TextToImage
+            } else {
+                MemoryMode::Edit
+            };
+            assert!(matches!(
+                memory_strategy_safety_check_for(
+                    provider_id,
+                    variant,
+                    Some(Quant::Q4),
+                    &loaded,
+                    &crossed
+                ),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
     }
 }

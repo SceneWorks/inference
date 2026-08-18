@@ -16,8 +16,12 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
-use mlx_gen::nn::{apply_text_rope, gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter, LinearFacts};
+use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
+use mlx_gen::qkv::{
+    self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvPart, QkvSource, RopeSpec, RopeStyle,
+    RopeTables,
+};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -136,13 +140,107 @@ impl AdaLayerNorm {
     }
 }
 
+/// **How one attention's q/k/v are represented** — the structural self-vs-cross split SC-18319 P4
+/// needs, chosen once at construction.
+///
+/// [`FusedQkvProjection`] computes all three projections from **one** activation. That is exactly
+/// right for a self-attention and catastrophic for a cross-attention, where `q` reads the query
+/// stream and `k`/`v` read the encoder stream: packing a cross triple would compute the keys and
+/// values from the query stream, producing a running model with garbage cross-attention and no
+/// error anywhere.
+///
+/// The pack predicate cannot catch that. `try_pack` compares `in_features`, never provenance, and
+/// the conditioner's `cross_attn` has `source_dim == model_dim == 1024`, so all three widths match,
+/// every part shares `bits`/`group_size`, and 1024 = 64 · 16 is group-aligned on both axes. (The
+/// DiT's `cross_attn` happens to be saved by `InputWidthMismatch` — q reads 2048, k/v read 1024 —
+/// but that is an accident of Anima's geometry, not a guard.) So the refusal is encoded here, in
+/// the type: a cross-attention has no fused representation to reach for.
+#[derive(Clone)]
+pub(crate) enum Qkv {
+    /// Self-attention — all three read one activation, so they are packed.
+    SelfFused(FusedQkvProjection),
+    /// Cross-attention — `q` reads the query stream, `k`/`v` the encoder stream. Never packed.
+    Cross {
+        q: AdaptableLinear,
+        k: AdaptableLinear,
+        v: AdaptableLinear,
+    },
+}
+
+/// The projected q/k/v, owned so [`Projected::source`] can hand out a borrowing
+/// [`QkvSource`].
+pub(crate) enum Projected {
+    Packed(Array),
+    Separate(Array, Array, Array),
+}
+
+impl Projected {
+    pub(crate) fn source(&self) -> QkvSource<'_> {
+        match self {
+            Projected::Packed(p) => QkvSource::Packed(p),
+            Projected::Separate(q, k, v) => QkvSource::Separate { q, k, v },
+        }
+    }
+}
+
+impl Qkv {
+    pub(crate) fn self_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
+        Qkv::SelfFused(FusedQkvProjection::new(q, k, v))
+    }
+
+    pub(crate) fn cross_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
+        Qkv::Cross { q, k, v }
+    }
+
+    /// `true` for a self-attention, i.e. the representation that assumes ONE input stream. The
+    /// forwards assert this against the presence of an `encoder` argument, so a mis-constructed
+    /// attention fails loudly rather than silently reading k/v off the query stream.
+    pub(crate) fn is_self(&self) -> bool {
+        matches!(self, Qkv::SelfFused(_))
+    }
+
+    /// One matmul on the fused arm, three on the cross arm.
+    pub(crate) fn project(&self, q_src: &Array, kv_src: &Array) -> Result<Projected> {
+        match self {
+            Qkv::SelfFused(p) => Ok(Projected::Packed(p.forward_packed(q_src)?)),
+            Qkv::Cross { q, k, v } => Ok(Projected::Separate(
+                q.forward(q_src)?,
+                k.forward(kv_src)?,
+                v.forward(kv_src)?,
+            )),
+        }
+    }
+
+    /// The MUTATION half of a host's q/k/v routing — unfuses first on the fused arm.
+    pub(crate) fn part_mut(&mut self, part: QkvPart) -> Option<&mut AdaptableLinear> {
+        match self {
+            Qkv::SelfFused(p) => p.part_mut(part).ok(),
+            Qkv::Cross { q, k, v } => Some(match part {
+                QkvPart::Q => q,
+                QkvPart::K => k,
+                QkvPart::V => v,
+            }),
+        }
+    }
+
+    /// The PROBE half — facts without unfusing.
+    pub(crate) fn part_facts(&self, part: QkvPart) -> LinearFacts {
+        match self {
+            Qkv::SelfFused(p) => p.part_facts(part),
+            Qkv::Cross { q, k, v } => LinearFacts::of(match part {
+                QkvPart::Q => q,
+                QkvPart::K => k,
+                QkvPart::V => v,
+            }),
+        }
+    }
+}
+
 /// `CosmosAttention` — self (attn1: q/k/v from hidden, RoPE) or cross (attn2: q from hidden, k/v from
 /// text, no RoPE). Per-head q/k RMSNorm; heads == kv_heads (no GQA repeat for Anima).
 #[derive(Clone)]
 struct Attention {
-    to_q: AdaptableLinear,
-    to_k: AdaptableLinear,
-    to_v: AdaptableLinear,
+    qkv: Qkv,
     to_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
@@ -161,12 +259,27 @@ struct Attention {
 }
 
 impl Attention {
-    fn from_weights(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
+    /// `self_attention` selects the q/k/v representation (SC-18319 P4) — see [`Qkv`]. It is a
+    /// construction-time fact, not a per-call one: `attn1` always reads one stream, `attn2` always
+    /// reads two.
+    fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &DitConfig,
+        self_attention: bool,
+    ) -> Result<Self> {
         let hd = cfg.attention_head_dim as i32;
+        let (q, k, v) = (
+            lin(w, &join(prefix, "q_proj"))?,
+            lin(w, &join(prefix, "k_proj"))?,
+            lin(w, &join(prefix, "v_proj"))?,
+        );
         Ok(Self {
-            to_q: lin(w, &join(prefix, "q_proj"))?,
-            to_k: lin(w, &join(prefix, "k_proj"))?,
-            to_v: lin(w, &join(prefix, "v_proj"))?,
+            qkv: if self_attention {
+                Qkv::self_attn(q, k, v)
+            } else {
+                Qkv::cross_attn(q, k, v)
+            },
             to_out: lin(w, &join(prefix, "output_proj"))?,
             norm_q: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             norm_k: w.require(&join(prefix, "k_norm.weight"))?.clone(),
@@ -198,40 +311,43 @@ impl Attention {
         rope: Option<(&Array, &Array)>,
         plan: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let hsh = hidden.shape();
-        let (b, sq) = (hsh[0], hsh[1]);
         let kv_src = encoder.unwrap_or(hidden);
-        let sk = kv_src.shape()[1];
+        // SC-18319 P4 — the fused representation projects from ONE stream, so a self-attention that
+        // was handed an encoder would silently read k/v off the query stream. Refuse loudly.
+        if self.qkv.is_self() && encoder.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "anima: a self-attention (fused q/k/v) was given a cross-attention encoder stream"
+                    .into(),
+            ));
+        }
 
-        let q = self
-            .to_q
-            .forward(hidden)?
-            .reshape(&[b, sq, self.heads, self.head_dim])?;
-        let k = self
-            .to_k
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-        let v = self
-            .to_v
-            .forward(kv_src)?
-            .reshape(&[b, sk, self.heads, self.head_dim])?;
-
-        // per-head q/k RMSNorm (over the head_dim).
-        let q = rms_norm(&q, &self.norm_q, ATTN_QK_NORM_EPS)?;
-        let k = rms_norm(&k, &self.norm_k, ATTN_QK_NORM_EPS)?;
-
-        let (q, k) = match rope {
-            Some((cos, sin)) => (
-                apply_text_rope(&q, cos, sin)?,
-                apply_text_rope(&k, cos, sin)?,
-            ),
-            None => (q, k),
-        };
-
-        // [b,s,h,hd] -> [b,h,s,hd]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        // SC-18319 — the shared prologue. The DiT attention is **knob 3's reference case**: the
+        // SAME code path runs self-attention with RoPE and cross-attention with none, so "RoPE
+        // optional" is a per-call knob rather than a per-family one. `RopeStyle::None` skips the
+        // rotation outright (it is not an identity table, which would still cost two multiplies and
+        // an add over the whole q/k stream in all 28 blocks). The rest: separate q/k/v (knob 9),
+        // per-head RMSNorm over `head_dim` after the head split (knob 1), half-split `rotate_half`
+        // rotation over full-width `[1, S, head_dim]` tables (knob 2 — `nn::apply_text_rope`
+        // verbatim), token-major axes, one shared q/k table (knob 6 off — the conditioner is where
+        // the tables differ).
+        let spec = AttnPrepSpec::new(self.heads, self.head_dim)
+            .with_qk_norm(QkNormSpec::per_head(
+                &self.norm_q,
+                &self.norm_k,
+                ATTN_QK_NORM_EPS,
+            ))
+            .with_rope(match rope {
+                Some((cos, sin)) => RopeSpec {
+                    style: RopeStyle::RotateHalf,
+                    q: Some(RopeTables::new(cos, sin)),
+                    k: Some(RopeTables::new(cos, sin)),
+                    ..RopeSpec::default()
+                },
+                None => RopeSpec::default(),
+            });
+        let projected = self.qkv.project(hidden, kv_src)?;
+        let heads = qkv::prepare(projected.source(), &spec)?;
+        let (q, k, v) = (heads.q, heads.k, heads.v);
         let o = if self.ckpt_sdpa {
             // sc-10576: checkpoint just the SDPA. q/k/v are the threaded inputs (grads to the QKV
             // projections — and their LoRA — flow back through them); only the f32 scale is captured.
@@ -249,10 +365,7 @@ impl Attention {
         } else {
             mlx_gen::attention::sdpa_budgeted_bhsd(&q, &k, &v, self.scale, None, plan)?
         };
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, sq, self.heads * self.head_dim])?;
-        self.to_out.forward(&o)
+        self.to_out.forward(&qkv::merge_heads(&o)?)
     }
 }
 
@@ -296,9 +409,9 @@ impl Block {
     pub(crate) fn from_weights(w: &Weights, prefix: &str, cfg: &DitConfig) -> Result<Self> {
         Ok(Self {
             norm1: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_self_attn"))?,
-            attn1: Attention::from_weights(w, &join(prefix, "self_attn"), cfg)?,
+            attn1: Attention::from_weights(w, &join(prefix, "self_attn"), cfg, true)?,
             norm2: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_cross_attn"))?,
-            attn2: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg)?,
+            attn2: Attention::from_weights(w, &join(prefix, "cross_attn"), cfg, false)?,
             norm3: AdaLayerNormZero::from_weights(w, &join(prefix, "adaln_modulation_mlp"))?,
             ff: FeedForward::from_weights(w, &join(prefix, "mlp"))?,
         })
@@ -903,11 +1016,24 @@ impl CosmosDiT {
 impl AdaptableHost for Attention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["q_proj"] => Some(&mut self.to_q),
-            ["k_proj"] => Some(&mut self.to_k),
-            ["v_proj"] => Some(&mut self.to_v),
+            ["q_proj"] => self.qkv.part_mut(QkvPart::Q),
+            ["k_proj"] => self.qkv.part_mut(QkvPart::K),
+            ["v_proj"] => self.qkv.part_mut(QkvPart::V),
             ["output_proj"] => Some(&mut self.to_out),
             _ => None,
+        }
+    }
+
+    /// The PROBE half (SC-18319) — q/k/v answer from [`Qkv::part_facts`], which reads the packed
+    /// representation instead of dismantling it. `block_stream.rs`'s adapter capture walks EVERY
+    /// path on EVERY resident block, so without this a load-time capture would unfuse the whole
+    /// stack.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["q_proj"] => Some(self.qkv.part_facts(QkvPart::Q)),
+            ["k_proj"] => Some(self.qkv.part_facts(QkvPart::K)),
+            ["v_proj"] => Some(self.qkv.part_facts(QkvPart::V)),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 
@@ -1045,10 +1171,12 @@ mod structural {
         pub(crate) fn structural(cfg: DitConfig) -> Self {
             let heads = cfg.num_attention_heads as i32;
             let head_dim = cfg.attention_head_dim as i32;
-            let attn = || Attention {
-                to_q: ph_lin(),
-                to_k: ph_lin(),
-                to_v: ph_lin(),
+            let attn = |self_attention: bool| Attention {
+                qkv: if self_attention {
+                    Qkv::self_attn(ph_lin(), ph_lin(), ph_lin())
+                } else {
+                    Qkv::cross_attn(ph_lin(), ph_lin(), ph_lin())
+                },
                 to_out: ph_lin(),
                 norm_q: ph_norm(),
                 norm_k: ph_norm(),
@@ -1064,9 +1192,9 @@ mod structural {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm1: adaln0(),
-                    attn1: attn(),
+                    attn1: attn(true),
                     norm2: adaln0(),
-                    attn2: attn(),
+                    attn2: attn(false),
                     norm3: adaln0(),
                     ff: FeedForward {
                         proj_in: ph_lin(),
@@ -1128,12 +1256,26 @@ pub(crate) mod synthetic {
             Array::ones::<f32>(&[d]).unwrap()
         }
 
-        fn attn(&mut self, heads: i32, head_dim: i32, q_in: i32, kv_in: i32) -> Attention {
+        fn attn(
+            &mut self,
+            heads: i32,
+            head_dim: i32,
+            q_in: i32,
+            kv_in: i32,
+            self_attention: bool,
+        ) -> Attention {
             let inner = heads * head_dim;
+            let (q, k, v) = (
+                self.lin(inner, q_in),
+                self.lin(inner, kv_in),
+                self.lin(inner, kv_in),
+            );
             Attention {
-                to_q: self.lin(inner, q_in),
-                to_k: self.lin(inner, kv_in),
-                to_v: self.lin(inner, kv_in),
+                qkv: if self_attention {
+                    Qkv::self_attn(q, k, v)
+                } else {
+                    Qkv::cross_attn(q, k, v)
+                },
                 to_out: self.lin(q_in, inner),
                 norm_q: self.norm(head_dim),
                 norm_k: self.norm(head_dim),
@@ -1171,9 +1313,10 @@ pub(crate) mod synthetic {
             let blocks = (0..cfg.num_layers)
                 .map(|_| Block {
                     norm1: r.adaln0(h, adaln),
-                    attn1: r.attn(heads, head_dim, h, h), // self-attn: kv from hidden
+                    attn1: r.attn(heads, head_dim, h, h, true), // self-attn: kv from hidden
                     norm2: r.adaln0(h, adaln),
-                    attn2: r.attn(heads, head_dim, h, text), // cross-attn: kv from encoder (text_dim)
+                    // cross-attn: kv from encoder (text_dim)
+                    attn2: r.attn(heads, head_dim, h, text, false),
                     norm3: r.adaln0(h, adaln),
                     ff: FeedForward {
                         proj_in: r.lin(ff, h),

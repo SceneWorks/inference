@@ -878,6 +878,7 @@ fn the_control_routes_preview_their_target_latent() {
             eprintln!("── {label}: {}² × {steps} steps", pose.width);
             let paths = ZImageControlPaths {
                 snapshot: required_path(snapshot_var),
+                text_encoder: None,
                 control: required_path(net_var),
                 adapters: Vec::new(),
                 base,
@@ -984,6 +985,7 @@ fn the_edit_route_previews_its_reduced_schedule() {
 
     let paths = ZImageEditPaths {
         base: required_path("ZIMAGE_TURBO_SNAPSHOT"),
+        text_encoder: None,
     };
     let model = ZImageEdit::load(&paths).unwrap_or_else(|e| panic!("load z-image edit: {e}"));
 

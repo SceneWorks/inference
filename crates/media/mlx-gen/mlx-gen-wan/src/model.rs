@@ -4,7 +4,7 @@
 //! channel-concat image conditioning, in_dim 36 — sc-2681), plus their registry self-registration.
 //!
 //! The 5B [`Wan`] struct runs the complete dense pipeline (sc-2680) — [`Wan::generate`]: UMT5-XXL
-//! encode → the dense [`denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
+//! encode → the dense [`crate::pipeline::denoise`] (T2V) or the [`denoise_ti2v`] per-token mask-blend (TI2V, single- or
 //! multi-keyframe) → z48 VAE decode → RGB8 frames, with Q4/Q8 + LoRA. The shared [`Wan14b`] struct
 //! serves both A14B variants — [`Wan14b::generate`] runs the
 //! complete pipeline: UMT5-XXL encode → (I2V only) build the channel-concat conditioning `y` →
@@ -16,7 +16,9 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::{adapter_stack_resident_bytes, AdapterResidencyMode};
+use mlx_gen::gen_core::{
+    adapter_stack_resident_bytes, AdapterResidencyMode, ApproximationPlan, ApproximationSurface,
+};
 use mlx_gen::tiling::VaeTiling;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -32,16 +34,18 @@ use crate::adapters::{
     WanLoraReport,
 };
 use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
+use crate::feature_cache::TrunkCache;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
-    build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22, denoise,
+    build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx,
     denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range,
     denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
-    preprocess_ti2v_image, reject_off_grid, reject_over_area, resolve_sampler_knobs, seq_len,
-    staged_expert_swap, ti2v_blend_init, Expert,
+    preprocess_ti2v_image, refuse_unwired_approximation, reject_off_grid, reject_over_area,
+    resolve_sampler_knobs, seq_len, staged_expert_swap, ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
+use crate::token_pruning::TokenPruner;
 use crate::transformer::WanTransformer;
 
 /// Concrete z48 VAE assigned to the TI2V-5B route.
@@ -90,6 +94,22 @@ const WAN_NATIVE_SAMPLERS: [&str; 3] = ["uni_pc", "euler", "dpmpp_2m"];
 /// manifest surfaces only the curated names.
 const WAN_LEGACY_SAMPLERS: [&str; 2] = ["unipc", "dpmpp2m"];
 
+/// The dense-5B decode plan. A benchmark scope's fixed-tile control still wins outright — it exists to
+/// hold tiles constant across a measurement campaign — and otherwise this defers to the carrier-aware
+/// planner, which honors a worker-selected bounded-decode rung and falls back to
+/// `auto_tiling_budgeted` when the request carries no memory strategy.
+fn dense_decode_tiling(
+    request: &GenerationRequest,
+    width: u32,
+    height: u32,
+    out_frames: u32,
+) -> Result<Option<mlx_gen::TilingConfig>> {
+    match mlx_gen::diagnostics::benchmark_decode_control() {
+        Some(control) => Ok(Some(control.tiling_config())),
+        None => crate::memory_strategy::decode_tiling(request, width, height, out_frames),
+    }
+}
+
 /// Wan's full per-generation sampler menu: native solvers (curated vocabulary) + the curated gen-core
 /// fold-ins + the legacy aliases.
 fn wan_samplers() -> Vec<&'static str> {
@@ -119,6 +139,8 @@ pub const MODEL_ID: &str = "wan2_2_ti2v_5b";
 /// Stable identity + advertised capabilities for the Wan2.2 TI2V-5B (dense text+image→video).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -179,8 +201,120 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            // The sc-18322 denoise feature cache, declared on the dense 5B alone: it is the one Wan
+            // provider with a single transformer for the whole trajectory (no MoE expert swap to
+            // invalidate a retained residual across) and a native one-forward-per-step loop with a step
+            // index. Implemented in `crate::feature_cache`, wired into `pipeline::denoise_approx`.
+            //
+            // Declared is NOT selectable. No characterization artifact family exists yet, so the shared
+            // floor refuses every selection against this surface — see `gen_core::approximation`. The
+            // declaration is what makes the mechanism discoverable and what the terminal measurement
+            // campaign narrows from these candidate intervals to the ones it can vouch for.
+            approximation: approximation_surface(),
         },
     }
+}
+
+/// The dense 5B's declared approximate-capability surface (sc-18322).
+///
+/// The candidate intervals are the mechanism's implemented operating points, not measured ones — the
+/// domain shape carries no measurement claim, and the characterization binding (absent, and
+/// unconstructible) is what refuses selection until one exists. Warmup is capped at 8 steps because the
+/// native Wan trajectories run 20-50 steps and a warmup past a third of them leaves nothing to reuse.
+pub(crate) fn approximation_surface() -> ApproximationSurface {
+    ApproximationSurface::feature_cache(vec![2, 3, 4], 8).with_token_pruning(vec![2, 3, 4], 8)
+}
+
+/// The denoise feature cache a resolved plan asks for — the provider-side bridge from contract to
+/// mechanism (sc-18322).
+///
+/// Deliberately two definitions rather than one with an inner `cfg`, so the production answer is
+/// visibly and unconditionally `None`: [`TrunkCache`]'s only constructor is `#[cfg(test)]`, so a
+/// production build cannot reach the uncharacterized path even if it somehow held a
+/// [`ApproximationPlan::Approximate`]. That is the second of two independent locks — the first is the
+/// contract refusing every approximate selection for want of a characterization artifact.
+/// Both bridges first run [`refuse_inert_over_trajectory`], because the step count is only known here.
+#[cfg(not(test))]
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn trunk_cache(id: &str, plan: &ApproximationPlan, steps: usize) -> Result<Option<TrunkCache>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(TrunkCache::from_plan_for_test(plan))
+}
+
+/// The token pruner a resolved plan asks for — the second provider-side bridge, locked exactly like
+/// [`trunk_cache`] (sc-18322). `total` is the generate's patchified token count, which the rotation
+/// phases are built over.
+#[cfg(not(test))]
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    _total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+fn token_pruner(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+    total: usize,
+) -> Result<Option<TokenPruner>> {
+    refuse_inert_over_trajectory(id, plan, steps)?;
+    TokenPruner::from_plan_for_test(plan, total)
+}
+
+/// Refuse an approximate policy that would engage on **no step** of this request's trajectory
+/// (sc-18322).
+///
+/// The last way to encode *off* inside an `Approximate` plan. A warmup is gated against the declared
+/// `max_warmup_steps` without knowing the step count — a request may leave `steps` to the model's default
+/// — so a policy well inside its declared domain can still cover the whole trajectory and produce a
+/// result bit-identical to the exact path. That is exactly the second-encoding-of-off defect that
+/// rejecting a reuse interval of `1` exists to prevent, and letting it through here would make the
+/// contract's own "an approximate plan changed the output" claim false.
+///
+/// This is the one place the step count and the policy are both in hand, so it is the one place the
+/// refusal can be made. Unreachable today (no plan reaching a provider can be anything but `Exact`), and
+/// it fails closed the day selection becomes possible.
+pub(crate) fn refuse_inert_over_trajectory(
+    id: &str,
+    plan: &ApproximationPlan,
+    steps: usize,
+) -> Result<()> {
+    if let Some(policy) = plan.feature_cache() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected denoise feature cache (interval {} steps, warmup {}) reuses \
+                 nothing over this request's {steps} steps, so it would produce the exact result \
+                 through the approximate path. Lower the warmup, raise the step count, or leave \
+                 approximation unset.",
+                policy.reuse_interval.steps(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    if let Some(policy) = plan.token_pruning() {
+        if policy.is_inert_over(steps) {
+            return Err(Error::Unsupported(format!(
+                "{id}: the selected token pruning (drop stride {}, warmup {}) prunes nothing over \
+                 this request's {steps} steps, so it would produce the exact result through the \
+                 approximate path. Lower the warmup, raise the step count, or leave approximation \
+                 unset.",
+                policy.drop_stride.stride(),
+                policy.warmup.steps()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The projection width the UMT5 text encoder packs to on a quantized tier: **Q8** (sc-12831). Q8 is
@@ -489,7 +623,7 @@ impl Wan {
     /// then **stages** the phases to bound memory: (1) UMT5 encode the prompt (+ neg, unless CFG is
     /// off); (1b, TI2V) load the z48 vae22, encode the conditioning image → `z_img`, build the
     /// first-frame mask + per-token mask, blend the noise init; (2) load the 5B DiT (merge adapters,
-    /// quantize), embed the contexts, run the dense [`denoise`] (T2V) or [`denoise_ti2v`] mask-blend
+    /// quantize), embed the contexts, run the dense [`crate::pipeline::denoise`] (T2V) or [`denoise_ti2v`] mask-blend
     /// loop; (3) load the vae22 decoder → RGB8 frames. CFG runs with the single guidance scale.
     fn generate_impl(
         &self,
@@ -499,6 +633,18 @@ impl Wan {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        // The resolved approximate-capability plan (sc-18322). `validate` already ran the same
+        // resolution at the shared floor, so this cannot fail here; resolving again is how the route
+        // dispatch below gets a plan without re-reading the request and re-deriving a policy.
+        //
+        // Always `Exact` today — the contract refuses every approximate selection until a
+        // quality-characterization artifact family exists — but the three unwired routes refuse a
+        // non-exact plan **by name** rather than by omission, so the day selection becomes possible they
+        // fail closed instead of silently running the exact denoise.
+        let approximation = self
+            .descriptor
+            .capabilities
+            .approximation_plan(self.descriptor.id, req)?;
         let cfg = &self.config;
         // Sequential offload (epic 12732, sc-12796): the dense render is already staged (TE → DiT → z48
         // VAE, each loaded → used → dropped in turn), so there is no expert swap. Under `Sequential`,
@@ -564,12 +710,8 @@ impl Wan {
         let out_frames = 1 + (lat[1] - 1) * Ti2vProviderVae::VAE_TILING.temporal_scale;
         let out_height = lat[2] * Ti2vProviderVae::VAE_TILING.spatial_scale;
         let out_width = lat[3] * Ti2vProviderVae::VAE_TILING.spatial_scale;
-        let decode_tiling = crate::memory_strategy::decode_tiling(
-            req,
-            out_width as u32,
-            out_height as u32,
-            out_frames as u32,
-        )?;
+        let decode_tiling =
+            dense_decode_tiling(req, out_width as u32, out_height as u32, out_frames as u32)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         let (context, context_null) = encode_text_staged_for_tier(
@@ -688,6 +830,12 @@ impl Wan {
                 None => None,
             };
             let total = steps as u32;
+            // Provider-neutral benchmark boundary: model construction, adapter/quant work, and
+            // context embedding above are pre-denoise preparation. Emit only when the solver is
+            // ready to consume its first latent, matching Qwen and SDXL.
+            mlx_gen::diagnostics::record_phase_boundary(
+                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
+            );
             // Curated unified solver (epic 7114, sc-7121): the gen-core-only solvers route through the
             // shared `denoise_curated`; the native unipc/euler/dpmpp2m stay on `scheduler.rs` (N1). The
             // image-conditioned TI2V mask-blend (per-token timesteps + a post-step re-blend) has no
@@ -703,6 +851,13 @@ impl Wan {
                     ));
                 }
                 (Some((z_img, mask, mask_tokens)), false) => {
+                    // Unwired for the denoise feature cache: the mask-blend re-mixes the conditioning
+                    // latent into the trajectory after every step (sc-18322).
+                    refuse_unwired_approximation(
+                        self.descriptor.id,
+                        "TI2V mask-blend",
+                        &approximation,
+                    )?;
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
                             current: i as u32,
@@ -726,20 +881,29 @@ impl Wan {
                         &mut on_step,
                     )?
                 }
-                (None, true) => denoise_curated(
-                    &dit,
-                    req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
-                    cfg.num_train_timesteps,
-                    steps,
-                    shift,
-                    guidance,
-                    &ctx_cond,
-                    ctx_uncond.as_ref(),
-                    &latents_init,
-                    seed,
-                    &req.cancel,
-                    on_progress,
-                )?,
+                (None, true) => {
+                    // Unwired: a curated solver evaluates the model 1..N times per solver step, so
+                    // "the previous step's residual" has no single meaning (sc-18322).
+                    refuse_unwired_approximation(
+                        self.descriptor.id,
+                        "curated unified solver",
+                        &approximation,
+                    )?;
+                    denoise_curated(
+                        &dit,
+                        req.sampler.as_deref().expect("is_wan_curated ⇒ Some"),
+                        cfg.num_train_timesteps,
+                        steps,
+                        shift,
+                        guidance,
+                        &ctx_cond,
+                        ctx_uncond.as_ref(),
+                        &latents_init,
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                    )?
+                }
                 (None, false) => {
                     let mut on_step = |i: usize| {
                         on_progress(Progress::Step {
@@ -747,7 +911,21 @@ impl Wan {
                             total,
                         })
                     };
-                    denoise(
+                    // The one wired route: native dense T2V, one forward per step over one
+                    // transformer, with the step index in hand (sc-18322). Neither `TrunkCache` nor
+                    // `TokenPruner` has a production constructor, so both are `None` in every non-test
+                    // build — the plan being `Exact` is the contract-level reason, this is the
+                    // mechanism-level one. The step count is only known here, which is why the
+                    // inert-over-the-trajectory refusal lives in these two bridges.
+                    let grid = dit.patch_grid(&latents_init);
+                    let mut trunk = trunk_cache(self.descriptor.id, &approximation, steps)?;
+                    let mut prune = token_pruner(
+                        self.descriptor.id,
+                        &approximation,
+                        steps,
+                        grid.0 * grid.1 * grid.2,
+                    )?;
+                    denoise_approx(
                         &dit,
                         kind,
                         cfg.num_train_timesteps,
@@ -759,6 +937,8 @@ impl Wan {
                         &latents_init,
                         &req.cancel,
                         &mut on_step,
+                        trunk.as_mut(),
+                        prune.as_mut(),
                     )?
                 }
             }
@@ -774,6 +954,9 @@ impl Wan {
         }
 
         // --- Stage 3: z48 vae22 decode → RGB8 frames ---
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
         on_progress(Progress::Decoding);
         // Causal temporal decode: t_lat → 1 + (t_lat−1)·4 output frames (= gen_frames). The tiling
         // was chosen (and budget-checked) up front by `auto_tiling_budgeted` (sc-4998). sc-5039 casts
@@ -817,6 +1000,8 @@ pub const MODEL_ID_T2V_14B: &str = "wan2_2_t2v_14b";
 /// Stable identity + advertised capabilities for the Wan2.2 T2V-A14B (dual-expert MoE text→video).
 pub fn descriptor_t2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID_T2V_14B,
@@ -869,6 +1054,8 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }
@@ -1300,6 +1487,21 @@ impl Wan14b {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        // Every A14B route is an expert-swap route: the trajectory changes transformers at the
+        // boundary, so a retained trunk residual or a rotation phase captured under the high-noise
+        // expert is meaningless under the low-noise one (and retaining it would keep the outgoing
+        // expert's weights alive). This provider therefore declares no approximate mechanism, and
+        // refuses a non-exact plan **by name** here rather than by omission — resolving the plan is
+        // what makes that refusal exist at all, and its absence was why the guard's doc claimed a
+        // coverage it did not have (sc-18322).
+        refuse_unwired_approximation(
+            self.descriptor.id,
+            "MoE expert swap",
+            &self
+                .descriptor
+                .capabilities
+                .approximation_plan(self.descriptor.id, req)?,
+        )?;
         let cfg = &self.config;
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
@@ -1781,6 +1983,8 @@ fn grid(cfg: &WanModelConfig, vae: VaeTiling) -> (u32, u32) {
 /// concat first frame) and the (3.5, 3.5) per-expert guidance.
 pub fn descriptor_i2v_14b() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID_I2V_14B,
@@ -1831,6 +2035,8 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }
@@ -1924,6 +2130,32 @@ mod tests {
             resolve_capped_dims(&req(512, 512), &five_b, Ti2vProviderVae::VAE_TILING),
             (512, 512)
         );
+    }
+
+    #[test]
+    fn benchmark_scope_forces_dense_wan_spatial_and_temporal_tiles() {
+        let scope = mlx_gen::diagnostics::begin_benchmark_request(
+            "wan-fixed-tile",
+            "wan_video",
+            &[],
+            Some(mlx_gen::diagnostics::BenchmarkDecodeControl {
+                spatial_tile_px: 256,
+                spatial_overlap_px: 64,
+                temporal_tile_frames: Some(32),
+                temporal_overlap_frames: Some(8),
+            }),
+            |_| {},
+        )
+        .unwrap();
+        let tiling = dense_decode_tiling(&GenerationRequest::default(), 832, 480, 81)
+            .unwrap()
+            .unwrap();
+        let spatial = tiling.spatial.unwrap();
+        let temporal = tiling.temporal.unwrap();
+        assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 64));
+        assert_eq!((temporal.tile_frames, temporal.overlap_frames), (32, 8));
+        scope.finish();
+        assert_eq!(mlx_gen::diagnostics::benchmark_decode_control(), None);
     }
 
     #[test]

@@ -274,6 +274,8 @@ fn vace_decode_tail(
 /// Stable identity + advertised capabilities for `wan_vace`.
 pub fn descriptor_vace() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID_VACE,
@@ -327,6 +329,8 @@ pub fn descriptor_vace() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

@@ -10,6 +10,7 @@
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+pub mod approximation;
 pub mod attention_budget;
 pub mod audio_dsp;
 pub mod audio_embed;
@@ -17,13 +18,16 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod control;
+pub mod encoder_contract;
 pub mod error;
+pub mod execution_domains;
 pub mod face;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
+pub mod latent;
 pub mod license;
 mod macros;
 pub mod media;
@@ -40,9 +44,16 @@ pub mod tokenizer;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
+pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod weightsmeta;
 
+pub use approximation::{
+    ApproximationPlan, ApproximationRequest, ApproximationSurface, CacheReuseInterval,
+    CacheWarmupSteps, CharacterizationBinding, CharacterizationFamily, CharacterizationRef,
+    FeatureCacheDomain, FeatureCachePolicy, TokenDropStride, TokenPruningDomain,
+    TokenPruningPolicy, MIN_DROP_STRIDE, MIN_REUSE_INTERVAL,
+};
 pub use audio_dsp::{
     db_to_linear, measure_loudness, measure_track_loudness, mixdown, LoudnessStats, MixClip,
     MixRequest, SILENCE_FLOOR_LUFS,
@@ -57,10 +68,21 @@ pub use caption::{
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
 pub use control::{
-    reject_unknown_components, require_base_dir, require_component, require_control,
-    AcceptedControlKinds, ControlBranch,
+    reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
+    require_component_file, require_control, AcceptedControlKinds, ControlBranch,
+};
+pub use encoder_contract::{
+    read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
+    EncoderConfigBool, EncoderConfigFloat, EncoderContract, EncoderPackingContract,
+    EncoderPromptExecutionContract, EncoderPromptLengthPolicy, EncoderPromptPadding,
+    EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding, EncoderTokenizerContract,
+    EncoderTokenizerDisposition, ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
+pub use execution_domains::{
+    CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
+    GraphEvalCadence,
+};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, effective_component_quant, ActivationMemoryAnchor, AudioEditMode, AudioEditRef,
@@ -72,12 +94,22 @@ pub use generator::{
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
+pub use latent::{
+    latent_spaces_compatible, normalization_vectors_hash, DecoderOption, LatentNormalization,
+    LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
+    SpatialCompression, DECODER_OPTIONS, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE,
+    LTX_VIDEO_LATENT_SPACE, MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE,
+    QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN, QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD,
+    SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
+    SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID, WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+    WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION, WAN_Z48_STD,
+};
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
 pub use license::{
-    component_licenses_manifest_json, license_table_conformance_errors, provider_terms,
-    resolve_component, resolve_family, CeilingBoundary, ComponentLicense, LicenseFamily,
-    LicenseTerm, ProviderComponents,
+    component_licenses_manifest_json, decoder_license_conformance_errors,
+    license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
+    CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
@@ -86,37 +118,48 @@ pub use memory_strategy::{
     standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
     MemoryAssetFacts, MemoryBackend, MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget,
     MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics,
-    MemoryComponentKind, MemoryConformanceState, MemoryDecodeRouteDomain, MemoryEvidence,
-    MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey, MemoryEvidenceLogRecord,
-    MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges,
-    MemoryParityContract, MemoryParityResult, MemoryPeakBreakdown, MemoryPhase,
-    MemoryPidDecodeRoutes, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRejection,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyEngagementExclusion, MemoryStrategyParameters,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWarmRunSemantics,
-    MemoryWindowMaterialization, ResidentRequestMemory, TransformerComponent,
-    MEMORY_CALIBRATION_ABI, MEMORY_EVIDENCE_V1_PREFIX,
+    MemoryComponentKind, MemoryConformanceState, MemoryDecodeArtifactIdentity,
+    MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
+    MemoryDecodeQualityFixture, MemoryDecodeQualityRuntimeIdentity, MemoryDecodeRouteDomain,
+    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
+    MemoryEvidenceLogRecord, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryOptimizationAuthority, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
+    MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRejection, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics, MemorySafetyDecision,
+    MemorySelection, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyEngagementExclusion,
+    MemoryStrategyParameters, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWarmRunSemantics, MemoryWindowMaterialization, ResidentRequestMemory,
+    TransformerComponent, MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI,
+    MEMORY_EVIDENCE_V1_PREFIX,
 };
 pub use registry::{
-    ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
-    CaptionerRegistration, ImageEmbedderRegistration, MemoryBehaviorBeginRequest,
-    MemoryBehaviorFixture, MemoryBehaviorRegistration, MemoryContractFixtureRegistration,
-    MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, TextEmbedderRegistration, TrainerRegistration,
+    candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
+    mlx_memory_contract_surface_specs, ActivationMemoryRegistration, AudioEmbedderRegistration,
+    AudioTransformRegistration, CaptionerRegistration, EncoderContractRouteRegistration,
+    ImageEmbedderRegistration, ImportedModelOperation, ImportedModelRegistration,
+    ImportedModelSource, MemoryBehaviorBeginRequest, MemoryBehaviorFixture,
+    MemoryBehaviorRegistration, MemoryContractFixtureRegistration, MemoryContractSurface,
+    MemoryContractSurfaceResolverRegistration, MemoryContractSurfaceSelector,
+    MemoryContractSurfaceSpec, MemoryContractSurfaceTier, MemoryRegistration, ModelRegistration,
+    PerComponentBytes, ProviderRegistry, ProviderRegistryBuilder,
+    ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration, TrainerRegistration,
     TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase,
-    LoadShape, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, Precision, PreviewFrame,
-    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
-    PromptEnhancementSink, Quant, WeightsSource,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
+    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
+    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
+    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
+    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    KREA_CONVROT_DIT_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
     safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,

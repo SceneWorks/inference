@@ -30,6 +30,11 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// Descriptor-less provider memory routes that the CPU bundle intentionally reconciles outside the
+/// ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
+
 /// Platform label for this bundle; matches `RuntimeCatalog::platform`.
 pub const PLATFORM: &str = "cpu";
 /// The single tensor backend every media, LLM, and snapshot-preparer provider in this bundle uses.
@@ -213,6 +218,8 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
@@ -319,6 +326,50 @@ mod tests {
             assert!(
                 candle_gen_catalog::nvfp4_quant_tiers().is_empty(),
                 "the supported CPU-only resolution must NOT surface the NVFP4 tier"
+            );
+        }
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cpu_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        // Shape, not population. This used to destructure `[waiver]` and pin `pulid_flux`/`pulid`,
+        // so a second legitimate bespoke route went RED with nothing actually broken — and, because
+        // the table reaches this bundle through a plain `pub use`, re-checking those ids proved only
+        // what the compiler already had. The load-bearing claim is that each waived route really is
+        // absent from *this* bundle's composed registry: that absence is what the waiver documents,
+        // and it is what a bundle that quietly grew a registration would break.
+        let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+        assert!(
+            !waivers.is_empty(),
+            "the CPU bundle exposes descriptor-less memory routes; an empty waiver table would make \
+             every check below vacuous"
+        );
+        let registry = super::media_registry().expect("CPU media registry");
+        assert!(
+            registry.generators().next().is_some(),
+            "an empty registry would make every absence check below vacuously true"
+        );
+        for waiver in waivers {
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration in the CPU bundle after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration in the CPU bundle after all",
+                waiver.provider_id
             );
         }
     }

@@ -44,7 +44,7 @@ use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
 use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae, load_sdxl_vae_encoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{AutoEncoderKL, PID_BACKBONE};
+use crate::{SdxlVaeDecoder, PID_BACKBONE};
 
 /// The edit compute dtype — fp16, matching the production SDXL path (the f16-stable VAE + UNet).
 const DTYPE: DType = DType::F16;
@@ -150,7 +150,7 @@ impl Default for SdxlEditRequest {
 pub struct SdxlEdit {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     vae_encoder: VaeMomentsEncoder,
     sampler: EulerAncestralSampler,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
@@ -308,7 +308,7 @@ impl SdxlEdit {
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the

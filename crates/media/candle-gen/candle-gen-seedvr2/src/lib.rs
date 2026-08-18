@@ -62,6 +62,8 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
@@ -108,6 +110,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

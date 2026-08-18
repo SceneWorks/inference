@@ -76,6 +76,8 @@ pub const LANGUAGES: &[&str] = &["en"];
 /// The 44k provider's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         // Same five named component ids as the 16k provider (epic 13657, sc-13666) — `clip` /
         // `synchformer` / `dit` / `vae` / `vocoder`. The ids match; the underlying checkpoints differ
@@ -119,6 +121,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_session: false,
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

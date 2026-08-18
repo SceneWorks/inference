@@ -54,6 +54,25 @@ use crate::vae::{load_vae, load_vae_encoder, QwenVaeEncoder};
 /// runs **f32** (decode-precision-sensitive).
 const DIT_DTYPE: DType = DType::BF16;
 
+#[cfg(test)]
+type NativeDitLoadTestHook = Box<dyn FnMut(&Weights, &Device) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic barrier injected into the real native-file entrypoint after one provider tensor
+    /// has been consumed. Tests replace the selected path here; production builds contain no hook.
+    static NATIVE_DIT_LOAD_TEST_HOOK: std::cell::RefCell<Option<NativeDitLoadTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_native_dit_load_test_hook(weights: &Weights, device: &Device) -> Result<()> {
+    NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(hook) => hook(weights, device),
+        None => Ok(()),
+    })
+}
+
 /// Query-score budget used by the constrained-card rung. This matches the already GPU-validated Krea
 /// ControlNet chunk size: 128 Mi score elements (~512 MiB at f32) instead of the shared multi-GiB
 /// default. Chunking is only over independent query rows, so it does not alter the key/value domain.
@@ -124,7 +143,9 @@ pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 pub(crate) struct KreaText {
     tok: crate::tokenizer::KreaTokenizer,
     te: KreaTextEncoder,
-    root: PathBuf,
+    /// Grounded edit keeps the checkpoint-coupled visual tower on the bundled multimodal source;
+    /// a language-only replacement never has to duplicate unrelated `visual.*` tensors.
+    vision_encoder_source: gen_core::ValidatedEncoderSource,
     device: Device,
     /// Qwen3-VL vision tower for grounded edit conditioning (sc-12129). Kept lazy so ordinary
     /// txt2img/img2img/control requests neither load nor require the `visual.*` subtree.
@@ -134,10 +155,12 @@ pub(crate) struct KreaText {
 impl KreaText {
     fn vision(&self) -> Result<Arc<crate::vision::VisionTower>> {
         candle_gen::cached(&self.vision, || {
-            Ok(Arc::new(crate::vision::load_vision_tower(
-                &self.root,
-                &self.device,
-            )?))
+            read_validated_vision_source(&self.vision_encoder_source, |source| {
+                Ok(Arc::new(crate::vision::load_vision_tower_from_source(
+                    source,
+                    &self.device,
+                )?))
+            })
         })
     }
 }
@@ -176,6 +199,18 @@ pub(crate) struct ResidencyHeavy {
     vae_encoder: QwenVaeEncoder,
 }
 
+/// Native-file quantization choices that must remain paired across the staged renderer.
+pub(crate) struct NativeFileQuantization {
+    pub(crate) transformer: Option<gen_core::Quant>,
+    pub(crate) text_encoder: Option<gen_core::Quant>,
+}
+
+/// Request-scoped PiD selection for a sequential heavy-phase load.
+pub(crate) struct PidLoad<'a> {
+    pub(crate) spec: Option<&'a PidWeights>,
+    pub(crate) enabled: bool,
+}
+
 impl ResidencyHeavy {
     /// The Qwen-Image VAE, for the multi-phase decode (epic 13879, sc-13887) — which decodes through the
     /// native VAE only (PiD is rejected on the multi-phase path).
@@ -210,6 +245,26 @@ fn load_residency_heavy_cancelable(
             load_vae_encoder(root, device)?
         },
     })
+}
+
+fn resolve_vision_encoder_source(
+    root: &Path,
+) -> gen_core::Result<gen_core::ValidatedEncoderSource> {
+    crate::ENCODER_CONTRACT
+        .validate_source(&gen_core::WeightsSource::Dir(root.join("text_encoder")))
+}
+
+/// Admit the exact edit-only vision surface before the backend opens any payload bytes. Keeping this
+/// check beside the lazy read is what lets language-valid T2I/img2img/control snapshots omit
+/// `visual.*` while making the first grounded edit fail closed.
+fn read_validated_vision_source<T>(
+    source: &gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&gen_core::WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(CandleError::from)?;
+    source.read_unchanged(read)
 }
 
 pub(crate) fn encode_residency(
@@ -329,6 +384,90 @@ pub fn load_components(
     adapters: &[AdapterSpec],
     pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_with_encoder(root, &selected, device, adapters, pid_spec)
+}
+
+/// Load the resident Krea components while selecting an explicitly authored Qwen3-VL text encoder.
+///
+/// `None` selects the snapshot's bundled `text_encoder/`, preserving the existing load route.
+/// `Some` accepts either the encoder component itself or a complete snapshot containing it. Both
+/// routes pass the same exact config-and-header [`crate::ENCODER_CONTRACT`] and numeric-tier policy
+/// before any tensor payload is opened; the retained validation receipt is rechecked immediately
+/// before and after the backend enumerates the selected shards.
+pub fn load_components_with_text_encoder(
+    root: &Path,
+    text_encoder: Option<&gen_core::WeightsSource>,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, text_encoder)?;
+    load_components_with_encoder(root, &selected, device, adapters, pid_spec)
+}
+
+/// Load the resident Krea components while preserving the caller's complete prepared encoder receipt.
+///
+/// Unlike a detached `text_encoder` path, the prepared [`gen_core::LoadSpec`] also identifies the
+/// selected config, tokenizer, and exact shard inventory. The entire provider load stays inside that
+/// receipt bracket so an admitted source cannot be replaced and freshly revalidated here.
+pub fn load_components_with_spec(
+    root: &Path,
+    spec: &gen_core::LoadSpec,
+    device: &Device,
+) -> Result<Components> {
+    match &spec.weights {
+        gen_core::WeightsSource::Dir(admitted_root) if admitted_root == root => {}
+        gen_core::WeightsSource::Dir(admitted_root) => {
+            return Err(CandleError::Msg(format!(
+                "krea edit: runtime base {} differs from admitted base {}",
+                root.display(),
+                admitted_root.display()
+            )));
+        }
+        gen_core::WeightsSource::File(_) => {
+            return Err(CandleError::Msg(
+                "krea edit: admitted base must be the runtime snapshot directory".to_owned(),
+            ));
+        }
+    }
+    spec.read_prepared_files_unchanged(|| {
+        load_components_with_text_encoder(
+            root,
+            spec.text_encoder.as_ref(),
+            device,
+            &spec.adapters,
+            spec.pid.as_ref(),
+        )
+    })
+}
+
+fn resolve_components_text_encoder(
+    root: &Path,
+    text_encoder: Option<&gen_core::WeightsSource>,
+) -> Result<gen_core::ValidatedEncoderSource> {
+    let builtin = gen_core::WeightsSource::Dir(root.join("text_encoder"));
+    let requested = text_encoder.unwrap_or(&builtin);
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(requested, root)
+        .map_err(CandleError::from)?;
+    let expected_bits = gen_core::text_encoder_packed_quant_bits(&builtin)?;
+    if let Some(bits) = selected.load_time_quant_bits(expected_bits, crate::KREA_2_EDIT_ID)? {
+        return Err(CandleError::Msg(format!(
+            "candle {} requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly",
+            crate::KREA_2_EDIT_ID
+        )));
+    }
+    Ok(selected)
+}
+
+pub(crate) fn load_components_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
     // Both phases, in the SAME order the pre-split loader used (tokenizer + TE, then DiT + VAE + PiD),
     // so the resident load is byte-identical — the phase fns below are just the two halves named.
     //
@@ -336,7 +475,7 @@ pub fn load_components(
     // `GenerationRequest` exists, so the PiD overlay must be there for whichever later request asks for
     // it. That is the opposite of the `Sequential` path's calculus (see [`load_heavy`]), where the load
     // is per-generate and the request IS in hand.
-    let text = load_text(root, device)?;
+    let text = load_text_with_source(root, text_encoder_source, device)?;
     let heavy = load_heavy(root, device, adapters, pid_spec, true)?;
     Ok(Components { text, heavy })
 }
@@ -367,18 +506,36 @@ fn pid_to_load(pid_spec: Option<&PidWeights>, use_pid: bool) -> Option<&PidWeigh
 /// encoder upcasts each projection — so both render correctly; only the resident footprint differs).
 #[cfg(test)]
 fn load_te_weights(root: &Path, device: &Device) -> Result<Weights> {
-    load_te_weights_cancelable(root, device, None)
+    load_te_weights_cancelable(
+        &gen_core::WeightsSource::Dir(root.join("text_encoder")),
+        device,
+        None,
+    )
 }
 
 fn load_te_weights_cancelable(
-    root: &Path,
+    source: &gen_core::WeightsSource,
     device: &Device,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<Weights> {
-    let dir = root.join("text_encoder");
     let open = |dtype| match cancel {
-        Some(cancel) => Weights::from_dir_cancelable(&dir, device, dtype, cancel),
-        None => Weights::from_dir(&dir, device, dtype).map_err(candle_gen::CandleError::from),
+        Some(cancel) => match source {
+            gen_core::WeightsSource::Dir(path) => {
+                Weights::from_dir_cancelable(path, device, dtype, cancel)
+            }
+            gen_core::WeightsSource::File(path) => {
+                candle_gen::check_cancel(cancel)?;
+                Weights::from_file(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+        },
+        None => match source {
+            gen_core::WeightsSource::Dir(path) => {
+                Weights::from_dir(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+            gen_core::WeightsSource::File(path) => {
+                Weights::from_file(path, device, dtype).map_err(candle_gen::CandleError::from)
+            }
+        },
     };
     let w = open(TE_STORE_DTYPE)?;
     if w.get_native("language_model.layers.0.input_layernorm.weight")?
@@ -391,16 +548,47 @@ fn load_te_weights_cancelable(
     }
 }
 
-pub(crate) fn load_text(root: &Path, device: &Device) -> Result<KreaText> {
-    load_text_cancelable(root, device, None)
+pub(crate) fn load_text_with_source(
+    root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
+    device: &Device,
+) -> Result<KreaText> {
+    load_text_cancelable(root, source, device, None)
 }
 
-pub(crate) fn load_text_for_request(
+pub(crate) fn load_text_for_request_with_source(
     root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
     device: &Device,
     cancel: &gen_core::CancelFlag,
 ) -> Result<KreaText> {
-    load_text_cancelable(root, device, Some(cancel))
+    load_text_cancelable(root, source, device, Some(cancel))
+}
+
+pub(crate) fn load_text_quantized_for_request(
+    root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
+    device: &Device,
+    cancel: &gen_core::CancelFlag,
+    quant: gen_core::Quant,
+) -> Result<KreaText> {
+    candle_gen::check_cancel(cancel)?;
+    let vision_encoder_source = resolve_vision_encoder_source(root)?;
+    let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
+    let cpu = Device::Cpu;
+    let te_w =
+        source.read_unchanged(|weights| load_te_weights_cancelable(weights, &cpu, Some(cancel)))?;
+    let mut te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+    te.quantize_onto(quant, device)?;
+    candle_gen::check_cancel(cancel)?;
+    Ok(KreaText {
+        tok,
+        te,
+        vision_encoder_source,
+        device: device.clone(),
+        vision: Mutex::new(None),
+    })
 }
 
 fn check_optional_cancel(cancel: Option<&gen_core::CancelFlag>) -> Result<()> {
@@ -412,22 +600,24 @@ fn check_optional_cancel(cancel: Option<&gen_core::CancelFlag>) -> Result<()> {
 
 fn load_text_cancelable(
     root: &Path,
+    source: &gen_core::ValidatedEncoderSource,
     device: &Device,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<KreaText> {
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
-    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
+    let vision_encoder_source = resolve_vision_encoder_source(root)?;
+    let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = load_te_weights_cancelable(root, device, cancel)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
+    let te_w =
+        source.read_unchanged(|weights| load_te_weights_cancelable(weights, device, cancel))?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
-
     Ok(KreaText {
         tok,
         te,
-        root: root.to_path_buf(),
+        vision_encoder_source,
         device: device.clone(),
         vision: Mutex::new(None),
     })
@@ -560,10 +750,21 @@ pub fn load_components_convrot(
     device: &Device,
     adapters: &[AdapterSpec],
 ) -> Result<Components> {
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_convrot_with_encoder(root, &selected, convrot_dit, device, adapters)
+}
+
+pub(crate) fn load_components_convrot_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    convrot_dit: &Path,
+    device: &Device,
+    adapters: &[AdapterSpec],
+) -> Result<Components> {
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
-    let text = load_text(root, device)?;
+    let text = load_text_with_source(root, text_encoder_source, device)?;
     let heavy = load_heavy_convrot(root, convrot_dit, device, adapters)?;
     Ok(Components { text, heavy })
 }
@@ -623,33 +824,83 @@ pub fn load_components_native(
     device: &Device,
     adapters: &[AdapterSpec],
 ) -> Result<Components> {
-    let text = load_text(root, device)?;
-    let heavy = load_heavy_native(root, native_dit, device, adapters)?;
+    let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
+    let selected = resolve_components_text_encoder(root, None)?;
+    load_components_native_with_encoder(
+        root, &selected, &pinned, device, adapters, None, None, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_components_native_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    native_quant: Option<gen_core::Quant>,
+    text_load_quant: Option<gen_core::Quant>,
+    stream_blocks: bool,
+) -> Result<Components> {
+    let text = match text_load_quant {
+        Some(quant) => {
+            let cancel = gen_core::CancelFlag::new();
+            load_text_quantized_for_request(root, text_encoder_source, device, &cancel, quant)?
+        }
+        None => load_text_with_source(root, text_encoder_source, device)?,
+    };
+    let heavy = load_heavy_native_with(
+        root,
+        native_dit,
+        device,
+        adapters,
+        native_quant,
+        stream_blocks,
+    )?;
     Ok(Components { text, heavy })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_components_native_registry_with_encoder(
+    root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    native_quant: Option<gen_core::Quant>,
+    text_load_quant: Option<gen_core::Quant>,
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
+    let mut components = load_components_native_with_encoder(
+        root,
+        text_encoder_source,
+        native_dit,
+        device,
+        adapters,
+        native_quant,
+        text_load_quant,
+        false,
+    )?;
+    components.heavy.pid = pid_spec
+        .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
+        .transpose()?;
+    Ok(components)
 }
 
 /// The heavy half of a native single-file load: the dense or dequantized DiT (from `native_dit`, read
 /// through the native→diffusers remap) + the Qwen-Image VAE (from `root`). This out-of-registry native
 /// single-file entrypoint accepts job-local LoRA/LoKr/diff-patch adapters through the shared Krea
-/// installer. PiD remains absent; the registered dense, packed, and ConvRot routes attach it through
-/// their dedicated component loaders.
-pub(crate) fn load_heavy_native(
+/// installer ([`load_native_dit`]). PiD remains absent; the registered dense, packed, and ConvRot
+/// routes attach it through their dedicated component loaders.
+pub(crate) fn load_heavy_native_with(
     root: &Path,
-    native_dit: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
     device: &Device,
     adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
+    stream_blocks: bool,
 ) -> Result<KreaHeavy> {
-    let cfg = Krea2Config::from_snapshot(root)?;
-    // `from_native_file`: native_keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
-    // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-    let mut dit_w = Weights::from_native_file(native_dit, device, DIT_DTYPE)?;
-    crate::convert::validate_native_transformer(&dit_w, &cfg)?;
-    let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
-    let mut dit = Krea2Transformer::load(&dit_w, &cfg)?;
-    if !adapters.is_empty() {
-        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
-    }
-
+    let dit = load_native_dit(root, native_dit, device, adapters, quant, stream_blocks)?;
     let vae = load_vae(root, device)?;
 
     Ok(KreaHeavy {
@@ -657,6 +908,109 @@ pub(crate) fn load_heavy_native(
         vae: Arc::new(vae),
         pid: None,
     })
+}
+
+fn load_native_dit(
+    root: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
+    stream_blocks: bool,
+) -> Result<Krea2Transformer> {
+    load_native_dit_at_dtype(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        DIT_DTYPE,
+    )
+}
+
+fn load_native_dit_at_dtype(
+    root: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
+    stream_blocks: bool,
+    dit_dtype: DType,
+) -> Result<Krea2Transformer> {
+    native_dit.read_unchanged(|_| {
+        let cfg = Krea2Config::from_snapshot(root)?;
+        // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
+        // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
+        let source_device = if quant.is_some() {
+            &Device::Cpu
+        } else {
+            device
+        };
+        let mut dit_w = Weights::from_pinned_native_file(native_dit, source_device, dit_dtype)?;
+        #[cfg(test)]
+        run_native_dit_load_test_hook(&dit_w, device)?;
+        crate::convert::validate_native_transformer(&dit_w, &cfg)?;
+        let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
+        if stream_blocks && (!adapters.is_empty() || quant.is_some()) {
+            return Err(CandleError::Msg(
+                "Krea native block streaming requires an adapter-free, non-quantizing load".into(),
+            ));
+        }
+        let mut dit = if stream_blocks {
+            Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+        } else {
+            Krea2Transformer::load(&dit_w, &cfg)?
+        };
+        if !adapters.is_empty() {
+            crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
+        }
+        if let Some(quant) = quant {
+            dit.quantize_onto(quant, device)?;
+        }
+
+        // Both paths materialize mmap-backed payloads here: eager loads the complete DiT, while the
+        // streamed form eagerly loads its front/head tensors before deferring only transformer
+        // blocks. Finish those host-to-device reads before `read_unchanged` performs its post-check.
+        // Individual streamed block windows use the same guarded synchronization when opened.
+        device.synchronize()?;
+
+        Ok(dit)
+    })
+}
+
+/// Sequential imported-file heavy phase: native DiT + VAE + img2img/edit encoder, loaded only after
+/// the text encoder was released. The transformer stays file-backed and window-materialized when the
+/// source is adapter-free.
+pub(crate) fn load_residency_heavy_native(
+    root: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
+    stream_blocks: bool,
+) -> Result<ResidencyHeavy> {
+    Ok(ResidencyHeavy {
+        heavy: load_heavy_native_with(root, native_dit, device, adapters, quant, stream_blocks)?,
+        vae_encoder: load_vae_encoder(root, device)?,
+    })
+}
+
+pub(crate) fn load_residency_heavy_native_registry(
+    root: &Path,
+    native_dit: &gen_core::PinnedWeightsFile,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    quant: Option<gen_core::Quant>,
+    pid: PidLoad<'_>,
+    stream_blocks: bool,
+) -> Result<ResidencyHeavy> {
+    let mut result =
+        load_residency_heavy_native(root, native_dit, device, adapters, quant, stream_blocks)?;
+    result.heavy.pid = pid_to_load(pid.spec, pid.enabled)
+        .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
+        .transpose()?;
+    Ok(result)
 }
 
 /// The **sequential** twin of [`load_heavy_convrot`] (sc-12089 / epic 10765 Phase 1c): the int8 DiT +
@@ -734,10 +1088,17 @@ pub fn render(
 /// The context and final latents intentionally survive their producing phase; model weights do not.
 /// A device synchronization precedes each model drop so asynchronous CUDA work cannot keep the prior
 /// phase alive while the next allocates. The resident/default path never calls this function.
-pub(crate) fn render_three_stage(
+/// Three-stage renderer for snapshot and imported-file sources. All phases remain identical; only the
+/// DiT opener is selected from the optional registry primary `WeightsSource::File` instead of
+/// `root/transformer`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_three_stage_with_native(
     root: &Path,
+    text_encoder_source: &gen_core::ValidatedEncoderSource,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
     device: &Device,
     adapters: &[AdapterSpec],
+    quantization: NativeFileQuantization,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
@@ -751,7 +1112,20 @@ pub(crate) fn render_three_stage(
         gen_core::MemoryPhase::Conditioning,
         on_progress,
     )?;
-    let text = load_text_cancelable(root, device, Some(&req.cancel))?;
+    let text = if native_dit.is_some() {
+        match quantization.text_encoder {
+            Some(quant) => load_text_quantized_for_request(
+                root,
+                text_encoder_source,
+                device,
+                &req.cancel,
+                quant,
+            )?,
+            None => load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?,
+        }
+    } else {
+        load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?
+    };
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
@@ -764,13 +1138,28 @@ pub(crate) fn render_three_stage(
         gen_core::MemoryPhase::Denoise,
         on_progress,
     )?;
-    let dit = load_dit_cancelable(
-        root,
-        device,
-        adapters,
-        memory.stream_transformer_blocks,
-        Some(&req.cancel),
-    )?;
+    let dit = match native_dit {
+        Some(native_dit) => {
+            candle_gen::check_cancel(&req.cancel)?;
+            let dit = load_native_dit(
+                root,
+                native_dit,
+                device,
+                adapters,
+                quantization.transformer,
+                memory.stream_transformer_blocks,
+            )?;
+            candle_gen::check_cancel(&req.cancel)?;
+            dit
+        }
+        None => load_dit_cancelable(
+            root,
+            device,
+            adapters,
+            memory.stream_transformer_blocks,
+            Some(&req.cancel),
+        )?,
+    };
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = turbo_sigmas(steps);
@@ -839,7 +1228,8 @@ pub(crate) fn render_three_stage(
                 memory.decode_tile_edge.unwrap_or(512),
                 memory.decode_overlap.unwrap_or(128),
             ));
-            let decoded = vae.decode_with_tile(latent, tile)?.to_dtype(DType::F32)?;
+            let decoded = decode_via_seam(&vae, None, latent, tile, Some(&req.cancel))?
+                .to_dtype(DType::F32)?;
             to_image(&decoded)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1056,10 +1446,13 @@ fn render_from_context(
         // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
         // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it.
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1178,10 +1571,13 @@ fn render_img2img_from_context(
             )?
         };
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1304,10 +1700,13 @@ fn render_base_from_contexts(
             },
         )?;
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1341,46 +1740,97 @@ pub(crate) fn encode_multiphase_contexts(
     Ok((context, neg))
 }
 
-/// Load a **bare, re-adaptable** job-local Krea DiT from the snapshot's `transformer/` — no load-time
-/// adapters, no diff-patch fold, no PiD (the DiT part of [`load_heavy`] only). This is the job-local base
-/// the multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
-/// [`crate::adapters::install_additive`] of the phase subset). It is owned by the render call and never
-/// the shared resident, so re-adapting it between phases can never race a concurrent generate — the
-/// concurrency-safety invariant. (Because candle's `Krea2Transformer` is not a cheap `Clone` like MLX's,
-/// this is ONE extra transient DiT per multi-phase job rather than a per-phase refcounted clone; see the
-/// PR notes / follow-up for the base-sharing-clone optimization.)
-fn load_dit_base(root: &Path, device: &Device) -> Result<Krea2Transformer> {
-    let cfg = Krea2Config::from_snapshot(root)?;
-    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    crate::convert::validate_transformer(&dit_w, &cfg)?;
-    Ok(Krea2Transformer::load(&dit_w, &cfg)?)
+#[derive(Debug, Eq, PartialEq)]
+enum MultiphaseDitSource {
+    SnapshotDir(PathBuf),
+    NativeFile(Box<gen_core::PinnedWeightsFile>),
 }
 
-/// **Multi-phase Raw render** (epic 13879, sc-13887) — drive the resolved per-phase plan over ONE global
-/// Raw schedule, then decode once. The `sigmas` schedule is built ONCE for the TOTAL step budget (the sum
-/// of the phases' steps); each phase runs a contiguous slice `sigmas[start..=end]` from the RUNNING latent
-/// (the prior phase's output, or the initial noise for phase 0) — so the latent and sigma trajectory flow
-/// continuously across every boundary (the crux: no per-phase schedule, hence no seam/reset), while the
-/// ACTIVE ADAPTERS and GUIDANCE change per phase.
-///
-/// **Per-phase adapter toggling, concurrency-safe.** A single **job-local** base DiT ([`load_dit_base`])
-/// is re-adapted in place between phases: [`Krea2Transformer::clear_adapters`] drops the prior phase's
-/// forward-time residuals, then [`crate::adapters::install_additive`] pushes the current phase's subset
-/// (empty ⇒ bare base). The shared resident DiT is NEVER touched, so this races no concurrent generate —
-/// the candle realization of MLX's per-phase-clone intent (candle's DiT is not a cheap `Clone`, so it
-/// re-adapts one job-local DiT instead of cloning the resident per phase).
-///
-/// **Per-phase guidance.** `guidance > 0` runs the true-CFG two-forward path (cond + uncond combined by
-/// the reference `krea_cfg_combine`); `guidance == 0` collapses to a single conditional forward. The
-/// caller encodes `neg_context` iff any phase uses CFG — a CFG phase with no negative context is a loud
-/// error (never a silent wrong render).
-///
-/// Multi-phase renders from pure noise and never routes the PiD decoder (rejected up front by
-/// `validate_phases`), so decode is always the native Qwen-VAE. `req.count` images, one per seed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn render_multiphase(
-    vae: &QwenVae,
+fn multiphase_dit_source(
     root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+) -> MultiphaseDitSource {
+    match native_dit {
+        Some(source) => MultiphaseDitSource::NativeFile(Box::new(source.clone())),
+        None => MultiphaseDitSource::SnapshotDir(root.join("transformer")),
+    }
+}
+
+fn load_dit_base_with<T>(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    load_snapshot: impl FnOnce(&Path) -> Result<T>,
+    load_native: impl FnOnce(&gen_core::PinnedWeightsFile) -> Result<T>,
+) -> Result<T> {
+    match multiphase_dit_source(root, native_dit) {
+        MultiphaseDitSource::SnapshotDir(transformer) => load_snapshot(&transformer),
+        MultiphaseDitSource::NativeFile(source) => load_native(&source),
+    }
+}
+
+/// Load a **bare, re-adaptable** job-local Krea DiT from the same physical source as the registered
+/// provider — either the snapshot's `transformer/` directory or its imported native single-file DiT.
+/// No load-time adapters, diff-patch fold, or PiD state is carried in. This is the job-local base the
+/// multi-phase driver re-adapts between phases ([`Krea2Transformer::clear_adapters`] +
+/// [`crate::adapters::install_additive`] of the phase subset). It is owned by the render call and never
+/// the shared resident, so re-adapting it between phases can never race a concurrent generate.
+#[cfg(test)]
+fn load_dit_base(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    device: &Device,
+    quant: Option<gen_core::Quant>,
+) -> Result<Krea2Transformer> {
+    load_dit_base_at_dtype(root, native_dit, device, quant, DIT_DTYPE)
+}
+
+fn load_dit_base_at_dtype(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    device: &Device,
+    quant: Option<gen_core::Quant>,
+    dit_dtype: DType,
+) -> Result<Krea2Transformer> {
+    load_dit_base_with(
+        root,
+        native_dit,
+        |transformer| {
+            let cfg = Krea2Config::from_snapshot(root)?;
+            let dit_w = Weights::from_dir(transformer, device, dit_dtype)?;
+            crate::convert::validate_transformer(&dit_w, &cfg)?;
+            Ok(Krea2Transformer::load(&dit_w, &cfg)?)
+        },
+        |source| load_native_dit_at_dtype(root, source, device, &[], quant, false, dit_dtype),
+    )
+}
+
+/// Make one resolved multi-phase adapter subset authoritative on the job-local DiT. This is the
+/// production phase-boundary operation: prior residuals are released before the selected subset is
+/// materialized from its real adapter files. Keeping it as one operation lets regression coverage
+/// exercise the exact state transition used by [`render_multiphase`] without constructing the VAE.
+fn materialize_multiphase_adapter_set(
+    dit: &mut Krea2Transformer,
+    specs: &[AdapterSpec],
+) -> Result<crate::adapters::AdditiveReport> {
+    dit.clear_adapters()?;
+    if specs.is_empty() {
+        return Ok(crate::adapters::AdditiveReport::default());
+    }
+    crate::adapters::install_additive(dit, specs, 0)
+}
+
+type MultiphaseAdapterStateObserver<'a> = dyn FnMut(Option<usize>, &[AdapterSpec], &crate::adapters::AdditiveReport, &mut Krea2Transformer)
+    + 'a;
+
+/// The production multi-phase render driver. The public provider wrapper supplies the production DiT
+/// dtype and VAE decoder; the test-only call supplies F32 and an identity decoder because Candle CPU
+/// cannot execute BF16 matmul. Loading, native-file pinning, noise initialization, global schedule,
+/// phase transitions, sampler forwards, progress, and final adapter release are otherwise identical.
+#[allow(clippy::too_many_arguments)]
+fn render_multiphase_driver<T>(
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    quant: Option<gen_core::Quant>,
     device: &Device,
     resolved: &[crate::multiphase::ResolvedPhase],
     all_specs: &[AdapterSpec],
@@ -1388,7 +1838,10 @@ pub(crate) fn render_multiphase(
     neg_context: Option<&Tensor>,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
-) -> Result<Vec<Image>> {
+    dit_dtype: DType,
+    on_adapter_state: &mut MultiphaseAdapterStateObserver<'_>,
+    decode: &mut dyn FnMut(&Tensor) -> Result<T>,
+) -> Result<Vec<T>> {
     // ONE global Raw schedule for the TOTAL step budget (sum of the phases' steps) — the crux that keeps
     // the sigma trajectory continuous across boundaries (no per-phase recompute / reset).
     let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
@@ -1398,13 +1851,13 @@ pub(crate) fn render_multiphase(
     // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
     // reused across the seed loop. Pre-resolve each phase's adapter spec subset (host-cheap; the adapter
     // files are read at install time inside the loop).
-    let mut dit = load_dit_base(root, device)?;
+    let mut dit = load_dit_base_at_dtype(root, native_dit, device, quant, dit_dtype)?;
     let phase_specs: Vec<Vec<AdapterSpec>> = resolved
         .iter()
         .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
         .collect();
 
-    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+    let outputs = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
         // phase's output latent at the SHARED boundary sigma.
         let mut latent = init_noise(req.height, req.width, seed, device)?;
@@ -1413,14 +1866,12 @@ pub(crate) fn render_multiphase(
         // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
         let preview_counter = crate::preview::multiphase_counter(&sigmas);
         let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
-        for (phase, specs) in resolved.iter().zip(&phase_specs) {
+        for (phase_index, (phase, specs)) in resolved.iter().zip(&phase_specs).enumerate() {
             // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
             // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
             // prior phase installed.
-            dit.clear_adapters()?;
-            if !specs.is_empty() {
-                crate::adapters::install_additive(&mut dit, specs, 0)?;
-            }
+            let report = materialize_multiphase_adapter_set(&mut dit, specs)?;
+            on_adapter_state(Some(phase_index), specs, &report, &mut dit);
             let end = phase.slice.end.min(sigmas.len().saturating_sub(1));
             let start = phase.slice.start.min(end);
             let sub = &sigmas[start..=end];
@@ -1457,9 +1908,75 @@ pub(crate) fn render_multiphase(
             )?;
         }
         on_progress(Progress::Decoding);
-        let decoded = vae.decode(&latent)?.to_dtype(DType::F32)?;
+        decode(&latent)
+    })?;
+
+    // Release the final phase's residual tensors before returning rather than relying on the
+    // job-local DiT's destructor. This makes the lifetime boundary explicit and keeps repeated
+    // requests from retaining the last adapter subset until an outer owner happens to drop.
+    dit.clear_adapters()?;
+    let released = crate::adapters::AdditiveReport::default();
+    on_adapter_state(None, &[], &released, &mut dit);
+    Ok(outputs)
+}
+
+/// **Multi-phase Raw render** (epic 13879, sc-13887) — drive the resolved per-phase plan over ONE global
+/// Raw schedule, then decode once. The `sigmas` schedule is built ONCE for the TOTAL step budget (the sum
+/// of the phases' steps); each phase runs a contiguous slice `sigmas[start..=end]` from the RUNNING latent
+/// (the prior phase's output, or the initial noise for phase 0) — so the latent and sigma trajectory flow
+/// continuously across every boundary (the crux: no per-phase schedule, hence no seam/reset), while the
+/// ACTIVE ADAPTERS and GUIDANCE change per phase.
+///
+/// **Per-phase adapter toggling, concurrency-safe.** A single **job-local** base DiT ([`load_dit_base`])
+/// from the provider's exact snapshot/imported source is re-adapted in place between phases:
+/// [`Krea2Transformer::clear_adapters`] drops the prior phase's
+/// forward-time residuals, then [`crate::adapters::install_additive`] pushes the current phase's subset
+/// (empty ⇒ bare base). The shared resident DiT is NEVER touched, so this races no concurrent generate —
+/// the candle realization of MLX's per-phase-clone intent (candle's DiT is not a cheap `Clone`, so it
+/// re-adapts one job-local DiT instead of cloning the resident per phase).
+///
+/// **Per-phase guidance.** `guidance > 0` runs the true-CFG two-forward path (cond + uncond combined by
+/// the reference `krea_cfg_combine`); `guidance == 0` collapses to a single conditional forward. The
+/// caller encodes `neg_context` iff any phase uses CFG — a CFG phase with no negative context is a loud
+/// error (never a silent wrong render).
+///
+/// Multi-phase renders from pure noise and never routes the PiD decoder (rejected up front by
+/// `validate_phases`), so decode is always the native Qwen-VAE. `req.count` images, one per seed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_multiphase(
+    vae: &QwenVae,
+    root: &Path,
+    native_dit: Option<&gen_core::PinnedWeightsFile>,
+    quant: Option<gen_core::Quant>,
+    device: &Device,
+    resolved: &[crate::multiphase::ResolvedPhase],
+    all_specs: &[AdapterSpec],
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let mut on_adapter_state =
+        |_, _: &[AdapterSpec], _: &crate::adapters::AdditiveReport, _: &mut Krea2Transformer| {};
+    let mut decode = |latent: &Tensor| {
+        let decoded = decode_via_seam(vae, None, latent, None, Some(&req.cancel))?;
         to_image(&decoded)
-    })
+    };
+    render_multiphase_driver(
+        root,
+        native_dit,
+        quant,
+        device,
+        resolved,
+        all_specs,
+        context,
+        neg_context,
+        req,
+        on_progress,
+        DIT_DTYPE,
+        &mut on_adapter_state,
+        &mut decode,
+    )
 }
 
 /// Render the **Raw img2img** (reference-guided latent-init under full classifier-free guidance) path
@@ -1592,10 +2109,13 @@ fn render_base_img2img_from_contexts(
             )?
         };
         on_progress(Progress::Decoding);
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            comps.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -1828,10 +2348,13 @@ fn render_edit_from_context(
         // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
         // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
         // `[1,3,4H,4W]` tensor and `to_image` reads the size from it — matching `render` / `render_base`.
-        let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&lat)?,
-            None => heavy.vae.decode(&lat)?.to_dtype(DType::F32)?,
-        };
+        let decoded = decode_via_seam(
+            heavy.vae.as_ref(),
+            pid_decoder.as_ref().map(|pid| pid as &dyn LatentDecoder),
+            &lat,
+            None,
+            Some(&req.cancel),
+        )?;
         to_image(&decoded)
     })
 }
@@ -2099,6 +2622,42 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
     )
 }
 
+/// Route both the native Qwen VAE and an optional PiD override through the same decoder seam. A
+/// selected native tile tuple becomes a typed [`gen_core::tiling::TilingConfig`]; decoders with their
+/// own policy inherit the trait's forwarding default and ignore that native geometry. The untiled
+/// default remains the exact historical `decode` call.
+fn decode_via_seam(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    latents: &Tensor,
+    tile: Option<(u32, u32)>,
+    cancel: Option<&gen_core::CancelFlag>,
+) -> Result<Tensor> {
+    if cancel.is_some_and(gen_core::CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    let decoder: &dyn LatentDecoder = decoder.unwrap_or(native);
+    candle_gen::ensure_decoder_compatible(
+        Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let decoded = match tile {
+        Some((edge, overlap)) => {
+            let tiling = gen_core::tiling::TilingConfig::spatial_only(
+                edge.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Krea decode tile edge {edge} exceeds i32"))
+                })?,
+                overlap.try_into().map_err(|_| {
+                    CandleError::Msg(format!("Krea decode overlap {overlap} exceeds i32"))
+                })?,
+            );
+            decoder.decode_tiled(latents, &tiling, cancel)?
+        }
+        None => decoder.decode(latents)?,
+    };
+    Ok(decoded.to_dtype(DType::F32)?)
+}
+
 /// Convert a decoded pixel tensor `[1, 3, H, W]` in `[-1, 1]` (f32) → RGB8 [`Image`]. Shared by the
 /// native VAE decode (`QwenVae::decode` applies the per-channel `z·std + mean` de-normalize internally)
 /// and the PiD super-resolving decode (which already emits `[-1, 1]` pixels, possibly at 4× the size).
@@ -2124,7 +2683,476 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(CandleError::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
+
+    #[test]
+    fn selected_text_encoder_admission_is_exact_and_uses_the_builtin_default() {
+        let fixture = tempfile::tempdir().unwrap();
+        let builtin = fixture.path().join("text_encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&builtin, crate::ENCODER_CONTRACT)
+            .unwrap();
+
+        let default = resolve_components_text_encoder(fixture.path(), None).unwrap();
+        default
+            .read_unchanged::<(), gen_core::Error>(|source| match source {
+                gen_core::WeightsSource::Dir(path) if path == &builtin => Ok(()),
+                other => Err(gen_core::Error::Msg(format!(
+                    "unexpected builtin encoder source: {other:?}"
+                ))),
+            })
+            .unwrap();
+
+        let compatible = fixture.path().join("compatible-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&compatible, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let selected = resolve_components_text_encoder(
+            fixture.path(),
+            Some(&gen_core::WeightsSource::Dir(compatible.clone())),
+        )
+        .unwrap();
+        selected
+            .read_unchanged::<(), gen_core::Error>(|source| match source {
+                gen_core::WeightsSource::Dir(path) if path == &compatible => Ok(()),
+                other => Err(gen_core::Error::Msg(format!(
+                    "unexpected selected encoder source: {other:?}"
+                ))),
+            })
+            .unwrap();
+
+        let incompatible = fixture.path().join("incompatible-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &incompatible,
+            gen_core::EncoderContract {
+                hidden_size: crate::ENCODER_CONTRACT.hidden_size + 1,
+                ..crate::ENCODER_CONTRACT
+            },
+        )
+        .unwrap();
+        let error = resolve_components_text_encoder(
+            fixture.path(),
+            Some(&gen_core::WeightsSource::Dir(incompatible)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+    }
+
+    struct DecodeSpy {
+        output: Tensor,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Tensor) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&gen_core::LatentSpace> {
+            Some(&gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Tensor) -> Result<Tensor> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_image(decoder: &dyn LatentDecoder, latents: &Tensor) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: the actual Krea decode helper stays byte-identical to each historical match arm.
+    /// The asymmetric NCHW fixture detects channel/layout changes, while the larger PiD fixture proves
+    /// override precedence and dynamic output sizing survive a caller-selected native tile policy.
+    #[test]
+    fn decode_route_keeps_native_and_pid_bytes_exact() {
+        let device = Device::Cpu;
+        let latents = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        let native_values = vec![
+            -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+            0.25, 0.75, -1.0, 1.0,
+        ];
+        let native_output = Tensor::from_vec(native_values, (1, 3, 2, 3), &device).unwrap();
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_image(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let got = decode_via_seam(&native, None, &latents, None, None).unwrap();
+        assert_eq!(to_image(&got).unwrap(), expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), DType::F32, &device).unwrap());
+        let pid_output = Tensor::ones((1, 3, 4, 5), DType::F32, &device).unwrap();
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_image(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let cancel = gen_core::CancelFlag::default();
+        let got =
+            decode_via_seam(&native, Some(&pid), &latents, Some((16, 4)), Some(&cancel)).unwrap();
+        assert_eq!(to_image(&got).unwrap(), expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
+
+    #[test]
+    fn native_file_entrypoint_postchecks_after_provider_payload_consumption() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, source, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let replacement = tmp.path().join("tiny-native.replacement.safetensors");
+        std::fs::copy(&source, &replacement).unwrap();
+        let pinned = gen_core::PinnedWeightsFile::pin(&source).unwrap();
+
+        let first_consumed = Arc::new(Barrier::new(2));
+        let replacement_done = Arc::new(Barrier::new(2));
+        let payload_consumed = Arc::new(AtomicBool::new(false));
+        let writer_first = Arc::clone(&first_consumed);
+        let writer_done = Arc::clone(&replacement_done);
+        let writer_source = source.clone();
+        let writer = std::thread::spawn(move || {
+            writer_first.wait();
+            #[cfg(unix)]
+            std::fs::rename(replacement, writer_source).unwrap();
+            #[cfg(not(unix))]
+            {
+                let bytes = std::fs::read(replacement).unwrap();
+                std::fs::write(writer_source, bytes).unwrap();
+            }
+            writer_done.wait();
+        });
+
+        let hook_first = Arc::clone(&first_consumed);
+        let hook_done = Arc::clone(&replacement_done);
+        let hook_consumed = Arc::clone(&payload_consumed);
+        NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |weights, device| {
+                let first = weights
+                    .get("img_in.weight")?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(!first.is_empty());
+                device.synchronize()?;
+                hook_consumed.store(true, Ordering::SeqCst);
+                hook_first.wait();
+                hook_done.wait();
+                Ok(())
+            }));
+        });
+
+        let result =
+            load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], None, false, DType::F32);
+        NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        writer.join().unwrap();
+
+        assert!(payload_consumed.load(Ordering::SeqCst));
+        let error = result
+            .err()
+            .expect("mid-load replacement must invalidate the production native-file entrypoint")
+            .to_string();
+        assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn request_scoped_residencies_keep_multiphase_on_the_pinned_native_loader() {
+        use candle_gen::gen_core::{AdapterKind, GenerationPhase, PhaseAdapter};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        struct DropWitness {
+            event: &'static str,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                candle_gen::lock_recover(&self.log).push(self.event);
+            }
+        }
+        struct ResidentHeavy {
+            // Keep an actually loaded provider DiT under the residency owner, exactly as the real
+            // heavy bundle does. The job-local render DiT below is deliberately a second load.
+            _dit: Krea2Transformer,
+            _release: DropWitness,
+        }
+
+        fn write_lora(
+            tmp: &tempfile::TempDir,
+            file: &str,
+            target: &str,
+            out_dim: usize,
+            sign: f32,
+        ) -> PathBuf {
+            let path = tmp.path().join(file);
+            let down = Tensor::from_vec(vec![0.05f32; 32], (1, 32), &Device::Cpu).unwrap();
+            let up = Tensor::from_vec(vec![sign * 0.05f32; out_dim], (out_dim, 1), &Device::Cpu)
+                .unwrap();
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([
+                    (format!("{target}.lora_A.weight"), down),
+                    (format!("{target}.lora_B.weight"), up),
+                ]),
+                &path,
+            )
+            .unwrap();
+            path
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, imported, cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        assert_eq!(
+            multiphase_dit_source(&root, Some(&pinned)),
+            MultiphaseDitSource::NativeFile(Box::new(pinned.clone()))
+        );
+        assert!(
+            !root.join("transformer/model.safetensors").exists(),
+            "fixture must make snapshot fallback impossible"
+        );
+
+        let adapter_a = AdapterSpec::new(
+            write_lora(
+                &tmp,
+                "phase-a.safetensors",
+                "transformer_blocks.0.attn.to_q",
+                cfg.q_dim(),
+                1.0,
+            ),
+            1.0,
+            AdapterKind::Lora,
+        );
+        let adapter_b = AdapterSpec::new(
+            write_lora(
+                &tmp,
+                "phase-b.safetensors",
+                "transformer_blocks.0.attn.to_k",
+                cfg.kv_dim(),
+                -1.0,
+            ),
+            1.0,
+            AdapterKind::Lora,
+        );
+        let all_specs = vec![adapter_a.clone(), adapter_b.clone()];
+        let resolved = crate::multiphase::resolve_phases(
+            &[
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![PhaseAdapter {
+                        adapter: 0,
+                        weight: None,
+                    }],
+                },
+                GenerationPhase {
+                    steps: 1,
+                    guidance: Some(0.0),
+                    adapters: vec![PhaseAdapter {
+                        adapter: 1,
+                        weight: Some(0.75),
+                    }],
+                },
+            ],
+            0.0,
+            all_specs.len(),
+            "krea_2_raw",
+        )
+        .unwrap();
+
+        // Exercise both request-scoped production residency arms. Each owns a real native-loaded
+        // resident DiT, while the render closure invokes the exact production multi-phase driver:
+        // native pin, generated noise, global schedule, phase adapter transitions, sampler forwards,
+        // decoder boundary, and explicit final adapter release. Only BF16 and VAE decode are swapped
+        // for CPU-executable F32 and an identity decoder.
+        for stage_residency in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let text_log = Arc::clone(&log);
+            let heavy_log = Arc::clone(&log);
+            let heavy_root = root.clone();
+            let heavy_pin = pinned.clone();
+            let residency = candle_gen::Residency::<DropWitness, ResidentHeavy>::request_scoped(
+                move |_| {
+                    candle_gen::lock_recover(&text_log).push("load-text");
+                    Ok(DropWitness {
+                        event: "drop-text",
+                        log: Arc::clone(&text_log),
+                    })
+                },
+                move |_, _| {
+                    candle_gen::lock_recover(&heavy_log).push("load-heavy");
+                    Ok(ResidentHeavy {
+                        _dit: load_dit_base(&heavy_root, Some(&heavy_pin), &Device::Cpu, None)?,
+                        _release: DropWitness {
+                            event: "drop-heavy",
+                            log: Arc::clone(&heavy_log),
+                        },
+                    })
+                },
+            );
+
+            residency
+                .run_request_scoped(
+                    stage_residency,
+                    false,
+                    &gen_core::CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |_| {
+                        candle_gen::lock_recover(&log).push("encode");
+                        Ok(())
+                    },
+                    |_| {
+                        candle_gen::lock_recover(&log).push("materialize-encoding");
+                        Ok(())
+                    },
+                    |_, _, _| {
+                        candle_gen::lock_recover(&log).push("render");
+                        // CPU Candle cannot execute BF16 matmul. Keep the resident-side load above on
+                        // the exact production BF16 entry point, then run the production driver at F32.
+                        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+                        let context = context.unsqueeze(0)?;
+                        let request = GenerationRequest {
+                            width: 32,
+                            height: 32,
+                            count: 1,
+                            seed: Some(0x5eed),
+                            ..Default::default()
+                        };
+                        let adapter_log = Arc::clone(&log);
+                        let mut on_adapter_state =
+                            |phase: Option<usize>,
+                             specs: &[AdapterSpec],
+                             report: &crate::adapters::AdditiveReport,
+                             dit: &mut Krea2Transformer| {
+                                match phase {
+                                    Some(0) => {
+                                        assert_eq!(specs.len(), 1);
+                                        assert_eq!(specs[0].path, all_specs[0].path);
+                                        assert_eq!(report.applied, 1);
+                                        assert!(dit.adapted_projection_count().unwrap() > 0);
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("materialize-phase-a");
+                                    }
+                                    Some(1) => {
+                                        assert_eq!(specs.len(), 1);
+                                        assert_eq!(specs[0].path, all_specs[1].path);
+                                        assert_eq!(specs[0].scale, 0.75);
+                                        assert_eq!(report.applied, 1);
+                                        assert!(dit.adapted_projection_count().unwrap() > 0);
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("materialize-phase-b");
+                                    }
+                                    None => {
+                                        assert!(specs.is_empty());
+                                        assert_eq!(report.applied, 0);
+                                        assert_eq!(dit.adapted_projection_count().unwrap(), 0);
+                                        candle_gen::lock_recover(&adapter_log)
+                                            .push("release-phase-adapters");
+                                    }
+                                    Some(index) => panic!("unexpected phase {index}"),
+                                }
+                            };
+                        let mut decode = |latent: &Tensor| -> Result<Tensor> {
+                            assert_eq!(latent.dims(), &[1, LATENT_CHANNELS, 4, 4]);
+                            Ok(latent.clone())
+                        };
+                        let images = render_multiphase_driver(
+                            &root,
+                            Some(&pinned),
+                            None,
+                            &Device::Cpu,
+                            &resolved,
+                            &all_specs,
+                            &context,
+                            None,
+                            &request,
+                            &mut |_| {},
+                            DType::F32,
+                            &mut on_adapter_state,
+                            &mut decode,
+                        )?;
+                        assert_eq!(images.len(), 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+
+            let before_owner_drop = candle_gen::lock_recover(&log).clone();
+            let phase_a = before_owner_drop
+                .iter()
+                .position(|event| *event == "materialize-phase-a")
+                .unwrap();
+            let phase_b = before_owner_drop
+                .iter()
+                .position(|event| *event == "materialize-phase-b")
+                .unwrap();
+            let released = before_owner_drop
+                .iter()
+                .position(|event| *event == "release-phase-adapters")
+                .unwrap();
+            assert!(phase_a < phase_b && phase_b < released);
+            if stage_residency {
+                let text_drop = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "drop-text")
+                    .unwrap();
+                let heavy_load = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "load-heavy")
+                    .unwrap();
+                let heavy_drop = before_owner_drop
+                    .iter()
+                    .position(|event| *event == "drop-heavy")
+                    .unwrap();
+                assert!(text_drop < heavy_load && released < heavy_drop);
+            } else {
+                assert!(!before_owner_drop.contains(&"drop-text"));
+                assert!(!before_owner_drop.contains(&"drop-heavy"));
+            }
+            drop(residency);
+            let after_owner_drop = candle_gen::lock_recover(&log);
+            assert!(after_owner_drop.contains(&"drop-text"));
+            assert!(after_owner_drop.contains(&"drop-heavy"));
+        }
+    }
 
     #[test]
     fn calibration_faults_are_request_local_and_default_path_is_inert() {

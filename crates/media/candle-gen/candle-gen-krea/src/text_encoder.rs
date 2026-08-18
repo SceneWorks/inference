@@ -78,7 +78,7 @@ impl KreaTeConfig {
     }
 
     /// Parse `<root>/text_encoder/config.json` (`text_config`) + `<root>/model_index.json`
-    /// (`text_encoder_select_layers`); missing scalars fall back to [`Self::qwen3_vl_4b`].
+    /// (`text_encoder_select_layers`). Architecture scalars are required and fail closed.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let path = root.join("text_encoder").join("config.json");
@@ -90,22 +90,45 @@ impl KreaTeConfig {
         })?;
         let tc = v.get("text_config").unwrap_or(&v);
         let d = Self::qwen3_vl_4b();
-        let u = |k: &str, dflt: usize| {
+        let required_usize = |k: &str| -> Result<usize> {
             tc.get(k)
                 .and_then(serde_json::Value::as_u64)
-                .map(|n| n as usize)
-                .unwrap_or(dflt)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!(
+                        "krea te: {} missing required integer {k}",
+                        path.display()
+                    ))
+                })
         };
+        for (field, expected) in [
+            ("hidden_size", 2560),
+            ("intermediate_size", 9728),
+            ("vocab_size", 151_936),
+        ] {
+            let actual = required_usize(field)?;
+            if actual != expected {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea te: {} field {field} expected {expected}, got {actual}",
+                    path.display()
+                )));
+            }
+        }
 
         let mut cfg = Self {
-            num_layers: u("num_hidden_layers", d.num_layers),
-            num_heads: u("num_attention_heads", d.num_heads),
-            num_kv_heads: u("num_key_value_heads", d.num_kv_heads),
-            head_dim: u("head_dim", d.head_dim),
+            num_layers: required_usize("num_hidden_layers")?,
+            num_heads: required_usize("num_attention_heads")?,
+            num_kv_heads: required_usize("num_key_value_heads")?,
+            head_dim: required_usize("head_dim")?,
             rms_norm_eps: tc
                 .get("rms_norm_eps")
                 .and_then(serde_json::Value::as_f64)
-                .unwrap_or(d.rms_norm_eps),
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!(
+                        "krea te: {} missing required number rms_norm_eps",
+                        path.display()
+                    ))
+                })?,
             // `text_config.rope_theta` is null on disk; honor `rope_parameters`/`rope_scaling` if set,
             // else the qwen3_vl_text default (5e6).
             rope_theta: tc
@@ -123,15 +146,25 @@ impl KreaTeConfig {
             image_token_id: v
                 .get("image_token_id")
                 .and_then(serde_json::Value::as_u64)
-                .map(|n| n as u32)
-                .unwrap_or(d.image_token_id),
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!(
+                        "krea te: {} missing required integer image_token_id",
+                        path.display()
+                    ))
+                })?,
             mrope_section: tc
                 .get("rope_parameters")
                 .or_else(|| tc.get("rope_scaling"))
                 .and_then(|r| r.get("mrope_section"))
                 .and_then(serde_json::Value::as_array)
                 .and_then(|a| read_mrope_section(a))
-                .unwrap_or(d.mrope_section),
+                .ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(format!(
+                        "krea te: {} missing required three-value mrope_section",
+                        path.display()
+                    ))
+                })?,
         };
 
         // `text_encoder_select_layers` lives in the pipeline manifest. A genuinely-absent
@@ -387,6 +420,41 @@ impl KreaTextEncoder {
         })
     }
 
+    /// Build the dense encoder on CPU, fold every advertised projection directly onto the compute
+    /// device, and migrate only dense-kept leaves. This avoids a full dense-TE CUDA transient.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        self.embed_tokens.to_device(device)?;
+        for layer in &mut self.layers {
+            for projection in [
+                &mut layer.attn.q_proj,
+                &mut layer.attn.k_proj,
+                &mut layer.attn.v_proj,
+                &mut layer.attn.o_proj,
+                &mut layer.mlp.gate,
+                &mut layer.mlp.up,
+                &mut layer.mlp.down,
+            ] {
+                projection.quantize_onto(quant, device)?;
+            }
+            layer.input_ln = layer.input_ln.to_device(device)?;
+            layer.post_ln = layer.post_ln.to_device(device)?;
+            layer.attn.q_norm = layer.attn.q_norm.to_device(device)?;
+            layer.attn.k_norm = layer.attn.k_norm.to_device(device)?;
+        }
+        self.rotary = Rotary::new(
+            self.head_dim,
+            self.rope_theta,
+            crate::pipeline::MAX_TEXT_TOKENS,
+            device,
+        )?;
+        self.device = device.clone();
+        Ok(())
+    }
+
     /// `input_ids`: `[1, S]` u32. Returns the stacked conditioning `[1, S - prefix_tokens, num_select,
     /// hidden]` (the DiT's `context`), f32. The final norm is never applied; only layers up to
     /// `max(out_layers)` are run. Causal (decoder-only); no padding (the candle tokenizer emits none).
@@ -549,10 +617,10 @@ mod tests {
             .path()
             .join(format!("krea_te_{name}_{:?}", std::thread::current().id()));
         std::fs::create_dir_all(tmp.join("text_encoder")).unwrap();
-        // A minimal valid text_encoder/config.json (missing scalars default to qwen3_vl_4b).
+        // A minimal validation-complete Krea text-encoder config.
         std::fs::write(
             tmp.join("text_encoder").join("config.json"),
-            br#"{"text_config": {}}"#,
+            br#"{"image_token_id":151655,"text_config":{"hidden_size":2560,"intermediate_size":9728,"vocab_size":151936,"num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"rms_norm_eps":0.000001,"rope_parameters":{"mrope_section":[24,20,20]}}}"#,
         )
         .unwrap();
         tmp
@@ -587,6 +655,22 @@ mod tests {
         let tmp = te_snapshot_tmp(&tmp, "idx_corrupt");
         std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
         assert!(KreaTeConfig::from_snapshot(&tmp).is_err());
+    }
+
+    #[test]
+    fn from_snapshot_rejects_missing_architecture_scalar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = te_snapshot_tmp(&tmp, "missing_hidden");
+        let path = tmp.join("text_encoder/config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hidden_size");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = KreaTeConfig::from_snapshot(&tmp).unwrap_err().to_string();
+        assert!(error.contains("hidden_size"), "{error}");
     }
 
     #[test]

@@ -9,42 +9,498 @@ use candle_gen::gen_core::{
     self, LoadSpec, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, Precision, Quant, WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     LoadShape, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges,
     MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
 };
+use gen_core::MemoryPhase;
+#[cfg(any(feature = "cuda", test))]
+use gen_core::MemoryRequestScope;
 #[cfg(test)]
 use gen_core::{GenerationMemory, GenerationRequest, MemoryGeometry, MemoryRunOutcome};
-#[cfg(any(feature = "cuda", test))]
-use gen_core::{MemoryPhase, MemoryRequestScope};
 
 pub(crate) const DECODE_TILE_EDGE: u32 = 512;
 pub(crate) const DECODE_OVERLAP: u32 = 128;
 pub(crate) const ATTENTION_CHUNK_SIZE: u32 =
     gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
-#[cfg(any(feature = "cuda", test))]
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
-#[cfg(any(feature = "cuda", test))]
+fn ordinary_streamable(spec: &LoadSpec) -> bool {
+    spec.precision == Precision::Bf16
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && spec.quantize.is_none()
+        && spec.pid.is_none()
+        && spec.control.is_none()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.components.is_empty()
+}
+
+fn control_streamable(spec: &LoadSpec) -> bool {
+    spec.precision == Precision::Bf16
+        && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && spec.quantize.is_none()
+        && spec.adapters.is_empty()
+        && spec.pid.is_none()
+        && spec.control.is_some()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.components.is_empty()
+}
+
+fn set_transformer_streamability(contract: &mut MemoryProviderContract, streamable: bool) {
+    let capability = contract
+        .strategies
+        .iter_mut()
+        .find(|capability| capability.strategy == MemoryStrategy::BoundedTransformerResidency)
+        .expect("Z-Image contracts always publish the complete strategy ladder");
+    capability.support = if streamable {
+        MemoryStrategySupport::Implemented
+    } else {
+        MemoryStrategySupport::Missing
+    };
+    capability.parameters.transformer_window_sizes = if streamable {
+        TRANSFORMER_WINDOW_SIZES.to_vec()
+    } else {
+        Vec::new()
+    };
+    contract.lifecycle.transformer_window_materialization = streamable;
+}
+
+fn surface_selector_matches_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
+        gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Msg(format!(
+            "Z-Image memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Convert the generic finite-surface witness into the executable Z-Image load shape.
+///
+/// Q4/Q8 are already-packed artifact tiers selected before provider load. They therefore reach the
+/// real loader with `quantize == None`; retaining the generic witness' `Some(Q4|Q8)` here would mean
+/// unsupported on-the-fly packing of a dense source.
+fn normalized_surface_spec(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<LoadSpec> {
+    surface_selector_matches_spec(surface)?;
+    let mut spec = surface.spec.clone();
+    spec.quantize = None;
+    Ok(spec)
+}
+
+pub(crate) fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let spec = normalized_surface_spec(surface)?;
+    provider_contract(provider_id, &spec)
+}
+
+pub(crate) fn weights_free_control_surface_contract(
+    provider_id: &str,
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let spec = normalized_surface_spec(surface)?;
+    if spec.control.is_none() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: control contract surface is missing its mandatory control source"
+        )));
+    }
+    control_contract(provider_id, &spec)
+}
+
+fn imported_tensor_bytes(
+    tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    loaded_name: &str,
+    component: &str,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+
+    // `candle_core::safetensors::load` first materializes every source tensor. U16 is promoted to
+    // Candle's U32 storage; the remaining accepted integer widths stay native. Every float then
+    // passes through `normalize_fp8_map(..., BF16)`, including dense f32/f64 and plain/scaled fp8.
+    let loaded = match tensor.dtype {
+        Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
+        Dtype::U16 => tensor.materialized_bytes(4)?,
+        Dtype::F8_E4M3 | Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64 => {
+            tensor.materialized_bytes(2)?
+        }
+        dtype => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "z-image imported {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                tensor.name
+            )))
+        }
+    };
+    // Test the key *after* any combined-checkpoint component prefix is stripped. That is the key
+    // `normalize_fp8_map` sees, so a combined `model.diffusion_model.scaled_fp8` marker is omitted
+    // exactly like a standalone transformer's unprefixed `scaled_fp8` marker.
+    if loaded_name == "scaled_fp8"
+        || loaded_name.ends_with(".scale_weight")
+        || loaded_name.ends_with(".weight_scale")
+        || loaded_name.ends_with(".scale_input")
+        || loaded_name.ends_with(".input_scale")
+    {
+        Ok(0)
+    } else {
+        Ok(loaded)
+    }
+}
+
+fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    imported_tensor_headers_bytes(&headers, component, &path.display().to_string())
+}
+
+fn imported_tensor_headers_bytes(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    component: &str,
+    source: &str,
+) -> gen_core::Result<u64> {
+    let bytes = headers.iter().try_fold(0_u64, |total, tensor| {
+        total
+            .checked_add(imported_tensor_bytes(tensor, &tensor.name, component)?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "z-image imported {component} resident byte sum overflow"
+                ))
+            })
+    })?;
+    if bytes == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "z-image imported {component} '{source}' contains no tensor bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn materialized_text_encoder_headers_bytes(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> gen_core::Result<u64> {
+    use std::collections::{HashMap, HashSet};
+
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<HashMap<_, _>>();
+    let packed_bases = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .collect::<HashSet<_>>();
+    let group_size = crate::ENCODER_CONTRACT
+        .packing
+        .expect("Z-Image's executable encoder contract is packable")
+        .group_size;
+    let bytes = headers.iter().try_fold(0_u64, |total, header| {
+        if header
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| header.name.strip_suffix(".biases"))
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            return Ok(total);
+        }
+        let resident = if let Some(base) = header
+            .name
+            .strip_suffix(".weight")
+            .filter(|base| packed_bases.contains(base))
+        {
+            let scales_name = format!("{base}.scales");
+            let biases_name = format!("{base}.biases");
+            let scales = by_name.get(scales_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "z-image packed text-encoder weight {:?} is missing {scales_name:?}",
+                    header.name
+                ))
+            })?;
+            let biases = by_name.get(biases_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "z-image packed text-encoder weight {:?} is missing {biases_name:?}",
+                    header.name
+                ))
+            })?;
+            candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                header, scales, biases, group_size,
+            )?
+        } else {
+            imported_tensor_bytes(header, &header.name, "text encoder")?
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            gen_core::Error::Msg("z-image text-encoder resident byte sum overflow".into())
+        })
+    })?;
+    if bytes == 0 {
+        return Err(gen_core::Error::Msg(
+            "z-image validated text encoder contains no materialized tensor bytes".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn selected_encoder_has_authoritative_config(source: &WeightsSource) -> bool {
+    match source {
+        WeightsSource::File(path) => path
+            .parent()
+            .is_some_and(|parent| parent.join("config.json").is_file()),
+        WeightsSource::Dir(path) => {
+            path.join("config.json").is_file() || path.join("text_encoder/config.json").is_file()
+        }
+    }
+}
+
+/// Exact Candle materialization for a source that carries the behavior evidence required by the
+/// executable encoder contract. `None` preserves the catalog's weights-free declaration seam for a
+/// path that has no authored config yet; any real, authored source is validated and projected from
+/// the precise 36-layer language surface rather than its raw shard inventory.
+fn validated_materialized_text_encoder_bytes(
+    source: &WeightsSource,
+    comfyui_file: bool,
+) -> gen_core::Result<Option<u64>> {
+    let selected = if comfyui_file && matches!(source, WeightsSource::File(_)) {
+        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(source)?;
+        if headers
+            .iter()
+            .any(|header| header.name == "model.embed_tokens.weight")
+        {
+            crate::ENCODER_CONTRACT.validate_comfyui_source(source)?
+        } else if selected_encoder_has_authoritative_config(source) {
+            crate::ENCODER_CONTRACT.validate_source_for_planning(source)?
+        } else {
+            return Ok(None);
+        }
+    } else if selected_encoder_has_authoritative_config(source) {
+        crate::ENCODER_CONTRACT.validate_source_for_planning(source)?
+    } else {
+        return Ok(None);
+    };
+    let headers = selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
+    materialized_text_encoder_headers_bytes(&headers).map(Some)
+}
+
+fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerComponentBytes> {
+    let mut components = PerComponentBytes::default();
+    let mut mapped_text_encoder_headers = Vec::new();
+    let mut mapped_keys = [
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    ];
+    for tensor in gen_core::weightsmeta::safetensors_path_tensor_headers(path)? {
+        let Some((component, mapped)) = crate::comfyui::combined_component_key(&tensor.name) else {
+            return Err(gen_core::Error::Msg(format!(
+                "z-image combined checkpoint tensor {:?} has no component mapping",
+                tensor.name
+            )));
+        };
+        if mapped.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "z-image combined checkpoint tensor {:?} maps to an empty component key",
+                tensor.name
+            )));
+        }
+        let (component_index, component_name) = match component {
+            crate::comfyui::CombinedComponent::Transformer => (0, "transformer"),
+            crate::comfyui::CombinedComponent::TextEncoder => (1, "text encoder"),
+            crate::comfyui::CombinedComponent::Vae => (2, "VAE"),
+        };
+        if !mapped_keys[component_index].insert(mapped.to_owned()) {
+            return Err(gen_core::Error::Msg(format!(
+                "z-image combined checkpoint tensor {:?} collides at {component_name} key {mapped:?}",
+                tensor.name
+            )));
+        }
+        match component {
+            crate::comfyui::CombinedComponent::Transformer => {
+                let resident_bytes = imported_tensor_bytes(&tensor, mapped, component_name)?;
+                components.dit = components.dit.checked_add(resident_bytes).ok_or_else(|| {
+                    gen_core::Error::Msg(
+                        "z-image combined transformer resident byte sum overflow".into(),
+                    )
+                })?
+            }
+            crate::comfyui::CombinedComponent::TextEncoder => {
+                mapped_text_encoder_headers.push(gen_core::weightsmeta::SafetensorsTensorHeader {
+                    name: mapped.to_owned(),
+                    ..tensor
+                });
+            }
+            crate::comfyui::CombinedComponent::Vae => {
+                let resident_bytes = imported_tensor_bytes(&tensor, mapped, component_name)?;
+                components.vae = components.vae.checked_add(resident_bytes).ok_or_else(|| {
+                    gen_core::Error::Msg("z-image combined VAE resident byte sum overflow".into())
+                })?
+            }
+        }
+    }
+    components.text_encoder = if mapped_text_encoder_headers
+        .iter()
+        .any(|header| header.name == "model.embed_tokens.weight")
+    {
+        crate::ENCODER_CONTRACT
+            .validate_embedded_comfyui_file(path, crate::comfyui::COMBINED_TEXT_ENCODER_PREFIXES)?;
+        let headers = crate::ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&mapped_text_encoder_headers)?;
+        materialized_text_encoder_headers_bytes(&headers)?
+    } else {
+        imported_tensor_headers_bytes(
+            &mapped_text_encoder_headers,
+            "text encoder",
+            "combined checkpoint mapped inventory",
+        )?
+    };
+    for (component, bytes) in [
+        ("transformer", components.dit),
+        ("text encoder", components.text_encoder),
+        ("VAE", components.vae),
+    ] {
+        if bytes == 0 {
+            return Err(gen_core::Error::Msg(format!(
+                "z-image combined checkpoint '{}' is missing the {component} component",
+                path.display()
+            )));
+        }
+    }
+    Ok(components)
+}
+
+fn imported_file_components(
+    spec: &LoadSpec,
+    primary: &std::path::Path,
+    provider_id: &str,
+) -> gen_core::Result<PerComponentBytes> {
+    let _ = gen_core::require_base_snapshot(spec, provider_id)?;
+    let legacy_text_encoder = spec
+        .components
+        .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+    if spec.text_encoder.is_some() && legacy_text_encoder.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{}'",
+            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT
+        )));
+    }
+    let text_encoder = spec.text_encoder.as_ref().or(legacy_text_encoder);
+    let vae = spec.components.get(gen_core::COMFYUI_VAE_COMPONENT);
+    let text_encoder_bytes = |source: &WeightsSource| -> gen_core::Result<u64> {
+        if let Some(bytes) = validated_materialized_text_encoder_bytes(source, true)? {
+            return Ok(bytes);
+        }
+        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(source)?;
+        imported_tensor_headers_bytes(&headers, "text encoder", "direct-shard inventory")
+    };
+    match (text_encoder, vae) {
+        (None, None) => {
+            spec.read_file_unchanged_if_prepared(primary, combined_file_components)
+        }
+        (Some(text_encoder), Some(WeightsSource::File(vae))) => {
+            Ok(PerComponentBytes {
+                text_encoder: text_encoder_bytes(text_encoder)?,
+                dit: spec.read_file_unchanged_if_prepared(primary, |p| {
+                    single_file_tensor_bytes(p, "transformer")
+                })?,
+                vae: spec.read_file_unchanged_if_prepared(vae, |p| {
+                    single_file_tensor_bytes(p, "VAE")
+                })?,
+            })
+        }
+        (Some(text_encoder), None) => {
+            let mut components =
+                spec.read_file_unchanged_if_prepared(primary, combined_file_components)?;
+            components.text_encoder = text_encoder_bytes(text_encoder)?;
+            Ok(components)
+        }
+        (_, Some(WeightsSource::Dir(path))) => Err(gen_core::Error::Msg(format!(
+            "{provider_id}: component '{}' must be a file, not {}",
+            gen_core::COMFYUI_VAE_COMPONENT,
+            path.display()
+        ))),
+        _ => Err(gen_core::Error::Msg(format!(
+            "{provider_id}: separate ComfyUI import requires a text encoder and '{}', or neither for a combined checkpoint",
+            gen_core::COMFYUI_VAE_COMPONENT
+        ))),
+    }
+}
+
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let streamable = matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && matches!(spec.weights, gen_core::WeightsSource::Dir(_));
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
+    if provider_id == crate::base::MODEL_ID
+        && matches!(spec.weights, gen_core::WeightsSource::File(_))
+    {
+        return Err(gen_core::Error::Msg(
+            "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+             not a single .safetensors file"
+                .into(),
+        ));
+    }
+    // This declaration seam must remain usable before model assets exist locally. Once an authored
+    // config or a contract-complete ComfyUI language signature is present, however, validate and
+    // price the exact materialized surface. Synthetic/catalog-only paths without that evidence keep
+    // the historical raw-inventory fallback and make no validation claim.
+    // File and Dir intentionally retain one provider/calibration identity: the executable provider,
+    // phase graph, and output semantics are the same. The promoted matrix has no load-source axis,
+    // however, so only Dir advertises rung 4 until the pinned/re-openable File path has its own real
+    // measurement. A Dir rung-4 cell must never be relabeled as File evidence.
+    let streamable = ordinary_streamable(spec);
+    let explicit_text_encoder = spec.text_encoder.as_ref();
+    let legacy_text_encoder = spec
+        .components
+        .get(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+    if explicit_text_encoder.is_some() && legacy_text_encoder.is_some() {
+        return Err(gen_core::Error::Msg(format!(
+            "{provider_id}: text encoder was supplied through both LoadSpec::text_encoder and legacy component '{}'",
+            gen_core::COMFYUI_TEXT_ENCODER_COMPONENT
+        )));
+    }
+    let selected_text_encoder = explicit_text_encoder.or(legacy_text_encoder);
+    let components = match &spec.weights {
+        gen_core::WeightsSource::Dir(root) => {
+            let mut components = PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )
             .unwrap_or_default();
+            let builtin = WeightsSource::Dir(root.join("text_encoder"));
+            let effective = selected_text_encoder.unwrap_or(&builtin);
+            if let Some(bytes) = validated_materialized_text_encoder_bytes(effective, false)? {
+                components.text_encoder = bytes;
+            } else if selected_text_encoder.is_some() {
+                components.text_encoder = gen_core::text_encoder_source_bytes(effective)?;
+            }
+            components
+        }
+        gen_core::WeightsSource::File(path) => imported_file_components(spec, path, provider_id)?,
+    };
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -92,6 +548,7 @@ pub(crate) fn provider_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         // PiD replaces the native VAE with a separately planned decoder. Until that decoder accepts
         // this provider's bounded host-decode route, the request safety gate rejects optimized PiD
         // runs.
@@ -156,16 +613,18 @@ pub(crate) fn provider_contract(
 /// Explicit contract for the bespoke dual-network control routes. The control encoder, text encoder,
 /// denoiser, and decoder are phase-loaded; both the base and control main stacks honor the selected
 /// transformer window.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn control_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let mut contract = provider_contract(provider_id, spec)?;
+    set_transformer_streamability(&mut contract, control_streamable(spec));
     let overlay_bytes = match spec.control.as_ref() {
-        Some(gen_core::WeightsSource::Dir(path)) | Some(gen_core::WeightsSource::File(path)) => {
-            gen_core::safetensors_path_bytes(path)
-        }
+        Some(gen_core::WeightsSource::Dir(path)) => gen_core::safetensors_path_bytes(path),
+        Some(gen_core::WeightsSource::File(path)) => spec
+            .read_file_unchanged_if_prepared(path, |p| -> gen_core::Result<u64> {
+                Ok(gen_core::safetensors_path_bytes(p))
+            })?,
         None => 0,
     };
     contract.asset_facts.base_bytes = contract
@@ -295,11 +754,7 @@ pub(crate) fn snapshot_quant_tier(
 ) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{provider_id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     crate::pipeline::packed_config_at(root, "transformer")
         .map_err(gen_core::Error::backend)?
@@ -313,7 +768,6 @@ pub(crate) fn snapshot_quant_tier(
         .transpose()
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -336,6 +790,7 @@ pub(crate) fn registered_valid_fixture(
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
+    let is_control = contract.provider_id.ends_with("_control");
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -345,8 +800,12 @@ pub(crate) fn registered_valid_fixture(
             component_precision_floors: &[],
         },
         gen_core::MemoryBehaviorRoute {
-            mode: gen_core::MemoryMode::TextToImage,
-            reference_count: 0,
+            mode: if is_control {
+                gen_core::MemoryMode::ImageToImage
+            } else {
+                gen_core::MemoryMode::TextToImage
+            },
+            reference_count: u32::from(is_control),
             use_pid: false,
             has_phases: false,
             overlay: None,
@@ -392,6 +851,666 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
+    }
+
+    fn rung_four_support(contract: &MemoryProviderContract) -> MemoryStrategySupport {
+        contract
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .expect("rung four")
+            .support
+            .clone()
+    }
+
+    #[test]
+    fn production_streamability_fails_closed_on_unsupported_load_axes() {
+        let eligible = spec();
+        assert!(ordinary_streamable(&eligible));
+
+        let mut adapted = eligible.clone();
+        adapted.adapters.push(gen_core::AdapterSpec::new(
+            "/adapter.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        assert!(ordinary_streamable(&adapted), "plain Z replays adapters");
+
+        let mut external_text_encoder = eligible.clone();
+        external_text_encoder.text_encoder = Some(WeightsSource::Dir("/text-encoder".into()));
+        assert!(
+            ordinary_streamable(&external_text_encoder),
+            "validated external text encoders remain a supported Z surface"
+        );
+
+        let mut identity = eligible.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        let ineligible = [
+            eligible.clone().with_quant(Quant::Q4),
+            eligible.clone().with_pid(
+                WeightsSource::File("/pid.safetensors".into()),
+                WeightsSource::Dir("/gemma".into()),
+            ),
+            eligible
+                .clone()
+                .with_control(WeightsSource::File("/control.safetensors".into())),
+            eligible
+                .clone()
+                .with_extra_control(WeightsSource::File("/control-2.safetensors".into())),
+            eligible
+                .clone()
+                .with_ip_adapter(WeightsSource::File("/ip-adapter.safetensors".into())),
+            identity,
+            eligible.clone().with_component(
+                "unknown",
+                WeightsSource::File("/component.safetensors".into()),
+            ),
+            LoadSpec::new(WeightsSource::File("/model.safetensors".into()))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        ];
+        for spec in ineligible {
+            assert!(!ordinary_streamable(&spec), "must fail closed: {spec:?}");
+        }
+
+        let control = eligible
+            .clone()
+            .with_control(WeightsSource::File("/control.safetensors".into()));
+        assert!(control_streamable(&control));
+        assert!(
+            !control_streamable(&eligible),
+            "control source is mandatory"
+        );
+        assert!(!control_streamable(&adapted.with_control(
+            WeightsSource::File("/control.safetensors".into())
+        )));
+    }
+
+    #[test]
+    fn selector_surface_normalizes_prepacked_tiers_and_requires_control_witness() {
+        for surface in gen_core::candle_memory_contract_surface_specs() {
+            let normalized = normalized_surface_spec(&surface).expect("valid common selector");
+            assert_eq!(
+                normalized.quantize,
+                None,
+                "{} must reach Z as an already-packed artifact tier",
+                surface.selector.id()
+            );
+        }
+
+        let mut q4 = gen_core::candle_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == gen_core::OffloadPolicy::Resident
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 resident deferred surface");
+        let plain = weights_free_surface_contract(crate::MODEL_ID, &q4).unwrap();
+        assert_eq!(
+            rung_four_support(&plain),
+            MemoryStrategySupport::Implemented
+        );
+
+        assert!(weights_free_control_surface_contract("z_image_turbo_control", &q4).is_err());
+        q4.spec.control = Some(WeightsSource::Dir("/synthetic-control".into()));
+        let control = weights_free_control_surface_contract("z_image_turbo_control", &q4).unwrap();
+        assert_eq!(
+            rung_four_support(&control),
+            MemoryStrategySupport::Implemented
+        );
+
+        q4.spec.quantize = Some(Quant::Q8);
+        assert!(
+            weights_free_surface_contract(crate::MODEL_ID, &q4).is_err(),
+            "selector/quant mutation must fail closed"
+        );
+    }
+
+    fn write_safetensors(path: &std::path::Path, tensors: &[(&str, usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, bytes) in tensors {
+            let bytes = *bytes;
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": "U8",
+                    "shape": [bytes],
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend(vec![0_u8; offset]);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn append_sparse_f16_tensor(path: &std::path::Path, name: &str, shape: &[usize]) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        let start = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap_or(0);
+        let bytes = shape
+            .iter()
+            .try_fold(2_u64, |total, dimension| {
+                total.checked_mul(*dimension as u64)
+            })
+            .unwrap();
+        let end = start.checked_add(bytes).unwrap();
+        assert!(header
+            .insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            )
+            .is_none());
+        let encoded = serde_json::to_vec(&header).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
+    fn directory_spec(tmp: &tempfile::TempDir) -> (LoadSpec, std::path::PathBuf) {
+        let root = tmp.path().join("snapshot");
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_typed_safetensors(
+                &root.join(component).join("model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        (
+            LoadSpec::new(WeightsSource::Dir(root.clone())),
+            root.join("text_encoder/model.safetensors"),
+        )
+    }
+
+    fn packed_directory_spec(tmp: &tempfile::TempDir, bits: i32) -> LoadSpec {
+        let root = tmp.path().join(format!("packed-q{bits}"));
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_typed_safetensors(
+                &root.join(component).join("model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        std::fs::write(
+            root.join("transformer/config.json"),
+            format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+        )
+        .unwrap();
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            Some(bits),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root))
+    }
+
+    fn separate_file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(&base, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let dit = tmp.path().join("dit.safetensors");
+        let text_root = tmp.path().join("text-encoder");
+        let vae = tmp.path().join("vae.safetensors");
+        write_safetensors(&dit, &[("block.weight", 32)]);
+        gen_core_testkit::write_encoder_contract_fixture(&text_root, crate::ENCODER_CONTRACT)
+            .expect("validation-complete text encoder fixture");
+        write_safetensors(&vae, &[("decoder.weight", 8)]);
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_component(
+                gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text_root.join("model.safetensors")),
+            )
+            .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae))
+    }
+
+    fn combined_file_spec(tmp: &tempfile::TempDir) -> (LoadSpec, std::path::PathBuf) {
+        use std::io::Write as _;
+
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(&base, crate::ENCODER_CONTRACT)
+            .unwrap();
+
+        let encoder_root = tmp.path().join("encoder-fixture");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder_root, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let encoder_headers = gen_core::weightsmeta::safetensors_path_tensor_headers(
+            encoder_root.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let combined = tmp.path().join("combined.safetensors");
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        for tensor in encoder_headers {
+            let end = offset.checked_add(tensor.data_bytes).unwrap();
+            header.insert(
+                format!("conditioner.embedders.0.transformer.{}", tensor.name),
+                serde_json::json!({
+                    "dtype": format!("{:?}", tensor.dtype),
+                    "shape": tensor.shape,
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        for (name, bytes) in [
+            ("model.diffusion_model.block.weight", 2_u64),
+            ("first_stage_model.decoder.weight", 2_u64),
+        ] {
+            let end = offset.checked_add(bytes).unwrap();
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "U8",
+                    "shape": [bytes],
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        let mut file = std::fs::File::create(&combined).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + offset).unwrap();
+
+        (
+            LoadSpec::new(WeightsSource::File(combined.clone()))
+                .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base)),
+            combined,
+        )
+    }
+
+    #[test]
+    fn file_asset_facts_follow_bf16_materialization_and_omit_fp8_companions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let dit = tmp.path().join("dit.safetensors");
+        let text = tmp.path().join("text.safetensors");
+        let vae = tmp.path().join("vae.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[
+                ("block.weight", "F8_E4M3", &[2, 4], 8),
+                ("block.weight_scale", "F32", &[], 4),
+                ("dense.weight", "F32", &[3], 12),
+            ],
+        );
+        write_typed_safetensors(&text, &[("layer.weight", "F32", &[3], 12)]);
+        write_typed_safetensors(&vae, &[("decoder.weight", "BF16", &[4], 8)]);
+        let spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_component(
+                gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text),
+            )
+            .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae));
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(contract.asset_facts.transformer_bytes, 16 + 6);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 6);
+        assert_eq!(contract.asset_facts.decoder_bytes, 8);
+        assert_eq!(contract.asset_facts.base_bytes, 36);
+    }
+
+    #[test]
+    fn file_contract_prices_every_loadable_typed_source_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = separate_file_spec(&tmp);
+        let mut accepted = vec![("valid", valid.clone())];
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        accepted.push(("precision-is-accepted", precision));
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        accepted.push(("adapter-is-accepted", adapter));
+        let mut external_te = valid.clone();
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_te_root,
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete typed text encoder fixture");
+        external_te
+            .components
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
+        accepted.push(("external-text-encoder", external_te));
+
+        for (name, spec) in accepted {
+            crate::validate_load_spec(&spec)
+                .unwrap_or_else(|error| panic!("load gate rejected {name}: {error}"));
+            provider_contract(crate::MODEL_ID, &spec)
+                .unwrap_or_else(|error| panic!("memory contract rejected {name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn imported_directory_encoder_pricing_ignores_nested_safetensors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = separate_file_spec(&tmp);
+        spec.components
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        let external = tmp.path().join("external-text-encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&external, crate::ENCODER_CONTRACT)
+            .unwrap();
+        spec.text_encoder = Some(WeightsSource::Dir(external.clone()));
+        let baseline = provider_contract(crate::MODEL_ID, &spec)
+            .unwrap()
+            .asset_facts
+            .conditioning_bytes;
+
+        let nested = external.join("archive");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_safetensors(
+            &nested.join("not-a-direct-shard.safetensors"),
+            &[("extra", 4096)],
+        );
+
+        assert_eq!(
+            provider_contract(crate::MODEL_ID, &spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            baseline
+        );
+    }
+
+    fn assert_conditioning_ignores_unmaterialized_language_tensors(
+        spec: &LoadSpec,
+        text_encoder_path: &std::path::Path,
+        route: &str,
+        key_prefix: &str,
+    ) {
+        let conditioning = || {
+            provider_contract(crate::MODEL_ID, spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes
+        };
+        let baseline = conditioning();
+        for (name, shape) in [
+            (
+                "model.norm.weight",
+                vec![crate::ENCODER_CONTRACT.hidden_size],
+            ),
+            ("model.unrelated_projection.weight", vec![17]),
+        ] {
+            let name = format!("{key_prefix}{name}");
+            append_sparse_f16_tensor(text_encoder_path, &name, &shape);
+            assert_eq!(
+                conditioning(),
+                baseline,
+                "{route} charged an unmaterialized tensor {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditioning_prices_only_the_materialized_36_layer_language_surface() {
+        let directory = tempfile::tempdir().unwrap();
+        let (directory_spec, directory_encoder) = directory_spec(&directory);
+        assert_conditioning_ignores_unmaterialized_language_tensors(
+            &directory_spec,
+            &directory_encoder,
+            "snapshot directory",
+            "",
+        );
+
+        let imported = tempfile::tempdir().unwrap();
+        let imported_spec = separate_file_spec(&imported);
+        assert_conditioning_ignores_unmaterialized_language_tensors(
+            &imported_spec,
+            &imported.path().join("text-encoder/model.safetensors"),
+            "imported component file",
+            "",
+        );
+
+        let configless = tempfile::tempdir().unwrap();
+        let configless_spec = separate_file_spec(&configless);
+        std::fs::remove_file(configless.path().join("text-encoder/config.json")).unwrap();
+        assert_conditioning_ignores_unmaterialized_language_tensors(
+            &configless_spec,
+            &configless.path().join("text-encoder/model.safetensors"),
+            "configless ComfyUI component file",
+            "",
+        );
+
+        let combined = tempfile::tempdir().unwrap();
+        let (combined_spec, combined_file) = combined_file_spec(&combined);
+        crate::validate_load_spec(&combined_spec).expect("combined route is runtime-admissible");
+        assert_conditioning_ignores_unmaterialized_language_tensors(
+            &combined_spec,
+            &combined_file,
+            "combined ComfyUI checkpoint",
+            "conditioner.embedders.0.transformer.",
+        );
+    }
+
+    #[test]
+    fn packed_conditioning_prices_the_runtime_qtensor_format_once() {
+        let contract = crate::ENCODER_CONTRACT;
+        let attention_width = contract.num_attention_heads * contract.head_dim;
+        let kv_width = contract.num_key_value_heads * contract.head_dim;
+        let matrix_elements = contract.vocab_size * contract.hidden_size
+            + contract.loaded_hidden_layers
+                * (2 * attention_width * contract.hidden_size
+                    + 2 * kv_width * contract.hidden_size
+                    + 3 * contract.intermediate_size * contract.hidden_size);
+        let dense_vector_bytes =
+            contract.loaded_hidden_layers * (2 * contract.hidden_size + 2 * contract.head_dim) * 2;
+
+        for (bits, bytes_per_block) in [(4, 20_u64), (8, 34_u64)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = packed_directory_spec(&tmp, bits);
+            let expected = u64::try_from(matrix_elements / candle_gen::quant::QUANT_BLOCK).unwrap()
+                * bytes_per_block
+                + u64::try_from(dense_vector_bytes).unwrap();
+            assert_eq!(
+                provider_contract(crate::MODEL_ID, &spec)
+                    .unwrap()
+                    .asset_facts
+                    .conditioning_bytes,
+                expected,
+                "Q{bits} must count each Q4_1/Q8_0 tensor and no transient affine sidecars"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_free_contract_discovery_does_not_claim_source_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = separate_file_spec(&tmp);
+        spec.components
+            .remove(gen_core::COMFYUI_TEXT_ENCODER_COMPONENT);
+        let incompatible = tmp.path().join("wrong-text-encoder.safetensors");
+        write_safetensors(&incompatible, &[("layer.weight", 16)]);
+        spec.text_encoder = Some(WeightsSource::File(incompatible));
+
+        assert!(
+            provider_contract(crate::MODEL_ID, &spec).is_ok(),
+            "catalog discovery must remain weights-free"
+        );
+        let error = crate::validate_load_spec(&spec)
+            .expect_err("the executable load seam must reject a missing selected encoder")
+            .to_string();
+        assert!(error.contains("text encoder"), "got: {error}");
+    }
+
+    #[test]
+    fn combined_and_separate_imports_publish_the_same_exact_phase_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokenizer = tmp.path().join("tokenizer-base");
+        std::fs::create_dir_all(&tokenizer).unwrap();
+        let combined = tmp.path().join("combined.safetensors");
+        write_safetensors(
+            &combined,
+            &[
+                ("model.diffusion_model.block.weight", 11),
+                // The combined loader strips the component prefix, then `normalize_fp8_map`
+                // discards this exact marker. Asset facts must not count its source payload.
+                ("model.diffusion_model.scaled_fp8", 13),
+                ("conditioner.embedders.0.transformer.layer.weight", 7),
+                ("first_stage_model.decoder.weight", 5),
+            ],
+        );
+        let combined_spec = LoadSpec::new(WeightsSource::File(combined)).with_component(
+            gen_core::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(tokenizer.clone()),
+        );
+        let combined_contract = provider_contract(crate::MODEL_ID, &combined_spec).unwrap();
+
+        let dit = tmp.path().join("dit.safetensors");
+        let text_encoder = tmp.path().join("text-encoder.safetensors");
+        let vae = tmp.path().join("vae.safetensors");
+        write_safetensors(&dit, &[("block.weight", 11)]);
+        write_safetensors(&text_encoder, &[("layer.weight", 7)]);
+        write_safetensors(&vae, &[("decoder.weight", 5)]);
+        let separate_spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                gen_core::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(tokenizer),
+            )
+            .with_component(
+                gen_core::COMFYUI_TEXT_ENCODER_COMPONENT,
+                WeightsSource::File(text_encoder),
+            )
+            .with_component(gen_core::COMFYUI_VAE_COMPONENT, WeightsSource::File(vae));
+        let separate_contract = provider_contract(crate::MODEL_ID, &separate_spec).unwrap();
+
+        for contract in [&combined_contract, &separate_contract] {
+            assert_eq!(contract.asset_facts.transformer_bytes, 11);
+            assert_eq!(contract.asset_facts.conditioning_bytes, 7);
+            assert_eq!(contract.asset_facts.decoder_bytes, 5);
+            assert_eq!(contract.asset_facts.base_bytes, 23);
+        }
+    }
+
+    #[test]
+    fn combined_inventory_fails_closed_on_missing_or_unmapped_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokenizer = tmp.path().join("tokenizer-base");
+        std::fs::create_dir_all(&tokenizer).unwrap();
+        for (name, tensors, expected) in [
+            (
+                "missing-vae.safetensors",
+                vec![
+                    ("model.diffusion_model.block.weight", 11),
+                    ("text_encoder.layer.weight", 7),
+                ],
+                "missing the VAE",
+            ),
+            (
+                "unknown.safetensors",
+                vec![
+                    ("model.diffusion_model.block.weight", 11),
+                    ("text_encoder.layer.weight", 7),
+                    ("first_stage_model.decoder.weight", 5),
+                    ("mystery.weight", 3),
+                ],
+                "no component mapping",
+            ),
+            (
+                "collision.safetensors",
+                vec![
+                    ("model.diffusion_model.block.weight", 11),
+                    ("transformer.block.weight", 11),
+                    ("text_encoder.layer.weight", 7),
+                    ("first_stage_model.decoder.weight", 5),
+                ],
+                "collides",
+            ),
+        ] {
+            let checkpoint = tmp.path().join(name);
+            write_safetensors(&checkpoint, &tensors);
+            let spec = LoadSpec::new(WeightsSource::File(checkpoint)).with_component(
+                gen_core::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(tokenizer.clone()),
+            );
+            let error = provider_contract(crate::MODEL_ID, &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn z_image_base_load_and_memory_contract_reject_the_same_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/z-image.safetensors".into()));
+        let load_error = crate::base::load(&spec)
+            .err()
+            .expect("base generator must reject File")
+            .to_string();
+        let contract_error = provider_contract(crate::base::MODEL_ID, &spec)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(contract_error, load_error);
+        assert!(contract_error.contains("snapshot directory"));
     }
 
     #[test]
@@ -505,6 +1624,7 @@ mod tests {
     fn context(contract: &MemoryProviderContract) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         MemoryRunContext {
+            optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: rung_four_selection(),
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
@@ -813,7 +1933,8 @@ mod tests {
     #[test]
     fn control_routes_publish_the_full_executable_ladder() {
         for id in ["z_image_turbo_control", "z_image_control"] {
-            let contract = control_contract(id, &spec()).unwrap();
+            let spec = spec().with_control(WeightsSource::Dir("/control".into()));
+            let contract = control_contract(id, &spec).unwrap();
             assert!(contract.conformance_errors().is_empty());
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,

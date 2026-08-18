@@ -54,11 +54,10 @@ const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 const POSE_IMG2IMG_STRENGTH: f32 = 1.0;
 /// The single Kolors sampler — diffusers `EulerDiscreteScheduler` (leading), see [`KolorsEulerSampler`].
 const SAMPLER: &str = "euler_discrete";
-/// Kolors' VAE downsamples by 8, so both image dims must be multiples of **8** for a clean latent
-/// shape. Exposed as the pinned-engine stride SceneWorks ties each advertised Kolors image bucket to
-/// (sc-12612). `validate_request` enforces exactly this value, so the const cannot drift from the
-/// check. (Distinct from the `i32` `model::SPATIAL_SCALE`, which is the same 8 in latent math.)
-pub const SIZE_MULTIPLE: u32 = 8;
+/// Kolors' `/8` VAE feeds an SDXL U-Net with two exact downsample/upsample skip joins, so both image
+/// dims must be multiples of **32**. Exposed as the pinned-engine stride SceneWorks ties each
+/// advertised Kolors image bucket to (sc-12612); the model and registry share the same constant.
+pub const SIZE_MULTIPLE: u32 = crate::model::PRODUCTION_SPATIAL_MULTIPLE as u32;
 
 /// Kolors' identity + capabilities — constructible without loading weights (registry
 /// introspection). Advertises **only** the wired + parity-proven surface (the false-capability
@@ -67,6 +66,8 @@ pub const SIZE_MULTIPLE: u32 = 8;
 /// [`crate::model::Kolors::apply_lora`], the inference complement to the Kolors trainer sc-4568).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -143,6 +144,18 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            // sc-18317: Kolors' guidance is real classifier-free guidance, and the one convention it
+            // implements is the doubled `[cond, uncond]` batch every assembly in `model.rs` builds.
+            // Declaring the single mode — rather than leaving the domain `Unsupported` — is what makes
+            // a planner able to select it explicitly and makes `sequential` a refusal by name instead
+            // of a silently batched run.
+            execution: mlx_gen::gen_core::ExecutionSurface {
+                cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Modes(
+                    crate::model::CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..mlx_gen::gen_core::ExecutionSurface::default()
+            },
+            approximation: Default::default(),
         },
     }
 }
@@ -547,13 +560,20 @@ impl KolorsGenerator {
                     .into(),
             ));
         }
-        let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+        let decode_tiling =
+            crate::memory_strategy::decode_tiling_for_contract(req, &self.memory_strategy)?;
         let forward_plan =
             SdxlForwardPlan::with_attention(crate::memory_strategy::attention_plan(req)?)
                 .with_window(dit_window.map(|size| SdxlBlockWindow {
                     size,
                     cancel: &req.cancel,
                 }));
+        // sc-18317: the request's typed CFG batching selection, resolved once for every mode so the
+        // six assemblies cannot disagree. An unset selection resolves to `Batched`, this family's own
+        // pre-story convention, which is what keeps every existing render byte-for-byte identical;
+        // any other mode was already refused by `Capabilities::validate_request` against the
+        // descriptor's declared `execution` surface before we got here.
+        let cfg_batching = crate::model::resolve_cfg_batching(req);
 
         self.residency.run_request_scoped(
             stage_residency,
@@ -793,6 +813,7 @@ impl KolorsGenerator {
                             on_progress,
                             &req.preview,
                             forward_plan,
+                            cfg_batching,
                         )?;
                         let latents = match &vp_plan {
                             Some(p) => {
@@ -841,6 +862,7 @@ impl KolorsGenerator {
                                 on_progress,
                                 &req.preview,
                                 forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((image, scale)) = control {
                             heavy.denoise_controlnet_latents_with_preview(
@@ -859,6 +881,7 @@ impl KolorsGenerator {
                                 on_progress,
                                 &req.preview,
                                 forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((tokens, scale)) = &ip {
                             heavy.denoise_ip_latents_with_preview(
@@ -876,6 +899,7 @@ impl KolorsGenerator {
                                 on_progress,
                                 &req.preview,
                                 forward_plan,
+                                cfg_batching,
                             )?
                         } else if let Some((_image, strength)) = img2img {
                             let x0 = legacy_img2img_init.as_ref().expect(
@@ -896,6 +920,7 @@ impl KolorsGenerator {
                                 on_progress,
                                 &req.preview,
                                 forward_plan,
+                                cfg_batching,
                             )?
                         } else {
                             heavy.denoise_latents_with_preview(
@@ -911,6 +936,7 @@ impl KolorsGenerator {
                                 on_progress,
                                 &req.preview,
                                 forward_plan,
+                                cfg_batching,
                             )?
                         };
 
@@ -1001,7 +1027,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
-    // Kolors VAE downsamples by 8; non-multiple-of-8 dims would mismatch latent shapes.
+    // The /8 VAE plus two exact U-Net downsample/upsample joins require SIZE_MULTIPLE.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "kolors: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -1113,21 +1139,7 @@ mod tests {
     #[test]
     fn registered_in_family_catalog() {
         // The family catalog resolves "kolors" and reaches the loader without real weights.
-        let spec = LoadSpec {
-            weights: WeightsSource::Dir("/nonexistent/kolors".into()),
-            quantize: None,
-            precision: mlx_gen::Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-            load_shape: Default::default(),
-            components: Default::default(),
-        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()));
         let err = match crate::provider_registry().unwrap().load("kolors", &spec) {
             Ok(_) => panic!("bogus weights dir must fail to load"),
             Err(e) => e.to_string(),
@@ -1177,9 +1189,9 @@ mod tests {
     #[test]
     fn validate_ties_size_multiple_to_pinned_stride() {
         // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised Kolors
-        // bucket to. Pin the value and mutation-check that a size which is a multiple of 4 but not
-        // SIZE_MULTIPLE (8) is still rejected with the stride error, and an on-stride size passes.
-        assert_eq!(SIZE_MULTIPLE, 8);
+        // bucket to. Pin the value and mutation-check that a VAE-valid size which is not the full
+        // U-Net multiple is rejected with the stride error, and an on-stride size passes.
+        assert_eq!(SIZE_MULTIPLE, 32);
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -1189,20 +1201,20 @@ mod tests {
         let off_stride = validate_request(
             &caps,
             &GenerationRequest {
-                width: 1020, // 255×4 — a multiple of 4 but not SIZE_MULTIPLE
+                width: 1000, // 125×8 — VAE-valid but not SIZE_MULTIPLE
                 ..base.clone()
             },
         )
         .unwrap_err()
         .to_string();
         assert!(
-            off_stride.contains("multiples of 8"),
+            off_stride.contains("multiples of 32"),
             "expected the stride error, got: {off_stride}"
         );
         assert!(validate_request(
             &caps,
             &GenerationRequest {
-                width: 1024, // 128×8 — on-stride
+                width: 1024, // 32×32 — on-stride
                 ..base.clone()
             },
         )
@@ -1218,6 +1230,87 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("num_steps must be >= 1"), "got: {err}");
+    }
+
+    /// **sc-18317 — the declared CFG-batching domain is reachable, and the two domains this lane has
+    /// no mechanism for are refused.**
+    ///
+    /// The production `validate` delegates the shared contract to `Capabilities::validate_request`
+    /// (asserted separately), so admitting/refusing here is admitting/refusing on the `generate` path.
+    /// `Batched` is admitted because `model::cfg_conditioning` genuinely consumes it; `Sequential` is refused because the
+    /// ChatGLM3 assembly and the shared SDXL denoise runs guidance as one batch; and the cadence / FFN-chunk domains are refused because this
+    /// family has no such mechanism at all — the truthful state, not an oversight.
+    #[test]
+    fn execution_domains_are_declared_exactly_where_this_lane_consumes_them() {
+        let caps = descriptor().capabilities;
+        assert!(caps.execution.declaration_errors().is_empty());
+        assert!(caps.execution.cfg_batching.is_supported());
+        assert!(!caps.execution.graph_eval_cadence_blocks.is_supported());
+        assert!(!caps.execution.ffn_chunk_rows.is_supported());
+
+        let request = |memory| mlx_gen::gen_core::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            steps: Some(1),
+            memory: Some(memory),
+            ..Default::default()
+        };
+
+        caps.validate_request(
+            "kolors",
+            &request(mlx_gen::gen_core::GenerationMemory {
+                cfg_batching: Some(mlx_gen::gen_core::CfgBatching::Batched),
+                ..Default::default()
+            }),
+        )
+        .expect("the implemented mode must be admitted");
+
+        for (label, memory) in [
+            (
+                "cfg_batching",
+                mlx_gen::gen_core::GenerationMemory {
+                    cfg_batching: Some(mlx_gen::gen_core::CfgBatching::Sequential),
+                    ..Default::default()
+                },
+            ),
+            (
+                "graph_eval_cadence",
+                mlx_gen::gen_core::GenerationMemory {
+                    graph_eval_cadence: Some(mlx_gen::gen_core::GraphEvalCadence::EVERY_BLOCK),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ffn_chunk",
+                mlx_gen::gen_core::GenerationMemory {
+                    ffn_chunk: Some(mlx_gen::gen_core::FfnChunk::new(2048).unwrap()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let error = caps
+                .validate_request("kolors", &request(memory))
+                .expect_err("an unimplemented execution selection must be refused");
+            assert!(
+                matches!(error, mlx_gen::gen_core::Error::Unsupported(_)),
+                "{label} must be a capability gap: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(label), "{label}: {message}");
+            assert!(
+                message.contains("unset"),
+                "{label} refusal must name the remedy: {message}"
+            );
+        }
+
+        // And an unset selection still validates — the default-preservation half.
+        caps.validate_request(
+            "kolors",
+            &request(mlx_gen::gen_core::GenerationMemory::default()),
+        )
+        .expect("an unset execution selection must validate");
     }
 
     #[test]

@@ -72,6 +72,9 @@ def violations(tree: ast.AST) -> list[tuple[int, str]]:
             continue
 
         if isinstance(function, ast.Attribute) and function.attr == "open":
+            if isinstance(function.value, ast.Name) and function.value.id == "os":
+                # os.open is descriptor-level binary I/O and performs no text decoding.
+                continue
             if isinstance(function.value, ast.Name) and function.value.id in MODULE_OPENERS:
                 continue
             mode = literal_mode(node, 0)

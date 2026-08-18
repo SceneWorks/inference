@@ -255,6 +255,8 @@ const MAX_STEPS: u32 = 200;
 /// (`req.guidance` overrides the ceiling), no negative prompt / sampler / scheduler / LoRA / quant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SVD_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -298,6 +300,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[],
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

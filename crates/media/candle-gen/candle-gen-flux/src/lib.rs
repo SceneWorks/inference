@@ -346,6 +346,8 @@ impl Generator for FluxGenerator {
 /// `"candle"` and `mac_only` is `false` (the two backend-correct deviations from `mlx-gen-flux`).
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.model_id(),
@@ -403,6 +405,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }
@@ -525,36 +529,49 @@ pub fn register_providers(
         .register_generator(SCHNELL_REGISTRATION)
         .register_generator(DEV_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(SCHNELL_MEMORY_REGISTRATION)
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
-        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
         .register_memory_behavior(DEV_MEMORY_BEHAVIOR);
     registry
 }
 
-#[cfg(feature = "cuda")]
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(SCHNELL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: FLUX1_SCHNELL_ID,
+            contract: registered_schnell_memory_contract,
+        })
+        .register_memory_strategy(DEV_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: FLUX1_DEV_ID,
+            contract: registered_dev_memory_contract,
+        })
+}
+
 fn registered_schnell_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(FLUX1_SCHNELL_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
 fn registered_dev_memory_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     memory_strategy::provider_contract(FLUX1_DEV_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
 const SCHNELL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: FLUX1_SCHNELL_ID,
     contract: registered_schnell_memory_contract,
     safety_check: memory_strategy::registered_safety_check,
 };
 
-#[cfg(feature = "cuda")]
 const DEV_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: FLUX1_DEV_ID,
     contract: registered_dev_memory_contract,

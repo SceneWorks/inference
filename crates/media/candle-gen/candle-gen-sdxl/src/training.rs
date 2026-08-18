@@ -69,7 +69,7 @@ use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
 use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
 
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+use crate::SdxlVaeDecoder;
 
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
@@ -272,7 +272,7 @@ struct SamplePreview {
     prompts: Vec<String>,
     /// The f16-stable SDXL VAE decoder (`madebyollin/sdxl-vae-fp16-fix`), resident for the run so each
     /// preview decodes its final latent without a per-cadence reload.
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
 }
 
 /// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
@@ -297,7 +297,7 @@ struct SamplePreview {
 #[allow(clippy::too_many_arguments)]
 fn render_one_preview(
     unet: &UNet2DConditionModel,
-    vae: &AutoEncoderKL,
+    vae: &SdxlVaeDecoder,
     cond: &Tensor,
     cfg: &TrainingConfig,
     lat_h: usize,
@@ -309,7 +309,7 @@ fn render_one_preview(
     let latents = preview_latents(unet, cond, cfg, lat_h, lat_w, compute_dtype, seed, device)?;
     // The shared decode expects compute-dtype latents (like the inference curated loop); un-scale +
     // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
-    decode_image(vae, &latents, None)
+    decode_image(vae, &latents, None, None)
 }
 
 /// The curated denoise behind [`render_one_preview`] (sc-11173 / F-083), returning the final
@@ -634,11 +634,11 @@ impl SdxlTrainer {
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
         on_progress(TrainingProgress::LoadingModel);
         let vae = {
-            let vb = candle_gen::mmap_var_builder(
-                &[resolve_vae_file(&self.component_paths.vae_fp16_fix)],
-                DType::F32,
-                device,
-            )?;
+            let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+            })?;
+            let vb =
+                candle_gen::mmap_var_builder(&[resolve_vae_file(vae_source)], DType::F32, device)?;
             VaeMomentsEncoder::new(vb, VAE_SCALE)?
         };
         let clip = DualClip::load(
@@ -683,8 +683,10 @@ impl SdxlTrainer {
                     ));
                     prompts.push(prompt.clone());
                 }
-                let vae_decoder =
-                    load_sdxl_vae(&self.component_paths.vae_fp16_fix, device, compute_dtype)?;
+                let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                    CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+                })?;
+                let vae_decoder = load_sdxl_vae(vae_source, device, compute_dtype)?;
                 Some(SamplePreview {
                     conds,
                     prompts,

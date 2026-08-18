@@ -329,10 +329,13 @@ where
                 .to_string(),
         };
         let parts: Vec<&str> = dotted.split('.').collect();
-        match host.adaptable_mut(&parts) {
+        // SC-18319 — pass 1 only *reads* (is the base packed, how big is it), so it goes through the
+        // PROBE half of the host surface. Taking the `&mut` here would unfuse every `FusedQkvProjection`
+        // it walked past — dismantling the fusion during a scan that installs nothing.
+        match host.adaptable_facts(&parts) {
             // Packed base: take the deferred form when the module has one, else plan a materialization.
-            Some(lin) if lin.is_quantized() => {
-                let base_shape = lin.base_shape();
+            Some(facts) if facts.is_quantized => {
+                let base_shape = facts.base_shape;
                 match factors(scale, &base_shape)? {
                     Some(f) => plans.push(LycorisPlan::Deferred { dotted, factors: f }),
                     None => {
@@ -345,10 +348,10 @@ where
                     }
                 }
             }
-            Some(lin) => {
+            Some(facts) => {
                 // Dense base still materializes the same `[out,in]` bf16 delta as a stacked residual —
                 // the OOM the guard prevents on packed tiers is reachable here too (F-011). Project it.
-                projected_materialize += projected_delta_bytes(&lin.base_shape());
+                projected_materialize += projected_delta_bytes(&facts.base_shape);
                 plans.push(LycorisPlan::Dense { dotted, delta });
             }
             None => plans.push(LycorisPlan::Unmatched(raw.into())),
@@ -1388,7 +1391,8 @@ where
         let mut resolvable = true;
         for tgt in targets {
             let parts: Vec<&str> = tgt.target_path.split('.').collect();
-            match host.adaptable_mut(&parts).map(|lin| lin.base_shape()) {
+            // SC-18319 — shape-only resolution, so the PROBE half. See `install_lycoris_groups`.
+            match host.adaptable_facts(&parts).map(|facts| facts.base_shape) {
                 Some(shape) if shape.len() == 2 => {
                     fused_out += shape[0];
                     match in_dim {
@@ -2002,32 +2006,47 @@ fn fold_one_diff_module(
     // OFF.)
     let live = scale != 0.0;
     let segs: Vec<&str> = stem.split('.').collect();
-    if host.adaptable_mut(&segs).is_none() {
+    // SC-18319 — every *decision* this function makes (does the path resolve to a Linear at all, is
+    // the base packed, do the weight and bias shapes match) is answerable from the PROBE half, so the
+    // `&mut` handle is taken only on the branches that actually write. That matters twice over here:
+    // the quantized/shape-mismatch arm SKIPS, and a `scale == 0` install writes nothing at all — under
+    // the old `&mut`-first resolution both of those still unfused every `FusedQkvProjection` they
+    // touched, in exchange for no mutation whatsoever.
+    let Some(facts) = host.adaptable_facts(&segs) else {
         return fold_one_diff_param(host, stem, &segs, parts, scale, report);
-    }
-    let lin = host.adaptable_mut(&segs).expect("just probed");
+    };
 
     if let Some(diff) = &parts.diff {
         // A weight `.diff` is the one genuinely tier-dependent channel: a dense delta cannot fold into
         // a packed weight, and unpacking to make it fit would defeat the tier the user chose. Skip the
         // whole module (coupled bias with it) and surface it.
-        if lin.is_quantized() || diff.shape() != lin.base_shape().as_slice() {
+        if facts.is_quantized || diff.shape() != facts.base_shape.as_slice() {
             skip_whole_module(stem, parts, report);
             return Ok(());
         }
+    }
+    // Bias delta (`.diff_b`): folds onto `{stem}.bias` when the base carries a shape-matching bias —
+    // packed or not, since `QuantizedLinear` never packs its bias.
+    let bias_ok = parts
+        .diff_b
+        .as_ref()
+        .is_some_and(|d| facts.bias_shape.as_deref() == Some(d.shape()));
+
+    if let Some(diff) = &parts.diff {
         if live {
-            lin.merge_dense_delta(&scaled_f32(diff, scale)?)?;
+            host.adaptable_mut(&segs)
+                .expect("resolved through the probe above")
+                .merge_dense_delta(&scaled_f32(diff, scale)?)?;
         }
         report.record(live);
     }
 
-    // Bias delta (`.diff_b`): fold onto `{stem}.bias` when the base carries a shape-matching bias —
-    // packed or not, since `QuantizedLinear` never packs its bias.
     if let Some(diff_b) = &parts.diff_b {
-        let bias_ok = lin.bias().is_some_and(|b| b.shape() == diff_b.shape());
         if bias_ok {
             if live {
-                lin.merge_bias_delta(&scaled_f32(diff_b, scale)?)?;
+                host.adaptable_mut(&segs)
+                    .expect("resolved through the probe above")
+                    .merge_bias_delta(&scaled_f32(diff_b, scale)?)?;
             }
             report.record(live);
         } else {

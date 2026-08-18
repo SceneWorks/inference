@@ -6,6 +6,28 @@
 //! residency and bounded decode are structural N/A. Bounded attention is wired only through the
 //! generation path used by denoise; understanding, VQA, interleave text, and think-token forwards
 //! retain their historical unbounded attention path.
+//!
+//! ## Declared ladder (sc-18608)
+//!
+//! The registry publishes 12 weights-free surfaces per provider — bf16/Q4/Q8 × resident/sequential
+//! × eager/deferred — and both registered providers declare exactly:
+//!
+//! * [`MemoryStrategy::Resident`] — every surface;
+//! * [`MemoryStrategy::BoundedAttention`] — every surface. `chunk_attention` +
+//!   `attention_chunk_size` reach [`crate::t2i::T2iOptions::attention_score_budget`], which is what
+//!   builds the budgeted `AttentionPlan` for both the T2I and the reference-conditioned edit
+//!   denoise loops. Nothing about it depends on the artifact layout.
+//! * [`MemoryStrategy::BoundedTransformerResidency`] — the **deferred** surfaces of a verified
+//!   single-file snapshot only, and for `_fast` only once the distill LoRA is pre-merged. This is
+//!   provider-local block windowing over the generation-path Qwen stack, reached through
+//!   [`crate::t2i::T2iOptions::transformer_window_size`].
+//!
+//! Rung 4 keys off `LoadSpec::load_shape` and **not** `offload_policy`: SenseNova is deliberately
+//! not on the shared `Residency` seam (`supports_sequential_offload: false`, F-176), so sequential
+//! offload is a no-op fallback for it and would be a fabricated precondition if declared as one.
+//! [`MemoryStrategy::StagedResidency`] and [`MemoryStrategy::BoundedDecode`] stay
+//! [`MemoryStrategySupport::StructurallyNotApplicable`] on every surface for the structural reasons
+//! above — there is no separable conditioning component to stage and no decoder phase to tile.
 
 use mlx_gen::gen_core::{
     Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -32,7 +54,70 @@ pub const FAST_CALIBRATION_FINGERPRINT: &str =
 const QUALITY_Q8_ARTIFACT: &str =
     "8da38dde4c39722259a98cfc47643c88e48cea205595625fdbd9fec097f9dc4f";
 const FAST_Q8_ARTIFACT: &str = "a9f8968d44ec440bdd7bfb2937a61b847d6f80bb563ffe60ca56be0e395bcf50";
-const STATIC_BEHAVIOR_CALIBRATION: &str = "sensenova-static-registry-behavior-v1";
+/// Source-owned weights-free behavior identity. Route/fixture semantics are versioned here so a
+/// correction never restamps the measured calibration fingerprints above. v2 makes the registry
+/// fixtures single-phase and fails phase-bearing contexts closed.
+const STATIC_BEHAVIOR_CALIBRATION: &str = "sensenova-static-registry-behavior-v2";
+
+/// Component key read by the fast loader. Shared with `model::load_inner` so the loader's
+/// `reject_unknown_components` allow-list and this module's contract gate cannot drift apart.
+pub(crate) const DISTILL_LORA_COMPONENT: &str = "distill_lora";
+
+/// The exact production load compositions the SenseNova memory routes are wired for.
+///
+/// [`crate::model::load`] refuses a non-directory source, any precision override, user adapters,
+/// and any unrecognized component key. Every remaining `LoadSpec` axis — control, extra controls,
+/// IP adapter, PiD, identity, and an external text encoder — is silently *ignored* by that loader,
+/// because NEO-Unify is one fused checkpoint with no seam for any of them. Publishing a memory
+/// contract for either shape would declare a rung on a route that cannot load at all, or that
+/// cannot honor the composition it was handed. Both are unreachable declarations, so admission
+/// fails closed here rather than emitting a contract nothing can execute.
+fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    let known_components: &[&str] = match provider_id {
+        crate::MODEL_ID => &[],
+        crate::MODEL_ID_FAST => &[DISTILL_LORA_COMPONENT],
+        _ => {
+            return Err(CoreError::Unsupported(format!(
+                "unknown SenseNova provider {provider_id}"
+            )))
+        }
+    };
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: SenseNova memory routes require a snapshot directory, not a single file"
+        )));
+    }
+    if spec.precision != mlx_gen::Precision::Bf16 {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: only the dense bf16 source is wired; drop the precision override"
+        )));
+    }
+    // The descriptor advertises exactly Q4/Q8 over the dense bf16 source; nothing else can load.
+    if !matches!(spec.quantize, None | Some(Quant::Q4 | Quant::Q8)) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: SenseNova packs only Q4 or Q8 over the dense bf16 backbone"
+        )));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: user-supplied adapters are not supported (supports_lora=false)"
+        )));
+    }
+    mlx_gen::gen_core::reject_unknown_components(spec, known_components, provider_id)?;
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: SenseNova has no control, IP-adapter, PiD, identity, or external \
+             text-encoder seam; its memory routes cannot honor that composition"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ArtifactFileIdentity {
@@ -395,8 +480,24 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     let artifact = verified_artifact(spec);
     memory_strategy_contract_with_artifact(provider_id, spec, artifact.as_ref())
+}
+
+/// Production admission with the artifact the loader already pinned.
+///
+/// The loader resolves and verifies one artifact for the whole load; re-verifying here would hash
+/// the checkpoint a second time. Keeping the composition gate in this wrapper is what stops a
+/// loaded generator from publishing a contract that
+/// [`memory_strategy_contract`] would have refused.
+pub(crate) fn validated_memory_strategy_contract_with_artifact(
+    provider_id: &str,
+    spec: &LoadSpec,
+    artifact: Option<&PinnedArtifact>,
+) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
+    memory_strategy_contract_with_artifact(provider_id, spec, artifact)
 }
 
 /// Weights-free contract used only by registry conformance. Production resolution never calls this
@@ -405,6 +506,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    validate_load_contract(provider_id, spec)?;
     let route = if provider_id == crate::MODEL_ID_FAST {
         "fast"
     } else {
@@ -541,6 +643,9 @@ pub fn validate_runner_gate(
 
 /// Verify once, construct the contract from the same pin, and enforce the runner identity gates.
 pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResult<String> {
+    // Evidence must be captured on a composition production admission would accept; otherwise the
+    // record would key a rung to a route the loader refuses or silently ignores.
+    validate_load_contract(provider_id, spec)?;
     let artifact = verified_artifact(spec).ok_or_else(|| {
         CoreError::Unsupported(format!(
             "{provider_id}: runner requires one stable model.safetensors artifact"
@@ -570,6 +675,16 @@ pub(crate) fn safety_check(
         if context.use_pid || context.overlay.is_some() {
             return Err(CoreError::Unsupported(format!(
                 "{}: calibrated memory route has no PiD or overlay",
+                contract.provider_id
+            )));
+        }
+        // `GenerationRequest::phases` is read only by the Krea MLX family; SenseNova's denoise
+        // threads one AR trajectory through a per-step-mutated KV cache and ignores the field
+        // entirely. A phase-bearing context would therefore be admitted against evidence for a
+        // trajectory the engine never runs, so it fails closed here.
+        if context.has_phases {
+            return Err(CoreError::Unsupported(format!(
+                "{}: SenseNova runs one single-phase trajectory and ignores request phases",
                 contract.provider_id
             )));
         }
@@ -658,22 +773,24 @@ pub(crate) fn registered_valid_fixture(
             mode: MemoryMode::TextToImage,
             reference_count: 0,
             use_pid: false,
-            has_phases: true,
+            has_phases: false,
             overlay: None,
         },
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode: MemoryMode::Edit,
             reference_count: 1,
             use_pid: false,
-            has_phases: true,
+            has_phases: false,
             overlay: None,
         },
     ]
     .into_iter()
     .map(|route| {
-        Ok(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+        let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(
             mlx_gen::gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?,
-        ))
+        );
+        fixture.request.prompt = "weights-free SenseNova memory behavior".into();
+        Ok(fixture)
     })
     .collect()
 }
@@ -716,6 +833,327 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(LoadShape::DeferredMaterialization);
         (root, spec)
+    }
+
+    /// The complete declared ladder, read back off the real registry rather than off one
+    /// hand-picked `LoadSpec`. A caller-chosen spec cannot see a rung whose availability moves with
+    /// numeric tier, residency policy, or materialization shape; the provider-owned witness set can.
+    #[test]
+    fn registry_publishes_the_exact_declared_ladder() {
+        use mlx_gen::gen_core::{LoadShape, MemoryContractSurfaceTier};
+        use std::collections::BTreeSet;
+
+        let registry = crate::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert_eq!(
+            surfaces.len(),
+            24,
+            "two providers × twelve witness surfaces"
+        );
+
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+            let selectors: BTreeSet<_> = provider
+                .iter()
+                .map(|surface| surface.selector.id())
+                .collect();
+            let expected: BTreeSet<_> = [
+                "bf16:resident:eager",
+                "bf16:resident:deferred",
+                "bf16:sequential:eager",
+                "bf16:sequential:deferred",
+                "q4:resident:eager",
+                "q4:resident:deferred",
+                "q4:sequential:eager",
+                "q4:sequential:deferred",
+                "q8:resident:eager",
+                "q8:resident:deferred",
+                "q8:sequential:eager",
+                "q8:sequential:deferred",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(selectors, expected, "{provider_id}");
+
+            let mut bounded_transformer = 0;
+            for surface in &provider {
+                let selector = surface.selector;
+                assert!(!surface.composed, "{provider_id}");
+                assert!(matches!(
+                    surface.resolved_artifact_tier(),
+                    MemoryContractSurfaceTier::Bf16
+                        | MemoryContractSurfaceTier::Q4
+                        | MemoryContractSurfaceTier::Q8
+                ));
+                assert!(surface
+                    .contract
+                    .calibration
+                    .as_ref()
+                    .is_some_and(|identity| identity
+                        .fingerprint
+                        .starts_with(STATIC_BEHAVIOR_CALIBRATION)));
+                assert!(
+                    surface.contract.conformance_errors().is_empty(),
+                    "{provider_id} {}: {:?}",
+                    selector.id(),
+                    surface.contract.conformance_errors()
+                );
+                let support = |strategy| {
+                    surface
+                        .contract
+                        .capability(strategy)
+                        .expect("complete SenseNova ladder")
+                        .support
+                        .clone()
+                };
+                assert_eq!(
+                    support(MemoryStrategy::Resident),
+                    MemoryStrategySupport::Implemented,
+                    "{provider_id} {}",
+                    selector.id()
+                );
+                assert_eq!(
+                    support(MemoryStrategy::BoundedAttention),
+                    MemoryStrategySupport::Implemented,
+                    "{provider_id} {}",
+                    selector.id()
+                );
+                assert_eq!(
+                    surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedAttention)
+                        .unwrap()
+                        .parameters
+                        .attention_chunk_sizes,
+                    vec![ATTENTION_CHUNK_SIZE]
+                );
+                for structural in [
+                    MemoryStrategy::StagedResidency,
+                    MemoryStrategy::BoundedDecode,
+                ] {
+                    assert!(
+                        matches!(
+                            support(structural),
+                            MemoryStrategySupport::StructurallyNotApplicable { .. }
+                        ),
+                        "{provider_id} {} {structural:?}",
+                        selector.id()
+                    );
+                }
+                // Rung 4 tracks the materialization shape ONLY. SenseNova is off the shared
+                // residency seam, so keying it on `offload_policy` would invent a precondition.
+                let deferred = selector.load_shape == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    support(MemoryStrategy::BoundedTransformerResidency)
+                        == MemoryStrategySupport::Implemented,
+                    deferred,
+                    "{provider_id} {}",
+                    selector.id()
+                );
+                if deferred {
+                    bounded_transformer += 1;
+                    let parameters = &surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .parameters;
+                    assert_eq!(
+                        parameters.transformer_window_sizes,
+                        vec![TRANSFORMER_WINDOW_SIZE]
+                    );
+                    assert_eq!(
+                        parameters.transformer_window_components,
+                        vec![TransformerComponent::Dit]
+                    );
+                }
+            }
+            assert_eq!(bounded_transformer, 6, "{provider_id}");
+        }
+    }
+
+    /// Every declared optimized rung must be *executable* from the registered behavior seam: the
+    /// exact fixtures the conformance walker uses have to open a scope and configure a request the
+    /// provider's own descriptor accepts.
+    #[test]
+    fn registered_fixtures_are_single_phase_and_executable() {
+        let registry = crate::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let mut executed = 0;
+        for (provider_id, descriptor) in [
+            (crate::MODEL_ID, crate::model::descriptor()),
+            (crate::MODEL_ID_FAST, crate::model::descriptor_fast()),
+        ] {
+            let behavior = registry
+                .memory_behavior_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} registers no memory behavior"));
+            for surface in surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+            {
+                for strategy in [
+                    MemoryStrategy::BoundedAttention,
+                    MemoryStrategy::BoundedTransformerResidency,
+                ] {
+                    if surface.contract.capability(strategy).unwrap().support
+                        != MemoryStrategySupport::Implemented
+                    {
+                        continue;
+                    }
+                    let fixtures =
+                        (behavior.valid_fixtures)(&surface.spec, &surface.contract, strategy)
+                            .unwrap();
+                    assert_eq!(fixtures.len(), 2, "T2I and single-reference edit routes");
+                    for (fixture, mode) in fixtures
+                        .iter()
+                        .zip([MemoryMode::TextToImage, MemoryMode::Edit])
+                    {
+                        assert_eq!(fixture.context.mode, mode);
+                        assert!(!fixture.context.has_phases, "{provider_id}");
+                        assert!(fixture.request.phases.is_none(), "{provider_id}");
+                        assert!(!fixture.context.use_pid && !fixture.request.use_pid);
+                        assert_eq!(fixture.context.overlay, None);
+                        assert_eq!(
+                            fixture.request.conditioning.len(),
+                            fixture.context.geometry.reference_count as usize
+                        );
+                        descriptor
+                            .capabilities
+                            .validate_request(provider_id, &fixture.request)
+                            .unwrap();
+
+                        let mut scope = (behavior.begin_request)(
+                            &surface.spec,
+                            &surface.contract,
+                            &fixture.context,
+                        )
+                        .unwrap()
+                        .expect("an implemented SenseNova rung must open a request scope");
+                        let mut request = fixture.request.clone();
+                        scope.configure_request(&mut request).unwrap();
+                        let memory = request.memory.expect("configured memory knobs");
+                        assert!(memory.chunk_attention);
+                        assert_eq!(memory.attention_chunk_size, Some(ATTENTION_CHUNK_SIZE));
+                        let rung4 = strategy == MemoryStrategy::BoundedTransformerResidency;
+                        assert_eq!(memory.stream_transformer_blocks, rung4);
+                        assert_eq!(
+                            memory.transformer_window_size,
+                            rung4.then_some(TRANSFORMER_WINDOW_SIZE)
+                        );
+                        executed += 1;
+                    }
+                }
+            }
+        }
+        // Per provider: 12 bounded-attention surfaces + 6 deferred rung-4 surfaces, two routes each.
+        assert_eq!(executed, 2 * (12 + 6) * 2);
+    }
+
+    /// A phase-bearing context must be refused, not silently admitted against single-phase
+    /// evidence. SenseNova ignores `GenerationRequest::phases` outright.
+    #[test]
+    fn phase_bearing_context_is_refused_by_admission_and_by_begin_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        let spec = spec.with_quant(Quant::Q8);
+        let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        let fixtures =
+            registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedAttention).unwrap();
+        let mut phases = fixtures[0].context.clone();
+        assert!(!phases.has_phases);
+        phases.has_phases = true;
+        assert!(matches!(
+            registered_safety_check(&spec, &contract, &phases),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("single-phase trajectory")
+        ));
+        assert!(registered_begin_request(crate::MODEL_ID, &spec, &contract, &phases).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Admission must not publish a ladder for a composition `model::load` cannot load, or silently
+    /// ignores. Each axis is mutated on its own so the assertion proves every gate, not the set.
+    #[test]
+    fn unloadable_compositions_publish_no_contract() {
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        weights_free_memory_strategy_contract(crate::MODEL_ID, &base).unwrap();
+        memory_strategy_contract(crate::MODEL_ID, &base).unwrap();
+
+        assert!(memory_strategy_contract("sensenova_u1_8b_imaginary", &base).is_err());
+
+        let mutations: Vec<(&str, LoadSpec)> = vec![
+            (
+                "single-file source",
+                LoadSpec::new(WeightsSource::File("/nonexistent/model.safetensors".into())),
+            ),
+            ("precision override", {
+                let mut spec = base.clone();
+                spec.precision = mlx_gen::Precision::Fp32;
+                spec
+            }),
+            ("unsupported pack", base.clone().with_quant(Quant::Nvfp4)),
+            ("user adapter", {
+                let mut spec = base.clone();
+                spec.adapters.push(mlx_gen::AdapterSpec::new(
+                    "/nonexistent/user.safetensors".into(),
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                ));
+                spec
+            }),
+            ("unknown component", {
+                let mut spec = base.clone();
+                spec.components.insert(
+                    "text_encoder".into(),
+                    WeightsSource::Dir("/nonexistent/te".into()),
+                );
+                spec
+            }),
+            ("control", {
+                let mut spec = base.clone();
+                spec.control = Some(WeightsSource::Dir("/nonexistent/control".into()));
+                spec
+            }),
+            ("identity", {
+                let mut spec = base.clone();
+                spec.identity = Some(mlx_gen::IdentityWeights {
+                    encoder: Some(WeightsSource::File("/nonexistent/enc.safetensors".into())),
+                    eva: None,
+                    face_dir: None,
+                });
+                spec
+            }),
+            ("external text encoder", {
+                let mut spec = base.clone();
+                spec.text_encoder = Some(WeightsSource::Dir("/nonexistent/te".into()));
+                spec
+            }),
+        ];
+        for (label, spec) in mutations {
+            for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+                assert!(
+                    memory_strategy_contract(provider_id, &spec).is_err(),
+                    "{provider_id}: {label} must publish no memory contract"
+                );
+                assert!(
+                    weights_free_memory_strategy_contract(provider_id, &spec).is_err(),
+                    "{provider_id}: {label} must publish no weights-free memory contract"
+                );
+            }
+        }
+
+        // The fast route's one recognized component stays admissible on the fast id only.
+        let mut distill = base.clone();
+        distill.components.insert(
+            DISTILL_LORA_COMPONENT.into(),
+            WeightsSource::File("/nonexistent/lora.safetensors".into()),
+        );
+        memory_strategy_contract(crate::MODEL_ID_FAST, &distill).unwrap();
+        assert!(memory_strategy_contract(crate::MODEL_ID, &distill).is_err());
     }
 
     #[test]
@@ -1116,7 +1554,7 @@ mod tests {
                     mode,
                     reference_count,
                     use_pid: false,
-                    has_phases: true,
+                    has_phases: false,
                     overlay: None,
                 },
             )
@@ -1156,7 +1594,7 @@ mod tests {
                 mode: MemoryMode::TextToImage,
                 reference_count: 0,
                 use_pid: false,
-                has_phases: true,
+                has_phases: false,
                 overlay: None,
             },
         )

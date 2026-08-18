@@ -30,6 +30,11 @@ pub mod providers {
     pub use candle_gen_catalog::providers::*;
 }
 
+/// Descriptor-less provider memory routes that the CUDA bundle intentionally reconciles outside
+/// the ordinary generator registry.
+#[cfg(feature = "media")]
+pub use candle_gen_catalog::{BespokeMemoryRouteWaiver, BESPOKE_MEMORY_ROUTE_WAIVERS};
+
 /// The advanced quant tiers this CUDA runtime surfaces beyond affine `Q4`/`Q8` — the NVFP4 FP4
 /// tensor-core tier (epic 11037, sc-11042 Option A) on consumer Blackwell `sm_120`. Re-exported from
 /// the media catalog so a product/worker reads the served tier off the runtime bundle; empty when the
@@ -57,6 +62,19 @@ fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
         candle_gen_catalog::provider_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        candle_gen_catalog::memory_contract_surface_registry()
     }
 
     #[cfg(not(feature = "media"))]
@@ -217,6 +235,8 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",
@@ -301,5 +321,49 @@ mod tests {
     fn cuda_bundle_surfaces_nvfp4_tier() {
         use super::gen_core::Quant;
         assert_eq!(super::nvfp4_quant_tiers(), &[Quant::Nvfp4]);
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn cuda_bundle_reexports_the_exact_bespoke_memory_route_waiver() {
+        // Shape, not population. This used to destructure `[waiver]` and pin `pulid_flux`/`pulid`,
+        // so a second legitimate bespoke route went RED with nothing actually broken — and, because
+        // the table reaches this bundle through a plain `pub use`, re-checking those ids proved only
+        // what the compiler already had. The load-bearing claim is that each waived route really is
+        // absent from *this* bundle's composed registry: that absence is what the waiver documents,
+        // and it is what a bundle that quietly grew a registration would break.
+        let waivers: &[super::BespokeMemoryRouteWaiver] = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+        assert!(
+            !waivers.is_empty(),
+            "the CUDA bundle exposes descriptor-less memory routes; an empty waiver table would \
+             make every check below vacuous"
+        );
+        let registry = super::media_registry().expect("CUDA media registry");
+        assert!(
+            registry.generators().next().is_some(),
+            "an empty registry would make every absence check below vacuously true"
+        );
+        for waiver in waivers {
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration in the CUDA bundle after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration in the CUDA bundle after all",
+                waiver.provider_id
+            );
+        }
     }
 }

@@ -646,6 +646,9 @@ fn build_targets(
                 let save_path = format!("transformer_blocks.{i}.{attn}.{suf}");
                 let segs = resolve_segments(&save_path);
                 let seg_refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                // SC-18319 — LTX resolves through its OWN `LtxAdaptable` trait over its own
+                // `Linear`, not the shared `AdaptableHost`/`AdaptableLinear` surface, so there is no
+                // `FusedQkvProjection` behind this path and no probe/mutate split to honour.
                 let Some(lin) = dit.adaptable_mut(&seg_refs) else {
                     continue;
                 };
@@ -1511,10 +1514,8 @@ mod load_trainer_tests {
     /// the split-weight load, so this needs no base snapshot and is deterministic (env-independent).
     #[test]
     fn load_trainer_forwards_text_encoder_override() {
-        let spec = LoadSpec {
-            text_encoder: Some(WeightsSource::Dir("/nonexistent/ltx_gemma".into())),
-            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx_root".into()))
-        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx_root".into()));
+        spec.text_encoder = Some(WeightsSource::Dir("/nonexistent/ltx_gemma".into()));
         // `Box<dyn Trainer>` isn't `Debug`, so match rather than `unwrap_err`.
         let err = match load_trainer(&spec) {
             Ok(_) => panic!("expected a LoadSpec::text_encoder override error"),

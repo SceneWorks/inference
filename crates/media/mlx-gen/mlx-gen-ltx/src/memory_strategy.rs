@@ -332,6 +332,9 @@ fn build_contract(
             cache_eviction: true,
         },
         strategies: strategies(),
+        // LTX declares no decode-quality geometry policy table, so this route carries no semantic
+        // decode authority — the fail-closed default every non-declaring provider contract uses.
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         // LTX stages Gemma before the AvDiT for every render. A selected decode rung therefore
@@ -428,6 +431,19 @@ pub(crate) fn weights_free_memory_strategy_contract(
         STATIC_CALIBRATION_FINGERPRINT,
     )
     .map_err(Into::into)
+}
+
+/// LTX witnesses the shared MLX tiers under both offload policies, but only the eager half of the
+/// materialization axis. `build_contract` rejects `DeferredMaterialization` outright — LTX has no
+/// deferred/block-window loader — so publishing the deferred selectors would advertise a load
+/// surface no contract can be built for, and the registry conformance walk (which constructs every
+/// published selector) would fail the whole MLX catalog. The witness set is the provider's own
+/// finite inventory, not the shared default.
+pub(crate) fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::mlx_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization)
+        .collect()
 }
 
 fn fixture_contract(contract: &MemoryProviderContract) -> bool {
@@ -752,6 +768,38 @@ mod tests {
 
     fn fixture_spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into())).with_quant(Quant::Q8)
+    }
+
+    /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
+    /// fixture publishes and fails the entire MLX catalog when one errors, so the published witness
+    /// set must be exactly the set this provider can build. Asserting it here localizes the failure
+    /// to LTX instead of surfacing it as eight red `mlx-gen-catalog` tests.
+    #[test]
+    fn every_published_contract_surface_builds_and_no_deferred_surface_is_published() {
+        let surfaces = memory_contract_surface_specs();
+        assert_eq!(
+            surfaces.len(),
+            gen_core::mlx_memory_contract_surface_specs().len() / 2,
+            "the witness set is the eager half of the shared MLX surface"
+        );
+        for surface in &surfaces {
+            assert_eq!(
+                surface.selector.load_shape,
+                LoadShape::EagerMaterialization,
+                "{} has no deferred/block-window loader",
+                surface.selector.id()
+            );
+            weights_free_memory_strategy_contract(&surface.spec).unwrap_or_else(|error| {
+                panic!("surface {} must build: {error}", surface.selector.id())
+            });
+        }
+        assert!(
+            gen_core::mlx_memory_contract_surface_specs()
+                .into_iter()
+                .filter(|surface| surface.selector.load_shape == LoadShape::DeferredMaterialization)
+                .all(|surface| weights_free_memory_strategy_contract(&surface.spec).is_err()),
+            "a deferred surface that now builds must be published, not filtered out"
+        );
     }
 
     #[test]

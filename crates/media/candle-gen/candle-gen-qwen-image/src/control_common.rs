@@ -40,15 +40,14 @@ pub(crate) fn component_vb(
 /// `tokenizer.json` per prompt/branch. Byte-identical [`TokenizerConfig`] to the old per-encode load, so
 /// the cached tokenizer yields the same ids. `label` prefixes the error message.
 pub(crate) fn load_tokenizer(
-    root: &Path,
+    source: &candle_gen::gen_core::ValidatedEncoderSource,
     te_cfg: &TextEncoderConfig,
     label: &str,
 ) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        tokenizer_config(te_cfg),
-    )
-    .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+    source.read_tokenizer_unchanged(|path| {
+        TextTokenizer::from_file(path, tokenizer_config(te_cfg))
+            .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+    })
 }
 
 /// The Qwen-Image [`TokenizerConfig`] — one home for the max-length / pad / chat-template policy so no

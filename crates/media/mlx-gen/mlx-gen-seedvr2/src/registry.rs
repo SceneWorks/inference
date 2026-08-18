@@ -47,6 +47,8 @@ fn variant(id: &str) -> (&'static str, DitConfig) {
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::SEEDVR2_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
@@ -89,6 +91,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }
@@ -349,21 +353,7 @@ mod tests {
     #[test]
     fn both_ids_resolve_in_registry() {
         for id in [MODEL_ID, MODEL_ID_3B, MODEL_ID_7B] {
-            let spec = LoadSpec {
-                weights: WeightsSource::Dir("/nonexistent/seedvr2".into()),
-                quantize: None,
-                precision: Precision::Bf16,
-                control: None,
-                ip_adapter: None,
-                adapters: Vec::new(),
-                extra_controls: Vec::new(),
-                pid: None,
-                identity: None,
-                text_encoder: None,
-                offload_policy: Default::default(),
-                load_shape: Default::default(),
-                components: Default::default(),
-            };
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/seedvr2".into()));
             let err = match crate::provider_registry().unwrap().load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),
                 Err(e) => e.to_string(),

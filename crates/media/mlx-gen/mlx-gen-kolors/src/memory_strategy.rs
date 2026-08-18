@@ -25,10 +25,17 @@
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — ChatGLM3-6B + (U-Net + control/IP/VAE/PiD) held across requests |
 //! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop ChatGLM3-6B** → load heavy → denoise + decode |
-//! | 2 Bounded decode | **Missing** (measured — [`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) bounds the request 16.041 → 9.998 GiB (−37.67%) and clears the drift bar at 1024²/1280², but fails it at 1536²/2048² and `decode_tile_edges` has no geometry axis |
+//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](mlx_gen_sdxl::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 16.041 → 9.998 GiB and must be recaptured for the new arithmetic |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** — the request and the U-Net seam — and is not bit-exact on its query-row axis |
 //! | 4 Bounded transformer residency | Implemented (streamable loads), **two scopes** | [`mlx_gen::block_residency::run_windowed`] over the U-Net's eleven `Transformer2D` sub-stacks (70 blocks) **and** over ChatGLM3-6B's 28 `GlmBlock`s |
-
+//!
+//! The rung-2 row is the route-blind legacy default. A caller may now replace it for one exact
+//! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
+//! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
+//! default and the existing estimated-fit fallback.
+//! The older range failures documented below predate SC-19753's layer-wise normalization and are
+//! retained as history, not as the current decoder's expected quality result.
+//!
 //!
 //! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
 //!
@@ -87,29 +94,35 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// Inherited rather than invented: it is the worst drift a sibling MLX provider on this same shared
-/// tiling machinery *admits* into a shipped ladder
-/// (`mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGES` tops out at 48 on its 768 px tile; its
-/// rejected set starts at 64). Z-Image's decoder is the same diffusers `AutoencoderKL` with the same
-/// spatial-extent GroupNorms and the same head/tail split, so it is the closest precedent that
-/// exists for Kolors — which runs literally the same `sdxl-vae-fp16-fix` decoder.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar. Historically that threshold
+/// came from Z's old 48-admitted/64-rejected split; Z now admits all measured edges with a much lower
+/// worst result, so the split is provenance rather than current domain evidence.
 pub const DECODE_DRIFT_BAR: u32 = 48;
 
-/// **Rung 2 is `Missing` on Kolors/MLX, and that is a measurement taken on Kolors' own weights.**
+/// **The route-blind rung-2 fallback is `Missing` on Kolors/MLX.**
 ///
-/// The mechanism is implemented and it works. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
+/// The measurements below are the historical pre-SC-19753 evidence for refusing one unconditional
+/// tile domain across every output. SC-19753 changed the shared decoder to preserve global GroupNorm
+/// statistics and packages new production-latent results as exact sealed route/geometry policies.
+/// Those rows can adopt rung 2 without weakening this fail-closed fallback; coordinates absent from
+/// the table still see [`DECODE_SUPPORT`] `Missing`.
+///
+/// The original mechanism was implemented and bounded memory. Kolors decodes through [`mlx_gen_sdxl::Autoencoder`] —
 /// the same `sdxl-vae-fp16-fix` `AutoencoderKL` SDXL uses — so `decode_tiled` runs the globally-scoped
 /// head (denormalize → `post_quant_conv` → `conv_in` → mid resnets → mid **self-attention**) once on
 /// the full latent and tiles only the full-resolution upsample tail.
 ///
-/// **It is also, by a wide margin, the biggest lever on this family's ladder.** At 1024² q4 it takes
-/// the whole staged request from **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock**
-/// (925 → 1018 ms/step) — against rung 4's −7.21% for +4.2× at the same tier and geometry
-/// (`the_withheld_decode_geometry_is_priced_at_the_request_level`). It is withheld anyway, and the
-/// size of the prize is exactly why the withholding argument had to be measured rather than
-/// asserted.
+/// **Historical whole-tail memory result.** Before SC-19753, 1024² q4 moved the staged request from
+/// **16.0412 → 9.9981 GiB (−37.67%)** for **+10% wall clock** (925 → 1018 ms/step). The layer-wise
+/// decoder's executable test now promises only a greater-than-3% saving until current memory is
+/// recaptured. The route-blind fallback remains withheld; exact sealed rows control admission.
 ///
-/// ## The candidate is real, and at 1024² it CLEARS the bar
+/// ## Historical pre-SC-19753 evidence
+///
+/// The tables and mechanism analysis in this section describe the retired whole-tail decoder. They
+/// remain useful provenance for the route-blind fallback, but they are not current quality claims.
+///
+/// ### The candidate was real, and at 1024² it cleared the bar
 ///
 /// Swept against the **exact untiled decode of the same latent**, on the *production* latent — what
 /// the denoiser actually hands the decode phase, not a re-encoded finished image — at q4 1024²
@@ -137,13 +150,13 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// the production latent reads 44 at the same geometry. A user gets the production latent, so the
 /// absolute bar is judged on it.
 ///
-/// ## What withholds it: the datum is a property of the GEOMETRY, not of the tile edge
+/// ### What withheld it: the datum was a property of geometry, not tile edge
 ///
 /// `MemoryParameterRanges::decode_tile_edges` is an absolute pixel domain with no geometry axis, so
 /// publishing 768 publishes it at everything `crate::registry::descriptor` advertises — and that is
 /// `max_size: 2048`. Re-swept across that range at the same overlap, on a **rendered production
 /// latent at each output size**
-/// (`no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`):
+/// (the pre-SC-19753 form of `layerwise_decode_clears_the_bar_across_the_advertised_output_range`):
 ///
 /// | output | tile covers | max Δ | vs the 48/255 bar |
 /// |---:|---:|---:|---|
@@ -165,7 +178,7 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// against the rendered 38), and a rung admitted on the friendly instrument would be admitted on
 /// evidence no user ever sees.
 ///
-/// ## How this differs from SDXL, which shares the decoder
+/// ### How this differed from SDXL, which shares the decoder
 ///
 /// SDXL withholds rung 2 too, and it is worth being precise about where the two families agree,
 /// because the shared `AutoencoderKL` makes it tempting to inherit:
@@ -181,9 +194,8 @@ pub const DECODE_DRIFT_BAR: u32 = 48;
 /// misstated the best geometry (896 vs 768), the best overlap (192 vs 256), the prize (−16.51% vs
 /// −37.67%) and which output sizes clear.
 ///
-/// What would unlock it is a geometry-relative tile parameter (a fraction of the output rather than
-/// a pixel edge), or a decoder whose tail normalizes over the full extent. Both are contract-level
-/// changes, and neither is this story's — tracked as sc-17678.
+/// SC-19753 supplies the previously missing full-extent normalization and exact geometry policy. The
+/// constant remains `Missing` only because a route-blind value cannot express that sealed identity.
 pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
 
 /// The attention chunk size the rung-3 sweep exercised.
@@ -632,6 +644,7 @@ pub fn memory_strategy_contract(
     contract_with_asset_facts(
         provider_id,
         spec,
+        streamable(spec),
         components.text_encoder,
         components.dit,
         components.vae,
@@ -777,18 +790,94 @@ pub(crate) fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     // No overlays either: sizing one means opening its checkpoint, and this path exists precisely to
     // produce the declaration without touching a weight file.
-    contract_with_asset_facts(provider_id, spec, 0, 0, 0, Vec::new())
+    contract_with_asset_facts(provider_id, spec, streamable(spec), 0, 0, 0, Vec::new())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedSurfaceMaterialization {
+    unet_blocks_lazy: bool,
+    text_encoder_blocks_lazy: bool,
+    adapters_replayable: bool,
+}
+
+/// Source-derived load facts for each shipped resolved artifact tier. Keeping the U-Net and
+/// ChatGLM3 facts separate mirrors the two independent production marker probes: either component
+/// becoming dense must withdraw the all-or-nothing rung.
+fn resolved_surface_materialization(
+    tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
+) -> ResolvedSurfaceMaterialization {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier::{Bf16, Nvfp4, Q4, Q8};
+    match tier {
+        Bf16 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: true,
+            text_encoder_blocks_lazy: true,
+            adapters_replayable: false,
+        },
+        Q4 | Q8 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: true,
+            text_encoder_blocks_lazy: true,
+            adapters_replayable: true,
+        },
+        Nvfp4 => ResolvedSurfaceMaterialization {
+            unet_blocks_lazy: false,
+            text_encoder_blocks_lazy: false,
+            adapters_replayable: false,
+        },
+    }
+}
+
+fn weights_free_surface_streamable_with(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+    materialization: ResolvedSurfaceMaterialization,
+) -> bool {
+    let spec = &surface.spec;
+    matches!(spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+        && materialization.unet_blocks_lazy
+        && materialization.text_encoder_blocks_lazy
+        && (spec.adapters.is_empty() || materialization.adapters_replayable)
+}
+
+/// Selector-aware finite-surface resolver. The explicit selector tier names the resolved artifact;
+/// production continues to call [`memory_strategy_contract`] and probes both real component markers.
+#[doc(hidden)]
+pub fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts(
+        provider_id,
+        &surface.spec,
+        weights_free_surface_streamable_with(
+            surface,
+            resolved_surface_materialization(surface.resolved_artifact_tier()),
+        ),
+        0,
+        0,
+        0,
+        Vec::new(),
+    )
 }
 
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
+    streamable: bool,
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
     overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = streamable(spec);
+    let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
+        mlx_gen::gen_core::MemoryBackend::Mlx,
+        loaded_tier(spec),
+    )?;
+    let geometry_decode = decode_policies.iter().any(|policy| {
+        matches!(
+            policy.disposition,
+            mlx_gen::gen_core::MemoryDecodeQualityDisposition::Admitted
+        )
+    });
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -819,6 +908,9 @@ fn contract_with_asset_facts(
         // Rung 4 makes transformer weight residency a VARIABLE of the peak rather than a constant
         // folded into `AssetBytes`.
         variables.push(MemoryFormulaVariable::TransformerWindowSize);
+    }
+    if geometry_decode {
+        variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     let overlay_bytes = overlays.iter().fold(0_u64, |total, component| {
         total.saturating_add(component.resident_bytes)
@@ -859,7 +951,7 @@ fn contract_with_asset_facts(
         // Request-scoped: the same cached generator serves warm → staged → warm without
         // reconstruction, so the hook is available regardless of the load-time `OffloadPolicy`.
         synchronized_phase_release: true,
-        decode_tiling: false,
+        decode_tiling: geometry_decode,
         attention_chunking: false,
         transformer_window_materialization: streamable,
     };
@@ -887,6 +979,8 @@ fn contract_with_asset_facts(
             _ => MemoryParameterRanges::default(),
         };
     }
+    contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
+    contract.adopt_decode_geometry_policies("kolors", decode_policies)?;
     // No `pid_decode_routes`: that declaration exists to split rung 2's candidate domain between the
     // native VAE and the PiD student, and rung 2 is not selectable on this provider. The student
     // keeps its own internal auto-planning exactly as it did before this story — unchanged
@@ -911,8 +1005,9 @@ fn contract_with_asset_facts(
     Ok(contract)
 }
 
-/// Refuse a bounded-decode geometry. Rung 2 is `Missing` on this provider ([`DECODE_SUPPORT`]), so
-/// there is no admitted domain to validate against and every geometry is out of it.
+/// Refuse a bounded-decode geometry under the route-blind default. Rung 2 is `Missing` when no
+/// sealed route/geometry table is packaged ([`DECODE_SUPPORT`]), so every geometry is then out of
+/// domain.
 ///
 /// This is a *rejection* rather than an absence on purpose. The shared `validate_selection` already
 /// refuses a rung the contract declares `Missing`, but a calibration harness that hand-builds a
@@ -921,15 +1016,10 @@ fn contract_with_asset_facts(
 /// This closes the path from "the code exists" to "a render silently used it".
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable on this provider (rung 2 is declared \
-         Missing). The tiled decode was measured and withheld — NOT because no geometry works: its \
-         best (edge {DECODE_TILE_EDGE} overlap {DECODE_OVERLAP}) clears the \
-         {DECODE_DRIFT_BAR}/255 sibling bar at 1024² with 38/255 and at 1280² with 26/255, and \
-         would have bought -37.67% of the request peak for +10% wall clock. It fails at 1536² \
-         (69/255) and 2048² (53/255), because the upsample tail's GroupNorms normalize over each \
-         tile's own crop — so what bounds the drift is the tile's FRACTION of the output, and a \
-         fixed pixel edge cannot hold that across an advertised range up to 2048². Requested edge \
-         {edge:?} overlap {overlap:?}; see memory_strategy::DECODE_SUPPORT for the full sweep."
+        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
+         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
+         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
+         overlap {overlap:?}."
     ))
 }
 
@@ -970,7 +1060,11 @@ pub(crate) fn safety_check(
         // Kolors advertises txt2img, img2img, ControlNet-pose, IP-Adapter and the combined
         // strict-pose tier, so the mode axis is deliberately permissive. What is NOT permissive is
         // the geometry.
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
+            && contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
+        {
             return Err(refuse_decode(
                 &contract.provider_id,
                 context.selection.parameters.decode_tile_edge,
@@ -1143,7 +1237,10 @@ fn begin_with_cleanup(
         widest_windowable_stack(),
         move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
     )?;
-    // Rungs 2 and 3 are `Missing`, so neither can be engaged and neither parameter is ever set.
+    config.load_shape = context.load_shape;
+    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
+    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
+    // so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(
@@ -1213,17 +1310,65 @@ pub(crate) fn transformer_window(
     }))
 }
 
-/// Rung 2: **always a refusal.** Bounded decode is `Missing` on this provider ([`DECODE_SUPPORT`]),
-/// and this is the request-side layer of that.
-///
-/// It returns `Ok(None)` — the exact single-pass decode — when the request did not ask for a bounded
-/// decode, and a typed error when it did. The error direction is what matters: `Ok(None)` for a
-/// request that *did* ask would silently render an unbounded decode while the caller believed it had
-/// selected a bounded one, which is the false-green this seam exists to prevent.
+/// Legacy mechanism guard retained for the weights-free refusal tests.
+#[cfg(test)]
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
+    decode_tiling_with_contract(req, None)
+}
+
+/// Resolve the production decoder from the exact loaded contract. Historical loads with no sealed
+/// geometry table still fail closed; a policy adopter must also carry the request-local authority
+/// installed by `begin_request`.
+pub(crate) fn decode_tiling_for_contract(
+    req: &GenerationRequest,
+    contract: &MemoryProviderContract,
+) -> mlx_gen::Result<Option<TilingConfig>> {
+    decode_tiling_with_contract(req, Some(contract))
+}
+
+fn decode_tiling_with_contract(
+    req: &GenerationRequest,
+    contract: Option<&MemoryProviderContract>,
+) -> mlx_gen::Result<Option<TilingConfig>> {
     let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
+            mlx_gen::diagnostics::DecodePathDisposition::Dense,
+            None,
+        );
         return Ok(None);
     };
+    if contract.is_some_and(|contract| {
+        contract
+            .capability(MemoryStrategy::BoundedDecode)
+            .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty())
+    }) {
+        let edge = memory.decode_tile_edge.ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "kolors: geometry-aware bounded decode requires an exact tile edge".to_owned(),
+            )
+        })?;
+        let overlap = memory.decode_overlap.ok_or_else(|| {
+            mlx_gen::Error::Unsupported(
+                "kolors: geometry-aware bounded decode requires an exact overlap".to_owned(),
+            )
+        })?;
+        let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
+            crate::MODEL_ID,
+            req,
+            edge,
+            overlap,
+        )?;
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
+            mlx_gen::diagnostics::DecodePathDisposition::Tiled,
+            Some(&evidence),
+        );
+        return Ok(Some(TilingConfig::spatial_only(
+            edge as i32,
+            overlap as i32,
+        )));
+    }
     Err(mlx_gen::Error::Unsupported(
         refuse_decode(
             crate::MODEL_ID,
@@ -1664,6 +1809,10 @@ mod tests {
             !load_leaves_blocks_lazy(&spec) || !text_encoder_leaves_blocks_lazy(&spec),
             "the gate registry::load uses must fire on this snapshot"
         );
+        assert!(
+            !streamable(&spec),
+            "one lazy component cannot stand in for the provider's two-scope contract"
+        );
 
         // The control: a fully packed snapshot re-packs nothing and must stay quiet, which is the
         // narrowing sc-15521 made and which this must not undo.
@@ -1674,6 +1823,7 @@ mod tests {
         .unwrap();
         assert!(load_leaves_blocks_lazy(&spec));
         assert!(text_encoder_leaves_blocks_lazy(&spec));
+        assert!(streamable(&spec));
     }
 
     /// The `TextEncoder` scope's stack is 28 blocks deep, so the window domain the shared request
@@ -1706,6 +1856,21 @@ mod tests {
         weights_free_memory_strategy_contract(crate::MODEL_ID, &spec(shape)).unwrap()
     }
 
+    fn surface(
+        tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
+        policy: OffloadPolicy,
+        shape: LoadShape,
+    ) -> mlx_gen::gen_core::MemoryContractSurfaceSpec {
+        mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.selector.tier == tier
+                    && surface.selector.offload_policy == policy
+                    && surface.selector.load_shape == shape
+            })
+            .unwrap()
+    }
+
     #[test]
     fn a_deferred_load_publishes_the_full_ladder_and_conforms() {
         let contract = contract(LoadShape::DeferredMaterialization);
@@ -1723,6 +1888,105 @@ mod tests {
                 contract.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Implemented,
                 "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_free_resolved_tiers_expose_both_deferred_load_policies() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            for tier in [
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+            ] {
+                let deferred = surface(tier, policy, LoadShape::DeferredMaterialization);
+                let contract = weights_free_surface_contract(crate::MODEL_ID, &deferred).unwrap();
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented,
+                    "{policy:?} {tier:?} is a resolved packed surface"
+                );
+
+                let eager = surface(tier, policy, LoadShape::EagerMaterialization);
+                assert_eq!(
+                    weights_free_surface_contract(crate::MODEL_ID, &eager)
+                        .unwrap()
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weights_free_adapter_replayability_tracks_the_resolved_tier() {
+        let adapter = AdapterSpec {
+            path: "/nonexistent/lora.safetensors".into(),
+            scale: 1.0,
+            kind: mlx_gen::AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        };
+        for (tier, expected) in [
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                MemoryStrategySupport::Missing,
+            ),
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                MemoryStrategySupport::Implemented,
+            ),
+            (
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+                MemoryStrategySupport::Implemented,
+            ),
+        ] {
+            let mut surface = surface(
+                tier,
+                OffloadPolicy::Resident,
+                LoadShape::DeferredMaterialization,
+            );
+            surface.spec.adapters = vec![adapter.clone()];
+            assert_eq!(
+                weights_free_surface_contract(crate::MODEL_ID, &surface)
+                    .unwrap()
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                expected,
+                "{tier:?} adapter replayability"
+            );
+        }
+    }
+
+    #[test]
+    fn either_non_lazy_component_withdraws_the_weights_free_rung() {
+        let surface = surface(
+            mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+            OffloadPolicy::Resident,
+            LoadShape::DeferredMaterialization,
+        );
+        let exact = resolved_surface_materialization(surface.selector.tier);
+        assert!(weights_free_surface_streamable_with(&surface, exact));
+        for changed in [
+            ResolvedSurfaceMaterialization {
+                unet_blocks_lazy: false,
+                ..exact
+            },
+            ResolvedSurfaceMaterialization {
+                text_encoder_blocks_lazy: false,
+                ..exact
+            },
+        ] {
+            assert!(
+                !weights_free_surface_streamable_with(&surface, changed),
+                "both independently probed component stacks must remain lazy"
             );
         }
     }
@@ -1769,10 +2033,8 @@ mod tests {
             moe_expert: None,
         };
         let dense = spec(LoadShape::DeferredMaterialization);
-        let with_adapter = LoadSpec {
-            adapters: vec![adapter],
-            ..dense.clone()
-        };
+        let mut with_adapter = dense.clone();
+        with_adapter.adapters = vec![adapter];
         assert!(streamable(&dense), "the adapter-free load streams");
         assert!(
             !streamable(&with_adapter),
@@ -1808,10 +2070,8 @@ mod tests {
     /// marker, which is exactly the shape of the upstream `Kwai-Kolors/Kolors-diffusers` snapshot.
     #[test]
     fn a_load_time_quantization_over_a_dense_snapshot_cannot_stream() {
-        let dense_q8 = LoadSpec {
-            quantize: Some(mlx_gen::Quant::Q8),
-            ..spec(LoadShape::DeferredMaterialization)
-        };
+        let mut dense_q8 = spec(LoadShape::DeferredMaterialization);
+        dense_q8.quantize = Some(mlx_gen::Quant::Q8);
         assert!(!load_leaves_blocks_lazy(&dense_q8));
         assert!(!streamable(&dense_q8));
         // The control: the same spec without the quantize request stays lazy.
@@ -1862,7 +2122,10 @@ mod tests {
             ..Default::default()
         };
         let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(err.to_string().contains("38/255"), "got: {err}");
+        assert!(
+            err.to_string().contains("no applicable admitted row"),
+            "got: {err}"
+        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {

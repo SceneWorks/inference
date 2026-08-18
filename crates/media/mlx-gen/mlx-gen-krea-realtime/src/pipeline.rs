@@ -88,6 +88,8 @@ fn resolve_frames(req: &GenerationRequest) -> Result<ResolvedFrames> {
 /// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -164,6 +166,8 @@ pub fn descriptor() -> ModelDescriptor {
             // z16 VAE stride 8 × the Wan DiT's 2×2 latent patch: explicit dimensions must land
             // on a 16px grid or integer division would silently render a smaller clip.
             size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

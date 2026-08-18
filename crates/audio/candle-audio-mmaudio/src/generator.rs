@@ -96,6 +96,8 @@ pub const REQUIRED_COMPONENTS: &[&str] = &["clip", "synchformer", "dit", "vae", 
 /// MMAudio's identity + capabilities — constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: REQUIRED_COMPONENTS,
         id: MODEL_ID,
@@ -139,6 +141,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_session: false,
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

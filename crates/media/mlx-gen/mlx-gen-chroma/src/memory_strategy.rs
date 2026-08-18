@@ -19,9 +19,17 @@
 //! |---|---|---|---|
 //! | 0 resident | — | 28.0779 GiB | baseline |
 //! | 1 staged residency | shed T5-XXL before the DiT/VAE load, per request | **19.2065 GiB (−31.60%)** | Implemented |
-//! | 2 bounded decode | `Vae::decode_tiled` on the FLUX.1 16-ch AutoencoderKL | bounds the phase; **fails quality** | Missing, see [`DECODE_SUPPORT`] |
+//! | 2 bounded decode | `Vae::decode_tiled` on the FLUX.1 16-ch AutoencoderKL | bounds the phase; SC-19753 preserves full-image GroupNorm statistics | route-blind Missing; exact measured rows may be Implemented, see [`DECODE_SUPPORT`] |
 //! | 3 bounded attention | `sdpa_budgeted_bhsd` on both block stacks | bounds the phase; **not the binding one** | Missing, see [`ATTENTION_SUPPORT`] |
 //! | 4 bounded transformer residency | `run_windowed` over the two DiT sub-stacks | **14.6932 GiB (−23.50% on rung 1)** | Implemented |
+//!
+//! The rung-2 row is the route-blind legacy default. A caller may now replace it for one exact
+//! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
+//! quality policy. Coordinates absent from that table remain refused; an empty table preserves the
+//! default and the existing estimated-fit fallback.
+//! SC-19753 changes the decoder to preserve full-activation GroupNorm statistics and refreshes the
+//! packaged policy rows; the pre-SC-19753 drift figures below remain historical context for the
+//! route-blind fallback, not claims about the new layer-wise tiled arithmetic.
 //!
 //! Rung 4's saving is attributed rather than assumed: 4.5133 GiB measured against a 4.5125 GiB
 //! windowable block weight set read from the snapshot's own safetensors `data_offsets` — the whole
@@ -33,12 +41,10 @@
 //! Two verdicts here are the opposite of what the architecture suggests, and both were reached by
 //! measuring rather than by reasoning from the sibling families:
 //!
-//! * **Rung 2 is `Missing`, on a narrow margin.** Tiling the FLUX.1 VAE decode is a large saving on
-//!   this family (−11% to −72% of the decode phase). At the variant's real 28-step schedule the best
-//!   of 28 swept geometries drifts **53/255** against the untiled decode of the **production**
-//!   latent, ~10% over the 48/255 bar the closest sibling admits — and resampling that cell across
-//!   five production latents gives 28..82, a 2.9x spread that straddles the bar. Withheld as an
-//!   UNRESOLVED margin, not as a clean failure. See [`DECODE_SUPPORT`].
+//! * **The route-blind rung 2 is `Missing`.** Before SC-19753, tiling the whole FLUX.1 VAE tail saved
+//!   −11% to −72% of the decode phase but its per-crop GroupNorm model produced a 28..82/255 sample.
+//!   That historical result explains the fail-closed fallback. The current layer-wise decoder keeps
+//!   full-image statistics, and sealed exact-coordinate evidence may adopt it. See [`DECODE_SUPPORT`].
 //! * **Rung 3 is `Missing`.** MLX's fused attention kernel streams its scores, so query-row
 //!   chunking has no materialized score matrix to bound: measured **−0.001%** on the request peak.
 //!   See [`ATTENTION_SUPPORT`].
@@ -50,9 +56,8 @@
 //!   **−0.00%**. See [`TRANSFORMER_WINDOW_COMPONENT`].
 //!
 //! sc-16462 (inference PR #443) packs the T5/VAE auxiliaries. It changes the conditioning phase's
-//! weight, so every conditioning number here is re-derived when it lands — but it does not disturb
-//! either verdict, because rung 1 already removes that phase from the request peak and rung 2's
-//! rejection is a decoder-quality result that a narrower text encoder does not touch.
+//! weight, so every conditioning number here is re-derived when it lands, but it does not disturb
+//! the rung-3 or rung-4 verdicts; rung 2 is now governed by SC-19753's sealed coordinate evidence.
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
@@ -62,7 +67,8 @@ use mlx_gen::gen_core::{
     MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
     MemoryMode, MemoryNumericTier, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, TransformerComponent,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -87,9 +93,9 @@ pub const DECODE_TILE_EDGES_SWEPT: &[u32] = &[960, 896, 832, 768, 640, 512, 384]
 /// Feather overlaps swept beside [`DECODE_TILE_EDGES_SWEPT`].
 pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 
-/// **Rung 2 is `Missing`, and the reason is a NARROW margin rather than a clear failure.**
+/// **The route-blind rung-2 fallback is `Missing`.**
 ///
-/// Measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
+/// The following pre-SC-19753 history was measured on Chroma1-Base q4 at 1024² at the variant's real **28-step** schedule
 /// (`decode_tile_mechanism_sweep_on_the_production_latent`), against the exact untiled decode of the
 /// **production** latent — what the denoiser hands the decode phase, not a re-encoded finished image
 /// whose statistics have already been through the VAE round trip:
@@ -110,7 +116,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// drift `mlx_gen_z_image` *admits* into a shipped ladder on the same tiling machinery over the same
 /// `AutoencoderKL` type.
 ///
-/// ## Why this is withheld as UNRESOLVED rather than as a failure
+/// ## Historical pre-SC-19753 classification: UNRESOLVED rather than failure
 ///
 /// **A previous revision of this doc published 105–166/255, called it "more than double the bar",
 /// and built a mechanism argument on the drift being flat in the geometry. All of that was an
@@ -121,7 +127,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// **And 10% is far inside the statistic's own variance, which is measured rather than assumed.**
 /// `max Δ` is an extreme-order statistic over ~3.1M subpixels — a single outlier sets it — so
-/// `the_rung_two_drift_margin_is_resampled_across_seeds` re-takes the best cell across five
+/// the pre-SC-19753 version of `layerwise_decode_quality_is_resampled_across_seeds` re-took the best cell across five
 /// production latents:
 ///
 /// | seed | 1234 | 7 | 99 | 20260805 | 424242 |
@@ -135,13 +141,9 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// clean rejection: on this evidence `max Δ` against a borrowed 48/255 threshold does not resolve
 /// this candidate in either direction.
 ///
-/// The rung therefore ships `Missing` **because nothing here supports admitting it**, and the
-/// withholding reason is recorded as an unresolved margin. Admitting it would need a quality
-/// methodology this epic has not agreed on — a perceptual metric, or a distributional bar derived
-/// for this family rather than borrowed from a sibling — and shipping it on a margin narrower than
-/// its own seed-to-seed noise would be exactly the inherited-verdict failure the epic exists to
-/// prevent. `the_rung_two_drift_margin_is_resampled_across_seeds` pins the verdict CLASS, so a move
-/// to a clean failure or to admissibility reddens rather than sitting stale.
+/// Those results explain why the route-blind constant stays fail-closed. SC-19753 does not promote
+/// the constant; it packages new exact production-latent geometry rows, leaving every absent or
+/// mismatched coordinate refused.
 pub const DECODE_SUPPORT: bool = false;
 /// The native VAE tile ladder this provider *would* publish, and the reference domain its checked
 /// [`mlx_gen_pid::DecodeRoutes`] is constructed from so the native and PiD domains stay provably
@@ -459,9 +461,32 @@ fn route_mode_and_references(spec: &LoadSpec) -> (MemoryMode, u32) {
 /// `{base}.scales`), so the production Q4/Q8 route is admitted and only the re-quantizing one is not.
 pub fn structurally_streamable(spec: &LoadSpec) -> bool {
     WINDOW_SUPPORT
-        && spec.offload_policy == OffloadPolicy::Sequential
         && spec.load_shape == LoadShape::DeferredMaterialization
         && spec.quantize.is_none()
+        && clean(spec)
+        && matches!(spec.weights, WeightsSource::Dir(_))
+}
+
+/// Weights-free counterpart of [`structurally_streamable`] for the finite registry surface.
+///
+/// On a real load `spec.quantize` means "pack this dense source now" and is therefore refused by
+/// [`structurally_streamable`]. In a [`MemoryContractSurfaceSpec`](mlx_gen::gen_core::MemoryContractSurfaceSpec),
+/// however, that same field is the tensor-free witness for the selector's already-resolved artifact
+/// tier. Q4/Q8 catalog tiers are prepacked and reach production with `quantize == None`; treating the
+/// witness as load-time quantization would erase both shipped tiers from generated capabilities.
+fn weights_free_structurally_streamable(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> bool {
+    let resolved_artifact_tier = surface.resolved_artifact_tier();
+    let spec = &surface.spec;
+    WINDOW_SUPPORT
+        && matches!(
+            resolved_artifact_tier,
+            mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16
+                | mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                | mlx_gen::gen_core::MemoryContractSurfaceTier::Q8
+        )
+        && spec.load_shape == LoadShape::DeferredMaterialization
         && clean(spec)
         && matches!(spec.weights, WeightsSource::Dir(_))
 }
@@ -476,9 +501,18 @@ fn build_contract(
     overlays: Vec<MemoryResidentComponent>,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     variant_for(provider_id)?;
-    let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = clean(spec);
-    let decode = DECODE_SUPPORT && clean;
+    let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
+        mlx_gen::gen_core::MemoryBackend::Mlx,
+        loaded_tier(spec),
+    )?;
+    let geometry_decode = decode_policies.iter().any(|policy| {
+        matches!(
+            policy.disposition,
+            mlx_gen::gen_core::MemoryDecodeQualityDisposition::Admitted
+        )
+    });
+    let decode = (DECODE_SUPPORT && clean) || geometry_decode;
     let attention = ATTENTION_SUPPORT && clean;
     let routes = decode_routes(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -539,7 +573,9 @@ fn build_contract(
             MemoryPhase::Denoise,
             MemoryPhase::Decode,
         ],
-        synchronized_phase_release: staged,
+        // Chroma uses request_scoped_from_policy: load-time offload is only the default and every
+        // cached generator can execute a staged request that evicts its warm pair first.
+        synchronized_phase_release: true,
         decode_tiling: decode,
         attention_chunking: attention,
         transformer_window_materialization: streamable,
@@ -547,7 +583,7 @@ fn build_contract(
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
             MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-            MemoryStrategy::StagedResidency if staged => MemoryStrategySupport::Implemented,
+            MemoryStrategy::StagedResidency => MemoryStrategySupport::Implemented,
             MemoryStrategy::BoundedDecode if decode => {
                 capability.parameters.decode_tile_edges = routes.native_edges().to_vec();
                 capability.parameters.decode_overlaps = vec![DECODE_OVERLAP];
@@ -566,6 +602,9 @@ fn build_contract(
             _ => MemoryStrategySupport::Missing,
         };
     }
+    contract.resident_request_memory = ResidentRequestMemory::ExplicitResident;
+    contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
+    contract.adopt_decode_geometry_policies("chroma", decode_policies)?;
     if streamable {
         contract.additional_prerequisites.push((
             MemoryStrategy::BoundedTransformerResidency,
@@ -658,6 +697,52 @@ pub fn weights_free_contract(
     )
 }
 
+/// Selector-aware finite-surface resolver. The selector's tier is the explicit resolved artifact
+/// tier; downstream consumers never need to reinterpret `LoadSpec::quantize` as a packed-source
+/// fact. Production continues to call [`contract_for`] and inspect the real source marker.
+#[doc(hidden)]
+pub fn weights_free_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let route = variant_for(provider_id)?.id().replace('_', "-");
+    build_contract(
+        provider_id,
+        &surface.spec,
+        weights_free_structurally_streamable(surface),
+        Some(MemoryCalibrationIdentity::new(
+            format!("{STATIC_CALIBRATION}-{route}"),
+            surface.spec.load_shape,
+        )),
+        Default::default(),
+        Vec::new(),
+    )
+}
+
+/// Numeric tier the loaded Chroma artifact actually carries. Turnkey Chroma tiers deliberately keep
+/// `spec.quantize == None` so their dense T5 tower is never repacked; the transformer marker is the
+/// authoritative q4/q8 identity used by both calibration and decode-quality admission.
+fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    let packed = match &spec.weights {
+        WeightsSource::Dir(root) if spec.quantize.is_none() => {
+            mlx_gen::quant::packed_quant_bits_at(&root.join("transformer"))
+                .ok()
+                .flatten()
+                .and_then(|bits| match bits {
+                    4 => Some(mlx_gen::Quant::Q4),
+                    8 => Some(mlx_gen::Quant::Q8),
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize.or(packed),
+        component_precision_floors: &[],
+    }
+}
+
 pub(crate) fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -680,7 +765,11 @@ pub(crate) fn safety_check(
                 contract.provider_id
             )));
         }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
+            && contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
+        {
             decode_routes(&contract.provider_id)?
                 .validate(
                     context.use_pid,
@@ -695,8 +784,8 @@ pub(crate) fn safety_check(
         ) {
             if !contract.lifecycle.transformer_window_materialization || !context.has_phases {
                 return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires the Sequential + \
-                     DeferredMaterialization route with rung 1 engaged in the same request",
+                    "{}: bounded transformer residency requires DeferredMaterialization with \
+                     staged residency engaged in the same request",
                     contract.provider_id
                 )));
             }
@@ -714,11 +803,7 @@ pub(crate) fn safety_check(
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(loaded_tier(spec)),
         Some(&route_gate),
     )
 }
@@ -741,16 +826,13 @@ pub(crate) fn registered_fixture(
     let context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
+        loaded_tier(spec),
         mlx_gen::gen_core::MemoryBehaviorRoute {
             mode,
             reference_count,
             use_pid: false,
-            has_phases: spec.offload_policy == OffloadPolicy::Sequential,
+            // Request-scoped residency exposes phase boundaries under either load-time default.
+            has_phases: true,
             overlay: route_overlay(spec),
         },
     )?;
@@ -780,6 +862,8 @@ fn begin_request_with_cleanup(
                 .map_err(CoreError::Unsupported)
         },
     )?;
+    config.load_shape = context.load_shape;
+    mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
     config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
     config.transformer_window = contract
         .engages(
@@ -893,6 +977,7 @@ pub(crate) fn transformer_window(
 /// Rung 2's plan. Unselected requests return `None`, keeping the historical one-pass decode exactly
 /// intact. PiD is handled before this plan at the decode call site and never inherits native VAE
 /// geometry.
+#[cfg(test)]
 pub(crate) fn decode_tiling(
     req: &GenerationRequest,
     provider_id: &str,
@@ -911,6 +996,60 @@ pub(crate) fn decode_tiling(
         .map_err(|error| mlx_gen::Error::Unsupported(error.to_string()))?
         .validate(req.use_pid, Some(edge), Some(overlap))
         .map_err(mlx_gen::Error::Unsupported)?;
+    Ok(Some(TilingConfig::spatial_only(
+        edge as i32,
+        overlap as i32,
+    )))
+}
+
+/// Production rung-2 resolution. The mechanism helper above remains available to correctness-only
+/// tests, but a real request may tile only under an exact sealed geometry row selected and armed by
+/// its request scope.
+pub(crate) fn decode_tiling_for_contract(
+    req: &GenerationRequest,
+    provider_id: &'static str,
+    contract: &MemoryProviderContract,
+) -> mlx_gen::Result<Option<TilingConfig>> {
+    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
+        mlx_gen::diagnostics::record_geometry_decode_decision(
+            mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
+            mlx_gen::diagnostics::DecodePathDisposition::Dense,
+            None,
+        );
+        return Ok(None);
+    };
+    if req.cancel.is_cancelled() {
+        return Err(mlx_gen::Error::Canceled);
+    }
+    let has_quality_table = contract
+        .capability(MemoryStrategy::BoundedDecode)
+        .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty());
+    if !has_quality_table {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: bounded decode is withheld until an exact production-latent geometry-quality row is packaged for this loaded route"
+        )));
+    }
+    let edge = memory.decode_tile_edge.ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact tile edge"
+        ))
+    })?;
+    let overlap = memory.decode_overlap.ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "{provider_id}: geometry-aware bounded decode requires an exact overlap"
+        ))
+    })?;
+    let evidence = mlx_gen::request_scope::validate_geometry_decode_authorization(
+        provider_id,
+        req,
+        edge,
+        overlap,
+    )?;
+    mlx_gen::diagnostics::record_geometry_decode_decision(
+        mlx_gen::diagnostics::DecodePolicyDisposition::GeometryTiled,
+        mlx_gen::diagnostics::DecodePathDisposition::Tiled,
+        Some(&evidence),
+    );
     Ok(Some(TilingConfig::spatial_only(
         edge as i32,
         overlap as i32,
@@ -1226,6 +1365,11 @@ mod tests {
             ),
         ];
         for spec in cases {
+            assert!(
+                !structurally_streamable(&spec),
+                "production predicate must reject {:?}",
+                route_overlay(&spec)
+            );
             let contract = weights_free_contract(crate::CHROMA1_BASE_ID, &spec).unwrap();
             assert!(contract.conformance_errors().is_empty());
             for strategy in [
@@ -1247,13 +1391,17 @@ mod tests {
     }
 
     #[test]
-    fn rung_four_needs_sequential_deferred_and_a_non_requantizing_tier() {
+    fn production_rung_four_needs_deferred_directory_clean_route_and_no_requantization() {
         assert!(structurally_streamable(&streamable_spec()));
+        assert!(
+            structurally_streamable(
+                &streamable_spec().with_offload_policy(OffloadPolicy::Resident)
+            ),
+            "materialization shape is independent from phase offload policy"
+        );
         for spec in [
             // Eager materialization: no reopenable stream.
             sequential_spec(),
-            // Resident: rung 1 cannot be engaged in the same request.
-            streamable_spec().with_offload_policy(OffloadPolicy::Resident),
             // A dense source the loader would re-quantize per window.
             streamable_spec().with_quant(Quant::Q4),
             // A single-file checkpoint has no component tree to reopen.
@@ -1262,15 +1410,138 @@ mod tests {
                 .with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             assert!(!structurally_streamable(&spec));
-            assert_eq!(
-                weights_free_contract(crate::CHROMA1_BASE_ID, &spec)
-                    .unwrap()
-                    .capability(MemoryStrategy::BoundedTransformerResidency)
-                    .unwrap()
-                    .support,
-                MemoryStrategySupport::Missing
-            );
         }
+    }
+
+    #[test]
+    fn production_packed_and_dense_artifact_tiers_share_the_deferred_source_predicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (tag, bits) in [("bf16", None), ("q4", Some(4)), ("q8", Some(8))] {
+            let root = tier_root(&tmp, tag, bits);
+            for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+                let spec = tier_spec(&root)
+                    .with_offload_policy(policy)
+                    .with_load_shape(LoadShape::DeferredMaterialization);
+                assert!(
+                    structurally_streamable(&spec),
+                    "{tag} {policy:?} resolved artifact"
+                );
+                assert!(
+                    !structurally_streamable(&spec.clone().with_quant(Quant::Q4)),
+                    "a real load-time quantization request remains distinct from the resolved artifact tier"
+                );
+                let mut external_te = spec;
+                external_te.text_encoder = Some(WeightsSource::Dir("/external-text".into()));
+                assert!(
+                    !structurally_streamable(&external_te),
+                    "external text encoder must remain fail-closed"
+                );
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn weights_free_resolved_tiers_expose_both_deferred_load_policies() {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            for tier in [
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q4,
+                mlx_gen::gen_core::MemoryContractSurfaceTier::Q8,
+            ] {
+                let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                    .into_iter()
+                    .find(|surface| {
+                        surface.selector.tier == tier
+                            && surface.selector.offload_policy == policy
+                            && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                    })
+                    .unwrap();
+                let contract =
+                    weights_free_surface_contract(crate::CHROMA1_BASE_ID, &surface).unwrap();
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented,
+                    "{policy:?} {tier:?} is a resolved prepacked surface"
+                );
+                assert!(contract
+                    .requires(MemoryStrategy::BoundedTransformerResidency)
+                    .any(|prerequisite| matches!(
+                        prerequisite,
+                        MemoryStrategyPrerequisite::Rung {
+                            rung: MemoryStrategy::StagedResidency,
+                            scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                        }
+                    )));
+
+                let eager = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.selector.tier == tier
+                            && candidate.selector.offload_policy == policy
+                            && candidate.selector.load_shape == LoadShape::EagerMaterialization
+                    })
+                    .unwrap();
+                assert_eq!(
+                    weights_free_surface_contract(crate::CHROMA1_BASE_ID, &eager)
+                        .unwrap()
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_deferred_rung_four_selection_engages_request_scoped_staging() {
+        let surface = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.selector.tier == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Resident
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .unwrap();
+        let contract = weights_free_surface_contract(crate::CHROMA1_BASE_ID, &surface).unwrap();
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(contract.lifecycle.synchronized_phase_release);
+        assert_eq!(
+            contract.resident_request_memory,
+            ResidentRequestMemory::ExplicitResident
+        );
+
+        let mut fixture = registered_fixture(
+            &surface.spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0);
+        contract
+            .validate_selection(&fixture.context.selection)
+            .unwrap();
+        assert!(matches!(
+            safety_check(&surface.spec, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        let mut scope = registered_begin_request(&surface.spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut fixture.request).unwrap();
+        let memory = fixture.request.memory.expect("rung 4 request memory");
+        assert!(memory.stage_residency);
+        assert!(memory.stream_transformer_blocks);
     }
 
     #[test]

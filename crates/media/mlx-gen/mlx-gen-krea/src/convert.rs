@@ -437,6 +437,26 @@ mod tests {
     use mlx_rs::Dtype;
 
     #[test]
+    fn load_time_and_offline_krea_quantization_both_keep_embeddings_dense() {
+        assert!(!is_text_encoder_quant_target(
+            "language_model.embed_tokens.weight"
+        ));
+        assert_eq!(
+            text_encoder_quant_targets(2)
+                .into_iter()
+                .filter(|name| name.contains("embed_tokens"))
+                .count(),
+            0
+        );
+        assert!(
+            !crate::model::ENCODER_CONTRACT
+                .packing
+                .expect("Krea supports projection packing")
+                .pack_embedding
+        );
+    }
+
+    #[test]
     fn expected_key_count_matches_published_turbo() {
         let cfg = Krea2Config::turbo();
         let keys = expected_transformer_keys(&cfg);

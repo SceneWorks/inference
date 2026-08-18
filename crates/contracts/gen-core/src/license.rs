@@ -844,6 +844,57 @@ pub fn license_table_conformance_errors(
     errors
 }
 
+/// Validate that every alternate decoder advertised for `backend` is represented in that
+/// backend's provider-to-component licence table.
+///
+/// [`crate::DecoderOption::license_component`] is the bridge between the weights-free decoder
+/// registry and the model-weight licence manifest. Latent compatibility is not enough: every
+/// eligible provider row must also include the donor component, so the manifest's derived provider
+/// terms are the base-plus-decoder union. This remains disclosure-only; it never gates a load.
+pub fn decoder_license_conformance_errors(
+    backend: &str,
+    options: &[crate::DecoderOption],
+    components: &[ComponentLicense],
+    providers: &[ProviderComponents],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for option in options
+        .iter()
+        .filter(|option| option.eligible_backends.contains(&backend))
+    {
+        let component = option.license_component;
+        if is_blank(component) {
+            errors.push(format!("decoder {:?} has no licence component", option.id));
+            continue;
+        }
+        if resolve_component(components, component).is_none() {
+            errors.push(format!(
+                "decoder {:?} references unknown licence component {component:?}",
+                option.id
+            ));
+        }
+        for provider_id in option.eligible_provider_ids {
+            match providers
+                .iter()
+                .find(|provider| provider.provider_id == *provider_id)
+            {
+                None => errors.push(format!(
+                    "decoder {:?} is eligible for provider {provider_id:?}, but that provider has no licence row",
+                    option.id
+                )),
+                Some(provider) if !provider.components.contains(&component) => {
+                    errors.push(format!(
+                        "provider {provider_id:?} does not include decoder {:?} licence component {component:?}",
+                        option.id
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    errors
+}
+
 /// Serialize the licence table into the canonical **model-licenses manifest** JSON at
 /// `schema_version` 3 — the file the release tooling emits beside the SPDX SBOM.
 ///
@@ -1011,6 +1062,34 @@ mod v3_tests {
             license_table_conformance_errors(FAMILIES, COMPONENTS, &[PLAIN_FLUX, IDENTITY_FLUX]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn decoder_licence_conformance_detects_a_dropped_composite_component() {
+        const OPTION: crate::DecoderOption = crate::DecoderOption {
+            id: "fixture_decoder",
+            label: "Fixture decoder",
+            component_id: crate::VAE_COMPONENT,
+            input_latent_space: &crate::QWEN_KREA_Z16_LATENT_SPACE,
+            eligible_backends: &["mlx"],
+            eligible_provider_ids: &["flux1_dev"],
+            license_component: "t5_xxl",
+            experimental: true,
+        };
+        assert_eq!(
+            decoder_license_conformance_errors("mlx", &[OPTION], COMPONENTS, &[PLAIN_FLUX]),
+            Vec::<String>::new()
+        );
+
+        const DROPPED_DONOR: ProviderComponents = ProviderComponents {
+            provider_id: "flux1_dev",
+            components: &["flux1_dev_dit"],
+        };
+        let errors =
+            decoder_license_conformance_errors("mlx", &[OPTION], COMPONENTS, &[DROPPED_DONOR]);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(errors[0].contains("fixture_decoder"), "got: {errors:?}");
+        assert!(errors[0].contains("t5_xxl"), "got: {errors:?}");
     }
 
     /// The strictest term comes from a component that is not the headline model: the identity

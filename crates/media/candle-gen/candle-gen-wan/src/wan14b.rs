@@ -1139,6 +1139,8 @@ impl Generator for Wan14bGenerator {
 /// load; quant still deferred). `conditioning` differs per variant.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.id(),
@@ -1190,6 +1192,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

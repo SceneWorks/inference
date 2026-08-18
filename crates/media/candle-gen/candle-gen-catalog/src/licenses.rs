@@ -218,9 +218,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     // --- krea -------------------------------------------------------------------------------
     // The VAE is `Qwen/Qwen-Image` by the Krea `vae/config.json`'s own `_name_or_path`.
-    // `krea_2_edit` runs the edit surface on the **Raw** checkpoint. `krea_2_control` is a
-    // trainer-only id whose produced overlay applies at `krea_2_turbo` inference, so it loads the
-    // Turbo snapshot. The Qwen3-VL-4B tower is a pinned hole.
+    // `krea_2_edit` runs the edit surface on the **Raw** checkpoint, while
+    // `krea_2_turbo_edit` runs it on the distilled Turbo checkpoint. `krea_2_control` is a
+    // trainer-only id whose produced overlay applies at `krea_2_turbo` inference. The Qwen3-VL-4B
+    // tower is a pinned hole.
     ProviderComponents {
         provider_id: "krea_2_control",
         components: &["krea_2_turbo", "qwen_image"],
@@ -235,6 +236,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     ProviderComponents {
         provider_id: "krea_2_turbo",
+        components: &["krea_2_turbo", "qwen_image"],
+    },
+    ProviderComponents {
+        provider_id: "krea_2_turbo_edit",
         components: &["krea_2_turbo", "qwen_image"],
     },
     // --- lens -------------------------------------------------------------------------------
@@ -526,7 +531,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 48);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 49);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -558,8 +563,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            57,
-            "57 distinct Candle provider ids: 52 generators + 7 trainers (5 of them also generator \
+            58,
+            "58 distinct Candle provider ids: 53 generators + 7 trainers (5 of them also generator \
              ids) + 1 captioner + 2 embedders"
         );
 
@@ -649,6 +654,7 @@ mod tests {
             ("krea_2_edit", &["krea_qwen3_vl_4b"]),
             ("krea_2_raw", &["krea_qwen3_vl_4b"]),
             ("krea_2_turbo", &["krea_qwen3_vl_4b"]),
+            ("krea_2_turbo_edit", &["krea_qwen3_vl_4b"]),
             // Convention on the two Lens ids: each names **its own** deleted upstream plus the
             // shared `lens_transformer` key, because both load an in-snapshot `transformer/`
             // (`candle-gen-lens/src/lib.rs` `component_vb("transformer", …)` on either route) whose
@@ -677,7 +683,7 @@ mod tests {
             ("z_image_turbo", &["z_image_qwen3_text_encoder"]),
         ];
 
-        assert_eq!(INCOMPLETE.len(), 27);
+        assert_eq!(INCOMPLETE.len(), 28);
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         for (id, missing) in INCOMPLETE {
             assert!(

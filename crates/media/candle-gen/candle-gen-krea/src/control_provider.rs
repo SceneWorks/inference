@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, OffloadPolicy, PreviewSink, Progress, Quant, WeightsSource,
+};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -194,19 +196,35 @@ struct Krea2ControlHeavy {
 pub struct Krea2Control {
     device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Krea2ControlHeavy>,
+    /// Complete caller-prepared identity retained for deferred warm/staged materialization.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 impl Krea2Control {
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
+        Self::load_with_text_encoder(paths, None)
+    }
+
+    pub fn load_with_text_encoder(
+        paths: &Krea2ControlPaths,
+        text_encoder: Option<WeightsSource>,
+    ) -> Result<Self> {
+        // NOTE: the former "INT8-ConvRot does not support LoRA/LoKr" rejection is gone on purpose —
+        // sc-18477 wired `install_additive` into the ConvRot arm of `load_control_heavy`, so the
+        // combination is now implemented rather than merely accepted. The remaining guard is the
+        // one that still holds: at most ONE replacement DiT may be selected.
         if paths.convrot_dit.is_some() && paths.native_dit.is_some() {
             return Err(CandleError::Msg(
                 "krea control: select at most one replacement DiT (ConvRot or native)".into(),
             ));
         }
-        let device = candle_gen::default_device()?;
         let text_root = paths.root.clone();
+        let source =
+            text_encoder.unwrap_or_else(|| WeightsSource::Dir(text_root.join("text_encoder")));
+        let text_encoder = resolve_control_text_encoder_source(&text_root, &source)?;
+        let device = candle_gen::default_device()?;
         let text_device = device.clone();
         let heavy_root = paths.root.clone();
         let heavy_convrot_dit = paths.convrot_dit.clone();
@@ -217,7 +235,7 @@ impl Krea2Control {
         let heavy_chunk_attention = paths.chunk_attention;
         let heavy_device = device.clone();
         let residency = candle_gen::Residency::request_scoped(
-            move |_| load_control_text(&text_root, &text_device),
+            move |_| load_control_text(&text_root, &text_encoder, &text_device),
             move |_use_pid, _| {
                 load_control_heavy(
                     &heavy_root,
@@ -231,7 +249,51 @@ impl Krea2Control {
                 )
             },
         );
-        Ok(Self { device, residency })
+        Ok(Self {
+            device,
+            residency,
+            prepared_spec: None,
+        })
+    }
+
+    /// Load from the exact caller-prepared specification.
+    ///
+    /// The compatibility [`Self::load_with_text_encoder`] entry point validates a selected path at
+    /// provider construction. Request authors that already prepared an encoder contract must retain
+    /// that complete receipt instead: it also pins the selected config, tokenizer, and complete shard
+    /// inventory. Keep the full provider construction inside the prepared-file bracket so a compatible
+    /// replacement between admission and this bespoke load cannot be silently revalidated.
+    pub fn load_with_spec(
+        paths: &Krea2ControlPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        validate_spec_root(&paths.root, spec, "krea control")?;
+        let mut model = spec.read_prepared_files_unchanged(|| {
+            let control = required_source_path(spec.control.as_ref(), "krea control overlay")?;
+            let convrot_dit = spec
+                .components
+                .get(candle_gen::gen_core::KREA_CONVROT_DIT_COMPONENT)
+                .map(|source| required_file_path(source, "krea control ConvRot DiT"))
+                .transpose()?;
+            Self::load_with_text_encoder(
+                &Krea2ControlPaths {
+                    root: paths.root.clone(),
+                    convrot_dit,
+                    // `validate_spec_root` above rejects a `File` base, so a native DiT can only
+                    // arrive through the runtime paths — carry the caller's selection rather than
+                    // silently dropping it to `None`.
+                    native_dit: paths.native_dit.clone(),
+                    control,
+                    adapters: spec.adapters.clone(),
+                    branch_tier: paths.branch_tier,
+                    chunk_attention: paths.chunk_attention,
+                    offload_policy: paths.offload_policy,
+                },
+                spec.text_encoder.clone(),
+            )
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
     }
 
     /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
@@ -243,19 +305,69 @@ impl Krea2Control {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_request(req)?;
-        self.residency.run_request_scoped(
-            req.stage_residency,
-            false,
-            &req.cancel,
-            false,
-            on_progress,
-            |text| text.encode(req),
-            |_| Ok(self.device.synchronize()?),
-            |heavy, context, on_progress| {
-                let result = heavy.render(&self.device, req, control_image, context, on_progress);
-                candle_gen::synchronize_result(&self.device, result)
-            },
-        )
+        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+            self.residency.run_request_scoped(
+                req.stage_residency,
+                false,
+                &req.cancel,
+                false,
+                on_progress,
+                |text| text.encode(req),
+                |_| Ok(self.device.synchronize()?),
+                |heavy, context, on_progress| {
+                    let result =
+                        heavy.render(&self.device, req, control_image, context, on_progress);
+                    candle_gen::synchronize_result(&self.device, result)
+                },
+            )
+        })
+    }
+}
+
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
+    }
+}
+
+fn required_source_path(source: Option<&WeightsSource>, label: &str) -> Result<PathBuf> {
+    match source {
+        Some(WeightsSource::Dir(path) | WeightsSource::File(path)) => Ok(path.clone()),
+        None => Err(CandleError::Msg(format!(
+            "{label}: prepared load spec is missing the required source"
+        ))),
+    }
+}
+
+fn required_file_path(source: &WeightsSource, label: &str) -> Result<PathBuf> {
+    match source {
+        WeightsSource::File(path) => Ok(path.clone()),
+        WeightsSource::Dir(path) => Err(CandleError::Msg(format!(
+            "{label}: expected a file source, got directory {}",
+            path.display()
+        ))),
+    }
+}
+
+fn validate_spec_root(
+    runtime_root: &Path,
+    spec: &candle_gen::gen_core::LoadSpec,
+    label: &str,
+) -> Result<()> {
+    match &spec.weights {
+        WeightsSource::Dir(admitted_root) if admitted_root == runtime_root => Ok(()),
+        WeightsSource::Dir(admitted_root) => Err(CandleError::Msg(format!(
+            "{label}: runtime base {} differs from admitted base {}",
+            runtime_root.display(),
+            admitted_root.display()
+        ))),
+        WeightsSource::File(_) => Err(CandleError::Msg(format!(
+            "{label}: admitted base must be the runtime snapshot directory"
+        ))),
     }
 }
 
@@ -281,13 +393,39 @@ pub fn load_control_from_native_dit_file(
 }
 
 /// Load the Qwen3-VL text phase exactly once per resident model or once per sequential generation.
-fn load_control_text(root: &Path, device: &Device) -> Result<Krea2ControlText> {
-    let tokenizer = KreaTokenizer::from_snapshot(root, device)?;
-    let te_cfg = KreaTeConfig::from_snapshot(root)?;
-    let te_w = Weights::from_dir(&root.join("text_encoder"), device, DType::F32)?;
+fn load_control_text(
+    _root: &Path,
+    selected_source: &candle_gen::gen_core::ValidatedEncoderSource,
+    device: &Device,
+) -> Result<Krea2ControlText> {
+    let tokenizer = KreaTokenizer::from_validated_source(selected_source, device)?;
+    let te_cfg = KreaTeConfig::qwen3_vl_4b();
+    let te_w = selected_source.read_unchanged(|source| -> Result<Weights> {
+        Ok(match source {
+            WeightsSource::Dir(path) => Weights::from_dir(path, device, DType::F32)?,
+            WeightsSource::File(path) => Weights::from_file(path, device, DType::F32)?,
+        })
+    })?;
     let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
     drop(te_w);
     Ok(Krea2ControlText { tokenizer, te })
+}
+
+fn resolve_control_text_encoder_source(
+    root: &Path,
+    selected_source: &WeightsSource,
+) -> Result<candle_gen::gen_core::ValidatedEncoderSource> {
+    let selected = crate::ENCODER_CONTRACT
+        .validate_source_against_base(selected_source, root)
+        .map_err(CandleError::from)?;
+    let builtin = WeightsSource::Dir(root.join("text_encoder"));
+    let expected_bits = candle_gen::gen_core::text_encoder_packed_quant_bits(&builtin)?;
+    if let Some(bits) = selected.load_time_quant_bits(expected_bits, "krea_2_turbo_control")? {
+        return Err(CandleError::Msg(format!(
+            "krea_2_turbo_control requires a selected text encoder already packed at Q{bits}; this provider does not repack a dense Krea encoder on the fly"
+        )));
+    }
+    Ok(selected)
 }
 
 /// Load the render phase after the text value has dropped on the sequential path.
@@ -521,9 +659,17 @@ fn control_image_to_nchw(
 mod tests {
     use super::*;
 
-    fn missing_paths(offload_policy: OffloadPolicy) -> Krea2ControlPaths {
-        Krea2ControlPaths {
-            root: PathBuf::from("/nonexistent/krea-control-residency-test-snapshot"),
+    fn validation_complete_paths(
+        offload_policy: OffloadPolicy,
+    ) -> (tempfile::TempDir, Krea2ControlPaths) {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let paths = Krea2ControlPaths {
+            root: fixture.path().to_path_buf(),
             convrot_dit: None,
             native_dit: None,
             control: PathBuf::from("/nonexistent/krea-control-residency-test-overlay.safetensors"),
@@ -531,14 +677,16 @@ mod tests {
             branch_tier: None,
             chunk_attention: false,
             offload_policy,
-        }
+        };
+        (fixture, paths)
     }
 
     /// Weight-free proof that construction is lazy and the legacy path policy is not an authority.
     #[test]
     fn legacy_policy_does_not_eagerly_load_components() {
-        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Sequential))
-            .expect("construction must not touch the missing snapshot");
+        let (_fixture, paths) = validation_complete_paths(OffloadPolicy::Sequential);
+        let model = Krea2Control::load(&paths)
+            .expect("construction must validate but not materialize the snapshot");
         assert!(model
             .residency
             .with_resident_parts(|_, _| ())
@@ -549,13 +697,65 @@ mod tests {
     /// The resident legacy value is equally lazy; neither load-time value can choose the request route.
     #[test]
     fn resident_legacy_policy_is_also_lazy() {
-        let model = Krea2Control::load(&missing_paths(OffloadPolicy::Resident))
-            .expect("construction must not touch the missing snapshot");
+        let (_fixture, paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let model = Krea2Control::load(&paths)
+            .expect("construction must validate but not materialize the snapshot");
         assert!(model
             .residency
             .with_resident_parts(|_, _| ())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn post_construction_control_mutation_fails_before_deferred_materialization() {
+        let (fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let control = fixture.path().join("control.safetensors");
+        std::fs::write(&control, b"before").unwrap();
+        paths.control = control.clone();
+
+        let selected = WeightsSource::Dir(fixture.path().join("text_encoder"));
+        let validated = crate::ENCODER_CONTRACT
+            .validate_source_against_base(&selected, fixture.path())
+            .unwrap();
+        let mut spec =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+                .with_control(WeightsSource::File(control.clone()));
+        validated.prepare_load_spec(&mut spec).unwrap();
+        let model = Krea2Control::load_with_spec(&paths, &spec)
+            .expect("sparse fixture construction must retain deferred loaders");
+
+        std::fs::write(&control, b"after!").unwrap();
+        let request = Krea2ControlRequest {
+            prompt: "a dancer".into(),
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            steps: 1,
+            ..Default::default()
+        };
+        let control_image = Image {
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            pixels: vec![0; (SIZE_MULTIPLE * SIZE_MULTIPLE * 3) as usize],
+        };
+        let progress_called = std::cell::Cell::new(false);
+        let error = model
+            .generate(&request, &control_image, &mut |_| progress_called.set(true))
+            .expect_err("mutated control must fail before the first deferred materializer")
+            .to_string();
+        assert!(
+            error.contains("receipt changed") || error.contains("pinned weights"),
+            "unexpected mutation error: {error}"
+        );
+        assert!(!progress_called.get(), "materialization emitted progress");
+        assert!(
+            model
+                .residency
+                .with_resident_parts(|_, _| ())
+                .unwrap()
+                .is_none(),
+            "the warm deferred loader ran before the retained receipt rejected mutation"
+        );
     }
 
     /// SC-16453: the immutable ConvRot file must survive the provider-path boundary and select the
@@ -583,9 +783,14 @@ mod tests {
         );
         assert!(control_dit_source(Some(convrot), Some(native)).is_err());
 
+        // Lazy means the DiT, VAE, and overlay stay unread — the base snapshot's text encoder is
+        // admitted against `ENCODER_CONTRACT` at construction, so the base needs the same fixture
+        // every other construction test in this module uses. The overlay and adapter paths stay
+        // nonexistent, which is what keeps the laziness claim honest.
+        let (_base, base_paths) = validation_complete_paths(OffloadPolicy::Resident);
         let model = load_control_from_native_dit_file(
             native,
-            "/nonexistent/krea-base",
+            &base_paths.root,
             "/nonexistent/control.safetensors",
             &[AdapterSpec::new(
                 "/nonexistent/user.safetensors".into(),
@@ -604,7 +809,9 @@ mod tests {
     /// ConvRot + adapters is admitted and retained for the lazy heavy-phase loader.
     #[test]
     fn convrot_retains_adapters_for_lazy_heavy_load() {
-        let mut paths = missing_paths(OffloadPolicy::Resident);
+        // `validation_complete_paths` (not the old `missing_paths`): the loader now validates the
+        // selected text encoder up front, so the root must carry a real encoder fixture.
+        let (_fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
         paths.convrot_dit = Some(PathBuf::from(
             "/nonexistent/krea2_turbo_int8_convrot.safetensors",
         ));

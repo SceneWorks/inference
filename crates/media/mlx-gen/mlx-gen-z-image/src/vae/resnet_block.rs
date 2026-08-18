@@ -5,8 +5,9 @@ use mlx_rs::ops::add;
 use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d, group_norm, silu};
+use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
@@ -59,5 +60,52 @@ impl ResnetBlock2D {
             None => x,
         };
         Ok(add(&residual, &h)?.transpose_axes(&[0, 3, 1, 2])?) // NCHW
+    }
+
+    /// Normalization-correct bounded forward for a VAE decode tail (sc-19753).
+    ///
+    /// GroupNorm statistics are captured from each full layer activation, while the expensive 3×3
+    /// convolutions run on halo-expanded tiles. This matches dense normalization semantics instead
+    /// of normalizing each whole-decoder crop independently.
+    pub fn forward_tiled(
+        &self,
+        x_nchw: &Array,
+        tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+
+        let norm1 = GlobalGroupNorm::new(&x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
+        let h = tiled_conv2d_3x3_nhwc(
+            &x,
+            &self.conv1_w,
+            Some(&self.conv1_b),
+            tile_edge,
+            cancel,
+            |tile| silu(&norm1.apply(tile)?),
+        )?;
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let norm2 = GlobalGroupNorm::new(&h, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
+        let h = tiled_conv2d_3x3_nhwc(
+            &h,
+            &self.conv2_w,
+            Some(&self.conv2_b),
+            tile_edge,
+            cancel,
+            |tile| silu(&norm2.apply(tile)?),
+        )?;
+
+        let residual = match &self.shortcut {
+            Some((sw, sb)) => conv2d(&x, sw, Some(sb), 1, 0)?,
+            None => x,
+        };
+        let out = add(&residual, &h)?;
+        out.eval()?;
+        Ok(out.transpose_axes(&[0, 3, 1, 2])?)
     }
 }

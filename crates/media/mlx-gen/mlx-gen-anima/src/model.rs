@@ -25,6 +25,8 @@ const RES_MAX: u32 = 1536;
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let cfg_capable = variant.uses_cfg();
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: variant.id(),
@@ -79,6 +81,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

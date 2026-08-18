@@ -17,6 +17,18 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+KREA_ALTERNATE_DECODER_SMOKE = (
+    WORKFLOW.parents[2] / "scripts" / "ci" / "run_krea_alternate_decoder_smoke.sh"
+)
+KREA_ALTERNATE_DECODER_EXAMPLE = (
+    WORKFLOW.parents[2]
+    / "crates"
+    / "media"
+    / "mlx-gen"
+    / "mlx-gen-krea"
+    / "examples"
+    / "alternate_decoder_characterization.rs"
+)
 MODEL_MANIFEST = WORKFLOW.parents[2] / "release" / "real-weight-models.toml"
 # An `unwired_reason` has to carry an actual explanation. "n/a" or "todo" would silence the gate
 # while recording nothing, which is precisely the failure this exists to prevent -- a deliberate
@@ -39,6 +51,29 @@ MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
 MACOS_INTERPRETER = "python3.12"
+WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
+WINDOWS_UV_VERSION = 'version: "0.12.3"'
+WINDOWS_UV_CACHE = "enable-cache: false"
+WINDOWS_UV_INSTALL = (
+    "uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config "
+    "|| exit /b 1"
+)
+WINDOWS_UV_FIND = (
+    "for /f \"delims=\" %%P in ('uv python find 3.12.10 --managed-python "
+    "--no-project --no-config') do set \"REVIEWED_PYTHON=%%P\""
+)
+WINDOWS_PYTHON_EXPORT = 'echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"'
+WINDOWS_INTERPRETER = r'"%REVIEWED_PYTHON%"'
+# sc-18804 pins every Windows real-weight job to the uv-managed reviewed CPython 3.12.10 so a
+# runner restart cannot swap the interpreter out from under a hash-locked requirements file.
+# `candle-scail2-shared` predates that convention: it provisions against the runner's OWN CPython
+# 3.14 under its own py314 hash lock, and hard-fails the job when the runner is not exactly
+# CPython 3.14 x64 (`test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured`
+# mutation-guards both the version assertion and the lock). That is a different answer to the same
+# hazard, not an absence of one, so it is recorded here as a named exception rather than silently
+# tolerated. `windows_reviewed_interpreter_exemption_errors` below re-proves the exempt job still
+# carries its own pinning, so the exemption cannot decay into an unpinned job.
+WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS = {"candle-scail2-shared"}
 APPROVED_REAL_WEIGHT_LOCKS = {
     MACOS_HUB_LOCK,
     WINDOWS_HUB_LOCK,
@@ -310,6 +345,203 @@ def real_weight_macos_interpreter_errors(workflow: str) -> list[str]:
     return errors
 
 
+def windows_reviewed_interpreter_exemption_errors(job: str, lines: list[str]) -> list[str]:
+    """Re-prove that an exempt Windows job still pins its own interpreter.
+
+    The exemption in ``WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS`` is a recorded exception, not a
+    hole: an exempt job must still (a) refuse the registry-dependent ``setup-python``, (b) assert
+    the exact interpreter it was hash-locked against and abort when the runner does not match, and
+    (c) terminate the job on a failed hash-locked install. Delete any of those and this fails, so
+    the exemption cannot quietly decay into an unpinned job.
+    """
+    errors: list[str] = []
+    body = "\n".join(lines)
+    if any(
+        re.search(r"\buses:\s*actions/setup-python@", line.split("#", 1)[0])
+        for line in lines
+    ):
+        errors.append(
+            f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
+        )
+    if not re.search(r"sys\.version_info|platform\.python_version\(\)", body):
+        errors.append(
+            f"{job}: an exempt Windows job must assert its exact interpreter version"
+        )
+    if not re.search(r"platform\.machine\(\)", body):
+        errors.append(
+            f"{job}: an exempt Windows job must assert its exact interpreter architecture"
+        )
+    # The abort has to live in the SAME step as the interpreter assertion. Checking the whole job
+    # would be satisfied by any unrelated `exit /b 1` — the Git Bash selection carries one — which
+    # would let the validation step be gutted while this still passed.
+    step_boundary = re.compile(r"^      - ")
+    validation_starts = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(r"sys\.version_info|platform\.python_version\(\)", line)
+    ]
+    for start in validation_starts:
+        step_start = start
+        while step_start > 0 and not step_boundary.match(lines[step_start]):
+            step_start -= 1
+        step_end = start + 1
+        while step_end < len(lines) and not step_boundary.match(lines[step_end]):
+            step_end += 1
+        step = "\n".join(lines[step_start:step_end])
+        if not re.search(r"\bthrow\b|exit /b 1|exit \$LASTEXITCODE", step):
+            errors.append(
+                f"{job}: an exempt Windows job must abort when its interpreter check fails"
+            )
+    if not validation_starts:
+        errors.append(
+            f"{job}: an exempt Windows job must abort when its interpreter check fails"
+        )
+    for line in lines:
+        command = line.split("#", 1)[0]
+        if not re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE):
+            continue
+        if "--require-hashes" not in command:
+            errors.append(f"{job}: exempt install must stay hash-locked: {command.strip()!r}")
+    if re.search(r"-m\s+pip\s+install", body, re.IGNORECASE) and not re.search(
+        r"\$LASTEXITCODE -ne 0|\|\|\s+exit /b 1", body
+    ):
+        errors.append(f"{job}: exempt install must terminate the job on failure")
+    return errors
+
+
+def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
+    """Pin every Windows real-weight Python command to the reviewed CPython 3.12.
+
+    The Windows wheel locks are platform- and interpreter-specific. A runner restart changed bare
+    ``python`` from 3.12 to 3.14, so pip selected cp314 wheels whose hashes correctly differed from
+    the reviewed cp312 lock. ``setup-python`` then blocked behind an operator-observed elevation
+    prompt, which unattended CI cannot satisfy. Guard the no-registry uv provisioning plus every
+    producer and consumer, not only pip: mixing interpreters around a shared ``PYTHONPATH`` is
+    equally unsafe. ``cmd`` also continues after a failed command, so every hash-locked install must
+    explicitly terminate the step.
+
+    Jobs in ``WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS`` answer the same hazard with their own
+    hard interpreter validation instead; they are checked by
+    ``windows_reviewed_interpreter_exemption_errors`` rather than skipped outright.
+    """
+    errors: list[str] = []
+    interpreter = re.compile(
+        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
+        r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
+        re.IGNORECASE,
+    )
+    setup_action = re.compile(
+        rf"\s*(?:-\s*)?uses:\s*{re.escape(WINDOWS_SETUP_ACTION)}\s*$"
+    )
+    setup_version = re.compile(rf"\s*{re.escape(WINDOWS_UV_VERSION)}\s*$")
+    setup_cache = re.compile(rf"\s*{re.escape(WINDOWS_UV_CACHE)}\s*$")
+    for job, lines in workflow_job_bodies(workflow).items():
+        runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+        if "windows" not in runs_on.lower():
+            continue
+        if job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
+            errors.extend(windows_reviewed_interpreter_exemption_errors(job, lines))
+            continue
+        setup_indices = [
+            index
+            for index, line in enumerate(lines)
+            if setup_action.fullmatch(line.split("#", 1)[0])
+        ]
+        if len(setup_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one pinned Windows setup-uv action, "
+                f"found {len(setup_indices)}"
+            )
+            setup_index = len(lines)
+        else:
+            setup_index = setup_indices[0]
+            setup_block = lines[setup_index : setup_index + 6]
+            if not any(
+                setup_version.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(f"{job}: setup-uv must install exact uv 0.12.3")
+            if not any(
+                setup_cache.fullmatch(line.split("#", 1)[0]) for line in setup_block
+            ):
+                errors.append(f"{job}: setup-uv cache must remain disabled")
+        if any(
+            re.search(r"\buses:\s*actions/setup-python@", line.split("#", 1)[0])
+            for line in lines
+        ):
+            errors.append(
+                f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
+            )
+
+        exact_commands = [line.split("#", 1)[0].strip() for line in lines]
+        install_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_INSTALL
+        ]
+        find_indices = [
+            index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_FIND
+        ]
+        export_indices = [
+            index
+            for index, command in enumerate(exact_commands)
+            if command == WINDOWS_PYTHON_EXPORT
+        ]
+        if len(install_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one fail-fast managed CPython 3.12.10 install, "
+                f"found {len(install_indices)}"
+            )
+        if len(find_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one managed CPython 3.12.10 path resolution, "
+                f"found {len(find_indices)}"
+            )
+        if len(export_indices) != 1:
+            errors.append(
+                f"{job}: expected exactly one reviewed Python path export, "
+                f"found {len(export_indices)}"
+            )
+        install_index = install_indices[0] if len(install_indices) == 1 else len(lines)
+        find_index = find_indices[0] if len(find_indices) == 1 else len(lines)
+        export_index = export_indices[0] if len(export_indices) == 1 else len(lines)
+        if not setup_index < install_index < find_index < export_index:
+            errors.append(
+                f"{job}: setup-uv, managed install, path resolution, and export are out of order"
+            )
+        for index, line in enumerate(lines):
+            command = line.split("#", 1)[0]
+            stripped = command.strip()
+            if stripped in {WINDOWS_UV_INSTALL, WINDOWS_UV_FIND}:
+                continue
+            found_interpreters = list(interpreter.finditer(command))
+            looks_like_python_command = bool(
+                re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
+            )
+            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+                errors.append(
+                    f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
+                    f"{command.strip()!r}"
+                )
+            for found in found_interpreters:
+                name = found.group(1)
+                if name != WINDOWS_INTERPRETER:
+                    errors.append(
+                        f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
+                        f"{name!r} in {command.strip()!r}"
+                    )
+                elif index <= find_index:
+                    errors.append(
+                        f"{job}: Windows Python runs before the reviewed path is resolved: "
+                        f"{command.strip()!r}"
+                    )
+            if re.search(r"\s-m\s+pip\s+install\b", command, re.IGNORECASE) and not re.search(
+                r"\|\|\s+exit /b 1\s*$", command
+            ):
+                errors.append(
+                    f"{job}: Windows pip install must fail the cmd step: {command.strip()!r}"
+                )
+    return errors
+
+
 def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     """Reject pip installs that can escape the reviewed wheel/hash inputs."""
     errors: list[str] = []
@@ -373,11 +605,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = WINDOWS_MAGE_LOCK
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
+        elif f"{WINDOWS_INTERPRETER} -m pip" in command:
+            expected_lock = WINDOWS_HUB_LOCK
         elif "python -m pip" in command:
+            # Only the SCAIL-2 shared-package job is allowed to reach the runner's own CPython;
+            # see WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS. Any other job spelling it this way
+            # has no expected lock and fails below.
             expected_lock = (
-                WINDOWS_SCAIL_HUB_LOCK
-                if job == "candle-scail2-shared"
-                else WINDOWS_HUB_LOCK
+                WINDOWS_SCAIL_HUB_LOCK if job == "candle-scail2-shared" else None
             )
         if expected_lock != lock:
             errors.append(
@@ -403,12 +638,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
+        # 33 since sc-18325 added the three correctness-only decode-quality jobs;
+        # 30 since sc-18315 added pinned Krea license materialization;
         # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
         # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 29,
+        MACOS_HUB_LOCK: 33,
         WINDOWS_HUB_LOCK: 10,
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -420,6 +657,74 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             f"pip install lock counts differ: expected {expected_lock_counts}, "
             f"got {actual_lock_counts}"
         )
+    return errors
+
+
+def decode_quality_candidate_rows(job: dict) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    candidate_env = job.get("env", {}).get("DECODE_QUALITY_CANDIDATES", "")
+    if candidate_env != "${{ matrix.candidate.value }}":
+        return candidate_env.split(), errors
+    candidates = job.get("strategy", {}).get("matrix", {}).get("candidate", [])
+    rows: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != {"geometry", "value"}:
+            errors.append(f"invalid candidate matrix row {candidate!r}")
+            continue
+        geometry, value = candidate["geometry"], candidate["value"]
+        if not isinstance(geometry, str) or not isinstance(value, str):
+            errors.append(f"candidate matrix row must use strings: {candidate!r}")
+            continue
+        if value.split(":", 1)[0] != geometry:
+            errors.append(f"candidate geometry label does not match value: {candidate!r}")
+        rows.append(value)
+    return rows, errors
+
+
+def decode_quality_candidate_policy_errors(workflow: str) -> list[str]:
+    parsed = yaml.safe_load(workflow)
+    jobs = parsed["jobs"]
+    rules = {
+        "mlx-decode-quality-kolors": 64,
+        "mlx-decode-quality-sdxl": 64,
+        # Chroma is a DiT with an explicitly validated /16 image-id grid; unlike the
+        # Kolors/SDXL U-Net it has no mirrored downsample skip joins, so 720 remains valid.
+        "mlx-decode-quality-chroma": 16,
+    }
+    errors: list[str] = []
+    for job, geometry_multiple in rules.items():
+        job_config = jobs[job]
+        rows, matrix_errors = decode_quality_candidate_rows(job_config)
+        errors.extend(f"{job}: {error}" for error in matrix_errors)
+        strategy = job_config.get("strategy", {})
+        if strategy.get("fail-fast") is not False or strategy.get("max-parallel") != 1:
+            errors.append(f"{job}: quality cells must run serialized with fail-fast disabled")
+        if not rows:
+            errors.append(f"{job}: empty candidate grid")
+        if len(rows) != len(set(rows)):
+            errors.append(f"{job}: duplicate candidate matrix row")
+        for row in rows:
+            prefix = f"{job}: invalid candidate {row!r}"
+            try:
+                geometry, tile_text, overlap_text = row.split(":")
+                width_text, height_text = geometry.split("x")
+                width, height = int(width_text), int(height_text)
+                tile, overlap = int(tile_text), int(overlap_text)
+            except (TypeError, ValueError):
+                errors.append(f"{prefix}: expected WIDTHxHEIGHT:TILE:OVERLAP")
+                continue
+            if width <= 0 or height <= 0:
+                errors.append(f"{prefix}: geometry must be positive")
+            if width % geometry_multiple or height % geometry_multiple:
+                errors.append(
+                    f"{prefix}: geometry must align to the family /{geometry_multiple} grid"
+                )
+            if not 0 < overlap < tile <= min(width, height):
+                errors.append(
+                    f"{prefix}: require 0 < overlap < tile <= min(width,height)"
+                )
+            if tile % 8 or overlap % 8:
+                errors.append(f"{prefix}: tile and overlap must align to the decoder /8 grid")
     return errors
 
 
@@ -572,10 +877,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
         return shell
 
+    def test_macos_metal_reclaims_broad_test_artifacts_before_bundle_profiles(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["macos-metal"]["steps"]
+        names = [step.get("name") for step in steps]
+        pre_test_reclaim = "Reclaim Clippy and rustdoc artifacts before linking MLX tests"
+        reclaim = "Reclaim broad MLX test artifacts before bundle profiles"
+        self.assertEqual(names.count(pre_test_reclaim), 1)
+        self.assertEqual(names.count(reclaim), 1)
+        self.assertLess(names.index("Rustdoc macOS MLX packages"), names.index(pre_test_reclaim))
+        self.assertLess(names.index(pre_test_reclaim), names.index("Test MLX packages"))
+        self.assertLess(names.index("Test MLX packages"), names.index(reclaim))
+        self.assertLess(names.index(reclaim), names.index("Test LLM-only macOS bundle"))
+        self.assertLess(names.index(reclaim), names.index("Test LLM+audio macOS bundle"))
+        self.assertLess(names.index(reclaim), names.index("Clippy Candle Metal packages"))
+        self.assertEqual(steps[names.index(pre_test_reclaim)]["run"], "cargo clean")
+        self.assertEqual(steps[names.index(reclaim)]["run"], "cargo clean")
+
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 29)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 33)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
@@ -583,6 +905,86 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
         )
+
+    def test_decode_quality_candidates_stay_inside_family_geometry_domains(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(decode_quality_candidate_policy_errors(workflow_text), [])
+        workflow = yaml.safe_load(workflow_text)
+        jobs = workflow["jobs"]
+        geometries: dict[str, set[tuple[int, int]]] = {}
+        for job in (
+            "mlx-decode-quality-kolors",
+            "mlx-decode-quality-sdxl",
+            "mlx-decode-quality-chroma",
+        ):
+            geometries[job] = set()
+            rows, errors = decode_quality_candidate_rows(jobs[job])
+            self.assertEqual(errors, [])
+            for row in rows:
+                geometry = row.split(":", 1)[0]
+                width_text, height_text = geometry.split("x")
+                geometries[job].add((int(width_text), int(height_text)))
+
+        self.assertIn((1280, 768), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((768, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((1280, 720), geometries["mlx-decode-quality-kolors"])
+        self.assertNotIn((720, 1280), geometries["mlx-decode-quality-kolors"])
+        self.assertIn((1280, 720), geometries["mlx-decode-quality-chroma"])
+        self.assertIn((720, 1280), geometries["mlx-decode-quality-chroma"])
+
+        expected_cells = {
+            "mlx-decode-quality-kolors": 7,
+            "mlx-decode-quality-sdxl": 50,
+            "mlx-decode-quality-chroma": 12,
+        }
+        for job, cells in expected_cells.items():
+            with self.subTest(job=job):
+                config = jobs[job]
+                matrix = config["strategy"]["matrix"]
+                route_count = len(matrix.get("model", ["kolors"]))
+                self.assertEqual(route_count * len(matrix["candidate"]), cells)
+                self.assertEqual(
+                    config["env"]["DECODE_QUALITY_CANDIDATES"],
+                    "${{ matrix.candidate.value }}",
+                )
+                self.assertIn("${{ matrix.candidate.geometry }}", config["name"])
+                upload = next(
+                    step
+                    for step in config["steps"]
+                    if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+                )
+                artifact_name = upload["with"]["name"]
+                self.assertTrue(artifact_name.startswith("decode-quality-v2-"))
+                self.assertIn("${{ matrix.candidate.geometry }}", artifact_name)
+                if job != "mlx-decode-quality-kolors":
+                    self.assertIn("${{ matrix.model.id }}", artifact_name)
+                self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                collector_step = next(
+                    step["run"]
+                    for step in config["steps"]
+                    if "collect_decode_quality_admission.py" in step.get("run", "")
+                )
+                self.assertIn("--expected-policy-count 1", collector_step)
+                self.assertIn("--expected-fixture-count 5", collector_step)
+        self.assertEqual(sum(expected_cells.values()), 69)
+
+        mutations = {
+            "Kolors landscape geometry": ("1280x768:576:48", "1280x720:576:48"),
+            "Kolors portrait geometry": ("768x1280:576:48", "720x1280:576:48"),
+            "SDXL geometry": ("1216x832:704:160", "1216x816:704:160"),
+            "Chroma geometry": ("1280x720:576:192", "1280x722:576:192"),
+            "zero geometry": ("768x768:576:48", "0x768:576:48"),
+            "zero overlap": ("768x768:576:48", "768x768:576:0"),
+            "overlap equals tile": ("768x768:576:48", "768x768:576:576"),
+            "tile exceeds geometry": ("768x768:576:48", "768x768:776:48"),
+            "tile off decoder grid": ("768x768:576:48", "768x768:578:48"),
+            "overlap off decoder grid": ("768x768:576:48", "768x768:576:50"),
+        }
+        for label, (before, after) in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertIn(before, workflow_text)
+                mutated = workflow_text.replace(before, after, 1)
+                self.assertTrue(decode_quality_candidate_policy_errors(mutated))
 
     def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
@@ -600,6 +1002,137 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             line for line in workflow.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
+
+    def test_real_weight_windows_steps_name_reviewed_cpython_and_fail_fast(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
+        windows_python_lines = [
+            line
+            for lines in workflow_job_bodies(workflow).values()
+            if any(
+                candidate.startswith("    runs-on:")
+                and "windows" in candidate.lower()
+                for candidate in lines
+            )
+            for line in lines
+            if WINDOWS_INTERPRETER in line and not line.lstrip().startswith("#")
+        ]
+        # Shape, not population. `real_weight_windows_interpreter_errors` already enforces, per
+        # Windows job, exactly one pinned setup-uv at the reviewed version with the cache off, one
+        # managed CPython 3.12.10 install, one path resolution, one reviewed-Python export, their
+        # ordering, and `|| exit /b 1` on every pip install. The file-wide totals that used to sit
+        # here (`len(windows_python_lines) == 76` and six `workflow.count(...) == 11`) restated that
+        # per-job claim as a frozen corpus: they went RED whenever a Windows job was legitimately
+        # added or removed, while catching nothing the checker misses. Kept instead: non-vacuity, so
+        # the mutations below never run against an empty scan, and the mutation coverage itself,
+        # which is what proves the checker bites.
+        self.assertTrue(
+            windows_python_lines,
+            "no Windows reviewed-interpreter lines found; every mutation below would be vacuous",
+        )
+        self.assertIn(
+            f'{WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version"',
+            workflow,
+        )
+        pip_installs = [
+            line.strip()
+            for line in windows_python_lines
+            if f"{WINDOWS_INTERPRETER} -m pip install" in line
+        ]
+        # Same posture: `len(pip_installs) == 11` was the Windows-job count in disguise. The
+        # per-install fail-fast shape below is the real claim; non-vacuity keeps it from passing on
+        # an empty list.
+        self.assertTrue(
+            pip_installs,
+            "no Windows reviewed-interpreter pip installs found; the fail-fast check below would "
+            "be vacuous",
+        )
+        for install in pip_installs:
+            self.assertRegex(install, r"\|\|\s+exit /b 1$")
+        for replacement in ("python", "py", "py -3.14"):
+            with self.subTest(replacement=replacement):
+                mutated = workflow.replace(WINDOWS_INTERPRETER, replacement, 1)
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        first_windows_install = pip_installs[0]
+        no_fail_fast = workflow.replace(
+            first_windows_install, first_windows_install.removesuffix(" || exit /b 1"), 1
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(no_fail_fast))
+        whitespace_install_without_fail_fast = first_windows_install.replace(
+            "pip install", "pip  install", 1
+        ).removesuffix(" || exit /b 1")
+        whitespace_bypass = workflow.replace(
+            first_windows_install, whitespace_install_without_fail_fast, 1
+        )
+        self.assertNotEqual(whitespace_bypass, workflow)
+        self.assertTrue(real_weight_windows_interpreter_errors(whitespace_bypass))
+        missing_setup = workflow.replace(f"uses: {WINDOWS_SETUP_ACTION}", "uses: missing", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(missing_setup))
+        wrong_version = workflow.replace(WINDOWS_UV_VERSION, 'version: "0.99.0"', 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version))
+        provisioning_mutations = {
+            "wrong Python": WINDOWS_UV_INSTALL.replace("3.12.10", "3.14.0"),
+            "registry mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-registry", ""),
+            "launcher mutation allowed": WINDOWS_UV_INSTALL.replace(" --no-bin", ""),
+            "system Python allowed": WINDOWS_UV_FIND.replace(" --managed-python", ""),
+        }
+        for name, replacement in provisioning_mutations.items():
+            with self.subTest(provisioning_mutation=name):
+                mutated = workflow.replace(
+                    WINDOWS_UV_INSTALL
+                    if replacement.startswith("uv python install")
+                    else WINDOWS_UV_FIND,
+                    replacement,
+                    1,
+                )
+                self.assertTrue(real_weight_windows_interpreter_errors(mutated))
+        cache_enabled = workflow.replace(WINDOWS_UV_CACHE, "enable-cache: true", 1)
+        self.assertTrue(real_weight_windows_interpreter_errors(cache_enabled))
+        wrong_setup_comment_decoy = workflow.replace(
+            f"uses: {WINDOWS_SETUP_ACTION}",
+            f"uses: astral-sh/setup-uv@{'0' * 40} # uses: {WINDOWS_SETUP_ACTION}",
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_setup_comment_decoy))
+        wrong_version_comment_decoy = workflow.replace(
+            WINDOWS_UV_VERSION,
+            f'version: "0.99.0" # {WINDOWS_UV_VERSION}',
+            1,
+        )
+        self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
+
+    def test_windows_reviewed_interpreter_exemption_still_requires_its_own_pinning(self) -> None:
+        """The sc-18804 exemption for `candle-scail2-shared` must not be a blank hole.
+
+        The exempt job answers the same hazard its own way — it hard-validates the runner's
+        CPython 3.14 x64 and installs from a matching py314 hash lock. Each of those properties is
+        mutated ONE AT A TIME: mutating them together would only prove the set is load-bearing,
+        not that any individual member is.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
+        bodies = workflow_job_bodies(workflow)
+        for job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
+            self.assertIn(job, bodies, f"exempt job {job} no longer exists — drop the exemption")
+            lines = bodies[job]
+            self.assertEqual(windows_reviewed_interpreter_exemption_errors(job, lines), [])
+            mutations = {
+                "version assertion dropped": ("platform.python_version()", "'3.14.0'"),
+                "architecture assertion dropped": ("platform.machine()", "'AMD64'"),
+                "hash lock dropped": ("--require-hashes", ""),
+                "failure no longer aborts": ("throw ", "Write-Host "),
+                "registry setup-python reintroduced": (
+                    "- uses: dtolnay/rust-toolchain@",
+                    "- uses: actions/setup-python@v5\n      - uses: dtolnay/rust-toolchain@",
+                ),
+            }
+            for mutation, (needle, replacement) in mutations.items():
+                with self.subTest(job=job, mutation=mutation):
+                    mutated = [line.replace(needle, replacement) for line in lines]
+                    self.assertNotEqual(mutated, lines, f"{mutation} changed nothing")
+                    self.assertTrue(
+                        windows_reviewed_interpreter_exemption_errors(job, mutated)
+                    )
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
@@ -832,7 +1365,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
-        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 13)
+        # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
+        # q4 Krea correctness projection and standalone Wan donor plus exact-file materialization.
+        self.assertEqual(workflow.count("export_model_snapshot_paths.py"), 15)
+        self.assertEqual(workflow.count("--model krea-2-turbo-mlx-q4"), 2)
+        self.assertEqual(
+            workflow.count("--model krea-realtime-14b-mlx-wan-z16-vae-q8"), 2
+        )
+        self.assertEqual(workflow.count("--model sdxl-base-mlx-vae-bf16"), 2)
         expected_models = {
             "same-l-metal": ("same-l",),
             "same-chunked-metal": ("same-s", "same-l"),
@@ -926,9 +1466,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        mage_job = workflow[
-            workflow.index("  mlx-media:") : workflow.index("\n  mlx-qwen-image:")
-        ]
+        mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
             'echo "MAGE_GOLDEN_DIR=$RUNNER_TEMP/mage-flow-oracles" >> "$GITHUB_ENV"',
@@ -947,7 +1485,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/python-install",
             workflow,
         )
-        self.assertNotIn("uses: actions/setup-python", mage_job)
+        self.assertNotIn("uses: actions/setup-python", mlx_media)
         self.assertNotIn("3.12.11", workflow)
         self.assertIn("Run Mage-Flow text-encoder parity", workflow)
         self.assertIn("Run Mage-VAE all-geometry parity", workflow)
@@ -965,27 +1503,104 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "MAGE_ORACLE_SEED_DIR: ${{ vars.MAGE_ORACLE_SEED_DIR }}",
             workflow,
         )
+        seed_import = workflow[
+            workflow.index("\n      - name: Require operator-provisioned Mage oracle seed") :
+            workflow.index("\n      - name: Require an uncached operator seed")
+        ]
+        self.assertIn("mage_flow_e2e_golden.png", seed_import)
+        self.assertIn("mage_flow_edit_golden.png", seed_import)
         self.assertIn("migrate_mage_edit_variant_manifest:", workflow)
         self.assertIn(
             "default: false",
             workflow[workflow.index("migrate_mage_edit_variant_manifest:") :],
         )
-        migration = workflow[
-            workflow.index("\n      - name: Migrate only the copied Mage edit-variant manifest") :
-            workflow.index(
-                "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
-            )
-        ]
+        self.assertIn(
+            "Converge and durably certify the exact Mage manifest pair on the active rw-mage seed",
+            workflow,
+        )
+        self.assertIn(
+            "mage_seed_slot: [single]",
+            workflow,
+        )
+        recovery_index = workflow.index(
+            "\n      - name: Recover any interrupted persistent Mage seed promotion"
+        )
+        restore_index = workflow.index("\n      - name: Restore verified Mage oracle cache")
+        seed_index = workflow.index(
+            "\n      - name: Require operator-provisioned Mage oracle seed"
+        )
+        self.assertLess(recovery_index, restore_index)
+        self.assertLess(restore_index, seed_index)
+        restore = workflow[restore_index:seed_index]
+        self.assertIn("id: mage-oracle-cache", restore)
+        self.assertIn("github.event_name != 'workflow_dispatch'", restore)
+        self.assertIn("inputs.profile != 'media'", restore)
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", restore)
+        recovery = workflow[recovery_index:restore_index]
+        self.assertIn("scripts/release/promote_mage_oracle_seed.py", recovery)
+        self.assertIn("--recover-only", recovery)
+        self.assertIn("id: mage-seed-recovery", recovery)
+        self.assertIn('--runner-name "$RUNNER_NAME"', recovery)
+        self.assertIn('--slot "${{ matrix.mage_seed_slot }}"', recovery)
+        self.assertIn('--revision "$GITHUB_SHA"', recovery)
+        self.assertIn('echo "completed=true" >> "$GITHUB_OUTPUT"', recovery)
+        prepare_index = workflow.index("\n      - name: Prepare pinned Mage reference environment")
+        classify_index = workflow.index("\n      - name: Classify the copied Mage manifest pair")
+        migration_index = workflow.index(
+            "\n      - name: Migrate only the copied Mage edit-variant manifest"
+        )
+        verify_index = workflow.index(
+            "\n      - name: Verify restored or operator-provisioned Mage oracle cache"
+        )
+        self.assertLess(prepare_index, classify_index)
+        self.assertLess(classify_index, migration_index)
+        self.assertLess(migration_index, verify_index)
+        preparation = workflow[prepare_index:classify_index]
+        self.assertIn('python -m venv "$RUNNER_TEMP/mage-reference"', preparation)
+        self.assertIn(
+            '"$RUNNER_TEMP/mage-reference/bin/python" -m pip install', preparation
+        )
+        self.assertIn("requirements-oracles.txt", preparation)
+        classification = workflow[classify_index:migration_index]
+        self.assertIn("id: mage-seed-state", classification)
+        self.assertIn("provision_mage_edit_variants.py", classification)
+        self.assertIn("verify_mage_candle_transfer.py", classification)
+        self.assertIn('echo "current=true" >> "$GITHUB_OUTPUT"', classification)
+        self.assertIn('echo "current=false" >> "$GITHUB_OUTPUT"', classification)
+        migration = workflow[migration_index:verify_index]
         self.assertIn("inputs.profile == 'media'", migration)
         self.assertIn("inputs.migrate_mage_edit_variant_manifest", migration)
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", migration
+        )
+        self.assertIn("steps.mage-seed-state.outputs.current != 'true'", migration)
         self.assertIn('golden_root="$(cd "$MAGE_GOLDEN_DIR" && pwd -P)"', migration)
         self.assertIn('runner_root="$(cd "$RUNNER_TEMP" && pwd -P)"', migration)
         self.assertIn('seed_root="$(cd "$MAGE_ORACLE_SEED_DIR" && pwd -P)"', migration)
         self.assertIn('"$golden_root" != "$runner_root/"*', migration)
         self.assertIn('"$golden_root" == "$seed_root"', migration)
         self.assertIn(" -ef ", migration)
+        self.assertIn('"$RUNNER_TEMP/mage-reference/bin/python"', migration)
+        self.assertNotIn("python3.12 scripts/release/provision_mage_edit_variants.py", migration)
         self.assertIn("--migrate-reference-environment-manifest-only", migration)
+        self.assertIn("--migrate-edit-variant-manifest-hash-only", migration)
+        self.assertIn('transfer_links="$(stat -f \'%l\' "$transfer_manifest")"', migration)
+        self.assertIn('"$transfer_links" != "1"', migration)
         self.assertNotIn("dump_mage_flow_golden.py", migration)
+        precondition_index = workflow.index(
+            "\n      - name: Require an uncached operator seed for durable Mage certification"
+        )
+        self.assertLess(seed_index, precondition_index)
+        self.assertLess(precondition_index, migration_index)
+        precondition = workflow[precondition_index:migration_index]
+        self.assertIn("steps.mage-oracle-cache.outputs.cache-hit", precondition)
+        self.assertIn("steps.mage-oracle-seed.outputs.imported", precondition)
+        seed_import = workflow[seed_index:precondition_index]
+        self.assertIn('echo "edit-sha=$edit_sha"', seed_import)
+        self.assertIn(
+            'echo "transfer-sha=$transfer_sha"', seed_import
+        )
+        self.assertIn('} >> "$GITHUB_OUTPUT"', seed_import)
         self.assertIn("refusing to run the multi-hour CPU producer", workflow)
         self.assertNotIn("Regenerate and verify shared CPU Mage oracles", workflow)
         self.assertIn(
@@ -1003,6 +1618,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "scripts/release/mage_reference_environment.py",
             "scripts/release/provision_mage_oracles.py",
             "scripts/release/provision_mage_edit_variants.py",
+            "scripts/release/promote_mage_oracle_seed.py",
             "scripts/release/verify_mage_candle_oracles.py",
             "scripts/release/verify_mage_candle_transfer.py",
         ):
@@ -1026,11 +1642,71 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--verify-edit-artifact", workflow)
         self.assertNotIn("--write-manifest", workflow)
         self.assertIn("mage_candle_oracles_manifest.json", workflow)
-        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 3)
-        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 3)
+        self.assertGreaterEqual(workflow.count("--edit-snapshot \"$MAGE_EDIT_SNAPSHOT\""), 6)
+        self.assertEqual(workflow.count("--gen \"$MAGE_SNAPSHOT\""), 8)
+        provider_index = workflow.index("\n      - name: Run provider conformance")
+        edit_parity_index = workflow.index(
+            "\n      - name: Run Mage-Flow instruction-edit parity"
+        )
+        promote_index = workflow.index(
+            "\n      - name: Atomically promote the verified Mage manifests"
+        )
+        persistent_verify_index = workflow.index(
+            "\n      - name: Verify the promoted persistent Mage oracle seed"
+        )
+        receipt_index = workflow.index(
+            "\n      - name: Upload persistent Mage seed promotion receipt"
+        )
+        cache_save_index = workflow.index("\n      - name: Save verified Mage oracle cache")
+        edit_upload_index = workflow.index("\n      - name: Upload verified Mage edit oracle")
+        self.assertLess(provider_index, edit_parity_index)
+        self.assertLess(edit_parity_index, promote_index)
+        self.assertLess(promote_index, persistent_verify_index)
+        self.assertLess(persistent_verify_index, receipt_index)
+        self.assertLess(receipt_index, cache_save_index)
+        self.assertLess(cache_save_index, edit_upload_index)
+        promotion = workflow[promote_index:persistent_verify_index]
+        self.assertIn(
+            "steps.mage-seed-recovery.outputs.completed != 'true'", promotion
+        )
+        for argument in (
+            "--source \"$MAGE_GOLDEN_DIR\"",
+            "--seed \"$MAGE_ORACLE_SEED_DIR\"",
+            "steps.mage-oracle-seed.outputs.edit-sha",
+            "steps.mage-oracle-seed.outputs.transfer-sha",
+            "--runner-name \"$RUNNER_NAME\"",
+            "--slot \"${{ matrix.mage_seed_slot }}\"",
+            "--revision \"$GITHUB_SHA\"",
+            "--allow-already-current",
+        ):
+            self.assertIn(argument, promotion)
+        persistent_verify = workflow[persistent_verify_index:receipt_index]
+        self.assertEqual(persistent_verify.count('--output "$MAGE_ORACLE_SEED_DIR"'), 5)
+        self.assertIn(
+            "mage-seed-promotion-${{ matrix.mage_seed_slot }}-${{ github.sha }}",
+            workflow[receipt_index:cache_save_index],
+        )
+        cache_save = workflow[cache_save_index:edit_upload_index]
+        self.assertIn("inputs.migrate_mage_edit_variant_manifest != true", cache_save)
+        self.assertNotIn("matrix.mage_seed_slot != 'secondary'", workflow)
+        promotion_gate_index = workflow.index("\n  mage-seed-promotion-gate:")
+        qwen_index = workflow.index("\n  # sc-17284", promotion_gate_index)
+        promotion_gate = workflow[promotion_gate_index:qwen_index]
+        self.assertIn("needs: mlx-media", promotion_gate)
+        self.assertIn("if: always()", promotion_gate)
+        self.assertIn("needs.mlx-media.result", promotion_gate)
+        self.assertIn("merge-multiple: true", promotion_gate)
+        self.assertIn("--verify-receipts", promotion_gate)
+        self.assertIn("--revision \"$GITHUB_SHA\"", promotion_gate)
+        self.assertIn("Require the exact-run Mage seed certification", promotion_gate)
+        candle_media_index = workflow.index("\n  candle-media:")
+        self.assertIn(
+            "needs: [mlx-media, mage-seed-promotion-gate]",
+            workflow[candle_media_index:],
+        )
         self.assertLess(
             workflow.index("Verify restored or operator-provisioned Mage oracle cache"),
-            workflow.index("Save verified Mage oracle cache"),
+            cache_save_index,
         )
         self.assertIn("mage-flow-candle-oracles-${{ github.sha }}", workflow)
         self.assertIn("mage_edit_oracle_manifest.json", workflow)
@@ -1147,6 +1823,203 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertGreater(len(requirement_lines), 12)
         self.assertTrue(all(line.endswith(" \\") for line in requirement_lines))
 
+    def test_withdrawn_or_gated_media_models_materialize_from_exact_public_mirrors(self) -> None:
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        expected = {
+            "flux-1-dev": (
+                "black-forest-labs/FLUX.1-dev",
+                "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21",
+                "SceneWorks/flux1-dev-mlx",
+                "323fd12d79f78ad444e882e8d8e871914584f2b9",
+                "bf16",
+            ),
+            "mage-flow": (
+                "microsoft/Mage-Flow",
+                "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9",
+                "SceneWorks/Mage-Flow",
+                "5f6455818d8ca80ce780e9c01b9e0de1d8c5f9db",
+                None,
+            ),
+            "mage-flow-edit": (
+                "microsoft/Mage-Flow-Edit",
+                "b01d524f86498b7dabcc4b3572c6d264d786a16e",
+                "SceneWorks/Mage-Flow-Edit",
+                "dbd4a9c07faca94491ad88ab21225d62e054d9cc",
+                None,
+            ),
+            "mage-flow-edit-base": (
+                "microsoft/Mage-Flow-Edit-Base",
+                "8654a7bc0283ab2946385230b5b2eb944e0b76ea",
+                "SceneWorks/Mage-Flow-Edit-Base",
+                "6c119cdac7ce7cf8c1ab4990d9c8ca18641f2c5d",
+                None,
+            ),
+            "mage-flow-edit-turbo": (
+                "microsoft/Mage-Flow-Edit-Turbo",
+                "14427bd7627d3a25436497a5939e1096f6a0d523",
+                "SceneWorks/Mage-Flow-Edit-Turbo",
+                "75c11a2957aca2c78272984375502105b2b235ab",
+                None,
+            ),
+        }
+        mage_download_files = [
+            "model_index.json",
+            "scheduler/*",
+            "text_encoder/*",
+            "transformer/*",
+            "vae/*",
+        ]
+        mage_materialization_files = [
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/.gitattributes",
+            "text_encoder/README.md",
+            "text_encoder/chat_template.json",
+            "text_encoder/config.json",
+            "text_encoder/generation_config.json",
+            "text_encoder/merges.txt",
+            "text_encoder/model-00001-of-00002.safetensors",
+            "text_encoder/model-00002-of-00002.safetensors",
+            "text_encoder/model.safetensors.index.json",
+            "text_encoder/preprocessor_config.json",
+            "text_encoder/tokenizer.json",
+            "text_encoder/tokenizer_config.json",
+            "text_encoder/video_preprocessor_config.json",
+            "text_encoder/vocab.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        flux_materialization_files = [
+            "LICENSE.md",
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors",
+            "text_encoder_2/config.json",
+            "text_encoder_2/model-00001-of-00002.safetensors",
+            "text_encoder_2/model-00002-of-00002.safetensors",
+            "text_encoder_2/model.safetensors.index.json",
+            "tokenizer/merges.txt",
+            "tokenizer/special_tokens_map.json",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/vocab.json",
+            "tokenizer_2/special_tokens_map.json",
+            "tokenizer_2/spiece.model",
+            "tokenizer_2/tokenizer.json",
+            "tokenizer_2/tokenizer_config.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ]
+        for key, (
+            canonical_repo,
+            canonical_rev,
+            mirror_repo,
+            mirror_rev,
+            prefix,
+        ) in expected.items():
+            with self.subTest(key=key):
+                model = models[key]
+                self.assertEqual(model["repository"], canonical_repo)
+                self.assertEqual(model["revision"], canonical_rev)
+                self.assertEqual(model["materialization_repository"], mirror_repo)
+                self.assertEqual(model["materialization_revision"], mirror_rev)
+                self.assertEqual(model.get("materialization_path_prefix"), prefix)
+                self.assertNotIn("materialization_requires_auth", model)
+                if key.startswith("mage-flow"):
+                    self.assertEqual(model["download_files"], mage_download_files)
+                    self.assertEqual(
+                        model["materialization_expected_files"], mage_materialization_files
+                    )
+                    self.assertFalse(
+                        any(
+                            pattern.startswith(("bf16/", "q4/", "q8/"))
+                            for pattern in model["download_files"]
+                        )
+                    )
+                else:
+                    self.assertEqual(
+                        model["materialization_expected_files"], flux_materialization_files
+                    )
+
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+
+        # Shape, not population. Two `count("--require-materialization-provenance") == 6` pins used
+        # to stand here: a second lane for an already-covered model turned them RED for no reason,
+        # while a *new* mirrored model whose snapshot call forgot the flag kept them green — the
+        # defect they exist to catch. Derive both sides from their sources of truth instead: the
+        # mirrored set comes from the manifest, and each snapshot invocation is checked on its own.
+        mirrored = {
+            key for key, model in models.items() if "materialization_repository" in model
+        }
+        self.assertEqual(
+            mirrored,
+            set(expected),
+            "every mirror-materialized manifest model must be pinned by this test",
+        )
+
+        # Materialization is a macOS-lane job; the Windows lanes consume what it produced, which is
+        # why they call the same script without the flag. Classify by each job's own `runs-on`
+        # rather than by slicing the file at whichever job names happen to bound the lanes today.
+        provenance_flag = "--require-materialization-provenance"
+        macos_provenance_models: set[str] = set()
+        provenance_jobs: set[str] = set()
+        for job, lines in workflow_job_bodies(workflow).items():
+            runs_on = next((line for line in lines if line.startswith("    runs-on:")), "")
+            is_macos = "macos" in runs_on.lower()
+            # `\`-continued `run:` blocks put the flag on its own line; fold before matching.
+            body = re.sub(r"\\\n\s*", " ", "\n".join(lines))
+            for command in re.findall(
+                r"scripts/release/ensure_model_snapshot\.py[^\n]*", body
+            ):
+                model_flag = re.search(r"--model\s+(\S+)", command)
+                self.assertIsNotNone(
+                    model_flag, f"{job}: snapshot invocation names no model: {command!r}"
+                )
+                assert model_flag is not None
+                key = model_flag.group(1).strip('"')
+                if provenance_flag in command:
+                    provenance_jobs.add(job)
+                with self.subTest(job=job, model=key):
+                    if not is_macos:
+                        self.assertNotIn(
+                            provenance_flag,
+                            command,
+                            "only the macOS lane materializes; other lanes consume its output",
+                        )
+                    elif key in mirrored:
+                        if provenance_flag in command:
+                            macos_provenance_models.add(key)
+                        self.assertIn(
+                            provenance_flag,
+                            command,
+                            "every macOS use of a mirror-materialized model must verify provenance",
+                        )
+                    else:
+                        self.assertNotIn(
+                            provenance_flag,
+                            command,
+                            "provenance verification only applies to mirrored models",
+                        )
+        self.assertEqual(
+            macos_provenance_models,
+            mirrored,
+            "the macOS lane must provenance-verify exactly the mirror-materialized models",
+        )
+        self.assertTrue(
+            provenance_jobs,
+            "no job requires materialization provenance; the checks above would be vacuous",
+        )
+
     def test_residency_ab_is_operator_run_without_ci_model_dependencies(self) -> None:
         """The CUDA residency A/B stays operator-run — gated directly, not by variable name.
 
@@ -1210,6 +2083,53 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for path in sorted(WORKFLOW.parent.glob("*.yml"))
         )
         self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
+
+    def test_native_decode_seam_real_weight_gates_are_exact_and_golden_free(self) -> None:
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(workflow_text)
+        cases = {
+            "mlx-media": (
+                "Prove the SDXL native decode seam on real weights",
+                "mlx-gen-sdxl",
+                "native_decode_seam_is_byte_exact_to_pre_seam_engine",
+                'SDXL_SNAPSHOT="$SDXL_N1_SNAPSHOT/bf16"',
+            ),
+            "mlx-qwen-image": (
+                "Prove the Qwen native decode seam on real weights",
+                "mlx-gen-qwen-image",
+                "native_decode_seam_is_byte_exact_and_precancelled",
+                'MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16"',
+            ),
+        }
+        for job, (step_name, package, test_name, snapshot_binding) in cases.items():
+            with self.subTest(job=job):
+                steps = workflow["jobs"][job]["steps"]
+                matching = [step for step in steps if step.get("name") == step_name]
+                self.assertEqual(len(matching), 1)
+                run = matching[0]["run"]
+                self.assertIn("set -o pipefail", run)
+                self.assertIn(snapshot_binding, run)
+                self.assertIn(f"cargo test --locked --release -p {package}", run)
+                self.assertIn(f"--test vae_real_weights", run)
+                self.assertIn(test_name, run)
+                self.assertIn("-- --exact --ignored --nocapture", run)
+                self.assertIn('grep -qE "test result: ok\\. 1 passed"', run)
+                self.assertNotIn("GOLDEN", run)
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        sdxl = models["sdxl-base-mlx-vae-bf16"]
+        self.assertEqual(sdxl["repository"], "SceneWorks/sdxl-base-mlx")
+        self.assertEqual(sdxl["revision"], "36699bb8a6353e61c920e3bf19f0e6f8e4151c55")
+        self.assertEqual(sdxl["environment"], ["SDXL_N1_SNAPSHOT"])
+        expected = [
+            "bf16/vae/config.json",
+            "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+        ]
+        self.assertEqual(sdxl["download_files"], expected)
+        self.assertEqual(sdxl["expected_files"], expected)
 
     def test_manifest_wiring_policy_discriminates_mutations(self) -> None:
         # The detector has to detect. Each case below is a defect shape that really occurred:
@@ -1365,7 +2285,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("set -o pipefail", job)
         self.assertIn("verify_residency_ab.py", job)
         self.assertIn("--min-reduction-mib 512", job)
-        self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v3", job)
+        self.assertIn("--expected-fingerprint z-image-mlx-independent-materialization-v4", job)
         self.assertIn("--expected-abi 3", job)
         # sc-18149: the lane pins the adjudicated tolerance contract from outside the harness.
         self.assertIn("--expected-parity tolerance:mean_abs_u8_subpixel:4.0", job)
@@ -1586,6 +2506,89 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # No SANA verifier exists; the day one appears this pin should flip to a positive
         # requirement rather than being deleted.
         self.assertNotIn("verify_residency_ab.py", job)
+
+    def test_krea_alternate_decoder_smoke_is_explicit_and_correctness_only(self) -> None:
+        """SC-18315 keeps its model smoke distinct from memory/calibration capture."""
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        jobs = workflow_job_bodies(workflow)
+        job = "\n".join(jobs["mlx-krea-alternate-decoder"])
+        job_header = job.split("steps:", 1)[0]
+        inputs = yaml.safe_load(workflow)[True]["workflow_dispatch"]["inputs"]
+        choices = inputs["profile"]["options"]
+
+        self.assertEqual(choices.count("krea-alternate-decoder"), 1)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'krea-alternate-decoder'",
+            job,
+        )
+        self.assertNotIn("github.event_name == 'schedule'", job_header)
+        self.assertNotIn("inputs.profile == 'all'", job_header)
+        self.assertIn(
+            "runs-on: [self-hosted, macOS, ARM64, nax, rw-sa3]", job
+        )
+        self.assertIn("scripts/ci/run_krea_alternate_decoder_smoke.sh", job)
+        self.assertLess(
+            job.index("--model krea-2-turbo-mlx-q4"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("scripts/release/ensure_model_snapshot_file.py", job)
+        self.assertIn("--file LICENSE.pdf", job)
+        self.assertIn("--model krea-realtime-14b-mlx-wan-z16-vae-q8", job)
+        self.assertIn("--file q8/vae.safetensors", job)
+        self.assertLess(
+            job.index("scripts/release/ensure_model_snapshot_file.py"),
+            job.index("scripts/ci/run_krea_alternate_decoder_smoke.sh"),
+        )
+        self.assertIn("actions/upload-artifact@", job)
+        self.assertIn("if-no-files-found: error", job)
+        self.assertNotIn("xcrun metal --version", job)
+        self.assertNotIn("gpu_fault_evidence.sh", job)
+        self.assertNotIn("memory.csv", job)
+        self.assertNotIn("--inventory-output", job)
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        donor = models["krea-realtime-14b-mlx-wan-z16-vae-q8"]
+        self.assertEqual(donor["repository"], "SceneWorks/krea-realtime-14b-mlx")
+        self.assertEqual(
+            donor["revision"], "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+        )
+        self.assertEqual(donor["download_files"], ["q8/vae.safetensors"])
+        self.assertEqual(donor["expected_files"], ["q8/vae.safetensors"])
+        self.assertEqual(
+            donor["environment"], ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+        )
+
+        script = KREA_ALTERNATE_DECODER_SMOKE.read_text(encoding="utf-8")
+        self.assertTrue(os.access(KREA_ALTERNATE_DECODER_SMOKE, os.X_OK))
+        self.assertIn("d009674080cc1bccf2b629d834c34bf5eccdb723", script)
+        self.assertIn("e68e9a3d98187fdf6936838ffcf6df5aa48d6626", script)
+        self.assertIn(
+            "42159a8b571dbeb3ea40327b88a6161a5342c0511202af7c031360629757163d",
+            script,
+        )
+        self.assertIn("run_characterization 512 0", script)
+        self.assertIn("run_characterization 768 1", script)
+        self.assertEqual(script.count(".png\n"), 4)
+        self.assertIn("sha256.txt", script)
+        self.assertIn("provenance.txt", script)
+        self.assertNotIn("get_peak_memory", script)
+        self.assertNotIn("reset_peak_memory", script)
+        self.assertNotIn("gpu_fault_evidence", script)
+        self.assertIn('!= "$RUNNER_TEMP"/*', script)
+
+        example = KREA_ALTERNATE_DECODER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("KREA_AB_OUTPUT_DIR", example)
+        self.assertNotIn("get_peak_memory", example)
+        self.assertNotIn("reset_peak_memory", example)
+        self.assertNotIn("std::time::Instant", example)
+        self.assertEqual(example.count("validate_rgb_output("), 3)
+        self.assertIn("usize::try_from(size)", example)
+        self.assertIn(".checked_mul(edge)", example)
+        self.assertIn("pixels.checked_mul(3)", example)
 
     def test_krea_s18_sweep_is_operator_dispatched_and_keeps_its_evidence(self) -> None:
         """sc-17276: the S18 coherence sweep is a measurement lane, not a regression gate.
@@ -2218,6 +3221,39 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for assignment in assignments:
             with self.subTest(assignment=assignment):
                 self.assertIn("github.event.merge_group.base_sha", assignment)
+
+    def test_feature_epic_policy_runs_in_the_unconditional_gate_path(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        changes = workflow["jobs"]["changes"]
+        policy_steps = [
+            step
+            for step in changes["steps"]
+            if step.get("run") == "python3 scripts/ci/feature_epic_policy.py"
+        ]
+        self.assertEqual(
+            len(policy_steps),
+            1,
+            "the feature-epic policy must run exactly once in the always-created changes job",
+        )
+        self.assertNotIn(
+            "if",
+            policy_steps[0],
+            "event or path gating the policy would let an invalid topology omit its verdict",
+        )
+        self.assertNotIn(
+            "if",
+            changes,
+            "the changes job is the always-run trust boundary for feature-epic topology",
+        )
+        self.assertIn(
+            "changes",
+            workflow["jobs"]["gate"]["needs"],
+            "CI gate must fail when the topology policy in changes fails",
+        )
+
+        triggers = workflow[True]
+        self.assertIn("pull_request", triggers)
+        self.assertIn("merge_group", triggers)
 
     def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))

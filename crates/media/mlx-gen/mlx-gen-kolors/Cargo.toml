@@ -35,3 +35,6 @@ serde_json = { workspace = true }
 # Synthesize tiny safetensors snapshots so the asset-fact projections (the f32 VAE and the resident
 # overlays, sc-15839) are asserted against real headers without a multi-GB tier.
 safetensors = { workspace = true }
+# Bind production-latent and dense/tiled output bytes into P9 quality-admission receipts. This is
+# semantic image-quality provenance only; the harness deliberately records no timing or memory data.
+sha2 = { workspace = true }

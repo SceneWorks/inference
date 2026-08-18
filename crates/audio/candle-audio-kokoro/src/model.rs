@@ -119,6 +119,8 @@ pub const MAX_DURATION_SECS: f32 = 30.0;
 /// Kokoro's identity + capabilities — constructible without weights (registry introspection).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -162,6 +164,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_conversation_session: false,
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

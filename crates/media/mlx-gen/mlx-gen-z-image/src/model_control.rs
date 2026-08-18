@@ -44,6 +44,8 @@ pub const MODEL_ID: &str = "z_image_turbo_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: Some(crate::model_base_control::accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
@@ -91,6 +93,8 @@ pub fn descriptor() -> ModelDescriptor {
             audio_languages: vec![],
             audio_edit_modes: vec![],
             size_floor: SizeFloor::RangeChecked,
+            execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }
@@ -171,17 +175,17 @@ pub(crate) fn resolve_control_base_and_control<'a>(
 /// whole-model bits when `quant` is set (the Z-Image control quant scope covers the text encoder), so
 /// the `Resident` and `Sequential` paths build byte-identical encoders.
 pub(crate) fn load_control_text_encoder_only(
-    root: &Path,
-    quant: Option<Quant>,
+    source: &gen_core::ValidatedEncoderSource,
+    load_time_quant_bits: Option<i32>,
     streamable: bool,
 ) -> Result<TextEncoder> {
     let mut text_encoder = if streamable {
-        loader::load_text_encoder_streamable(root)?
+        loader::load_validated_text_encoder_streamable(source)?
     } else {
-        loader::load_text_encoder(root)?
+        loader::load_validated_text_encoder(source)?
     };
-    if let Some(q) = quant {
-        text_encoder.quantize(q.bits())?;
+    if let Some(bits) = load_time_quant_bits {
+        text_encoder.quantize(bits)?;
     }
     Ok(text_encoder)
 }
@@ -259,8 +263,20 @@ pub(crate) fn load_control_residency(
     } else {
         None
     };
-    let tokenizer = loader::load_tokenizer(root)?;
-    let mut residency = build_control_residency(spec, model_id, precision_msg)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
+        .quant
+        .map(Quant::bits);
+    let text_encoder_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
+    let mut residency = build_control_residency_with_source(
+        spec,
+        model_id,
+        precision_msg,
+        text_encoder_source,
+        text_encoder_quant_bits,
+    )?;
     if let Some(bits) = requantize_bits {
         let warned = std::sync::atomic::AtomicBool::new(false);
         residency = residency.with_staged_advisory(move || {
@@ -274,18 +290,46 @@ pub(crate) fn load_control_residency(
 
 /// Request-scoped builder shared by both Z-Image control variants. Construction touches no component
 /// weights. The pose branch carries no PiD overlay, so the seam's `use_pid` argument is unused.
+#[cfg(test)]
 pub(crate) fn build_control_residency(
     spec: &LoadSpec,
     model_id: &'static str,
     precision_msg: &'static str,
 ) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
+    let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
+        .quant
+        .map(Quant::bits);
+    let text_encoder_quant_bits =
+        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
+    build_control_residency_with_source(
+        spec,
+        model_id,
+        precision_msg,
+        text_encoder_source,
+        text_encoder_quant_bits,
+    )
+}
+
+fn build_control_residency_with_source(
+    spec: &LoadSpec,
+    model_id: &'static str,
+    precision_msg: &'static str,
+    text_encoder_source: gen_core::ValidatedEncoderSource,
+    text_encoder_quant_bits: Option<i32>,
+) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
     Ok(Residency::request_scoped(
         move |streamable| {
-            let (root, _control) =
+            let (_root, _control) =
                 resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
-            load_control_text_encoder_only(root, spec_text.quantize, streamable)
+            load_control_text_encoder_only(
+                &text_encoder_source,
+                text_encoder_quant_bits,
+                streamable,
+            )
         },
         move |_use_pid, streamable| {
             let (root, control) =
@@ -487,7 +531,6 @@ impl ZImageTurboControl {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
-                    None,
                     tiling.as_ref(),
                     latents,
                     &req.cancel,
@@ -619,14 +662,19 @@ mod tests {
     }
 
     // SC-15806 construction proof: both legacy values retain loaders and touch no component weights.
-    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-control-base".into(),
-        ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/z-image-control-overlay.safetensors".into(),
-        ))
-        .with_offload_policy(policy)
+    fn incomplete_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_control(WeightsSource::File(
+                snapshot.path().join("control.safetensors"),
+            ))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     // ── F-009 (sc-12461): the control lane's tier-mismatch guard must fire on the DEFAULT
@@ -639,6 +687,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let root = loader::packed_snapshot_fixture(&tmp, "control-load", 8);
+            gen_core_testkit::write_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                crate::ENCODER_CONTRACT,
+            )
+            .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_control(WeightsSource::File(
                     "/nonexistent/z-image-control-overlay.safetensors".into(),
@@ -682,11 +735,14 @@ mod tests {
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let (snapshot, spec) = incomplete_control_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
+            assert!(!snapshot.path().join("control.safetensors").exists());
             let res =
-                build_control_residency(&missing_control_spec(policy), MODEL_ID, PRECISION_MSG)
-                    .unwrap_or_else(|error| {
-                        panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
-                    });
+                build_control_residency(&spec, MODEL_ID, PRECISION_MSG).unwrap_or_else(|error| {
+                    panic!("{policy:?} must defer absent heavy components: {error}")
+                });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
