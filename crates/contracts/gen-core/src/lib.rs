@@ -22,6 +22,7 @@ pub mod encoder_contract;
 pub mod error;
 pub mod execution_domains;
 pub mod face;
+pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
 pub mod image_embed;
