@@ -98,6 +98,16 @@ text, present verbatim in most files' `__metadata__`) is **excluded** below per 
 instruction to record `__metadata__` "minus the embedded license body" — its presence is noted,
 its text is not reproduced.
 
+**Full `__metadata__` per file** (every key, not just the curated highlights in §2.2–§2.5 below,
+license body stripped) is committed alongside this document under
+[`sc-18756-headers/`](sc-18756-headers/) — one JSON file per safetensors file, same relative path
+plus `.json`. A fresh agent implementing sc-18757/sc-18758/etc. reads those instead of re-hitting
+the gated endpoint. The one exception: `nvfp4`'s `_quantization_metadata.layers` map (1176
+per-tensor entries, all `format: "nvfp4"`) is summarized to counts-by-format rather than
+reproduced entry-by-entry — every entry was inspected during the capture, the companion file says
+so explicitly (`_summarized: true`), and the full per-tensor map is trivially reconstructible
+(every one of the 1176 entries carries the same `format` value).
+
 ### 2.1 Full file inventory — all 14 safetensors files, including the two the epic never itemized
 
 The epic's original table (§1.2 of epic 18755) covered 12 of the repo's 14 safetensors files. The
@@ -105,27 +115,28 @@ two it never itemized — `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safete
 `gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` — are captured here for the first
 time.
 
-| Component file | Tensors | Size (measured) | dtypes | `__metadata__` top-level keys (license text excluded) |
-| --- | --- | --- | --- | --- |
-| `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 4349 | 42.02 GB | BF16, F32 | `config`, `gemma_source_checkpoint`, `license`, `model_version` |
-| `diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` **(new)** | 7229 | 21.50 GB | BF16, F32, I8, U8 | `config`, `gemma_source_checkpoint`, `license`, `model_version` |
-| `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 4349 | 42.02 GB | BF16, F32 | `config`, `gemma_source_checkpoint`, `license`, `model_version` |
-| `diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 7229 | 21.50 GB | BF16, F32, I8, U8 | `config`, `gemma_source_checkpoint`, `license`, `model_version` |
-| `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | **7877** | 18.72 GB | BF16, F32, F8_E4M3, U8 | `_quantization_metadata`, `config`, `gemma_source_checkpoint`, `license`, `model_version` |
-| `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | 686 | 26.26 GB | BF16, U8 | `format`, `gemma_config` |
-| `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` **(new)** | 1342 | 15.37 GB | BF16, F32, I8, U8 | `format`, `gemma_config` |
-| `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 170 | 1.45 GB | BF16 | `config`, `license`, `model_version` |
-| `vae/ltx-2.5-video-vae-bf16.safetensors` (DiffVAE) | 396 | 1.47 GB | BF16 | `config`, `license`, `model_version` |
-| `vae/ltx-2.5-audio-vae-bf16.safetensors` | 1329 | 0.36 GB | BF16 | `config`, `license`, `model_version` |
-| `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | 72 | 1.00 GB | BF16 | `config`, `license` |
-| `latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` | 72 | 0.26 GB | BF16 | `config` (no `license` key on this file) |
-| `model_patches/ltx-2.5-duration-head-bf16.safetensors` | 15 | 0.0038 GB (~3.8 MB) | BF16 | `config`, `license`, `model_version` |
-| `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 3320 | 8.90 GB | BF16 | `lora_rank`, `lora_alpha`, `license`, `model_version` |
+| Component file | Tensors | Size, bytes (exact, measured) | Size, GB (rounded) | dtypes | Full header |
+| --- | --- | --- | --- | --- | --- |
+| `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 4349 | 42,018,190,584 | 42.02 | BF16, F32 | [json](sc-18756-headers/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors.json) |
+| `diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` **(new)** | 7229 | 21,504,034,224 | 21.50 | BF16, F32, I8, U8 | [json](sc-18756-headers/diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors.json) |
+| `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 4349 | 42,018,190,584 | 42.02 | BF16, F32 | [json](sc-18756-headers/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors.json) |
+| `diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 7229 | 21,504,034,224 | 21.50 | BF16, F32, I8, U8 | [json](sc-18756-headers/diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors.json) |
+| `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | **7877** | 18,721,548,408 | 18.72 | BF16, F32, F8_E4M3, U8 | [json](sc-18756-headers/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors.json) |
+| `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | 686 | 26,263,858,182 | 26.26 | BF16, U8 | [json](sc-18756-headers/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors.json) |
+| `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` **(new)** | 1342 | 15,372,969,374 | 15.37 | BF16, F32, I8, U8 | [json](sc-18756-headers/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors.json) |
+| `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 170 | 1,452,269,922 | 1.45 | BF16 | [json](sc-18756-headers/vae/ltx-2.5-video-vae-conv-bf16.safetensors.json) |
+| `vae/ltx-2.5-video-vae-bf16.safetensors` (DiffVAE) | 396 | 1,472,223,346 | 1.47 | BF16 | [json](sc-18756-headers/vae/ltx-2.5-video-vae-bf16.safetensors.json) |
+| `vae/ltx-2.5-audio-vae-bf16.safetensors` | 1329 | 364,866,540 | 0.36 | BF16 | [json](sc-18756-headers/vae/ltx-2.5-audio-vae-bf16.safetensors.json) |
+| `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | 72 | 995,778,752 | 1.00 | BF16 | [json](sc-18756-headers/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors.json) |
+| `latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` | 72 | 261,944,000 | 0.26 | BF16 | [json](sc-18756-headers/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors.json) |
+| `model_patches/ltx-2.5-duration-head-bf16.safetensors` | 15 | 3,843,690 | 0.0038 | BF16 | [json](sc-18756-headers/model_patches/ltx-2.5-duration-head-bf16.safetensors.json) |
+| `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 3320 | 8,899,889,568 | 8.90 | BF16 | [json](sc-18756-headers/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors.json) |
 
 **Correction to the epic's table:** the nvfp4 transformer measures **7877** tensors, not 7876 as
-the epic's table states. Every other tensor count and size matches the epic's cited figures
-exactly (tensor-for-tensor, byte-for-byte on `total_size_bytes`). This is now the authoritative,
-independently-measured figure.
+the epic's table states. Every other tensor count matches the epic's cited figures exactly
+(tensor-for-tensor), and sizes agree with the epic's rounded GB figures — the epic records size
+only to one decimal GB, so there is no byte-level figure in the epic to compare against; the exact
+byte counts above are this document's own measurement and are now the authoritative record.
 
 `SpatioTemporalScaleFactors`, patch sizes, and frame-count constraints are unchanged from the 2.3
 reference and are not re-derived here (not a per-file header field) — see epic 18755 §1.2 for that
