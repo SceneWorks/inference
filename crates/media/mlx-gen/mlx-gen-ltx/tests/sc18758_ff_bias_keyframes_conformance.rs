@@ -3,11 +3,10 @@
 //!
 //! `tests/fixtures/ltx25_distilled_dit_tensors.json` is the **real** LTX-2.5 distilled
 //! `transformer.safetensors` header (name + shape per tensor), captured locally via a header-only
-//! read (the 8-byte length prefix + JSON header — zero weight bytes) from
-//! `$HF_HOME/hub/models--Lightricks--LTX-2.5/snapshots/<rev>/diffusion_models/
-//! ltx-2.5-22b-distilled-transformer-bf16.safetensors`, with the `model.diffusion_model.` prefix
-//! stripped and the `*_embeddings_connector.*` tensors dropped (this story's subject is the DiT, not
-//! the connector; connector.safetensors is a separate file mlx-gen-ltx loads independently). The
+//! read (the 8-byte length prefix + JSON header — zero weight bytes) of the distilled transformer
+//! snapshot on the models volume cache, with the `model.diffusion_model.` prefix stripped and the
+//! `*_embeddings_connector.*` tensors dropped (this story's subject is the DiT, not the connector;
+//! connector.safetensors is a separate file mlx-gen-ltx loads independently). The
 //! real header has **4349** total tensors, 258 of them the two embeddings connectors, 4091 DiT-only —
 //! matching the acceptance criterion's cited count. The LTX-2.5 **dev** header
 //! (`ltx-2.5-22b-dev-transformer-bf16.safetensors`) was cross-checked and is byte-identical in shape/
