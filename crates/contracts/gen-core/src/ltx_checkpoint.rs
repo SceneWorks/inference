@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::gemma_assets::GemmaAssets;
 use crate::weightsmeta::{is_hidden_file, safetensors_file_metadata};
 use crate::{Error, Result};
 
@@ -75,7 +76,8 @@ pub const MODEL_VERSION_METADATA_KEY: &str = "model_version";
 /// The `__metadata__` key carrying `{"ltx_version": …, "gemma_version": …}` on 2.4+ transformers.
 pub const GEMMA_SOURCE_CHECKPOINT_METADATA_KEY: &str = "gemma_source_checkpoint";
 /// The `__metadata__` key under which a packed single-file text encoder stores its HF Gemma config.
-pub const GEMMA_CONFIG_METADATA_KEY: &str = "gemma_config";
+/// Re-exported from [`crate::gemma_assets`] so there is exactly one definition of the key.
+pub use crate::gemma_assets::GEMMA_CONFIG_METADATA_KEY;
 
 /// Parse a checkpoint's `model_version` into comparable numeric components.
 ///
@@ -622,6 +624,18 @@ impl GemmaEncoderIdentity {
         }
     }
 
+    /// Read the identity out of already-loaded [`GemmaAssets`] (sc-18762's asset unpacker), so a
+    /// caller that has unpacked the encoder does not re-read its config.
+    pub fn from_assets(assets: &GemmaAssets) -> Result<Self> {
+        let config: Value = serde_json::from_str(assets.config_json()).map_err(|e| {
+            Error::Msg(format!(
+                "ltx: the Gemma config from {} is not valid JSON: {e}",
+                assets.source()
+            ))
+        })?;
+        Ok(Self::from_config_value(assets.source(), &config))
+    }
+
     /// Read `<dir>/config.json`.
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
@@ -653,8 +667,17 @@ impl GemmaEncoderIdentity {
         Ok(Self::from_config_value(path, config))
     }
 
-    /// Read whichever of the two layouts `path` is: a directory → `config.json`, a `.safetensors`
-    /// file → its packed `gemma_config` metadata.
+    /// Read whichever of the two layouts `path` is: an HF snapshot directory (`config.json`) or a
+    /// packed single-file encoder (`__metadata__["gemma_config"]`) — the same two layouts
+    /// [`GemmaAssets::load`] accepts, keyed the same way and on the same
+    /// [`GEMMA_CONFIG_METADATA_KEY`].
+    ///
+    /// Deliberately **config-only**, unlike [`GemmaAssets::load`], which additionally requires the
+    /// packed `tokenizer_json` and the required sidecars. Answering "which Gemma generation is
+    /// this?" needs the config and nothing else, and coupling it to the full asset pack would report
+    /// an incomplete pack as `tokenizer_json … absent` when the caller asked about a **version
+    /// mismatch** — burying the actual answer. Use [`from_assets`](Self::from_assets) when the
+    /// encoder has already been unpacked.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.is_dir() {
@@ -1891,7 +1914,7 @@ mod tests {
         write_split_bundle(dir.path());
         let bundle = discover_split_bundle(dir.path()).unwrap();
         // The bundle's own packed text encoder satisfies the assertion…
-        let te = GemmaEncoderIdentity::from_single_file(
+        let te = GemmaEncoderIdentity::load(
             dir.path()
                 .join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
         )
@@ -1909,7 +1932,7 @@ mod tests {
             r#"{"model_type":"gemma3","text_config":{"hidden_size":3840}}"#,
         )
         .unwrap();
-        let legacy = GemmaEncoderIdentity::from_dir(&gemma3).unwrap();
+        let legacy = GemmaEncoderIdentity::load(&gemma3).unwrap();
         let err = bundle
             .check_gemma_version(&legacy)
             .expect_err("a Gemma 3 snapshot must not load a 2.5 bundle");

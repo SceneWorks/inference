@@ -26,8 +26,8 @@
 use std::path::Path;
 
 use mlx_gen::gen_core::ltx_checkpoint::{
-    CaptionFeatureVersion, GemmaVersionCheck, LtxCheckpointLayout, LtxComponent,
-    SPLIT_MANIFEST_FILE,
+    CaptionFeatureVersion, GemmaEncoderIdentity, GemmaVersionCheck, LtxCheckpointLayout,
+    LtxComponent, SPLIT_MANIFEST_FILE,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VocoderConfig};
@@ -622,4 +622,23 @@ fn real_2_5_snapshot_resolves_every_component() {
         assert_gemma_version(&bundle).unwrap(),
         GemmaVersionCheck::Matched(v) if v == "gemma4-12b-ltx-v1"
     ));
+
+    // 6. The config-only identity read and sc-18762's full asset unpack agree about the real
+    //    encoder. The identity path is deliberately narrower (it does not require the packed
+    //    tokenizer), so this pins the two surfaces to the same answer on a real file.
+    let te_path = root.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors");
+    let identity = GemmaEncoderIdentity::load(&te_path).expect("config-only identity");
+    let assets =
+        mlx_gen::gen_core::gemma_assets::GemmaAssets::load(&te_path).expect("full asset unpack");
+    let from_assets = GemmaEncoderIdentity::from_assets(&assets).expect("identity from assets");
+    assert_eq!(identity.model_type, from_assets.model_type);
+    assert_eq!(identity.gemma_version, from_assets.gemma_version);
+    assert_eq!(
+        identity.model_type.as_deref(),
+        Some(mlx_gen::gen_core::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE)
+    );
+    assert_eq!(
+        assets.config_model_type().unwrap(),
+        mlx_gen::gen_core::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE
+    );
 }
