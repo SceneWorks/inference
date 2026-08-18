@@ -991,6 +991,134 @@ mod tests {
         );
     }
 
+    /// **Regression guard for the sc-18765 namespace refactor.** The video-VAE sanitizers used to
+    /// hardcode the `vae.` prefix; they now take it from [`VaeNamespace`]. This pins the LTX-2.3
+    /// (`Bundled`) behaviour that the byte-parity goldens cover but that needs real checkpoints to
+    /// exercise: the `vae.` prefix and the half are stripped, the two statistics are renamed to each
+    /// half's own spelling, `position_ids` and every non-`vae.` key are dropped, and the audio VAE's
+    /// identically-suffixed statistics are NOT pulled into the video components.
+    #[test]
+    fn bundled_namespace_sanitizers_keep_the_2_3_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = |o: i32, i: i32| Array::ones::<f32>(&[o, i, 3, 3, 3]).unwrap();
+        let vec1 = |n: i32| Array::ones::<f32>(&[n]).unwrap();
+        let w = Weights::from_file(write_tmp(
+            &tmp,
+            &[
+                ("vae.decoder.conv_in.conv.weight", conv(8, 4)),
+                (
+                    "vae.decoder.up_blocks.0.res_blocks.0.conv1.conv.bias",
+                    vec1(8),
+                ),
+                ("vae.encoder.conv_out.conv.weight", conv(5, 8)),
+                (
+                    "vae.encoder.down_blocks.0.res_blocks.0.conv2.conv.bias",
+                    vec1(8),
+                ),
+                ("vae.per_channel_statistics.mean-of-means", vec1(4)),
+                ("vae.per_channel_statistics.std-of-means", vec1(4)),
+                // Dropped: not `vae.`, or explicitly excluded.
+                ("vae.decoder.position_ids", vec1(2)),
+                ("audio_vae.per_channel_statistics.mean-of-means", vec1(4)),
+                ("vocoder.vocoder.conv_pre.bias", vec1(4)),
+                (
+                    "model.diffusion_model.transformer_blocks.0.attn1.to_q.weight",
+                    vec1(4),
+                ),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(VaeNamespace::detect(&w), VaeNamespace::Bundled);
+
+        let mut dec: Vec<String> = sanitize_vae_decoder(&w, VaeNamespace::Bundled)
+            .unwrap()
+            .into_keys()
+            .collect();
+        dec.sort();
+        assert_eq!(
+            dec,
+            vec![
+                "conv_in.conv.weight",
+                "per_channel_statistics.mean",
+                "per_channel_statistics.std",
+                "up_blocks.0.res_blocks.0.conv1.conv.bias",
+            ]
+        );
+
+        let mut enc: Vec<String> = sanitize_vae_encoder(&w, VaeNamespace::Bundled)
+            .unwrap()
+            .into_keys()
+            .collect();
+        enc.sort();
+        assert_eq!(
+            enc,
+            vec![
+                "conv_out.conv.weight",
+                "down_blocks.0.res_blocks.0.conv2.conv.bias",
+                "per_channel_statistics._mean_of_means",
+                "per_channel_statistics._std_of_means",
+            ]
+        );
+
+        // Conv3d weights are transposed to the channels-last MLX layout on the way out.
+        let out = sanitize_vae_decoder(&w, VaeNamespace::Bundled).unwrap();
+        assert_eq!(out["conv_in.conv.weight"].shape(), &[8, 3, 3, 3, 4]);
+
+        // The same file read in the WRONG namespace yields nothing — the prefix is load-bearing,
+        // not incidental.
+        assert!(sanitize_vae_decoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A `Component`-namespace file is detected as such and maps onto the same 2.3 component
+    /// spellings (the LTX-2.5 shape). The full 170-key version of this runs in
+    /// `tests/ltx_2_5_vae_conformance.rs`; this pins the detection + mapping without the fixture.
+    #[test]
+    fn component_namespace_maps_onto_the_same_2_3_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = |o: i32, i: i32| Array::ones::<f32>(&[o, i, 3, 3, 3]).unwrap();
+        let vec1 = |n: i32| Array::ones::<f32>(&[n]).unwrap();
+        let w = Weights::from_file(write_tmp(
+            &tmp,
+            &[
+                ("decoder.conv_in.conv.weight", conv(8, 4)),
+                ("encoder.conv_out.conv.weight", conv(5, 8)),
+                ("per_channel_statistics.mean-of-means", vec1(4)),
+                ("per_channel_statistics.std-of-means", vec1(4)),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(VaeNamespace::detect(&w), VaeNamespace::Component);
+
+        let mut dec: Vec<String> = sanitize_vae_decoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .into_keys()
+            .collect();
+        dec.sort();
+        assert_eq!(
+            dec,
+            vec![
+                "conv_in.conv.weight",
+                "per_channel_statistics.mean",
+                "per_channel_statistics.std",
+            ]
+        );
+        let mut enc: Vec<String> = sanitize_vae_encoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .into_keys()
+            .collect();
+        enc.sort();
+        assert_eq!(
+            enc,
+            vec![
+                "conv_out.conv.weight",
+                "per_channel_statistics._mean_of_means",
+                "per_channel_statistics._std_of_means",
+            ]
+        );
+    }
+
     /// Write tensors to a unique temp safetensors file and return its path.
     fn write_tmp(tmp: &tempfile::TempDir, entries: &[(&str, Array)]) -> PathBuf {
         // `tag` separates the cases within a run; the pid separates two *concurrent* `cargo test`

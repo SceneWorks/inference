@@ -177,6 +177,7 @@ outstanding.
 | test | needs weights | what it pins |
 | --- | --- | --- |
 | `mlx-gen-ltx/tests/ltx_2_5_vae_conformance.rs` (10 tests) | no | key-by-key 2.5↔2.3 diff, layout pre-image over all 1457 tensors, config/block-list equality, DiffVAE encoder identity, converter output key sets, unknown-class refusal |
+| `mlx-gen-ltx/src/convert.rs` unit tests (2 added) | no | the LTX-2.3 (`Bundled`) sanitizer mapping the namespace refactor generalized — otherwise covered only by the real-checkpoint byte-parity goldens |
 | `candle-gen-ltx/tests/ltx_2_5_vae_conformance.rs` (2 tests) | no | the shipped candle loaders find every 2.5 tensor at the file root, with a `vae.`-namespaced control that must fail |
 | `mlx-gen-ltx/tests/ltx_2_5_vae_real_weights.rs` (3 tests, `#[ignore]`) | yes | real-weight round trip at both acceptance geometries, audio VAE + vocoder length/channel/rate, DiffVAE encoder mode equivalence + width-check control |
 | `candle-gen-ltx/tests/ltx_2_5_vae_real_weights.rs` (2 tests, `#[ignore]`) | yes | the unconverted 2.5 files through the candle ports, device- and geometry-scaled |
