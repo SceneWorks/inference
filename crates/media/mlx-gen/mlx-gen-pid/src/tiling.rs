@@ -89,13 +89,10 @@ fn tile_axis(n: i32, tile: i32, overlap: i32) -> Vec<(i32, i32)> {
 /// integer, `tile` floored to at least `align`, then [`tile_axis`] per axis. The tile grid is the
 /// row-major product `ys × xs` of these windows — the fact [`feathered_assembly`]'s separable fold
 /// rests on.
-fn plan_axes(
-    h: i32,
-    w: i32,
-    tile: i32,
-    overlap: i32,
-    align: i32,
-) -> (Vec<(i32, i32)>, Vec<(i32, i32)>) {
+/// One axis's aligned `(start, end)` windows.
+type AxisWindows = Vec<(i32, i32)>;
+
+fn plan_axes(h: i32, w: i32, tile: i32, overlap: i32, align: i32) -> (AxisWindows, AxisWindows) {
     let align = align.max(1);
     let tile = (tile / align * align).max(align);
     let overlap = (overlap / align * align).clamp(0, tile - align);
