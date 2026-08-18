@@ -83,6 +83,28 @@ impl CausalLm {
         // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
         // `*ForCausalLM` keeps the historical `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight`
         // layout. `decoder_root` carries the right stem so the per-key suffixes below are uniform.
+        // sc-18769 makes a Gemma 4 `config.json` **parse** — that is this story's whole point, and
+        // `ModelConfig::layer_attention` now resolves the per-layer table the decoder needs. The
+        // decoder itself is sc-18760 (MLX) / sc-18761 (candle): this block still reads one uniform
+        // `head_dim` per model, projects a `v_proj` every layer, and masks every layer causally, so
+        // handing it a Gemma 4 snapshot would half-build a model and then die on a missing
+        // `self_attn.v_proj.weight` (the `full_attention` layers share their key projection).
+        //
+        // Refuse by name instead. Before this story the loader refused a Gemma 4 config outright as
+        // an unknown architecture; now that it is a known one, that refusal has to be restated here
+        // or it degrades into a cryptic weight-lookup failure. Delete this guard when the per-layer
+        // attention block lands.
+        if cfg.architecture.is_gemma4() {
+            return Err(Error::Unsupported(
+                "Gemma 4 needs per-layer-type attention (two head dims, two RoPE schedules, \
+                 sliding-window layers, `attention_k_eq_v`, and a scale-free value norm); the \
+                 generic decoder is still uniform. The config layer and primitives are in place \
+                 (see `ModelConfig::layer_attention`) — sc-18760 / sc-18761 build the decoder on \
+                 them."
+                    .to_string(),
+            ));
+        }
+
         let vlm_nested = cfg.architecture.is_qwen3_vl();
         let decoder_root = if vlm_nested {
             "model.language_model".to_string()

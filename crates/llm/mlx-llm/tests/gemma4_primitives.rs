@@ -239,6 +239,44 @@ fn gemma4_real_packed_te_config_parses_to_the_same_table() {
     );
 }
 
+/// Attempt a `CausalLm` build against an empty weight map — enough to reach (and assert) the
+/// architecture guard, which runs before any tensor is looked up.
+fn build_empty_causal_lm(cfg: ModelConfig) -> Result<CausalLm, mlx_llm::Error> {
+    CausalLm::from_weights(&Weights::from_map(HashMap::new()), "", cfg)
+}
+
+/// The generic decoder must **refuse Gemma 4 by name** until sc-18760 / sc-18761 wire the
+/// per-layer-type attention block.
+///
+/// This story makes a Gemma 4 config parse, which is what turns a previously-clear "unsupported
+/// architecture" refusal into a cryptic missing-`v_proj` failure three quarters of the way through
+/// a load. The typed refusal replaces it, and names both the reason and the successor stories.
+#[test]
+fn generic_decoder_declines_gemma4_until_the_decoder_stories_land() {
+    let cfg: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
+    let cfg = ModelConfig::from_json(&cfg).expect("the config layer must still parse it");
+    assert!(cfg.is_gemma4());
+    match build_empty_causal_lm(cfg) {
+        Err(e) => {
+            let m = e.to_string();
+            assert!(m.contains("Gemma 4"), "{m}");
+            assert!(
+                m.contains("sc-18760"),
+                "the refusal must name the successor: {m}"
+            );
+            assert!(
+                m.contains("sc-18761"),
+                "the refusal must name the successor: {m}"
+            );
+            assert!(
+                !m.contains("v_proj"),
+                "must refuse up front, not die on a weight lookup: {m}"
+            );
+        }
+        Ok(_) => panic!("the uniform decoder must not claim to have built a Gemma 4 model"),
+    }
+}
+
 /// The schedule is derived when `layer_types` is absent and read verbatim when present — and the
 /// two agree on the shipped config, which is the only reason omitting it is safe.
 #[test]
