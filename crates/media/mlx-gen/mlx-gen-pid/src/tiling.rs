@@ -27,7 +27,7 @@
 //!   with the tile's patch grid.
 //! - Blend keeps the seedvr2-style feather (sc-5201): `feather_weight` tapers edges that abut a
 //!   neighbor, and the result is still `acc / wsum`. Assembly is sc-18320's separable fold
-//!   ([`feathered_assembly`]): each weighted tile is placed along **one** axis at a time
+//!   (`feathered_assembly`): each weighted tile is placed along **one** axis at a time
 //!   ([`mlx_gen::vae_tiling::accumulate_along_axis`]) — into an x-full row strip, then the strip
 //!   into the full image — and the blend normalizer is factorized into two 1-D ramp sums
 //!   materialized once at the end, instead of padding every weighted tile *and* its feather mask to
@@ -87,7 +87,7 @@ fn tile_axis(n: i32, tile: i32, overlap: i32) -> Vec<(i32, i32)> {
 /// The aligned per-axis windows behind [`plan_tiles`]: `tile`/`overlap` rounded **down** to a
 /// multiple of `align` (the pixel→latent factor) so each tile's LQ slice and patch grid stay
 /// integer, `tile` floored to at least `align`, then [`tile_axis`] per axis. The tile grid is the
-/// row-major product `ys × xs` of these windows — the fact [`feathered_assembly`]'s separable fold
+/// row-major product `ys × xs` of these windows — the fact `feathered_assembly`'s separable fold
 /// rests on.
 /// One axis's aligned `(start, end)` windows.
 type AxisWindows = Vec<(i32, i32)>;
@@ -100,7 +100,7 @@ fn plan_axes(h: i32, w: i32, tile: i32, overlap: i32, align: i32) -> (AxisWindow
 }
 
 /// The grid of overlapping tiles covering an `h × w` grid — the row-major product of
-/// [`plan_axes`]'s windows.
+/// `plan_axes`'s windows.
 pub fn plan_tiles(h: i32, w: i32, tile: i32, overlap: i32, align: i32) -> Vec<SpatialTile> {
     let (ys, xs) = plan_axes(h, w, tile, overlap, align);
     let mut out = Vec::with_capacity(ys.len() * xs.len());
@@ -176,7 +176,7 @@ fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
 
 /// One tiled **velocity** forward: compute `v = net(x, t, …)` for the whole `[B,3,H,W]` grid by running
 /// the net on overlapping pixel tiles (each with its aligned `lq_latent` slice) and feather-blending the
-/// per-tile predictions via [`feathered_assembly`]. `overlap` is the feather width (px). `eval`s per tile
+/// per-tile predictions via `feathered_assembly`. `overlap` is the feather width (px). `eval`s per tile
 /// so tile activations don't stack — which is also what keeps each Metal command buffer short enough to
 /// dodge the watchdog.
 #[allow(clippy::too_many_arguments)]
@@ -407,7 +407,7 @@ mod tests {
     /// The **predecessor accumulator**, verbatim (with `net.forward` replaced by the injected
     /// per-tile closure): every weighted tile *and* its feather mask padded to the full image into
     /// two full-image accumulators, normalized once. Deliberately a copy rather than a refactor —
-    /// grading [`feathered_assembly`] against a paraphrase of itself would prove nothing. Same
+    /// grading `feathered_assembly` against a paraphrase of itself would prove nothing. Same
     /// pattern as `mlx_gen::vae_tiling`'s test-local `pad_to_full_reference`.
     fn pad_to_full_oracle(
         h: i32,
@@ -463,7 +463,7 @@ mod tests {
         Ok(divide(acc.expect("≥1 tile"), wsum.expect("≥1 tile"))?)
     }
 
-    /// sc-18320 preservation bar: [`feathered_assembly`]'s separable fold against the verbatim
+    /// sc-18320 preservation bar: `feathered_assembly`'s separable fold against the verbatim
     /// pad-to-full predecessor above, on a grid with **3 overlapping windows per axis** (9 tiles),
     /// driven by the same synthetic per-tile forward. The forward adds a tile-dependent bump on top
     /// of a slice of a shared full image, so overlapping tiles genuinely disagree and the feather

@@ -218,7 +218,7 @@ pub fn tiled_conv2d_3x3_nhwc(
 /// array from a host `Vec`: call it before that `from_slice` (the mlx-rs assert would still abort
 /// loudly without it, but as a panic rather than a catchable [`Error`]). There is no separate
 /// blend-weight buffer to guard: sc-18320's separable fold retired the full-output-sized weight
-/// accumulator — the normalizer is carried as three 1-D host vectors ([`AxisCoverage`]) and
+/// accumulator — the normalizer is carried as three 1-D host vectors (`AxisCoverage`) and
 /// materialized once as a rank-1 broadcast product, strictly smaller than the output.
 pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32) -> Result<()> {
     if full_elems > MAX_WRITABLE_ELEMS {
