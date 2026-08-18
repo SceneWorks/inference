@@ -361,6 +361,12 @@ fn save_component(dir: &Path, name: &str, weights: &HashMap<String, Array>) -> R
 /// `build_output_config(version="2.3", include_audio)` — the runtime `config.json`. The reference
 /// sets `caption_channels=3840` then overwrites it with `null` for the 2.3 family; the net value is
 /// `null`, written directly here.
+///
+/// Every key here (including `is_v2`) exists only to mirror the reference `mlx_video.convert`
+/// output format — nothing in this codebase reads the emitted `config.json`. The loader is driven
+/// entirely by `embedded_config.json` ([`crate::config::LtxConfig::from_model_dir`]); in
+/// particular, version/feature selection comes from the embedded config's `caption_projection_*`
+/// keys, never from `is_v2`. Do not wire logic to this file's keys.
 fn build_output_config(include_audio: bool) -> serde_json::Value {
     serde_json::json!({
         "model_type": if include_audio { "AudioVideo" } else { "VideoOnly" },
