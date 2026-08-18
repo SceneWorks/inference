@@ -29,6 +29,7 @@ pub mod imageops;
 pub mod json_constraint;
 pub mod latent;
 pub mod license;
+pub mod ltx_checkpoint;
 mod macros;
 pub mod media;
 pub mod memory_strategy;
@@ -162,8 +163,19 @@ pub use tiling::{TilingConfig, VaeTiling};
 pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
-    safetensors_dir_bytes, safetensors_path_bytes, safetensors_path_tensor_headers,
-    SafetensorsTensorHeader,
+    safetensors_dir_bytes, safetensors_file_metadata, safetensors_path_bytes,
+    safetensors_path_tensor_headers, SafetensorsTensorHeader,
+};
+// The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
+// candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the
+// `gemma_source_checkpoint` ⇄ text-encoder `gemma_version` assertion. Pure paths + JSON, so it keeps
+// gen-core's zero-tensor invariant.
+pub use ltx_checkpoint::{
+    check_gemma_version, declared_layout, declared_model_version, discover_split_bundle,
+    discover_split_bundle_skipping, layout_for_declared_version, layout_for_version,
+    parse_model_version, GemmaEncoderIdentity, GemmaSourceCheckpoint, GemmaVersionCheck, LtxBundle,
+    LtxBundleBuilder, LtxCheckpointLayout, LtxCheckpointMetadata, LtxComponent, LtxConfigRoot,
+    LtxResolvedComponent,
 };
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The

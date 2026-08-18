@@ -49,6 +49,7 @@ use std::path::PathBuf;
 
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::gen_core::ltx_checkpoint::{layout_for_declared_version, LtxCheckpointLayout};
 use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::{to_dtype, Weights};
@@ -435,6 +436,24 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     reject_unknown_components(spec, &["uncensored_enhancer"], MODEL_ID)?;
     let uncensored_enhancer =
         resolve_uncensored_enhancer(spec.components.get("uncensored_enhancer"))?;
+    // Layout gate (sc-18757): which LTX generation this tree holds is decided by its declared
+    // `model_version` — NOT by which files are present and NOT by their names. This engine
+    // implements the LTX-2.3 all-in-one component set; an LTX-2.5 split bundle carries a different
+    // DiT, a Gemma 4 text encoder and a diffusion VAE, so it is refused **here**, by version, with
+    // the version named. Without this gate a 2.5 tree fell through to the per-file existence check
+    // below and died as "missing transformer.safetensors" — a filename-shaped error that points at
+    // the wrong problem. `crate::bundle` resolves the split layout for the engine that implements it.
+    let declared_version = crate::bundle::declared_model_version(root)?;
+    if layout_for_declared_version(declared_version.as_deref()) == LtxCheckpointLayout::Split {
+        return Err(Error::Msg(format!(
+            "ltx_2_3: {} declares model_version {:?}, which ships as a split-component bundle \
+             (per-component transformer / text encoder / video VAE / audio VAE / duration head / \
+             latent upsamplers, each with its own config). The ltx_2_3 engine loads the all-in-one \
+             LTX-2.3 layout only.",
+            root.display(),
+            declared_version.as_deref().unwrap_or_default(),
+        )));
+    }
     // Quantization geometry rides on the checkpoint's `split_model.json` (sc-2686): the transformer is
     // shipped selectively quantized (Q4 for `base_q4`, Q8 for `base_q8`), bits/group from the
     // manifest — never hardcoded. The per-Linear `.scales` predicate (in `transformer.rs`) then picks

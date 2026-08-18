@@ -41,6 +41,89 @@ pub fn is_hidden_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
+/// no whole-file buffer.
+///
+/// [`CheckpointMeta::from_file`] also exposes `__metadata__` (via
+/// [`CheckpointMeta::metadata`]), but it reads the entire file into memory first, which is fine for
+/// adapter-sized checkpoints and catastrophic for a 22B transformer. Component resolution keyed on
+/// `__metadata__["model_version"]` (sc-18757) must inspect exactly those multi-gigabyte files, so it
+/// uses this reader instead. An absent `__metadata__` block yields an empty map, not an error — a
+/// safetensors file is allowed to carry none.
+pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
+    /// Same ceiling `safetensors_path_tensor_headers` applies, for the same reason: refuse to
+    /// allocate an arbitrary buffer from an untrusted 8-byte length prefix.
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+            path.display()
+        )));
+    }
+    let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    if data_start > file_len {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} extends past the file",
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+        .map_err(|error| {
+            Error::Msg(format!("safetensors header in {}: {error}", path.display()))
+        })?;
+    let Some(block) = json.get("__metadata__") else {
+        return Ok(BTreeMap::new());
+    };
+    let block = block.as_object().ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors __metadata__ in {} is not a JSON object",
+            path.display()
+        ))
+    })?;
+    let mut out = BTreeMap::new();
+    for (key, value) in block {
+        // The safetensors spec types every `__metadata__` value as a string; a producer that emits a
+        // non-string is malformed, and silently dropping the entry would turn a `model_version`
+        // typo into "this checkpoint declares no version" (which selects the OLDEST layout).
+        let text = value.as_str().ok_or_else(|| {
+            Error::Msg(format!(
+                "safetensors __metadata__[{key:?}] in {} is {}, not a string",
+                path.display(),
+                match value {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a bool",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => "an object",
+                    serde_json::Value::String(_) => unreachable!("as_str covered strings"),
+                }
+            ))
+        })?;
+        out.insert(key.clone(), text.to_string());
+    }
+    Ok(out)
+}
+
 // =================================================================================================
 // CheckpointMeta — neutral safetensors header / byte-view reader.
 // =================================================================================================
