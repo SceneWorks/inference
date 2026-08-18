@@ -31,6 +31,14 @@ use mlx_llm::primitives::{
 
 const GOLDENS: &str = include_str!("../../testdata/gemma4/gemma4_goldens.json");
 const GEMMA4_CONFIG: &str = include_str!("../../testdata/gemma4/gemma4_unified_config.json");
+/// The **real** LTX-2.5 packed text encoder's safetensors header (sc-18756 evidence capture), whose
+/// `metadata.gemma_config` is the shipped `Gemma4UnifiedConfig` verbatim. Weightless — 6 KB of
+/// header JSON, no gated download — so the config layer can be asserted against the actual
+/// checkpoint rather than only against a hand-shaped fixture.
+const REAL_TE_HEADER: &str = include_str!(
+    "../../../../docs/reference/sc-18756-headers/text_encoders/\
+     gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors.json"
+);
 
 fn goldens() -> Value {
     serde_json::from_str(GOLDENS).expect("parse gemma4 goldens")
@@ -164,6 +172,71 @@ fn gemma4_layer_types_resolve_to_forty_sliding_and_eight_full() {
     assert_eq!(cfg.intermediate_size, 15360);
     assert_eq!(cfg.vocab_size, 262144);
     assert_eq!(cfg.rms_norm_eps, 1e-6);
+}
+
+/// The shipped `google/gemma-4-12B-it` text config, read straight out of the LTX-2.5 packed text
+/// encoder's safetensors metadata, must produce the same table the synthetic fixture does.
+///
+/// This is what turns the fixture from "shaped after the epic's measurements" into "agrees with the
+/// checkpoint": every number below is the checkpoint's own, and the 48-entry `layer_types` array it
+/// ships is compared against the schedule this crate derives when the key is absent.
+#[test]
+fn gemma4_real_packed_te_config_parses_to_the_same_table() {
+    let header: Value = serde_json::from_str(REAL_TE_HEADER).expect("parse TE header dump");
+    let real = &header["metadata"]["gemma_config"];
+    assert_eq!(real["model_type"], "gemma4_unified");
+    assert_eq!(real["gemma_version"], "gemma4-12b-ltx-v1");
+
+    let cfg = ModelConfig::from_json(real).expect("the shipped Gemma 4 config parses");
+    assert_eq!(cfg.architecture.family(), "gemma4_unified");
+    assert_eq!(cfg.num_layers, 48);
+    assert_eq!(cfg.num_heads, 16);
+    assert_eq!(cfg.hidden_size, 3840);
+    assert_eq!(cfg.intermediate_size, 15360);
+    assert_eq!(cfg.vocab_size, 262144);
+    assert_eq!(cfg.rms_norm_eps, 1e-6);
+    assert_eq!(cfg.max_position_embeddings, 262144);
+    assert_eq!(cfg.final_logit_softcap, Some(30.0));
+    assert!(cfg.tie_word_embeddings);
+    assert_eq!(cfg.attn_scale(), 1.0);
+    assert!(!cfg.is_moe(), "`num_experts: null` is not a MoE model");
+    assert!(!cfg.is_mla());
+
+    // The checkpoint ships `layer_types` explicitly; it must equal the derived 5:1 schedule (which
+    // is what makes the derive path safe for any Gemma 4 config that omits the key).
+    let shipped: Vec<&str> = real["text_config"]["layer_types"]
+        .as_array()
+        .expect("the shipped config carries layer_types")
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(shipped.len(), 48);
+    let parsed: Vec<&str> = cfg
+        .gemma4
+        .as_ref()
+        .unwrap()
+        .layer_types
+        .iter()
+        .map(|t| t.as_str())
+        .collect();
+    assert_eq!(parsed, shipped, "parsed table vs the shipped layer_types");
+
+    // And it must agree with the synthetic fixture, which omits `layer_types` entirely.
+    let synthetic =
+        ModelConfig::from_json(&serde_json::from_str::<Value>(GEMMA4_CONFIG).unwrap()).unwrap();
+    assert_eq!(
+        cfg.gemma4.as_ref().unwrap().layer_types,
+        synthetic.gemma4.as_ref().unwrap().layer_types,
+        "the derived schedule must match the shipped one"
+    );
+    assert_eq!(
+        cfg.gemma4.as_ref().unwrap().sliding,
+        synthetic.gemma4.as_ref().unwrap().sliding
+    );
+    assert_eq!(
+        cfg.gemma4.as_ref().unwrap().full,
+        synthetic.gemma4.as_ref().unwrap().full
+    );
 }
 
 /// The schedule is derived when `layer_types` is absent and read verbatim when present — and the
