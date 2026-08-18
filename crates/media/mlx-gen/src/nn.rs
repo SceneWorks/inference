@@ -1298,6 +1298,18 @@ mod tests {
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
 
+    // The retained handles are thread-local, but the trace probes behind [`COMPILE_TRACE_COUNTS`]
+    // are process-global: every test that resets, asserts, or increments them must hold this lock,
+    // or a concurrently scheduled sibling corrupts the exact-count assertions. Poison-tolerant so
+    // one failing test doesn't cascade into the others.
+    static COMPILE_TRACE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_compile_trace_counts() -> std::sync::MutexGuard<'static, ()> {
+        COMPILE_TRACE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // MLX keeps this source-backed runtime predicate private to its C++ Metal backend. The focused
     // NAX job links the exact pinned static library, so this test-only declaration calls the same
     // predicate used by the qmm/conv dispatchers without adding a production API solely for CI.
@@ -1554,6 +1566,7 @@ mod tests {
             self, CompileDisposition, DiagnosticCounter, ToggleDisposition, RETAINED_COMPILATION,
         };
         use std::sync::atomic::Ordering;
+        let _counts = hold_compile_trace_counts();
 
         RETAINED_COMPILE_GLUE.with(|slot| *slot.borrow_mut() = None);
         set_compile_glue(true);
@@ -2671,6 +2684,7 @@ mod tests {
     fn production_default_reaches_the_retained_arm_with_no_diagnostic_scope() {
         use crate::capability::{CapabilityOptOut, PipelineCapability};
         use std::sync::atomic::Ordering;
+        let _counts = hold_compile_trace_counts();
 
         const CALLS: usize = 4;
         let x = patterned(&[2, 3, 8], false);
@@ -2742,6 +2756,7 @@ mod tests {
     fn an_observed_production_request_reports_only_retained_dispositions() {
         use crate::diagnostics::CompileDisposition;
 
+        let _counts = hold_compile_trace_counts();
         release_retained_compile_glue();
         let x = patterned(&[1, 4, 16], false);
         let gate = patterned(&[1, 4, 16], true);
