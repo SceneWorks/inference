@@ -112,6 +112,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             // their activation levers; `generate` threads the request through
             // `MemoryConfig::with_request` into `Flux2ControlTransformer::forward_with_mem`.
             execution: crate::chunk::EXECUTION_SURFACE,
+            approximation: Default::default(),
         },
     }
 }

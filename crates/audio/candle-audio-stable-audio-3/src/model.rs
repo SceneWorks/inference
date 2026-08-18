@@ -1109,6 +1109,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
             execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

@@ -458,6 +458,7 @@ impl Flux2Variant {
                 // descriptor, because `model.rs`'s denoise threads the request through
                 // `MemoryConfig::with_request` on every route — gated long-sequence edit or not.
                 execution: crate::chunk::EXECUTION_SURFACE,
+                approximation: Default::default(),
             },
         }
     }

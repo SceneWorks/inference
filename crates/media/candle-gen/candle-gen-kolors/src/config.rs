@@ -129,6 +129,7 @@ pub fn descriptor() -> ModelDescriptor {
                 ),
                 ..candle_gen::gen_core::ExecutionSurface::default()
             },
+            approximation: Default::default(),
         },
     }
 }

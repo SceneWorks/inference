@@ -10,6 +10,7 @@
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
+pub mod approximation;
 pub mod attention_budget;
 pub mod audio_dsp;
 pub mod audio_embed;
@@ -47,6 +48,12 @@ pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod weightsmeta;
 
+pub use approximation::{
+    ApproximationPlan, ApproximationRequest, ApproximationSurface, CacheReuseInterval,
+    CacheWarmupSteps, CharacterizationBinding, CharacterizationFamily, CharacterizationRef,
+    FeatureCacheDomain, FeatureCachePolicy, TokenDropStride, TokenPruningDomain,
+    TokenPruningPolicy, MIN_DROP_STRIDE, MIN_REUSE_INTERVAL,
+};
 pub use audio_dsp::{
     db_to_linear, measure_loudness, measure_track_loudness, mixdown, LoudnessStats, MixClip,
     MixRequest, SILENCE_FLOOR_LUFS,

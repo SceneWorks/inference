@@ -6,6 +6,7 @@
 //! [`ModelDescriptor`] property plus a [`GenerationOutput`] variant — *not* a per-modality
 //! trait split (which breaks on multi-modal models).
 
+use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
@@ -433,6 +434,25 @@ pub struct GenerationRequest {
     /// surface for ordinary Krea 2 Turbo on constrained CUDA cards.
     pub memory: Option<GenerationMemory>,
 
+    // --- Approximate capabilities (sc-18322, epic 18304 P7) ---
+    /// Optional **result-changing** cost reductions — the deliberate opposite of
+    /// [`memory`](Self::memory) and of the typed execution domains, both of which promise
+    /// equivalence. `None` (the `Default`) is the provider's exact path, byte-for-byte the
+    /// pre-sc-18322 render.
+    ///
+    /// This is a separate sub-block rather than more [`GenerationMemory`] fields precisely because
+    /// `GenerationMemory` is documented as *quality-preserving*: a lever that changes the output has
+    /// no business sharing a struct whose whole contract is that it does not. It also keeps
+    /// `GenerationMemory` `Copy`, which a characterization reference (an owned string pair) would
+    /// break.
+    ///
+    /// Every selection here is gated at the shared request floor against
+    /// [`Capabilities::approximation`], and — until epic 18304's terminal measurement campaign
+    /// defines a quality-characterization artifact — **every** selection is refused, because an
+    /// approximate mechanism may only be selected alongside a characterization of what it costs in
+    /// quality. See [`crate::approximation`].
+    pub approximation: Option<ApproximationRequest>,
+
     // --- Audio (Option; consumed by audio models — `Modality::Audio`) ---
     /// The typed audio sub-block (sc-12834). `None` for every image/video request — the top-level
     /// request stays un-bloated, mirroring the planned typed video guider block (§9 known additive
@@ -802,6 +822,7 @@ impl Default for GenerationRequest {
             use_pid: false,
             pid_capture_sigma: None,
             memory: None,
+            approximation: None,
             audio: None,
             phases: None,
             cancel: CancelFlag::default(),
@@ -966,6 +987,11 @@ impl GenerationRequest {
             prompt_enhancement: _,
             use_pid: _,
             memory: _,
+            // The approximation sub-block is float-free by construction (sc-18322): its policy is
+            // step counts and its characterization reference is opaque strings. A float-bearing
+            // approximate parameter — a quality/cost threshold, say — must join the floor, and this
+            // named-not-`..` binding is what forces that decision when one arrives.
+            approximation: _,
             cancel: _,
             preview: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
@@ -2000,6 +2026,27 @@ pub struct Capabilities {
     /// reason [`supports_multi_speaker`](Self::supports_multi_speaker) and the audio surface live
     /// here. A planner reading the descriptor sees the domains beside the rest of the surface.
     pub execution: ExecutionSurface,
+    /// The typed **approximate capabilities** this provider implements on
+    /// [`GenerationRequest::approximation`] (sc-18322): mechanisms that make a render cheaper by
+    /// changing its result. See [`crate::approximation`].
+    ///
+    /// `Default` declares the mechanism absent *and* binds no quality-characterization artifact
+    /// family, so every existing descriptor keeps today's behaviour with no edit and a request that
+    /// selects an approximation is a typed [`Error::Unsupported`] at the shared floor.
+    ///
+    /// # Why this is not part of [`execution`](Self::execution)
+    ///
+    /// [`ExecutionSurface`]'s contract is that every domain it carries is bit-identical or
+    /// numerically equivalent, which is what lets a planner select one freely. An approximation is
+    /// the negation of that promise. Folding the two surfaces together would leave a consumer unable
+    /// to tell, from the descriptor, whether selecting a declared knob can move the pixels — so the
+    /// two live side by side, and the equivalence class stays readable off the field name.
+    ///
+    /// A mechanism declared here is **implemented but not selectable**: see
+    /// [`ApproximationSurface::is_selectable`](crate::ApproximationSurface::is_selectable), which is
+    /// `false` for every provider until the terminal measurement campaign defines a
+    /// characterization artifact family.
+    pub approximation: ApproximationSurface,
 }
 
 /// Generous upper sanity caps for the unbounded counter knobs (F-004). Not model limits — each model
@@ -2136,6 +2183,24 @@ impl Capabilities {
         self.validate_request_inner(id, req, false)
     }
 
+    /// The **approximate-capability plan** for one request — what a provider's denoise will actually
+    /// run (sc-18322).
+    ///
+    /// The same call the shared floor already made, exposed so a provider consumes the resolved
+    /// [`ApproximationPlan`] instead of re-reading
+    /// [`GenerationRequest::approximation`] and re-deriving the policy. There is therefore exactly one
+    /// place in the workspace that turns a request into a plan, and it is the place that refuses.
+    ///
+    /// Returns [`ApproximationPlan::Exact`] for every request today — see
+    /// [`crate::approximation`] for why that is the designed state, not a gap.
+    pub fn approximation_plan(
+        &self,
+        id: &str,
+        req: &GenerationRequest,
+    ) -> Result<ApproximationPlan> {
+        self.approximation.resolve(id, req.approximation.as_ref())
+    }
+
     /// Shared implementation of the floor. `check_size` gates only the size-range check so the
     /// auto-size path ([`validate_request_skip_size`](Self::validate_request_skip_size)) still runs
     /// every other check; the public [`validate_request`](Self::validate_request) passes `true`.
@@ -2180,6 +2245,17 @@ impl Capabilities {
         // exist to remove. Unset fields validate vacuously, so this is inert for every request that
         // does not select an execution schedule.
         self.execution.validate(id, req.memory.as_ref())?;
+        // Approximate capabilities (sc-18322). Gated on the same shared floor and for the same
+        // reason, but with a stronger conclusion: `resolve` refuses EVERY approximate selection
+        // today, because no provider can bind a quality-characterization artifact family (the
+        // binding's payload type is uninhabited). Resolving here — and discarding the plan — is what
+        // makes the refusal unforgettable; a provider that wants to *execute* an approximation calls
+        // `Capabilities::approximation_plan` and gets the same answer from the same code.
+        // An absent or empty selection resolves to `Exact` vacuously, so this is inert for every
+        // request that does not ask for an approximation.
+        self.approximation
+            .resolve(id, req.approximation.as_ref())
+            .map(|_plan| ())?;
         if req.count == 0 || req.count > self.max_count {
             return Err(Error::Msg(format!(
                 "{id}: count {} out of range 1..={}",

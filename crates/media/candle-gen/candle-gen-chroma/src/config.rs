@@ -144,6 +144,7 @@ impl ChromaVariant {
                 audio_edit_modes: vec![],
                 size_floor: SizeFloor::RangeChecked,
                 execution: Default::default(),
+                approximation: Default::default(),
             },
         }
     }

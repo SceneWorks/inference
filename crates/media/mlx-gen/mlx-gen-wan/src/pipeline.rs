@@ -883,12 +883,35 @@ fn predict(
     guidance: f32,
     y: Option<&Array>,
 ) -> Result<Array> {
+    predict_approx(transformer, latents, t, cache, guidance, y, None, None)
+}
+
+/// [`predict`] carrying the sc-18322 denoise feature cache. `trunk: None` is exactly [`predict`].
+#[allow(clippy::too_many_arguments)]
+fn predict_approx(
+    transformer: &WanTransformer,
+    latents: &Array,
+    t: f32,
+    cache: &StepCache,
+    guidance: f32,
+    y: Option<&Array>,
+    trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    prune: Option<&crate::token_pruning::TokenPruner>,
+) -> Result<Array> {
     let x = match y {
         Some(y) => concatenate_axis(&[latents, y], 0)?,
         None => latents.clone(),
     };
-    let preds =
-        transformer.forward_cached(&x, t, &cache.cross_kv, &cache.cos, &cache.sin, cache.batch)?;
+    let preds = transformer.forward_cached_approx(
+        &x,
+        t,
+        &cache.cross_kv,
+        &cache.cos,
+        &cache.sin,
+        cache.batch,
+        trunk,
+        prune,
+    )?;
     if cache.batch == 2 {
         // preds[0] = cond (context row 0), preds[1] = uncond (row 1).
         cfg_combine(&preds[0], &preds[1], guidance)
@@ -918,6 +941,88 @@ pub fn denoise(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    denoise_approx(
+        transformer,
+        kind,
+        num_train_timesteps,
+        steps,
+        shift,
+        guidance,
+        ctx_cond,
+        ctx_uncond,
+        init_noise,
+        cancel,
+        on_step,
+        None,
+        None,
+    )
+}
+
+/// Refuse an approximate plan on a denoise route that does not implement it (sc-18322).
+///
+/// The routes that are **not** wired for the denoise feature cache — the TI2V mask-blend, the curated
+/// unified solvers, and the MoE expert-swap paths — must refuse rather than run exactly, because
+/// silently ignoring a selection is the defect the typed approximate surface exists to remove. Each
+/// has a structural reason it is unwired, named in the message so a caller knows it is not a gap
+/// waiting to be filled by a retry:
+///
+/// * **TI2V mask-blend** re-blends the conditioning latent into the trajectory after every step, so a
+///   trunk residual captured at one step is not the quantity a later step needs.
+/// * **Curated solvers** evaluate the model 1..N times per solver step (Heun twice, DPM++ SDE at a
+///   midpoint), so "the previous step's residual" is ambiguous — and the step index the cache keys on
+///   never reaches the predict closure.
+/// * **MoE expert swap** changes transformers mid-trajectory, so a residual captured under the
+///   high-noise expert is meaningless under the low-noise one, a rotation phase captured under one is
+///   not the other's, and retaining either across the swap would keep the outgoing expert's weights
+///   alive.
+///
+/// Each of those three has a live call site: `Wan::generate_impl`'s TI2V and curated arms, and
+/// `Wan14b::generate_impl`, which covers every A14B route because every A14B route swaps experts. The
+/// refusal names the plan's **actually selected** mechanisms rather than a fixed string, so a
+/// pruning-only plan is not refused with the cache's name.
+///
+/// Unreachable today — the shared floor refuses every approximate selection before a provider is
+/// called, so no plan reaching here can be anything but `Exact`. It exists so that the day a
+/// characterization artifact makes selection possible, these routes fail closed by construction
+/// instead of needing to be remembered.
+pub fn refuse_unwired_approximation(
+    id: &str,
+    route: &str,
+    plan: &mlx_gen::gen_core::ApproximationPlan,
+) -> Result<()> {
+    if plan.is_exact() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{id}: the {route} denoise route does not implement {}. Leave approximation unset for this \
+         route's exact denoise.",
+        plan.describe_selection()
+    )))
+}
+
+/// [`denoise`] carrying the sc-18322 **denoise feature cache**.
+///
+/// `trunk: None` is exactly [`denoise`]. When present, the cache decides per step whether the block
+/// stack runs or its retained trunk residual is reapplied — and note where that decision is *not*: the
+/// cancel check, the per-step `eval` and the progress callback below are straight-line statements in
+/// this loop, outside the branch, so a reused step performs all three exactly as a recomputed one
+/// does. That is the whole of the cancel-responsiveness discipline; see [`crate::feature_cache`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_approx(
+    transformer: &WanTransformer,
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    guidance: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    mut trunk: Option<&mut crate::feature_cache::TrunkCache>,
+    mut prune: Option<&mut crate::token_pruning::TokenPruner>,
+) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
@@ -941,10 +1046,38 @@ pub fn denoise(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let pred = predict(transformer, &latents, t, &cache, guidance, None)?;
+        // Declare the step to the feature cache before the forward: the step index lives here, in the
+        // only loop that has one, so the cache never has to derive it from a timestep (sc-18322).
+        if let Some(cache) = trunk.as_deref_mut() {
+            cache.begin_step(i);
+        }
+        // Pruning declares the step for the same reason the cache does — it keys its per-block rotation
+        // on it — and its warmup decision comes from the contract's own predicate, so a warmup step
+        // passes `None` and runs the untouched block loop.
+        if let Some(pruner) = prune.as_deref_mut() {
+            pruner.begin_step(i);
+        }
+        let prune_this_step = match prune.as_deref() {
+            Some(pruner) if pruner.prunes_step(i) => Some(pruner),
+            _ => None,
+        };
+        let pred = predict_approx(
+            transformer,
+            &latents,
+            t,
+            &cache,
+            guidance,
+            None,
+            trunk.as_deref_mut(),
+            prune_this_step,
+        )?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
         // per-step `mx.eval(latents)`).
+        //
+        // Unconditional, and outside the feature-cache branch three call levels down: a reused step is
+        // materialized and progress-reported exactly like a recomputed one, so skipping the block stack
+        // can never make the loop less cancel-responsive (sc-18322).
         mlx_rs::transforms::eval([&latents])?;
         on_step(i + 1);
     }
