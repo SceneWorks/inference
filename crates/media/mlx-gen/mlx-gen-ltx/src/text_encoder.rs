@@ -13,6 +13,13 @@
 //! and adds a parallel **audio** head: `text_embedding_projection.audio_aggregate_embed` (→ 2048) +
 //! `audio_embeddings_connector` (8 layers, dim 2048 = 32×64). Built only by `from_weights_av`;
 //! the video-only `from_weights` leaves it `None`.
+//!
+//! sc-18763: `normed_hidden` below is the V2 (`PER_TOKEN_RMS`) caption feature extractor, and it's
+//! the ONLY one this crate implements. That was previously implicit — nothing checked the loaded
+//! model actually selected V2 before running this math. [`LtxTextEncoder::from_weights`] /
+//! [`LtxTextEncoder::from_weights_av`] now require `ltx_cfg.text_encoder_feature_version == V2`
+//! (see [`crate::config::TextEncoderFeatureVersion`] and its upstream-mirroring detection),
+//! erroring loudly instead of silently running V2 math against a V1-shaped checkpoint.
 
 use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
@@ -21,7 +28,7 @@ use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::config::LtxConfig;
+use crate::config::{LtxConfig, TextEncoderFeatureVersion};
 use crate::connector::Connector;
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
@@ -73,6 +80,7 @@ impl LtxTextEncoder {
         ltx_cfg: &LtxConfig,
         dtype: Dtype,
     ) -> Result<Self> {
+        require_v2(ltx_cfg)?;
         let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
         let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
         Ok(Self {
@@ -93,6 +101,7 @@ impl LtxTextEncoder {
         ltx_cfg: &LtxConfig,
         dtype: Dtype,
     ) -> Result<Self> {
+        require_v2(ltx_cfg)?;
         let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
         let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
         let audio = Self::audio_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
@@ -247,5 +256,53 @@ impl LtxTextEncoder {
                                                    // zero padded token positions (multiply by the 0/1 mask == where(mask, x, 0)).
         let mask = attention_mask.reshape(&[b, l, 1])?.as_dtype(self.dtype)?;
         Ok(multiply(&normed, &mask)?)
+    }
+}
+
+/// sc-18763: reject construction against anything but a V2-selected config. `normed_hidden` above
+/// is the V2 math unconditionally — running it against a V1-shaped checkpoint would silently
+/// produce plausible-looking, wrong conditioning (the exact failure mode the story called out).
+fn require_v2(ltx_cfg: &LtxConfig) -> Result<()> {
+    if ltx_cfg.text_encoder_feature_version != TextEncoderFeatureVersion::V2 {
+        return Err(Error::Msg(format!(
+            "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
+             selected {:?}, which this port does not implement",
+            ltx_cfg.text_encoder_feature_version
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    use super::*;
+    use crate::config::LtxConfig;
+
+    fn v1_config() -> LtxConfig {
+        // No embedded_config.json at all resolves to V1 (see `video_only_defaults`).
+        LtxConfig::video_only_defaults()
+    }
+
+    fn v2_config() -> LtxConfig {
+        LtxConfig::from_embedded_transformer(&serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        }))
+        .expect("valid V2 config")
+    }
+
+    #[test]
+    fn require_v2_accepts_v2_config() {
+        require_v2(&v2_config()).expect("V2 config must be accepted");
+    }
+
+    #[test]
+    fn require_v2_rejects_v1_config_loudly() {
+        let err = require_v2(&v1_config()).expect_err("V1 config must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("V2"), "unexpected error message: {msg}");
+        assert!(msg.contains("V1"), "unexpected error message: {msg}");
     }
 }

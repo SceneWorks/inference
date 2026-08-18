@@ -35,6 +35,109 @@ impl RopeType {
     }
 }
 
+/// Caption feature-extractor version selected for the S1 text-encoder's caption/connector-input
+/// path, per upstream's exact detection (`_create_feature_extractor`, Lightricks/LTX-2 @
+/// `d1511477`, `text_encoders/gemma/encoders/encoder_configurator.py:163-200`). sc-18763: this
+/// selection was previously implicit — `LtxTextEncoder` always ran the V2 math with no named
+/// decision — which is exactly the shape of bug the story called out: a checkpoint that resolved
+/// to V1 would have silently run V2 math and produced plausible-looking, wrong conditioning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEncoderFeatureVersion {
+    /// V1 ("19B" in upstream's naming): the caption projection lives inside the transformer, no
+    /// per-token-RMS feature path. **Not ported** — [`LtxTextEncoder`](crate::text_encoder::LtxTextEncoder)
+    /// only implements V2 math, so selecting V1 is itself a construction-time error.
+    V1,
+    /// V2 ("22B"): per-token RMS norm → rescale → dual (video + audio) aggregate embeds. The only
+    /// feature-extractor path this crate implements. Measured on both the real LTX-2.3
+    /// `ltx-2.3-22b-dev.safetensors` header and the real LTX-2.5
+    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header (sc-18763) — both select V2.
+    V2,
+}
+
+/// One of the four keys upstream's `_V2_EXPECTED_CONFIG` uses to detect V2, with the exact value
+/// it must carry.
+struct V2ConfigKey {
+    name: &'static str,
+    expected: bool,
+}
+
+/// Upstream's `_V2_EXPECTED_CONFIG` (`encoder_configurator.py:163-168`), exactly.
+const V2_EXPECTED_CONFIG: [V2ConfigKey; 4] = [
+    V2ConfigKey {
+        name: "caption_proj_before_connector",
+        expected: true,
+    },
+    V2ConfigKey {
+        name: "caption_projection_first_linear",
+        expected: false,
+    },
+    V2ConfigKey {
+        name: "caption_proj_input_norm",
+        expected: false,
+    },
+    V2ConfigKey {
+        name: "caption_projection_second_linear",
+        expected: false,
+    },
+];
+
+/// Port of upstream's exact-match detection logic (`_create_feature_extractor`,
+/// `encoder_configurator.py:171-209`): V1 iff none of the 4 [`V2_EXPECTED_CONFIG`] keys are
+/// present in the source config; V2 iff all 4 are present and match exactly; anything else (a
+/// partial key set, or a present key with an unexpected value) is config drift and **errors
+/// loudly** rather than silently falling back to V1 — the story's "verify, do not assume" mandate.
+///
+/// `present[i]` is `Some(value)` iff `V2_EXPECTED_CONFIG[i].name` is present in the source config
+/// (`None` = key absent). This mirrors upstream's `transformer_config.keys() & _V2_EXPECTED_CONFIG
+/// .keys()` intersection, which distinguishes "absent" from "present with the default value" —
+/// intentionally NOT the same thing as this crate's `get_bool(t, key, default)` helper, which
+/// cannot tell the two apart.
+fn detect_text_encoder_feature_version(
+    present: [Option<bool>; 4],
+) -> Result<TextEncoderFeatureVersion> {
+    let present_count = present.iter().filter(|v| v.is_some()).count();
+    if present_count == 0 {
+        return Ok(TextEncoderFeatureVersion::V1);
+    }
+    if present_count < V2_EXPECTED_CONFIG.len() {
+        let missing: Vec<&str> = V2_EXPECTED_CONFIG
+            .iter()
+            .zip(present.iter())
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.name)
+            .collect();
+        return Err(Error::Msg(format!(
+            "ltx: partial V2 caption-feature-extractor config — missing keys: {}",
+            missing.join(", ")
+        )));
+    }
+    let mismatched: Vec<String> = V2_EXPECTED_CONFIG
+        .iter()
+        .zip(present.iter())
+        .filter_map(|(k, v)| {
+            let got = v.expect("present_count == 4 checked above");
+            (got != k.expected).then(|| format!("{}={got} (expected {})", k.name, k.expected))
+        })
+        .collect();
+    if !mismatched.is_empty() {
+        return Err(Error::Msg(format!(
+            "ltx: unknown caption-feature-extractor config: {}",
+            mismatched.join(", ")
+        )));
+    }
+    Ok(TextEncoderFeatureVersion::V2)
+}
+
+/// The four V2-detection flags, read directly for **presence** (not [`get_bool`]'s
+/// presence-blind default) from the `transformer` block of `embedded_config.json`.
+fn read_v2_presence_flags(t: &Value) -> [Option<bool>; 4] {
+    let mut out = [None; 4];
+    for (slot, key) in out.iter_mut().zip(V2_EXPECTED_CONFIG.iter()) {
+        *slot = t.get(key.name).and_then(Value::as_bool);
+    }
+    out
+}
+
 /// The full LTX transformer config. Dimension-parametric: every field is read from
 /// `embedded_config.json` where present, falling back to the reference's hardcoded defaults.
 #[derive(Clone, Debug)]
@@ -75,6 +178,10 @@ pub struct LtxConfig {
     pub connector_num_learnable_registers: i32,
     pub connector_positional_embedding_max_pos: i32,
     pub connector_apply_gated_attention: bool,
+    /// The S1 caption feature-extractor version (sc-18763), explicit and config-driven — see
+    /// [`TextEncoderFeatureVersion`]. [`LtxTextEncoder::from_weights`](crate::text_encoder::LtxTextEncoder::from_weights)
+    /// rejects anything but `V2`.
+    pub text_encoder_feature_version: TextEncoderFeatureVersion,
 
     // --- Audio stack (sc-2684 AudioVideo) ---
     pub audio_num_attention_heads: i32,
@@ -151,12 +258,18 @@ impl LtxConfig {
             audio_connector_attention_head_dim: 64,
             audio_positional_embedding_max_pos: 20,
             av_ca_timestep_scale_multiplier: 1000,
+            // No `embedded_config.json` at all ⇒ none of the four V2-detection keys are present ⇒
+            // V1 by the same reasoning `detect_text_encoder_feature_version` applies to a real,
+            // sparse config (sc-18763). Never hit by 2.3/2.5, which both ship the file.
+            text_encoder_feature_version: TextEncoderFeatureVersion::V1,
         }
     }
 
     /// Build the config from the `transformer` block of a parsed `embedded_config.json`,
-    /// reproducing `generate_av.py`'s field resolution exactly.
-    pub fn from_embedded_transformer(t: &Value) -> Self {
+    /// reproducing `generate_av.py`'s field resolution exactly. Fallible (sc-18763): a
+    /// corrupted/unknown caption-feature-extractor config combination errors here rather than
+    /// being silently treated as V1 (see `detect_text_encoder_feature_version` in this module).
+    pub fn from_embedded_transformer(t: &Value) -> Result<Self> {
         let mut cfg = Self::video_only_defaults();
 
         // Plain dimension-parametric reads (default = the reference's hardcoded value).
@@ -289,7 +402,13 @@ impl LtxConfig {
                 get_i32(t, "audio_caption_channels", cfg.audio_caption_channels);
         }
 
-        cfg
+        // S1 caption feature-extractor version (sc-18763) — explicit, config-driven selection.
+        // Detection reads the four V2 keys for PRESENCE directly off `t` (not through the
+        // presence-blind `get_bool` helper above), matching upstream's `dict.keys()` intersection.
+        cfg.text_encoder_feature_version =
+            detect_text_encoder_feature_version(read_v2_presence_flags(t))?;
+
+        Ok(cfg)
     }
 
     /// Load the config from a model directory's `embedded_config.json` (the `transformer` block).
@@ -305,7 +424,7 @@ impl LtxConfig {
         let t = root_cfg
             .get("transformer")
             .ok_or_else(|| Error::Msg("ltx: embedded_config.json missing `transformer`".into()))?;
-        let cfg = Self::from_embedded_transformer(t);
+        let cfg = Self::from_embedded_transformer(t)?;
         // F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
         // reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
         // (wrong output, no error), reject the only value the engine does not implement. The 2.0
@@ -838,7 +957,12 @@ fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
 mod tests {
     use super::*;
 
-    /// An LTX-2.3 `transformer` block of `embedded_config.json`.
+    /// An LTX-2.3 `transformer` block of `embedded_config.json`. The four V2-detection keys
+    /// (`caption_proj_before_connector`/`caption_proj_input_norm` and the two
+    /// `caption_projection_*_linear` flags) are the values measured directly off the real
+    /// `ltx-2.3-22b-dev.safetensors` header's `__metadata__.config.transformer` (sc-18763,
+    /// 2026-08-18 — read via two HTTP-range-style header-only reads, no weight payload) — i.e. this
+    /// fixture is not a guess, it reproduces what LTX-2.3 actually ships.
     fn ltx23_transformer() -> Value {
         serde_json::json!({
             "_class_name": "AVTransformer3DModel",
@@ -864,6 +988,8 @@ mod tests {
             "connector_apply_gated_attention": true,
             "caption_projection_first_linear": false,
             "caption_projection_second_linear": false,
+            "caption_proj_before_connector": true,
+            "caption_proj_input_norm": false,
             "audio_connector_attention_head_dim": 64,
             "audio_connector_num_attention_heads": 32,
             "cross_attention_adaln": true,
@@ -879,7 +1005,7 @@ mod tests {
 
     #[test]
     fn ltx23_config_matches_reference_build_logic() {
-        let cfg = LtxConfig::from_embedded_transformer(&ltx23_transformer());
+        let cfg = LtxConfig::from_embedded_transformer(&ltx23_transformer()).unwrap();
         // Gated family → adaLN coeff 9.
         assert!(cfg.apply_gated_attention);
         assert_eq!(cfg.adaln_embedding_coefficient, 9);
@@ -889,6 +1015,12 @@ mod tests {
         assert!(!cfg.caption_projection_second_linear);
         assert_eq!(cfg.caption_channels, 4096);
         assert_eq!(cfg.audio_caption_channels, 32 * 64);
+        // sc-18763: LTX-2.3's real header carries all four V2 keys at their expected values — the
+        // "verify, do not assume" measurement the story asked for. 2.3 was ALREADY on V2.
+        assert_eq!(
+            cfg.text_encoder_feature_version,
+            TextEncoderFeatureVersion::V2
+        );
         // Audio stack dims (sc-2684).
         assert_eq!(cfg.audio_inner_dim(), 2048);
         assert_eq!(cfg.audio_connector_num_attention_heads, 32);
@@ -929,15 +1061,24 @@ mod tests {
             "audio_positional_embedding_max_pos": [42],
             "av_ca_timestep_scale_multiplier": 2000.0,
         });
-        let cfg = LtxConfig::from_embedded_transformer(&t);
+        let cfg = LtxConfig::from_embedded_transformer(&t).unwrap();
         assert_eq!(cfg.audio_in_channels, 256);
         assert_eq!(cfg.audio_out_channels, 257);
         assert_eq!(cfg.audio_positional_embedding_max_pos, 42);
         assert_eq!(cfg.av_ca_timestep_scale_multiplier, 2000);
+        // No V2 keys present in `t` at all ⇒ V1 (not an error — a fully-absent config is a clean
+        // detection, distinct from a *partial* or *mismatched* one; see the `text_encoder_feature_*`
+        // tests below).
+        assert_eq!(
+            cfg.text_encoder_feature_version,
+            TextEncoderFeatureVersion::V1
+        );
         // The float-typed integer is read via the same getter for the non-audio multiplier too.
         let t2 = serde_json::json!({ "timestep_scale_multiplier": 3000.0 });
         assert_eq!(
-            LtxConfig::from_embedded_transformer(&t2).timestep_scale_multiplier,
+            LtxConfig::from_embedded_transformer(&t2)
+                .unwrap()
+                .timestep_scale_multiplier,
             3000
         );
     }
@@ -949,6 +1090,92 @@ mod tests {
         assert!(!cfg.apply_gated_attention);
         assert_eq!(cfg.caption_channels, 3840);
         assert!(cfg.caption_projection_first_linear);
+    }
+
+    // --- sc-18763: caption feature-extractor version selection ------------------------------------
+
+    /// The 2.5 transformer config's V2-detection keys, measured directly off the real
+    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header
+    /// (`docs/reference/sc-18756-headers/diffusion_models/…-bf16.safetensors.json`, captured
+    /// 2026-08-18, sc-18756).
+    fn ltx25_v2_keys() -> Value {
+        serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        })
+    }
+
+    #[test]
+    fn ltx25_config_selects_v2() {
+        // Acceptance (sc-18763): a test asserts the extractor version chosen for a 2.5 config is V2.
+        let cfg = LtxConfig::from_embedded_transformer(&ltx25_v2_keys()).unwrap();
+        assert_eq!(
+            cfg.text_encoder_feature_version,
+            TextEncoderFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn no_v2_keys_present_selects_v1_not_an_error() {
+        let cfg = LtxConfig::from_embedded_transformer(&serde_json::json!({})).unwrap();
+        assert_eq!(
+            cfg.text_encoder_feature_version,
+            TextEncoderFeatureVersion::V1
+        );
+    }
+
+    #[test]
+    fn partial_v2_key_set_errors_loudly_instead_of_falling_back_to_v1() {
+        // Only 2 of the 4 keys present — config drift, not a clean V1 or V2 config. Must error, not
+        // silently resolve to V1 (the story's explicit "verify, do not assume" / no-silent-fallback
+        // requirement).
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+        });
+        let err = LtxConfig::from_embedded_transformer(&corrupted)
+            .expect_err("partial V2 key set must error");
+        let msg = err.to_string();
+        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_input_norm"));
+        assert!(msg.contains("caption_projection_second_linear"));
+    }
+
+    #[test]
+    fn all_four_keys_present_but_wrong_value_errors_loudly() {
+        // All 4 keys present (so it's not "partial"), but one value disagrees with
+        // `_V2_EXPECTED_CONFIG` — config drift the reference itself raises `NotImplementedError` on.
+        let mut corrupted = ltx25_v2_keys();
+        corrupted["caption_proj_before_connector"] = serde_json::json!(false);
+        let err = LtxConfig::from_embedded_transformer(&corrupted)
+            .expect_err("mismatched V2 key value must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_before_connector"));
+    }
+
+    #[test]
+    fn text_encoder_requires_v2_config_to_build() {
+        // The engine only implements V2 math (`LtxTextEncoder::from_weights`) — building a text
+        // encoder from a V1-selected config must be rejected there, not silently mis-run. Exercised
+        // directly against `detect_text_encoder_feature_version` here; the construction-time gate
+        // itself is covered in `text_encoder.rs`'s tests.
+        assert_eq!(
+            detect_text_encoder_feature_version([None, None, None, None]).unwrap(),
+            TextEncoderFeatureVersion::V1
+        );
+        assert_eq!(
+            detect_text_encoder_feature_version([
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false)
+            ])
+            .unwrap(),
+            TextEncoderFeatureVersion::V2
+        );
     }
 
     #[test]

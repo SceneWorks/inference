@@ -6,11 +6,20 @@
 //!
 //! The projection lives at the checkpoint's top level (`text_embedding_projection.video_aggregate_
 //! embed.*`); the connector under `model.diffusion_model.video_embeddings_connector.*`. Runs bf16.
+//!
+//! sc-18763: the math below (`normed_hidden`) is the V2 (`PER_TOKEN_RMS`) caption feature
+//! extractor, and it's the ONLY one this crate implements — see
+//! [`crate::config::TextEncoderFeatureVersion`] for the upstream-mirroring detection this crate
+//! validates against at construction (both [`LtxTextEncoder::new`] and
+//! [`LtxTextEncoder::new_av`]), so a config drift away from V2 errors loudly instead of silently
+//! running this math against a checkpoint it doesn't apply to.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 
-use crate::config::{ConnectorConfig, GemmaConfig};
+use crate::config::{
+    ConnectorConfig, GemmaConfig, TextEncoderFeatureConfig, TextEncoderFeatureVersion,
+};
 use crate::connector::Connector;
 use crate::gemma::GemmaEncoder;
 use crate::quant::{qlinear, QLinear};
@@ -46,6 +55,7 @@ impl LtxTextEncoder {
         gemma_cfg: &GemmaConfig,
         conn_cfg: &ConnectorConfig,
     ) -> Result<Self> {
+        require_v2()?;
         let device = gemma_vb.device().clone();
         let gemma = GemmaEncoder::new(gemma_vb, gemma_cfg)?;
         // Packed-detecting aggregate projection (sc-9417): dense in the hosted tier, but routed through
@@ -153,5 +163,31 @@ impl LtxTextEncoder {
         let a_feat = audio.aggregate.forward(&(normed * audio.rescale)?)?;
         let audio_ctx = audio.connector.forward(&a_feat, nv)?;
         Ok((video, audio_ctx))
+    }
+}
+
+/// sc-18763: reject construction unless the crate's caption-feature-extractor selection resolves
+/// to V2 — `normed_hidden` above is the V2 math unconditionally, and running it against anything
+/// else would silently produce plausible-looking, wrong conditioning. `new_av` delegates to `new`,
+/// so this one call site covers both constructors.
+fn require_v2() -> Result<()> {
+    let cfg = TextEncoderFeatureConfig::ltx_2_3()?;
+    if cfg.version != TextEncoderFeatureVersion::V2 {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
+             selected {:?}, which this port does not implement",
+            cfg.version
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    use super::*;
+
+    #[test]
+    fn require_v2_accepts_the_shipped_ltx_2_3_flags() {
+        require_v2().expect("the hardcoded LTX-2.3 flags must resolve to V2");
     }
 }

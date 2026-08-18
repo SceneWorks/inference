@@ -186,6 +186,127 @@ impl ConnectorConfig {
     }
 }
 
+// --- Caption feature-extractor version (sc-18763) ------------------------------------------------
+//
+// Port of mlx-gen-ltx's `config.rs` detection of the same name — see that module's doc comments
+// for the full upstream citation (`_create_feature_extractor`, Lightricks/LTX-2 @ `d1511477`,
+// `text_encoders/gemma/encoders/encoder_configurator.py:163-200`). This crate has no
+// `embedded_config.json` reader (the shipped LTX-2.3 dense checkpoint carries its config in
+// `__metadata__`, not a sibling file — see the module doc above), so unlike the mlx crate the
+// selection here is against a **named, hardcoded** flag set ([`TextEncoderFeatureConfig::ltx_2_3`])
+// rather than a JSON blob — but it runs through the exact same upstream-mirroring detection
+// function, so it's explicit (a named, testable enum instead of "whatever `normed_hidden` happens
+// to compute") and still rejects a corrupted flag combination loudly rather than silently treating
+// it as V1.
+
+use candle_gen::candle_core::{Error as CandleError, Result as CandleResult};
+
+/// Caption feature-extractor version selected for the S1 text-encoder's caption/connector-input
+/// path. See the module-level note above for the upstream citation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEncoderFeatureVersion {
+    /// V1 ("19B" in upstream's naming): the caption projection lives inside the transformer, no
+    /// per-token-RMS feature path. **Not ported** — [`LtxTextEncoder`](crate::text_encoder::LtxTextEncoder)
+    /// only implements V2 math, so selecting V1 is itself a construction-time error.
+    V1,
+    /// V2 ("22B"): per-token RMS norm → rescale → dual (video + audio) aggregate embeds. The only
+    /// feature-extractor path this crate implements. Measured on the real LTX-2.3
+    /// `ltx-2.3-22b-dev.safetensors` header (sc-18763) — 2.3 selects V2.
+    V2,
+}
+
+struct V2ConfigKey {
+    name: &'static str,
+    expected: bool,
+}
+
+/// Upstream's `_V2_EXPECTED_CONFIG` (`encoder_configurator.py:163-168`), exactly.
+const V2_EXPECTED_CONFIG: [V2ConfigKey; 4] = [
+    V2ConfigKey {
+        name: "caption_proj_before_connector",
+        expected: true,
+    },
+    V2ConfigKey {
+        name: "caption_projection_first_linear",
+        expected: false,
+    },
+    V2ConfigKey {
+        name: "caption_proj_input_norm",
+        expected: false,
+    },
+    V2ConfigKey {
+        name: "caption_projection_second_linear",
+        expected: false,
+    },
+];
+
+/// Port of upstream's exact-match detection logic: V1 iff none of the 4 `V2_EXPECTED_CONFIG`
+/// keys (this module's private constant) are present; V2 iff all 4 are present and match exactly;
+/// a partial key set or a present key with an unexpected value is config drift and **errors
+/// loudly** rather than silently falling back to V1. `present[i]` is `Some(value)` iff
+/// `V2_EXPECTED_CONFIG[i].name` is considered present in the source config (`None` = absent).
+pub fn detect_text_encoder_feature_version(
+    present: [Option<bool>; 4],
+) -> CandleResult<TextEncoderFeatureVersion> {
+    let present_count = present.iter().filter(|v| v.is_some()).count();
+    if present_count == 0 {
+        return Ok(TextEncoderFeatureVersion::V1);
+    }
+    if present_count < V2_EXPECTED_CONFIG.len() {
+        let missing: Vec<&str> = V2_EXPECTED_CONFIG
+            .iter()
+            .zip(present.iter())
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.name)
+            .collect();
+        return Err(CandleError::Msg(format!(
+            "ltx: partial V2 caption-feature-extractor config — missing keys: {}",
+            missing.join(", ")
+        )));
+    }
+    let mismatched: Vec<String> = V2_EXPECTED_CONFIG
+        .iter()
+        .zip(present.iter())
+        .filter_map(|(k, v)| {
+            let got = v.expect("present_count == 4 checked above");
+            (got != k.expected).then(|| format!("{}={got} (expected {})", k.name, k.expected))
+        })
+        .collect();
+    if !mismatched.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "ltx: unknown caption-feature-extractor config: {}",
+            mismatched.join(", ")
+        )));
+    }
+    Ok(TextEncoderFeatureVersion::V2)
+}
+
+/// The named, explicit caption-feature-extractor flag set this crate builds a text encoder from —
+/// see the module note above for why this is hardcoded rather than JSON-parsed.
+#[derive(Clone, Copy, Debug)]
+pub struct TextEncoderFeatureConfig {
+    pub version: TextEncoderFeatureVersion,
+}
+
+impl TextEncoderFeatureConfig {
+    /// The shipped LTX-2.3 checkpoint's caption-feature-extractor flags, measured directly off the
+    /// real `ltx-2.3-22b-dev.safetensors` header's `__metadata__.config.transformer` (sc-18763,
+    /// 2026-08-18 — a header-only read, no weight payload fetched):
+    /// `caption_proj_before_connector=true, caption_projection_first_linear=false,
+    /// caption_proj_input_norm=false, caption_projection_second_linear=false`. Validated (not just
+    /// asserted) through [`detect_text_encoder_feature_version`], so a future edit that drifts these
+    /// constants away from `_V2_EXPECTED_CONFIG` fails loudly instead of silently mis-selecting.
+    pub fn ltx_2_3() -> CandleResult<Self> {
+        let version = detect_text_encoder_feature_version([
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+        ])?;
+        Ok(Self { version })
+    }
+}
+
 /// Gemma-3-12B (used as a text encoder — all hidden states extracted).
 #[derive(Clone, Debug)]
 pub struct GemmaConfig {
@@ -433,5 +554,50 @@ mod audio_config_tests {
         assert_eq!(a.num_resolutions(), 3);
         assert!(!a.mid_block_add_attention);
         assert_eq!(a.z_channels, 8);
+    }
+}
+
+#[cfg(test)]
+mod text_encoder_feature_version_tests {
+    use super::*;
+
+    #[test]
+    fn ltx_2_3_selects_v2() {
+        // Acceptance (sc-18763): the extractor version chosen for the shipped LTX-2.3 flags is V2 —
+        // measured off the real checkpoint header, not assumed.
+        let cfg = TextEncoderFeatureConfig::ltx_2_3().expect("valid V2 flags");
+        assert_eq!(cfg.version, TextEncoderFeatureVersion::V2);
+    }
+
+    #[test]
+    fn no_keys_present_selects_v1_not_an_error() {
+        let v = detect_text_encoder_feature_version([None, None, None, None]).unwrap();
+        assert_eq!(v, TextEncoderFeatureVersion::V1);
+    }
+
+    #[test]
+    fn partial_v2_key_set_errors_loudly_instead_of_falling_back_to_v1() {
+        let err = detect_text_encoder_feature_version([Some(true), Some(false), None, None])
+            .expect_err("partial V2 key set must error");
+        let msg = err.to_string();
+        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_input_norm"));
+        assert!(msg.contains("caption_projection_second_linear"));
+    }
+
+    #[test]
+    fn all_four_keys_present_but_wrong_value_errors_loudly() {
+        // Deliberately-corrupted combo: all 4 present (not partial), but one disagrees with
+        // `_V2_EXPECTED_CONFIG` — the reference itself raises `NotImplementedError` on this shape.
+        let err = detect_text_encoder_feature_version([
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ])
+        .expect_err("mismatched V2 key value must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_before_connector"));
     }
 }

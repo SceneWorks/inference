@@ -432,6 +432,15 @@ fn build_embedded_config() -> serde_json::Value {
             "connector_apply_gated_attention": true,
             "caption_projection_first_linear": false,
             "caption_projection_second_linear": false,
+            // sc-18763: the other two of the four keys upstream's `_create_feature_extractor` uses
+            // to detect the V2 (per-token-RMS) caption feature extractor — measured directly off
+            // the real `ltx-2.3-22b-dev.safetensors` header, both present on the shipped 2.3
+            // checkpoint. Omitting either (as this fixture did before sc-18763) makes
+            // `LtxConfig::from_model_dir` on the CONVERTED directory see a partial V2 key set and
+            // error loudly rather than silently defaulting to V1 — so a real conversion run must
+            // emit them, not just this test fixture.
+            "caption_proj_before_connector": true,
+            "caption_proj_input_norm": false,
             "audio_connector_attention_head_dim": 64,
             "audio_connector_num_attention_heads": 32,
             "cross_attention_adaln": true,
