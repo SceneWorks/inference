@@ -48,9 +48,14 @@ pub enum TextEncoderFeatureVersion {
     /// only implements V2 math, so selecting V1 is itself a construction-time error.
     V1,
     /// V2 ("22B"): per-token RMS norm → rescale → dual (video + audio) aggregate embeds. The only
-    /// feature-extractor path this crate implements. Measured on both the real LTX-2.3
-    /// `ltx-2.3-22b-dev.safetensors` header and the real LTX-2.5
-    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header (sc-18763) — both select V2.
+    /// feature-extractor path this crate implements. Measured directly on the real 2.5
+    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header (all 4 keys present, matching
+    /// `V2_EXPECTED_CONFIG` exactly) and on the **already-hosted** `SceneWorks/ltx-2.3-mlx`
+    /// tier's `embedded_config.json` (the legacy 2-key shape `is_legacy_two_key_v2_shape` in this
+    /// module carves out) — both select V2 (sc-18763; the tier finding is a 2026-08-18
+    /// coordinator-review correction of an earlier version of this doc comment that had instead
+    /// measured the upstream *dense* `ltx-2.3-22b-dev.safetensors` checkpoint, which the loader
+    /// never reads).
     V2,
 }
 
@@ -81,29 +86,72 @@ const V2_EXPECTED_CONFIG: [V2ConfigKey; 4] = [
     },
 ];
 
-/// Port of upstream's exact-match detection logic (`_create_feature_extractor`,
-/// `encoder_configurator.py:171-209`): V1 iff none of the 4 [`V2_EXPECTED_CONFIG`] keys are
-/// present in the source config; V2 iff all 4 are present and match exactly; anything else (a
-/// partial key set, or a present key with an unexpected value) is config drift and **errors
-/// loudly** rather than silently falling back to V1 — the story's "verify, do not assume" mandate.
+/// Whether one of the 4 [`V2_EXPECTED_CONFIG`] keys is absent, present with a boolean value, or
+/// present with some other JSON value type. Upstream's detection is a **key-presence** check
+/// (`transformer_config.keys() & _V2_EXPECTED_CONFIG.keys()`) followed by a **value** comparison —
+/// a key present with a non-bool value counts as present for the first check and then always fails
+/// the second (a string/number is never `==` a bool), landing in the "unknown config" error, not
+/// silently treated as absent. `Option<bool>` alone cannot express that distinction (it collapses
+/// "absent" and "present but the wrong type" to `None`), which is why this exists (sc-18763 review
+/// point 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyPresence {
+    Absent,
+    Bool(bool),
+    NonBool,
+}
+
+/// The exact 2-of-4-key shape the **already-hosted** `SceneWorks/ltx-2.3-mlx` tier's
+/// `embedded_config.json` carries: measured directly (2026-08-18, sc-18763 coordinator review)
+/// against every cached snapshot/quant variant on this machine (`01df27d308…` and `254989c3ca…`,
+/// q4/q8/bf16) — `caption_projection_first_linear` and `caption_projection_second_linear` are
+/// present and `false`; `caption_proj_before_connector` and `caption_proj_input_norm` are **absent**
+/// entirely. This predates the two extra keys this story added detection for: the converter that
+/// produced these tiers ran before the audit, so every already-installed 2.3 tier is missing them.
 ///
-/// `present[i]` is `Some(value)` iff `V2_EXPECTED_CONFIG[i].name` is present in the source config
-/// (`None` = key absent). This mirrors upstream's `transformer_config.keys() & _V2_EXPECTED_CONFIG
-/// .keys()` intersection, which distinguishes "absent" from "present with the default value" —
-/// intentionally NOT the same thing as this crate's `get_bool(t, key, default)` helper, which
-/// cannot tell the two apart.
+/// Upstream's own detection would call this "partial V2 config" and raise (`NotImplementedError`)
+/// — that is not survivable here: it would break `LtxConfig::from_model_dir` on every existing
+/// installed 2.3 tier the first time this code runs, and re-publishing them is out of scope for
+/// this story. So this exact shape — and *only* this exact shape — is carved out as V2 explicitly.
+/// Any other partial combination (a different pair of keys, a single key, 3 of 4, or this same pair
+/// with a non-`false` value) still errors via the general partial/mismatch logic below; the carve-
+/// out check runs first specifically so it cannot silently widen to cover those.
+fn is_legacy_two_key_v2_shape(present: &[KeyPresence; 4]) -> bool {
+    present[0] == KeyPresence::Absent // caption_proj_before_connector
+        && present[1] == KeyPresence::Bool(false) // caption_projection_first_linear
+        && present[2] == KeyPresence::Absent // caption_proj_input_norm
+        && present[3] == KeyPresence::Bool(false) // caption_projection_second_linear
+}
+
+/// Port of upstream's exact-match detection logic (`_create_feature_extractor`,
+/// `encoder_configurator.py:171-209`), extended with the legacy carve-out above: V1 iff none of
+/// the 4 [`V2_EXPECTED_CONFIG`] keys are present; V2 iff [`is_legacy_two_key_v2_shape`] matches, or
+/// all 4 are present and match exactly; anything else (a different partial key set, or a present
+/// key with an unexpected value) is config drift and **errors loudly** rather than silently falling
+/// back to V1 — the story's "verify, do not assume" mandate.
+///
+/// `present[i]` describes `V2_EXPECTED_CONFIG[i].name`'s state in the source config. This mirrors
+/// upstream's `transformer_config.keys() & _V2_EXPECTED_CONFIG.keys()` intersection, which is
+/// intentionally NOT the same thing as this crate's `get_bool(t, key, default)` helper — that
+/// helper cannot tell "absent" apart from "present with the default value".
 fn detect_text_encoder_feature_version(
-    present: [Option<bool>; 4],
+    present: [KeyPresence; 4],
 ) -> Result<TextEncoderFeatureVersion> {
-    let present_count = present.iter().filter(|v| v.is_some()).count();
+    let present_count = present
+        .iter()
+        .filter(|v| **v != KeyPresence::Absent)
+        .count();
     if present_count == 0 {
         return Ok(TextEncoderFeatureVersion::V1);
+    }
+    if is_legacy_two_key_v2_shape(&present) {
+        return Ok(TextEncoderFeatureVersion::V2);
     }
     if present_count < V2_EXPECTED_CONFIG.len() {
         let missing: Vec<&str> = V2_EXPECTED_CONFIG
             .iter()
             .zip(present.iter())
-            .filter(|(_, v)| v.is_none())
+            .filter(|(_, v)| **v == KeyPresence::Absent)
             .map(|(k, _)| k.name)
             .collect();
         return Err(Error::Msg(format!(
@@ -114,9 +162,14 @@ fn detect_text_encoder_feature_version(
     let mismatched: Vec<String> = V2_EXPECTED_CONFIG
         .iter()
         .zip(present.iter())
-        .filter_map(|(k, v)| {
-            let got = v.expect("present_count == 4 checked above");
-            (got != k.expected).then(|| format!("{}={got} (expected {})", k.name, k.expected))
+        .filter_map(|(k, v)| match v {
+            KeyPresence::Bool(got) if *got == k.expected => None,
+            KeyPresence::Bool(got) => Some(format!("{}={got} (expected {})", k.name, k.expected)),
+            KeyPresence::NonBool => Some(format!(
+                "{}=<non-bool value> (expected {})",
+                k.name, k.expected
+            )),
+            KeyPresence::Absent => unreachable!("present_count == 4 checked above"),
         })
         .collect();
     if !mismatched.is_empty() {
@@ -129,11 +182,18 @@ fn detect_text_encoder_feature_version(
 }
 
 /// The four V2-detection flags, read directly for **presence** (not [`get_bool`]'s
-/// presence-blind default) from the `transformer` block of `embedded_config.json`.
-fn read_v2_presence_flags(t: &Value) -> [Option<bool>; 4] {
-    let mut out = [None; 4];
+/// presence-blind default) from the `transformer` block of `embedded_config.json`. A key present
+/// with a non-bool JSON value reads as [`KeyPresence::NonBool`], not "absent".
+fn read_v2_presence_flags(t: &Value) -> [KeyPresence; 4] {
+    let mut out = [KeyPresence::Absent; 4];
     for (slot, key) in out.iter_mut().zip(V2_EXPECTED_CONFIG.iter()) {
-        *slot = t.get(key.name).and_then(Value::as_bool);
+        *slot = match t.get(key.name) {
+            None => KeyPresence::Absent,
+            Some(v) => match v.as_bool() {
+                Some(b) => KeyPresence::Bool(b),
+                None => KeyPresence::NonBool,
+            },
+        };
     }
     out
 }
@@ -957,12 +1017,16 @@ fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
 mod tests {
     use super::*;
 
-    /// An LTX-2.3 `transformer` block of `embedded_config.json`. The four V2-detection keys
-    /// (`caption_proj_before_connector`/`caption_proj_input_norm` and the two
-    /// `caption_projection_*_linear` flags) are the values measured directly off the real
-    /// `ltx-2.3-22b-dev.safetensors` header's `__metadata__.config.transformer` (sc-18763,
-    /// 2026-08-18 — read via two HTTP-range-style header-only reads, no weight payload) — i.e. this
-    /// fixture is not a guess, it reproduces what LTX-2.3 actually ships.
+    /// An LTX-2.3 `transformer` block of `embedded_config.json`, reproducing the **already-hosted**
+    /// `SceneWorks/ltx-2.3-mlx` tier's actual shape — measured directly against every cached
+    /// snapshot/quant variant on this machine (sc-18763 coordinator review, 2026-08-18; corrects an
+    /// earlier version of this fixture that instead measured the upstream *dense*
+    /// `ltx-2.3-22b-dev.safetensors` checkpoint's `__metadata__`, which is NOT what
+    /// `LtxConfig::from_model_dir` reads in production — the crate reads the split MLX tier's
+    /// `embedded_config.json`, a different, older converter artifact). Only
+    /// `caption_projection_first_linear`/`caption_projection_second_linear` are present (both
+    /// `false`); `caption_proj_before_connector`/`caption_proj_input_norm` are absent — the legacy
+    /// 2-key shape [`is_legacy_two_key_v2_shape`] carves out.
     fn ltx23_transformer() -> Value {
         serde_json::json!({
             "_class_name": "AVTransformer3DModel",
@@ -988,8 +1052,6 @@ mod tests {
             "connector_apply_gated_attention": true,
             "caption_projection_first_linear": false,
             "caption_projection_second_linear": false,
-            "caption_proj_before_connector": true,
-            "caption_proj_input_norm": false,
             "audio_connector_attention_head_dim": 64,
             "audio_connector_num_attention_heads": 32,
             "cross_attention_adaln": true,
@@ -1015,8 +1077,9 @@ mod tests {
         assert!(!cfg.caption_projection_second_linear);
         assert_eq!(cfg.caption_channels, 4096);
         assert_eq!(cfg.audio_caption_channels, 32 * 64);
-        // sc-18763: LTX-2.3's real header carries all four V2 keys at their expected values — the
-        // "verify, do not assume" measurement the story asked for. 2.3 was ALREADY on V2.
+        // sc-18763 (coordinator review): the REAL shipped tier only carries the legacy 2-key shape
+        // (verified against every cached SceneWorks/ltx-2.3-mlx snapshot on this machine) — it
+        // resolves to V2 via the explicit legacy carve-out, not the strict 4-key match.
         assert_eq!(
             cfg.text_encoder_feature_version,
             TextEncoderFeatureVersion::V2
@@ -1128,9 +1191,11 @@ mod tests {
 
     #[test]
     fn partial_v2_key_set_errors_loudly_instead_of_falling_back_to_v1() {
-        // Only 2 of the 4 keys present — config drift, not a clean V1 or V2 config. Must error, not
-        // silently resolve to V1 (the story's explicit "verify, do not assume" / no-silent-fallback
-        // requirement).
+        // A DIFFERENT 2-of-4 pair than the legacy shape (`caption_proj_before_connector` +
+        // `caption_projection_first_linear`, not `caption_projection_{first,second}_linear`) — the
+        // legacy carve-out must not widen to accept it. Config drift, not a clean V1 or V2 config;
+        // must error, not silently resolve to V1 (the story's explicit "verify, do not assume" /
+        // no-silent-fallback requirement).
         let corrupted = serde_json::json!({
             "caption_proj_before_connector": true,
             "caption_projection_first_linear": false,
@@ -1157,23 +1222,78 @@ mod tests {
     }
 
     #[test]
+    fn present_non_bool_value_errors_as_unknown_config_not_silent_v1() {
+        // sc-18763 coordinator review point 3: a key present with a non-bool JSON value must count
+        // as PRESENT (matching upstream's `dict.keys()` semantics) and then fail the value
+        // comparison — landing in "unknown config", never silently treated as absent/V1.
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": "yes", // non-bool — must not read as absent
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        });
+        let err = LtxConfig::from_embedded_transformer(&corrupted)
+            .expect_err("a present non-bool value must error, not resolve V1");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_before_connector"));
+    }
+
+    #[test]
+    fn present_non_bool_value_in_a_partial_set_still_counts_as_present() {
+        // A non-bool value at a legacy-shape key position means this is NOT the legacy shape
+        // (`is_legacy_two_key_v2_shape` requires an exact `Bool(false)`), and the non-bool key
+        // still counts toward `present_count` (not toward "missing") — so with only 3 of 4 keys
+        // "present" (1 non-bool + 2 absent), this is "partial", not "unknown value on all 4".
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": "false", // non-bool, string not JSON bool
+            "caption_projection_second_linear": false,
+        });
+        let err = LtxConfig::from_embedded_transformer(&corrupted)
+            .expect_err("must error, not silently resolve to the legacy V2 shape");
+        let msg = err.to_string();
+        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+    }
+
+    #[test]
+    fn legacy_two_key_shape_with_a_true_value_is_not_the_carve_out() {
+        // Same two key NAMES as the shipped legacy shape, but a `true` instead of `false` — the
+        // carve-out is exact-match, not name-only. Both keys present (so not "partial"; the other
+        // two are still absent, so it IS partial here) — the point is it must not resolve V2.
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": true,
+            "caption_projection_second_linear": false,
+        });
+        let err = LtxConfig::from_embedded_transformer(&corrupted)
+            .expect_err("a wrong-valued near-miss of the legacy shape must not resolve V2");
+        assert!(err.to_string().contains("partial"));
+    }
+
+    #[test]
     fn text_encoder_requires_v2_config_to_build() {
         // The engine only implements V2 math (`LtxTextEncoder::from_weights`) — building a text
         // encoder from a V1-selected config must be rejected there, not silently mis-run. Exercised
         // directly against `detect_text_encoder_feature_version` here; the construction-time gate
         // itself is covered in `text_encoder.rs`'s tests.
+        use KeyPresence::{Absent, Bool};
         assert_eq!(
-            detect_text_encoder_feature_version([None, None, None, None]).unwrap(),
+            detect_text_encoder_feature_version([Absent, Absent, Absent, Absent]).unwrap(),
             TextEncoderFeatureVersion::V1
         );
         assert_eq!(
             detect_text_encoder_feature_version([
-                Some(true),
-                Some(false),
-                Some(false),
-                Some(false)
+                Bool(true),
+                Bool(false),
+                Bool(false),
+                Bool(false)
             ])
             .unwrap(),
+            TextEncoderFeatureVersion::V2
+        );
+        // The exact legacy 2-key shape shipped tiers carry (sc-18763 coordinator review).
+        assert_eq!(
+            detect_text_encoder_feature_version([Absent, Bool(false), Absent, Bool(false)])
+                .unwrap(),
             TextEncoderFeatureVersion::V2
         );
     }

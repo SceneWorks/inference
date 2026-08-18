@@ -9,10 +9,13 @@
 //!
 //! sc-18763: the math below (`normed_hidden`) is the V2 (`PER_TOKEN_RMS`) caption feature
 //! extractor, and it's the ONLY one this crate implements — see
-//! [`crate::config::TextEncoderFeatureVersion`] for the upstream-mirroring detection this crate
-//! validates against at construction (both [`LtxTextEncoder::new`] and
-//! [`LtxTextEncoder::new_av`]), so a config drift away from V2 errors loudly instead of silently
-//! running this math against a checkpoint it doesn't apply to.
+//! [`crate::config::TextEncoderFeatureVersion`] for the upstream-mirroring detection function.
+//! Construction (both [`LtxTextEncoder::new`] and [`LtxTextEncoder::new_av`], via `require_v2`
+//! below) validates against [`crate::config::TextEncoderFeatureConfig::ltx_2_3`], which is
+//! currently a **hardcoded, compile-time-checked constant** (this crate has no
+//! `embedded_config.json` reader yet) — NOT a live per-checkpoint config-driven check the way the
+//! mlx side is. Real config-driven validation on this backend is being wired through sc-18757's
+//! config-threading surface; see the module note in `config.rs` for detail.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -138,18 +141,44 @@ impl LtxTextEncoder {
     /// Encode `input_ids` `[1,L]` (u32) + `mask01` (1 for valid, left-padded) → `video_embeddings`
     /// `[1, L, 4096]` (bf16).
     pub fn encode(&self, input_ids: &Tensor, mask01: &[u32]) -> Result<Tensor> {
+        Ok(self.encode_with_features(input_ids, mask01)?.1)
+    }
+
+    /// Like [`Self::encode`] but also returns the pre-connector `video_features` `[1, L, 4096]`
+    /// (bf16) — the feature-extractor output entering the connector (post-projection, post-norm).
+    /// sc-18763: this is the "connector input" the acceptance-criterion golden-parity gate checks;
+    /// mirrors mlx-gen-ltx `text_encoder.rs`'s `encode_with_features`.
+    pub fn encode_with_features(
+        &self,
+        input_ids: &Tensor,
+        mask01: &[u32],
+    ) -> Result<(Tensor, Tensor)> {
         let hiddens = self.gemma.forward(input_ids, mask01)?; // 49 × (1,L,3840)
         let normed = self.normed_hidden(&hiddens, mask01)?;
         let scaled = (normed * self.rescale)?;
         let features = self.aggregate.forward(&scaled)?; // (1,L,4096)
         let nv = mask01.iter().filter(|&&m| m != 0).count();
-        self.connector.forward(&features, nv)
+        let embeddings = self.connector.forward(&features, nv)?;
+        Ok((features, embeddings))
     }
 
     /// Encode once and project BOTH the video (4096) and audio (2048) contexts, sharing the Gemma
     /// hidden states + per-token-RMS concat (sc-5495). Requires [`Self::new_av`]. Returns
     /// `(video_embeddings [1,L,4096], audio_embeddings [1,L,2048])` (bf16).
     pub fn encode_both(&self, input_ids: &Tensor, mask01: &[u32]) -> Result<(Tensor, Tensor)> {
+        let (_, _, video, audio_ctx) = self.encode_both_with_features(input_ids, mask01)?;
+        Ok((video, audio_ctx))
+    }
+
+    /// Like [`Self::encode_both`] but also returns the pre-connector `(video_features,
+    /// audio_features)` — the feature-extractor outputs entering each connector (post-projection,
+    /// post-norm). Requires [`Self::new_av`]. Mirrors mlx-gen-ltx `text_encoder.rs`'s
+    /// `encode_av_with_features`.
+    pub fn encode_both_with_features(
+        &self,
+        input_ids: &Tensor,
+        mask01: &[u32],
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let audio = self.audio.as_ref().ok_or_else(|| {
             candle_gen::candle_core::Error::Msg(
                 "ltx: audio text head not loaded (use new_av)".into(),
@@ -162,7 +191,7 @@ impl LtxTextEncoder {
         let video = self.connector.forward(&v_feat, nv)?;
         let a_feat = audio.aggregate.forward(&(normed * audio.rescale)?)?;
         let audio_ctx = audio.connector.forward(&a_feat, nv)?;
-        Ok((video, audio_ctx))
+        Ok((v_feat, a_feat, video, audio_ctx))
     }
 }
 
@@ -170,6 +199,13 @@ impl LtxTextEncoder {
 /// to V2 — `normed_hidden` above is the V2 math unconditionally, and running it against anything
 /// else would silently produce plausible-looking, wrong conditioning. `new_av` delegates to `new`,
 /// so this one call site covers both constructors.
+///
+/// This currently checks a **hardcoded, compile-time constant**
+/// ([`TextEncoderFeatureConfig::ltx_2_3`]), not a live per-checkpoint config value — this crate
+/// doesn't yet thread real config through construction (sc-18757 is wiring that). It still catches
+/// a real class of bug (someone editing that constant away from what upstream's detection accepts
+/// without noticing), just not a per-checkpoint one yet. Do not describe this as "config-driven"
+/// the way the mlx backend's genuinely-JSON-driven check is (sc-18763 coordinator review).
 fn require_v2() -> Result<()> {
     let cfg = TextEncoderFeatureConfig::ltx_2_3()?;
     if cfg.version != TextEncoderFeatureVersion::V2 {
