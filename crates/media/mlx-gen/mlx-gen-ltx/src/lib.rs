@@ -86,7 +86,7 @@ pub use text_encoder::LtxTextEncoder;
 // so `mlx_gen_ltx::tiling::*` / `mlx_gen_ltx::TilingConfig` keep resolving for existing callers.
 pub use config::{VocoderConfig, VocoderGenConfig};
 pub use mlx_gen::tiling::{self, TilingConfig};
-pub use tokenizer::LtxTokenizer;
+pub use tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 pub use training::{load_trainer, LtxTrainer};
 pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
