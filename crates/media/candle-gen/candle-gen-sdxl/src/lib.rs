@@ -101,6 +101,12 @@ pub use denoise::{
     Denoiser,
 };
 
+// Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long prompt
+// weighting" shape that lets every CLIP-conditioned SDXL family accept a prompt past CLIP's
+// architectural 77-token window instead of hard-erroring. Shared by the txt2img `pipeline`, the
+// InstantID `conditioning` conditioner, and the `training` caption encoder so the three cannot drift.
+mod long_prompt;
+
 // SDXL dual-CLIP conditioning (sc-5491) — penultimate hidden (cross-attn) + pooled text-embeds
 // (add_embedding), the micro-conditioning the txt2img `pipeline` skips but `forward_instantid` needs.
 pub mod conditioning;

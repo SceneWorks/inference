@@ -83,6 +83,7 @@ pub const PID_BACKBONE: &str = "sdxl";
 use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
 
+use crate::long_prompt::{self, ChunkPlan};
 use crate::SdxlVaeDecoder;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
 
@@ -614,21 +615,58 @@ impl Pipeline {
         prompt: &str,
         uncond: &str,
     ) -> Result<Tensor> {
-        let l = self.encode_one(Clip::L, &toks.tok_l, prompt, uncond)?;
-        let g = self.encode_one(Clip::BigG, &toks.tok_g, prompt, uncond)?;
+        // sc-20528: a prompt past CLIP's 77-token window is chunked, not rejected. The chunk count is
+        // decided ONCE for the whole request — the two encoders are concatenated on the feature axis
+        // and `[uncond, cond]` are stacked on the batch axis, so all four encodings must land on the
+        // same sequence length. The negative prompt therefore takes exactly the same path as the
+        // positive one (topped up with empty windows when it is the shorter of the two).
+        let (plan_l, plan_g) = self.chunk_plans(toks)?;
+        let chunks = long_prompt::common_chunks(
+            &[(&plan_l, &toks.tok_l), (&plan_g, &toks.tok_g)],
+            &[uncond, prompt],
+        )?;
+        let l = self.encode_one(Clip::L, &toks.tok_l, &plan_l, prompt, uncond, chunks)?;
+        let g = self.encode_one(Clip::BigG, &toks.tok_g, &plan_g, prompt, uncond, chunks)?;
         Ok(Tensor::cat(&[l, g], D::Minus1)?)
     }
 
-    /// Load one CLIP encoder, encode `[uncond, cond]` through it (padded to its
-    /// `max_position_embeddings`), and return the embeddings — the encoder weights are loaded into a
-    /// local and **dropped when this function returns** (sc-4987), freeing its VRAM before the next
-    /// encoder / the UNet load.
+    /// The per-encoder [`ChunkPlan`] pair for this pipeline's CLIP configs (`pad_with` +
+    /// `max_position_embeddings`), built from the cached tokenizers. Cheap — no weights, no tensors.
+    fn chunk_plans(&self, toks: &SdxlTokenizers) -> Result<(ChunkPlan, ChunkPlan)> {
+        let clip2 = self
+            .config
+            .clip2
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?;
+        let plan_l = ChunkPlan::new(
+            &toks.tok_l,
+            self.config.clip.pad_with.as_deref(),
+            self.config.clip.max_position_embeddings,
+        )?;
+        let plan_g = ChunkPlan::new(
+            &toks.tok_g,
+            clip2.pad_with.as_deref(),
+            clip2.max_position_embeddings,
+        )?;
+        Ok((plan_l, plan_g))
+    }
+
+    /// Load one CLIP encoder, encode `[uncond, cond]` through it (each text split into `chunks`
+    /// windows of `max_position_embeddings` ids, sc-20528), and return the embeddings — the encoder
+    /// weights are loaded into a local and **dropped when this function returns** (sc-4987), freeing
+    /// its VRAM before the next encoder / the UNet load.
+    ///
+    /// `plan` is this encoder's half of [`Self::chunk_plans`]; `chunks` is the request-wide window
+    /// count, the SAME for both encoders and both texts, so the returned
+    /// `[2, chunks·window, embed_dim]` tensors concatenate on the feature axis.
     fn encode_one(
         &self,
         which: Clip,
         tokenizer: &Tokenizer,
+        plan: &ChunkPlan,
         prompt: &str,
         uncond: &str,
+        chunks: usize,
     ) -> Result<Tensor> {
         let (_tok_repo, weights_sub) = which.sources();
         let clip_cfg = match which {
@@ -706,36 +744,28 @@ impl Pipeline {
             }
         };
 
-        let vocab = tokenizer.get_vocab(true);
-        let pad_token = clip_cfg
-            .pad_with
-            .clone()
-            .unwrap_or_else(|| "<|endoftext|>".into());
-        let pad_id = *vocab
-            .get(pad_token.as_str())
-            .ok_or_else(|| CandleError::Msg(format!("pad token {pad_token:?} not in vocab")))?;
-
+        // sc-20528: one forward per CLIP window, concatenated on the sequence axis (the A1111/compel
+        // "long prompt weighting" shape). A prompt that fits produces exactly one window whose ids are
+        // the tokenizer output right-padded with the pad token — bit-for-bit the pre-sc-20528 encoding,
+        // so nothing about a ≤77-token render changes.
         let encode = |text: &str| -> Result<Tensor> {
-            let mut tokens = tokenizer
-                .encode(text, true)
-                .map_err(|e| CandleError::Msg(format!("tokenize: {e}")))?
-                .get_ids()
-                .to_vec();
-            let max = clip_cfg.max_position_embeddings;
-            if tokens.len() > max {
-                return Err(CandleError::Msg(format!(
-                    "prompt too long: {} tokens > {max}",
-                    tokens.len()
-                )));
+            let rows = plan.rows_aligned(tokenizer, text, chunks)?;
+            let mut hidden = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let ids = Tensor::new(row.as_slice(), &self.device)?.unsqueeze(0)?;
+                hidden.push(text_model.forward(&ids)?);
             }
-            while tokens.len() < max {
-                tokens.push(pad_id);
+            // Take the single window straight through rather than routing it via `cat` — the ≤77 path
+            // stays the identical tensor the old code produced.
+            if hidden.len() == 1 {
+                Ok(hidden.remove(0))
+            } else {
+                Ok(Tensor::cat(&hidden, 1)?)
             }
-            Ok(Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?)
         };
 
-        let cond = text_model.forward(&encode(prompt)?)?;
-        let uncond = text_model.forward(&encode(uncond)?)?;
+        let cond = encode(prompt)?;
+        let uncond = encode(uncond)?;
         Ok(Tensor::cat(&[uncond, cond], 0)?.to_dtype(self.dtype)?)
         // `text_model` drops here, freeing this encoder's weights before the caller loads the next
         // (sc-4987). The `tokenizer` is borrowed from the generator's cache and outlives this call.
