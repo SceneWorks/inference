@@ -37,7 +37,7 @@ use mlx_gen::nn::{conv3d, silu};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{CancelFlag, Error, Result};
 
-use crate::config::{LtxVaeConfig, VaeBlock};
+use crate::config::{LatentLogVar, LtxVaeConfig, VaeBlock};
 use crate::contiguous;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 
@@ -415,7 +415,10 @@ enum DownLayer {
     Down(SpaceToDepth),
 }
 
-/// The LTX-2.3 video encoder (`VideoEncoder`, UNIFORM logvar). Causal throughout.
+/// The LTX video encoder (`VideoEncoder`). Causal throughout. The log-variance head is
+/// config-declared ([`LatentLogVar`]) and only ever affects how wide `conv_out` is — the encoder
+/// output is `normalize(conv_out[:, :latent_channels])` in every mode the reference builds a
+/// `(means, logvar)` pair from.
 struct VideoEncoder {
     conv_in: CausalConv3d,
     down_blocks: Vec<DownLayer>,
@@ -447,10 +450,37 @@ impl VideoEncoder {
         let c = cfg.latent_channels;
         let mean = f32(w, "per_channel_statistics._mean_of_means")?.reshape(&[1, c, 1, 1, 1])?;
         let std = f32(w, "per_channel_statistics._std_of_means")?.reshape(&[1, c, 1, 1, 1])?;
+        let conv_out = CausalConv3d::from_weights(w, "conv_out.conv")?;
+
+        // sc-18765 — the declared log-variance mode fixes `conv_out`'s width. Check the weights
+        // against it: a mismatch means the config and the checkpoint disagree about the shape of the
+        // encoder head, and taking the first `latent_channels` channels anyway would hand back a
+        // plausible-looking latent built from the wrong slice.
+        let expected = cfg.latent_log_var.conv_out_channels(c);
+        let actual = conv_out.w.shape()[0];
+        if actual != expected {
+            return Err(Error::Msg(format!(
+                "ltx vae encoder: conv_out emits {actual} channels but latent_log_var={:?} with \
+                 latent_channels={c} requires {expected}",
+                cfg.latent_log_var
+            )));
+        }
+        if cfg.latent_log_var == LatentLogVar::None {
+            // `none` leaves no log-variance tail, so the reference's own `torch.chunk(sample, 2)`
+            // would split the MEANS in half and return a `latent_channels / 2`-wide latent. No
+            // shipped LTX checkpoint declares it, and guessing which of the two readings is intended
+            // is not this port's call to make.
+            return Err(Error::Msg(
+                "ltx vae encoder: latent_log_var=\"none\" is not supported (the reference's own \
+                 means/logvar split is ill-defined without a log-variance head)"
+                    .into(),
+            ));
+        }
+
         Ok(Self {
             conv_in: CausalConv3d::from_weights(w, "conv_in.conv")?,
             down_blocks,
-            conv_out: CausalConv3d::from_weights(w, "conv_out.conv")?,
+            conv_out,
             patch_size: cfg.patch_size,
             latent_channels: c,
             mean,
@@ -459,8 +489,9 @@ impl VideoEncoder {
     }
 
     /// `(B, 3, F, H, W)` video (F = 1 + 8·k, values in [-1, 1]) → `(B, 128, F', H/32, W/32)`
-    /// normalized latent means. Causal, deterministic (UNIFORM logvar → output = normalize(means);
-    /// the discarded log-variance tail is not computed).
+    /// normalized latent means. Causal, deterministic: the output is `normalize(means)` where the
+    /// means are the leading `latent_channels` of `conv_out`, for every supported
+    /// [`LatentLogVar`] mode. The log-variance tail is sliced off and never computed.
     fn encode(&self, video: &Array) -> Result<Array> {
         let mut x = patchify(video, self.patch_size)?;
         x = self.conv_in.forward(&x, true)?;
@@ -478,8 +509,9 @@ impl VideoEncoder {
         }
         let x = pixel_norm(&x, ENC_NORM_EPS)?;
         let x = silu(&x)?;
-        // conv_out → latent_channels + 1. UNIFORM logvar: the output is normalize(means) where
-        // means = the first `latent_channels`; the log-variance tail is discarded.
+        // conv_out width is `LatentLogVar::conv_out_channels` (checked at load). The output is
+        // normalize(means) where means = the first `latent_channels`; the log-variance tail —
+        // whatever its width and meaning under the declared mode — is discarded.
         let x = self.conv_out.forward(&x, true)?;
         let means = slice_c(&x, 0, self.latent_channels)?;
         let normed = divide(&subtract(&means, &self.mean)?, &self.std)?;
@@ -522,10 +554,13 @@ fn unpatchify(x: &Array, p: i32) -> Result<Array> {
 // Public VAE
 // ---------------------------------------------------------------------------------------------
 
-/// The LTX-2.3 video VAE: a decoder (always) + an optional encoder (loaded only when its weights
-/// are present — the I2V sibling needs it; pure T2V uses only `decode`).
+/// The LTX video VAE: a decoder and an encoder, each present only when its weights are (pure T2V
+/// uses only `decode`; the I2V sibling adds the encoder; an LTX-2.5 `CausalDiffusionVAE` bundle
+/// supplies only this conv encoder, its decoder being a different architecture entirely).
 pub struct LtxVideoVae {
-    decoder: VideoDecoder,
+    /// The conv decoder. `None` for an encoder-only VAE ([`Self::encoder_only`]) — `decode` then
+    /// errors rather than there being a decoder-shaped hole to fall into.
+    decoder: Option<VideoDecoder>,
     /// The encoder — populated eagerly by [`from_weights`], or lazily on first [`encode`] from
     /// [`lazy`](Self::lazy). `OnceLock` (not `OnceCell`) so the VAE keeps its prior `Send`/`Sync`.
     encoder: OnceLock<VideoEncoder>,
@@ -551,7 +586,21 @@ impl LtxVideoVae {
             let _ = encoder.set(VideoEncoder::from_weights(w, cfg)?);
         }
         Ok(Self {
-            decoder,
+            decoder: Some(decoder),
+            encoder,
+            lazy: None,
+        })
+    }
+
+    /// Build an **encoder-only** VAE (sc-18765). LTX-2.5's `CausalDiffusionVAE` checkpoint carries
+    /// the same conv encoder as the conv VAE — differing only in the declared
+    /// [`LatentLogVar`] — but pairs it with an `NADiffusionDecoder`, so there is no conv decoder to
+    /// load alongside it. [`Self::decode`] and [`Self::decode_tiled`] return an error on the result.
+    pub fn encoder_only(encoder_w: &Weights, cfg: &LtxVaeConfig) -> Result<Self> {
+        let encoder = OnceLock::new();
+        let _ = encoder.set(VideoEncoder::from_weights(encoder_w, cfg)?);
+        Ok(Self {
+            decoder: None,
             encoder,
             lazy: None,
         })
@@ -568,7 +617,7 @@ impl LtxVideoVae {
     ) -> Result<Self> {
         let decoder = VideoDecoder::from_weights(decoder_w, cfg)?;
         Ok(Self {
-            decoder,
+            decoder: Some(decoder),
             encoder: OnceLock::new(),
             lazy: Some((encoder_path, cfg.clone())),
         })
@@ -592,10 +641,27 @@ impl LtxVideoVae {
         Ok(self.encoder.get().expect("encoder just set"))
     }
 
+    /// The conv decoder, or a message-bearing error for an [encoder-only](Self::encoder_only) VAE.
+    fn decoder(&self) -> Result<&VideoDecoder> {
+        self.decoder.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "LtxVideoVae: decode requires conv decoder weights (this VAE was built \
+                 encoder-only — an LTX-2.5 CausalDiffusionVAE checkpoint decodes through its \
+                 NADiffusionDecoder, not through this port)"
+                    .into(),
+            )
+        })
+    }
+
     /// Decode a normalized latent `(B, 128, F', H', W')` → video `(B, 3, F, 32·H', 32·W')` in
     /// roughly [-1, 1] (the caller clips + scales to uint8). Non-causal single pass.
     pub fn decode(&self, latent: &Array) -> Result<Array> {
-        contiguous(&self.decoder.decode(latent)?)
+        contiguous(&self.decoder()?.decode(latent)?)
+    }
+
+    /// Whether the VAE can decode — i.e. it was built with conv decoder weights.
+    pub fn has_decoder(&self) -> bool {
+        self.decoder.is_some()
     }
 
     /// Encode a video `(B, 3, F, H, W)` (F = 1 + 8·k, [-1, 1]) → normalized latent
@@ -632,13 +698,14 @@ impl LtxVideoVae {
             return self.decode(latent);
         }
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
+        let decoder = self.decoder()?;
 
         mlx_gen::vae_tiling::tiled_decode_with_hooks(
             latent,
             &plan,
             [2, 3, 4],
             Some(cancel),
-            |tile| self.decoder.decode(tile),
+            |tile| decoder.decode(tile),
             |accumulators| {
                 for accumulator in accumulators {
                     accumulator.eval()?;
