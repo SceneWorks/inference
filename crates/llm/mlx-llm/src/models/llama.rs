@@ -62,10 +62,6 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
-        // norm, and `layers.{i}.*`) — there is no second `model.` segment — while `lm_head.weight`
-        // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
-        // `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight` layout.
         // sc-18769 makes a Gemma 4 `config.json` **parse** — that is this story's whole point, and
         // `ModelConfig::layer_attention` now resolves the per-layer table the decoder needs. The
         // decoder itself is sc-18760 (MLX) / sc-18761 (candle): this block still reads one uniform
@@ -88,6 +84,10 @@ impl CausalLm {
             ));
         }
 
+        // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
+        // norm, and `layers.{i}.*`) — there is no second `model.` segment — while `lm_head.weight`
+        // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
+        // `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight` layout.
         let vlm_nested = cfg.architecture.is_qwen3_vl();
         let decoder_root = if vlm_nested {
             "model.language_model".to_string()
