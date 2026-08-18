@@ -17,7 +17,9 @@
 
 use std::path::Path;
 
-use candle_gen::gen_core::ltx_checkpoint::{GemmaVersionCheck, LtxCheckpointLayout, LtxComponent};
+use candle_gen::gen_core::ltx_checkpoint::{
+    CaptionFeatureVersion, GemmaVersionCheck, LtxCheckpointLayout, LtxComponent,
+};
 use candle_gen::gen_core::{LoadSpec, WeightsSource};
 use candle_gen_ltx::bundle::{
     assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,
@@ -112,7 +114,10 @@ fn the_shipped_2_3_sections_reproduce_the_pinned_constants() {
     // shipped LTX-2.3 checkpoint actually carries, must land on exactly the constants the current pin
     // hardcodes. A drift here would silently re-shape the 2.3 DiT.
     let t: serde_json::Value = serde_json::from_str(LTX_2_3_TRANSFORMER_SECTION).unwrap();
-    let av = AvConfig::from_transformer_config(&t);
+    // The shipped 2.3 section declares only the legacy caption pair, so this exercises the
+    // measured carve-out: it must resolve, not error.
+    let av = AvConfig::from_transformer_config(&t).expect("the shipped 2.3 caption shape resolves");
+    assert_eq!(av.caption_feature_version, CaptionFeatureVersion::V2);
     let pinned = AvConfig::ltx_2_3();
     assert_eq!(av.video.num_layers, pinned.video.num_layers);
     assert_eq!(av.video.num_heads, pinned.video.num_heads);
@@ -238,7 +243,11 @@ fn write_2_5_bundle(root: &Path) {
                         "audio_connector_num_attention_heads": 32,
                         "audio_connector_attention_head_dim": 64,
                         "audio_positional_embedding_max_pos": [24],
-                        "positional_embedding_max_pos": [24, 2048, 2048]
+                        "positional_embedding_max_pos": [24, 2048, 2048],
+                        "caption_proj_before_connector": true,
+                        "caption_projection_first_linear": false,
+                        "caption_proj_input_norm": false,
+                        "caption_projection_second_linear": false
                     },
                     "scheduler": {"_class_name": "RectifiedFlowScheduler"},
                     "vae": null, "audio_vae": null, "vocoder": null
@@ -303,6 +312,7 @@ fn every_2_5_component_reads_its_own_config_off_its_own_file() {
 
     // The transformer's own section — 2.5 dims, not the 2.3 constants.
     let av = AvConfig::from_bundle(&bundle).unwrap();
+    assert_eq!(av.caption_feature_version, CaptionFeatureVersion::V2);
     assert_eq!(av.video.num_layers, 44);
     assert_eq!(av.video.num_heads, 24);
     assert_eq!(av.video.rope_max_pos, [24, 2048, 2048]);

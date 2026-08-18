@@ -466,6 +466,134 @@ fn string_field(v: &Value, key: &str) -> Option<String> {
 }
 
 // =================================================================================================
+// Caption feature-extractor selection (config-driven)
+// =================================================================================================
+
+/// Which caption feature extractor a transformer's config selects.
+///
+/// Upstream `encoder_configurator._create_feature_extractor` picks between two shapes, and picks
+/// **only** from config — never from a weight-key probe or a per-model constant:
+///
+/// * **V1** — a single `aggregate_embed` projection living in the transformer.
+/// * **V2** — per-token RMS norm with dual (video + audio) aggregate embeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionFeatureVersion {
+    V1,
+    V2,
+}
+
+/// Upstream's `_V2_EXPECTED_CONFIG`, verbatim: the four keys whose presence selects V2 and the exact
+/// value each must carry.
+pub const CAPTION_V2_EXPECTED_CONFIG: [(&str, bool); 4] = [
+    ("caption_proj_before_connector", true),
+    ("caption_projection_first_linear", false),
+    ("caption_proj_input_norm", false),
+    ("caption_projection_second_linear", false),
+];
+
+/// The subset of [`CAPTION_V2_EXPECTED_CONFIG`] the shipped LTX-2.3 checkpoints actually declare.
+///
+/// Measured, not assumed: the `SceneWorks/ltx-2.3-mlx` q4/q8 tiers' `embedded_config.json` carries
+/// `caption_projection_first_linear: false` and `caption_projection_second_linear: false` and
+/// **omits** `caption_proj_before_connector` / `caption_proj_input_norm` entirely, while declaring
+/// `text_encoder_norm_type: "per_token_rms"` — i.e. it is a V2 checkpoint that predates the two
+/// newer keys. Upstream's strict rule would call that "partial V2" and raise.
+pub const CAPTION_V2_LEGACY_KEYS: [&str; 2] = [
+    "caption_projection_first_linear",
+    "caption_projection_second_linear",
+];
+
+/// Select the caption feature extractor from a **transformer config section**.
+///
+/// Port of upstream `_create_feature_extractor`'s detection, plus one measured carve-out:
+///
+/// 1. **None** of the four [`CAPTION_V2_EXPECTED_CONFIG`] keys present → [`CaptionFeatureVersion::V1`]
+///    (the projection lives in the transformer).
+/// 2. **All four** present → [`CaptionFeatureVersion::V2`] iff every value matches; any disagreement
+///    is a hard error naming the offending key, its actual value and the expected one. This is
+///    upstream's `NotImplementedError("Unknown config: …")`.
+/// 3. **Exactly the two [`CAPTION_V2_LEGACY_KEYS`], both `false`** → [`CaptionFeatureVersion::V2`].
+///    The shipped LTX-2.3 tiers are this shape and they are genuinely V2; erroring here would refuse
+///    to load a checkpoint that has always worked. Deliberately narrow: both keys must be present
+///    **and** `false`, and neither newer key may appear.
+/// 4. **Any other partial combination** → a hard error naming the missing keys, matching upstream's
+///    `NotImplementedError("Partial V2 config — missing keys: …")`. Config drift must fail loudly
+///    rather than silently choose an extractor.
+///
+/// LTX-2.5 declares all four keys, so it takes rule 2; LTX-2.3 takes rule 3.
+pub fn caption_feature_version(transformer: &Value) -> Result<CaptionFeatureVersion> {
+    let present: Vec<(&str, bool, Option<bool>)> = CAPTION_V2_EXPECTED_CONFIG
+        .iter()
+        .map(|(name, expected)| {
+            (
+                *name,
+                *expected,
+                transformer.get(*name).and_then(Value::as_bool),
+            )
+        })
+        .collect();
+    // A key that is present but not a bool is drift, not absence — treat it as present-and-wrong so
+    // it reports through the value-mismatch path instead of silently reading as missing.
+    let declared: Vec<&str> = CAPTION_V2_EXPECTED_CONFIG
+        .iter()
+        .filter(|(name, _)| transformer.get(*name).is_some_and(|v| !v.is_null()))
+        .map(|(name, _)| *name)
+        .collect();
+
+    if declared.is_empty() {
+        return Ok(CaptionFeatureVersion::V1);
+    }
+
+    if declared.len() == CAPTION_V2_EXPECTED_CONFIG.len() {
+        let mismatched: Vec<String> = present
+            .iter()
+            .filter(|(_, expected, actual)| *actual != Some(*expected))
+            .map(|(name, expected, actual)| match actual {
+                Some(value) => format!("{name}={value} (expected {expected})"),
+                None => format!("{name}=<non-boolean> (expected {expected})"),
+            })
+            .collect();
+        if mismatched.is_empty() {
+            return Ok(CaptionFeatureVersion::V2);
+        }
+        return Err(Error::Msg(format!(
+            "ltx: unsupported caption-projection config: {}. Only the V2 shape upstream's \
+             _V2_EXPECTED_CONFIG pins is implemented; this checkpoint's caption stack differs and \
+             would be silently mis-built",
+            mismatched.join(", ")
+        )));
+    }
+
+    // Rule 3 — the measured LTX-2.3 shape: exactly the two legacy keys, both false.
+    let legacy_only = declared.len() == CAPTION_V2_LEGACY_KEYS.len()
+        && CAPTION_V2_LEGACY_KEYS
+            .iter()
+            .all(|key| declared.contains(key));
+    if legacy_only {
+        let both_false = CAPTION_V2_LEGACY_KEYS
+            .iter()
+            .all(|key| transformer.get(*key).and_then(Value::as_bool) == Some(false));
+        if both_false {
+            return Ok(CaptionFeatureVersion::V2);
+        }
+    }
+
+    let missing: Vec<&str> = CAPTION_V2_EXPECTED_CONFIG
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !declared.contains(name))
+        .collect();
+    Err(Error::Msg(format!(
+        "ltx: partial caption-projection config — declared [{}] but missing [{}]. The only accepted \
+         partial shape is the shipped LTX-2.3 pair ({}) with both false; anything else is config \
+         drift and must not silently select a feature extractor",
+        declared.join(", "),
+        missing.join(", "),
+        CAPTION_V2_LEGACY_KEYS.join(", "),
+    )))
+}
+
+// =================================================================================================
 // Gemma text-encoder identity + the version assertion
 // =================================================================================================
 
@@ -1873,6 +2001,113 @@ mod tests {
             declared_layout(dir.path()).unwrap(),
             LtxCheckpointLayout::Split
         );
+    }
+
+    // --- caption feature-extractor selection ------------------------------------------------------
+
+    #[test]
+    fn no_v2_keys_selects_v1() {
+        // Upstream: "V1: V2 config keys absent → projection lives in transformer".
+        let v1 = serde_json::json!({"num_layers": 48, "caption_channels": 3840});
+        assert_eq!(
+            caption_feature_version(&v1).unwrap(),
+            CaptionFeatureVersion::V1
+        );
+    }
+
+    #[test]
+    fn all_four_v2_keys_with_the_expected_values_select_v2() {
+        let mut v2 = serde_json::Map::new();
+        for (name, expected) in CAPTION_V2_EXPECTED_CONFIG {
+            v2.insert(name.to_string(), Value::Bool(expected));
+        }
+        assert_eq!(
+            caption_feature_version(&Value::Object(v2)).unwrap(),
+            CaptionFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn the_shipped_2_3_two_key_shape_selects_v2_through_the_carve_out() {
+        // MEASURED: `SceneWorks/ltx-2.3-mlx` q4's `embedded_config.json` declares exactly these two
+        // keys (both false), omits `caption_proj_before_connector` / `caption_proj_input_norm`, and
+        // sets `text_encoder_norm_type: "per_token_rms"`. Upstream's strict rule calls that partial
+        // V2 and raises — which would refuse a checkpoint that has always loaded.
+        let legacy = serde_json::json!({
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+            "text_encoder_norm_type": "per_token_rms",
+        });
+        assert_eq!(
+            caption_feature_version(&legacy).unwrap(),
+            CaptionFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn the_carve_out_is_narrow() {
+        // Only the exact pair, only both-false. One key alone is drift.
+        let one = serde_json::json!({"caption_projection_first_linear": false});
+        let err = caption_feature_version(&one).expect_err("one key is not the legacy shape");
+        assert!(
+            err.to_string().contains("partial caption-projection"),
+            "{err}"
+        );
+
+        // The right pair with a WRONG value is not the legacy shape either.
+        let wrong_value = serde_json::json!({
+            "caption_projection_first_linear": true,
+            "caption_projection_second_linear": false,
+        });
+        assert!(caption_feature_version(&wrong_value).is_err());
+
+        // Three of four is drift, and the message names what is missing.
+        let three = serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&three).expect_err("three keys is partial");
+        let text = err.to_string();
+        assert!(text.contains("caption_proj_input_norm"), "{text}");
+    }
+
+    #[test]
+    fn a_full_v2_block_with_a_drifted_value_is_a_hard_error() {
+        let mut drifted = serde_json::Map::new();
+        for (name, expected) in CAPTION_V2_EXPECTED_CONFIG {
+            drifted.insert(name.to_string(), Value::Bool(expected));
+        }
+        drifted.insert(
+            "caption_proj_before_connector".to_string(),
+            Value::Bool(false),
+        );
+        let err = caption_feature_version(&Value::Object(drifted))
+            .expect_err("a drifted value must not silently select V2");
+        let text = err.to_string();
+        assert!(
+            text.contains("caption_proj_before_connector=false"),
+            "{text}"
+        );
+        assert!(text.contains("expected true"), "{text}");
+    }
+
+    #[test]
+    fn the_real_2_5_transformer_selects_v2_from_its_own_config() {
+        // Ground truth: the shipped 2.5 transformers declare all four keys with the expected values.
+        for name in [
+            "ltx-2.5-22b-dev-transformer-bf16",
+            "ltx-2.5-22b-distilled-transformer-bf16",
+            "ltx-2.5-22b-distilled-transformer-nvfp4",
+        ] {
+            let meta = captured_metadata(&format!("diffusion_models/{name}.safetensors.json"));
+            let transformer = meta.section("transformer").expect(name);
+            assert_eq!(
+                caption_feature_version(transformer).unwrap(),
+                CaptionFeatureVersion::V2,
+                "{name}"
+            );
+        }
     }
 
     // --- real captured LTX-2.5 headers -----------------------------------------------------------

@@ -17,7 +17,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use mlx_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent};
+use mlx_gen::gen_core::ltx_checkpoint::{
+    caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
+};
 use mlx_gen::{Error, Result};
 
 /// Rotary-embedding layout. LTX-2.3 uses [`RopeType::Split`] (the 2.0 default is interleaved).
@@ -52,6 +54,14 @@ pub struct LtxConfig {
     pub caption_channels: i32,
     pub caption_projection_first_linear: bool,
     pub caption_projection_second_linear: bool,
+    /// Which caption feature extractor this checkpoint's config selects — resolved from the
+    /// transformer section's four `caption_proj*` keys by
+    /// [`caption_feature_version`], never from a per-model constant or a
+    /// weight probe. LTX-2.3 declares only the legacy pair and resolves to
+    /// [`CaptionFeatureVersion::V2`] through the measured carve-out; LTX-2.5 declares all four.
+    /// Only set by the fallible constructors ([`LtxConfig::from_model_dir`] /
+    /// [`LtxConfig::from_bundle`]), because an undetectable shape is a load error, not a default.
+    pub caption_feature_version: CaptionFeatureVersion,
     /// adaLN-single scale_shift_table row count: **9** for the gated family, **6** otherwise.
     pub adaln_embedding_coefficient: i32,
     pub apply_gated_attention: bool,
@@ -125,6 +135,9 @@ impl LtxConfig {
             caption_channels: 3840,
             caption_projection_first_linear: true,
             caption_projection_second_linear: true,
+            // The 2.0 fallback has no `caption_proj*` keys at all, which is exactly upstream's V1
+            // condition. A real checkpoint overwrites this in `validated`.
+            caption_feature_version: CaptionFeatureVersion::V1,
             adaln_embedding_coefficient: 6,
             apply_gated_attention: false,
             cross_attention_adaln: false,
@@ -306,7 +319,7 @@ impl LtxConfig {
         let t = root_cfg
             .get("transformer")
             .ok_or_else(|| Error::Msg("ltx: embedded_config.json missing `transformer`".into()))?;
-        Self::from_embedded_transformer(t).validated()
+        Self::from_embedded_transformer(t).validated(t)
     }
 
     /// Build the config from a **split bundle's** transformer component (sc-18757).
@@ -317,16 +330,22 @@ impl LtxConfig {
     /// against 2.5 weights.
     pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
         let transformer = bundle.require(LtxComponent::Transformer)?;
-        Self::from_embedded_transformer(transformer.config()?).validated()
+        let section = transformer.config()?;
+        Self::from_embedded_transformer(section).validated(section)
     }
 
-    /// Apply the load-time gates that reject checkpoint values this engine does not implement.
+    /// Apply the load-time gates that reject checkpoint values this engine does not implement, and
+    /// resolve the config-driven caption feature-extractor selection.
     ///
     /// F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
     /// reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
     /// (wrong output, no error), reject the only value the engine does not implement. The 2.0
     /// interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
-    fn validated(self) -> Result<Self> {
+    ///
+    /// `transformer` is the source config section, needed because the caption-extractor selection is
+    /// keyed on **key presence**, not just parsed values — `caption_projection_first_linear: false`
+    /// and "absent" mean different things to it, and the parsed struct cannot distinguish them.
+    fn validated(mut self, transformer: &Value) -> Result<Self> {
         if self.rope_type != RopeType::Split {
             return Err(Error::Msg(
                 "ltx: rope_type != \"split\" is not supported (only the LTX-2.3 split RoPE is \
@@ -334,6 +353,7 @@ impl LtxConfig {
                     .into(),
             ));
         }
+        self.caption_feature_version = caption_feature_version(transformer)?;
         Ok(self)
     }
 }

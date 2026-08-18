@@ -25,7 +25,9 @@
 //! latent upsampler, prompt-enhance, and fp8/on-the-fly quant are deferred to follow-up stories.
 //! I2V/keyframes/IC-LoRA clips and inference LoRA/PEFT-LoKr are wired by the package pipeline.
 
-use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent};
+use candle_gen::gen_core::ltx_checkpoint::{
+    caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
+};
 use candle_gen::gen_core::{self, Error as GenError};
 use serde_json::Value;
 
@@ -162,6 +164,13 @@ pub struct AvConfig {
     pub cross_inner: usize,
     /// Cross-modal (time-axis) RoPE max position (`cross_pe_max_pos`, 20).
     pub cross_max_pos: i32,
+    /// Which caption feature extractor the checkpoint's config selects — resolved from the
+    /// transformer section's four `caption_proj*` keys by
+    /// [`caption_feature_version`], never from a per-model constant.
+    /// [`ltx_2_3`](Self::ltx_2_3) carries the value the shipped LTX-2.3 config **resolves to**
+    /// (V2, through the measured legacy carve-out), so the constant and the config agree by
+    /// construction rather than by assertion.
+    pub caption_feature_version: CaptionFeatureVersion,
 }
 
 impl AvConfig {
@@ -173,6 +182,10 @@ impl AvConfig {
             audio_max_pos: 20,
             cross_inner: 2048,
             cross_max_pos: 20,
+            // Measured off the shipped `SceneWorks/ltx-2.3-mlx` `embedded_config.json`: it declares
+            // only `caption_projection_{first,second}_linear: false` plus
+            // `text_encoder_norm_type: "per_token_rms"`, which the carve-out resolves to V2.
+            caption_feature_version: CaptionFeatureVersion::V2,
         }
     }
     /// Audio inner dim `heads × head_dim` = 2048.
@@ -184,7 +197,10 @@ impl AvConfig {
     ///
     /// `cross_max_pos` mirrors `LTXModel.__init__`'s `cross_pe_max_pos = max(video_max_pos[0],
     /// audio_max_pos)` rather than being read directly — it is derived, not declared.
-    pub fn from_transformer_config(t: &Value) -> Self {
+    ///
+    /// Fallible because the caption feature-extractor selection is config-driven and an
+    /// undetectable `caption_proj*` shape is a load error, not a default.
+    pub fn from_transformer_config(t: &Value) -> gen_core::Result<Self> {
         let mut cfg = Self::ltx_2_3();
         cfg.video = TransformerConfig::from_transformer_config(t);
         cfg.audio_heads = get_usize(t, "audio_num_attention_heads", cfg.audio_heads);
@@ -193,13 +209,14 @@ impl AvConfig {
         cfg.audio_max_pos =
             get_i32_array_first(t, "audio_positional_embedding_max_pos", cfg.audio_max_pos);
         cfg.cross_max_pos = cfg.video.rope_max_pos[0].max(cfg.audio_max_pos);
-        cfg
+        cfg.caption_feature_version = caption_feature_version(t)?;
+        Ok(cfg)
     }
 
     /// Read the dual-modal dims from a split bundle's **transformer** component (sc-18757).
     pub fn from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
         let transformer = bundle.require(LtxComponent::Transformer)?;
-        Ok(Self::from_transformer_config(transformer.config()?))
+        Self::from_transformer_config(transformer.config()?)
     }
 }
 
@@ -813,7 +830,8 @@ mod component_config_tests {
 
     #[test]
     fn the_transformer_section_drives_every_dit_field() {
-        let cfg = AvConfig::from_transformer_config(&transformer_section());
+        let cfg = AvConfig::from_transformer_config(&transformer_section())
+            .expect("V1: no caption_proj* keys");
         assert_eq!(cfg.video.num_layers, 44);
         assert_eq!(cfg.video.num_heads, 24);
         assert_eq!(cfg.video.head_dim, 96);
@@ -835,7 +853,8 @@ mod component_config_tests {
     #[test]
     fn an_omitted_key_keeps_its_2_3_value_but_a_missing_section_never_does() {
         // Within a present section, an omitted key falls back — that is the documented behavior.
-        let cfg = AvConfig::from_transformer_config(&serde_json::json!({"num_layers": 40}));
+        let cfg = AvConfig::from_transformer_config(&serde_json::json!({"num_layers": 40}))
+            .expect("V1: no caption_proj* keys");
         assert_eq!(cfg.video.num_layers, 40);
         assert_eq!(cfg.video.num_heads, AvConfig::ltx_2_3().video.num_heads);
     }

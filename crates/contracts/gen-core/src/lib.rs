@@ -171,11 +171,11 @@ pub use weightsmeta::{
 // `gemma_source_checkpoint` ⇄ text-encoder `gemma_version` assertion. Pure paths + JSON, so it keeps
 // gen-core's zero-tensor invariant.
 pub use ltx_checkpoint::{
-    check_gemma_version, declared_layout, declared_model_version, discover_split_bundle,
-    discover_split_bundle_skipping, layout_for_declared_version, layout_for_version,
-    parse_model_version, GemmaEncoderIdentity, GemmaSourceCheckpoint, GemmaVersionCheck, LtxBundle,
-    LtxBundleBuilder, LtxCheckpointLayout, LtxCheckpointMetadata, LtxComponent, LtxConfigRoot,
-    LtxResolvedComponent,
+    caption_feature_version, check_gemma_version, declared_layout, declared_model_version,
+    discover_split_bundle, discover_split_bundle_skipping, layout_for_declared_version,
+    layout_for_version, parse_model_version, CaptionFeatureVersion, GemmaEncoderIdentity,
+    GemmaSourceCheckpoint, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
+    LtxCheckpointMetadata, LtxComponent, LtxConfigRoot, LtxResolvedComponent,
 };
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The

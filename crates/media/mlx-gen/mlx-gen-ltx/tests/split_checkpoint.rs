@@ -26,7 +26,8 @@
 use std::path::Path;
 
 use mlx_gen::gen_core::ltx_checkpoint::{
-    GemmaVersionCheck, LtxCheckpointLayout, LtxComponent, SPLIT_MANIFEST_FILE,
+    CaptionFeatureVersion, GemmaVersionCheck, LtxCheckpointLayout, LtxComponent,
+    SPLIT_MANIFEST_FILE,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VocoderConfig};
@@ -82,6 +83,10 @@ fn ltx_2_3_transformer_config_is_unchanged() {
     // No caption projection → caption_channels = connector heads × head_dim.
     assert!(!cfg.caption_projection_first_linear);
     assert!(!cfg.caption_projection_second_linear);
+    // The shipped 2.3 config declares ONLY that legacy pair — `caption_proj_before_connector` and
+    // `caption_proj_input_norm` are absent — so this exercises the measured carve-out. Upstream's
+    // strict rule would call it "partial V2" and refuse to load a checkpoint that has always worked.
+    assert_eq!(cfg.caption_feature_version, CaptionFeatureVersion::V2);
     assert_eq!(cfg.caption_channels, 4096);
     assert_eq!(cfg.audio_caption_channels, 2048);
     // RoPE.
@@ -250,7 +255,9 @@ fn write_2_5_bundle(root: &Path) {
                         "num_layers": 44, "num_attention_heads": 24, "attention_head_dim": 128,
                         "cross_attention_dim": 3072, "in_channels": 128, "out_channels": 128,
                         "apply_gated_attention": true, "cross_attention_adaln": true,
+                        "caption_proj_before_connector": true,
                         "caption_projection_first_linear": false,
+                        "caption_proj_input_norm": false,
                         "caption_projection_second_linear": false,
                         "use_embeddings_connector": true,
                         "connector_num_attention_heads": 24, "connector_attention_head_dim": 128,
@@ -385,6 +392,12 @@ fn every_2_5_component_resolves_independently_and_reads_its_own_config() {
     assert_eq!(transformer.cross_attention_dim, 3072);
     assert_eq!(transformer.positional_embedding_max_pos, [24, 2048, 2048]);
     assert_eq!(transformer.caption_channels, 24 * 128);
+    // LTX-2.5 declares all four caption keys, so it takes the strict V2 path rather than the
+    // 2.3 carve-out.
+    assert_eq!(
+        transformer.caption_feature_version,
+        CaptionFeatureVersion::V2
+    );
 
     // The conv VAE's own section, off its own file.
     let vae = LtxVaeConfig::from_bundle(&bundle, LtxComponent::ConvVideoVae).expect("vae config");
@@ -520,4 +533,93 @@ fn the_ltx_2_3_engine_refuses_a_2_5_bundle_by_version() {
     assert!(text.contains("2.5.0"), "{text}");
     assert!(text.contains("split-component bundle"), "{text}");
     assert!(!text.contains("missing transformer.safetensors"), "{text}");
+}
+
+// =================================================================================================
+// Real-weights gate — the actual `Lightricks/LTX-2.5` snapshot.
+// =================================================================================================
+
+/// Resolve the **real** shipped LTX-2.5 bundle end to end.
+///
+/// `#[ignore]`d: it needs the gated `Lightricks/LTX-2.5` snapshot on disk. Header reads only — no
+/// tensor is materialized, so this is safe to run beside anything else on the box.
+///
+/// The snapshot directory is named by the caller through `LTX_2_5_SNAPSHOT` — the harness never
+/// derives it from a cache layout:
+///
+/// ```text
+/// LTX_2_5_SNAPSHOT=/path/to/ltx-2.5-snapshot \
+///   cargo test -p mlx-gen-ltx --test split_checkpoint -- --ignored real_
+/// ```
+#[test]
+#[ignore = "needs the gated Lightricks/LTX-2.5 snapshot (set LTX_2_5_SNAPSHOT)"]
+fn real_2_5_snapshot_resolves_every_component() {
+    let root = std::path::PathBuf::from(
+        std::env::var("LTX_2_5_SNAPSHOT").expect("set LTX_2_5_SNAPSHOT to the snapshot dir"),
+    );
+
+    // 1. Layout is keyed on the declared version.
+    assert_eq!(
+        declared_model_version(&root).unwrap().as_deref(),
+        Some("2.5.0")
+    );
+    assert_eq!(declared_layout(&root).unwrap(), LtxCheckpointLayout::Split);
+
+    // 2. The shipped repo carries FIVE transformer variants (dev/distilled × bf16/int8/nvfp4) and
+    //    TWO text encoders. A bare directory scan must refuse to guess between them rather than
+    //    silently binding, say, `dev` where the caller wanted `distilled`.
+    let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+    let err = resolve_split_bundle(&spec)
+        .expect_err("the shipped repo ships several transformers; discovery must not guess");
+    assert!(err.to_string().contains("ambiguous"), "{err}");
+
+    // 3. With the variants named explicitly, every component resolves.
+    let f = |rel: &str| WeightsSource::File(root.join(rel));
+    let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+        .with_component(
+            "transformer",
+            f("diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"),
+        )
+        .with_component(
+            "text_encoder",
+            f("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
+        );
+    let bundle = resolve_split_bundle(&spec).expect("the real 2.5 bundle resolves");
+    assert_eq!(bundle.model_version(), Some("2.5.0"));
+    for component in LtxComponent::ALL {
+        bundle
+            .require(*component)
+            .unwrap_or_else(|e| panic!("{}: {e}", component.id()));
+    }
+
+    // 4. Each component's own config drives its own reader.
+    let transformer = LtxConfig::from_bundle(&bundle).expect("real transformer config");
+    assert_eq!(transformer.rope_type, RopeType::Split);
+    assert_eq!(
+        transformer.caption_feature_version,
+        CaptionFeatureVersion::V2
+    );
+    assert!(transformer.num_layers > 0);
+
+    let conv = LtxVaeConfig::from_bundle(&bundle, LtxComponent::ConvVideoVae)
+        .expect("real conv video VAE config");
+    assert!(!conv.decoder_blocks.is_empty());
+    let audio = AudioVaeConfig::from_bundle(&bundle).expect("real audio VAE config");
+    assert!(audio.z_channels > 0);
+    let vocoder = VocoderConfig::from_bundle(&bundle).expect("real vocoder config");
+    assert!(vocoder.final_sample_rate() > 0);
+
+    // The two video VAEs are distinct components — the conv one and the diffusion one, each read
+    // from its own file, never one standing in for the other.
+    let diff = bundle.require(LtxComponent::DiffusionVideoVae).unwrap();
+    assert_eq!(
+        diff.config().unwrap()["_class_name"],
+        mlx_gen::gen_core::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
+    );
+
+    // 5. The real transformer and the real packed Gemma 4 encoder agree.
+    assert!(matches!(
+        assert_gemma_version(&bundle).unwrap(),
+        GemmaVersionCheck::Matched(v) if v == "gemma4-12b-ltx-v1"
+    ));
 }
