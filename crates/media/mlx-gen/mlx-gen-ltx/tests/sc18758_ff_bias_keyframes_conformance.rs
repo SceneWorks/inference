@@ -1,32 +1,36 @@
-//! sc-18758 conformance: the LTX-2.3→2.5 DiT config delta (`ff_bias`/`audio_ff_bias`/
-//! `use_keyframes_abs_pos_embedding`) changes **exactly** the tensor set the reference build logic
-//! implies — no missing, no extra — and 2.3 conformance is untouched.
+//! sc-18758 conformance: the LTX-2.3→2.5 DiT config delta (`ff_bias`/`use_keyframes_abs_pos_embedding`)
+//! changes **exactly** the tensor set the real shipped checkpoint has — no missing, no extra.
 //!
-//! **BLOCKED (credential, Michael only):** the acceptance criterion asks for a conformance check
-//! against the *real* LTX-2.5 checkpoint's header (4349 tensor names). `SceneWorks/ltx-2.3-mlx`-style
-//! weight repos are gated on Hugging Face and no HF token exists on this development machine, so the
-//! real 2.5 `transformer.safetensors` header could not be fetched or inspected. Per the story's own
-//! fallback plan, this harness instead:
-//!   1. Derives a synthetic tensor-name set directly from the **actual loader source** in
-//!      `crate::transformer` (`AvDiT::from_weights`, `AvBlock::load`, `Attention::load`,
-//!      `FeedForward::load`, `AdaLayerNormSingle::load`) — not invented, transcribed from the
-//!      `format!()` key patterns those functions read.
-//!   2. Builds one placeholder-valued superset weights map (48 real layers, every optional leaf —
-//!      attention gates, both FFN biases, the keyframes marker — present) so the *same* map can be
-//!      fed to both the 2.3 and 2.5 configs.
-//!   3. Uses [`mlx_gen::weights::Weights::unused_keys`] after each construction to observe exactly
-//!      which keys each config's loader actually touched, and asserts the touched-set **delta**
-//!      between 2.3 and 2.5 is precisely the measured two-key config change: 2.3 reads 4 bias tensors
-//!      per block (`ff.proj_{in,out}.bias`, `audio_ff.proj_{in,out}.bias`) that 2.5 does not (192
-//!      tensors over 48 layers), and 2.5 additionally reads `keyframes_abs_pos_embedding`, which 2.3
-//!      does not.
+//! `tests/fixtures/ltx25_distilled_dit_tensors.json` is the **real** LTX-2.5 distilled
+//! `transformer.safetensors` header (name + shape per tensor), captured locally via a header-only
+//! read (the 8-byte length prefix + JSON header — zero weight bytes) from
+//! `$HF_HOME/hub/models--Lightricks--LTX-2.5/snapshots/<rev>/diffusion_models/
+//! ltx-2.5-22b-distilled-transformer-bf16.safetensors`, with the `model.diffusion_model.` prefix
+//! stripped and the `*_embeddings_connector.*` tensors dropped (this story's subject is the DiT, not
+//! the connector; connector.safetensors is a separate file mlx-gen-ltx loads independently). The
+//! real header has **4349** total tensors, 258 of them the two embeddings connectors, 4091 DiT-only —
+//! matching the acceptance criterion's cited count. The LTX-2.5 **dev** header
+//! (`ltx-2.5-22b-dev-transformer-bf16.safetensors`) was cross-checked and is byte-identical in shape/
+//! name (both distilled and dev share the same transformer architecture); the fixture captures either.
 //!
-//! This proves the flag-driven parameter set is exactly right relative to the loader's own behavior,
-//! independent of the real header. Someone with the gated-repo credential should re-run this class of
-//! check against a real header dump (`safetensors` `__metadata__`/key list) to confirm the absolute
-//! 4349 count; see the module docs above for what's still open.
+//! **Measured from the real header (not assumed):** `__metadata__.config.transformer` carries
+//! `ff_bias: false` and `use_keyframes_abs_pos_embedding: true`, and has **no** `audio_ff_bias` key at
+//! all — so `audio_ff_bias` takes the reference's absent-key default (`True`), same as 2.3. Concretely:
+//! zero `transformer_blocks.*.ff.net.{0.proj,2}.bias` (video FFN, removed) but all 96
+//! `transformer_blocks.*.audio_ff.net.{0.proj,2}.bias` (audio FFN, present/unchanged across 48
+//! blocks), plus one `keyframes_abs_pos_embedding` (added). The measured 2.3→2.5 tensor-set delta is
+//! therefore exactly **96 removed + 1 added**, not "192 removed + 1 added" (an earlier draft of this
+//! harness incorrectly folded `audio_ff_bias` into the delta before reading the real header).
+//!
+//! The real header's tensor names are the *reference* naming (`to_out.0`, `linear_1`/`linear_2`,
+//! `ff.net.0.proj`/`ff.net.2`) — mlx-gen-ltx's own `transformer.safetensors` is produced by
+//! [`mlx_gen_ltx::convert::LtxConvertOpts`]'s `sanitize_transformer`, which additionally renames
+//! `.to_out.0.`→`.to_out.`, `.ff.net.0.proj.`→`.ff.proj_in.`, `.ff.net.2.`→`.ff.proj_out.` (+ audio),
+//! and `.linear_1.`/`.linear_2.`→`.linear1.`/`.linear2.`. This harness applies that exact rename (kept
+//! in lockstep with `convert.rs::sanitize_transformer` — see [`sanitize`]) before building the
+//! [`Weights`] map, so `AvDiT::from_weights` sees precisely what a converted checkpoint would.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use mlx_gen::weights::Weights;
 use mlx_rs::Array;
@@ -34,13 +38,110 @@ use mlx_rs::Array;
 use mlx_gen_ltx::config::LtxConfig;
 use mlx_gen_ltx::transformer::{AvDiT, Precision};
 
+const FIXTURE_JSON: &str = include_str!("fixtures/ltx25_distilled_dit_tensors.json");
 const NUM_LAYERS: i32 = 48;
 
-/// The 2.3 config the epic orientation cites as unaffected — [`LtxConfig::video_only_defaults`] is
-/// already dimensioned as the shipped AV 2.3 checkpoint (32 heads × 128 head-dim video, 32×64 audio,
-/// gated family, 48 layers); only `ff_bias`/`audio_ff_bias`/`use_keyframes_abs_pos_embedding` are
-/// touched here, matching `LtxConfig::from_embedded_transformer` parsing an `embedded_config.json`
-/// that omits both delta keys.
+struct RealTensor {
+    name: String,
+    shape: Vec<i32>,
+}
+
+/// Parse the `[{"name": "...", "shape": [..]}, ...]` fixture without a `serde::Deserialize` derive
+/// (the crate depends on `serde_json` but not `serde` directly) — plain `serde_json::Value` walking.
+fn real_2_5_tensors() -> Vec<RealTensor> {
+    let v: serde_json::Value = serde_json::from_str(FIXTURE_JSON).expect("fixture is valid JSON");
+    v.as_array()
+        .expect("fixture is a JSON array")
+        .iter()
+        .map(|entry| {
+            let name = entry["name"]
+                .as_str()
+                .expect("entry.name is a string")
+                .to_string();
+            let shape = entry["shape"]
+                .as_array()
+                .expect("entry.shape is a JSON array")
+                .iter()
+                .map(|n| n.as_i64().expect("shape entry is an integer") as i32)
+                .collect();
+            RealTensor { name, shape }
+        })
+        .collect()
+}
+
+/// The exact rename `convert.rs::sanitize_transformer` applies to a `model.diffusion_model.`-stripped
+/// reference key, converting it to mlx-gen-ltx's internal `transformer.safetensors` naming. Kept
+/// byte-for-byte identical to that function so this harness tests the real converted key set, not an
+/// invented one.
+fn sanitize(name: &str) -> String {
+    name.replace(".to_out.0.", ".to_out.")
+        .replace(".ff.net.0.proj.", ".ff.proj_in.")
+        .replace(".ff.net.2.", ".ff.proj_out.")
+        .replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
+        .replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
+        .replace(".linear_1.", ".linear1.")
+        .replace(".linear_2.", ".linear2.")
+}
+
+/// Real per-tensor shapes range up to `[16384, 4096]` (~268 MB as f32 placeholders) — allocating 4091
+/// of those would blow well past the "lightweight synthetic tensors" resource lane for a mere
+/// name-conformance check. `AvDiT::from_weights` never shape-validates at load time, so the *value* of
+/// a large dim is irrelevant to this test — only whether a dim is "big" (a feature/hidden width) or
+/// "small" (a structural row count some loader constructs *do* slice, e.g. the cross-modal
+/// `scale_shift_table_a2v_ca_{audio,video}` tables' `take_axis` for rows `0..4` + `4`, which needs
+/// `dim0 ≥ 5`). Any dim ≤ 6 is preserved exactly (covers the real `2`- and `5`-row tables in this
+/// fixture); anything larger shrinks to `1`. Total footprint: at most a handful of elements per tensor.
+fn shrink_shape(shape: &[i32]) -> Vec<i32> {
+    if shape.is_empty() {
+        return vec![1];
+    }
+    shape
+        .iter()
+        .map(|&d| if d > 6 { 1 } else { d.max(1) })
+        .collect()
+}
+
+fn placeholder(shape: &[i32]) -> Array {
+    let shape = shrink_shape(shape);
+    let n: i32 = shape.iter().product();
+    Array::from_slice(&vec![0.0f32; n.max(1) as usize], &shape)
+}
+
+/// The real, `sanitize`-remapped LTX-2.5 DiT weights map: exactly the 4091 real DiT tensor names
+/// (shapes shrunk per [`shrink_shape`] — `AvDiT::from_weights` never shape-validates at load time,
+/// only names matter here).
+fn real_25_weights() -> Weights {
+    let mut m = std::collections::HashMap::new();
+    for t in real_2_5_tensors() {
+        m.insert(sanitize(&t.name), placeholder(&t.shape));
+    }
+    Weights::from_map(m)
+}
+
+/// A reconstructed "real 2.3-shaped" map: the real 2.5 set with the two confirmed deltas reversed —
+/// `keyframes_abs_pos_embedding` removed, and the 96 video `ff.proj_{in,out}.bias` tensors added back
+/// (shape taken from the real header's `ff.proj_in.weight`/`ff.proj_out.weight` out-dim: `[16384,
+/// 4096]` ⇒ bias `[16384]`; `[4096, 16384]` ⇒ bias `[4096]` — shrunk the same way as every other
+/// tensor here). This is not invented data — every tensor it adds/removes is one of the exact two
+/// measured deltas, applied in reverse to real data.
+fn reconstructed_23_weights() -> Weights {
+    let mut m = std::collections::HashMap::new();
+    for t in real_2_5_tensors() {
+        if t.name == "keyframes_abs_pos_embedding" {
+            continue;
+        }
+        m.insert(sanitize(&t.name), placeholder(&t.shape));
+    }
+    for i in 0..NUM_LAYERS {
+        let p = format!("transformer_blocks.{i}");
+        m.insert(format!("{p}.ff.proj_in.bias"), placeholder(&[16384]));
+        m.insert(format!("{p}.ff.proj_out.bias"), placeholder(&[4096]));
+    }
+    Weights::from_map(m)
+}
+
+/// The 2.3 config: `ff_bias`/`audio_ff_bias` default `true` (both absent from a 2.3
+/// `embedded_config.json`), `use_keyframes_abs_pos_embedding` defaults `false`.
 fn ltx23_cfg() -> LtxConfig {
     let mut cfg = LtxConfig::video_only_defaults();
     cfg.apply_gated_attention = true;
@@ -50,204 +151,111 @@ fn ltx23_cfg() -> LtxConfig {
     cfg
 }
 
-/// The measured 2.3→2.5 delta applied to the same base.
+/// The measured 2.3→2.5 delta, verified against the real header: `ff_bias:false` (video only) +
+/// `use_keyframes_abs_pos_embedding:true`. `audio_ff_bias` is left at its default (`true`) — the real
+/// header carries no such key.
 fn ltx25_cfg() -> LtxConfig {
     let mut cfg = ltx23_cfg();
     cfg.ff_bias = false;
-    cfg.audio_ff_bias = false;
     cfg.use_keyframes_abs_pos_embedding = true;
     cfg
 }
 
-/// A `[1]` f32 placeholder — `AvDiT::from_weights` never shape-validates at load time (only a later
-/// `forward` would), so every leaf can share this one dummy value; only tensor **names** matter here.
-fn leaf() -> Array {
-    Array::from_slice(&[0.0f32], &[1])
-}
-
-/// Every key one `AdaLayerNormSingle::load(w, prefix)` reads (transcribed from
-/// `crate::transformer::AdaLayerNormSingle::load`): two timestep-embedder Linears + the output Linear.
-fn insert_adaln(m: &mut HashMap<String, Array>, prefix: &str) {
-    for leaf_key in [
-        "emb.timestep_embedder.linear1.weight",
-        "emb.timestep_embedder.linear1.bias",
-        "emb.timestep_embedder.linear2.weight",
-        "emb.timestep_embedder.linear2.bias",
-        "linear.weight",
-        "linear.bias",
-    ] {
-        m.insert(format!("{prefix}.{leaf_key}"), leaf());
-    }
-}
-
-/// Every key one `Attention::load(w, prefix, ...)` reads (transcribed from
-/// `crate::transformer::Attention::load`): q/k/v/out Linears (always biased — `attention_bias` is
-/// reference-hardcoded `True`, independent of `ff_bias`), q/k RMSNorm weights, and the optional gate
-/// Linear (included here — the superset is shared by both configs, so its presence/absence in the
-/// real checkpoint cancels out of the 2.3-vs-2.5 delta this test asserts).
-fn insert_attention(m: &mut HashMap<String, Array>, prefix: &str) {
-    for sub in ["to_q", "to_k", "to_v", "to_out", "to_gate_logits"] {
-        m.insert(format!("{prefix}.{sub}.weight"), leaf());
-        m.insert(format!("{prefix}.{sub}.bias"), leaf());
-    }
-    m.insert(format!("{prefix}.q_norm.weight"), leaf());
-    m.insert(format!("{prefix}.k_norm.weight"), leaf());
-}
-
-/// Every key one `FeedForward::load(w, prefix, prec, bias)` **could** read — always inserts the bias
-/// tensors (the superset), so a config that sets `bias:false` demonstrably leaves them unaccessed
-/// rather than merely being handed a map that lacks them.
-fn insert_ff(m: &mut HashMap<String, Array>, prefix: &str) {
-    m.insert(format!("{prefix}.proj_in.weight"), leaf());
-    m.insert(format!("{prefix}.proj_in.bias"), leaf());
-    m.insert(format!("{prefix}.proj_out.weight"), leaf());
-    m.insert(format!("{prefix}.proj_out.bias"), leaf());
-}
-
-/// The full transformer.safetensors superset: every key `AvDiT::from_weights` could possibly read for
-/// `NUM_LAYERS` blocks, including `keyframes_abs_pos_embedding` (present regardless of config — the
-/// test proves *access*, not presence, differs between 2.3 and 2.5).
-fn superset_weights() -> Weights {
-    let mut m = HashMap::new();
-
-    // Video stream globals.
-    m.insert("patchify_proj.weight".into(), leaf());
-    m.insert("patchify_proj.bias".into(), leaf());
-    insert_adaln(&mut m, "adaln_single");
-    insert_adaln(&mut m, "prompt_adaln_single");
-    insert_adaln(&mut m, "av_ca_video_scale_shift_adaln_single");
-    insert_adaln(&mut m, "av_ca_a2v_gate_adaln_single");
-    m.insert("scale_shift_table".into(), leaf());
-    m.insert("proj_out.weight".into(), leaf());
-    m.insert("proj_out.bias".into(), leaf());
-    m.insert("keyframes_abs_pos_embedding".into(), leaf());
-
-    // Audio stream globals.
-    m.insert("audio_patchify_proj.weight".into(), leaf());
-    m.insert("audio_patchify_proj.bias".into(), leaf());
-    insert_adaln(&mut m, "audio_adaln_single");
-    insert_adaln(&mut m, "audio_prompt_adaln_single");
-    insert_adaln(&mut m, "av_ca_audio_scale_shift_adaln_single");
-    insert_adaln(&mut m, "av_ca_v2a_gate_adaln_single");
-    m.insert("audio_scale_shift_table".into(), leaf());
-    m.insert("audio_proj_out.weight".into(), leaf());
-    m.insert("audio_proj_out.bias".into(), leaf());
-
-    // Per-block (transformer_blocks.{i}.*), transcribed from `AvBlock::load`.
-    for i in 0..NUM_LAYERS {
-        let p = format!("transformer_blocks.{i}");
-        insert_attention(&mut m, &format!("{p}.attn1"));
-        insert_attention(&mut m, &format!("{p}.attn2"));
-        insert_ff(&mut m, &format!("{p}.ff"));
-        m.insert(format!("{p}.scale_shift_table"), leaf());
-        m.insert(format!("{p}.prompt_scale_shift_table"), leaf());
-        insert_attention(&mut m, &format!("{p}.audio_attn1"));
-        insert_attention(&mut m, &format!("{p}.audio_attn2"));
-        insert_ff(&mut m, &format!("{p}.audio_ff"));
-        m.insert(format!("{p}.audio_scale_shift_table"), leaf());
-        m.insert(format!("{p}.audio_prompt_scale_shift_table"), leaf());
-        insert_attention(&mut m, &format!("{p}.audio_to_video_attn"));
-        insert_attention(&mut m, &format!("{p}.video_to_audio_attn"));
-        m.insert(format!("{p}.scale_shift_table_a2v_ca_audio"), leaf());
-        m.insert(format!("{p}.scale_shift_table_a2v_ca_video"), leaf());
-    }
-
-    Weights::from_map(m)
-}
-
-/// The exact set of `ff.proj_{in,out}.bias` / `audio_ff.proj_{in,out}.bias` keys across all
-/// `NUM_LAYERS` blocks — what 2.3 reads that 2.5 must not (192 tensors at `NUM_LAYERS=48`).
-fn expected_ff_bias_keys() -> std::collections::HashSet<String> {
-    let mut s = std::collections::HashSet::new();
-    for i in 0..NUM_LAYERS {
-        let p = format!("transformer_blocks.{i}");
-        for ff_prefix in ["ff", "audio_ff"] {
-            s.insert(format!("{p}.{ff_prefix}.proj_in.bias"));
-            s.insert(format!("{p}.{ff_prefix}.proj_out.bias"));
-        }
-    }
-    s
-}
-
-/// Zero missing, zero extra: both the 2.3 and the 2.5 config load cleanly from the shared superset
-/// (a real checkpoint has no extra keys to begin with; here that direction is covered by
-/// `ff_bias_false_never_requires_an_absent_bias_tensor` in `transformer.rs`'s unit tests, which builds
-/// a map that genuinely lacks the bias tensors).
+/// The core proof: the 2.5 config loads the **real** LTX-2.5 tensor set with zero missing and zero
+/// extra (`unused_keys()` empty) — not a superset, the exact real 4091-tensor DiT set.
 #[test]
-fn ltx25_and_ltx23_both_load_from_the_documented_key_set() {
+fn ltx25_config_loads_the_real_header_exactly_no_missing_no_extra() {
     let prec = Precision::dense_f32(4, 64);
-    let w = superset_weights();
-
-    AvDiT::from_weights(&w, &ltx23_cfg(), prec).expect("2.3 config loads from the documented set");
-    AvDiT::from_weights(&w, &ltx25_cfg(), prec).expect("2.5 config loads from the documented set");
-}
-
-/// The core conformance/mutation proof: the accessed-tensor delta between the 2.3 and 2.5
-/// constructions is **exactly** the measured config delta — no more, no less. This is what "no
-/// missing, no extra" reduces to without a real header: the loader's *own* read pattern, observed via
-/// [`Weights::unused_keys`], must match the two-key delta bit-for-bit.
-#[test]
-fn ff_bias_and_keyframes_change_exactly_the_measured_tensor_set() {
-    let prec = Precision::dense_f32(4, 64);
-    let w23 = superset_weights();
-    let w25 = superset_weights();
-
-    AvDiT::from_weights(&w23, &ltx23_cfg(), prec).unwrap();
-    AvDiT::from_weights(&w25, &ltx25_cfg(), prec).unwrap();
-
-    let unused23: std::collections::HashSet<String> =
-        w23.unused_keys().into_iter().map(str::to_string).collect();
-    let unused25: std::collections::HashSet<String> =
-        w25.unused_keys().into_iter().map(str::to_string).collect();
-
-    // 2.3 leaves `keyframes_abs_pos_embedding` unread; 2.5 does not.
-    assert!(unused23.contains("keyframes_abs_pos_embedding"));
-    assert!(!unused25.contains("keyframes_abs_pos_embedding"));
-
-    // 2.5 leaves every `ff`/`audio_ff` bias tensor unread; 2.3 does not.
-    let ff_bias_keys = expected_ff_bias_keys();
-    assert_eq!(ff_bias_keys.len(), (NUM_LAYERS as usize) * 4);
-    for key in &ff_bias_keys {
-        assert!(
-            !unused23.contains(key),
-            "2.3 must read {key} (ff_bias defaults true)"
-        );
-        assert!(
-            unused25.contains(key),
-            "2.5 must NOT read {key} (ff_bias:false — the tensor doesn't exist on a real checkpoint)"
-        );
-    }
-
-    // The delta is EXACTLY these two effects — nothing else changed between the two loads.
-    let extra_unused_in_25: std::collections::HashSet<_> =
-        unused25.difference(&unused23).cloned().collect();
+    let w = real_25_weights();
+    let total = w.len();
     assert_eq!(
-        extra_unused_in_25, ff_bias_keys,
-        "2.5 vs 2.3 must leave exactly the ff/audio_ff bias tensors unread, nothing more"
+        total, 4091,
+        "fixture must be the real 4091-tensor DiT-only set"
     );
-    let mut extra_unused_in_23: std::collections::HashSet<_> =
-        unused23.difference(&unused25).cloned().collect();
-    assert!(extra_unused_in_23.remove("keyframes_abs_pos_embedding"));
+
+    AvDiT::from_weights(&w, &ltx25_cfg(), prec).expect("ltx_2_5 config must load the real header");
+    let unused = w.unused_keys();
     assert!(
-        extra_unused_in_23.is_empty(),
-        "2.3 vs 2.5 must leave exactly `keyframes_abs_pos_embedding` unread, nothing more; got {extra_unused_in_23:?}"
+        unused.is_empty(),
+        "ltx_2_5 must read every real tensor — unread: {unused:?}"
     );
 }
 
-/// 2.3 conformance is unchanged (F-047-style guard): a config with neither delta key set (the
-/// `LtxConfig::video_only_defaults` / `from_embedded_transformer` fallback) still reads every FFN bias
-/// and never touches `keyframes_abs_pos_embedding` — i.e. sc-18758 introduced no regression on the
-/// pre-existing 2.3 path.
+/// The mutation proof: the SAME real 2.5 tensor set must **fail** to load under the 2.3 config
+/// (`ff_bias:true` demands the video FFN bias the real 2.5 checkpoint does not carry) — the flag, not
+/// checkpoint content, decides requiredness.
 #[test]
-fn ltx23_conformance_reads_every_ff_bias_and_no_keyframes_marker() {
+fn ltx23_config_fails_on_the_real_2_5_header() {
     let prec = Precision::dense_f32(4, 64);
-    let w = superset_weights();
-    AvDiT::from_weights(&w, &ltx23_cfg(), prec).unwrap();
+    let w = real_25_weights();
+    let err = AvDiT::from_weights(&w, &ltx23_cfg(), prec);
+    assert!(
+        err.is_err(),
+        "ltx_2_3 config (ff_bias:true) must error on the real LTX-2.5 header, which carries no \
+         video ff.proj_{{in,out}}.bias"
+    );
+}
 
-    let unused: std::collections::HashSet<String> =
-        w.unused_keys().into_iter().map(str::to_string).collect();
-    for key in expected_ff_bias_keys() {
-        assert!(!unused.contains(&key), "2.3 must still read {key}");
+/// 2.3 conformance is unchanged: the reconstructed real-2.3-shaped set (real 2.5 data with the two
+/// measured deltas reversed) loads cleanly under the 2.3 config with zero missing, zero extra.
+#[test]
+fn ltx23_config_loads_the_reconstructed_2_3_header_exactly() {
+    let prec = Precision::dense_f32(4, 64);
+    let w = reconstructed_23_weights();
+    AvDiT::from_weights(&w, &ltx23_cfg(), prec)
+        .expect("ltx_2_3 config must load the reconstructed 2.3-shaped header");
+    let unused = w.unused_keys();
+    assert!(
+        unused.is_empty(),
+        "ltx_2_3 must read every tensor in its own header shape — unread: {unused:?}"
+    );
+}
+
+/// The exact measured delta, spelled out against real tensor names: 96 video FFN bias tensors
+/// removed (48 blocks × `ff.proj_in.bias` + `ff.proj_out.bias`), 1 `keyframes_abs_pos_embedding`
+/// added — audio_ff bias is untouched (present in both).
+#[test]
+fn measured_delta_is_exactly_96_removed_and_1_added() {
+    let real: HashSet<String> = real_2_5_tensors()
+        .into_iter()
+        .map(|t| sanitize(&t.name))
+        .collect();
+    let reconstructed: HashSet<String> = {
+        let mut s: HashSet<String> = real
+            .iter()
+            .filter(|n| n.as_str() != "keyframes_abs_pos_embedding")
+            .cloned()
+            .collect();
+        for i in 0..NUM_LAYERS {
+            s.insert(format!("transformer_blocks.{i}.ff.proj_in.bias"));
+            s.insert(format!("transformer_blocks.{i}.ff.proj_out.bias"));
+        }
+        s
+    };
+
+    let removed_going_25_to_23_direction: Vec<_> = reconstructed.difference(&real).collect();
+    let added_going_23_to_25_direction: Vec<_> = real.difference(&reconstructed).collect();
+
+    assert_eq!(
+        removed_going_25_to_23_direction.len(),
+        (NUM_LAYERS as usize) * 2,
+        "reconstructed 2.3 adds back exactly 96 video ff bias tensors vs the real 2.5 set"
+    );
+    assert!(removed_going_25_to_23_direction
+        .iter()
+        .all(|k| k.contains(".ff.proj_") && k.contains(".bias") && !k.contains("audio_ff")));
+
+    assert_eq!(added_going_23_to_25_direction.len(), 1);
+    assert_eq!(
+        added_going_23_to_25_direction[0].as_str(),
+        "keyframes_abs_pos_embedding"
+    );
+
+    // Audio FFN bias is present and identical in both directions (untouched by the delta).
+    for i in 0..NUM_LAYERS {
+        let k = format!("transformer_blocks.{i}.audio_ff.proj_in.bias");
+        assert!(real.contains(&k) && reconstructed.contains(&k));
+        let k = format!("transformer_blocks.{i}.audio_ff.proj_out.bias");
+        assert!(real.contains(&k) && reconstructed.contains(&k));
     }
-    assert!(unused.contains("keyframes_abs_pos_embedding"));
 }

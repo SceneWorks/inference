@@ -912,10 +912,12 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    /// `bias` is [`LtxConfig::ff_bias`]/`audio_ff_bias`/`connector_ff_bias` — `true` for 2.3 (both
-    /// Linears carry a bias, byte-identical to pre-sc-18758), `false` for 2.5's video/audio FFN
-    /// (neither `proj_in` nor `proj_out` carries one; see reference `FeedForward.__init__`, which
-    /// threads a single `bias` flag to both `net.0.proj` and `net.2`).
+    /// `bias` is the caller's [`LtxConfig::ff_bias`]/`audio_ff_bias`/`connector_ff_bias` — `true`
+    /// keeps both Linears biased (byte-identical to pre-sc-18758; this is 2.3 for all three, and 2.5
+    /// for `audio_ff_bias`/`connector_ff_bias` — the real 2.5 header carries no `audio_ff_bias` key,
+    /// so it stays the reference absent-key default `True`). `false` (2.5's **video** `ff_bias` only)
+    /// means neither `proj_in` nor `proj_out` carries a bias; see reference `FeedForward.__init__`,
+    /// which threads a single `bias` flag to both `net.0.proj` and `net.2`.
     fn load(w: &Weights, prefix: &str, prec: Precision, bias: bool) -> Result<Self> {
         Ok(Self {
             proj_in: Linear::load_with_bias(w, &format!("{prefix}.proj_in"), prec, bias)?,

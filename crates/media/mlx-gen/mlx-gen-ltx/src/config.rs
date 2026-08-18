@@ -94,11 +94,19 @@ pub struct LtxConfig {
 
     // --- sc-18758: the entire measured LTX-2.3→2.5 transformer config delta (two keys). Both are
     // absent from the 2.3 `embedded_config.json`, so the defaults below reproduce 2.3 byte-for-byte;
-    // 2.5 sets `ff_bias:false` (`audio_ff_bias` follows) and `use_keyframes_abs_pos_embedding:true`.
+    // 2.5 sets `ff_bias:false` (video only — see `ff_bias`'s own doc) and
+    // `use_keyframes_abs_pos_embedding:true`.
     /// `ff_bias` — whether the **video** FFN's `proj_in`/`proj_out` Linears carry a bias. `true` for
     /// 2.3 (absent ⇒ default); `false` for 2.5 (the checkpoint carries no `ff.proj_{in,out}.bias`).
     pub ff_bias: bool,
-    /// `audio_ff_bias` — the audio-stream analog of [`ff_bias`](Self::ff_bias) (`audio_ff`).
+    /// `audio_ff_bias` — the audio-stream analog of [`ff_bias`](Self::ff_bias) (`audio_ff`). Parsed
+    /// independently (it is a distinct reference config key), but **not** part of the measured
+    /// 2.3→2.5 delta: verified against the real shipped header (both the distilled and dev
+    /// `transformer.safetensors`), the 2.5 metadata carries no `audio_ff_bias` key at all, so it
+    /// takes the reference absent-key default (`True`) same as 2.3 — all 96
+    /// `transformer_blocks.*.audio_ff.net.{0.proj,2}.bias` tensors are present and required in the
+    /// real 2.5 checkpoint. Kept as its own field (not hardcoded true) for fidelity to the reference
+    /// config surface, in case a future checkpoint does set it.
     pub audio_ff_bias: bool,
     /// `connector_ff_bias` — the `Embeddings1DConnector`'s own FFN bias flag (reference
     /// `Embeddings1DConnectorConfigurator`/`AudioEmbeddings1DConnectorConfigurator`). Independent of
@@ -954,14 +962,16 @@ mod tests {
         assert!(!cfg.use_keyframes_abs_pos_embedding);
     }
 
-    /// An LTX-2.5 `transformer` block: identical to the 2.3 fixture except the two measured delta
-    /// keys (sc-18758's orientation — diffing `__metadata__.config.transformer` between the 2.3 and
-    /// 2.5 checkpoints changes exactly these two keys, nothing else).
+    /// An LTX-2.5 `transformer` block: identical to the 2.3 fixture except the real measured delta
+    /// keys — verified against the actual shipped header (both the distilled and dev
+    /// `transformer.safetensors`, read locally): `ff_bias:false` and
+    /// `use_keyframes_abs_pos_embedding:true`. The real metadata carries **no** `audio_ff_bias` key
+    /// at all (that field stays absent here too, matching the real fixture byte-for-byte), so it
+    /// takes the same absent-key default as 2.3.
     fn ltx25_transformer() -> Value {
         let mut t = ltx23_transformer();
         let obj = t.as_object_mut().unwrap();
         obj.insert("ff_bias".into(), serde_json::json!(false));
-        obj.insert("audio_ff_bias".into(), serde_json::json!(false));
         obj.insert(
             "use_keyframes_abs_pos_embedding".into(),
             serde_json::json!(true),
@@ -975,10 +985,12 @@ mod tests {
         let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer());
 
         // The two measured keys flip.
-        assert!(cfg23.ff_bias && cfg23.audio_ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
-        assert!(!cfg25.ff_bias && !cfg25.audio_ff_bias && cfg25.use_keyframes_abs_pos_embedding);
-        // `connector_ff_bias` is not part of the delta — the 2.5 checkpoint doesn't set it either,
-        // so it stays the reference default (true) on both configs.
+        assert!(cfg23.ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
+        assert!(!cfg25.ff_bias && cfg25.use_keyframes_abs_pos_embedding);
+        // `audio_ff_bias` and `connector_ff_bias` are NOT part of the delta — the real 2.5 checkpoint
+        // sets neither key, so both stay the reference default (true) on both configs.
+        assert!(cfg23.audio_ff_bias);
+        assert!(cfg25.audio_ff_bias);
         assert!(cfg23.connector_ff_bias);
         assert!(cfg25.connector_ff_bias);
 

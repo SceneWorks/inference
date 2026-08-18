@@ -220,10 +220,12 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    /// `bias` is `AvConfig::video.ff_bias` / `audio_ff_bias` (sc-18758) — `true` for 2.3 (both
-    /// Linears carry a bias, byte-identical to pre-sc-18758), `false` for 2.5's video/audio FFN
-    /// (neither `net.0.proj` nor `net.2` carries one; reference `FeedForward.__init__` threads a
-    /// single `bias` flag to both).
+    /// `bias` is the caller's `AvConfig::video.ff_bias` / `audio_ff_bias` (sc-18758) — `true` keeps
+    /// both Linears biased (byte-identical to pre-sc-18758; this is 2.3 for both fields, and 2.5 for
+    /// `audio_ff_bias` — the real 2.5 header carries no `audio_ff_bias` key, so it stays the
+    /// reference absent-key default `True`). `false` (2.5's **video** `ff_bias` only) means neither
+    /// `net.0.proj` nor `net.2` carries a bias; reference `FeedForward.__init__` threads a single
+    /// `bias` flag to both.
     fn load(vb: VarBuilder, bias: bool) -> Result<Self> {
         Ok(Self {
             proj_in: qlinear(&vb.pp("net.0"), "proj", bias)?,

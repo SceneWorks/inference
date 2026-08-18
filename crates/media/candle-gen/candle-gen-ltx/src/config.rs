@@ -163,12 +163,15 @@ impl AvConfig {
         }
     }
 
-    /// The LTX-2.5 dual-modal config: [`TransformerConfig::ltx_2_5`]'s video half + `audio_ff_bias:
-    /// false` (2.5 sets both `ff_bias` and `audio_ff_bias`); every other dim is unchanged from 2.3.
+    /// The LTX-2.5 dual-modal config: [`TransformerConfig::ltx_2_5`]'s video half; `audio_ff_bias`
+    /// stays `true` — verified against the real shipped header (both the distilled and dev
+    /// `transformer.safetensors`), the 2.5 metadata carries **no** `audio_ff_bias` key at all (only
+    /// `ff_bias:false`), so it takes the reference's absent-key default (`True`) same as 2.3, and all
+    /// 96 `transformer_blocks.*.audio_ff.net.{0.proj,2}.bias` tensors are present and required. Only
+    /// the **video** FFN drops its bias.
     pub fn ltx_2_5() -> Self {
         Self {
             video: TransformerConfig::ltx_2_5(),
-            audio_ff_bias: false,
             ..Self::ltx_2_3()
         }
     }
@@ -495,17 +498,22 @@ mod sc_18758_delta_tests {
         assert!(ConnectorConfig::ltx_2_3_audio().ff_bias);
     }
 
-    /// The 2.3→2.5 config delta is exactly these two keys — everything else `AvConfig::ltx_2_5`
-    /// shares with `ltx_2_3` is unchanged (48 layers, 32/128 heads/head-dim, etc).
+    /// The 2.3→2.5 config delta, verified against the real shipped header (both distilled and dev
+    /// `transformer.safetensors`): `ff_bias:false` (video only) + `use_keyframes_abs_pos_embedding:
+    /// true`. `audio_ff_bias` is **not** part of the delta — the real 2.5 metadata carries no such
+    /// key, so it stays the reference absent-key default (`True`) on both configs, same as 2.3.
     #[test]
     fn ltx_2_5_flips_exactly_the_measured_delta() {
         let c23 = AvConfig::ltx_2_3();
         let c25 = AvConfig::ltx_2_5();
 
-        assert!(c23.video.ff_bias && c23.audio_ff_bias);
-        assert!(!c25.video.ff_bias && !c25.audio_ff_bias);
+        assert!(c23.video.ff_bias);
+        assert!(!c25.video.ff_bias);
         assert!(!c23.video.use_keyframes_abs_pos_embedding);
         assert!(c25.video.use_keyframes_abs_pos_embedding);
+        // audio_ff_bias is unchanged (true) on both — real header carries no `audio_ff_bias` key.
+        assert!(c23.audio_ff_bias);
+        assert!(c25.audio_ff_bias);
 
         // Not part of the delta — unaffected by the `ltx_2_5()` constructor.
         assert_eq!(c23.video.num_layers, c25.video.num_layers);
