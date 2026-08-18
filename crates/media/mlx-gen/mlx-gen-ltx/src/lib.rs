@@ -64,9 +64,9 @@ pub use conditioning::{
     keyframe_append_positions, patchify_grid, unpatchify_grid, I2vConditioning, Keyframe,
     VideoTokenState,
 };
-pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
+pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
-pub use convert::{convert_and_assemble, LtxConvertOpts};
+pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
 pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};
 pub use pipeline::{
