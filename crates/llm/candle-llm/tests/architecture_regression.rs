@@ -11,6 +11,8 @@
 //! either. Its expectations are an independent oracle computed from the documented formulas by
 //! `generate_regression.py`, not read back out of this crate.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use candle_llm::config::{Architecture, LayerAttentionType, ModelConfig, RopeType};
@@ -55,15 +57,54 @@ fn assert_close(got: f32, want: f32, what: &str) {
     );
 }
 
+/// The fixture must cover **exactly** the architectures the shared [`ModelConfig`] serves — no more,
+/// no fewer.
+///
+/// A `>= N` floor lets a newly-added architecture land uncovered, which is the regression this whole
+/// file exists to prevent: the guard has to fail when the enum grows, not merely when it shrinks.
+/// `Qwen35` is excluded because `ModelConfig::from_json` declines it (it has its own config and
+/// model); the Gemma 4 variants are excluded because the generic decoder refuses them until
+/// sc-18760 / sc-18761. Any other new variant must appear here **and** in the fixture.
+fn assert_family_coverage(cases: &[Value]) {
+    let covered: BTreeSet<&str> = cases
+        .iter()
+        .map(|c| c["expect"]["family"].as_str().expect("case family"))
+        .collect();
+    let expected: BTreeSet<&str> = [
+        Architecture::Llama,
+        Architecture::Qwen3,
+        Architecture::Phi3,
+        Architecture::Qwen2Moe,
+        Architecture::Gemma2,
+        Architecture::Glm4,
+        Architecture::DeepseekV2,
+        Architecture::Qwen3Vl,
+    ]
+    .into_iter()
+    .map(Architecture::family)
+    .collect();
+    assert_eq!(
+        covered, expected,
+        "the regression fixture must cover exactly the generic-decoder architectures"
+    );
+    // And the excluded variants must still be excluded for the stated reason.
+    assert!(
+        !covered.contains(Architecture::Qwen35.family()),
+        "Qwen3.6 is served by Qwen35Config, not ModelConfig"
+    );
+    for gemma4 in [Architecture::Gemma4Unified, Architecture::Gemma4] {
+        assert!(
+            gemma4.is_gemma4() && !covered.contains(gemma4.family()),
+            "{gemma4:?} has no generic decoder yet (sc-18760 / sc-18761)"
+        );
+    }
+}
+
 #[test]
 fn every_shipped_architecture_parses_and_derives_unchanged() {
     let fixture: Value = serde_json::from_str(FIXTURE).expect("parse regression fixture");
     let cases = fixture["cases"].as_array().expect("cases array");
-    assert!(
-        cases.len() >= 8,
-        "the fixture must cover every shipped architecture, found {}",
-        cases.len()
-    );
+    assert_family_coverage(cases);
 
     for case in cases {
         let name = case["name"].as_str().unwrap();

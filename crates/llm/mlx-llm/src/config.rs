@@ -134,6 +134,10 @@ pub struct LayerAttention {
     pub rope_theta: f32,
     /// Fraction of `head_dim` that carries a rotation; `1.0` ⇒ every channel.
     pub partial_rotary_factor: f32,
+    /// `rope_parameters.<type>.factor` — the linear divisor applied to the inverse frequencies
+    /// (`inv_freq /= factor`) at the end of the reference's proportional schedule. `1.0` ⇒ no
+    /// scaling, which is what every shipped Gemma 4 config carries.
+    pub rope_factor: f32,
     /// `Some(w)` ⇒ the layer attends only the `w` most recent keys (inclusive of the query's own
     /// position); `None` ⇒ the full causal prefix.
     pub sliding_window: Option<i32>,
@@ -155,9 +159,12 @@ impl LayerAttention {
     pub fn build_rope(&self) -> Rope {
         match self.rope_type {
             RopeType::Default => Rope::standard(self.head_dim, self.rope_theta),
-            RopeType::Proportional => {
-                Rope::proportional(self.head_dim, self.rope_theta, self.partial_rotary_factor)
-            }
+            RopeType::Proportional => Rope::proportional(
+                self.head_dim,
+                self.rope_theta,
+                self.partial_rotary_factor,
+                self.rope_factor,
+            ),
         }
     }
 }
@@ -262,7 +269,7 @@ impl Gemma4Config {
     /// Parse the Gemma 4 block out of an (already `text_config`-descended) config value.
     /// `num_layers` / `num_kv_heads` / `head_dim` are the scalars [`ModelConfig::from_json`] has
     /// already read, which double as the `sliding_attention` defaults.
-    fn from_json(v: &Value, num_layers: usize, num_kv_heads: i32, head_dim: i32) -> Self {
+    fn from_json(v: &Value, num_layers: usize, num_kv_heads: i32, head_dim: i32) -> Result<Self> {
         let int =
             |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let bidirectional = match v
@@ -292,6 +299,7 @@ impl Gemma4Config {
             .unwrap_or(false);
 
         // `rope_parameters` is keyed by layer type; both entries default to upstream's table.
+        // Fallible: an unsupported `factor` combination is refused rather than dropped.
         let rope_for = |kind: LayerAttentionType,
                         default_theta: f32,
                         default_type: RopeType,
@@ -317,20 +325,37 @@ impl Gemma4Config {
                 .and_then(|x| x.as_f64())
                 .map(|x| x as f32)
                 .unwrap_or(default_partial);
-            (rope_type, theta, partial)
+            // `factor` divides the inverse frequencies at the end of the *proportional* schedule
+            // only. Gemma 4's own `compute_default_rope_parameters` has no factor term, so a
+            // `default` layer type carrying one would mean a schedule this crate does not
+            // implement — refuse it rather than silently ignoring the key.
+            let factor = block
+                .and_then(|b| b.get("factor"))
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(1.0);
+            if rope_type == RopeType::Default && factor != 1.0 {
+                return Err(Error::Unsupported(format!(
+                    "rope_parameters.{}.factor = {factor} on a `default` rope_type: the reference \
+                     applies `factor` only to the `proportional` schedule, so this config asks for \
+                     a frequency scaling this decoder does not implement",
+                    kind.as_str()
+                )));
+            }
+            Ok((rope_type, theta, partial, factor))
         };
-        let (sliding_rope, sliding_theta, sliding_partial) = rope_for(
+        let (sliding_rope, sliding_theta, sliding_partial, sliding_factor) = rope_for(
             LayerAttentionType::Sliding,
             10_000.0,
             RopeType::Default,
             1.0,
-        );
-        let (full_rope, full_theta, full_partial) = rope_for(
+        )?;
+        let (full_rope, full_theta, full_partial, full_factor) = rope_for(
             LayerAttentionType::Full,
             1_000_000.0,
             RopeType::Proportional,
             0.25,
-        );
+        )?;
 
         // The `full_attention` layers' overrides (`per_layer_config` upstream): a wider head, and —
         // only when `attention_k_eq_v` is set — a different KV-head count.
@@ -341,7 +366,7 @@ impl Gemma4Config {
             num_kv_heads
         };
 
-        Self {
+        Ok(Self {
             layer_types: Self::resolve_layer_types(num_layers, v.get("layer_types")),
             sliding: LayerAttention {
                 head_dim,
@@ -349,6 +374,7 @@ impl Gemma4Config {
                 rope_type: sliding_rope,
                 rope_theta: sliding_theta,
                 partial_rotary_factor: sliding_partial,
+                rope_factor: sliding_factor,
                 sliding_window: Some(sliding_window),
                 // `attention_k_eq_v` gates only the non-sliding layers upstream
                 // (`use_alternative_attention = attention_k_eq_v and not is_sliding`).
@@ -360,6 +386,7 @@ impl Gemma4Config {
                 rope_type: full_rope,
                 rope_theta: full_theta,
                 partial_rotary_factor: full_partial,
+                rope_factor: full_factor,
                 sliding_window: None,
                 k_eq_v,
             },
@@ -369,7 +396,7 @@ impl Gemma4Config {
                 .get("use_double_wide_mlp")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
-        }
+        })
     }
 }
 
@@ -864,14 +891,15 @@ impl ModelConfig {
         // that reads them (memory estimates, cache sizing, diagnostics) sees a coherent shape rather
         // than a `rope_theta` default the config never carried. Every other architecture leaves this
         // `None` and every scalar untouched — the byte-identical-parse invariant.
-        let gemma4 = architecture.is_gemma4().then(|| {
-            Box::new(Gemma4Config::from_json(
+        let gemma4 = match architecture.is_gemma4() {
+            true => Some(Box::new(Gemma4Config::from_json(
                 v,
                 num_layers,
                 num_kv_heads,
                 head_dim,
-            ))
-        });
+            )?)),
+            false => None,
+        };
         let (head_dim, num_kv_heads, rope_theta, partial_rotary_factor) = match &gemma4 {
             Some(g) => (
                 g.sliding.head_dim,
@@ -957,6 +985,7 @@ impl ModelConfig {
                 rope_type: RopeType::Default,
                 rope_theta: self.rope_theta,
                 partial_rotary_factor: self.partial_rotary_factor,
+                rope_factor: 1.0,
                 sliding_window: None,
                 k_eq_v: false,
             },

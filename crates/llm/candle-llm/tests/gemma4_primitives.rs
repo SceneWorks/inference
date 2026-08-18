@@ -350,7 +350,7 @@ fn gemma4_real_rope_inv_freq_matches_golden() {
         "sliding (default, theta 1e4) inv_freq",
     );
 
-    let full = Rope::proportional(512, 1_000_000.0, 0.25);
+    let full = Rope::proportional(512, 1_000_000.0, 0.25, 1.0);
     assert_eq!(full.dim(), 512, "proportional keeps the full head width");
     assert_eq!(full.inv_freq().len(), 256);
     assert_abs_close(
@@ -387,6 +387,7 @@ fn gemma4_rope_rotation_matches_golden_for_both_layer_types() {
                 head_dim,
                 theta,
                 c["partial_rotary_factor"].as_f64().unwrap() as f32,
+                1.0,
             )
         };
         assert_abs_close(
@@ -442,7 +443,7 @@ fn gemma4_proportional_rope_differs_from_partial_and_standard() {
     let head_dim = 16i32;
     let theta = 1_000_000.0;
     let partial_factor = 0.25;
-    let proportional = Rope::proportional(head_dim, theta, partial_factor);
+    let proportional = Rope::proportional(head_dim, theta, partial_factor, 1.0);
 
     let rotary_dim = (head_dim as f32 * partial_factor) as i32; // 4
     let partial = Rope::partial(rotary_dim, theta, false);
@@ -484,12 +485,79 @@ fn gemma4_proportional_rope_differs_from_partial_and_standard() {
         "proportional must not collapse to standard RoPE at factor 0.25"
     );
 
-    let full = Rope::proportional(head_dim, theta, 1.0);
+    let full = Rope::proportional(head_dim, theta, 1.0, 1.0);
     assert_eq!(
         full.inv_freq(),
         standard.inv_freq(),
         "factor 1.0 is exactly standard RoPE"
     );
+}
+
+/// **`rope_parameters.factor`.** The reference divides the proportional schedule's inverse
+/// frequencies by `factor` as its last step. Every shipped Gemma 4 config carries `1.0` (a no-op),
+/// but a config that carried anything else used to be parsed with the key silently dropped — a
+/// wrong RoPE base that still renders.
+///
+/// A non-1.0 factor must scale the rotated channels and leave the zero tail zero; and because the
+/// reference defines `factor` only for the *proportional* schedule, a `default` layer type carrying
+/// one is refused outright rather than ignored.
+#[test]
+fn gemma4_rope_factor_scales_the_proportional_schedule_and_is_refused_elsewhere() {
+    let plain = Rope::proportional(16, 1_000_000.0, 0.25, 1.0);
+    let scaled = Rope::proportional(16, 1_000_000.0, 0.25, 4.0);
+    assert_eq!(plain.inv_freq().len(), scaled.inv_freq().len());
+    for (i, (p, s)) in plain.inv_freq().iter().zip(scaled.inv_freq()).enumerate() {
+        if *p == 0.0 {
+            assert_eq!(
+                *s, 0.0,
+                "channel {i}: the un-rotated tail stays exactly zero"
+            );
+        } else {
+            assert!(
+                (s - p / 4.0).abs() < 1e-9,
+                "channel {i}: factor must divide the frequency ({s} vs {})",
+                p / 4.0
+            );
+        }
+    }
+    assert!(
+        plain.inv_freq() != scaled.inv_freq(),
+        "a non-unit factor must change the schedule"
+    );
+
+    // Parsed off a real config, not just constructed.
+    let mut cfg: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
+    cfg["text_config"]["rope_parameters"]["full_attention"]["factor"] = json!(4.0);
+    let parsed = ModelConfig::from_json(&cfg).expect("a proportional factor is supported");
+    let full = parsed.gemma4.as_ref().unwrap().full;
+    assert_eq!(full.rope_factor, 4.0);
+    let rope = full.build_rope();
+    let unscaled = Rope::proportional(
+        full.head_dim,
+        full.rope_theta,
+        full.partial_rotary_factor,
+        1.0,
+    );
+    assert!(
+        (rope.inv_freq()[0] - unscaled.inv_freq()[0] / 4.0).abs() < 1e-9,
+        "the parsed factor must reach the built RoPE"
+    );
+
+    // The shipped config's implicit factor is 1.0 on both layer types.
+    let shipped =
+        ModelConfig::from_json(&serde_json::from_str::<Value>(GEMMA4_CONFIG).unwrap()).unwrap();
+    let g = shipped.gemma4.as_ref().unwrap();
+    assert_eq!(g.full.rope_factor, 1.0);
+    assert_eq!(g.sliding.rope_factor, 1.0);
+
+    // A `default` layer type with a factor is refused by name, not silently dropped.
+    let mut bad: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
+    bad["text_config"]["rope_parameters"]["sliding_attention"]["factor"] = json!(2.0);
+    let err = ModelConfig::from_json(&bad).expect_err("a default-schedule factor must be refused");
+    let m = err.to_string();
+    assert!(m.contains("sliding_attention"), "{m}");
+    assert!(m.contains("factor"), "{m}");
+    assert!(m.contains("proportional"), "{m}");
 }
 
 // ---------------------------------------------------------------------------------------------

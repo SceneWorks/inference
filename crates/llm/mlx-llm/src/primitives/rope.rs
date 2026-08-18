@@ -84,8 +84,16 @@ impl Rope {
     /// * **The frequencies.** `partial` re-bases the exponent on the rotated span (`2i/rd`);
     ///   proportional keeps `2i/head_dim`, so the same channel index gets a *higher* frequency.
     ///
-    /// With `partial_rotary_factor >= 1.0` this is exactly [`Rope::standard`].
-    pub fn proportional(head_dim: i32, theta: f32, partial_rotary_factor: f32) -> Self {
+    /// `factor` is the reference's trailing `inv_freq /= factor` (its `rope_parameters.factor`), a
+    /// linear frequency divisor; every shipped Gemma 4 config carries `1.0`, which is a no-op.
+    ///
+    /// With `partial_rotary_factor >= 1.0` and `factor == 1.0` this is exactly [`Rope::standard`].
+    pub fn proportional(
+        head_dim: i32,
+        theta: f32,
+        partial_rotary_factor: f32,
+        factor: f32,
+    ) -> Self {
         let half = (head_dim / 2).max(0) as usize;
         // `int(partial_rotary_factor * head_dim // 2)` in the reference.
         let rope_angles = ((partial_rotary_factor * head_dim as f32) / 2.0)
@@ -94,7 +102,9 @@ impl Rope {
         let inv_freq = (0..half)
             .map(|i| {
                 if i < rope_angles {
-                    1.0 / theta.powf((2 * i) as f32 / head_dim as f32)
+                    // `inv_freq /= factor` is applied to the rotated channels; the zero tail stays
+                    // zero either way (0 / factor == 0), matching the reference's whole-vector divide.
+                    1.0 / theta.powf((2 * i) as f32 / head_dim as f32) / factor
                 } else {
                     0.0
                 }

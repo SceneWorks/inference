@@ -643,12 +643,14 @@ impl CausalLm {
         let s = input_embeds.shape()[1];
         let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
         let mut out = Vec::with_capacity(self.layers.len() + 1);
-        let mut h = input_embeds.clone();
-        out.push(h.clone());
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &cos, &sin, AttnMask::Causal, cache, i)?;
-            out.push(h.clone());
-        }
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            &cos,
+            &sin,
+            AttnMask::Causal,
+            Some(&mut out),
+        )?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
         }
@@ -682,9 +684,31 @@ impl CausalLm {
         sin: &Array,
         mask: AttnMask<'_>,
     ) -> Result<Array> {
+        self.run_decoder_stack_collecting(input_embeds, cache, cos, sin, mask, None)
+    }
+
+    /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — one
+    /// loop, so the hidden-state-stack forward cannot drift from the logits forward. sc-18760
+    /// rewrites this loop for Gemma 4's per-layer attention and must not have to keep two copies of
+    /// it in step. Mirrors candle-llm's `run_decoder_stack_collecting`.
+    fn run_decoder_stack_collecting(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        cos: &Array,
+        sin: &Array,
+        mask: AttnMask<'_>,
+        mut collect: Option<&mut Vec<Array>>,
+    ) -> Result<Array> {
         let mut h = input_embeds.clone();
+        if let Some(sink) = collect.as_deref_mut() {
+            sink.push(h.clone());
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, cos, sin, mask, cache, i)?;
+            if let Some(sink) = collect.as_deref_mut() {
+                sink.push(h.clone());
+            }
         }
         Ok(h)
     }
