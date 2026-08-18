@@ -293,8 +293,12 @@ fn write_2_5_bundle(root: &Path) {
             VERSION,
             (
                 "config",
+                // NON-2.3 ddconfig values: with the 2.3 defaults, a mutant that skipped the
+                // `model.params.ddconfig` descent would fall back to those same defaults and pass.
                 &format!(
-                    r#"{{"audio_vae":{{"model":{{"params":{{"ddconfig":{LTX_2_3_DDCONFIG},
+                    r#"{{"audio_vae":{{"model":{{"params":{{"ddconfig":{{"ch":96,"out_ch":1,
+                        "ch_mult":[1,2,4,8],"num_res_blocks":3,"z_channels":16,"mel_bins":128,
+                        "mid_block_add_attention":true}},
                         "sampling_rate":16000}}}}}},"vocoder":{LTX_2_3_VOCODER}}}"#
                 ),
             ),
@@ -331,11 +335,18 @@ fn every_2_5_component_reads_its_own_config_off_its_own_file() {
     assert!(diff.is_diffusion());
     assert_eq!(diff.patch_size, 8);
 
-    // The audio VAE file owns BOTH its sections.
-    assert_eq!(
-        AudioVaeConfig::from_bundle(&bundle).unwrap(),
-        AudioVaeConfig::ltx_2_3()
-    );
+    // The audio VAE file owns BOTH its sections, and every ddconfig value differs from the 2.3
+    // default — so this fails if the nested `model.params.ddconfig` descent is skipped.
+    let audio = AudioVaeConfig::from_bundle(&bundle).unwrap();
+    assert_eq!(audio.ch, 96);
+    assert_eq!(audio.out_ch, 1);
+    assert_eq!(audio.ch_mult, vec![1, 2, 4, 8]);
+    assert_eq!(audio.num_resolutions(), 4);
+    assert_eq!(audio.num_res_blocks, 3);
+    assert_eq!(audio.z_channels, 16);
+    assert_eq!(audio.mel_bins, 128);
+    assert!(audio.mid_block_add_attention);
+    assert_ne!(audio, AudioVaeConfig::ltx_2_3());
     assert_eq!(
         VocoderConfig::from_bundle(&bundle)
             .unwrap()
@@ -347,6 +358,41 @@ fn every_2_5_component_reads_its_own_config_off_its_own_file() {
         assert_gemma_version(&bundle).unwrap(),
         GemmaVersionCheck::Matched(v) if v == "gemma4-12b-ltx-v1"
     ));
+}
+
+#[test]
+fn the_audio_vae_accepts_the_flattened_ddconfig_spelling() {
+    // Both spellings appear across LTX-2.x extracts: `audio_vae.model.params.ddconfig` (the shipped
+    // shape) and the same fields flattened onto the `audio_vae` block. Either way the values come
+    // from THIS component's own config, so the non-2.3 values below must survive.
+    let dir = tempfile::tempdir().unwrap();
+    write_2_5_bundle(dir.path());
+    write_component(
+        &dir.path().join("vae/ltx-2.5-audio-vae-bf16.safetensors"),
+        &[
+            VERSION,
+            (
+                "config",
+                r#"{"audio_vae":{"ch":64,"out_ch":1,"ch_mult":[1,2],"num_res_blocks":5,
+                    "z_channels":32,"mel_bins":80,"mid_block_add_attention":true},
+                    "vocoder":{"vocoder":{"resblock":"AMP1","activation":"snakebeta"}}}"#,
+            ),
+        ],
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+    let bundle = resolve_split_bundle(&spec).unwrap();
+    let audio = AudioVaeConfig::from_bundle(&bundle).expect("flattened ddconfig");
+    assert_eq!(audio.ch, 64);
+    assert_eq!(audio.out_ch, 1);
+    assert_eq!(audio.ch_mult, vec![1, 2]);
+    assert_eq!(audio.num_res_blocks, 5);
+    assert_eq!(audio.z_channels, 32);
+    assert_eq!(audio.mel_bins, 80);
+    assert!(audio.mid_block_add_attention);
+    assert!(VocoderConfig::from_bundle(&bundle)
+        .unwrap()
+        .core
+        .is_bigvgan());
 }
 
 #[test]

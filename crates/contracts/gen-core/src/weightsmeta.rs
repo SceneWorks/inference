@@ -949,6 +949,121 @@ mod tests {
             .expect("fixture temp dir")
     }
 
+    // --- `safetensors_file_metadata` error paths (sc-18757) --------------------------------------
+    //
+    // The happy path is exercised throughout `ltx_checkpoint`; these pin the refusals, because each
+    // one is a case where returning "no metadata" instead of an error would silently answer "this
+    // checkpoint declares no `model_version`" — which selects the OLDEST layout and mis-loads the
+    // file. Mirrors the sibling `LtxCheckpointMetadata::from_raw` malformed-JSON test.
+
+    /// Assemble a safetensors file from a raw header string (so a test can write a malformed one).
+    fn write_header(path: &Path, header: &str) {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&0_f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn file_metadata_reads_a_well_formed_block_and_tolerates_its_absence() {
+        let guard = fixture_dir("gencore_meta_ok_");
+        let with = guard.path().join("with.safetensors");
+        write_header(
+            &with,
+            r#"{"__metadata__":{"model_version":"2.5.0","format":"pt"},"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        let meta = safetensors_file_metadata(&with).expect("reads the block");
+        assert_eq!(meta.get("model_version").map(String::as_str), Some("2.5.0"));
+        assert_eq!(meta.len(), 2);
+
+        // A file with no `__metadata__` at all is legal safetensors — an empty map, not an error.
+        let without = guard.path().join("without.safetensors");
+        write_header(
+            &without,
+            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        assert!(safetensors_file_metadata(&without).unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_header_longer_than_the_file() {
+        let guard = fixture_dir("gencore_meta_trunc_");
+        let path = guard.path().join("truncated.safetensors");
+        // Declare a 4096-byte header, then supply only a few bytes of it.
+        let mut bytes = 4096_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(br#"{"__metad"#);
+        std::fs::write(&path, bytes).unwrap();
+        let err = safetensors_file_metadata(&path).expect_err("header runs past EOF");
+        assert!(err.to_string().contains("extends past the file"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_an_absurd_header_length() {
+        // The 8-byte length prefix is untrusted input; refuse to allocate from it rather than
+        // attempting a multi-gigabyte `vec![0; n]`. The file itself stays 8 bytes long.
+        let guard = fixture_dir("gencore_meta_huge_");
+        let path = guard.path().join("huge-header.safetensors");
+        std::fs::write(&path, 200_000_000_u64.to_le_bytes()).unwrap();
+        let err = safetensors_file_metadata(&path).expect_err("header length over the bound");
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_truncated_length_prefix() {
+        let guard = fixture_dir("gencore_meta_stub_");
+        let path = guard.path().join("stub.safetensors");
+        std::fs::write(&path, b"\x01\x02\x03").unwrap();
+        assert!(safetensors_file_metadata(&path).is_err());
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_non_object_metadata_block() {
+        let guard = fixture_dir("gencore_meta_nonobj_");
+        let path = guard.path().join("nonobject.safetensors");
+        write_header(
+            &path,
+            r#"{"__metadata__":["model_version","2.5.0"],"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        let err = safetensors_file_metadata(&path).expect_err("__metadata__ must be an object");
+        assert!(err.to_string().contains("not a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_non_string_metadata_value() {
+        // The spec types every `__metadata__` value as a string. Silently dropping a non-string
+        // would turn a producer's `model_version: 2.5` typo into "declares no version".
+        let guard = fixture_dir("gencore_meta_nonstr_");
+        for (label, blob) in [
+            ("number", r#"{"model_version":2.5}"#),
+            ("bool", r#"{"model_version":true}"#),
+            ("null", r#"{"model_version":null}"#),
+            ("object", r#"{"config":{"transformer":{}}}"#),
+            ("array", r#"{"model_version":["2.5.0"]}"#),
+        ] {
+            let path = guard.path().join(format!("{label}.safetensors"));
+            write_header(
+                &path,
+                &format!(
+                    r#"{{"__metadata__":{blob},"w":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#
+                ),
+            );
+            let err = match safetensors_file_metadata(&path) {
+                Ok(map) => panic!("{label}: expected an error, got {map:?}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("not a string"), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_malformed_header_json() {
+        let guard = fixture_dir("gencore_meta_badjson_");
+        let path = guard.path().join("bad.safetensors");
+        write_header(&path, r#"{"__metadata__":{"a":"b""#);
+        let err = safetensors_file_metadata(&path).expect_err("header JSON is truncated");
+        assert!(err.to_string().contains("safetensors header in"), "{err}");
+    }
+
     /// Guards the sc-17755 fix: the fixture root, and anything written into it, leave with the
     /// guard. Swap `fixture_dir` back for a bare `create_dir_all` on a `temp_dir()` join and this
     /// goes RED — which is the whole reason the leak went unnoticed for so long.

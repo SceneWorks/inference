@@ -517,12 +517,24 @@ pub const CAPTION_V2_LEGACY_KEYS: [&str; 2] = [
 /// 3. **Exactly the two [`CAPTION_V2_LEGACY_KEYS`], both `false`** → [`CaptionFeatureVersion::V2`].
 ///    The shipped LTX-2.3 tiers are this shape and they are genuinely V2; erroring here would refuse
 ///    to load a checkpoint that has always worked. Deliberately narrow: both keys must be present
-///    **and** `false`, and neither newer key may appear.
+///    **and** `false`, and neither newer key may appear **in any form, including as `null`**.
 /// 4. **Any other partial combination** → a hard error naming the missing keys, matching upstream's
 ///    `NotImplementedError("Partial V2 config — missing keys: …")`. Config drift must fail loudly
 ///    rather than silently choose an extractor.
 ///
+/// "Present" means **the key exists**, matching upstream's `keys()` intersection: a key carrying
+/// `null` is present with a non-boolean value and therefore a mismatch, never an absence. So
+/// `{caption_proj_before_connector: null, caption_projection_first_linear: false,
+/// caption_proj_input_norm: null, caption_projection_second_linear: false}` is four-keys-present
+/// with two wrong values (rule 2 → error), **not** the two-key legacy shape (rule 3).
+///
 /// LTX-2.5 declares all four keys, so it takes rule 2; LTX-2.3 takes rule 3.
+///
+/// This is the **single** detector for both backends. sc-18763 landed per-backend twins of this
+/// logic (`TextEncoderFeatureVersion` + a `read_v2_presence_flags` `Value`→flags adapter, duplicated
+/// in `mlx-gen-ltx` and `candle-gen-ltx`); those collapse onto this function, keeping their tests
+/// and pointing them here. Two copies of a rule that decides which feature extractor gets built is
+/// exactly the drift this module exists to prevent.
 pub fn caption_feature_version(transformer: &Value) -> Result<CaptionFeatureVersion> {
     let present: Vec<(&str, bool, Option<bool>)> = CAPTION_V2_EXPECTED_CONFIG
         .iter()
@@ -534,11 +546,18 @@ pub fn caption_feature_version(transformer: &Value) -> Result<CaptionFeatureVers
             )
         })
         .collect();
-    // A key that is present but not a bool is drift, not absence — treat it as present-and-wrong so
-    // it reports through the value-mismatch path instead of silently reading as missing.
+    // Presence is KEY EXISTENCE, exactly as upstream's `transformer_config.keys() &
+    // _V2_EXPECTED_CONFIG.keys()` computes it: a key whose value is `null` is still in `keys()`, and
+    // `None != True` then lands it in `unexpected_value_keys` and raises. So a null here is
+    // present-with-a-wrong-value, NOT absent.
+    //
+    // This is deliberately the opposite of how `LtxCheckpointMetadata::section` treats a null config
+    // SECTION, where 2.5 nulls `vae`/`audio_vae`/`vocoder` precisely to say "this file does not carry
+    // that component". Null means "absent" for a section and "present but not a bool" for these four
+    // leaf flags, because that is what each one means in the format.
     let declared: Vec<&str> = CAPTION_V2_EXPECTED_CONFIG
         .iter()
-        .filter(|(name, _)| transformer.get(*name).is_some_and(|v| !v.is_null()))
+        .filter(|(name, _)| transformer.get(*name).is_some())
         .map(|(name, _)| *name)
         .collect();
 
@@ -1084,9 +1103,18 @@ pub const SPLIT_MANIFEST_FILE: &str = "split_model.json";
 /// `root` may be a single `.safetensors` file (the upstream all-in-one checkpoint) or a directory.
 /// For a directory the order of authority is:
 ///
-/// 1. `split_model.json`'s `model_version` — the SceneWorks-converted LTX-2.3 manifest;
-/// 2. the first `.safetensors` in the tree (sorted, so the answer is deterministic) that stamps
-///    `__metadata__["model_version"]`.
+/// 1. `split_model.json`'s `model_version` — the SceneWorks-converted LTX-2.3 manifest, which is an
+///    explicit declaration about the whole tree and therefore wins outright;
+/// 2. otherwise, the `__metadata__["model_version"]` stamped by the tree's `.safetensors`. **Every**
+///    file is scanned and they must agree: two different versions under one root is an error naming
+///    both files.
+///
+/// The scan is exhaustive rather than first-match because first-match is order-dependent, and a
+/// single stray file can then decide the layout of a whole tree by sort order alone. That is not
+/// hypothetical: the shipped `ltx-2.5-22b-distilled-lora-450-bf16.safetensors` stamps
+/// `model_version: "2.5.0"`, so dropping it into an (unmanifested) LTX-2.3 tree would silently flip
+/// that tree to the split layout depending only on where its name sorted. This mirrors the
+/// bundle-level mixed-version refusal in [`LtxBundleBuilder::build`].
 ///
 /// The result is what [`layout_for_declared_version`] keys on. It deliberately does not depend on
 /// which components are present, so removing a component from a bundle can never change its layout.
@@ -1115,12 +1143,30 @@ pub fn declared_model_version(root: impl AsRef<Path>) -> Result<Option<String>> 
     let mut files = Vec::new();
     collect_safetensors(root, &mut files)?;
     files.sort();
+    let mut declared: Option<(String, PathBuf)> = None;
     for path in files {
-        if let Some(version) = LtxCheckpointMetadata::from_file(&path)?.model_version() {
-            return Ok(Some(version.to_string()));
+        let Some(version) = LtxCheckpointMetadata::from_file(&path)?
+            .model_version()
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        match &declared {
+            Some((seen, seen_path)) if *seen != version => {
+                return Err(Error::Msg(format!(
+                    "ltx: conflicting model_version under {} — {} declares {seen:?} but {} declares \
+                     {version:?}. The tree's layout cannot be decided; remove the stray file or point \
+                     at the intended bundle root",
+                    root.display(),
+                    seen_path.display(),
+                    path.display(),
+                )));
+            }
+            Some(_) => {}
+            None => declared = Some((version, path)),
         }
     }
-    Ok(None)
+    Ok(declared.map(|(version, _)| version))
 }
 
 /// The layout a checkpoint location declares. An undeclared version is
@@ -2011,6 +2057,85 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_2_5_stamped_file_cannot_flip_a_2_3_trees_layout() {
+        // The shipped `ltx-2.5-22b-distilled-lora-450-bf16.safetensors` stamps `model_version:
+        // "2.5.0"` and carries no `config` (see `the_real_distilled_lora_is_not_a_component`). Drop
+        // it into an unmanifested 2.3 tree and a first-match scan would decide the whole tree's
+        // layout by sort order: "loras/..." sorts BEFORE "ltx-2.3-...", so the 2.3 tree would silently
+        // become a split bundle. The exhaustive scan refuses instead, naming both files.
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors(
+            &dir.path().join("ltx-2.3-22b-distilled.safetensors"),
+            &[
+                (MODEL_VERSION_METADATA_KEY, "2.3.0"),
+                (CONFIG_METADATA_KEY, r#"{"transformer":{},"vae":{}}"#),
+            ],
+        );
+        write_safetensors(
+            &dir.path()
+                .join("loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"),
+            &[(MODEL_VERSION_METADATA_KEY, "2.5.0"), ("lora_rank", "128")],
+        );
+        // Sanity: the stray really does sort first, so a first-match scan would have answered 2.5.0.
+        let mut files = Vec::new();
+        collect_safetensors(dir.path(), &mut files).unwrap();
+        files.sort();
+        assert!(files[0].ends_with("ltx-2.5-22b-distilled-lora-450-bf16.safetensors"));
+
+        let err = declared_model_version(dir.path()).expect_err("conflicting declarations");
+        let text = err.to_string();
+        assert!(text.contains("conflicting model_version"), "{text}");
+        assert!(text.contains("2.3.0"), "{text}");
+        assert!(text.contains("2.5.0"), "{text}");
+        assert!(text.contains("ltx-2.3-22b-distilled.safetensors"), "{text}");
+        assert!(
+            text.contains("ltx-2.5-22b-distilled-lora-450-bf16.safetensors"),
+            "{text}"
+        );
+        assert!(declared_layout(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_manifest_settles_the_version_even_beside_a_stray_stamp() {
+        // The converted-2.3 manifest is an explicit declaration about the whole tree, so it wins
+        // outright and a co-located 2.5-stamped LoRA cannot make the tree ambiguous.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SPLIT_MANIFEST_FILE),
+            r#"{"format":"split","model_version":"2.3.0"}"#,
+        )
+        .unwrap();
+        write_safetensors(&dir.path().join("transformer.safetensors"), &[]);
+        write_safetensors(
+            &dir.path().join("loras/a-2-5-lora.safetensors"),
+            &[(MODEL_VERSION_METADATA_KEY, "2.5.0")],
+        );
+        assert_eq!(
+            declared_model_version(dir.path()).unwrap().as_deref(),
+            Some("2.3.0")
+        );
+        assert_eq!(
+            declared_layout(dir.path()).unwrap(),
+            LtxCheckpointLayout::AllInOne
+        );
+    }
+
+    #[test]
+    fn agreeing_declarations_across_a_tree_are_not_a_conflict() {
+        // The real 2.5 bundle stamps 2.5.0 on several components (and on its LoRA) — all agreeing.
+        let dir = tempfile::tempdir().unwrap();
+        write_split_bundle(dir.path());
+        write_safetensors(
+            &dir.path().join("loras/ltx-2.5-lora.safetensors"),
+            &[(MODEL_VERSION_METADATA_KEY, "2.5.0")],
+        );
+        assert_eq!(
+            declared_model_version(dir.path()).unwrap().as_deref(),
+            Some("2.5.0")
+        );
+    }
+
+    #[test]
     fn removing_a_component_does_not_change_the_declared_layout() {
         let dir = tempfile::tempdir().unwrap();
         write_split_bundle(dir.path());
@@ -2093,6 +2218,64 @@ mod tests {
         let err = caption_feature_version(&three).expect_err("three keys is partial");
         let text = err.to_string();
         assert!(text.contains("caption_proj_input_norm"), "{text}");
+    }
+
+    #[test]
+    fn a_null_caption_key_is_present_with_a_wrong_value_not_absent() {
+        // Upstream computes presence as `transformer_config.keys() & _V2_EXPECTED_CONFIG.keys()`; a
+        // null-valued key IS in `keys()`, and `None != True` then raises. Treating null as ABSENT
+        // would route this exact shape through the two-key legacy carve-out and load V2 where
+        // upstream hard-errors — the one case where the carve-out could mask real config drift.
+        let two_nulled = serde_json::json!({
+            "caption_proj_before_connector": null,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": null,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&two_nulled)
+            .expect_err("null-valued keys are present-with-wrong-value, not absent");
+        let text = err.to_string();
+        assert!(text.contains("caption_proj_before_connector"), "{text}");
+        assert!(text.contains("caption_proj_input_norm"), "{text}");
+        assert!(text.contains("<non-boolean>"), "{text}");
+
+        // A single null inside the legacy pair also breaks the carve-out: both keys must be `false`.
+        let legacy_half_nulled = serde_json::json!({
+            "caption_projection_first_linear": null,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&legacy_half_nulled)
+            .expect_err("a nulled legacy key is not `false`");
+        assert!(
+            err.to_string().contains("partial caption-projection"),
+            "{err}"
+        );
+
+        // All four nulled: four keys present, four wrong values.
+        let all_nulled = serde_json::json!({
+            "caption_proj_before_connector": null,
+            "caption_projection_first_linear": null,
+            "caption_proj_input_norm": null,
+            "caption_projection_second_linear": null,
+        });
+        let err = caption_feature_version(&all_nulled).expect_err("all four are non-boolean");
+        let text = err.to_string();
+        assert!(text.contains("unsupported caption-projection"), "{text}");
+        for (name, _) in CAPTION_V2_EXPECTED_CONFIG {
+            assert!(text.contains(name), "{text} missing {name}");
+        }
+
+        // A null in ONLY the two newer keys still counts them as present, so this is a four-key
+        // block with two mismatches — never the legacy two-key shape.
+        let newer_nulled = serde_json::json!({
+            "caption_proj_before_connector": null,
+            "caption_proj_input_norm": null,
+        });
+        let err = caption_feature_version(&newer_nulled).expect_err("two present, two missing");
+        assert!(
+            err.to_string().contains("partial caption-projection"),
+            "{err}"
+        );
     }
 
     #[test]

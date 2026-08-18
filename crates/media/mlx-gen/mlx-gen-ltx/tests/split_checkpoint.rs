@@ -319,9 +319,12 @@ fn write_2_5_bundle(root: &Path) {
             VERSION,
             (
                 "config",
-                r#"{"audio_vae":{"model":{"params":{"ddconfig":{"ch":128,"out_ch":2,
-                        "ch_mult":[1,2,4],"num_res_blocks":2,"z_channels":8,"mel_bins":64,
-                        "mid_block_add_attention":false},"sampling_rate":16000}}},
+                // Deliberately NON-2.3 ddconfig values. With the 2.3 defaults here, a mutant that
+                // dropped the `model.params.ddconfig` descent would read an empty object, fall back
+                // to those same defaults, and the assertions would still pass.
+                r#"{"audio_vae":{"model":{"params":{"ddconfig":{"ch":96,"out_ch":1,
+                        "ch_mult":[1,2,4,8],"num_res_blocks":3,"z_channels":16,"mel_bins":128,
+                        "mid_block_add_attention":true},"sampling_rate":16000}}},
                     "vocoder":{"vocoder":{"resblock":"AMP1","activation":"snakebeta",
                         "upsample_rates":[5,2,2,2,2,2],"upsample_initial_channel":1536,
                         "use_tanh_at_final":false,"use_bias_at_final":false},
@@ -405,11 +408,18 @@ fn every_2_5_component_resolves_independently_and_reads_its_own_config() {
     assert_eq!(vae.patch_size, 4);
     assert_eq!(vae.decoder_blocks.len(), 9);
 
-    // The audio VAE file owns BOTH its sections.
+    // The audio VAE file owns BOTH its sections. Every value below differs from the 2.3 default,
+    // so this fails if the nested `model.params.ddconfig` descent is skipped.
     let audio = AudioVaeConfig::from_bundle(&bundle).expect("audio vae config");
-    assert_eq!(audio.ch, 128);
-    assert_eq!(audio.z_channels, 8);
-    assert!(!audio.mid_block_add_attention);
+    assert_eq!(audio.ch, 96);
+    assert_eq!(audio.out_ch, 1);
+    assert_eq!(audio.ch_mult, vec![1, 2, 4, 8]);
+    assert_eq!(audio.num_resolutions(), 4);
+    assert_eq!(audio.num_res_blocks, 3);
+    assert_eq!(audio.z_channels, 16);
+    assert_eq!(audio.mel_bins, 128);
+    assert!(audio.mid_block_add_attention);
+    assert_ne!(audio, AudioVaeConfig::defaults());
     let vocoder = VocoderConfig::from_bundle(&bundle).expect("vocoder config");
     assert!(vocoder.core.is_bigvgan());
     assert_eq!(vocoder.final_sample_rate(), 48000);
@@ -431,6 +441,43 @@ fn every_2_5_component_resolves_independently_and_reads_its_own_config() {
         head.config_section("transformer").unwrap()["cross_attention_dim"],
         3072
     );
+}
+
+#[test]
+fn the_audio_vae_accepts_the_flattened_ddconfig_spelling() {
+    // Both spellings appear across LTX-2.x extracts: `audio_vae.model.params.ddconfig` (the shipped
+    // shape) and the same fields flattened onto the `audio_vae` block. Either way the values come
+    // from THIS component's own config — the flattened form is not a "default", so the non-2.3
+    // values below must survive.
+    let dir = tempfile::tempdir().unwrap();
+    write_2_5_bundle(dir.path());
+    write_component(
+        &dir.path().join("vae/ltx-2.5-audio-vae-bf16.safetensors"),
+        &[
+            VERSION,
+            (
+                "config",
+                r#"{"audio_vae":{"ch":64,"out_ch":1,"ch_mult":[1,2],"num_res_blocks":5,
+                    "z_channels":32,"mel_bins":80,"mid_block_add_attention":true},
+                    "vocoder":{"vocoder":{"resblock":"AMP1","activation":"snakebeta"}}}"#,
+            ),
+        ],
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+    let bundle = resolve_split_bundle(&spec).unwrap();
+    let audio = AudioVaeConfig::from_bundle(&bundle).expect("flattened ddconfig");
+    assert_eq!(audio.ch, 64);
+    assert_eq!(audio.out_ch, 1);
+    assert_eq!(audio.ch_mult, vec![1, 2]);
+    assert_eq!(audio.num_res_blocks, 5);
+    assert_eq!(audio.z_channels, 32);
+    assert_eq!(audio.mel_bins, 80);
+    assert!(audio.mid_block_add_attention);
+    // The sibling vocoder section still resolves off the same file.
+    assert!(VocoderConfig::from_bundle(&bundle)
+        .unwrap()
+        .core
+        .is_bigvgan());
 }
 
 #[test]

@@ -388,6 +388,57 @@ impl VaeBlock {
     }
 }
 
+/// The encoder's log-variance head (`vae.latent_log_var`, reference `LogVarianceType`). It decides
+/// how many channels `conv_out` emits on top of the `latent_channels` means — which is why the
+/// deterministic port cares about it at all: it slices the means off the front and must know how
+/// wide the tail is meant to be, so a mode/weight disagreement is a load error rather than a silent
+/// mis-slice.
+///
+/// The LTX-2.5 conv VAE declares `uniform`; the LTX-2.5 DiffVAE's (otherwise identical) conv encoder
+/// declares `constant`. **Both yield the same normalized means**: the reference emits
+/// `latent_channels + 1` channels either way and, after building its `(means, logvar)` pair, keeps
+/// `normalize(sample[:, :latent_channels])` — `uniform` broadcasts the trailing channel as the
+/// logvar, `constant` throws it away and substitutes `approx_ln_0 = -30`. Neither touches the means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatentLogVar {
+    /// `latent_channels + 1` conv_out channels; the trailing channel is one shared log-variance.
+    Uniform,
+    /// `latent_channels + 1` conv_out channels; the trailing channel is discarded and the
+    /// log-variance is a constant. Same means as [`Uniform`](Self::Uniform).
+    Constant,
+    /// `2 · latent_channels` conv_out channels: means then per-channel log-variance.
+    PerChannel,
+    /// `latent_channels` conv_out channels, no log-variance head.
+    None,
+}
+
+impl LatentLogVar {
+    /// Parse the reference's `latent_log_var` string. Unknown values are rejected rather than
+    /// defaulted — an unrecognized mode changes the conv_out width, which would otherwise surface as
+    /// a wrong-looking latent instead of an error.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "uniform" => Ok(Self::Uniform),
+            "constant" => Ok(Self::Constant),
+            "per_channel" => Ok(Self::PerChannel),
+            "none" => Ok(Self::None),
+            other => Err(Error::Msg(format!(
+                "ltx: unknown vae.latent_log_var {other:?} (expected uniform | constant | \
+                 per_channel | none)"
+            ))),
+        }
+    }
+
+    /// The `conv_out` channel count this mode implies for a `latent_channels`-wide latent.
+    pub fn conv_out_channels(&self, latent_channels: i32) -> i32 {
+        match self {
+            Self::Uniform | Self::Constant => latent_channels + 1,
+            Self::PerChannel => 2 * latent_channels,
+            Self::None => latent_channels,
+        }
+    }
+}
+
 /// The LTX video VAE config (`embedded_config.json` → `vae`), driving the encoder + decoder
 /// structure. `decoder_blocks` is listed in **encoder** order (the decoder reverses it at build
 /// time, matching the reference `_build_up_blocks_from_config`).
@@ -403,6 +454,9 @@ pub struct LtxVaeConfig {
     /// `"zeros"` for 2.3 (the 2.0 default was `"reflect"`). Spatial conv padding mode. The decoder
     /// hardcodes `"zeros"`; any other value is **rejected at load** ([`Self::from_model_dir`], F-075).
     pub spatial_padding_mode: String,
+    /// The encoder's log-variance head. See [`LatentLogVar`]: it fixes the expected `conv_out`
+    /// width, which [`crate::vae::LtxVideoVae`] checks the encoder weights against.
+    pub latent_log_var: LatentLogVar,
     pub decoder_blocks: Vec<VaeBlock>,
     pub encoder_blocks: Vec<VaeBlock>,
 }
@@ -422,6 +476,7 @@ impl LtxVaeConfig {
             patch_size: 4,
             timestep_conditioning: false,
             spatial_padding_mode: "zeros".into(),
+            latent_log_var: LatentLogVar::Uniform,
             decoder_blocks: vec![
                 b("res_x", 4, 1),
                 b("compress_space", 0, 2),
@@ -447,22 +502,51 @@ impl LtxVaeConfig {
         }
     }
 
-    /// Parse the `vae` block of a parsed `embedded_config.json`.
-    pub fn from_embedded_vae(v: &Value) -> Self {
+    /// Parse the `vae` block of a parsed `embedded_config.json` (or of an LTX-2.5 VAE component
+    /// checkpoint's `__metadata__.config.vae`, which is the same shape).
+    ///
+    /// Two on-disk spellings are accepted, mirroring the reference `_prepare_video_encoder_kwargs`
+    /// (sc-18765):
+    ///  - **flat** `CausalVideoAutoencoder` (LTX-2.3 and the LTX-2.5 conv VAE): encoder fields sit on
+    ///    the `vae` block itself, latent width is `latent_channels`, block list is `encoder_blocks`;
+    ///  - **nested** `CausalDiffusionVAE` (the LTX-2.5 DiffVAE): the same conv encoder's fields sit
+    ///    under `vae.encoder`, where the latent width is that block's `out_channels` and the block
+    ///    list is spelled `blocks`. Its `decoder` is an `NADiffusionDecoder` and is NOT parsed here —
+    ///    `decoder_blocks` stays absent, so a caller that asks this config for a conv decoder gets
+    ///    the defaults rather than a decoder built from another architecture's config.
+    pub fn from_embedded_vae(v: &Value) -> Result<Self> {
         let mut cfg = Self::defaults();
-        cfg.latent_channels = get_i32(v, "latent_channels", cfg.latent_channels);
-        cfg.patch_size = get_i32(v, "patch_size", cfg.patch_size);
+        // The nested-encoder block, when present, wins for every encoder-side field.
+        let enc = v.get("encoder").filter(|e| e.is_object());
+        let enc_scope = enc.unwrap_or(v);
+
+        cfg.latent_channels = match enc {
+            Some(e) => get_i32(e, "out_channels", cfg.latent_channels),
+            None => get_i32(v, "latent_channels", cfg.latent_channels),
+        };
+        cfg.patch_size = get_i32(enc_scope, "patch_size", cfg.patch_size);
         cfg.timestep_conditioning = get_bool(v, "timestep_conditioning", cfg.timestep_conditioning);
-        if let Some(s) = v.get("spatial_padding_mode").and_then(Value::as_str) {
+        if let Some(s) = enc_scope
+            .get("spatial_padding_mode")
+            .or_else(|| v.get("spatial_padding_mode"))
+            .and_then(Value::as_str)
+        {
             cfg.spatial_padding_mode = s.to_string();
+        }
+        if let Some(s) = enc_scope.get("latent_log_var").and_then(Value::as_str) {
+            cfg.latent_log_var = LatentLogVar::parse(s)?;
         }
         if let Some(blocks) = parse_vae_blocks(v.get("decoder_blocks")) {
             cfg.decoder_blocks = blocks;
         }
-        if let Some(blocks) = parse_vae_blocks(v.get("encoder_blocks")) {
+        if let Some(blocks) = parse_vae_blocks(
+            enc_scope
+                .get("encoder_blocks")
+                .or_else(|| enc_scope.get("blocks")),
+        ) {
             cfg.encoder_blocks = blocks;
         }
-        cfg
+        Ok(cfg)
     }
 
     /// Load from a model directory's `embedded_config.json` (`vae` block). Falls back to
@@ -476,7 +560,11 @@ impl LtxVaeConfig {
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
-            Some(v) => Self::from_embedded_vae(v).validated(),
+            // sc-18765 made `from_embedded_vae` fallible (`latent_log_var` parses into a typed enum)
+            // and inlined the F-075 gates here; sc-18757 extracted those same gates into `validated`
+            // so the split-bundle path applies them identically. Keep both: propagate the parse
+            // error, then run the shared gate.
+            Some(v) => Self::from_embedded_vae(v)?.validated(),
             None => Ok(Self::defaults()),
         }
     }
@@ -492,7 +580,7 @@ impl LtxVaeConfig {
     /// 2.3-shaped default here would build the wrong block ladder against 2.5 weights.
     pub fn from_bundle(bundle: &LtxBundle, component: LtxComponent) -> Result<Self> {
         let vae = bundle.require(component)?;
-        Self::from_embedded_vae(vae.config()?).validated()
+        Self::from_embedded_vae(vae.config()?)?.validated()
     }
 
     /// Apply the load-time gates that reject checkpoint values this decoder does not implement.
