@@ -1,0 +1,36 @@
+{
+  "_provenance": {
+    "source_repo": "Lightricks/LTX-2.5",
+    "path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    "captured": "2026-08-18",
+    "authenticated_as": "SceneWorks (HF_HOME=/Volumes/Models/huggingface)",
+    "method": "Two HTTP Range requests per file against https://huggingface.co/Lightricks/LTX-2.5/resolve/main/<path>, Authorization: Bearer <SceneWorks token>: bytes=0-7 for the little-endian u64 safetensors header length, then bytes=8-{8+len-1} for the JSON header itself. Zero tensor payload bytes fetched for any file.",
+    "story": "sc-18756"
+  },
+  "total_size_bytes": 995778752,
+  "header_len_bytes": 42936,
+  "tensor_count": 72,
+  "dtypes": [
+    "BF16"
+  ],
+  "metadata": {
+    "config": {
+      "_class_name": "LatentUpsampler",
+      "in_channels": 128,
+      "mid_channels": 1024,
+      "num_blocks_per_stage": 4,
+      "dims": 3,
+      "spatial_upsample": true,
+      "temporal_upsample": false,
+      "spatial_scale": 2.0,
+      "rational_resampler": false
+    },
+    "license": {
+      "_omitted": true,
+      "reason": "LTX-2.x Community License Agreement body, embedded verbatim in the upstream file's __metadata__. Excluded per the story's instruction to record __metadata__ 'minus the embedded license body'.",
+      "char_length": 34561,
+      "license_date": "August 11, 2026",
+      "canonical_text": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md"
+    }
+  }
+}
