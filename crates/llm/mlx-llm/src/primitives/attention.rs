@@ -114,16 +114,21 @@ fn sdpa_fused(
         AttnMask::Causal => Some(ScaledDotProductAttentionMask::Causal),
         AttnMask::Additive(a) => Some(ScaledDotProductAttentionMask::Array(a)),
         // `sdpa` materializes the window before dispatching; nothing else reaches the fused kernel.
-        AttnMask::SlidingCausal { .. } => {
-            return Err(Error::Msg(
-                "sliding-window masks must be materialized by `sdpa` before the fused kernel"
-                    .into(),
-            ))
-        }
+        AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
     };
     Ok(scaled_dot_product_attention(
         queries, keys, values, scale, m, None,
     )?)
+}
+
+/// The internal invariant [`sdpa`] upholds: it converts [`AttnMask::SlidingCausal`] into an explicit
+/// additive mask before dispatching, so neither the fused kernel nor the chunked-prefill path ever
+/// sees the variant. Reaching either with it is a bug in this module, not bad input.
+fn sliding_mask_not_materialized() -> Error {
+    Error::Msg(
+        "sliding-window masks must be materialized by `sdpa` before dispatch (internal invariant)"
+            .into(),
+    )
 }
 
 /// A contiguous `[start, end)` index vector for [`Array::take_axis`].
@@ -171,30 +176,26 @@ fn sdpa_chunked_prefill(
     while c0 < q_len {
         let c1 = (c0 + SDPA_MAX_FUSED_QLEN).min(q_len);
         let q_chunk = queries.try_index((.., .., c0..c1, ..))?; // [·, ·, c1−c0, hd] view
-        let out =
-            match mask {
-                AttnMask::None => sdpa_fused(&q_chunk, keys, values, scale, AttnMask::None)?,
-                AttnMask::Causal => {
-                    let end = offset + c1;
-                    let k_chunk = keys.try_index((.., .., 0..end, ..))?; // [·, ·, end, hd] prefix view
-                    let v_chunk = values.try_index((.., .., 0..end, ..))?;
-                    sdpa_fused(&q_chunk, &k_chunk, &v_chunk, scale, AttnMask::Causal)?
+        let out = match mask {
+            AttnMask::None => sdpa_fused(&q_chunk, keys, values, scale, AttnMask::None)?,
+            AttnMask::Causal => {
+                let end = offset + c1;
+                let k_chunk = keys.try_index((.., .., 0..end, ..))?; // [·, ·, end, hd] prefix view
+                let v_chunk = values.try_index((.., .., 0..end, ..))?;
+                sdpa_fused(&q_chunk, &k_chunk, &v_chunk, scale, AttnMask::Causal)?
+            }
+            AttnMask::Additive(a) => {
+                let q_axis = a.ndim() as i32 - 2;
+                if a.shape()[q_axis as usize] == q_len {
+                    let a_chunk = a.take_axis(range_index(c0, c1), q_axis)?;
+                    sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(&a_chunk))?
+                } else {
+                    sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(a))?
                 }
-                AttnMask::Additive(a) => {
-                    let q_axis = a.ndim() as i32 - 2;
-                    if a.shape()[q_axis as usize] == q_len {
-                        let a_chunk = a.take_axis(range_index(c0, c1), q_axis)?;
-                        sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(&a_chunk))?
-                    } else {
-                        sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(a))?
-                    }
-                }
-                // Unreachable: `sdpa` materializes the window into `Additive` before it gets here.
-                AttnMask::SlidingCausal { .. } => return Err(Error::Msg(
-                    "sliding-window masks must be materialized by `sdpa` before chunked prefill"
-                        .into(),
-                )),
-            };
+            }
+            // `sdpa` materializes the window into `Additive` before it ever reaches here.
+            AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
+        };
         outs.push(out); // stay lazy: the caller's single forward `eval` streams + frees each chunk's
                         // K/V prefix slice, so peak transient is one chunk (sc-7469 — no per-chunk sync)
         c0 = c1;
