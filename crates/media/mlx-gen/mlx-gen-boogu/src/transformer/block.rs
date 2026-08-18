@@ -713,12 +713,50 @@ mod tests {
             .expect("synthetic weights")
     }
 
+    /// Fused-vs-split comparison mirroring `mlx_gen::qkv`'s test helper `agree()`: bit-exact
+    /// whenever it holds (it does on the self-hosted macOS 26.2 NAX build), else a bounded
+    /// **relative** comparison. The two arms run differently shaped GEMMs over the same numbers —
+    /// the fused arm one `N = 5040` matmul, the split arm three at `N = 3360/840/840` — and MLX
+    /// picks its Metal GEMM tile shape (and therefore its accumulation order) from `(M, N, K)`, so
+    /// hosted CI (`macos-15-arm64`) compiles a kernel set that can land the arms a few ULP apart.
+    /// The bound is set far below what a slicing defect (a wrong row range, a stride misread)
+    /// would produce: that is an O(1) relative error, not O(ulp).
+    #[track_caller]
+    fn assert_arms_agree(a: &Array, b: &Array, what: &str) {
+        assert_eq!(a.shape(), b.shape(), "{what}: shape");
+        assert_eq!(a.dtype(), b.dtype(), "{what}: dtype");
+        assert_eq!(
+            a.dtype(),
+            mlx_rs::Dtype::Float32,
+            "{what}: this test's arrays are f32 (see `det`) — the 1e-5 bound below assumes it"
+        );
+        if array_eq(a, b, None).unwrap().item::<bool>() {
+            return;
+        }
+        let diff = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        let max_abs = mlx_rs::ops::max(&diff, None).unwrap().item::<f32>();
+        let scale = mlx_rs::ops::max(mlx_rs::ops::abs(a).unwrap(), None)
+            .unwrap()
+            .item::<f32>()
+            .max(f32::MIN_POSITIVE);
+        let rel = max_abs / scale;
+        // One ULP of f32 is ~2^-23 relative; allow a handful of accumulation steps' worth, and
+        // nothing remotely close to "read the wrong rows".
+        assert!(
+            rel <= 1e-5,
+            "{what}: the fused and split arms disagree by rel={rel:e} (max|delta|={max_abs:e}, \
+             scale={scale:e}), far beyond Metal GEMM kernel variance — this is a SLICING defect \
+             (a wrong row range or a stride misread), not accumulation order"
+        );
+    }
+
     /// SC-18319 — the production wiring, at boogu's own numbers.
     ///
     /// **Dense**: the three projections read the same activation at the same `in_features`, so they
     /// pack into one matrix and the block runs one matmul instead of three. **Quantized**:
     /// `GROUP_SIZE = 32` and the kv `out = 7 · 120 = 840` with `840 % 32 = 8`, so the pack is
-    /// refused rather than silently changing effective bits. Fusing must not move a single bit.
+    /// refused rather than silently changing effective bits. Fusing must not change the numbers
+    /// beyond Metal GEMM tile-shape variance (see [`assert_arms_agree`]).
     ///
     /// Fusion is **opt-in** (`mlx_gen::qkv::set_fused_qkv` defaults to off), so this test holds a
     /// guard across the whole build — otherwise every arm below would pass while exercising nothing,
@@ -759,8 +797,12 @@ mod tests {
         let sin = det(&[1, s, HEAD_DIM / 2], 0.07, 0.6);
         let packed_out = fused.forward(&x, &cos, &sin).expect("dense forward");
 
-        // Unfusing must not change a single bit — the packed matrix is the row-wise concatenation
-        // of the three bases and a matmul's rows are independent.
+        // The packed matrix is the row-wise concatenation of the three bases and a matmul's output
+        // rows are independent, so the two arms are ALGEBRAICALLY identical — but not bit-identical
+        // in general: MLX chooses its Metal GEMM tile shape (and with it the accumulation order)
+        // from `(M, N, K)`, and the arms differ in `N` by construction (one 5040-wide GEMM vs
+        // 3360/840/840). See `assert_arms_agree` for the bound that still catches a real slicing
+        // defect, and `mlx_gen::qkv::FusedQkvProjection::forward_packed`'s doc for the full story.
         let mut split = build(hidden);
         assert!(
             split.fusion_engaged(),
@@ -775,11 +817,10 @@ mod tests {
         );
         let split_out = split.forward(&x, &cos, &sin).expect("split forward");
         assert_eq!(packed_out.shape(), split_out.shape());
-        assert!(
-            array_eq(&packed_out, &split_out, None)
-                .unwrap()
-                .item::<bool>(),
-            "fusing boogu's q/k/v must be bit-exact"
+        assert_arms_agree(
+            &packed_out,
+            &split_out,
+            "boogu fused vs split self-attention",
         );
 
         // Quantizing must REFUSE the pack on the misaligned kv output axis — and the toggle is

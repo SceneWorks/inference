@@ -28,10 +28,17 @@
 //! the executed kernel is identical and only its construction is amortized. P3 substitutes MLX's
 //! native fused epilogue for the composed expression only where it is **bit-exact**, and reports a
 //! per-operation [`ToggleDisposition::Fallback`] otherwise. The accepted MLX tile-shape ULP context
-//! (fused-vs-unfused GEMM tiling differing by 1 ULP) does **not** apply: it concerns a fused *matmul
-//! tiling* choice, whereas these epilogues are asserted `array_eq` against the composed baseline
-//! across every supported dtype, layout, group size, and bit width in `nn`'s P3 suite, and the P1
-//! sites are proven bit-identical to their eager and one-shot forms.
+//! (fused-vs-unfused GEMM tiling differing by 1 ULP) does **not** bite here — but not because the
+//! epilogues avoid matmuls: three of the six P3 ops **are** matmuls (`quantized_matmul_bias` →
+//! `affine_qmm_bias_t`; `conv2d`/`conv3d` → implicit GEMM). What makes them exact is (a) each fused
+//! kernel is the **same template instantiation** as its composed counterpart, with `has_bias` as a
+//! template parameter over identical tile constants — so the accumulation order cannot change — and
+//! (b) `ops.cpp` carries admission guards mirroring MLX's own qmv/split-K/Winograd kernel
+//! selection, rejecting any shape that would route to a differently-tiled kernel with a `Fallback`
+//! receipt instead of running it. On that admitted set the epilogues are asserted `array_eq`
+//! against the composed baseline across every supported dtype, layout, group size, and bit width in
+//! `nn`'s P3 suite. The P1 sites are proven bit-identical to their one-shot compiled forms, and —
+//! at the level of each individual compiled op — to their eager forms.
 //!
 //! # Memory tradeoff of a default-on retention
 //!

@@ -709,8 +709,9 @@ fn dense_triple(inp: i32, q_out: i32, kv_out: i32, bias: bool) -> FusedQkvProjec
 /// **The bit-exactness invariant AND its negative control**, in the shape `nn.rs`'s compiled-glue
 /// guard established:
 ///
-/// * run the A/B twice — once unfused-vs-unfused (the eager-vs-eager sanity arm) and once
-///   fused-vs-unfused (the real invariant) — with **exact** equality, no tolerance;
+/// * run the A/B twice — once unfused-vs-unfused (the eager-vs-eager sanity arm, asserted exactly)
+///   and once fused-vs-unfused (the real invariant, asserted via [`agree`]: bit-exact where the
+///   Metal GEMM kernel is shared across the two output widths, bounded at ULP scale otherwise);
 /// * then prove the toggle is **not inert**. A bit-exactness test alone passes trivially if the
 ///   fused arm never engaged, which is the single most likely way this ships broken.
 ///
@@ -1415,8 +1416,9 @@ fn every_adopted_family_geometry_is_group_aligned() {
 ///
 /// Three claims per row, per dtype:
 ///
-/// 1. **exact** equality (`array_eq`, no tolerance) between the fused and the unfused arm, built
-///    from byte-identical bases with only [`set_fused_qkv`] flipped between them;
+/// 1. agreement via [`agree`] — bit-exact where the Metal GEMM kernel is shared across the two
+///    output widths, bounded far below a slicing defect otherwise — between the fused and the
+///    unfused arm, built from byte-identical bases with only [`set_fused_qkv`] flipped between them;
 /// 2. **dtype equality** -- a fusion that silently promoted would still compare equal under a
 ///    tolerance-based check and under `array_eq`'s own broadcasting, so the dtype is asserted
 ///    separately;
