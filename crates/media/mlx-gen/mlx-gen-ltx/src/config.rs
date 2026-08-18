@@ -91,6 +91,25 @@ pub struct LtxConfig {
     pub audio_positional_embedding_max_pos: i32,
     /// Cross-modal gate timestep multiplier (`av_ca_timestep_scale_multiplier`, 1000 in 2.3).
     pub av_ca_timestep_scale_multiplier: i32,
+
+    // --- sc-18758: the entire measured LTX-2.3→2.5 transformer config delta (two keys). Both are
+    // absent from the 2.3 `embedded_config.json`, so the defaults below reproduce 2.3 byte-for-byte;
+    // 2.5 sets `ff_bias:false` (`audio_ff_bias` follows) and `use_keyframes_abs_pos_embedding:true`.
+    /// `ff_bias` — whether the **video** FFN's `proj_in`/`proj_out` Linears carry a bias. `true` for
+    /// 2.3 (absent ⇒ default); `false` for 2.5 (the checkpoint carries no `ff.proj_{in,out}.bias`).
+    pub ff_bias: bool,
+    /// `audio_ff_bias` — the audio-stream analog of [`ff_bias`](Self::ff_bias) (`audio_ff`).
+    pub audio_ff_bias: bool,
+    /// `connector_ff_bias` — the `Embeddings1DConnector`'s own FFN bias flag (reference
+    /// `Embeddings1DConnectorConfigurator`/`AudioEmbeddings1DConnectorConfigurator`). Independent of
+    /// `ff_bias`: neither the 2.3 nor the shipped 2.5 checkpoint sets it, so it defaults `true` on
+    /// both — parsed here for full fidelity to the reference config surface, not because it is part
+    /// of the measured 2.3→2.5 delta.
+    pub connector_ff_bias: bool,
+    /// `use_keyframes_abs_pos_embedding` — whether the video stream carries a learned `(1, inner_dim)`
+    /// absolute-position marker added to single-pixel generated-keyframe tokens (the DFR keyframe-slot
+    /// path). `false` for 2.3 (absent ⇒ default, no such tensor); `true` for 2.5.
+    pub use_keyframes_abs_pos_embedding: bool,
 }
 
 impl LtxConfig {
@@ -151,6 +170,10 @@ impl LtxConfig {
             audio_connector_attention_head_dim: 64,
             audio_positional_embedding_max_pos: 20,
             av_ca_timestep_scale_multiplier: 1000,
+            ff_bias: true,
+            audio_ff_bias: true,
+            connector_ff_bias: true,
+            use_keyframes_abs_pos_embedding: false,
         }
     }
 
@@ -274,6 +297,13 @@ impl LtxConfig {
             "av_ca_timestep_scale_multiplier",
             cfg.av_ca_timestep_scale_multiplier,
         );
+
+        // sc-18758: the entire measured 2.3→2.5 delta. Both keys are absent from the 2.3
+        // `embedded_config.json`, so `get_bool`'s default (2.3's true/true/true/false) is exact.
+        cfg.ff_bias = get_bool(t, "ff_bias", true);
+        cfg.audio_ff_bias = get_bool(t, "audio_ff_bias", true);
+        cfg.connector_ff_bias = get_bool(t, "connector_ff_bias", true);
+        cfg.use_keyframes_abs_pos_embedding = get_bool(t, "use_keyframes_abs_pos_embedding", false);
 
         // caption_channels derivation (generate_av.py lines 1484–1498).
         let no_caption_proj =
@@ -915,6 +945,58 @@ mod tests {
         assert_eq!(cfg.connector_num_learnable_registers, 128);
         assert_eq!(cfg.connector_positional_embedding_max_pos, 4096);
         assert!(cfg.connector_apply_gated_attention);
+        // sc-18758: 2.3's `embedded_config.json` carries neither key ⇒ defaults (true/true/true/false),
+        // reproducing the reference `ff_bias=True, audio_ff_bias=True,
+        // use_keyframes_abs_pos_embedding=False` fallbacks byte-for-byte.
+        assert!(cfg.ff_bias);
+        assert!(cfg.audio_ff_bias);
+        assert!(cfg.connector_ff_bias);
+        assert!(!cfg.use_keyframes_abs_pos_embedding);
+    }
+
+    /// An LTX-2.5 `transformer` block: identical to the 2.3 fixture except the two measured delta
+    /// keys (sc-18758's orientation — diffing `__metadata__.config.transformer` between the 2.3 and
+    /// 2.5 checkpoints changes exactly these two keys, nothing else).
+    fn ltx25_transformer() -> Value {
+        let mut t = ltx23_transformer();
+        let obj = t.as_object_mut().unwrap();
+        obj.insert("ff_bias".into(), serde_json::json!(false));
+        obj.insert("audio_ff_bias".into(), serde_json::json!(false));
+        obj.insert(
+            "use_keyframes_abs_pos_embedding".into(),
+            serde_json::json!(true),
+        );
+        t
+    }
+
+    #[test]
+    fn ltx25_config_sets_exactly_the_measured_delta() {
+        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer());
+        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer());
+
+        // The two measured keys flip.
+        assert!(cfg23.ff_bias && cfg23.audio_ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
+        assert!(!cfg25.ff_bias && !cfg25.audio_ff_bias && cfg25.use_keyframes_abs_pos_embedding);
+        // `connector_ff_bias` is not part of the delta — the 2.5 checkpoint doesn't set it either,
+        // so it stays the reference default (true) on both configs.
+        assert!(cfg23.connector_ff_bias);
+        assert!(cfg25.connector_ff_bias);
+
+        // Everything else the epic orientation calls out as unchanged actually is unchanged: 48
+        // layers/32 heads/128 head-dim/4096 cross-attn/gated-attention/embeddings-connector/
+        // cross-attention-adaln/split-rope/float64-frequencies all match between the two configs.
+        assert_eq!(cfg23.num_layers, cfg25.num_layers);
+        assert_eq!(cfg23.num_attention_heads, cfg25.num_attention_heads);
+        assert_eq!(cfg23.attention_head_dim, cfg25.attention_head_dim);
+        assert_eq!(cfg23.cross_attention_dim, cfg25.cross_attention_dim);
+        assert_eq!(cfg23.apply_gated_attention, cfg25.apply_gated_attention);
+        assert_eq!(
+            cfg23.use_embeddings_connector,
+            cfg25.use_embeddings_connector
+        );
+        assert_eq!(cfg23.cross_attention_adaln, cfg25.cross_attention_adaln);
+        assert_eq!(cfg23.rope_type, cfg25.rope_type);
+        assert!(cfg23.double_precision_rope && cfg25.double_precision_rope);
     }
 
     #[test]

@@ -89,6 +89,14 @@ pub struct TransformerConfig {
     pub rope_theta: f64,
     pub rope_max_pos: [i32; 3],
     pub timestep_scale_multiplier: f64,
+    /// sc-18758 — the measured LTX-2.3→2.5 delta's video-stream half: `true` for 2.3 (both FFN
+    /// Linears carry a bias, the reference default when `ff_bias` is absent from the config), `false`
+    /// for 2.5 (the checkpoint carries no `ff.proj_{in,out}.bias`).
+    pub ff_bias: bool,
+    /// sc-18758 — whether the video stream carries a learned `(1, inner_dim)` absolute-position
+    /// marker added to single-pixel generated-keyframe tokens (the DFR keyframe-slot path). `false`
+    /// for 2.3 (no such tensor); `true` for 2.5.
+    pub use_keyframes_abs_pos_embedding: bool,
 }
 
 impl TransformerConfig {
@@ -101,8 +109,22 @@ impl TransformerConfig {
             rope_theta: 10000.0,
             rope_max_pos: [20, 2048, 2048],
             timestep_scale_multiplier: 1000.0,
+            ff_bias: true,
+            use_keyframes_abs_pos_embedding: false,
         }
     }
+
+    /// The LTX-2.5 video DiT: identical dims to 2.3 (per the epic orientation, the *entire* measured
+    /// config delta is `ff_bias`/`use_keyframes_abs_pos_embedding`) with `ff_bias:false` and
+    /// `use_keyframes_abs_pos_embedding:true`.
+    pub fn ltx_2_5() -> Self {
+        Self {
+            ff_bias: false,
+            use_keyframes_abs_pos_embedding: true,
+            ..Self::ltx_2_3()
+        }
+    }
+
     /// Inner dim `heads × head_dim` = 4096.
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
@@ -124,6 +146,8 @@ pub struct AvConfig {
     pub cross_inner: usize,
     /// Cross-modal (time-axis) RoPE max position (`cross_pe_max_pos`, 20).
     pub cross_max_pos: i32,
+    /// sc-18758 — `audio_ff_bias`, the audio-stream analog of `video.ff_bias`.
+    pub audio_ff_bias: bool,
 }
 
 impl AvConfig {
@@ -135,8 +159,20 @@ impl AvConfig {
             audio_max_pos: 20,
             cross_inner: 2048,
             cross_max_pos: 20,
+            audio_ff_bias: true,
         }
     }
+
+    /// The LTX-2.5 dual-modal config: [`TransformerConfig::ltx_2_5`]'s video half + `audio_ff_bias:
+    /// false` (2.5 sets both `ff_bias` and `audio_ff_bias`); every other dim is unchanged from 2.3.
+    pub fn ltx_2_5() -> Self {
+        Self {
+            video: TransformerConfig::ltx_2_5(),
+            audio_ff_bias: false,
+            ..Self::ltx_2_3()
+        }
+    }
+
     /// Audio inner dim `heads × head_dim` = 2048.
     pub fn audio_inner(&self) -> usize {
         self.audio_heads * self.audio_head_dim
@@ -153,6 +189,11 @@ pub struct ConnectorConfig {
     pub max_pos: i32,
     pub norm_eps: f64,
     pub rope_theta: f64,
+    /// sc-18758 — `connector_ff_bias` (reference `Embeddings1DConnectorConfigurator`/
+    /// `AudioEmbeddings1DConnectorConfigurator`). Independent of the DiT's own `ff_bias`; neither the
+    /// 2.3 nor the shipped 2.5 checkpoint sets it, so it is `true` on both in practice today — parsed
+    /// for fidelity to the reference config surface, not because it is part of the measured delta.
+    pub ff_bias: bool,
 }
 
 impl ConnectorConfig {
@@ -165,6 +206,7 @@ impl ConnectorConfig {
             max_pos: 4096,
             norm_eps: 1e-6,
             rope_theta: 10000.0,
+            ff_bias: true,
         }
     }
     pub fn inner_dim(&self) -> usize {
@@ -182,6 +224,7 @@ impl ConnectorConfig {
             max_pos: 4096,
             norm_eps: 1e-6,
             rope_theta: 10000.0,
+            ff_bias: true,
         }
     }
 }
@@ -433,5 +476,44 @@ mod audio_config_tests {
         assert_eq!(a.num_resolutions(), 3);
         assert!(!a.mid_block_add_attention);
         assert_eq!(a.z_channels, 8);
+    }
+}
+
+#[cfg(test)]
+mod sc_18758_delta_tests {
+    use super::*;
+
+    /// sc-18758: 2.3's defaults reproduce the reference `ff_bias`/`audio_ff_bias` absent-key fallback
+    /// (`True`) and `use_keyframes_abs_pos_embedding` absent-key fallback (`False`).
+    #[test]
+    fn ltx_2_3_defaults_match_the_reference_absent_key_fallback() {
+        let cfg = AvConfig::ltx_2_3();
+        assert!(cfg.video.ff_bias);
+        assert!(cfg.audio_ff_bias);
+        assert!(!cfg.video.use_keyframes_abs_pos_embedding);
+        assert!(ConnectorConfig::ltx_2_3().ff_bias);
+        assert!(ConnectorConfig::ltx_2_3_audio().ff_bias);
+    }
+
+    /// The 2.3→2.5 config delta is exactly these two keys — everything else `AvConfig::ltx_2_5`
+    /// shares with `ltx_2_3` is unchanged (48 layers, 32/128 heads/head-dim, etc).
+    #[test]
+    fn ltx_2_5_flips_exactly_the_measured_delta() {
+        let c23 = AvConfig::ltx_2_3();
+        let c25 = AvConfig::ltx_2_5();
+
+        assert!(c23.video.ff_bias && c23.audio_ff_bias);
+        assert!(!c25.video.ff_bias && !c25.audio_ff_bias);
+        assert!(!c23.video.use_keyframes_abs_pos_embedding);
+        assert!(c25.video.use_keyframes_abs_pos_embedding);
+
+        // Not part of the delta — unaffected by the `ltx_2_5()` constructor.
+        assert_eq!(c23.video.num_layers, c25.video.num_layers);
+        assert_eq!(c23.video.num_heads, c25.video.num_heads);
+        assert_eq!(c23.video.head_dim, c25.video.head_dim);
+        assert_eq!(c23.audio_heads, c25.audio_heads);
+        assert_eq!(c23.audio_head_dim, c25.audio_head_dim);
+        assert_eq!(c23.cross_inner, c25.cross_inner);
+        assert_eq!(c23.cross_max_pos, c25.cross_max_pos);
     }
 }

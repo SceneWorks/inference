@@ -65,8 +65,10 @@ impl Connector {
                 q_norm: a.get_unchecked("q_norm.weight")?.to_dtype(DType::BF16)?,
                 k_norm: a.get_unchecked("k_norm.weight")?.to_dtype(DType::BF16)?,
                 gate: linear(&a, "to_gate_logits")?,
-                ff_in: linear(&b.pp("ff.net.0"), "proj")?,
-                ff_out: linear(&b.pp("ff.net"), "2")?,
+                // sc-18758: `connector_ff_bias:false` leaves these two bias-free (independent of the
+                // DiT's own `ff_bias`) — `qlinear`'s `bias` flag already handles the absent tensor.
+                ff_in: qlinear(&b.pp("ff.net.0"), "proj", cfg.ff_bias)?,
+                ff_out: qlinear(&b.pp("ff.net"), "2", cfg.ff_bias)?,
             });
         }
         let registers = cvb
