@@ -1,0 +1,158 @@
+{
+  "_provenance": {
+    "source_repo": "Lightricks/LTX-2.5",
+    "path": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "captured": "2026-08-18",
+    "authenticated_as": "SceneWorks (HF_HOME=/Volumes/Models/huggingface)",
+    "method": "Two HTTP Range requests per file against https://huggingface.co/Lightricks/LTX-2.5/resolve/main/<path>, Authorization: Bearer <SceneWorks token>: bytes=0-7 for the little-endian u64 safetensors header length, then bytes=8-{8+len-1} for the JSON header itself. Zero tensor payload bytes fetched for any file.",
+    "story": "sc-18756"
+  },
+  "total_size_bytes": 1452269922,
+  "header_len_bytes": 57464,
+  "tensor_count": 170,
+  "dtypes": [
+    "BF16"
+  ],
+  "metadata": {
+    "config": {
+      "vae": {
+        "_class_name": "CausalVideoAutoencoder",
+        "dims": 3,
+        "in_channels": 3,
+        "out_channels": 3,
+        "latent_channels": 128,
+        "encoder_blocks": [
+          [
+            "res_x",
+            {
+              "num_layers": 4
+            }
+          ],
+          [
+            "compress_space_res",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 6
+            }
+          ],
+          [
+            "compress_time_res",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 4
+            }
+          ],
+          [
+            "compress_all_res",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 2
+            }
+          ],
+          [
+            "compress_all_res",
+            {
+              "multiplier": 1
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 2
+            }
+          ]
+        ],
+        "decoder_blocks": [
+          [
+            "res_x",
+            {
+              "num_layers": 4
+            }
+          ],
+          [
+            "compress_space",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 6
+            }
+          ],
+          [
+            "compress_time",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 4
+            }
+          ],
+          [
+            "compress_all",
+            {
+              "multiplier": 1
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 2
+            }
+          ],
+          [
+            "compress_all",
+            {
+              "multiplier": 2
+            }
+          ],
+          [
+            "res_x",
+            {
+              "num_layers": 2
+            }
+          ]
+        ],
+        "scaling_factor": 1.0,
+        "norm_layer": "pixel_norm",
+        "patch_size": 4,
+        "latent_log_var": "uniform",
+        "use_quant_conv": false,
+        "causal_decoder": false,
+        "timestep_conditioning": false,
+        "normalize_latent_channels": false,
+        "encoder_base_channels": 128,
+        "decoder_base_channels": 128,
+        "spatial_padding_mode": "zeros"
+      }
+    },
+    "model_version": "2.5.0",
+    "license": {
+      "_omitted": true,
+      "reason": "LTX-2.x Community License Agreement body, embedded verbatim in the upstream file's __metadata__. Excluded per the story's instruction to record __metadata__ 'minus the embedded license body'.",
+      "char_length": 34561,
+      "license_date": "August 11, 2026",
+      "canonical_text": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md"
+    }
+  }
+}
