@@ -62,10 +62,11 @@ use crate::audio_vae::AudioDecoder;
 use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
+use crate::image_crf::{condition_image_for_checkpoint, default_image_recompress};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
-    generate_av_latents_iclora, preprocess_conditioning_clip, preprocess_conditioning_image,
-    StageClip, StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
+    generate_av_latents_iclora, preprocess_conditioning_clip, StageClip, StageKeyframe,
+    STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -77,6 +78,13 @@ use crate::vocoder::LtxVocoder;
 
 /// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
+
+/// The `model_version` this engine's checkpoints declare, used to resolve generation params
+/// (sc-18759 — see [`crate::params`]). This crate loads only `ltx_2_3` checkpoints today (the
+/// `ltx_2_5` engine descriptor is sc-18778), so the literal is correct as written, not a
+/// placeholder: once split-checkpoint loading (sc-18757) threads a loaded checkpoint's declared
+/// `model_version` onto [`Ltx`], swap this constant for that field.
+const CHECKPOINT_MODEL_VERSION: &str = "2.3.0";
 
 /// Neutral gray the replace_person mask blends toward (reference `_apply_replacement_mask`).
 const REPLACE_NEUTRAL: u32 = 118;
@@ -1033,8 +1041,19 @@ impl Ltx {
     /// VAE-encode the conditioning image at a stage's pixel resolution `(px_h, px_w)` → the f32 clean
     /// latent `(1, 128, 1, px_h/32, px_w/32)`. The encoder is an f32 quality island (like the VAE
     /// decode); the caller casts the latent to the path dtype.
+    ///
+    /// Re-compresses the image first at the checkpoint's resolved `default_image_crf` (sc-18759 —
+    /// [`CHECKPOINT_MODEL_VERSION`] resolves to [`crate::params::LTX_2_3_PARAMS`]'s `crf: 33`)
+    /// before the existing f32 normalize/layout in [`preprocess_conditioning_image`].
     fn encode_conditioning(&self, image: &Image, px_h: u32, px_w: u32) -> Result<Array> {
-        let video = preprocess_conditioning_image(image, px_w, px_h)?; // f32 (1,3,1,px_h,px_w)
+        let video = condition_image_for_checkpoint(
+            image,
+            px_w,
+            px_h,
+            CHECKPOINT_MODEL_VERSION,
+            None,
+            &mut default_image_recompress,
+        )?; // f32 (1,3,1,px_h,px_w)
         self.vae.encode(&video)
     }
 

@@ -38,6 +38,8 @@ pub mod connector;
 pub mod conv3d;
 pub mod dit_train;
 pub mod gemma;
+pub mod image_crf;
+pub mod params;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
@@ -343,6 +345,9 @@ impl Pipeline {
         Ok(resolved as usize)
     }
 
+    /// Re-compresses the image first at the checkpoint's resolved `default_image_crf` (sc-18759
+    /// — [`config::CHECKPOINT_MODEL_VERSION`] resolves to [`params::LTX_2_3_PARAMS`]'s `crf: 33`)
+    /// before the existing normalize/layout in `conditioning::preprocess_conditioning_image`.
     fn encode_image(
         &self,
         vae: &LtxVideoVae,
@@ -350,8 +355,15 @@ impl Pipeline {
         width: u32,
         height: u32,
     ) -> CResult<Tensor> {
-        let video =
-            conditioning::preprocess_conditioning_image(image, width, height, &self.device)?;
+        let video = image_crf::condition_image_for_checkpoint(
+            image,
+            width,
+            height,
+            config::CHECKPOINT_MODEL_VERSION,
+            None,
+            &self.device,
+            &mut image_crf::default_image_recompress,
+        )?;
         Ok(vae.encode(&video)?)
     }
 
