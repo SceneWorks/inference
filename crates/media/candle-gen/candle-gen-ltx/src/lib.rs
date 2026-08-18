@@ -43,6 +43,7 @@ pub mod quant;
 pub mod rope;
 pub mod text_encoder;
 pub mod tier;
+pub mod tokenizer;
 pub mod training;
 pub mod transformer;
 pub mod vae;
@@ -67,6 +68,7 @@ use config::{
     DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, TEXT_MAX_LENGTH,
 };
 use text_encoder::LtxTextEncoder;
+use tokenizer::{ensure_single_leading_bos_u32, gemma_bos_id};
 use transformer::AvDiT;
 use vae::LtxVideoVae;
 /// Provider-facing LTX geometry, derived from the decoder implementation.
@@ -308,9 +310,15 @@ impl Pipeline {
         })
     }
 
-    /// Tokenize `prompt` with the Gemma tokenizer (BOS, right-truncate then **left-pad** to
-    /// `TEXT_MAX_LENGTH`), returning `(input_ids [1, 256] u32, mask01 [256])`.
+    /// Tokenize `prompt` with the Gemma tokenizer (exactly one leading BOS, right-truncate then
+    /// **left-pad** to `TEXT_MAX_LENGTH`), returning `(input_ids [1, 256] u32, mask01 [256])`.
+    ///
+    /// Gemma-3's `tokenizer.json` post-processor already supplies the `<bos>`, so the
+    /// [`ensure_single_leading_bos_u32`] call is normally a no-op — it is the explicit guard against
+    /// the two ways this goes wrong (no BOS from a post-processor-less tokenizer, a duplicate one
+    /// from an unconditional prepend), and it is the same policy the 2.5 path runs (sc-18762).
     fn tokenize(&self, tok: &tokenizers::Tokenizer, prompt: &str) -> CResult<(Tensor, Vec<u32>)> {
+        let bos_id = gemma_bos_id(tok)?;
         let enc = tok
             .encode(prompt, true)
             .map_err(|e| CandleError::Msg(format!("ltx: tokenize: {e}")))?;
@@ -319,6 +327,7 @@ impl Pipeline {
         if ids.len() > max {
             ids.truncate(max);
         }
+        ensure_single_leading_bos_u32(&mut ids, bos_id, max);
         let nv = ids.len();
         let pad = max - nv;
         let mut padded = vec![0u32; pad];
