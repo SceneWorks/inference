@@ -28,6 +28,14 @@
 //! The driver's tiling **decisions and numerics are unchanged** from the two hand-copied bodies: same
 //! narrow offsets, same trapezoidal outer-product blend, same `maximum(1e-8)` normalize — so decoded
 //! output is byte-identical for a given plan + decode closure.
+//!
+//! **sc-18320 note — the separable blend fold is MLX-only for now.** `mlx-gen`'s tiled decode
+//! re-associated its accumulation by axis and factorized the blend normalizer into per-axis 1-D
+//! vectors because its `pad`-to-full placement materialized a full-output-sized transient per tile.
+//! This driver never had that blow-up: its `slice_assign` accumulators update only each tile's
+//! destination slice, so the sole full-size buffers are the `output` and `weights` accumulators
+//! themselves. Retiring the full-size `weights` buffer here (the remaining, smaller win) is left to
+//! the backend-convergence epic (sc-19048's mandate).
 
 use candle_core::{DType, Error, Result, Tensor};
 use gen_core::CancelFlag;

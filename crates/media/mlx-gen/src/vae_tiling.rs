@@ -216,8 +216,10 @@ pub fn tiled_conv2d_3x3_nhwc(
 /// materialization of output-scale buffers anywhere to guard). It is deliberately kept, with its
 /// boundary unit test, as the ready-made guard for any **future** code that builds an over-bound
 /// array from a host `Vec`: call it before that `from_slice` (the mlx-rs assert would still abort
-/// loudly without it, but as a panic rather than a catchable [`Error`]). The blend-weight
-/// accumulator is strictly smaller than the output, so a single check covers both.
+/// loudly without it, but as a panic rather than a catchable [`Error`]). There is no separate
+/// blend-weight buffer to guard: sc-18320's separable fold retired the full-output-sized weight
+/// accumulator — the normalizer is carried as three 1-D host vectors ([`AxisCoverage`]) and
+/// materialized once as a rank-1 broadcast product, strictly smaller than the output.
 pub fn check_output_writable(full_elems: i64, out_f: i32, out_h: i32, out_w: i32) -> Result<()> {
     if full_elems > MAX_WRITABLE_ELEMS {
         return Err(Error::Msg(format!(
