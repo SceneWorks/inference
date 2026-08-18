@@ -110,6 +110,24 @@ mod tests {
         assert_eq!(seen_crf, Some(33));
     }
 
+    /// An explicit `Some(crf)` overrides the checkpoint default (matches upstream's
+    /// `ImageConditioningInput.crf` semantics) — proven by the same instrumentation.
+    #[test]
+    fn explicit_crf_override_reaches_the_conditioner_and_skips_resolution() {
+        let device = Device::Cpu;
+        let image = solid_image(4, 4, [10, 20, 30]);
+        let mut seen_crf: Option<u8> = None;
+        let mut spy = |img: &Image, crf: u8| -> Result<Image> {
+            seen_crf = Some(crf);
+            Ok(img.clone())
+        };
+        // A bogus model_version would error if resolution were reached at all -- proves the
+        // explicit override short-circuits resolve_generation_params.
+        let _ = condition_image_for_checkpoint(&image, 4, 4, "9.9.9", Some(40), &device, &mut spy)
+            .unwrap();
+        assert_eq!(seen_crf, Some(40));
+    }
+
     /// `crf == 0` is "no recompression" -- the spy must NOT be called.
     #[test]
     fn zero_crf_skips_recompression_entirely() {
@@ -123,6 +141,18 @@ mod tests {
         let _ = condition_image_for_checkpoint(&image, 4, 4, "2.5.0", Some(0), &device, &mut spy)
             .unwrap();
         assert!(!called, "crf=0 must skip the recompress hook entirely");
+    }
+
+    /// An unrecognized model_version with no explicit crf override propagates
+    /// `resolve_generation_params`'s error rather than silently defaulting.
+    #[test]
+    fn unresolvable_version_without_override_errors() {
+        let device = Device::Cpu;
+        let image = solid_image(4, 4, [10, 20, 30]);
+        let mut spy = |img: &Image, _crf: u8| -> Result<Image> { Ok(img.clone()) };
+        assert!(
+            condition_image_for_checkpoint(&image, 4, 4, "2.6.0", None, &device, &mut spy).is_err()
+        );
     }
 
     /// The production recompressor actually degrades pixels (real recompression, not a no-op).
