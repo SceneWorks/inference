@@ -236,10 +236,13 @@ impl ClipTextEncoder {
         let (b, n) = (sh[0], sh[1]);
         let dim = self.token_embedding.shape()[1];
 
-        // Defensive bound: the position-embedding gather below indexes `0..n` into the `[max_len, D]`
+        // Hard bound: the position-embedding gather below indexes `0..n` into the `[max_len, D]`
         // table. MLX gathers are not bounds-checked, so `n` past the table would silently produce
-        // garbage embeddings. The tokenizer caps at `MAX_LENGTH`, but guard here too so any other
-        // caller surfaces a typed error instead (F-062).
+        // garbage embeddings (F-062). Since sc-20528 this is the ONLY thing enforcing the context
+        // window — the tokenizer no longer truncates; it splits an over-long prompt into windows
+        // (`ClipBpeTokenizer::tokenize_windows`) and each window is forwarded here on its own, so a
+        // long prompt reaches this guard as `n == max_len`, never past it. A caller that hands over
+        // an unwindowed batch gets a typed error rather than silent garbage.
         let max_pos = self.position_embedding.shape()[0];
         if n > max_pos {
             return Err(Error::Msg(format!(

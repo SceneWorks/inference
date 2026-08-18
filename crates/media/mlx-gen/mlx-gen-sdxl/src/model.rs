@@ -34,7 +34,7 @@ use crate::loader;
 use crate::pipeline::{
     denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
     denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
-    encode_conditioning, encode_init_latents, preprocess_control_image, text_time_ids,
+    encode_conditioning_windows, encode_init_latents, preprocess_control_image, text_time_ids,
     ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -1026,9 +1026,13 @@ impl Sdxl {
         // `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle loads below —
         // bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders
         // (byte-identical to the pre-sc-10839 `encode_conditioning`).
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows, not truncated. The
+        // window count is decided ONCE here, as the max over both CFG rows, so `[cond, uncond]` stay
+        // stackable and the negative prompt takes exactly the same path as the positive one. A
+        // request whose rows both fit is a single window that IS the pre-sc-20528 token batch.
         let tokens = self
             .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
+            .tokenize_windows(&req.prompt, if cfg_on { Some(negative) } else { None })?;
 
         // ── Ladder request resolution (SC-15525) ────────────────────────────────────────────────
         // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
@@ -1071,7 +1075,7 @@ impl Sdxl {
             req.use_pid,
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
-                encode_conditioning(&text.0, &text.1, &tokens)
+                encode_conditioning_windows(&text.0, &text.1, &tokens)
             },
             // Materialize the conditioning + pooled while the encoders are still alive (Sequential
             // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the

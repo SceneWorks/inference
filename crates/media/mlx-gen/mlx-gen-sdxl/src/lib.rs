@@ -25,6 +25,12 @@ pub mod inpaint;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
+// Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long
+// prompt weighting" shape, ported from `candle-gen-sdxl/src/long_prompt.rs` so the two lanes
+// condition on the same tokens. Before it this lane silently truncated at 77 while candle saw the
+// whole prompt. Shared by the txt2img `model` path and the `training` caption/preview encoders so
+// they cannot drift; `ChunkedTokens` is re-exported below because it crosses `pipeline`'s surface.
+mod long_prompt;
 pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
@@ -56,6 +62,7 @@ pub use loader::{
     load_unet_kolors_dtype, load_unet_with_config, load_vae, resolve_unet_weight_file,
     resolve_vae_weight_file,
 };
+pub use long_prompt::ChunkedTokens;
 pub use model::{
     descriptor, load, load_concrete, load_from_ldm_file, DecodeQualitySample, Sdxl,
     LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
@@ -67,8 +74,8 @@ pub use pipeline::{
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
-    encode_init_latents, preprocess_control_image, preprocess_init_image, seeded_prior,
-    text_time_ids, ControlContext, Denoiser,
+    encode_conditioning_windows, encode_init_latents, preprocess_control_image,
+    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
 };
 pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
