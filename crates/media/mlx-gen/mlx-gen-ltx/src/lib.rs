@@ -44,8 +44,10 @@ pub mod connector;
 pub mod convert;
 pub mod enhance;
 pub mod gemma;
+pub mod image_crf;
 pub mod memory_strategy;
 pub mod model;
+pub mod params;
 pub mod pipeline;
 pub mod positions;
 pub mod rope;
@@ -64,11 +66,15 @@ pub use conditioning::{
     keyframe_append_positions, patchify_grid, unpatchify_grid, I2vConditioning, Keyframe,
     VideoTokenState,
 };
-pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
+pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
-pub use convert::{convert_and_assemble, LtxConvertOpts};
+pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
+pub use image_crf::{condition_image_for_checkpoint, default_image_recompress};
 pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};
+pub use params::{
+    resolve_generation_params, GuiderParams, LtxGenerationParams, LTX_2_3_PARAMS, LTX_2_5_PARAMS,
+};
 pub use pipeline::{
     decode_audio_track, decode_to_frames, denoise, denoise_av, denoise_av_tokens,
     generate_av_latents, generate_av_latents_iclora, generate_i2v_latents, generate_t2v,

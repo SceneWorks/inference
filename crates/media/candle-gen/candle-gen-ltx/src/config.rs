@@ -18,6 +18,13 @@ pub const MODEL_ID: &str = "ltx_2_3_distilled";
 /// changing the generator route.
 pub const TRAINER_ID: &str = "ltx_2_3";
 
+/// The `model_version` this engine's checkpoints declare, used to resolve generation params
+/// (sc-18759 — see [`crate::params`]). This crate loads only `ltx_2_3` checkpoints today (the
+/// `ltx_2_5_distilled` engine descriptor is sc-18778), so the literal is correct as written, not a
+/// placeholder: once split-checkpoint loading (sc-18757) threads a loaded checkpoint's declared
+/// `model_version` onto [`LtxGenerator`](crate::LtxGenerator), swap this constant for that field.
+pub const CHECKPOINT_MODEL_VERSION: &str = "2.3.0";
+
 // --- VAE compression factors + sampling defaults (mlx-gen-ltx positions.rs) ----------------------
 /// Temporal VAE compression: pixel frames → latent frames is `(F-1)/8 + 1`.
 pub const TEMPORAL_SCALE: usize = 8;
