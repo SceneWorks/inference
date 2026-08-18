@@ -250,7 +250,18 @@ impl ClipBpeTokenizer {
             .map(|_| Vec::with_capacity(rows.len() * width))
             .collect();
         for ids in &rows {
-            for (flat, window) in flats.iter_mut().zip(plan.rows_aligned(ids, chunks)) {
+            let aligned = plan.rows_aligned(ids, chunks);
+            // `rows_aligned` is contracted to return exactly `chunks` windows for EVERY row — that
+            // is what makes the transpose below rectangular. A bare `zip` would silently DROP the
+            // windows past `flats.len()` (or leave short flats) if a future edit desynced the two
+            // counts, i.e. re-introduce sc-20528's truncation through the back door. Assert the
+            // contract loudly rather than ship a quietly-clipped conditioning.
+            debug_assert_eq!(
+                aligned.len(),
+                flats.len(),
+                "sc-20528: rows_aligned must yield exactly {chunks} windows per row"
+            );
+            for (flat, window) in flats.iter_mut().zip(aligned) {
                 flat.extend_from_slice(&window);
             }
         }

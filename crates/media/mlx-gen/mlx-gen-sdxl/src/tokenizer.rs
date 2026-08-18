@@ -100,6 +100,16 @@ impl ClipBpeTokenizer {
         })
     }
 
+    /// The `<|endoftext|>` id read from this checkpoint's `vocab.json` — the token
+    /// [`Self::tokenize`] appends and the one
+    /// [`ClipTextEncoder::forward`](crate::text_encoder::ClipTextEncoder::forward) pools at
+    /// (`argmax` over the row finds it because EOS is the highest CLIP id). Exposed for consumers
+    /// that build their own fixed-width CLIP row and must terminate it with the tokenizer's OWN eos
+    /// rather than a hard-coded 49407 (sc-20528: `mlx-gen-sd3`'s `clip_token_ids`).
+    pub fn eos_id(&self) -> i32 {
+        self.eos_id
+    }
+
     /// BPE-merge one whitespace-split word into its sub-token strings (the vendored `Tokenizer.bpe`).
     /// The last symbol carries the `</w>` end-of-word marker.
     fn bpe(&self, word: &str) -> Vec<String> {
