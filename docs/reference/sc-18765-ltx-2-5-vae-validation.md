@@ -172,6 +172,40 @@ none of this exercises the CUDA kernels. The tests are deliberately not CUDA-gat
 acceptance geometries behind `LTX25_FULL=1`, so the CUDA lane runs them unchanged; that run is
 outstanding.
 
+### 3.3 The existing sweeps, unmodified, on the converted 2.5 components
+
+`mlx-gen-ltx/tests/vae_decode_sweep.rs` takes `LTX_VAE_DIR` and needs only a directory holding
+`vae_decoder.safetensors` + `embedded_config.json`, which is exactly what `convert_vae_components`
+emits. It runs against LTX-2.5 with no change:
+
+| run | output | peak | bytes / out-vox |
+| --- | --- | --- | --- |
+| `LTX_W=960 LTX_H=544 LTX_FRAMES=89` | `[1,3,89,544,960]` in 8.8 s | 19.26 GB | 444.9 |
+| `LTX_W=768 LTX_H=512 LTX_FRAMES=25` | `[1,3,25,512,768]` in 1.9 s | 5.99 GB | 654.3 |
+| 960×544×89, `LTX_TILE_PX=256 LTX_OVERLAP_PX=32` | same output in 11.9 s | **6.25 GB** | 144.5 |
+
+The budgeted/tiled decode path therefore also works unchanged on 2.5, cutting peak from 19.26 GB to
+6.25 GB at the trainer geometry.
+
+### 3.4 Why the *parity* suites were not pointed at 2.5
+
+`vae_parity.rs`, `audio_vae_parity.rs`, `vocoder_parity.rs` (MLX) and `vae_encode_parity.rs`
+(candle) compare against goldens dumped from the reference running **LTX-2.3 weights**. Feeding
+them LTX-2.5 weights would compare 2.5 outputs against 2.3 reference outputs — a guaranteed,
+meaningless failure. They are left pointed at 2.3, where they keep doing their job.
+
+What those suites establish is that *these port implementations* reproduce the reference. That
+result carries to 2.5 unchanged, because **no model code changed**: the encoder, decoder, audio
+decoder and vocoder are the same functions the 2.3 goldens gate. What 2.5 introduces is new weights
+and new packaging, and that is what is validated here — the key/shape/config conformance in §2 plus
+the round trips in §3.
+
+The residual risk this leaves is a *shared misreading* of the reference that both backends inherit.
+The cross-backend agreement in §3.2 does not fully retire it (both ports were written from the same
+reading), but the 2.3 golden gates do: they are dumps of the reference itself, and they pass on the
+same code paths. A 2.5-weight reference golden would be strictly stronger and is cheap to add if
+sc-18766/18767 stand up a torch reference environment for the DiffVAE anyway.
+
 ## 4. What the tests cover
 
 | test | needs weights | what it pins |
