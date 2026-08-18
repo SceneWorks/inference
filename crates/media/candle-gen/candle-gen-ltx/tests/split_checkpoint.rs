@@ -6,10 +6,12 @@
 //! those constants exactly, and that a 2.3 checkpoint still selects the all-in-one layout so `load`
 //! takes the branch it always took.
 //!
-//! The LTX-2.5 fixtures reproduce the metadata layout of the documented `Lightricks/LTX-2.5` folder
-//! structure (the real weights are gated on Hugging Face). Reference: `Lightricks/LTX-2` @
-//! `d1511477` — `ltx_core/loader/sft_loader.py`, the per-component `model_configurator.py` files,
-//! and `encoder_configurator._check_gemma_version`.
+//! The LTX-2.5 fixtures reproduce the `__metadata__` layout of the shipped `Lightricks/LTX-2.5`
+//! folder structure. The weights are gated on Hugging Face, so the fixtures are written on disk —
+//! but their shape matches the real headers sc-18756 captured under
+//! `docs/reference/sc-18756-headers/`, which `gen_core::ltx_checkpoint`'s own tests parse directly.
+//! Reference: `Lightricks/LTX-2` @ `d1511477` — `ltx_core/loader/sft_loader.py`, the per-component
+//! `model_configurator.py` files, and `encoder_configurator._check_gemma_version`.
 //!
 //! No CUDA feature gate: every assertion is a path + JSON read with no device involved.
 
@@ -247,7 +249,8 @@ fn write_2_5_bundle(root: &Path) {
     write_component(
         &root.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
         &[
-            VERSION,
+            // Ground truth (sc-18756): a packed TE declares no `model_version`.
+            ("format", "pt"),
             (
                 "gemma_config",
                 r#"{"model_type":"gemma4_unified","gemma_version":"gemma4-12b-ltx-v1"}"#,

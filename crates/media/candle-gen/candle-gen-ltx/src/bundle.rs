@@ -167,7 +167,8 @@ mod tests {
         write_safetensors(
             path,
             &[
-                ("model_version", "2.5.0"),
+                // Ground truth (sc-18756): a packed TE declares no `model_version`.
+                ("format", "pt"),
                 (
                     "gemma_config",
                     &format!(

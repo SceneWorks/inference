@@ -1481,10 +1481,12 @@ mod tests {
                 ),
             ],
         );
+        // Ground truth (sc-18756): the packed text encoder declares NO `model_version` — only
+        // `format` + `gemma_config`.
         write_safetensors(
             &root.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
             &[
-                (MODEL_VERSION_METADATA_KEY, "2.5.0"),
+                ("format", "pt"),
                 (
                     GEMMA_CONFIG_METADATA_KEY,
                     r#"{"model_type":"gemma4_unified","gemma_version":"gemma4-12b-ltx-v1"}"#,
@@ -1531,29 +1533,25 @@ mod tests {
                 ),
             ],
         );
+        // Ground truth (sc-18756): the latent upsamplers declare NO `model_version` either, so a
+        // bundle's version must come from whichever component does declare one.
         write_safetensors(
             &root.join(
                 "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
             ),
-            &[
-                (MODEL_VERSION_METADATA_KEY, "2.5.0"),
-                (
-                    CONFIG_METADATA_KEY,
-                    r#"{"_class_name":"LatentUpsampler","spatial_upsample":true,"temporal_upsample":false}"#,
-                ),
-            ],
+            &[(
+                CONFIG_METADATA_KEY,
+                r#"{"_class_name":"LatentUpsampler","spatial_upsample":true,"temporal_upsample":false}"#,
+            )],
         );
         write_safetensors(
             &root.join(
                 "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
             ),
-            &[
-                (MODEL_VERSION_METADATA_KEY, "2.5.0"),
-                (
-                    CONFIG_METADATA_KEY,
-                    r#"{"_class_name":"LatentUpsampler","spatial_upsample":false,"temporal_upsample":true}"#,
-                ),
-            ],
+            &[(
+                CONFIG_METADATA_KEY,
+                r#"{"_class_name":"LatentUpsampler","spatial_upsample":false,"temporal_upsample":true}"#,
+            )],
         );
     }
 
@@ -1875,6 +1873,204 @@ mod tests {
             declared_layout(dir.path()).unwrap(),
             LtxCheckpointLayout::Split
         );
+    }
+
+    // --- real captured LTX-2.5 headers -----------------------------------------------------------
+
+    /// Load one of sc-18756's captured `__metadata__` dumps and rebuild the on-disk
+    /// `__metadata__` map from it.
+    ///
+    /// The dumps store each value already JSON-**decoded** for readability; the real safetensors
+    /// block stores every value as a string, so a decoded object is re-encoded and a decoded string
+    /// is passed through verbatim (re-encoding `"2.5.0"` would yield `"\"2.5.0\""`, which is not what
+    /// the file holds).
+    ///
+    /// This test module deliberately reaches into `docs/reference/` rather than copying the headers:
+    /// binding the classifier to the captured evidence is the point, and a divergence between the
+    /// two should fail loudly rather than drift behind a stale copy.
+    fn captured_metadata(relative: &str) -> LtxCheckpointMetadata {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docs/reference/sc-18756-headers")
+            .join(relative);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read captured header {}: {e}", path.display()));
+        let dump: Value = serde_json::from_str(&text).expect("captured header parses");
+        let block = dump
+            .get("metadata")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{relative} has no `metadata` block"));
+        let raw: BTreeMap<String, String> = block
+            .iter()
+            .map(|(key, value)| {
+                let encoded = match value {
+                    Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).expect("re-encode"),
+                };
+                (key.clone(), encoded)
+            })
+            .collect();
+        LtxCheckpointMetadata::from_raw(Path::new(relative), raw).expect("metadata parses")
+    }
+
+    #[test]
+    fn the_real_2_5_transformer_headers_classify_and_stamp_as_documented() {
+        // All five shipped transformer variants (dev/distilled × bf16/int8-convrot/nvfp4).
+        for name in [
+            "ltx-2.5-22b-dev-transformer-bf16",
+            "ltx-2.5-22b-dev-transformer-comfy-int8-convrot",
+            "ltx-2.5-22b-distilled-transformer-bf16",
+            "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot",
+            "ltx-2.5-22b-distilled-transformer-nvfp4",
+        ] {
+            let meta = captured_metadata(&format!("diffusion_models/{name}.safetensors.json"));
+            assert_eq!(meta.model_version(), Some("2.5.0"), "{name}");
+            assert_eq!(meta.layout(), LtxCheckpointLayout::Split, "{name}");
+            assert_eq!(meta.classify(), Some(LtxComponent::Transformer), "{name}");
+            // Its own section is present…
+            assert_eq!(
+                meta.section("transformer")
+                    .and_then(|t| t.get("_class_name"))
+                    .and_then(Value::as_str),
+                Some(TRANSFORMER_CLASS),
+                "{name}"
+            );
+            assert!(meta.section("scheduler").is_some(), "{name}");
+            // …and the sections it no longer owns are simply NOT THERE. The shipped files omit the
+            // keys outright rather than carrying them as `null`; `section` treats both the same, so
+            // neither spelling can satisfy another component's slot.
+            for key in ["vae", "audio_vae", "vocoder", "duration_head"] {
+                assert!(meta.section(key).is_none(), "{name}: config.{key}");
+            }
+            // Every transformer stamps the Gemma assertion.
+            let gsc = meta.gemma_source_checkpoint().expect(name);
+            assert_eq!(gsc.ltx_version.as_deref(), Some("2.5.0"), "{name}");
+            assert_eq!(
+                gsc.gemma_version.as_deref(),
+                Some("gemma4-12b-ltx-v1"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_2_5_component_headers_classify_by_their_own_config() {
+        let conv = captured_metadata("vae/ltx-2.5-video-vae-conv-bf16.safetensors.json");
+        assert_eq!(conv.classify(), Some(LtxComponent::ConvVideoVae));
+        assert_eq!(
+            conv.section("vae").unwrap()["_class_name"],
+            CONV_VIDEO_VAE_CLASS
+        );
+
+        // Named `...-video-vae-bf16` with no "diff" anywhere in the file name — only its config says
+        // it is the diffusion decoder. This is why classification never keys on names.
+        let diff = captured_metadata("vae/ltx-2.5-video-vae-bf16.safetensors.json");
+        assert_eq!(diff.classify(), Some(LtxComponent::DiffusionVideoVae));
+        assert_eq!(
+            diff.section("vae").unwrap()["_class_name"],
+            DIFFUSION_VIDEO_VAE_CLASS
+        );
+
+        // One file, both sections — the vocoder has no component of its own.
+        let audio = captured_metadata("vae/ltx-2.5-audio-vae-bf16.safetensors.json");
+        assert_eq!(audio.classify(), Some(LtxComponent::AudioVae));
+        assert!(audio.section("audio_vae").is_some());
+        assert!(audio.section("vocoder").is_some());
+        assert_eq!(
+            audio.section("audio_vae").unwrap()["model"]["params"]["ddconfig"]["z_channels"],
+            8
+        );
+
+        // The duration head also carries `config.transformer` (the dims it projects from), so it
+        // must be tested before the plain transformer — it is, and it classifies correctly.
+        let head = captured_metadata("model_patches/ltx-2.5-duration-head-bf16.safetensors.json");
+        assert_eq!(head.classify(), Some(LtxComponent::DurationHead));
+        assert!(head.section("duration_head").is_some());
+        assert!(head.section("transformer").is_some());
+    }
+
+    #[test]
+    fn the_real_upsamplers_and_text_encoders_declare_no_model_version() {
+        // Ground truth from sc-18756: the latent upsamplers and the packed text encoders carry NO
+        // `model_version` at all. Resolution must not require one per component — the bundle's
+        // version comes from whichever component declares it — and classification must still work.
+        for (relative, expected) in [
+            (
+                "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors.json",
+                LtxComponent::SpatialUpsampler,
+            ),
+            (
+                "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors.json",
+                LtxComponent::TemporalUpsampler,
+            ),
+        ] {
+            let meta = captured_metadata(relative);
+            assert_eq!(meta.model_version(), None, "{relative}");
+            assert_eq!(meta.classify(), Some(expected), "{relative}");
+            // The upsampler config is BARE — no wrapper section.
+            assert_eq!(
+                meta.config().unwrap()["_class_name"],
+                LATENT_UPSAMPLER_CLASS,
+                "{relative}"
+            );
+            assert!(meta.section("vae").is_none(), "{relative}");
+        }
+
+        for name in [
+            "gemma4-12b-with-proj-ltx-2.5-bf16",
+            "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot",
+        ] {
+            let meta = captured_metadata(&format!("text_encoders/{name}.safetensors.json"));
+            assert_eq!(meta.model_version(), None, "{name}");
+            assert_eq!(meta.classify(), Some(LtxComponent::TextEncoder), "{name}");
+            let identity = GemmaEncoderIdentity::from_config_value(
+                name,
+                meta.gemma_config().expect("packed TE config"),
+            );
+            assert_eq!(
+                identity.model_type.as_deref(),
+                Some(GEMMA4_UNIFIED_MODEL_TYPE),
+                "{name}"
+            );
+            assert_eq!(
+                identity.gemma_version.as_deref(),
+                Some("gemma4-12b-ltx-v1"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_transformer_and_text_encoder_satisfy_the_gemma_assertion() {
+        let transformer = captured_metadata(
+            "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors.json",
+        );
+        let te =
+            captured_metadata("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors.json");
+        let identity = GemmaEncoderIdentity::from_config_value(
+            "gemma4-12b-with-proj-ltx-2.5-bf16",
+            te.gemma_config().unwrap(),
+        );
+        assert_eq!(
+            check_gemma_version(&transformer, &identity).unwrap(),
+            GemmaVersionCheck::Matched("gemma4-12b-ltx-v1".to_string())
+        );
+        // The LTX-2.3 encoder against the same real transformer is the acceptance failure case.
+        let gemma3 = GemmaEncoderIdentity {
+            source: PathBuf::from("/models/gemma-3-12b-it"),
+            model_type: Some(GEMMA3_MODEL_TYPE.to_string()),
+            gemma_version: None,
+        };
+        let err = check_gemma_version(&transformer, &gemma3).expect_err("mismatch");
+        assert!(err.to_string().contains("Gemma version mismatch"), "{err}");
+    }
+
+    #[test]
+    fn the_real_distilled_lora_is_not_a_component() {
+        // It ships inside the same bundle and stamps `model_version`, but carries no `config`, so a
+        // directory scan must skip it rather than mistake it for a component.
+        let lora = captured_metadata("loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors.json");
+        assert_eq!(lora.model_version(), Some("2.5.0"));
+        assert_eq!(lora.classify(), None);
     }
 
     #[test]

@@ -13,8 +13,10 @@
 //!   its version in the `split_model.json` manifest (`"model_version": "2.3.0"`). Its per-component
 //!   `.safetensors` are re-emitted by the converter and carry no `__metadata__`, so the manifest is
 //!   the only declaration.
-//! * An LTX-2.5 bundle carries `__metadata__["model_version"] = "2.5.0"` on **every** component file
-//!   and ships no manifest.
+//! * An LTX-2.5 bundle ships no manifest and stamps `__metadata__["model_version"] = "2.5.0"` on
+//!   its transformer, VAEs and duration head. Per sc-18756's captured headers the **latent
+//!   upsamplers and the packed text encoder declare no version at all**, so a bundle's version is
+//!   whatever its versioned components declare — never a per-component requirement.
 //! * A raw upstream LTX-2.3 checkpoint carries `__metadata__["model_version"]` on its one flat file.
 //!
 //! [`declared_model_version`] reads them in that order and stops at the first declaration, so the
@@ -200,7 +202,8 @@ mod tests {
         write_safetensors(
             path,
             &[
-                ("model_version", "2.5.0"),
+                // Ground truth (sc-18756): a packed TE declares no `model_version`.
+                ("format", "pt"),
                 (
                     "gemma_config",
                     &format!(

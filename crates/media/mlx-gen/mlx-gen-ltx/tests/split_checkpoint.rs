@@ -9,14 +9,19 @@
 //!   The 2.3 tree must also still select the all-in-one layout, so `load` takes exactly the branch
 //!   it always took.
 //!
-//! * **LTX-2.5 split resolution.** Synthetic bundles mirroring the documented `Lightricks/LTX-2.5`
-//!   layout (`diffusion_models/`, `text_encoders/`, `vae/`, `model_patches/`,
-//!   `latent_upscale_models/`) exercise per-component resolution, per-component config isolation,
-//!   the `gemma_source_checkpoint` assertion, and the missing-component error. The real 2.5 weights
-//!   are gated on Hugging Face and unavailable here; the fixtures reproduce the metadata layout the
-//!   upstream loaders read (`ltx_core/loader/sft_loader.py`, the per-component
+//! * **LTX-2.5 split resolution.** Bundles laid out like the shipped `Lightricks/LTX-2.5` repo
+//!   (`diffusion_models/`, `text_encoders/`, `vae/`, `model_patches/`, `latent_upscale_models/`)
+//!   exercise per-component resolution, per-component config isolation, the
+//!   `gemma_source_checkpoint` assertion, and the missing-component error.
+//!
+//!   The 2.5 **weights** are gated on Hugging Face, so these fixtures are written on disk rather
+//!   than downloaded — but their `__metadata__` shape is not invented: it matches the real headers
+//!   sc-18756 captured under `docs/reference/sc-18756-headers/`, which
+//!   `gen_core::ltx_checkpoint`'s own tests parse directly. In particular the latent upsamplers and
+//!   the packed text encoder declare **no** `model_version`, exactly as the shipped files do.
+//!   Upstream reference: `ltx_core/loader/sft_loader.py`, the per-component
 //!   `model_configurator.py` files, and `encoder_configurator._check_gemma_version` at
-//!   `Lightricks/LTX-2` @ `d1511477`).
+//!   `Lightricks/LTX-2` @ `d1511477`.
 
 use std::path::Path;
 
@@ -266,7 +271,8 @@ fn write_2_5_bundle(root: &Path) {
     write_component(
         &root.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
         &[
-            VERSION,
+            // Ground truth (sc-18756): a packed TE declares no `model_version`.
+            ("format", "pt"),
             (
                 "gemma_config",
                 r#"{"model_type":"gemma4_unified","gemma_version":"gemma4-12b-ltx-v1"}"#,
@@ -333,7 +339,7 @@ fn write_2_5_bundle(root: &Path) {
     write_component(
         &root.join("latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
         &[
-            VERSION,
+            // Ground truth (sc-18756): the latent upsamplers declare no `model_version`.
             (
                 "config",
                 r#"{"_class_name":"LatentUpsampler","in_channels":128,"mid_channels":512,
@@ -346,7 +352,7 @@ fn write_2_5_bundle(root: &Path) {
         &root
             .join("latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors"),
         &[
-            VERSION,
+            // Ground truth (sc-18756): the latent upsamplers declare no `model_version`.
             (
                 "config",
                 r#"{"_class_name":"LatentUpsampler","in_channels":128,"mid_channels":512,
