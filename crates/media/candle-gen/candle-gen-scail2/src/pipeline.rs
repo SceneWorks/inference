@@ -180,6 +180,7 @@ pub fn descriptor() -> ModelDescriptor {
                 multiple: DIM_ALIGN,
             },
             execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

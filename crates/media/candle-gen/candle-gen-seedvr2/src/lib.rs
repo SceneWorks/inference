@@ -111,6 +111,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             component_precision_floors: &[],
             size_floor: SizeFloor::RangeChecked,
             execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

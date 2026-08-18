@@ -122,6 +122,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
             execution: Default::default(),
+            approximation: Default::default(),
         },
     }
 }

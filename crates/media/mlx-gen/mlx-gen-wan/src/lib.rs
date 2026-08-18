@@ -54,6 +54,7 @@ pub mod block_stream;
 pub mod chunk;
 pub mod config;
 pub mod convert;
+pub mod feature_cache;
 pub mod memory_strategy;
 pub mod model;
 pub mod model_vace;
@@ -63,6 +64,7 @@ pub mod pth;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod token_pruning;
 pub mod training;
 pub mod transformer;
 pub mod vace;
@@ -100,6 +102,7 @@ pub use adapters::{
 pub use block_stream::WanBlockStream;
 pub use chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
+pub use feature_cache::TrunkCache;
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
@@ -109,14 +112,16 @@ pub use model_vace::{
 };
 pub use pipeline::{
     build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
-    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images,
-    preprocess_i2v_image, preprocess_ti2v_image, ti2v_blend_init, Expert,
+    decode_to_frames_22, denoise, denoise_approx, denoise_moe, denoise_ti2v, frames_to_images,
+    preprocess_i2v_image, preprocess_ti2v_image, refuse_unwired_approximation, ti2v_blend_init,
+    Expert,
 };
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,
     WanScheduler,
 };
+pub use token_pruning::TokenPruner;
 pub use vae::{OwnedWanSingleFrameDecoder, WanSingleFrameDecoder, WanVideoDecoder};
 
 /// Load the request-selected Wan z16 image decoder from `LoadSpec.components["vae"]`.
