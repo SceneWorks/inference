@@ -1,0 +1,175 @@
+{
+  "_provenance": {
+    "source_repo": "Lightricks/LTX-2.5",
+    "path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+    "captured": "2026-08-18",
+    "authenticated_as": "SceneWorks (HF_HOME=/Volumes/Models/huggingface)",
+    "method": "Two HTTP Range requests per file against https://huggingface.co/Lightricks/LTX-2.5/resolve/main/<path>, Authorization: Bearer <SceneWorks token>: bytes=0-7 for the little-endian u64 safetensors header length, then bytes=8-{8+len-1} for the JSON header itself. Zero tensor payload bytes fetched for any file.",
+    "story": "sc-18756"
+  },
+  "total_size_bytes": 364866540,
+  "header_len_bytes": 199664,
+  "tensor_count": 1329,
+  "dtypes": [
+    "BF16"
+  ],
+  "metadata": {
+    "config": {
+      "audio_vae": {
+        "model": {
+          "params": {
+            "ddconfig": {
+              "double_z": true,
+              "mel_bins": 64,
+              "z_channels": 8,
+              "resolution": 256,
+              "downsample_time": false,
+              "in_channels": 2,
+              "out_ch": 2,
+              "ch": 128,
+              "ch_mult": [
+                1,
+                2,
+                4
+              ],
+              "num_res_blocks": 2,
+              "attn_resolutions": [],
+              "dropout": 0.0,
+              "mid_block_add_attention": false,
+              "norm_type": "pixel",
+              "causality_axis": "height"
+            },
+            "sampling_rate": 16000
+          }
+        },
+        "preprocessing": {
+          "audio": {
+            "sampling_rate": 16000,
+            "max_wav_value": 32768.0,
+            "duration": 5.12,
+            "stereo": true,
+            "causal_padding": 3
+          },
+          "stft": {
+            "filter_length": 1024,
+            "hop_length": 160,
+            "win_length": 1024,
+            "causal": true
+          },
+          "mel": {
+            "n_mel_channels": 64,
+            "mel_fmin": 0,
+            "mel_fmax": 8000
+          }
+        }
+      },
+      "vocoder": {
+        "vocoder": {
+          "upsample_initial_channel": 1536,
+          "resblock": "AMP1",
+          "upsample_rates": [
+            5,
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "resblock_kernel_sizes": [
+            3,
+            7,
+            11
+          ],
+          "upsample_kernel_sizes": [
+            11,
+            4,
+            4,
+            4,
+            4,
+            4
+          ],
+          "resblock_dilation_sizes": [
+            [
+              1,
+              3,
+              5
+            ],
+            [
+              1,
+              3,
+              5
+            ],
+            [
+              1,
+              3,
+              5
+            ]
+          ],
+          "stereo": true,
+          "use_tanh_at_final": false,
+          "activation": "snakebeta",
+          "use_bias_at_final": false
+        },
+        "bwe": {
+          "upsample_initial_channel": 512,
+          "resblock": "AMP1",
+          "upsample_rates": [
+            6,
+            5,
+            2,
+            2,
+            2
+          ],
+          "resblock_kernel_sizes": [
+            3,
+            7,
+            11
+          ],
+          "upsample_kernel_sizes": [
+            12,
+            11,
+            4,
+            4,
+            4
+          ],
+          "resblock_dilation_sizes": [
+            [
+              1,
+              3,
+              5
+            ],
+            [
+              1,
+              3,
+              5
+            ],
+            [
+              1,
+              3,
+              5
+            ]
+          ],
+          "stereo": true,
+          "use_tanh_at_final": false,
+          "activation": "snakebeta",
+          "use_bias_at_final": false,
+          "apply_final_activation": false,
+          "input_sampling_rate": 16000,
+          "output_sampling_rate": 48000,
+          "hop_length": 80,
+          "n_fft": 512,
+          "win_size": 512,
+          "num_mels": 64
+        }
+      }
+    },
+    "model_version": "2.5.0",
+    "license": {
+      "_omitted": true,
+      "reason": "LTX-2.x Community License Agreement body, embedded verbatim in the upstream file's __metadata__. Excluded per the story's instruction to record __metadata__ 'minus the embedded license body'.",
+      "char_length": 34561,
+      "license_date": "August 11, 2026",
+      "canonical_text": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md"
+    }
+  }
+}
