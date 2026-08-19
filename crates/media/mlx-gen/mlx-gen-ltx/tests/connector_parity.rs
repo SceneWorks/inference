@@ -11,8 +11,9 @@ use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::connector::Connector;
+use mlx_gen_ltx::transformer::Precision;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -39,12 +40,15 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
 fn connector_matches_reference() {
     let dir = eros_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
     let w = Weights::from_file(dir.join("connector.safetensors")).expect("connector.safetensors");
     let conn = Connector::from_weights(
         &w,
         "video_embeddings_connector.",
         &cfg,
-        mlx_rs::Dtype::Float32,
+        // f32 activations (the isolated bit-exact gate) at the checkpoint's quant geometry; the
+        // 2.3 connector ships dense, so every Linear takes the dense arm.
+        Precision::quant_f32(split.bits, split.group),
     )
     .expect("build");
 
@@ -67,6 +71,7 @@ fn audio_connector_matches_reference() {
     // sc-2684: the audio connector is the same architecture at audio dims (32 × 64 = 2048).
     let dir = eros_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
     let w = Weights::from_file(dir.join("connector.safetensors")).expect("connector.safetensors");
     let conn = Connector::from_weights_dims(
         &w,
@@ -77,7 +82,7 @@ fn audio_connector_matches_reference() {
         cfg.positional_embedding_theta,
         cfg.connector_positional_embedding_max_pos,
         cfg.connector_ff_bias,
-        mlx_rs::Dtype::Float32,
+        Precision::quant_f32(split.bits, split.group),
     )
     .expect("build audio connector");
 

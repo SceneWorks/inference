@@ -8,12 +8,13 @@
 //! Run: `cargo test -p mlx-gen-ltx --test te_parity -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::gemma::GemmaConfig;
 use mlx_gen_ltx::text_encoder::LtxTextEncoder;
+use mlx_gen_ltx::transformer::Precision;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -44,6 +45,7 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
 fn full_text_encoder_matches_reference() {
     let base = base_dir();
     let cfg = LtxConfig::from_model_dir(&base).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&base).expect("split_model.json");
     let gemma_w = Weights::from_dir(gemma_dir()).expect("gemma shards");
     let conn_w =
         Weights::from_file(base.join("connector.safetensors")).expect("connector.safetensors");
@@ -53,7 +55,9 @@ fn full_text_encoder_matches_reference() {
         GemmaConfig::gemma_3_12b(),
         None, // dense bf16 Gemma (the default snapshot)
         &cfg,
-        Dtype::Bfloat16,
+        // bf16 activations at the checkpoint's declared quant geometry. The 2.3 connector ships
+        // dense, so every Linear here takes the dense arm regardless of the bits/group carried.
+        Precision::quant_bf16(split.bits, split.group),
     )
     .expect("build TE");
 
@@ -90,6 +94,7 @@ fn full_text_encoder_matches_reference() {
 fn full_text_encoder_av_matches_reference() {
     let base = base_dir();
     let cfg = LtxConfig::from_model_dir(&base).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&base).expect("split_model.json");
     let gemma_w = Weights::from_dir(gemma_dir()).expect("gemma shards");
     let conn_w =
         Weights::from_file(base.join("connector.safetensors")).expect("connector.safetensors");
@@ -99,7 +104,9 @@ fn full_text_encoder_av_matches_reference() {
         GemmaConfig::gemma_3_12b(),
         None, // dense bf16 Gemma (the default snapshot)
         &cfg,
-        Dtype::Bfloat16,
+        // bf16 activations at the checkpoint's declared quant geometry. The 2.3 connector ships
+        // dense, so every Linear here takes the dense arm regardless of the bits/group carried.
+        Precision::quant_bf16(split.bits, split.group),
     )
     .expect("build AV TE");
 

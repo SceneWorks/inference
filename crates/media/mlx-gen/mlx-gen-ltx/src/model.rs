@@ -604,7 +604,11 @@ impl Ltx {
             GemmaConfig::gemma_3_12b(),
             self.gemma_quant,
             &self.config,
-            Dtype::Bfloat16,
+            // The DiT's own checkpoint geometry re-targeted at bf16 activations: the connector and
+            // the feature-extractor Linear are packed on an LTX-2.5 `q4`/`q8` tier (sc-18775) and
+            // dense on LTX-2.3, decided per tensor by whether `.scales` is present — so one
+            // `Precision` serves both without a per-generation branch.
+            self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
         )
     }
 

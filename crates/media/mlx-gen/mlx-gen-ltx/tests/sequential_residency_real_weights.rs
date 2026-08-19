@@ -63,9 +63,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
 use mlx_gen_ltx::config::SplitModel;
 use mlx_gen_ltx::gemma::GemmaConfig;
+use mlx_gen_ltx::transformer::Precision;
 use mlx_gen_ltx::{LtxConfig, LtxTextEncoder, LtxTokenizer};
 use mlx_rs::memory::{clear_cache, get_cache_memory, get_peak_memory, reset_peak_memory};
-use mlx_rs::Dtype;
 use std::path::{Path, PathBuf};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -351,6 +351,7 @@ fn checked_capture_tier(model: &Path, requested: Option<Tier>) -> Tier {
 /// `encode_av`, and `eval` so every layer's weights are forced resident. Returns the peak bytes.
 fn te_resident_peak(model: &std::path::Path, gemma: &std::path::Path) -> usize {
     let cfg = LtxConfig::from_model_dir(model).expect("LtxConfig::from_model_dir");
+    let split = SplitModel::from_model_dir(model).expect("split_model.json");
     let gemma_w = Weights::from_dir(gemma).expect("gemma weights");
     let connector_w =
         Weights::from_file(model.join("connector.safetensors")).expect("connector weights");
@@ -361,7 +362,7 @@ fn te_resident_peak(model: &std::path::Path, gemma: &std::path::Path) -> usize {
         GemmaConfig::gemma_3_12b(),
         None, // the bundled `gemma/` is dense bf16 (no `config.json` quantization block)
         &cfg,
-        Dtype::Bfloat16,
+        Precision::quant_bf16(split.bits, split.group),
     )
     .expect("build TE");
     let tok = LtxTokenizer::from_dir(gemma).expect("tokenizer");
