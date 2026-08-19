@@ -27,18 +27,13 @@ import struct
 from pathlib import Path
 
 # (fixture entry name, path relative to the LTX-2.5 snapshot root, retained tensor prefixes).
-# A `None` prefix filter keeps every tensor. The DiffVAE file is recorded ENCODER-ONLY: this
-# story validates that its conv `Encoder` is the same module as the conv VAE's, while its
-# `NADiffusionDecoder` belongs to sc-18766 / sc-18767 and would otherwise add ~120 KB of key
-# names that nothing here asserts against. The dropped count is still recorded, so the
-# omission is visible in the fixture rather than silent.
+# A `None` prefix filter keeps every tensor. The DiffVAE file was recorded ENCODER-ONLY under
+# sc-18765, whose claim was only that its conv `Encoder` is the same module as the conv VAE's.
+# sc-18766 ports the `NADiffusionDecoder`, so the decoder half is now asserted against too and
+# the filter is gone.
 LTX25_FILES = [
     ("ltx_2_5_video_vae_conv", "vae/ltx-2.5-video-vae-conv-bf16.safetensors", None),
-    (
-        "ltx_2_5_video_vae_diffusion",
-        "vae/ltx-2.5-video-vae-bf16.safetensors",
-        ("encoder.", "per_channel_statistics."),
-    ),
+    ("ltx_2_5_video_vae_diffusion", "vae/ltx-2.5-video-vae-bf16.safetensors", None),
     ("ltx_2_5_audio_vae", "vae/ltx-2.5-audio-vae-bf16.safetensors", None),
 ]
 
