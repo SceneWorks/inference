@@ -678,7 +678,7 @@ const RK6_7S_B: [f64; 7] = [
 ];
 
 /// `rk6_7s`: a 6th-order, 7-stage explicit Runge–Kutta solver over the k-diffusion probability-flow
-/// ODE `dx/dσ = (x − x0(x,σ))/σ` (Butcher's classical 1964 tableau — see [`RK6_7S_C`] for
+/// ODE `dx/dσ = (x − x0(x,σ))/σ` (Butcher's classical 1964 tableau — see the private `RK6_7S_C` for
 /// provenance and the RES4LYF naming ambiguity). Deterministic; **~7 model evaluations per nominal
 /// step** (exactly 7 on every interior step; the terminal step to `σ = 0` is a single evaluation that
 /// lands on the denoised estimate, because the k-diffusion derivative `(x − x0)/σ` is undefined at
@@ -890,9 +890,9 @@ impl<T> Default for AbnorsettState<T> {
 /// `dx/dλ = −x + x̂0(λ)`: the linear part is solved exactly (`e^{−h}`, which is the DPM-Solver++
 /// `σ_next/σ` contraction) and the denoised estimate `x̂0` is extrapolated by the Lagrange
 /// polynomial through up to [`ABNORSETT_ORDER`] history points, integrated exactly against the
-/// exponential kernel ([`exp_ab_weights`] — Nørsett's exponential Adams–Bashforth coefficients,
-/// generalised to this schedule's non-uniform λ grid). Derived from the published literature (see
-/// [`exp_ab_weights`] for the citations); the RES4LYF id `abnorsett_4m` names the family + order,
+/// exponential kernel (the private `exp_ab_weights` — Nørsett's exponential Adams–Bashforth
+/// coefficients, generalised to this schedule's non-uniform λ grid). Derived from the published
+/// literature (its rustdoc carries the citations); the RES4LYF id `abnorsett_4m` names the family + order,
 /// and this implementation is a from-the-derivation build, not a port of RES4LYF code.
 ///
 /// **Startup ramp (short-schedule behavior):** a multistep method has no history at step 0. The
