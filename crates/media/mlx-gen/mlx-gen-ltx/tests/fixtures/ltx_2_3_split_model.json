@@ -1,0 +1,21 @@
+{
+  "format": "split",
+  "model_version": "2.3.0",
+  "components": [
+    "transformer",
+    "connector",
+    "vae_decoder",
+    "vae_encoder",
+    "audio_vae",
+    "vocoder",
+    "upsampler",
+    "spatial_upscaler_x2_v1_1",
+    "spatial_upscaler_x1_5_v1_0",
+    "temporal_upscaler_x2_v1_0"
+  ],
+  "source": "Lightricks/LTX-2.3",
+  "variant": "distilled",
+  "quantized": true,
+  "quantization_bits": 4,
+  "quantization_group_size": 64
+}

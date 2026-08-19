@@ -17,6 +17,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use mlx_gen::gen_core::ltx_checkpoint::{
+    caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
+};
 use mlx_gen::{Error, Result};
 
 /// Rotary-embedding layout. LTX-2.3 uses [`RopeType::Split`] (the 2.0 default is interleaved).
@@ -51,6 +54,14 @@ pub struct LtxConfig {
     pub caption_channels: i32,
     pub caption_projection_first_linear: bool,
     pub caption_projection_second_linear: bool,
+    /// Which caption feature extractor this checkpoint's config selects — resolved from the
+    /// transformer section's four `caption_proj*` keys by
+    /// [`caption_feature_version`], never from a per-model constant or a
+    /// weight probe. LTX-2.3 declares only the legacy pair and resolves to
+    /// [`CaptionFeatureVersion::V2`] through the measured carve-out; LTX-2.5 declares all four.
+    /// Only set by the fallible constructors ([`LtxConfig::from_model_dir`] /
+    /// [`LtxConfig::from_bundle`]), because an undetectable shape is a load error, not a default.
+    pub caption_feature_version: CaptionFeatureVersion,
     /// adaLN-single scale_shift_table row count: **9** for the gated family, **6** otherwise.
     pub adaln_embedding_coefficient: i32,
     pub apply_gated_attention: bool,
@@ -151,6 +162,9 @@ impl LtxConfig {
             caption_channels: 3840,
             caption_projection_first_linear: true,
             caption_projection_second_linear: true,
+            // The 2.0 fallback has no `caption_proj*` keys at all, which is exactly upstream's V1
+            // condition. A real checkpoint overwrites this in `validated`.
+            caption_feature_version: CaptionFeatureVersion::V1,
             adaln_embedding_coefficient: 6,
             apply_gated_attention: false,
             cross_attention_adaln: false,
@@ -343,19 +357,42 @@ impl LtxConfig {
         let t = root_cfg
             .get("transformer")
             .ok_or_else(|| Error::Msg("ltx: embedded_config.json missing `transformer`".into()))?;
-        let cfg = Self::from_embedded_transformer(t);
-        // F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
-        // reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
-        // (wrong output, no error), reject the only value the engine does not implement. The 2.0
-        // interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
-        if cfg.rope_type != RopeType::Split {
+        Self::from_embedded_transformer(t).validated(t)
+    }
+
+    /// Build the config from a **split bundle's** transformer component (sc-18757).
+    ///
+    /// The LTX-2.5 transformer file carries its own `config.transformer` in `__metadata__`; this
+    /// reads that section and only that section. An absent section is an error naming the component
+    /// and the file — never a fall-through to the 2.3 shape, which would build a 48-layer 2.3 DiT
+    /// against 2.5 weights.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let transformer = bundle.require(LtxComponent::Transformer)?;
+        let section = transformer.config()?;
+        Self::from_embedded_transformer(section).validated(section)
+    }
+
+    /// Apply the load-time gates that reject checkpoint values this engine does not implement, and
+    /// resolve the config-driven caption feature-extractor selection.
+    ///
+    /// F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
+    /// reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
+    /// (wrong output, no error), reject the only value the engine does not implement. The 2.0
+    /// interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
+    ///
+    /// `transformer` is the source config section, needed because the caption-extractor selection is
+    /// keyed on **key presence**, not just parsed values — `caption_projection_first_linear: false`
+    /// and "absent" mean different things to it, and the parsed struct cannot distinguish them.
+    fn validated(mut self, transformer: &Value) -> Result<Self> {
+        if self.rope_type != RopeType::Split {
             return Err(Error::Msg(
                 "ltx: rope_type != \"split\" is not supported (only the LTX-2.3 split RoPE is \
                  implemented); interleaved (2.0) RoPE is not ported"
                     .into(),
             ));
         }
-        Ok(cfg)
+        self.caption_feature_version = caption_feature_version(transformer)?;
+        Ok(self)
     }
 }
 
@@ -561,30 +598,51 @@ impl LtxVaeConfig {
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
-            Some(v) => {
-                let cfg = Self::from_embedded_vae(v)?;
-                // F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE
-                // decoder HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the
-                // values the engine does not implement instead of silently mis-running a ts-conditioned
-                // or reflect-padded checkpoint (the old doc claimed a "config gate" that never existed).
-                if cfg.timestep_conditioning {
-                    return Err(Error::Msg(
-                        "ltx: vae.timestep_conditioning=true is not supported (the decoder runs the \
-                         non-ts-conditioned 2.3 path only)"
-                            .into(),
-                    ));
-                }
-                if cfg.spatial_padding_mode != "zeros" {
-                    return Err(Error::Msg(format!(
-                        "ltx: vae.spatial_padding_mode={:?} is not supported (the decoder hardcodes \
-                         \"zeros\" padding)",
-                        cfg.spatial_padding_mode
-                    )));
-                }
-                Ok(cfg)
-            }
+            // sc-18765 made `from_embedded_vae` fallible (`latent_log_var` parses into a typed enum)
+            // and inlined the F-075 gates here; sc-18757 extracted those same gates into `validated`
+            // so the split-bundle path applies them identically. Keep both: propagate the parse
+            // error, then run the shared gate.
+            Some(v) => Self::from_embedded_vae(v)?.validated(),
             None => Ok(Self::defaults()),
         }
+    }
+
+    /// Build the config from a **split bundle's** video-VAE component (sc-18757).
+    ///
+    /// `component` selects which of the two LTX-2.5 video VAEs to read
+    /// ([`LtxComponent::ConvVideoVae`] or [`LtxComponent::DiffusionVideoVae`]); each ships as its
+    /// own file with its own `config.vae`. Unlike [`from_model_dir`](Self::from_model_dir) — where
+    /// an absent `vae` block means "this 2.3 tree predates the embedded config", so the 2.3 defaults
+    /// are the right answer — a split component file that carries no `config.vae` is an **error**:
+    /// the whole point of the split layout is that each component declares its own structure, and a
+    /// 2.3-shaped default here would build the wrong block ladder against 2.5 weights.
+    pub fn from_bundle(bundle: &LtxBundle, component: LtxComponent) -> Result<Self> {
+        let vae = bundle.require(component)?;
+        Self::from_embedded_vae(vae.config()?)?.validated()
+    }
+
+    /// Apply the load-time gates that reject checkpoint values this decoder does not implement.
+    ///
+    /// F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE decoder
+    /// HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the values the
+    /// engine does not implement instead of silently mis-running a ts-conditioned or reflect-padded
+    /// checkpoint (the old doc claimed a "config gate" that never existed).
+    fn validated(self) -> Result<Self> {
+        if self.timestep_conditioning {
+            return Err(Error::Msg(
+                "ltx: vae.timestep_conditioning=true is not supported (the decoder runs the \
+                 non-ts-conditioned 2.3 path only)"
+                    .into(),
+            ));
+        }
+        if self.spatial_padding_mode != "zeros" {
+            return Err(Error::Msg(format!(
+                "ltx: vae.spatial_padding_mode={:?} is not supported (the decoder hardcodes \
+                 \"zeros\" padding)",
+                self.spatial_padding_mode
+            )));
+        }
+        Ok(self)
     }
 }
 
@@ -668,6 +726,25 @@ impl AudioVaeConfig {
             Some(v) => Self::from_ddconfig(v),
             None => Self::defaults(),
         })
+    }
+
+    /// Build the config from a **split bundle's** audio-VAE component (sc-18757).
+    ///
+    /// The LTX-2.5 audio VAE file owns `config.audio_vae` (and, beside it, `config.vocoder` — see
+    /// [`VocoderConfig::from_bundle`]). The `ddconfig` structure sits at
+    /// `audio_vae.model.params.ddconfig`, exactly as in the all-in-one layout; a file that flattens
+    /// it onto the `audio_vae` block itself is accepted too, since both spellings appear across
+    /// LTX-2.x extracts and neither is a *default* — the values still come from this component's own
+    /// config. An absent `config.audio_vae` is an error, not the 2.3 shape.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        let block = audio.config()?;
+        let dd = block
+            .get("model")
+            .and_then(|v| v.get("params"))
+            .and_then(|v| v.get("ddconfig"))
+            .unwrap_or(block);
+        Ok(Self::from_ddconfig(dd))
     }
 }
 
@@ -828,6 +905,18 @@ impl VocoderConfig {
             Some(v) => Self::from_embedded_vocoder(v),
             None => Self::defaults(),
         })
+    }
+
+    /// Build the config from a **split bundle's** audio-VAE component (sc-18757).
+    ///
+    /// The vocoder has no file of its own: LTX-2.5 ships it inside the audio-VAE component, whose
+    /// metadata carries `config.audio_vae` **and** `config.vocoder`. This reads that sibling section
+    /// off the same file; an absent one is an error naming the component, not the HiFi-GAN defaults.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        Ok(Self::from_embedded_vocoder(
+            audio.config_section("vocoder")?,
+        ))
     }
 }
 

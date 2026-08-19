@@ -1,4 +1,20 @@
-//! LTX-2.3 (distilled 22B) model configuration — hardcoded constants for the shipped dense BF16
+//! LTX-2.x model configuration.
+//!
+//! Two sources, one set of structs:
+//!
+//! * **Hardcoded LTX-2.3 constants** (`*::ltx_2_3()`) for the shipped dense BF16 checkpoint. The
+//!   original `Lightricks/LTX-2.3` repo ships no `embedded_config.json`; the same values live in the
+//!   safetensors `__metadata__["config"]` blob and are fixed for that model family.
+//! * **Per-component configs read from a split bundle** (`*::from_bundle`, sc-18757). LTX-2.5 ships
+//!   one file per component, each carrying only its own config section, so every struct below reads
+//!   **its own** component's section from **its own** file. Nothing is defaulted across components:
+//!   a video-VAE file with no `config.vae` is an error, never a 2.3-shaped fallback.
+//!
+//! The 2.3 constants remain the *fallback within a section* (a key the section omits keeps its 2.3
+//! value, exactly as the MLX sibling's `embedded_config.json` readers do); they are never a fallback
+//! for a whole missing section.
+//!
+//! Legacy note — LTX-2.3 (distilled 22B): hardcoded constants for the shipped dense BF16
 //! checkpoint (`ltx-2.3-22b-distilled.safetensors`). The mlx provider reads `embedded_config.json`
 //! to support the quantized split checkpoints; we load the single dense file and pin the LTX-2.3
 //! values directly (they are fixed for this model family).
@@ -8,6 +24,12 @@
 //! dual-modal AV DiT, the audio VAE decoder, and the vocoder — sc-5495) are all consumed. The 2-stage
 //! latent upsampler, prompt-enhance, and fp8/on-the-fly quant are deferred to follow-up stories.
 //! I2V/keyframes/IC-LoRA clips and inference LoRA/PEFT-LoKr are wired by the package pipeline.
+
+use candle_gen::gen_core::ltx_checkpoint::{
+    caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
+};
+use candle_gen::gen_core::{self, Error as GenError};
+use serde_json::Value;
 
 /// Registry id (the distilled 22B text-to-video model).
 pub const MODEL_ID: &str = "ltx_2_3_distilled";
@@ -136,6 +158,32 @@ impl TransformerConfig {
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
     }
+
+    /// Read the video-stack dims from a `config.transformer` object (sc-18757). Keys the section
+    /// omits keep their [`ltx_2_3`](Self::ltx_2_3) value; the section itself is never defaulted.
+    pub fn from_transformer_config(t: &Value) -> Self {
+        let mut cfg = Self::ltx_2_3();
+        cfg.num_layers = get_usize(t, "num_layers", cfg.num_layers);
+        cfg.num_heads = get_usize(t, "num_attention_heads", cfg.num_heads);
+        cfg.head_dim = get_usize(t, "attention_head_dim", cfg.head_dim);
+        cfg.norm_eps = get_f64(t, "norm_eps", cfg.norm_eps);
+        cfg.rope_theta = get_f64(t, "positional_embedding_theta", cfg.rope_theta);
+        cfg.rope_max_pos = get_i32_3(t, "positional_embedding_max_pos", cfg.rope_max_pos);
+        cfg.timestep_scale_multiplier = get_f64(
+            t,
+            "timestep_scale_multiplier",
+            cfg.timestep_scale_multiplier,
+        );
+        // sc-18758's two video-stream flags, parsed from the SECTION rather than inherited from the
+        // 2.3 constants — this is the whole point of a config-driven reader, and the real 2.5 header
+        // stamps `ff_bias:false` / `use_keyframes_abs_pos_embedding:true`. The defaults are the
+        // reference's own absent-key fallbacks (`True` / `False`), written as literals so they stay
+        // anchored to the reference rather than to whichever constant `ltx_2_3()` happens to carry.
+        // Mirrors mlx-gen-ltx's reader exactly.
+        cfg.ff_bias = get_bool(t, "ff_bias", true);
+        cfg.use_keyframes_abs_pos_embedding = get_bool(t, "use_keyframes_abs_pos_embedding", false);
+        cfg
+    }
 }
 
 /// The dual-modal `AVTransformer3DModel` dims (sc-5495): the video stack ([`TransformerConfig`]) plus
@@ -153,6 +201,13 @@ pub struct AvConfig {
     pub cross_inner: usize,
     /// Cross-modal (time-axis) RoPE max position (`cross_pe_max_pos`, 20).
     pub cross_max_pos: i32,
+    /// Which caption feature extractor the checkpoint's config selects — resolved from the
+    /// transformer section's four `caption_proj*` keys by
+    /// [`caption_feature_version`], never from a per-model constant.
+    /// [`ltx_2_3`](Self::ltx_2_3) carries the value the shipped LTX-2.3 config **resolves to**
+    /// (V2, through the measured legacy carve-out), so the constant and the config agree by
+    /// construction rather than by assertion.
+    pub caption_feature_version: CaptionFeatureVersion,
     /// sc-18758 — `audio_ff_bias`, the audio-stream analog of `video.ff_bias`.
     pub audio_ff_bias: bool,
 }
@@ -166,6 +221,10 @@ impl AvConfig {
             audio_max_pos: 20,
             cross_inner: 2048,
             cross_max_pos: 20,
+            // Measured off the shipped `SceneWorks/ltx-2.3-mlx` `embedded_config.json`: it declares
+            // only `caption_projection_{first,second}_linear: false` plus
+            // `text_encoder_norm_type: "per_token_rms"`, which the carve-out resolves to V2.
+            caption_feature_version: CaptionFeatureVersion::V2,
             audio_ff_bias: true,
         }
     }
@@ -186,6 +245,36 @@ impl AvConfig {
     /// Audio inner dim `heads × head_dim` = 2048.
     pub fn audio_inner(&self) -> usize {
         self.audio_heads * self.audio_head_dim
+    }
+
+    /// Read the full dual-modal dims from a `config.transformer` object (sc-18757).
+    ///
+    /// `cross_max_pos` mirrors `LTXModel.__init__`'s `cross_pe_max_pos = max(video_max_pos[0],
+    /// audio_max_pos)` rather than being read directly — it is derived, not declared.
+    ///
+    /// Fallible because the caption feature-extractor selection is config-driven and an
+    /// undetectable `caption_proj*` shape is a load error, not a default.
+    pub fn from_transformer_config(t: &Value) -> gen_core::Result<Self> {
+        let mut cfg = Self::ltx_2_3();
+        cfg.video = TransformerConfig::from_transformer_config(t);
+        cfg.audio_heads = get_usize(t, "audio_num_attention_heads", cfg.audio_heads);
+        cfg.audio_head_dim = get_usize(t, "audio_attention_head_dim", cfg.audio_head_dim);
+        cfg.cross_inner = get_usize(t, "audio_cross_attention_dim", cfg.cross_inner);
+        cfg.audio_max_pos =
+            get_i32_array_first(t, "audio_positional_embedding_max_pos", cfg.audio_max_pos);
+        cfg.cross_max_pos = cfg.video.rope_max_pos[0].max(cfg.audio_max_pos);
+        // The audio-stream FFN bias flag. Defaults `true` (the reference's absent-key fallback):
+        // measured against the real 2.5 headers, they carry NO `audio_ff_bias` key at all, so it is
+        // NOT part of the 2.3→2.5 delta and must not be flipped alongside `ff_bias`.
+        cfg.audio_ff_bias = get_bool(t, "audio_ff_bias", true);
+        cfg.caption_feature_version = caption_feature_version(t)?;
+        Ok(cfg)
+    }
+
+    /// Read the dual-modal dims from a split bundle's **transformer** component (sc-18757).
+    pub fn from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
+        let transformer = bundle.require(LtxComponent::Transformer)?;
+        Self::from_transformer_config(transformer.config()?)
     }
 }
 
@@ -236,6 +325,48 @@ impl ConnectorConfig {
             rope_theta: 10000.0,
             ff_bias: true,
         }
+    }
+
+    /// Read the **video** connector dims from a `config.transformer` object (sc-18757). Both
+    /// connectors are declared on the transformer's own section — they are part of the DiT's config,
+    /// not a component of their own.
+    pub fn from_transformer_config(t: &Value) -> Self {
+        let mut cfg = Self::ltx_2_3();
+        cfg.num_layers = get_usize(t, "connector_num_layers", cfg.num_layers);
+        cfg.num_heads = get_usize(t, "connector_num_attention_heads", cfg.num_heads);
+        cfg.head_dim = get_usize(t, "connector_attention_head_dim", cfg.head_dim);
+        cfg.num_registers = get_usize(t, "connector_num_learnable_registers", cfg.num_registers);
+        cfg.max_pos = get_i32_array_first(t, "connector_positional_embedding_max_pos", cfg.max_pos);
+        cfg.norm_eps = get_f64(t, "norm_eps", cfg.norm_eps);
+        cfg.rope_theta = get_f64(t, "positional_embedding_theta", cfg.rope_theta);
+        // The connector's OWN FFN bias flag, independent of the DiT's `ff_bias`. Neither the 2.3 nor
+        // the shipped 2.5 checkpoint sets it, so it takes the reference's absent-key default
+        // (`True`) — but it is read rather than assumed, so a checkpoint that does set it is honored.
+        cfg.ff_bias = get_bool(t, "connector_ff_bias", true);
+        cfg
+    }
+
+    /// Read the **audio** connector dims from a `config.transformer` object (sc-18757). Layer count,
+    /// register count and RoPE geometry are shared with the video connector; only the head geometry
+    /// has its own `audio_connector_*` keys.
+    pub fn audio_from_transformer_config(t: &Value) -> Self {
+        let mut cfg = Self::from_transformer_config(t);
+        let audio = Self::ltx_2_3_audio();
+        cfg.num_heads = get_usize(t, "audio_connector_num_attention_heads", audio.num_heads);
+        cfg.head_dim = get_usize(t, "audio_connector_attention_head_dim", audio.head_dim);
+        cfg
+    }
+
+    /// Read the video connector dims from a split bundle's transformer component (sc-18757).
+    pub fn from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
+        let transformer = bundle.require(LtxComponent::Transformer)?;
+        Ok(Self::from_transformer_config(transformer.config()?))
+    }
+
+    /// Read the audio connector dims from a split bundle's transformer component (sc-18757).
+    pub fn audio_from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
+        let transformer = bundle.require(LtxComponent::Transformer)?;
+        Ok(Self::audio_from_transformer_config(transformer.config()?))
     }
 }
 
@@ -365,6 +496,39 @@ impl AudioVaeConfig {
     pub fn num_resolutions(&self) -> usize {
         self.ch_mult.len()
     }
+
+    /// Read the decoder structure from an `audio_vae.model.params.ddconfig` object (sc-18757).
+    pub fn from_ddconfig(dd: &Value) -> Self {
+        let mut cfg = Self::ltx_2_3();
+        cfg.ch = get_i32(dd, "ch", cfg.ch);
+        cfg.out_ch = get_i32(dd, "out_ch", cfg.out_ch);
+        if let Some(mult) = get_i32_vec(dd, "ch_mult") {
+            cfg.ch_mult = mult;
+        }
+        cfg.num_res_blocks = get_i32(dd, "num_res_blocks", cfg.num_res_blocks);
+        cfg.z_channels = get_i32(dd, "z_channels", cfg.z_channels);
+        cfg.mel_bins = get_i32(dd, "mel_bins", cfg.mel_bins);
+        cfg.mid_block_add_attention =
+            get_bool(dd, "mid_block_add_attention", cfg.mid_block_add_attention);
+        cfg
+    }
+
+    /// Read the decoder structure from a split bundle's **audio VAE** component (sc-18757).
+    ///
+    /// The `ddconfig` sits at `audio_vae.model.params.ddconfig`; a file that flattens it onto the
+    /// `audio_vae` block itself is accepted too, since both spellings appear across LTX-2.x extracts
+    /// — either way the values come from this component's own config. An absent `config.audio_vae`
+    /// is an error, not the 2.3 shape.
+    pub fn from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        let block = audio.config()?;
+        let dd = block
+            .get("model")
+            .and_then(|v| v.get("params"))
+            .and_then(|v| v.get("ddconfig"))
+            .unwrap_or(block);
+        Ok(Self::from_ddconfig(dd))
+    }
 }
 
 // --- Vocoder (`vocoder.{vocoder,bwe}`) ------------------------------------------------------------
@@ -417,6 +581,43 @@ impl VocoderGenConfig {
             apply_final_activation: false,
         }
     }
+
+    /// Read one generator's structure from a `config.vocoder.{vocoder,bwe}` object (sc-18757),
+    /// falling back per-key to `base` (the matching LTX-2.3 generator).
+    fn read(v: &Value, base: &VocoderGenConfig) -> Self {
+        let mut cfg = base.clone();
+        if let Some(a) = get_i32_vec(v, "upsample_rates") {
+            cfg.upsample_rates = a;
+        }
+        if let Some(a) = get_i32_vec(v, "upsample_kernel_sizes") {
+            cfg.upsample_kernel_sizes = a;
+        }
+        if let Some(a) = get_i32_vec(v, "resblock_kernel_sizes") {
+            cfg.resblock_kernel_sizes = a;
+        }
+        if let Some(rows) = v.get("resblock_dilation_sizes").and_then(Value::as_array) {
+            let parsed: Vec<Vec<i32>> = rows
+                .iter()
+                .filter_map(|row| {
+                    row.as_array()
+                        .map(|r| r.iter().filter_map(json_i32).collect())
+                })
+                .collect();
+            if !parsed.is_empty() {
+                cfg.resblock_dilation_sizes = parsed;
+            }
+        }
+        if let Some(s) = v.get("resblock").and_then(Value::as_str) {
+            cfg.resblock = s.to_string();
+        }
+        if let Some(s) = v.get("activation").and_then(Value::as_str) {
+            cfg.activation = s.to_lowercase();
+        }
+        cfg.use_tanh_at_final = get_bool(v, "use_tanh_at_final", cfg.use_tanh_at_final);
+        cfg.apply_final_activation =
+            get_bool(v, "apply_final_activation", cfg.apply_final_activation);
+        cfg
+    }
 }
 
 /// The full vocoder config: the core generator + the bandwidth-extension (BWE) stage. The shipped
@@ -455,6 +656,183 @@ impl VocoderConfig {
             self.output_sample_rate
         }
     }
+
+    /// Read the core + BWE generators from a `config.vocoder` object (sc-18757).
+    ///
+    /// An absent `bwe` sub-object means a **single-stage** vocoder (the pre-2.3 shape upstream's
+    /// `VocoderConfigurator` still supports) — the BWE stage is dropped, not defaulted to the 2.3
+    /// one, because a checkpoint without BWE weights would otherwise be built with a randomly
+    /// initialized second generator.
+    pub fn from_vocoder_config(v: &Value) -> Self {
+        let mut cfg = Self::ltx_2_3();
+        cfg.core = VocoderGenConfig::read(
+            v.get("vocoder").unwrap_or(v),
+            &VocoderGenConfig::ltx_2_3_core(),
+        );
+        match v.get("bwe").filter(|b| b.is_object()) {
+            Some(bwe) => {
+                cfg.bwe = Some(VocoderGenConfig::read(
+                    bwe,
+                    &VocoderGenConfig::ltx_2_3_bwe(),
+                ));
+                cfg.bwe_input_sample_rate =
+                    get_i32(bwe, "input_sampling_rate", cfg.bwe_input_sample_rate);
+                cfg.output_sample_rate = cfg.bwe_input_sample_rate;
+                cfg.bwe_output_sample_rate =
+                    get_i32(bwe, "output_sampling_rate", cfg.bwe_output_sample_rate);
+                cfg.bwe_hop_length = get_i32(bwe, "hop_length", cfg.bwe_hop_length);
+                // Upstream builds the BWE mel-STFT window from `n_fft` (`filter_length` = `n_fft`).
+                cfg.bwe_win_length = get_i32(bwe, "n_fft", cfg.bwe_win_length);
+            }
+            None => {
+                cfg.bwe = None;
+                cfg.output_sample_rate = get_i32(
+                    v.get("vocoder").unwrap_or(v),
+                    "output_sampling_rate",
+                    cfg.output_sample_rate,
+                );
+            }
+        }
+        cfg
+    }
+
+    /// Read the vocoder from a split bundle's **audio VAE** component (sc-18757).
+    ///
+    /// The vocoder has no file of its own: LTX-2.5 ships it inside the audio-VAE component, whose
+    /// metadata carries `config.audio_vae` **and** `config.vocoder`. An absent sibling section is an
+    /// error naming the component, not the HiFi-GAN defaults.
+    pub fn from_bundle(bundle: &LtxBundle) -> gen_core::Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        Ok(Self::from_vocoder_config(audio.config_section("vocoder")?))
+    }
+}
+
+/// The video-VAE structure a split bundle's video-VAE component declares (sc-18757).
+///
+/// candle's `LtxVideoVae` currently infers its block ladder from the weight shapes rather than from
+/// a config, so this carries the declared facts the loader needs to *route* — which decoder family
+/// the file holds, and the latent/patch geometry — instead of a full block list. Reading it proves
+/// the component's own `config.vae` is present and well-formed before any weight is touched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoVaeDeclaration {
+    /// `config.vae._class_name` — `CausalVideoAutoencoder` (conv) or `CausalDiffusionVAE` (DiffVAE).
+    pub class_name: String,
+    /// `latent_channels` — the DiT in/out width.
+    pub latent_channels: i32,
+    /// `patch_size` — the pixel-shuffle patchify factor.
+    pub patch_size: i32,
+}
+
+impl VideoVaeDeclaration {
+    /// The shipped LTX-2.3 convolutional VAE declaration.
+    pub fn ltx_2_3() -> Self {
+        Self {
+            class_name: gen_core::ltx_checkpoint::CONV_VIDEO_VAE_CLASS.to_string(),
+            latent_channels: LATENT_CHANNELS as i32,
+            patch_size: 4,
+        }
+    }
+
+    /// True when the file holds the diffusion decoder rather than the convolutional one.
+    pub fn is_diffusion(&self) -> bool {
+        self.class_name == gen_core::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
+    }
+
+    /// Read the declaration from a `config.vae` object.
+    pub fn from_vae_config(v: &Value) -> Self {
+        let mut cfg = Self::ltx_2_3();
+        if let Some(s) = v.get("_class_name").and_then(Value::as_str) {
+            cfg.class_name = s.to_string();
+        }
+        // `CausalDiffusionVAE` nests the encoder/decoder geometry; the latent width it reports is
+        // the encoder's `out_channels` (upstream `_prepare_video_encoder_kwargs`).
+        cfg.latent_channels = get_i32(v, "latent_channels", cfg.latent_channels);
+        let geometry = v.get("decoder").filter(|d| d.is_object()).unwrap_or(v);
+        cfg.patch_size = get_i32(geometry, "patch_size", cfg.patch_size);
+        cfg
+    }
+
+    /// Read the declaration from a split bundle's video-VAE component (sc-18757).
+    ///
+    /// `component` selects which of the two LTX-2.5 video VAEs to read — they are separate files
+    /// with separate structures, so there is no silent pick between them. A component file with no
+    /// `config.vae` is an error, never a 2.3-shaped default.
+    pub fn from_bundle(bundle: &LtxBundle, component: LtxComponent) -> gen_core::Result<Self> {
+        match component {
+            LtxComponent::ConvVideoVae | LtxComponent::DiffusionVideoVae => {}
+            other => {
+                return Err(GenError::Msg(format!(
+                    "ltx: `{}` is not a video VAE component",
+                    other.id()
+                )))
+            }
+        }
+        let vae = bundle.require(component)?;
+        Ok(Self::from_vae_config(vae.config()?))
+    }
+}
+
+// --- JSON readers ---------------------------------------------------------------------------------
+// Float-aware: the LTX converters emit some integer config values as floats (e.g.
+// `av_ca_timestep_scale_multiplier: 1000.0`), which `as_i64` silently drops.
+
+fn json_i32(n: &Value) -> Option<i32> {
+    n.as_i64()
+        .map(|x| x as i32)
+        .or_else(|| n.as_f64().map(|f| f as i32))
+}
+
+fn get_i32(v: &Value, key: &str, default: i32) -> i32 {
+    v.get(key).and_then(json_i32).unwrap_or(default)
+}
+
+fn get_usize(v: &Value, key: &str, default: usize) -> usize {
+    v.get(key)
+        .and_then(json_i32)
+        .filter(|n| *n >= 0)
+        .map_or(default, |n| n as usize)
+}
+
+fn get_f64(v: &Value, key: &str, default: f64) -> f64 {
+    v.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+
+fn get_bool(v: &Value, key: &str, default: bool) -> bool {
+    v.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn get_i32_vec(v: &Value, key: &str) -> Option<Vec<i32>> {
+    let out: Vec<i32> = v
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(json_i32)
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// First element of an int array (the single-element `*_max_pos` arrays LTX ships).
+fn get_i32_array_first(v: &Value, key: &str, default: i32) -> i32 {
+    v.get(key)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(json_i32)
+        .unwrap_or(default)
+}
+
+fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
+    match v.get(key).and_then(Value::as_array) {
+        Some(a) if a.len() == 3 => {
+            let mut out = default;
+            for (slot, value) in out.iter_mut().zip(a) {
+                if let Some(n) = json_i32(value) {
+                    *slot = n;
+                }
+            }
+            out
+        }
+        _ => default,
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +864,205 @@ mod audio_config_tests {
         assert_eq!(a.num_resolutions(), 3);
         assert!(!a.mid_block_add_attention);
         assert_eq!(a.z_channels, 8);
+    }
+}
+
+#[cfg(test)]
+mod component_config_tests {
+    use super::*;
+
+    /// An LTX-2.5-shaped `config.transformer` with values that differ from every 2.3 constant, so a
+    /// field that is silently not parsed shows up as a failure rather than passing on the default.
+    fn transformer_section() -> Value {
+        serde_json::json!({
+            "_class_name": "AVTransformer3DModel",
+            "num_layers": 44,
+            "num_attention_heads": 24,
+            "attention_head_dim": 96,
+            "norm_eps": 1e-5,
+            "positional_embedding_theta": 20000.0,
+            "positional_embedding_max_pos": [24, 4096, 4096],
+            "timestep_scale_multiplier": 500.0,
+            "audio_num_attention_heads": 16,
+            "audio_attention_head_dim": 32,
+            "audio_cross_attention_dim": 1024,
+            "audio_positional_embedding_max_pos": [12],
+            "connector_num_layers": 6,
+            "connector_num_attention_heads": 20,
+            "connector_attention_head_dim": 64,
+            "connector_num_learnable_registers": 96,
+            "connector_positional_embedding_max_pos": [2048],
+            "audio_connector_num_attention_heads": 12,
+            "audio_connector_attention_head_dim": 48
+        })
+    }
+
+    #[test]
+    fn the_transformer_section_drives_every_dit_field() {
+        let cfg = AvConfig::from_transformer_config(&transformer_section())
+            .expect("V1: no caption_proj* keys");
+        assert_eq!(cfg.video.num_layers, 44);
+        assert_eq!(cfg.video.num_heads, 24);
+        assert_eq!(cfg.video.head_dim, 96);
+        assert_eq!(cfg.video.inner_dim(), 24 * 96);
+        assert!((cfg.video.norm_eps - 1e-5).abs() < f64::EPSILON);
+        assert!((cfg.video.rope_theta - 20000.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.video.rope_max_pos, [24, 4096, 4096]);
+        // The converter emits this as a float; a non-float-aware reader would drop it.
+        assert!((cfg.video.timestep_scale_multiplier - 500.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.audio_heads, 16);
+        assert_eq!(cfg.audio_head_dim, 32);
+        assert_eq!(cfg.audio_inner(), 16 * 32);
+        assert_eq!(cfg.cross_inner, 1024);
+        assert_eq!(cfg.audio_max_pos, 12);
+        // `cross_pe_max_pos = max(video_max_pos[0], audio_max_pos)` — derived, not declared.
+        assert_eq!(cfg.cross_max_pos, 24);
+    }
+
+    /// The measured 2.3→2.5 delta, read FROM JSON rather than from a constant. Mirrors mlx's
+    /// `ltx_2_5_transformer_delta_is_read_from_config`.
+    ///
+    /// `from_transformer_config` used to ignore all three flags and hand back the 2.3 constants, so
+    /// the first real-2.5 consumer of `AvConfig::from_bundle` on candle would have built a
+    /// biased-FFN, no-keyframes DiT against weights that disagree — and candle would have silently
+    /// diverged from mlx, whose reader parsed them.
+    #[test]
+    fn the_2_5_ff_bias_and_keyframe_delta_is_read_from_config() {
+        // Exactly what the real `ltx-2.5-22b-{distilled,dev}-transformer-bf16.safetensors` headers
+        // stamp: `ff_bias:false` + `use_keyframes_abs_pos_embedding:true`, and NO `audio_ff_bias` /
+        // `connector_ff_bias` key at all.
+        let mut section = transformer_section();
+        section["ff_bias"] = serde_json::json!(false);
+        section["use_keyframes_abs_pos_embedding"] = serde_json::json!(true);
+
+        let cfg = AvConfig::from_transformer_config(&section).expect("V1: no caption_proj* keys");
+        assert!(!cfg.video.ff_bias);
+        assert!(cfg.video.use_keyframes_abs_pos_embedding);
+        // NOT part of the delta — absent from the real header, so both keep the reference `True`.
+        assert!(cfg.audio_ff_bias);
+        assert!(ConnectorConfig::from_transformer_config(&section).ff_bias);
+        assert!(ConnectorConfig::audio_from_transformer_config(&section).ff_bias);
+
+        // The 2.3 section (none of the three keys) reproduces the reference absent-key fallbacks,
+        // and matches the hardcoded 2.3 constants.
+        let base = AvConfig::from_transformer_config(&transformer_section())
+            .expect("V1: no caption_proj* keys");
+        assert!(base.video.ff_bias);
+        assert!(!base.video.use_keyframes_abs_pos_embedding);
+        assert!(base.audio_ff_bias);
+        assert_eq!(base.video.ff_bias, AvConfig::ltx_2_3().video.ff_bias);
+        assert_eq!(
+            base.video.use_keyframes_abs_pos_embedding,
+            AvConfig::ltx_2_3().video.use_keyframes_abs_pos_embedding
+        );
+
+        // Every flag is genuinely read, not inherited: flipping each away from its default lands.
+        let mut flipped = transformer_section();
+        flipped["audio_ff_bias"] = serde_json::json!(false);
+        flipped["connector_ff_bias"] = serde_json::json!(false);
+        let cfg = AvConfig::from_transformer_config(&flipped).expect("V1: no caption_proj* keys");
+        assert!(!cfg.audio_ff_bias);
+        assert!(!ConnectorConfig::from_transformer_config(&flipped).ff_bias);
+        assert!(!ConnectorConfig::audio_from_transformer_config(&flipped).ff_bias);
+    }
+
+    #[test]
+    fn an_omitted_key_keeps_its_2_3_value_but_a_missing_section_never_does() {
+        // Within a present section, an omitted key falls back — that is the documented behavior.
+        let cfg = AvConfig::from_transformer_config(&serde_json::json!({"num_layers": 40}))
+            .expect("V1: no caption_proj* keys");
+        assert_eq!(cfg.video.num_layers, 40);
+        assert_eq!(cfg.video.num_heads, AvConfig::ltx_2_3().video.num_heads);
+    }
+
+    #[test]
+    fn both_connectors_read_their_own_keys_off_the_transformer_section() {
+        let t = transformer_section();
+        let video = ConnectorConfig::from_transformer_config(&t);
+        assert_eq!(video.num_layers, 6);
+        assert_eq!(video.num_heads, 20);
+        assert_eq!(video.head_dim, 64);
+        assert_eq!(video.num_registers, 96);
+        assert_eq!(video.max_pos, 2048);
+        let audio = ConnectorConfig::audio_from_transformer_config(&t);
+        // Shared structure…
+        assert_eq!(audio.num_layers, 6);
+        assert_eq!(audio.num_registers, 96);
+        assert_eq!(audio.max_pos, 2048);
+        // …its own head geometry.
+        assert_eq!(audio.num_heads, 12);
+        assert_eq!(audio.head_dim, 48);
+    }
+
+    #[test]
+    fn the_audio_vae_ddconfig_drives_the_decoder_structure() {
+        let cfg = AudioVaeConfig::from_ddconfig(&serde_json::json!({
+            "ch": 96, "out_ch": 1, "ch_mult": [1, 2, 4, 8], "num_res_blocks": 3,
+            "z_channels": 16, "mel_bins": 128, "mid_block_add_attention": true
+        }));
+        assert_eq!(cfg.ch, 96);
+        assert_eq!(cfg.out_ch, 1);
+        assert_eq!(cfg.ch_mult, vec![1, 2, 4, 8]);
+        assert_eq!(cfg.num_resolutions(), 4);
+        assert_eq!(cfg.num_res_blocks, 3);
+        assert_eq!(cfg.z_channels, 16);
+        assert_eq!(cfg.mel_bins, 128);
+        assert!(cfg.mid_block_add_attention);
+    }
+
+    #[test]
+    fn the_vocoder_section_drives_both_generators_and_the_sample_rates() {
+        let cfg = VocoderConfig::from_vocoder_config(&serde_json::json!({
+            "vocoder": {
+                "resblock": "AMP1", "activation": "snakebeta",
+                "upsample_rates": [5, 2, 2, 2, 2, 2], "upsample_kernel_sizes": [11, 4, 4, 4, 4, 4]
+            },
+            "bwe": {
+                "resblock": "AMP1", "activation": "snakebeta",
+                "input_sampling_rate": 16000, "output_sampling_rate": 48000,
+                "hop_length": 80, "n_fft": 512
+            }
+        }));
+        assert!(cfg.core.is_bigvgan());
+        assert_eq!(cfg.core.upsample_rates.iter().product::<i32>(), 160);
+        let bwe = cfg.bwe.as_ref().expect("BWE stage");
+        assert!(bwe.is_bigvgan());
+        // Upstream builds the BWE generator with `apply_final_activation=False`.
+        assert!(!bwe.apply_final_activation);
+        assert_eq!(cfg.output_sample_rate, 16000);
+        assert_eq!(cfg.final_sample_rate(), 48000);
+        assert_eq!(cfg.bwe_hop_length, 80);
+        assert_eq!(cfg.bwe_win_length, 512);
+    }
+
+    #[test]
+    fn a_vocoder_without_bwe_drops_the_stage_instead_of_defaulting_it() {
+        // The pre-2.3 single-stage shape: a checkpoint with no BWE weights must not be built with a
+        // randomly-initialized second generator borrowed from the 2.3 config.
+        let cfg = VocoderConfig::from_vocoder_config(&serde_json::json!({
+            "vocoder": {"resblock": "1", "activation": "leaky_relu", "output_sampling_rate": 24000}
+        }));
+        assert!(cfg.bwe.is_none());
+        assert!(!cfg.core.is_bigvgan());
+        assert_eq!(cfg.final_sample_rate(), 24000);
+    }
+
+    #[test]
+    fn the_video_vae_declaration_distinguishes_conv_from_diffusion() {
+        let conv = VideoVaeDeclaration::from_vae_config(&serde_json::json!({
+            "_class_name": "CausalVideoAutoencoder", "latent_channels": 128, "patch_size": 4
+        }));
+        assert!(!conv.is_diffusion());
+        assert_eq!(conv.latent_channels, 128);
+        assert_eq!(conv.patch_size, 4);
+        let diff = VideoVaeDeclaration::from_vae_config(&serde_json::json!({
+            "_class_name": "CausalDiffusionVAE",
+            "latent_channels": 128,
+            "decoder": {"patch_size": 8, "head_dim": 64}
+        }));
+        assert!(diff.is_diffusion());
+        // The DiffVAE nests its geometry under `decoder`.
+        assert_eq!(diff.patch_size, 8);
     }
 }
 

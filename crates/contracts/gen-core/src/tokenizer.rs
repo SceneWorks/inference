@@ -113,7 +113,7 @@ pub struct TokenizerOutput {
 ///   unconditional prepend.
 ///
 /// Truncation happens only on the prepend branch — the caller has already right-truncated to
-/// `max_length`, so the sequence can exceed it only by the byte this function just added.
+/// `max_length`, so the sequence can exceed it only by the token this function just added.
 pub fn ensure_single_leading_bos(ids: &mut Vec<i32>, bos_id: i32, max_length: usize) {
     if ids.first() == Some(&bos_id) {
         return;

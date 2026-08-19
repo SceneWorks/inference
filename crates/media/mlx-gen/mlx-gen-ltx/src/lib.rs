@@ -38,6 +38,7 @@ pub(crate) fn contiguous(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod bundle;
 pub mod conditioning;
 pub mod config;
 pub mod connector;
@@ -61,6 +62,10 @@ pub mod vocoder;
 
 pub use adapters::{apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
+pub use bundle::{
+    assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,
+    split_component_ids, text_encoder_identity,
+};
 pub use conditioning::{
     append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes,
     keyframe_append_positions, patchify_grid, unpatchify_grid, I2vConditioning, Keyframe,
