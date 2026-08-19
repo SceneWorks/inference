@@ -41,6 +41,11 @@ const REAL_TE_HEADER: &str = include_str!(
      gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors.json"
 );
 
+/// The per-layer-type RoPE widths the table must resolve to (`Rope::dim()` is `usize` on
+/// this backend).
+const SLIDING_ROPE_DIM: usize = 256;
+const FULL_ROPE_DIM: usize = 512;
+
 fn goldens() -> Value {
     serde_json::from_str(GOLDENS).expect("parse gemma4 goldens")
 }
@@ -153,6 +158,19 @@ fn gemma4_layer_types_resolve_to_forty_sliding_and_eight_full() {
             assert_eq!(la.sliding_window, Some(1024), "layer {i} window");
             assert!(!la.k_eq_v, "sliding layers never share k/v");
             assert_eq!(cfg.layer_groups(i), 2, "layer {i} groups (16 heads / 8 kv)");
+            // The convenience accessors the decoder stories will actually call, not just the
+            // descriptor behind them — a dropped index inside one of these is invisible otherwise.
+            assert_eq!(
+                cfg.layer_head_dim(i),
+                256,
+                "layer {i} head dim via accessor"
+            );
+            assert_eq!(
+                cfg.layer_sliding_window(i),
+                Some(1024),
+                "layer {i} window via accessor"
+            );
+            assert_eq!(cfg.layer_rope(i).dim(), SLIDING_ROPE_DIM, "layer {i} rope");
         } else {
             assert_eq!(la.head_dim, 512, "layer {i} full head_dim");
             assert_eq!(la.num_kv_heads, 1, "layer {i} full kv heads");
@@ -166,6 +184,17 @@ fn gemma4_layer_types_resolve_to_forty_sliding_and_eight_full() {
                 16,
                 "layer {i} groups (16 heads / 1 kv)"
             );
+            assert_eq!(
+                cfg.layer_head_dim(i),
+                512,
+                "layer {i} head dim via accessor"
+            );
+            assert_eq!(
+                cfg.layer_sliding_window(i),
+                None,
+                "layer {i} window via accessor"
+            );
+            assert_eq!(cfg.layer_rope(i).dim(), FULL_ROPE_DIM, "layer {i} rope");
         }
     }
 

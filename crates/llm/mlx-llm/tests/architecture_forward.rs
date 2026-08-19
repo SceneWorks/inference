@@ -13,25 +13,32 @@
 //! edits this same decoder loop to add Gemma 4's per-layer attention, and any drift it introduces
 //! into the uniform architectures fails here.
 //!
-//! **Precision contract.** The comparison is exact — at the precision this backend actually
-//! computes in. The decoder's compute dtype is bf16, so both sides are compared as bf16 bit
-//! patterns, and for seven of the eight architectures (whose logits *are* bf16) that is plain
-//! f32 bit-equality.
+//! **Precision contract — and why this backend's differs from candle's.** MLX's Metal kernels are
+//! not bit-reproducible across machine conditions; this repo already carries that as a known fact
+//! (`mlx_metal_matmul_reduced_precision`, and the tile-shape dependence behind `sdpa`'s own 2e-3
+//! tolerances). Two earlier revisions of this file tried to assert exactly and were both disproved
+//! by CI rather than by reasoning:
 //!
-//! Gemma-2 is the exception and the reason this is spelled out: its final-logit soft-cap is applied
-//! in f32, so its logits escape as f32 and expose MLX's Metal GEMM, which this repo already knows is
-//! reproducible only to ~1e-3 (`mlx_metal_matmul_reduced_precision`, and the tile-shape dependence
-//! behind `sdpa`'s own 2e-3 tolerances). An earlier revision of this file asserted raw f32
-//! bit-equality and passed on an idle machine but failed on the loaded CI runner, on gemma2 index 0,
-//! by 1.5e-3 (`1.0900694` vs `1.0915667`) — GPU contention, not a code change. Both of those round
-//! to the same bf16 value.
+//! * raw f32 bit-equality — failed on gemma2 index 0, `1.0900694` vs `1.0915667` (Δ 1.5e-3);
+//! * bf16 bit-equality — failed on gemma2 index 1, `-0.17145248` vs `-0.17308894` (Δ 1.6e-3, about
+//!   two bf16 ULPs at that magnitude).
 //!
-//! So each value must match as bf16 **and** stay inside the documented Metal band. The pair is
-//! deliberate: bf16 equality is the real gate (a 1% attention-scale change moves the bf16 bits), and
-//! the band stops a drift larger than a bf16 ULP from hiding behind a lucky rounding.
+//! Both passed 25/25 locally on an idle machine, so the variable is runner load, not code. The
+//! drift is roughly a **fixed magnitude** (~1.6e-3), not a fixed ratio — it tracks the largest
+//! intermediates, so small logits show it as a large *relative* error. Gemma-2 is the only case
+//! exposed at all, because its final-logit soft-cap runs in f32 while the other seven
+//! architectures' logits stay bf16 and quantize the drift away.
 //!
-//! `candle-llm`'s mirror of this file runs on a deterministic CPU kernel and does assert raw f32
-//! bit-equality; the two files differ here for that reason alone.
+//! So MLX compares against an **absolute** tolerance ([`FORWARD_ABS_TOL`]) sized at ~2.5× the
+//! observed drift. That still has teeth — a 1% attention-scale change moves llama's logits by
+//! 7.8e-3, comfortably outside it — but it is honestly weaker than exact, and it will not see a
+//! change smaller than the tolerance.
+//!
+//! **That gap is covered by the other backend, not left open.** `candle-llm`'s mirror of this file
+//! runs on a deterministic CPU kernel and asserts raw f32 bit-equality on the same eight
+//! architectures built from the same weights, so every architecture's exact numerics — Gemma-2's
+//! soft-cap included — stay pinned bit-for-bit there. This suite's job is the Metal path: shapes,
+//! dispatch, cache growth, and drift above the band.
 //!
 //! Regenerate (only ever against a known-good tree, and say so in the commit):
 //!
@@ -554,23 +561,13 @@ fn run_forward(case: &Case) -> Vec<f32> {
     out
 }
 
-/// How far apart two runs of the same MLX graph may land, as a fraction of the row's magnitude.
+/// How far a logit may move between two runs of the same MLX graph before it counts as a change.
 ///
-/// MLX's Metal GEMM picks its tiling from the problem shape and machine state, so an f32 result is
-/// reproducible only to about a thousandth — the same band `primitives::attention`'s own tests use.
-/// Observed on the CI runner under load: 1.4e-3 relative on Gemma-2's f32 soft-capped logits.
-const METAL_GEMM_BAND: f32 = 5e-3;
-
-/// The bf16 bit pattern `x` rounds to (round-to-nearest-even), i.e. the value at the precision the
-/// decoder computes in.
-fn bf16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    if x.is_nan() {
-        return ((b >> 16) as u16) | 0x0040;
-    }
-    let lsb = (b >> 16) & 1;
-    (((b + 0x7fff + lsb) >> 16) & 0xffff) as u16
-}
+/// Sized at ~2.5x the largest drift CI has actually shown (1.6e-3, twice, both on Gemma-2's f32
+/// soft-capped logits under runner load). Absolute rather than relative because the drift tracks
+/// the largest intermediates, not each value's own magnitude. A 1% attention-scale change moves
+/// llama's logits by 7.8e-3, so real changes stay well outside it.
+const FORWARD_ABS_TOL: f32 = 4e-3;
 
 fn host(a: &Array) -> Vec<f32> {
     a.as_dtype(Dtype::Float32)
@@ -580,10 +577,17 @@ fn host(a: &Array) -> Vec<f32> {
 }
 
 /// **The regression gate.** Every architecture's full forward output, as the base branch produced
-/// it — matched at the decoder's compute precision (see the precision contract above).
+/// it — matched within the Metal band (see the precision contract above) — plus the coverage check
+/// that the case list is exactly the generic-decoder architecture set.
+///
+/// Deliberately a **single** test: a second `#[test]` in this binary runs on a second thread, and
+/// building its cases would touch MLX concurrently with this one's forward passes. That is exactly
+/// the kind of contention the precision contract above is about, and there is no reason to invite
+/// it inside our own test binary.
 #[test]
 fn every_architecture_forward_matches_the_base_branch() {
     let cases = cases();
+    assert_case_coverage(&cases);
 
     if std::env::var("SC18769_WRITE_FORWARD_GOLDEN").is_ok() {
         let mut doc = Map::new();
@@ -621,37 +625,28 @@ fn every_architecture_forward_matches_the_base_branch() {
             .collect();
         let got = run_forward(case);
         assert_eq!(got.len(), want.len(), "{}: logit count", case.name);
-        let scale = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0);
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            // The gate: identical at the decoder's own compute precision.
-            assert_eq!(
-                bf16_bits(*g),
-                bf16_bits(*w),
-                "{}: forward output moved at index {i}: got {g} (bf16 {:#06x}), the base branch \
-                 produced {w} (bf16 {:#06x}). The shared decoder or config changed this \
-                 architecture's numerics.",
-                case.name,
-                bf16_bits(*g),
-                bf16_bits(*w),
-            );
-            // The net under it: no drift wider than a bf16 ULP may hide behind a lucky rounding.
-            assert!(
-                (g - w).abs() <= METAL_GEMM_BAND * scale,
-                "{}: forward output at index {i} drifted {} (got {g}, base {w}) — beyond the \
-                 documented Metal GEMM reproducibility band of {} for this row",
-                case.name,
-                (g - w).abs(),
-                METAL_GEMM_BAND * scale,
+        if let Some((i, (g, w))) = got
+            .iter()
+            .zip(&want)
+            .enumerate()
+            .find(|(_, (g, w))| (*g - *w).abs() > FORWARD_ABS_TOL)
+        {
+            panic!(
+                "{name}: forward output moved at index {i} by {delta} (got {g}, the base branch \
+                 produced {w}) — beyond the {tol} Metal reproducibility band. The shared decoder \
+                 or config changed this architecture's numerics.",
+                name = case.name,
+                delta = (g - w).abs(),
+                tol = FORWARD_ABS_TOL,
             );
         }
     }
 }
 
-/// The fixture must cover **every** architecture the generic decoder serves, so a newly-added one
+/// The case list must cover **every** architecture the generic decoder serves, so a newly-added one
 /// cannot land without a forward golden.
-#[test]
-fn forward_goldens_cover_every_generic_architecture() {
-    let covered: std::collections::BTreeSet<&str> = cases().iter().map(|c| c.family).collect();
+fn assert_case_coverage(cases: &[Case]) {
+    let covered: std::collections::BTreeSet<&str> = cases.iter().map(|c| c.family).collect();
     let expected: std::collections::BTreeSet<&str> = [
         "llama",
         "qwen3",
