@@ -122,9 +122,12 @@ const DENOISE_ACT_BYTES_PER_TOKEN_HIDDEN: f64 = 80.0;
 /// decode peak lives in `RESIDENT_OVERHEAD_GIB`, so this term is the pure per-pixel conv growth.
 const DECODE_SPIKE_BYTES_PER_PIXEL: f64 = 6_500.0;
 
-/// The assembled full-resolution RGB output buffers held across a tiled decode (`output [1,3,H,W]` +
-/// blend `weights`), f32 — the term tiling can NOT shrink. ~16 B/px (12 for the 3-channel output + a
-/// 1-channel weight accumulator + margin).
+/// The assembled full-resolution RGB output buffer held across a tiled decode (`output [1,3,H,W]`),
+/// f32 — the term tiling can NOT shrink. sc-18320's separable fold retired the full-size 1-channel
+/// blend-weight accumulator this constant originally budgeted alongside the output (the normalizer
+/// is now three 1-D host vectors, materialized once at the end); `16` deliberately keeps the old
+/// 12 + 4 B/px envelope — this is a shipped, calibrated memory model, and over-predicting the
+/// unshrinkable term is the safe direction (resolution reduction slightly sooner, never OOM).
 const DECODE_ACCUM_BYTES_PER_PIXEL: f64 = 16.0;
 
 /// The working set of ONE minimal decode tile — the least the tiled decode can spike to, on top of the

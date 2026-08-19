@@ -520,13 +520,10 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
 /// The latent is a real one: a full render at 1024², re-encoded through the same VAE, so the
 /// GroupNorm statistics the tail tiles are the statistics of a real image rather than of noise.
 ///
-/// **This is an exploration harness, and it asserts one thing only.** The 32-cell grid it prints is
-/// evidence for a human reading the rung-2 write-up, not a gate: pinning 32 drift values would fail
-/// on any MLX kernel change without telling anyone anything useful. What it *does* pin is the single
-/// cell the verdict cites — the best geometry at the default output size — because that number
-/// appears in `memory_strategy::DECODE_SUPPORT` and in `refuse_decode`'s user-facing message. The
-/// range argument that actually decides the rung is asserted separately, in
-/// `no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range`.
+/// The grid remains an exploration instrument, but SC-19753 also pins two invariants: the policy
+/// overlap cannot change output arithmetic, and the default sealed geometry clears the 48/255 bar.
+/// The advertised-size regression is asserted separately by
+/// `layerwise_decode_clears_the_bar_across_the_advertised_output_range`.
 ///
 /// Set `SDXL_SWEEP_EDGES` / `SDXL_SWEEP_OVERLAPS` (comma-separated) to explore; the defaults are the
 /// published ladder and its rejection set.
@@ -585,6 +582,7 @@ fn decode_tile_mechanism_sweep() {
     println!("[sc-15525 rung2 mechanism] latent {:?}", latent.shape());
     println!("[sc-15525 rung2 mechanism] untiled decode peak {untiled_peak:.3} GiB at {size}²");
     let mut cited: Option<u32> = None;
+    let mut overlap_reference: Option<Vec<u8>> = None;
     println!("| edge | overlap | tiles | isolated peak (GiB) | max Δ | mean Δ |");
     println!("|---:|---:|---:|---:|---:|---:|");
     for overlap in &overlaps {
@@ -618,6 +616,16 @@ fn decode_tile_mechanism_sweep() {
             if size == 1024 && *edge == ms::DECODE_TILE_EDGE && *overlap == BEST_DECODE_OVERLAP {
                 cited = Some(drift);
             }
+            if size == 1024 && *edge == ms::DECODE_TILE_EDGE {
+                if let Some(reference) = &overlap_reference {
+                    assert_eq!(
+                        &px, reference,
+                        "overlap is policy identity only under layer-wise tiling; edge {edge} changed output at overlap {overlap}"
+                    );
+                } else {
+                    overlap_reference = Some(px.clone());
+                }
+            }
         }
     }
     // The one cell this harness gates: the number `memory_strategy::DECODE_SUPPORT` publishes and
@@ -633,40 +641,15 @@ fn decode_tile_mechanism_sweep() {
     }
 }
 
-/// **The measurement that decides rung 2**, and the one the SC-15525 review's "publish `[896]`@192"
-/// proposal turns on.
+/// SC-19753 regression across the provider's advertised output range.
 ///
-/// The review was right about the datum and right about the bar. At 1024² the best geometry in the
-/// whole sweep — edge [`ms::DECODE_TILE_EDGE`] at overlap [`BEST_DECODE_OVERLAP`] — drifts **38/255**,
-/// which clears [`SIBLING_DRIFT_BAR`], the worst drift Z-Image *admits* into its shipped ladder. On
-/// that evidence alone the candidate should be published.
-///
-/// What the 1024²-only sweep could not see is that **the datum is not a property of the tile edge**.
-/// A contract's `decode_tile_edges` is an absolute pixel domain with no geometry axis, so publishing
-/// 896 publishes it across everything this provider advertises — and `descriptor()` advertises
-/// `max_size: 2048`. Re-measured across that range, the same geometry walks straight through the bar:
-///
-/// | output | tiles | max Δ | verdict |
-/// |---:|---:|---:|---|
-/// | 1024² | 4 | **38** | clears 48 |
-/// | 1280² | 4 | 64 | fails |
-/// | 1536² | 4 | 120 | fails |
-/// | 2048² | 9 | 77 | fails |
-///
-/// The mechanism explains the shape and predicts it: the tail's GroupNorms normalize over the spatial
-/// extent each tile is handed, so what governs the drift is the tile's **fraction of the image**, not
-/// its pixel size. 896 covers 87.5% of a 1024² output and 43.75% of a 2048² one. No fixed pixel edge
-/// can hold a constant fraction across a 4× range, so no fixed edge is admissible across it — which
-/// is a different and much stronger statement than the one this module used to make, and unlike that
-/// one it is consistent with the table above.
-///
-/// So the rung stays `Missing`, and this test is why: it fails if 1024² ever stops clearing the bar
-/// (the candidate was never real) **and** it fails if the larger outputs ever start clearing it (the
-/// candidate is now publishable and the declaration is stale). Either way the verdict gets revisited
-/// instead of inherited.
+/// Before the layer-wise decoder, this test intentionally required the large outputs to exceed the
+/// 48/255 bar because whole-tail crops computed different GroupNorm statistics. That expectation is
+/// now the bug model. Full-activation statistics must keep every measured size within the bar. Exact
+/// sealed route/geometry policies decide production admission; the route-blind fallback stays closed.
 #[test]
 #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
-fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range() {
+fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
@@ -724,54 +707,35 @@ fn no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range(
     }
 
     let at = |size: u32| rows.iter().find(|(s, _, _)| *s == size).expect("row").1;
-    // Half one: the candidate is REAL at the size it was swept. Without this the test would pass on a
-    // decoder that drifts everywhere, and the withholding reason would be unfalsifiable.
-    assert!(
-        at(1024) <= SIBLING_DRIFT_BAR,
-        "edge {} overlap {BEST_DECODE_OVERLAP} no longer clears the sibling bar at 1024² ({} > \
-         {SIBLING_DRIFT_BAR}) — the whole premise of the rung-2 write-up is stale",
-        ms::DECODE_TILE_EDGE,
-        at(1024),
-    );
-    // Half two: and it is NOT admissible across the advertised range, which is why it is withheld.
-    for size in [1280_u32, 1536, 2048] {
+    for size in [1024_u32, 1280, 1536, 2048] {
         assert!(
-            at(size) > SIBLING_DRIFT_BAR,
-            "edge {} overlap {BEST_DECODE_OVERLAP} now clears {SIBLING_DRIFT_BAR}/255 at {size}² \
-             ({}) — a fixed edge may have become admissible across the advertised range, so rung 2 \
-             must be re-decided rather than left Missing on a superseded measurement",
+            at(size) <= SIBLING_DRIFT_BAR,
+            "layer-wise decode exceeds {SIBLING_DRIFT_BAR}/255 at {size}²: edge {} overlap \
+             {BEST_DECODE_OVERLAP} produced {}",
             ms::DECODE_TILE_EDGE,
             at(size),
         );
     }
 }
 
-/// **What rung 2 would have bought at the REQUEST level, and what it costs on the latent a real
-/// render actually produces.** Both are numbers the mechanism sweep cannot supply.
+/// Request-level memory and quality for layer-wise decode on a production latent.
 ///
 /// [`decode_tile_mechanism_sweep`] measures the *isolated* decode — the right scope for a drift
 /// comparison, the wrong scope for the saving, because a selector admits against the whole request.
-/// `generate` cannot supply this row either (`memory_strategy::decode_tiling` refuses every
-/// bounded-decode request), so it is assembled from the same public entry points as the rung-3 row,
-/// under the same staged schedule, with the tiled decode substituted for the single-pass one.
+/// The route-blind harness has no sealed policy and therefore remains refused, so this row is
+/// assembled from the same public entry points under the same staged schedule, with the layer-wise
+/// decode substituted for the single-pass one.
 ///
-/// **The saving is real and it is the one this ladder claims**: 19.0032 → 15.8660 GiB, **−16.51%**,
-/// at 876 → 936 ms/step (tiling costs ~7% wall clock, not a multiple). An earlier revision published
-/// that figure with no test behind it; this is the test.
+/// The retired whole-tail decoder measured 19.0032 → 15.8660 GiB (−16.51%) at 876 → 936 ms/step.
+/// Layer-wise arithmetic materially changes the peak, so this test now promises only the explicit
+/// greater-than-3% bound below until current memory is recaptured.
 ///
-/// **And the drift is worse here than the sweep suggested — 84/255, not 38.** That is not a
-/// contradiction, it is the sweep's latent being the friendlier one. The sweep decodes a latent
-/// obtained by *re-encoding a finished image*, whose statistics have already been through the VAE
-/// round trip; this row decodes what the denoiser actually hands the decode phase. The production
-/// latent is the one a user would get, and at 1024² — the single output size where the swept
-/// candidate cleared [`SIBLING_DRIFT_BAR`] — it does **not** clear it.
-///
-/// So this test carries the second, independent half of rung 2's `Missing` verdict:
-/// `no_single_decode_tile_edge_clears_the_bar_across_the_advertised_output_range` shows the candidate
-/// fails everywhere except 1024²; this shows it fails at 1024² too, once the latent is the real one.
+/// Before SC-19753 the production latent exposed the per-crop GroupNorm defect more strongly than a
+/// re-encoded image. The same row now guards the repair: it must preserve the measured memory saving
+/// while clearing the 48/255 quality bar on the latent a user actually receives.
 #[test]
 #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
-fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
+fn layerwise_decode_is_priced_at_the_request_level() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
     };
@@ -804,31 +768,26 @@ fn the_withheld_decode_geometry_is_priced_at_the_request_level() {
         tiled.peak_gib,
         untiled.peak_gib
     );
-    // Half two, and the one that decides the rung: on the PRODUCTION latent the best swept geometry
-    // does not clear the sibling bar even at 1024². Asserted rather than only printed, because this
-    // is the load-bearing fact — if a future VAE or blend change brought it under the bar, the whole
-    // `Missing` verdict would be resting on the range argument alone and would need re-deciding.
+    // Layer-wise normalization must clear the production quality bar. Exact policy identity, not
+    // this route-blind harness, decides whether the production selector may engage the rung.
     let drift = max_delta(&untiled.pixels, &tiled.pixels);
     assert!(
-        drift > SIBLING_DRIFT_BAR,
-        "edge {} overlap {BEST_DECODE_OVERLAP} now drifts only {drift}/255 on the production latent \
-         at 1024², which clears the {SIBLING_DRIFT_BAR}/255 sibling bar — rung 2's verdict is no \
-         longer supported at this output size and must be re-decided on the range argument alone",
+        drift <= SIBLING_DRIFT_BAR,
+        "edge {} overlap {BEST_DECODE_OVERLAP} exceeds the {SIBLING_DRIFT_BAR}/255 production bar: \
+         {drift}/255",
         ms::DECODE_TILE_EDGE,
     );
 }
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
 ///
-/// It is not invented here. It is the worst max-Δ that a **sibling MLX provider on the same shared
-/// tiling machinery** admits into a shipped ladder: `mlx_gen_z_image`'s `DECODE_TILE_EDGES` tops out
-/// at 48/255 (its 768 px tile), and its rejected set starts at 64. Z-Image's VAE is the same diffusers
-/// `AutoencoderKL` with the same spatial-extent GroupNorms and the same head/tail split, so it is the
-/// closest thing to a precedent that exists — using anything looser here would be inventing a bar to
-/// clear, and using anything tighter would be inventing one to fail.
+/// SC-19753 retains 48/255 as the product decode-quality admission bar across the 69 sealed
+/// coordinates. Historically it came from Z's old 48-admitted/64-rejected split; Z now admits all
+/// seven measured edges with a much lower worst result, so that split is provenance, not current
+/// Z-domain evidence.
 const SIBLING_DRIFT_BAR: u32 = 48;
 
-/// The overlap that minimises drift at [`ms::DECODE_TILE_EDGE`] — the sweep's best cell.
+/// Historical overlap retained as the sealed policy identity; it no longer changes arithmetic.
 const BEST_DECODE_OVERLAP: u32 = 192;
 
 // ── Rung 3 ───────────────────────────────────────────────────────────────────────────────────────

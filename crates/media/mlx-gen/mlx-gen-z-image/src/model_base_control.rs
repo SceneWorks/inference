@@ -50,6 +50,8 @@ pub const MODEL_ID: &str = "z_image_control";
 /// `Reference` (an optional img2img init — the fork's `generate_image` accepts both).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: Some(accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
@@ -328,7 +330,6 @@ impl ZImageControl {
                 pipeline::calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode, MODEL_ID)?;
                 let images = pipeline::decode_batch(
                     view.vae,
-                    None,
                     tiling.as_ref(),
                     latents,
                     &req.cancel,
@@ -479,38 +480,35 @@ mod tests {
         assert!(err.contains("base snapshot directory"), "got: {err}");
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that the Z-Image BASE-CONTROL dispatch
-    // HONORS `offload_policy`. Upgraded from the sc-11124 smoke test (which pointed a *single File*
-    // base at both arms, so both merely hit the shared up-front single-file rejection — an
-    // always-`Resident` impl passed it). This drives the shared `build_control_residency` seam with the
-    // base control variant's own `MODEL_ID`/`PRECISION_MSG` past that guard, using a non-existent base
-    // dir + control (so no weights load), and asserts the deferral discriminator:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the text encoder from the missing base dir → `Err`.
-    // A `Sequential → Resident` regression (the exact F-172 bug this seam fixed) would eager-load under
-    // the Sequential request and fail the first assertion. The real-weight A/B in
-    // `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by default.
-    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/z-image-base-control-residency-test-base".into(),
-        ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/z-image-base-control-residency-test-overlay.safetensors".into(),
-        ))
-        .with_offload_policy(policy)
+    // SC-15806: weight-free proof that BASE-CONTROL construction is request-scoped for both legacy
+    // policy values. Encoder/tokenizer admission is complete, while transformer, VAE, and control
+    // weights are deliberately absent; construction therefore succeeds only by retaining loaders.
+    fn incomplete_control_spec(policy: OffloadPolicy) -> (tempfile::TempDir, LoadSpec) {
+        let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete encoder and tokenizer fixture");
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
+            .with_control(WeightsSource::File(
+                snapshot.path().join("control.safetensors"),
+            ))
+            .with_offload_policy(policy);
+        (snapshot, spec)
     }
 
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let res = crate::model_control::build_control_residency(
-                &missing_control_spec(policy),
-                MODEL_ID,
-                PRECISION_MSG,
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer and ignore the missing snapshot: {error}")
-            });
+            let (snapshot, spec) = incomplete_control_spec(policy);
+            assert!(!snapshot.path().join("transformer").exists());
+            assert!(!snapshot.path().join("vae").exists());
+            assert!(!snapshot.path().join("control.safetensors").exists());
+            let res = crate::model_control::build_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+                .unwrap_or_else(|error| {
+                    panic!("{policy:?} must defer absent heavy components: {error}")
+                });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

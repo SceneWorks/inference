@@ -9,10 +9,11 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm};
+use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 
 use crate::silu_glue;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use super::nchw_to_nhwc;
 
@@ -97,6 +98,19 @@ impl ResnetBlock2D {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.norm1_w, &self.norm1_b, &self.norm2_w, &self.norm2_b])?;
+        self.conv1.materialize_weights()?;
+        self.conv2.materialize_weights()?;
+        if let Some(projection) = &self.time_emb_proj {
+            projection.materialize_weights()?;
+        }
+        if let Some(shortcut) = &self.shortcut {
+            shortcut.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Cast every dtype-bearing leaf to `dtype` (sc-4941 bf16 training): the GroupNorm weights/biases,
     /// both convs, the time-embedding projection, and the 1×1 shortcut.
     pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
@@ -145,6 +159,54 @@ impl ResnetBlock2D {
             None => x.clone(),
         };
         Ok(add(&residual, &y)?)
+    }
+
+    /// VAE-only, normalization-correct bounded forward (sc-19753).
+    ///
+    /// The U-Net continues to use [`Self::forward`]. VAE resnets carry no time embedding, allowing
+    /// their GroupNorms to use full-image statistics while only the two 3×3 convolutions tile.
+    pub fn forward_tiled_vae(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        if self.time_emb_proj.is_some() {
+            return Err(mlx_gen::Error::Msg(
+                "forward_tiled_vae called on a time-conditioned U-Net resnet".into(),
+            ));
+        }
+        let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
+        let y = tiled_conv2d_3x3_nhwc(
+            x,
+            self.conv1.weight(),
+            self.conv1.bias(),
+            tile_edge,
+            cancel,
+            |tile| silu_glue(&norm1.apply(tile)?),
+        )?;
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let norm2 = GlobalGroupNorm::new(&y, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
+        let y = tiled_conv2d_3x3_nhwc(
+            &y,
+            self.conv2.weight(),
+            self.conv2.bias(),
+            tile_edge,
+            cancel,
+            |tile| silu_glue(&norm2.apply(tile)?),
+        )?;
+        let residual = match &self.shortcut {
+            Some(sc) => sc.forward(x)?,
+            None => x.clone(),
+        };
+        let out = add(&residual, &y)?;
+        out.eval()?;
+        Ok(out)
     }
 
     /// The one LoRA-targetable **Linear** on a U-Net resnet — `time_emb_proj`. The convs

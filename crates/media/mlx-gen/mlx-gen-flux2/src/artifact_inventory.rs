@@ -1,19 +1,24 @@
 //! Exact HF-cache artifact pin for the calibrated FLUX.2 Klein BF16 ladder.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype};
 use mlx_gen::gen_core::{Error as CoreError, Result as CoreResult};
-use mlx_gen::{LoadSpec, WeightsSource};
+use mlx_gen::{LoadSpec, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
 
 const REVISIONS: &[&str] = &[
     crate::memory_strategy::KLEIN_CALIBRATED_REVISION,
     "acf05e8d5103838baba6a5e32dc91d6997a56023",
 ];
+pub(crate) const KLEIN_REHOST_REVISION: &str = "acf05e8d5103838baba6a5e32dc91d6997a56023";
+pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "406265beebe141024a06e24038c3713cf7af87d8";
+const KLEIN_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-mlx";
+const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-mlx";
 const TRUE_V2_TRANSFORMER_SHA256: &str =
     "72ae74528050cd97bf056568000fcb7915012b4d0fd0807de205513e0fdc64b9";
 
@@ -224,11 +229,611 @@ struct Entry {
 pub(crate) struct KleinArtifactInventory {
     root: PathBuf,
     entries: Vec<Entry>,
-    true_v2: bool,
+    visible_safetensors: Vec<(PathBuf, BTreeSet<String>)>,
+    kind: KleinArtifactKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KleinArtifactKind {
+    CalibratedBase,
+    TrueV2,
+    BaseRehost(Option<Quant>),
+    KvRehost(Option<Quant>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnkeyFamily {
+    Base,
+    Kv,
+}
+
+fn path_ends_with(root: &Path, suffix: &[&str]) -> bool {
+    let components = root
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    components.len() >= suffix.len()
+        && components[components.len() - suffix.len()..]
+            .iter()
+            .map(String::as_str)
+            .eq(suffix.iter().copied())
+}
+
+fn turnkey_identity(root: &Path) -> Option<(TurnkeyFamily, Option<Quant>)> {
+    for (family, cache_dir, revision) in [
+        (
+            TurnkeyFamily::Base,
+            KLEIN_REHOST_CACHE_DIR,
+            KLEIN_REHOST_REVISION,
+        ),
+        (
+            TurnkeyFamily::Kv,
+            KLEIN_KV_REHOST_CACHE_DIR,
+            KLEIN_KV_REHOST_REVISION,
+        ),
+    ] {
+        for (tier, quant) in [
+            ("bf16", None),
+            ("q4", Some(Quant::Q4)),
+            ("q8", Some(Quant::Q8)),
+        ] {
+            if path_ends_with(root, &[cache_dir, "snapshots", revision, tier]) {
+                return Some((family, quant));
+            }
+        }
+    }
+    None
+}
+
+fn visible_safetensors(directory: &Path) -> CoreResult<BTreeSet<String>> {
+    let mut visible = BTreeSet::new();
+    for entry in std::fs::read_dir(directory).map_err(|error| {
+        CoreError::Msg(format!(
+            "read FLUX.2 Klein component {}: {error}",
+            directory.display()
+        ))
+    })? {
+        let path = entry
+            .map_err(|error| CoreError::Msg(error.to_string()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+        {
+            visible.insert(
+                path.file_name()
+                    .expect("directory entry has a file name")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(visible)
+}
+
+fn single_safetensors(directory: &Path) -> CoreResult<(PathBuf, BTreeSet<String>)> {
+    let visible = visible_safetensors(directory)?;
+    if visible.len() != 1 {
+        return Err(CoreError::Unsupported(format!(
+            "flux2 Klein {} must contain exactly one visible safetensors file, found {:?}",
+            directory.display(),
+            visible
+        )));
+    }
+    let name = visible.iter().next().expect("one entry");
+    Ok((directory.join(name), visible))
+}
+
+fn pinned_entry(source: PathBuf) -> CoreResult<Entry> {
+    let link_target = std::fs::symlink_metadata(&source)
+        .map_err(|error| CoreError::Msg(format!("stat {}: {error}", source.display())))?
+        .file_type()
+        .is_symlink()
+        .then(|| std::fs::read_link(&source))
+        .transpose()
+        .map_err(|error| CoreError::Msg(format!("read link {}: {error}", source.display())))?;
+    let identity = identity(&source)
+        .map_err(|error| CoreError::Msg(format!("pin {}: {error}", source.display())))?;
+    Ok(Entry {
+        source,
+        link_target,
+        identity,
+    })
+}
+
+fn validate_dense_headers(path: &Path, component: &str) -> CoreResult<()> {
+    let headers = safetensors_path_tensor_headers(path)?;
+    if headers.is_empty()
+        || headers.iter().any(|header| {
+            header.dtype == Dtype::U32
+                || header.name.ends_with(".scales")
+                || header.name.ends_with(".biases")
+        })
+    {
+        return Err(CoreError::Unsupported(format!(
+            "flux2 Klein {component} must be a non-empty dense inventory"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_exact_shape(
+    component: &str,
+    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+    expected: &[usize],
+) -> CoreResult<()> {
+    if header.shape != expected {
+        return Err(CoreError::Unsupported(format!(
+            "flux2 Klein {component} tensor {} has shape {:?}, expected {expected:?}",
+            header.name, header.shape
+        )));
+    }
+    Ok(())
+}
+
+fn validate_exact_tensor_names(
+    component: &str,
+    observed: impl Iterator<Item = String>,
+    expected: impl Iterator<Item = String>,
+) -> CoreResult<()> {
+    let observed = observed.collect::<BTreeSet<_>>();
+    let expected = expected.collect::<BTreeSet<_>>();
+    if observed == expected {
+        return Ok(());
+    }
+    let missing = expected.difference(&observed).cloned().collect::<Vec<_>>();
+    let unexpected = observed.difference(&expected).cloned().collect::<Vec<_>>();
+    Err(CoreError::Unsupported(format!(
+        "flux2 Klein {component} tensor inventory is not exact: missing={missing:?} unexpected={unexpected:?}"
+    )))
+}
+
+fn validate_vae_headers(path: &Path) -> CoreResult<()> {
+    validate_dense_headers(path, "vae")?;
+    let observed = safetensors_path_tensor_headers(path)?
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect::<BTreeMap<_, _>>();
+    let required = klein_required_vae_weights();
+    validate_exact_tensor_names(
+        "VAE",
+        observed.keys().cloned(),
+        required
+            .keys()
+            .cloned()
+            .chain(std::iter::once("bn.num_batches_tracked".to_owned())),
+    )?;
+    let batch_counter = observed
+        .get("bn.num_batches_tracked")
+        .expect("exact VAE tensor-name equality requires the batch counter");
+    if batch_counter.dtype != Dtype::I64 || !batch_counter.shape.is_empty() {
+        return Err(CoreError::Unsupported(format!(
+            "flux2 Klein VAE bn.num_batches_tracked must be an I64 scalar, found {:?} {:?}",
+            batch_counter.dtype, batch_counter.shape
+        )));
+    }
+    for (name, shape) in required {
+        let header = observed.get(&name).ok_or_else(|| {
+            CoreError::Unsupported(format!("flux2 Klein VAE is missing required tensor {name}"))
+        })?;
+        if !header.is_float() {
+            return Err(CoreError::Unsupported(format!(
+                "flux2 Klein VAE tensor {name} must be floating point"
+            )));
+        }
+        validate_exact_shape("VAE", header, &shape)?;
+    }
+    Ok(())
+}
+
+fn klein_required_vae_weights() -> BTreeMap<String, Vec<usize>> {
+    fn insert(required: &mut BTreeMap<String, Vec<usize>>, name: String, shape: &[usize]) {
+        required.insert(name, shape.to_vec());
+    }
+    fn add_resnet(
+        required: &mut BTreeMap<String, Vec<usize>>,
+        prefix: &str,
+        input: usize,
+        output: usize,
+    ) {
+        for suffix in ["norm1.weight", "norm1.bias"] {
+            insert(required, format!("{prefix}.{suffix}"), &[input]);
+        }
+        insert(
+            required,
+            format!("{prefix}.conv1.weight"),
+            &[output, input, 3, 3],
+        );
+        insert(required, format!("{prefix}.conv1.bias"), &[output]);
+        for suffix in ["norm2.weight", "norm2.bias"] {
+            insert(required, format!("{prefix}.{suffix}"), &[output]);
+        }
+        insert(
+            required,
+            format!("{prefix}.conv2.weight"),
+            &[output, output, 3, 3],
+        );
+        insert(required, format!("{prefix}.conv2.bias"), &[output]);
+        if input != output {
+            insert(
+                required,
+                format!("{prefix}.conv_shortcut.weight"),
+                &[output, input, 1, 1],
+            );
+            insert(required, format!("{prefix}.conv_shortcut.bias"), &[output]);
+        }
+    }
+    fn add_attention(required: &mut BTreeMap<String, Vec<usize>>, prefix: &str, channels: usize) {
+        for suffix in ["group_norm.weight", "group_norm.bias"] {
+            insert(required, format!("{prefix}.{suffix}"), &[channels]);
+        }
+        for projection in ["to_q", "to_k", "to_v", "to_out.0"] {
+            insert(
+                required,
+                format!("{prefix}.{projection}.weight"),
+                &[channels, channels],
+            );
+            insert(required, format!("{prefix}.{projection}.bias"), &[channels]);
+        }
+    }
+
+    let mut required = BTreeMap::new();
+    for name in ["bn.running_mean", "bn.running_var"] {
+        insert(&mut required, name.to_owned(), &[128]);
+    }
+    insert(
+        &mut required,
+        "quant_conv.weight".to_owned(),
+        &[64, 64, 1, 1],
+    );
+    insert(&mut required, "quant_conv.bias".to_owned(), &[64]);
+    insert(
+        &mut required,
+        "post_quant_conv.weight".to_owned(),
+        &[32, 32, 1, 1],
+    );
+    insert(&mut required, "post_quant_conv.bias".to_owned(), &[32]);
+    insert(
+        &mut required,
+        "encoder.conv_in.weight".to_owned(),
+        &[128, 3, 3, 3],
+    );
+    insert(&mut required, "encoder.conv_in.bias".to_owned(), &[128]);
+
+    let channels = [128, 256, 512, 512];
+    let mut input = 128;
+    for (block, output) in channels.into_iter().enumerate() {
+        for resnet in 0..2 {
+            add_resnet(
+                &mut required,
+                &format!("encoder.down_blocks.{block}.resnets.{resnet}"),
+                input,
+                output,
+            );
+            input = output;
+        }
+        if block < 3 {
+            insert(
+                &mut required,
+                format!("encoder.down_blocks.{block}.downsamplers.0.conv.weight"),
+                &[output, output, 3, 3],
+            );
+            insert(
+                &mut required,
+                format!("encoder.down_blocks.{block}.downsamplers.0.conv.bias"),
+                &[output],
+            );
+        }
+    }
+    add_resnet(&mut required, "encoder.mid_block.resnets.0", 512, 512);
+    add_attention(&mut required, "encoder.mid_block.attentions.0", 512);
+    add_resnet(&mut required, "encoder.mid_block.resnets.1", 512, 512);
+    for suffix in ["weight", "bias"] {
+        insert(
+            &mut required,
+            format!("encoder.conv_norm_out.{suffix}"),
+            &[512],
+        );
+    }
+    insert(
+        &mut required,
+        "encoder.conv_out.weight".to_owned(),
+        &[64, 512, 3, 3],
+    );
+    insert(&mut required, "encoder.conv_out.bias".to_owned(), &[64]);
+
+    insert(
+        &mut required,
+        "decoder.conv_in.weight".to_owned(),
+        &[512, 32, 3, 3],
+    );
+    insert(&mut required, "decoder.conv_in.bias".to_owned(), &[512]);
+    add_resnet(&mut required, "decoder.mid_block.resnets.0", 512, 512);
+    add_attention(&mut required, "decoder.mid_block.attentions.0", 512);
+    add_resnet(&mut required, "decoder.mid_block.resnets.1", 512, 512);
+    input = 512;
+    for (block, output) in [512, 512, 256, 128].into_iter().enumerate() {
+        for resnet in 0..3 {
+            add_resnet(
+                &mut required,
+                &format!("decoder.up_blocks.{block}.resnets.{resnet}"),
+                input,
+                output,
+            );
+            input = output;
+        }
+        if block < 3 {
+            insert(
+                &mut required,
+                format!("decoder.up_blocks.{block}.upsamplers.0.conv.weight"),
+                &[output, output, 3, 3],
+            );
+            insert(
+                &mut required,
+                format!("decoder.up_blocks.{block}.upsamplers.0.conv.bias"),
+                &[output],
+            );
+        }
+    }
+    for suffix in ["weight", "bias"] {
+        insert(
+            &mut required,
+            format!("decoder.conv_norm_out.{suffix}"),
+            &[128],
+        );
+    }
+    insert(
+        &mut required,
+        "decoder.conv_out.weight".to_owned(),
+        &[3, 128, 3, 3],
+    );
+    insert(&mut required, "decoder.conv_out.bias".to_owned(), &[3]);
+    required
+}
+
+fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
+    let headers = safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(CoreError::Unsupported(
+            "flux2 Klein transformer inventory is empty".to_owned(),
+        ));
+    }
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let (linear_weights, dense_weights) = klein_required_transformer_weights();
+    for (name, shape) in &dense_weights {
+        let header = by_name.get(name.as_str()).ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "flux2 Klein transformer is missing required tensor {name}"
+            ))
+        })?;
+        if !header.is_float() {
+            return Err(CoreError::Unsupported(format!(
+                "flux2 Klein transformer requires dense tensor {name}"
+            )));
+        }
+        validate_exact_shape("transformer", header, shape)?;
+    }
+    match quant {
+        None => {
+            validate_dense_headers(path, "transformer")?;
+            validate_exact_tensor_names(
+                "dense transformer",
+                by_name.keys().map(|name| (*name).to_owned()),
+                linear_weights.keys().chain(dense_weights.keys()).cloned(),
+            )?;
+            for (name, shape) in &linear_weights {
+                let header = by_name.get(name.as_str()).ok_or_else(|| {
+                    CoreError::Unsupported(format!(
+                        "flux2 Klein transformer is missing required tensor {name}"
+                    ))
+                })?;
+                if !header.is_float() {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux2 Klein transformer tensor {name} must be floating point"
+                    )));
+                }
+                validate_exact_shape("transformer", header, shape)?;
+            }
+            Ok(())
+        }
+        Some(Quant::Q4 | Quant::Q8) => {
+            let expected = dense_weights
+                .keys()
+                .cloned()
+                .chain(linear_weights.keys().flat_map(|weight| {
+                    let base = weight
+                        .strip_suffix(".weight")
+                        .expect("linear inventory keys end in .weight");
+                    [
+                        weight.clone(),
+                        format!("{base}.scales"),
+                        format!("{base}.biases"),
+                    ]
+                }));
+            validate_exact_tensor_names(
+                "packed transformer",
+                by_name.keys().map(|name| (*name).to_owned()),
+                expected,
+            )?;
+            let mut packed = 0_usize;
+            for header in &headers {
+                if let Some(base) = header.name.strip_suffix(".weight") {
+                    if header.dtype == Dtype::U32 {
+                        let scales = format!("{base}.scales");
+                        let biases = format!("{base}.biases");
+                        if !by_name.contains_key(scales.as_str())
+                            || !by_name.contains_key(biases.as_str())
+                        {
+                            return Err(CoreError::Unsupported(format!(
+                                "flux2 Klein packed transformer has an incomplete triple for {base}"
+                            )));
+                        }
+                        packed += 1;
+                    }
+                }
+                if let Some(base) = header
+                    .name
+                    .strip_suffix(".scales")
+                    .or_else(|| header.name.strip_suffix(".biases"))
+                {
+                    let weight = format!("{base}.weight");
+                    if by_name.get(weight.as_str()).map(|header| header.dtype) != Some(Dtype::U32) {
+                        return Err(CoreError::Unsupported(format!(
+                            "flux2 Klein packed transformer has orphan metadata for {base}"
+                        )));
+                    }
+                }
+            }
+            if packed == 0 {
+                return Err(CoreError::Unsupported(
+                    "flux2 Klein packed transformer marker has no packed content".to_owned(),
+                ));
+            }
+            for (weight, dense_shape) in &linear_weights {
+                let base = weight
+                    .strip_suffix(".weight")
+                    .expect("linear inventory keys end in .weight");
+                let scales = format!("{base}.scales");
+                let biases = format!("{base}.biases");
+                let weight_header = by_name.get(weight.as_str());
+                let scales_header = by_name.get(scales.as_str());
+                let biases_header = by_name.get(biases.as_str());
+                if weight_header.map(|header| header.dtype) != Some(Dtype::U32)
+                    || scales_header.map(|header| header.dtype) != Some(Dtype::BF16)
+                    || biases_header.map(|header| header.dtype) != Some(Dtype::BF16)
+                {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux2 Klein packed transformer is missing the required U32/BF16 triple for {base}"
+                    )));
+                }
+                let [output, input] = dense_shape.as_slice() else {
+                    return Err(CoreError::Unsupported(format!(
+                        "flux2 Klein linear shape definition for {base} is not rank 2"
+                    )));
+                };
+                let packed_shape = [
+                    *output,
+                    input * quant.expect("packed branch").bits() as usize / 32,
+                ];
+                let affine_shape = [*output, input / 64];
+                validate_exact_shape(
+                    "packed transformer",
+                    weight_header.expect("dtype checked"),
+                    &packed_shape,
+                )?;
+                validate_exact_shape(
+                    "packed transformer scales",
+                    scales_header.expect("dtype checked"),
+                    &affine_shape,
+                )?;
+                validate_exact_shape(
+                    "packed transformer biases",
+                    biases_header.expect("dtype checked"),
+                    &affine_shape,
+                )?;
+            }
+            Ok(())
+        }
+        Some(Quant::Nvfp4) => Err(CoreError::Unsupported(
+            "flux2 Klein MLX does not support an NVFP4 artifact tier".to_owned(),
+        )),
+    }
+}
+
+fn klein_required_transformer_weights(
+) -> (BTreeMap<String, Vec<usize>>, BTreeMap<String, Vec<usize>>) {
+    let config = crate::config::Flux2Config::klein_9b();
+    let inner = config.inner_dim();
+    let mlp = (config.mlp_ratio * inner as f32) as usize;
+    let mut linear = BTreeMap::new();
+    let mut dense = BTreeMap::new();
+    let mut add_linear = |name: String, output: usize, input: usize| {
+        linear.insert(name, vec![output, input]);
+    };
+    add_linear(
+        "time_guidance_embed.timestep_embedder.linear_1.weight".to_owned(),
+        inner,
+        config.timestep_channels,
+    );
+    add_linear(
+        "time_guidance_embed.timestep_embedder.linear_2.weight".to_owned(),
+        inner,
+        inner,
+    );
+    for name in [
+        "double_stream_modulation_img.linear.weight",
+        "double_stream_modulation_txt.linear.weight",
+    ] {
+        add_linear(name.to_owned(), 6 * inner, inner);
+    }
+    add_linear(
+        "single_stream_modulation.linear.weight".to_owned(),
+        3 * inner,
+        inner,
+    );
+    add_linear("x_embedder.weight".to_owned(), inner, config.in_channels);
+    add_linear(
+        "context_embedder.weight".to_owned(),
+        inner,
+        config.joint_attention_dim,
+    );
+    add_linear("norm_out.linear.weight".to_owned(), 2 * inner, inner);
+    add_linear("proj_out.weight".to_owned(), config.out_channels, inner);
+    for block in 0..config.num_double_layers {
+        let prefix = format!("transformer_blocks.{block}");
+        for name in [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+        ] {
+            add_linear(format!("{prefix}.{name}.weight"), inner, inner);
+        }
+        for stream in ["ff", "ff_context"] {
+            add_linear(
+                format!("{prefix}.{stream}.linear_in.weight"),
+                2 * mlp,
+                inner,
+            );
+            add_linear(format!("{prefix}.{stream}.linear_out.weight"), inner, mlp);
+        }
+        for name in [
+            "attn.norm_q.weight",
+            "attn.norm_k.weight",
+            "attn.norm_added_q.weight",
+            "attn.norm_added_k.weight",
+        ] {
+            dense.insert(format!("{prefix}.{name}"), vec![config.head_dim]);
+        }
+    }
+    for block in 0..config.num_single_layers {
+        let prefix = format!("single_transformer_blocks.{block}.attn");
+        add_linear(
+            format!("{prefix}.to_qkv_mlp_proj.weight"),
+            3 * inner + 2 * mlp,
+            inner,
+        );
+        add_linear(format!("{prefix}.to_out.weight"), inner, inner + mlp);
+        dense.insert(format!("{prefix}.norm_q.weight"), vec![config.head_dim]);
+        dense.insert(format!("{prefix}.norm_k.weight"), vec![config.head_dim]);
+    }
+    (linear, dense)
 }
 
 impl KleinArtifactInventory {
-    pub(crate) fn verify(spec: &LoadSpec) -> CoreResult<Option<Self>> {
+    pub(crate) fn verify_for_provider(
+        provider_id: &str,
+        spec: &LoadSpec,
+    ) -> CoreResult<Option<Self>> {
         let WeightsSource::Dir(root) = &spec.weights else {
             return Ok(None);
         };
@@ -241,7 +846,16 @@ impl KleinArtifactInventory {
                 .map(|metadata| metadata.file_type().is_symlink())
                 .unwrap_or(false)
         {
-            return Self::verify_true_v2(root).map(Some);
+            let inventory = Self::verify_true_v2(root)?;
+            inventory.validate_provider(provider_id)?;
+            inventory.validate_resolved_route(spec.resolved_route.as_deref())?;
+            return Ok(Some(inventory));
+        }
+        if let Some((family, tier)) = turnkey_identity(&root) {
+            let inventory = Self::verify_turnkey(root, family, tier, spec)?;
+            inventory.validate_provider(provider_id)?;
+            inventory.validate_resolved_route(spec.resolved_route.as_deref())?;
+            return Ok(Some(inventory));
         }
         if !root.components().any(|part| {
             REVISIONS
@@ -317,10 +931,140 @@ impl KleinArtifactInventory {
         let inventory = Self {
             root,
             entries,
-            true_v2: false,
+            visible_safetensors: Vec::new(),
+            kind: KleinArtifactKind::CalibratedBase,
         };
         inventory.ensure_unchanged()?;
+        inventory.validate_provider(provider_id)?;
+        inventory.validate_resolved_route(spec.resolved_route.as_deref())?;
         Ok(Some(inventory))
+    }
+
+    fn verify_turnkey(
+        root: PathBuf,
+        family: TurnkeyFamily,
+        tier: Option<Quant>,
+        spec: &LoadSpec,
+    ) -> CoreResult<Self> {
+        if spec.precision != mlx_gen::Precision::Bf16 || spec.quantize.is_some() {
+            return Err(CoreError::Unsupported(
+                "flux2 Klein turnkey tiers require BF16 execution with LoadSpec.quantize=None"
+                    .to_owned(),
+            ));
+        }
+        let transformer_dir = root.join("transformer");
+        let observed = match (
+            mlx_gen::quant::packed_quant_bits_at(&transformer_dir)
+                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+            mlx_gen::quant::packed_quant_group_size_at(&transformer_dir)
+                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+        ) {
+            (None, None) => None,
+            (Some(bits), Some(group_size)) => Some((bits, group_size)),
+            _ => {
+                return Err(CoreError::Unsupported(
+                    "flux2 Klein transformer quantization marker is incomplete".to_owned(),
+                ))
+            }
+        };
+        let expected = tier.map(|quant| (quant.bits(), 64));
+        if observed != expected {
+            return Err(CoreError::Unsupported(format!(
+                "flux2 Klein turnkey transformer quantization {:?} does not match resolved tier {:?}",
+                observed, tier
+            )));
+        }
+        for component in ["text_encoder", "vae"] {
+            let directory = root.join(component);
+            let bits = mlx_gen::quant::packed_quant_bits_at(&directory)
+                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+            let group_size = mlx_gen::quant::packed_quant_group_size_at(&directory)
+                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+            if bits.is_some() || group_size.is_some() {
+                return Err(CoreError::Unsupported(format!(
+                    "flux2 Klein {component} must stay dense at every turnkey tier"
+                )));
+            }
+        }
+
+        crate::config::KLEIN_ENCODER_CONTRACT
+            .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))?;
+
+        let tokenizer = root.join("tokenizer/tokenizer.json");
+        let mut entries = vec![
+            pinned_entry(tokenizer)?,
+            pinned_entry(root.join("text_encoder/config.json"))?,
+            pinned_entry(root.join("transformer/config.json"))?,
+            pinned_entry(root.join("vae/config.json"))?,
+        ];
+        let mut visible = Vec::new();
+        for component in ["text_encoder", "transformer", "vae"] {
+            let directory = root.join(component);
+            let (weights, membership) = single_safetensors(&directory)?;
+            match component {
+                "transformer" => validate_transformer_headers(&weights, tier)?,
+                "vae" => validate_vae_headers(&weights)?,
+                "text_encoder" => {}
+                _ => unreachable!("turnkey component list is exhaustive"),
+            }
+            entries.push(pinned_entry(weights)?);
+            visible.push((directory, membership));
+        }
+        let inventory = Self {
+            root,
+            entries,
+            visible_safetensors: visible,
+            kind: match family {
+                TurnkeyFamily::Base => KleinArtifactKind::BaseRehost(tier),
+                TurnkeyFamily::Kv => KleinArtifactKind::KvRehost(tier),
+            },
+        };
+        inventory.ensure_unchanged()?;
+        Ok(inventory)
+    }
+
+    fn validate_provider(&self, provider_id: &str) -> CoreResult<()> {
+        let accepted = match self.kind {
+            KleinArtifactKind::CalibratedBase
+            | KleinArtifactKind::TrueV2
+            | KleinArtifactKind::BaseRehost(_) => matches!(
+                provider_id,
+                crate::FLUX2_KLEIN_9B_ID | crate::FLUX2_KLEIN_9B_EDIT_ID
+            ),
+            KleinArtifactKind::KvRehost(_) => matches!(
+                provider_id,
+                crate::FLUX2_KLEIN_9B_ID | crate::FLUX2_KLEIN_9B_KV_EDIT_ID
+            ),
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(CoreError::Unsupported(format!(
+                "FLUX.2 Klein artifact {:?} does not belong to provider {provider_id}",
+                self.kind
+            )))
+        }
+    }
+
+    fn validate_resolved_route(&self, resolved_route: Option<&str>) -> CoreResult<()> {
+        let Some(resolved_route) = resolved_route else {
+            return Ok(());
+        };
+        let expected = match self.kind {
+            KleinArtifactKind::CalibratedBase | KleinArtifactKind::BaseRehost(_) => {
+                "flux2_klein_9b"
+            }
+            KleinArtifactKind::TrueV2 => "flux2_klein_9b_true_v2",
+            KleinArtifactKind::KvRehost(_) => "flux2_klein_9b_kv",
+        };
+        if resolved_route == expected {
+            Ok(())
+        } else {
+            Err(CoreError::Unsupported(format!(
+                "FLUX.2 Klein artifact {:?} belongs to resolved route {expected}, not {resolved_route}",
+                self.kind
+            )))
+        }
     }
 
     fn verify_true_v2(root: PathBuf) -> CoreResult<Self> {
@@ -330,11 +1074,19 @@ impl KleinArtifactInventory {
             CoreError::Unsupported("True-V2 text-encoder link has no base root".to_owned())
         })?;
         let base_spec = LoadSpec::new(WeightsSource::Dir(base_root.to_path_buf()));
-        let base = Self::verify(&base_spec)?.ok_or_else(|| {
-            CoreError::Unsupported(
-                "True-V2 borrowed components are not the exact calibrated Klein base".to_owned(),
-            )
-        })?;
+        let base =
+            Self::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &base_spec)?.ok_or_else(|| {
+                CoreError::Unsupported(
+                    "True-V2 borrowed components are not the exact calibrated Klein base"
+                        .to_owned(),
+                )
+            })?;
+        if matches!(base.kind, KleinArtifactKind::KvRehost(_)) {
+            return Err(CoreError::Unsupported(
+                "True-V2 must borrow components from the exact base Klein artifact, not KV"
+                    .to_owned(),
+            ));
+        }
         let mut entries = base.entries.clone();
         for directory in ["vae", "text_encoder", "tokenizer", "scheduler"] {
             let source = root.join(directory);
@@ -381,7 +1133,8 @@ impl KleinArtifactInventory {
         let inventory = Self {
             root,
             entries,
-            true_v2: true,
+            visible_safetensors: Vec::new(),
+            kind: KleinArtifactKind::TrueV2,
         };
         inventory.ensure_unchanged()?;
         Ok(inventory)
@@ -391,11 +1144,19 @@ impl KleinArtifactInventory {
         self.root.join("transformer")
     }
 
-    pub(crate) fn calibration_tag(&self) -> &'static str {
-        if self.true_v2 {
-            "true-two"
-        } else {
-            "base"
+    pub(crate) fn calibration_tag(&self) -> Option<&'static str> {
+        match self.kind {
+            KleinArtifactKind::CalibratedBase => Some("base"),
+            KleinArtifactKind::TrueV2 => Some("true-two"),
+            KleinArtifactKind::BaseRehost(_) | KleinArtifactKind::KvRehost(_) => None,
+        }
+    }
+
+    pub(crate) fn resolved_quant(&self) -> Option<Quant> {
+        match self.kind {
+            KleinArtifactKind::BaseRehost(quant) | KleinArtifactKind::KvRehost(quant) => quant,
+            KleinArtifactKind::TrueV2 => None,
+            KleinArtifactKind::CalibratedBase => None,
         }
     }
 
@@ -410,6 +1171,485 @@ impl KleinArtifactInventory {
                 ));
             }
         }
+        for (directory, expected) in &self.visible_safetensors {
+            if &visible_safetensors(directory)? != expected {
+                return Err(CoreError::Unsupported(format!(
+                    "flux2 Klein {} safetensors membership changed after admission",
+                    directory.display()
+                )));
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transformer_inventory_uses_raw_diffusers_keys_before_loader_aliasing() {
+        let (linear, _) = klein_required_transformer_weights();
+        assert!(linear.contains_key("time_guidance_embed.timestep_embedder.linear_1.weight"));
+        assert!(linear.contains_key("transformer_blocks.0.attn.to_out.0.weight"));
+        assert!(!linear.contains_key("time_guidance_embed.linear_1.weight"));
+        assert!(!linear.contains_key("transformer_blocks.0.attn.to_out.weight"));
+    }
+
+    #[test]
+    fn vae_inventory_includes_the_exact_unused_pytorch_batch_counter() {
+        assert_eq!(klein_required_vae_weights().len(), 250);
+        let tensors = vae_tensors();
+        assert_eq!(tensors.len(), 251);
+        assert_eq!(
+            tensors
+                .iter()
+                .find(|(name, _, _)| name == "bn.num_batches_tracked")
+                .map(|(_, dtype, shape)| (*dtype, shape.as_slice())),
+            Some(("I64", &[][..]))
+        );
+    }
+
+    fn write_tensor_file(path: &Path, tensors: Vec<(String, &'static str, Vec<usize>)>) {
+        use std::io::Write;
+
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape) in tensors {
+            let width = match dtype {
+                "U32" => 4_u64,
+                "BF16" => 2_u64,
+                "I64" => 8_u64,
+                _ => unreachable!("fixture dtypes are exhaustive"),
+            };
+            let bytes = shape
+                .iter()
+                .try_fold(width, |bytes, dimension| {
+                    bytes.checked_mul(*dimension as u64)
+                })
+                .expect("fixture tensor extent");
+            let end = offset.checked_add(bytes).expect("fixture file extent");
+            header.insert(
+                name,
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        let mut encoded = serde_json::to_vec(&header).unwrap();
+        while !encoded.len().is_multiple_of(8) {
+            encoded.push(b' ');
+        }
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + offset).unwrap();
+    }
+
+    fn write_safetensors(path: &Path, packed: bool) {
+        let mut header = if packed {
+            br#"{"block.weight":{"dtype":"U32","shape":[1],"data_offsets":[0,4]},"block.scales":{"dtype":"BF16","shape":[1],"data_offsets":[4,6]},"block.biases":{"dtype":"BF16","shape":[1],"data_offsets":[6,8]}}"#.to_vec()
+        } else {
+            br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec()
+        };
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let payload = if packed { 8 } else { 2 };
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(vec![0_u8; payload]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn transformer_tensors(quant: Option<Quant>) -> Vec<(String, &'static str, Vec<usize>)> {
+        let (linear, dense) = klein_required_transformer_weights();
+        let mut tensors = Vec::new();
+        for (name, shape) in dense {
+            tensors.push((name, "BF16", shape));
+        }
+        for (weight, dense_shape) in linear {
+            if let Some(quant) = quant {
+                let base = weight.strip_suffix(".weight").unwrap().to_owned();
+                let output = dense_shape[0];
+                let input = dense_shape[1];
+                tensors.push((
+                    weight,
+                    "U32",
+                    vec![output, input * quant.bits() as usize / 32],
+                ));
+                tensors.push((format!("{base}.scales"), "BF16", vec![output, input / 64]));
+                tensors.push((format!("{base}.biases"), "BF16", vec![output, input / 64]));
+            } else {
+                tensors.push((weight, "BF16", dense_shape));
+            }
+        }
+        tensors
+    }
+
+    fn write_transformer_safetensors(path: &Path, quant: Option<Quant>) {
+        write_tensor_file(path, transformer_tensors(quant));
+    }
+
+    fn vae_tensors() -> Vec<(String, &'static str, Vec<usize>)> {
+        let mut tensors = klein_required_vae_weights()
+            .into_iter()
+            .map(|(name, shape)| (name, "BF16", shape))
+            .collect::<Vec<_>>();
+        tensors.push(("bn.num_batches_tracked".to_owned(), "I64", Vec::new()));
+        tensors
+    }
+
+    fn write_vae_safetensors(path: &Path) {
+        write_tensor_file(path, vae_tensors());
+    }
+
+    fn turnkey_fixture(family: TurnkeyFamily, tier: Option<Quant>) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, revision) = match family {
+            TurnkeyFamily::Base => (KLEIN_REHOST_CACHE_DIR, KLEIN_REHOST_REVISION),
+            TurnkeyFamily::Kv => (KLEIN_KV_REHOST_CACHE_DIR, KLEIN_KV_REHOST_REVISION),
+        };
+        let tier_dir = match tier {
+            None => "bf16",
+            Some(Quant::Q4) => "q4",
+            Some(Quant::Q8) => "q8",
+            Some(Quant::Nvfp4) => unreachable!(),
+        };
+        let root = tmp
+            .path()
+            .join(cache)
+            .join("snapshots")
+            .join(revision)
+            .join(tier_dir);
+        for component in ["tokenizer", "text_encoder", "transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::KLEIN_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::write(root.join("vae/config.json"), "{}").unwrap();
+        let transformer_config = tier.map_or_else(
+            || "{}".to_owned(),
+            |quant| {
+                format!(
+                    r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                    quant.bits()
+                )
+            },
+        );
+        std::fs::write(root.join("transformer/config.json"), transformer_config).unwrap();
+        write_transformer_safetensors(&root.join("transformer/model.safetensors"), tier);
+        write_vae_safetensors(&root.join("vae/model.safetensors"));
+        tmp
+    }
+
+    fn fixture_root(
+        tmp: &tempfile::TempDir,
+        family: TurnkeyFamily,
+        tier: Option<Quant>,
+    ) -> PathBuf {
+        let (cache, revision) = match family {
+            TurnkeyFamily::Base => (KLEIN_REHOST_CACHE_DIR, KLEIN_REHOST_REVISION),
+            TurnkeyFamily::Kv => (KLEIN_KV_REHOST_CACHE_DIR, KLEIN_KV_REHOST_REVISION),
+        };
+        tmp.path()
+            .join(cache)
+            .join("snapshots")
+            .join(revision)
+            .join(match tier {
+                None => "bf16",
+                Some(Quant::Q4) => "q4",
+                Some(Quant::Q8) => "q8",
+                Some(Quant::Nvfp4) => unreachable!(),
+            })
+    }
+
+    #[test]
+    fn turnkey_inventory_binds_family_tier_provider_and_production_quantize_none() {
+        for family in [TurnkeyFamily::Base, TurnkeyFamily::Kv] {
+            for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let tmp = turnkey_fixture(family, tier);
+                let root = fixture_root(&tmp, family, tier);
+                let spec = LoadSpec::new(WeightsSource::Dir(root));
+                let allowed = match family {
+                    TurnkeyFamily::Base => {
+                        [crate::FLUX2_KLEIN_9B_ID, crate::FLUX2_KLEIN_9B_EDIT_ID]
+                    }
+                    TurnkeyFamily::Kv => {
+                        [crate::FLUX2_KLEIN_9B_ID, crate::FLUX2_KLEIN_9B_KV_EDIT_ID]
+                    }
+                };
+                for provider_id in allowed {
+                    let inventory = KleinArtifactInventory::verify_for_provider(provider_id, &spec)
+                        .unwrap()
+                        .expect("exact turnkey inventory");
+                    assert_eq!(inventory.resolved_quant(), tier);
+                    assert!(inventory.calibration_tag().is_none());
+                }
+                let resolved_route = match family {
+                    TurnkeyFamily::Base => "flux2_klein_9b",
+                    TurnkeyFamily::Kv => "flux2_klein_9b_kv",
+                };
+                assert!(KleinArtifactInventory::verify_for_provider(
+                    crate::FLUX2_KLEIN_9B_ID,
+                    &spec.clone().with_resolved_route(resolved_route),
+                )
+                .unwrap()
+                .is_some());
+                for wrong_route in [
+                    "flux2_klein_9b",
+                    "flux2_klein_9b_kv",
+                    "flux2_klein_9b_true_v2",
+                ]
+                .into_iter()
+                .filter(|route| *route != resolved_route)
+                {
+                    assert!(KleinArtifactInventory::verify_for_provider(
+                        crate::FLUX2_KLEIN_9B_ID,
+                        &spec.clone().with_resolved_route(wrong_route),
+                    )
+                    .is_err());
+                }
+                let refused = match family {
+                    TurnkeyFamily::Base => crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                    TurnkeyFamily::Kv => crate::FLUX2_KLEIN_9B_EDIT_ID,
+                };
+                assert!(KleinArtifactInventory::verify_for_provider(refused, &spec).is_err());
+                assert!(KleinArtifactInventory::verify_for_provider(
+                    crate::FLUX2_KLEIN_9B_ID,
+                    &spec.clone().with_quant(Quant::Q4),
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn turnkey_inventory_rejects_quant_config_membership_and_identity_mutation() {
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let inventory =
+            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec)
+                .unwrap()
+                .unwrap();
+
+        write_safetensors(&root.join("transformer/extra.safetensors"), true);
+        assert!(inventory.ensure_unchanged().is_err());
+        std::fs::remove_file(root.join("transformer/extra.safetensors")).unwrap();
+        write_safetensors(&root.join("transformer/model.safetensors"), true);
+        assert!(
+            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec,).is_err()
+        );
+        write_transformer_safetensors(&root.join("transformer/model.safetensors"), Some(Quant::Q4));
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        assert!(
+            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec,).is_err()
+        );
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Kv, Some(Quant::Q8));
+        let root = fixture_root(&tmp, TurnkeyFamily::Kv, Some(Quant::Q8));
+        std::fs::write(
+            root.join("transformer/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":32}}"#,
+        )
+        .unwrap();
+        assert!(KleinArtifactInventory::verify_for_provider(
+            crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            &LoadSpec::new(WeightsSource::Dir(root)),
+        )
+        .is_err());
+
+        for malformed in [
+            r#"{"quantization":{}}"#,
+            r#"{"quantization":{"bits":"4","group_size":64}}"#,
+            r#"{"quantization":{"bits":4}}"#,
+        ] {
+            let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
+            let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
+            std::fs::write(root.join("transformer/config.json"), malformed).unwrap();
+            assert!(KleinArtifactInventory::verify_for_provider(
+                crate::FLUX2_KLEIN_9B_ID,
+                &LoadSpec::new(WeightsSource::Dir(root)),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn turnkey_inventory_rejects_transformer_vae_and_encoder_shape_mutations() {
+        let query = |root: PathBuf| {
+            KleinArtifactInventory::verify_for_provider(
+                crate::FLUX2_KLEIN_9B_ID,
+                &LoadSpec::new(WeightsSource::Dir(root)),
+            )
+        };
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
+        let mut transformer = transformer_tensors(Some(Quant::Q4));
+        transformer
+            .iter_mut()
+            .find(|(name, _, _)| name == "transformer_blocks.0.attn.to_q.weight")
+            .unwrap()
+            .2[0] = 1;
+        write_tensor_file(&root.join("transformer/model.safetensors"), transformer);
+        assert!(query(root).is_err());
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
+        let mut vae = vae_tensors();
+        vae.iter_mut()
+            .find(|(name, _, _)| name == "decoder.conv_out.weight")
+            .unwrap()
+            .2[1] = 1;
+        write_tensor_file(&root.join("vae/model.safetensors"), vae);
+        assert!(query(root).is_err());
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
+        let encoder_file = single_safetensors(&root.join("text_encoder")).unwrap().0;
+        write_safetensors(&encoder_file, false);
+        assert!(query(root).is_err());
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
+        let mut transformer = transformer_tensors(Some(Quant::Q8));
+        for suffix in ["weight", "scales", "biases"] {
+            transformer.push((
+                format!("time_guidance_embed.guidance_embedder.linear_1.{suffix}"),
+                if suffix == "weight" { "U32" } else { "BF16" },
+                if suffix == "weight" {
+                    vec![4096, 1024]
+                } else {
+                    vec![4096, 4]
+                },
+            ));
+        }
+        write_tensor_file(&root.join("transformer/model.safetensors"), transformer);
+        assert!(query(root).is_err());
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
+        let mut vae = vae_tensors();
+        vae.push((
+            "encoder.down_blocks.0.resnets.0.conv_shortcut.weight".to_owned(),
+            "BF16",
+            vec![128, 128, 1, 1],
+        ));
+        vae.push((
+            "encoder.down_blocks.0.resnets.0.conv_shortcut.bias".to_owned(),
+            "BF16",
+            vec![128],
+        ));
+        write_tensor_file(&root.join("vae/model.safetensors"), vae);
+        assert!(query(root).is_err());
+
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
+        let mut vae = vae_tensors();
+        let counter = vae
+            .iter_mut()
+            .find(|(name, _, _)| name == "bn.num_batches_tracked")
+            .unwrap();
+        counter.1 = "BF16";
+        counter.2 = vec![1];
+        write_tensor_file(&root.join("vae/model.safetensors"), vae);
+        assert!(query(root).is_err());
+    }
+
+    #[test]
+    fn turnkey_inventory_reaches_only_the_exact_production_rung_four_contract() {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+        use mlx_gen::{LoadShape, OffloadPolicy};
+
+        for (family, provider_id, resolved_route) in [
+            (
+                TurnkeyFamily::Base,
+                crate::FLUX2_KLEIN_9B_ID,
+                "flux2_klein_9b",
+            ),
+            (
+                TurnkeyFamily::Kv,
+                crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                "flux2_klein_9b_kv",
+            ),
+        ] {
+            for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let tmp = turnkey_fixture(family, tier);
+                let root = fixture_root(&tmp, family, tier);
+                let spec = LoadSpec::new(WeightsSource::Dir(root))
+                    .with_resolved_route(resolved_route)
+                    .with_offload_policy(OffloadPolicy::Sequential)
+                    .with_load_shape(LoadShape::DeferredMaterialization);
+                let contract = crate::memory_strategy::klein_contract_for(provider_id, &spec)
+                    .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented
+                );
+                assert!(contract.conformance_errors().is_empty());
+                assert_eq!(
+                    contract.calibration.as_ref().unwrap().fingerprint,
+                    format!(
+                        "{}-{}",
+                        crate::memory_strategy::KLEIN_STATIC_BEHAVIOR_FINGERPRINT,
+                        provider_id.replace('_', "-")
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_pinned_or_single_file_sources_never_become_turnkey_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(KleinArtifactInventory::verify_for_provider(
+            crate::FLUX2_KLEIN_9B_ID,
+            &LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf())),
+        )
+        .unwrap()
+        .is_none());
+        assert!(KleinArtifactInventory::verify_for_provider(
+            crate::FLUX2_KLEIN_9B_ID,
+            &LoadSpec::new(WeightsSource::File(tmp.path().join("model.safetensors"))),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn true_v2_inventory_is_dense_bf16_like_its_conversion_source() {
+        let inventory = |kind| KleinArtifactInventory {
+            root: PathBuf::new(),
+            entries: Vec::new(),
+            visible_safetensors: Vec::new(),
+            kind,
+        };
+        assert_eq!(inventory(KleinArtifactKind::TrueV2).resolved_quant(), None);
+        assert_eq!(
+            inventory(KleinArtifactKind::CalibratedBase).resolved_quant(),
+            None
+        );
+        assert!(inventory(KleinArtifactKind::TrueV2)
+            .validate_resolved_route(Some("flux2_klein_9b_true_v2"))
+            .is_ok());
+        assert!(inventory(KleinArtifactKind::TrueV2)
+            .validate_resolved_route(Some("flux2_klein_9b"))
+            .is_err());
     }
 }

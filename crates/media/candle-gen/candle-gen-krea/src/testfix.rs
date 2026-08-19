@@ -225,6 +225,72 @@ fn build_tiny_map(draw: &mut Draw, num_layers: usize) -> (HashMap<String, Tensor
     (t, c)
 }
 
+/// Serialize the real tiny DiT through the production native-mmdit key dialect and write the
+/// snapshot config consumed by [`crate::pipeline::load_dit_base`]. The returned root deliberately
+/// contains no diffusers `model.safetensors`: a successful load with the returned pin therefore proves
+/// the native-file branch was used rather than silently falling back to snapshot weights.
+pub(crate) fn tiny_native_transformer_fixture(
+    tmp: &tempfile::TempDir,
+) -> (PathBuf, PathBuf, Krea2Config) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let fixture = N.fetch_add(1, Ordering::Relaxed);
+    let root = tmp.path().join(format!("krea_tiny_native_{fixture}"));
+    let transformer = root.join("transformer");
+    std::fs::create_dir_all(&transformer).unwrap();
+
+    let (mut diffusers, mut cfg) = build_tiny_map(&mut |shape| rnd(shape), 1);
+    // Match the production Krea latent surface (`LATENT_CHANNELS == 16`, patch size 2) so the
+    // fixture can traverse the real render driver's `init_noise` path rather than injecting a
+    // test-only latent. Other tiny fixtures retain four latent channels for cheaper unit tests.
+    cfg.in_channels = 16 * cfg.patch_size * cfg.patch_size;
+    diffusers.insert(
+        "img_in.weight".into(),
+        rnd(&[cfg.hidden_size, cfg.in_channels]),
+    );
+    diffusers.insert(
+        "final_layer.linear.weight".into(),
+        rnd(&[cfg.in_channels, cfg.hidden_size]),
+    );
+    diffusers.insert("final_layer.linear.bias".into(), rnd(&[cfg.in_channels]));
+    let native: HashMap<String, Tensor> = diffusers
+        .into_iter()
+        .map(|(key, tensor)| {
+            let native = crate::loader::convrot_diffusers_to_native(&key)
+                .unwrap_or_else(|| panic!("tiny fixture key has no native mapping: {key}"));
+            (format!("model.diffusion_model.{native}"), tensor)
+        })
+        .collect();
+    let native_path = root.join("tiny-native.safetensors");
+    candle_gen::candle_core::safetensors::save(&native, &native_path).unwrap();
+
+    let config = serde_json::json!({
+        "in_channels": cfg.in_channels,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_kv_heads,
+        "attention_head_dim": cfg.attention_head_dim,
+        "num_layers": cfg.num_layers,
+        "intermediate_size": cfg.intermediate_size,
+        "norm_eps": cfg.norm_eps,
+        "axes_dims_rope": cfg.axes_dims_rope,
+        "rope_theta": cfg.rope_theta,
+        "timestep_embed_dim": cfg.timestep_embed_dim,
+        "num_text_layers": cfg.num_text_layers,
+        "num_layerwise_text_blocks": cfg.num_layerwise_text_blocks,
+        "num_refiner_text_blocks": cfg.num_refiner_text_blocks,
+        "text_hidden_dim": cfg.text_hidden_dim,
+        "text_intermediate_size": cfg.text_intermediate_size,
+        "text_num_attention_heads": cfg.text_num_attention_heads,
+        "text_num_key_value_heads": cfg.text_num_kv_heads,
+    });
+    std::fs::write(
+        transformer.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+
+    (root, native_path, cfg)
+}
+
 /// Serialize a built tensor map to a `.safetensors` inside `tmp` and load it as a [`KreaTrainDit`].
 /// Returns `(dit, path)`; `tmp` owns the file and removes it on drop.
 fn serialize_and_load(

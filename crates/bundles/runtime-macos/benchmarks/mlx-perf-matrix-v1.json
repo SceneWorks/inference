@@ -1,0 +1,384 @@
+{
+  "schemaVersion": "sceneworks.mlx-perf-matrix.v4",
+  "benchmarkId": "sc-18321-cross-family-v1",
+  "warmupRuns": 1,
+  "measuredRuns": 3,
+  "variants": [
+    {
+      "id": "baseline",
+      "toggles": [],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "deterministic"
+    },
+    {
+      "id": "tiled_decode_control",
+      "toggles": [],
+      "decodeControl": "fixed_tiled",
+      "controlVariant": "tiled_decode_control",
+      "outputComparison": "deterministic"
+    },
+    {
+      "id": "retained_compilation",
+      "toggles": [
+        "retained_compilation"
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
+    },
+    {
+      "id": "exact_epilogues",
+      "toggles": [
+        "exact_epilogues"
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
+    },
+    {
+      "id": "fused_attention_primitives",
+      "toggles": [
+        "fused_attention_primitives"
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "exact_control"
+    },
+    {
+      "id": "indexed_decode_accumulator",
+      "toggles": [
+        "indexed_decode_accumulator"
+      ],
+      "decodeControl": "fixed_tiled",
+      "controlVariant": "tiled_decode_control",
+      "outputComparison": "exact_control"
+    },
+    {
+      "id": "geometry_aware_decode",
+      "toggles": [
+        "geometry_aware_decode"
+      ],
+      "decodeControl": "default",
+      "controlVariant": "baseline",
+      "outputComparison": "geometry_aware_control"
+    },
+    {
+      "id": "all_on",
+      "toggles": [
+        "retained_compilation",
+        "exact_epilogues",
+        "fused_attention_primitives",
+        "indexed_decode_accumulator",
+        "geometry_aware_decode"
+      ],
+      "decodeControl": "default",
+      "controlVariant": "geometry_aware_decode",
+      "outputComparison": "exact_control"
+    }
+  ],
+  "artifacts": [
+    {
+      "key": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "resolvedRevision": "bb1b055249614cf9d7cf4373fbdbc184b77dee88",
+      "tier": "q4",
+      "inventorySha256": "6c5fcbd03a17890252cbc900e2a206b90f75e9e77ebeec91444d61cd62e7474e",
+      "inventoryFileCount": 5,
+      "inventoryTotalBytes": 17142889289
+    },
+    {
+      "key": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "resolvedRevision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+      "tier": "q4",
+      "inventorySha256": "716f354a58bc94bbc9416e7f12cc593bb8e0a57259184ef30400223c4ab87fcc",
+      "inventoryFileCount": 22,
+      "inventoryTotalBytes": 28355352897
+    },
+    {
+      "key": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "resolvedRevision": "36699bb8a6353e61c920e3bf19f0e6f8e4151c55",
+      "tier": "bf16",
+      "inventorySha256": "cda520c7eefbe0659d3863c3874905a24dc74a39e4505050a8ed3745c951bce1",
+      "inventoryFileCount": 18,
+      "inventoryTotalBytes": 6941187536
+    }
+  ],
+  "cases": [
+    {
+      "id": "wan-q4-512x480-f17",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "expectedP1CompileOperations": [
+        "wan::rope::rope_rotate",
+        "wan::transformer::gated",
+        "wan::transformer::gelu_ffn",
+        "wan::transformer::modulate"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 512,
+      "height": 480,
+      "frames": 17,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
+    },
+    {
+      "id": "wan-q4-640x480-f49",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "expectedP1CompileOperations": [
+        "wan::rope::rope_rotate",
+        "wan::transformer::gated",
+        "wan::transformer::gelu_ffn",
+        "wan::transformer::modulate"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 640,
+      "height": 480,
+      "frames": 49,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
+    },
+    {
+      "id": "wan-q4-832x480-f81",
+      "family": "wan_video",
+      "provider": "wan2_2_ti2v_5b",
+      "expectedP1CompileOperations": [
+        "wan::rope::rope_rotate",
+        "wan::transformer::gated",
+        "wan::transformer::gelu_ffn",
+        "wan::transformer::modulate"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "gelu_tanh",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "tier": "q4",
+      "width": 832,
+      "height": 480,
+      "frames": 81,
+      "steps": 8,
+      "seed": 1832101,
+      "prompt": "A red fox runs through a snowy pine forest at sunrise, cinematic tracking shot",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64,
+        "temporalTileFrames": 32,
+        "temporalOverlapFrames": 8
+      }
+    },
+    {
+      "id": "qwen-q4-512",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "expectedP1CompileOperations": [
+        "qwen_image::attention::rope_rotate",
+        "qwen_image::block::gated",
+        "qwen_image::block::modulate",
+        "qwen_image::feed_forward::gelu_ffn"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 512,
+      "height": 512,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    },
+    {
+      "id": "qwen-q4-1024",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "expectedP1CompileOperations": [
+        "qwen_image::attention::rope_rotate",
+        "qwen_image::block::gated",
+        "qwen_image::block::modulate",
+        "qwen_image::feed_forward::gelu_ffn"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 1024,
+      "height": 1024,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    },
+    {
+      "id": "qwen-q4-2048",
+      "family": "image_dit",
+      "provider": "qwen_image",
+      "expectedP1CompileOperations": [
+        "qwen_image::attention::rope_rotate",
+        "qwen_image::block::gated",
+        "qwen_image::block::modulate",
+        "qwen_image::feed_forward::gelu_ffn"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "conv3d_bias",
+        "quantized_matmul_bias",
+        "silu"
+      ],
+      "artifactKey": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "tier": "q4",
+      "width": 2048,
+      "height": 2048,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832102,
+      "prompt": "A glass observatory on a windswept cliff, precise architectural photograph at blue hour",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    },
+    {
+      "id": "sdxl-bf16-512",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "expectedP1CompileOperations": [
+        "mlx_gen::nn::gelu_exact",
+        "mlx_gen::nn::gelu_quick",
+        "sdxl::silu_glue"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
+      ],
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 512,
+      "height": 512,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    },
+    {
+      "id": "sdxl-bf16-1024",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "expectedP1CompileOperations": [
+        "mlx_gen::nn::gelu_exact",
+        "mlx_gen::nn::gelu_quick",
+        "sdxl::silu_glue"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
+      ],
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 1024,
+      "height": 1024,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    },
+    {
+      "id": "sdxl-bf16-2048",
+      "family": "sdxl_unet",
+      "provider": "sdxl",
+      "expectedP1CompileOperations": [
+        "mlx_gen::nn::gelu_exact",
+        "mlx_gen::nn::gelu_quick",
+        "sdxl::silu_glue"
+      ],
+      "expectedP3ExactEpilogueOperations": [
+        "conv2d_bias",
+        "group_norm_affine",
+        "silu"
+      ],
+      "artifactKey": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "tier": "bf16",
+      "width": 2048,
+      "height": 2048,
+      "frames": 1,
+      "steps": 8,
+      "seed": 1832103,
+      "prompt": "A ceramic teapot beside folded linen, soft north-window light, editorial still life",
+      "tiledDecodeControl": {
+        "spatialTilePx": 256,
+        "spatialOverlapPx": 64
+      }
+    }
+  ]
+}

@@ -238,6 +238,8 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
         Variant::LargeTurbo => (MODEL_ID_TURBO, false),
     };
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::SD3_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,

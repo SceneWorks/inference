@@ -1,4 +1,21 @@
-//! Exact immutable HF-cache inventory for the calibrated SD3.5-Large BF16 ladder.
+//! Snapshot admission for the SD3.5 one-block transformer window (rung 4).
+//!
+//! Two admissions, deliberately distinct:
+//!
+//! * [`Sd3ArtifactInventory::verify`] — the exact, content-pinned SC-15522 **Large** BF16 HF-cache
+//!   snapshot. Membership, symlink blob identity, and SHA-256 are all checked, so this admission
+//!   additionally binds the measured calibration fingerprint.
+//! * [`Sd3ArtifactInventory::structural`] — variant-generic. The window mechanism needs exactly one
+//!   guarantee the loader cannot otherwise give it: a `transformer/` subtree whose files do not
+//!   change between the load that admitted the rung and every window reopen during a generate. That
+//!   is an *identity* pin (device/inode/size/mtime/ctime + link target), not a content pin: it does
+//!   not assert which checkpoint this is and therefore carries **no** calibration. Large-Turbo and
+//!   Medium reach rung 4 through this admission and are graded on estimates (SC-18093) until each
+//!   has its own measured evidence.
+//!
+//! Before SC-18606 the exact admission was the *only* one, which made rung 4 structurally
+//! unreachable for Large-Turbo and Medium even though [`crate::block_stream::Sd3BlockStream`] is
+//! arch-parametric and materializes each variant's own topology.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufReader, Read};
@@ -275,17 +292,36 @@ fn visible_files(root: &Path) -> Result<BTreeSet<String>> {
 #[derive(Clone, Debug)]
 struct Entry {
     source: PathBuf,
-    link_target: PathBuf,
+    /// `Some` when the admitted file is a symlink (the HF cache shape). A structurally admitted
+    /// snapshot may be a plain file tree, in which case this is `None` and re-verification asserts
+    /// the file is *still* not a symlink.
+    link_target: Option<PathBuf>,
     identity: Identity,
+}
+
+/// Which of the two rung-4 admissions produced an inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sd3StreamAdmission {
+    /// The exact, content-pinned SC-15522 SD3.5-Large BF16 HF-cache snapshot.
+    CalibratedLarge,
+    /// Any variant's snapshot, admitted on transformer-subtree identity alone.
+    StructuralSnapshot,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Sd3ArtifactInventory {
     root: PathBuf,
     entries: Vec<Entry>,
+    admission: Sd3StreamAdmission,
 }
 
 impl Sd3ArtifactInventory {
+    /// `true` only for the exact content-pinned Large snapshot, which is the sole artifact carrying
+    /// the measured [`crate::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT`].
+    pub(crate) const fn is_calibrated(&self) -> bool {
+        matches!(self.admission, Sd3StreamAdmission::CalibratedLarge)
+    }
+
     pub(crate) fn verify(spec: &LoadSpec) -> Result<Option<Self>> {
         let WeightsSource::Dir(root) = &spec.weights else {
             return Ok(None);
@@ -340,10 +376,55 @@ impl Sd3ArtifactInventory {
             entries.push(Entry {
                 identity: file_identity,
                 source,
+                link_target: Some(link_target),
+            });
+        }
+        Ok(Some(Self {
+            root,
+            entries,
+            admission: Sd3StreamAdmission::CalibratedLarge,
+        }))
+    }
+
+    /// Variant-generic admission: pin the identity of every file under `transformer/`.
+    ///
+    /// Deliberately weaker than [`Self::verify`] — no membership table, no blob names, no content
+    /// digest — because the window mechanism only needs the subtree to be *stable*, not *known*.
+    /// Returns `Ok(None)` (never an error) when the spec cannot name a readable transformer subtree,
+    /// so an unstreamable load degrades to a rung-4-`Missing` contract instead of failing the load.
+    pub(crate) fn structural(spec: &LoadSpec) -> Result<Option<Self>> {
+        let WeightsSource::Dir(root) = &spec.weights else {
+            return Ok(None);
+        };
+        let root = std::path::absolute(root)?;
+        let transformer = root.join("transformer");
+        if !transformer.is_dir() {
+            return Ok(None);
+        }
+        let relative = visible_files(&transformer)?;
+        if !relative.iter().any(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "safetensors")
+        }) {
+            return Ok(None);
+        }
+        let mut entries = Vec::with_capacity(relative.len());
+        for name in &relative {
+            let source = transformer.join(name);
+            let link_target = std::fs::read_link(&source).ok();
+            let file_identity = identity(&source)?;
+            entries.push(Entry {
+                identity: file_identity,
+                source,
                 link_target,
             });
         }
-        Ok(Some(Self { root, entries }))
+        Ok(Some(Self {
+            root,
+            entries,
+            admission: Sd3StreamAdmission::StructuralSnapshot,
+        }))
     }
 
     pub(crate) fn transformer_dir(&self) -> PathBuf {
@@ -352,15 +433,45 @@ impl Sd3ArtifactInventory {
 
     pub(crate) fn ensure_unchanged(&self) -> Result<()> {
         for entry in &self.entries {
-            if std::fs::read_link(&entry.source).ok().as_ref() != Some(&entry.link_target)
+            if std::fs::read_link(&entry.source).ok() != entry.link_target
                 || identity(&entry.source).ok().as_ref() != Some(&entry.identity)
             {
                 return Err(Error::Unsupported(format!(
-                    "sd3 calibrated artifact changed after admission: {}",
+                    "sd3 admitted transformer artifact changed after admission: {}",
                     entry.source.display()
                 )));
             }
         }
         Ok(())
     }
+}
+
+/// The exact content-pinned admission, which only SD3.5-**Large** can ever satisfy.
+pub(crate) fn calibrated_inventory(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Result<Option<Sd3ArtifactInventory>> {
+    if provider_id != crate::MODEL_ID {
+        return Ok(None);
+    }
+    Sd3ArtifactInventory::verify(spec)
+}
+
+/// Resolve the rung-4 admission for one (provider, spec), preferring the calibrated artifact.
+///
+/// This is the single seam both [`crate::memory_strategy::contract_for`] (which decides whether to
+/// publish `BoundedTransformerResidency` as `Implemented`) and [`crate::model`]'s heavy loader
+/// (which decides whether to attach the block stream) consult, so a declared rung and an engaged
+/// rung cannot drift apart.
+pub(crate) fn stream_inventory(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Result<Option<Sd3ArtifactInventory>> {
+    if !crate::memory_strategy::structurally_streamable(spec) {
+        return Ok(None);
+    }
+    if let Some(exact) = calibrated_inventory(provider_id, spec)? {
+        return Ok(Some(exact));
+    }
+    Sd3ArtifactInventory::structural(spec)
 }

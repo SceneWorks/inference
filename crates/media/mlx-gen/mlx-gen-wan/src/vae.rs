@@ -21,30 +21,21 @@ use mlx_rs::ops::{
 };
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as VAE_MEAN, QWEN_WAN_Z16_STD as VAE_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
 use crate::vae_common::{
-    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
+    FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
 const CACHE_T: i32 = 2;
 /// Channel-L2 norm floor (reference `mx.clip(..., a_min=1e-12)`).
 const NORM_EPS: f32 = 1e-12;
-
-/// Per-channel latent normalization statistics for z_dim=16 (reference `VAE_MEAN`/`VAE_STD`). These
-/// are architecture constants (not learned), so they are hardcoded here and gated by the fixture.
-const VAE_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517,
-    -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-const VAE_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579,
-    1.6382, 1.1253, 2.8251, 1.9160,
-];
 
 /// Wan2.1 VAE fixed structure (z16, dim_mult [1,2,4,4], 2 res-blocks/stage).
 const DIM_MULT: [i32; 4] = [1, 2, 4, 4];
@@ -427,10 +418,34 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_middle(x)?)
+    }
+
+    /// The **globally-scoped** half: `conv1` → the three middle blocks, all at latent resolution
+    /// (sc-19753).
+    ///
+    /// `middle.1` is an [`AttentionBlock`]: a single-head softmax self-attention over every `H·W`
+    /// spatial token of a frame ([`AttentionBlock::forward`]). Its result therefore depends on the
+    /// whole spatial grid, so a spatial tile that runs it attends only to its own crop's token set —
+    /// a *wrong decode*, not a blend artifact. The channel-L2 [`rms_norm_channels`] used throughout
+    /// this VAE really is per-position and tiling-invariant; the attention is the one op that is
+    /// not, and it is why this half must run whole.
+    ///
+    /// Cheap to run dense: it is entirely at latent resolution, orders of magnitude under the
+    /// `[B, 3, 4·T, 8·H, 8·W]` output the tiling exists to bound.
+    fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
         x = self.middle.0.forward(&x)?;
         x = self.middle.1.forward(&x)?;
-        x = self.middle.2.forward(&x)?;
+        self.middle.2.forward(&x)
+    }
+
+    /// The **spatially-local** half: the upsample stack (×8 spatial, ×4 temporal) and the
+    /// `RMS → SiLU → conv` head. Every op here is a convolution, a nearest upsample, or the
+    /// per-position channel-L2 norm, so evaluating it on a crop is exact up to the convolution
+    /// padding at the crop boundary — which is what the trapezoidal overlap blend absorbs.
+    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+        let mut x = middle.clone();
         for layer in &self.upsamples {
             x = match layer {
                 UpLayer::Res(r) => r.forward(&x)?,
@@ -522,6 +537,163 @@ pub struct WanVae {
     inv_std: Array,                             // [1, z, 1, 1, 1]
 }
 
+/// Trait adapter for the ordinary Wan z16 video layout. It keeps the VAE's native NCTHW input/output
+/// while publishing the video denoiser's temporal latent identity to generic decode callers.
+pub struct WanVideoDecoder<'a> {
+    vae: &'a WanVae,
+}
+
+impl<'a> WanVideoDecoder<'a> {
+    pub fn new(vae: &'a WanVae) -> Self {
+        Self { vae }
+    }
+}
+
+impl LatentDecoder for WanVideoDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        if latents.shape().len() != 5 {
+            return Err(Error::Msg(format!(
+                "Wan z16 video decoder expects [B,C,T,H,W], got {:?}",
+                latents.shape()
+            )));
+        }
+        self.vae.decode(latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        if latents.shape().len() != 5 {
+            return Err(Error::Msg(format!(
+                "Wan z16 video decoder expects [B,C,T,H,W], got {:?}",
+                latents.shape()
+            )));
+        }
+        validate_decoder_tiling(tiling, VaeTiling::WAN, latents.shape()[2])?;
+        self.vae.decode_tiled(latents, tiling, cancel)
+    }
+}
+
+/// Single-image z16 adapter used by image pipelines that intentionally substitute the Wan VAE. The
+/// shared z16 normalization is accepted as rank-4 NCHW, lifted to a one-latent-frame Wan decode, and
+/// reduced back to a singleton-frame NCTHW image by selecting the leading output frame. Wan z16 is
+/// non-causal and expands one latent frame to four decoded frames; image lanes consume the first.
+pub struct WanSingleFrameDecoder<'a> {
+    vae: &'a WanVae,
+}
+
+/// Owned, mutation-pinned form of [`WanSingleFrameDecoder`] for cross-model decoder substitution.
+///
+/// SceneWorks stages only the standalone `vae.safetensors`; retaining the pin makes replacement of
+/// either a Hugging Face snapshot symlink or its blob a hard error before every decode.
+pub struct OwnedWanSingleFrameDecoder {
+    vae: WanVae,
+    source: PinnedWeightsFile,
+}
+
+impl OwnedWanSingleFrameDecoder {
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_pinned(PinnedWeightsFile::pin(path)?)
+    }
+
+    /// Load through the exact token prepared by the caller's [`mlx_gen::LoadSpec`].
+    ///
+    /// The pre/post guard spans safetensors metadata and tensor materialization. Retaining the same
+    /// token then protects every later decode from pathname, symlink-target, or file replacement.
+    pub fn from_pinned(source: PinnedWeightsFile) -> Result<Self> {
+        let vae = source.read_unchanged(|path| {
+            let weights = Weights::from_file(path)?;
+            WanVae::from_weights(&weights)
+        })?;
+        Ok(Self { vae, source })
+    }
+
+    pub fn source(&self) -> &PinnedWeightsFile {
+        &self.source
+    }
+}
+
+impl<'a> WanSingleFrameDecoder<'a> {
+    pub fn new(vae: &'a WanVae) -> Self {
+        Self { vae }
+    }
+
+    fn input_5d(latents: &Array) -> Result<Array> {
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "Wan z16 single-frame decoder expects [B,C,H,W], got {shape:?}"
+            )));
+        }
+        Ok(latents.reshape(&[shape[0], shape[1], 1, shape[2], shape[3]])?)
+    }
+
+    fn first_frame(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 5 || shape[2] < 1 {
+            return Err(Error::Msg(format!(
+                "Wan z16 single-frame decoder produced invalid [B,3,T,H,W] output {shape:?}"
+            )));
+        }
+        slice_axis(decoded, 2, 0, 1)
+    }
+}
+
+impl LatentDecoder for WanSingleFrameDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::first_frame(&self.vae.decode(&Self::input_5d(latents)?)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let latents = Self::input_5d(latents)?;
+        validate_decoder_tiling(tiling, VaeTiling::WAN, 1)?;
+        Self::first_frame(&self.vae.decode_tiled(&latents, tiling, cancel)?)
+    }
+}
+
+impl LatentDecoder for OwnedWanSingleFrameDecoder {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z16_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        self.source.ensure_unchanged()?;
+        WanSingleFrameDecoder::new(&self.vae).decode(latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        self.source.ensure_unchanged()?;
+        WanSingleFrameDecoder::new(&self.vae).decode_tiled(latents, tiling, cancel)
+    }
+}
+
 impl WanVae {
     /// Geometry owned by the concrete non-causal z16 decoder.
     pub const VAE_TILING: VaeTiling = VaeTiling::WAN;
@@ -567,29 +739,51 @@ impl WanVae {
     /// `cfg` doesn't fire for these dims. The Wan z16 VAE is **non-causal** in time (`T → 4·T`) and
     /// upsamples 8× spatially — [`VaeTiling::WAN`].
     ///
-    /// Mirrors the reference `WanVAE.decode_tiled` (`models/wan/tiling.py`): **denormalize once** on
-    /// the full (small) latent, then tile the denormalized latent and run only conv2+decoder+clip per
-    /// tile. The full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so
-    /// peak memory stays bounded by one tile's decode. Shared tiling geometry: [`mlx_gen::tiling`].
+    /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
+    /// — including its spatial self-attention — run **once** on the full latent
+    /// (`Decoder3d::forward_middle`); only the spatially-local upsample tail is tiled. The
+    /// reference `WanVAE.decode_tiled` (`models/wan/tiling.py`) hoists just the denormalize and runs
+    /// the *whole* decoder per tile, so every spatial tile's `middle.1` softmax attended only to its
+    /// own crop's tokens. This port deliberately diverges from the reference there: the earlier
+    /// clearance of this family was based on its channel-L2 norms being per-position, which is true,
+    /// but the middle attention is a spatial global reduction that the norms audit missed.
+    ///
+    /// The middle blocks are shape-preserving at latent resolution, so the tile plan is unchanged —
+    /// the same [`TilePlan`](mlx_gen::tiling::TilePlan) now partitions the middle feature map instead
+    /// of the latent. The
+    /// full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so peak
+    /// memory stays bounded by one tile's tail.
+    ///
+    /// **Memory cost of the dense head.** The middle feature map is now materialized whole rather
+    /// than per tile: `dim·4` channels at *latent* resolution, so it scales with `T_lat·H/8·W/8`,
+    /// not with the output. It sits alongside the full-size output accumulator the tiling already
+    /// required and is a fraction of it. This is the same tradeoff sc-19753 took on every image VAE
+    /// — bounding convolution work rather than every activation is the price of keeping global
+    /// statistics global. Shared tiling geometry: [`mlx_gen::tiling`].
     pub fn decode_tiled(
         &self,
         z: &Array,
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let sh = z.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
         if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(z);
         }
-        // Denormalize once (matches the reference), then tile the denormalized latent.
+        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent.
         let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+        let middle = self
+            .decoder
+            .forward_middle(&self.conv2.forward(&denorm, None)?)?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile decode = conv2 → decoder → clamp.
-        tile_decode_accumulate(&denorm, &plan, [2, 3, 4], cancel, |tile| {
-            let x = self.conv2.forward(tile, None)?;
-            let dec = self.decoder.forward(&x)?;
+        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp.
+        tile_decode_accumulate(&middle, &plan, [2, 3, 4], cancel, |tile| {
+            let dec = self.decoder.forward_upsample_tail(tile)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
     }

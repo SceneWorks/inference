@@ -68,6 +68,8 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// (pre-quantized; the loaders read the `.scales` siblings).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

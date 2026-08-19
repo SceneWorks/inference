@@ -410,6 +410,17 @@ impl MiniMaxH3Task {
 /// The identity, modality and capability surface.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        // Both `None`, and both deliberate (sc-17137 main sync):
+        //   * `encoder_contract`: like every shipped video provider (Wan, LTX, Mochi, SVD,
+        //     SeedVR2), the text encoder is not advertised as substitutable.
+        //   * `denoiser_output_latent_space`: the denoiser's video half is a 24-channel latent on
+        //     the 17-frame clip lattice — `ceil(clip/vae_ratio_t) - token_drop` tokens per clip,
+        //     decoded twice with a seam cross-fade (`crate::chunking`). No `LatentTemporalLaw`
+        //     variant expresses that mapping, and per the field's contract `None` makes every
+        //     external decoder fail closed rather than let a channel-count match imply
+        //     compatibility. The paired ViT decoder + audio VAE are internal to this crate.
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

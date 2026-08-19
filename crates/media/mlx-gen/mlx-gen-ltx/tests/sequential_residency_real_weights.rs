@@ -386,11 +386,13 @@ fn staged_generate(
     tier: Tier,
     request: &GenerationRequest,
 ) -> (Vec<Image>, bool, usize, usize) {
-    let spec = LoadSpec {
-        text_encoder: Some(WeightsSource::Dir(gemma.to_path_buf())),
-        quantize: tier.load_quant(),
-        ..LoadSpec::new(WeightsSource::Dir(model.to_path_buf()))
-    };
+    // Builder-style, not struct-update: `LoadSpec` carries crate-private prepared-pin and
+    // receipt fields, so `..LoadSpec::new(..)` no longer compiles from outside `gen-core`.
+    let mut spec = LoadSpec::new(WeightsSource::Dir(model.to_path_buf()))
+        .with_text_encoder(WeightsSource::Dir(gemma.to_path_buf()));
+    if let Some(quant) = tier.load_quant() {
+        spec = spec.with_quant(quant);
+    }
     let m = mlx_gen_ltx::provider_registry()
         .expect("build explicit LTX provider registry")
         .load("ltx_2_3", &spec)

@@ -167,6 +167,11 @@ fn projected_dense_component_bytes(
         )));
     }
     headers.iter().try_fold(0_u64, |total, tensor| {
+        // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 component is refused here
+        // rather than priced at `float_bytes`. That is deliberate — the calibrated route is the
+        // snapshot directory (`validate_contract_route`), whose loader casts float storage to the
+        // compute dtype; the ComfyUI scaled-fp8 seam in `crate::comfyui` dequantizes through its own
+        // `.scale_weight` companions and is a different, uncalibrated route.
         if !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: calibrated dense {component} tensor {} must use a floating source dtype; the loader would cast {:?} to its resident compute dtype",
@@ -237,6 +242,8 @@ fn validate_packed_triple(
             "{MODEL_ID}: packed transformer {base}.weight must be rank-2 U32 codes"
         )));
     }
+    // FP8 posture: an affine-packed grid's scales/biases are read as real floats, never as fp8
+    // codes, so `is_float`'s exclusion of `F8_E4M3` is the intended refusal here.
     if !scales.is_float()
         || !biases.is_float()
         || scales.shape.len() != 2
@@ -331,6 +338,9 @@ fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
             )));
         }
         let bytes = tensors.values().try_fold(0_u64, |total, tensor| {
+            // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 DiT is refused instead of
+            // being priced at the bf16 width its `.scale_weight` companions would only reach through
+            // the separate `crate::comfyui` dequant seam.
             if !tensor.is_float() {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{MODEL_ID}: calibrated dense transformer tensor {} must use a floating source dtype; the loader would cast {:?} to bf16",
@@ -415,6 +425,8 @@ fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
                 tensor.name
             )));
         }
+        // FP8 posture: `is_float` excludes `F8_E4M3`, so the only non-float storage a packed
+        // transformer may retain is the U32 code grid accounted above — a stray fp8 leaf is refused.
         if !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: packed transformer ordinary tensor {} must use a floating source dtype; only an exact packed triple may retain U32 codes",
@@ -571,6 +583,9 @@ fn build_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies: strategies(),
+        // Wan declares no decode-quality geometry policy table, so this route carries no semantic
+        // decode authority — the fail-closed default every other candle provider contract uses.
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
@@ -947,11 +962,27 @@ pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
     safety_check: registered_safety_check,
 };
 
+/// TI2V-5B advertises `supported_quants: [Q4, Q8]` plus the dense bf16 tier under both offload
+/// policies, so it witnesses the common Candle registry tiers — but only the eager half of the
+/// materialization axis. The provider has no deferred block loader: `validate_contract_route`
+/// rejects `DeferredMaterialization` on the production route and on the weights-free route alike,
+/// so publishing the deferred selectors would advertise a load surface no contract can be built
+/// for. The witness set is deliberately the provider's own finite inventory, not the shared
+/// default.
+#[cfg(any(feature = "cuda", test))]
+fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization)
+        .collect()
+}
+
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_memory_strategy_contract,
+        surface_specs: memory_contract_surface_specs,
     };
 
 #[cfg(any(feature = "cuda", test))]
@@ -1407,6 +1438,41 @@ mod tests {
         let loaded = crate::build_generator_with_source(&spec, source.clone()).unwrap();
         assert_eq!(loaded.memory_strategy_contract(), None);
         assert_eq!(loaded.dit_source, source);
+    }
+
+    /// The registry conformance walk constructs a weights-free contract for **every** selector the
+    /// fixture publishes and fails the whole catalog when one errors. That walk only runs in the
+    /// CUDA catalog lane, so this asserts the same property here, where it is reachable on CPU: the
+    /// published witness set is exactly the set this provider can build, and the deferred half the
+    /// shared Candle default would add is genuinely absent rather than silently dropped.
+    #[test]
+    fn every_published_contract_surface_builds_and_no_deferred_surface_is_published() {
+        // Walk the registration itself, not the local helper: the registry reads this field, and a
+        // registration pointed back at the shared Candle default is exactly the regression.
+        let surfaces = (MEMORY_FIXTURE.surface_specs)();
+        assert_eq!(
+            surfaces.len(),
+            gen_core::candle_memory_contract_surface_specs().len() / 2,
+            "the witness set is the eager half of the shared Candle surface"
+        );
+        for surface in &surfaces {
+            assert_eq!(
+                surface.selector.load_shape,
+                LoadShape::EagerMaterialization,
+                "{} has no deferred block loader",
+                surface.selector.id()
+            );
+            (MEMORY_FIXTURE.contract)(&surface.spec).unwrap_or_else(|error| {
+                panic!("surface {} must build: {error}", surface.selector.id())
+            });
+        }
+        assert!(
+            gen_core::candle_memory_contract_surface_specs()
+                .into_iter()
+                .filter(|surface| surface.selector.load_shape == LoadShape::DeferredMaterialization)
+                .all(|surface| weights_free_memory_strategy_contract(&surface.spec).is_err()),
+            "a deferred surface that now builds must be published, not filtered out"
+        );
     }
 
     #[test]

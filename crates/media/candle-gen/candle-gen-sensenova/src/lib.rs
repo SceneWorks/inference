@@ -117,6 +117,8 @@ pub fn descriptor_fast() -> ModelDescriptor {
 /// not advertised. Backend-correct deviations from MLX are `backend = "candle"` and `mac_only = false`.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id,

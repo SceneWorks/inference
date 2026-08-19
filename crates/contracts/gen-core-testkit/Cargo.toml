@@ -14,10 +14,10 @@ categories = ["science"]
 name = "gen_core_testkit"
 
 [dependencies]
-# The ONLY dependency: the backend-neutral contract. The testkit drives a provider purely through
-# the public `Generator` contract, so it links no tensor library and builds on Linux (the gen-core CI
-# lane) as readily as macOS — that backend-independence is the whole point (epic 3720, sc-4481).
+# Backend-neutral contract plus JSON serialization for sparse architecture fixtures. The testkit
+# links no tensor library and builds on Linux as readily as macOS.
 sceneworks-gen-core = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

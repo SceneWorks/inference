@@ -340,6 +340,56 @@ impl BooguTransformer {
             .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
+
+    /// Drop every attention block back to three separate q/k/v projections — SC-18319's
+    /// **fused-off baseline arm**, which the P6 matrix measures the packed path against.
+    ///
+    /// Bit-exact by construction (the packed matrix is the row-wise concatenation of the three
+    /// bases, and `mlx_gen::qkv::FusedQkvProjection::unfuse` slices it back by the same row ranges);
+    /// asserted at boogu's real widths in `transformer::block`'s tests. A quantized boogu is already
+    /// split — the group-32 kv `out` refuses the pack — so this is a no-op there.
+    pub fn unfuse_qkv(&mut self) -> Result<()> {
+        for b in &mut self.context_refiner {
+            b.unfuse_qkv()?;
+        }
+        for b in &mut self.noise_refiner {
+            b.unfuse_qkv()?;
+        }
+        for b in &mut self.ref_image_refiner {
+            b.unfuse_qkv()?;
+        }
+        for b in &mut self.double_stream {
+            b.unfuse_qkv()?;
+        }
+        for b in &mut self.single_stream {
+            b.unfuse_qkv()?;
+        }
+        Ok(())
+    }
+
+    /// SC-18319 — whether **every** attention block currently holds one packed q/k/v matrix.
+    ///
+    /// The P6 matrix reads this as the *activation receipt* for the fused arm rather than inferring
+    /// it from a flag or from timing: a dense boogu **loaded under an opt-in** reports `true`, and a
+    /// Q4/Q8 boogu reports `false` because the group-32 kv `out = 840` refuses the pack (see
+    /// `mlx_gen::qkv::NoFusion::OutFeaturesNotGroupAligned`). `false` after
+    /// [`unfuse_qkv`](Self::unfuse_qkv) is the baseline arm having actually taken effect.
+    ///
+    /// Fusion is opt-in (`mlx_gen::qkv::set_fused_qkv` defaults to off), so a transformer loaded
+    /// without an explicit `FusedQkvGuard::set(true)` in scope reports `false` here for that reason
+    /// alone — `mlx_gen::qkv::NoFusion::Disabled` rather than the group-32 rule. The block's own
+    /// `FusedQkvProjection::refusal` is what distinguishes the two causes, and `transformer::block`'s
+    /// tests assert both.
+    pub fn qkv_fusion_engaged(&self) -> bool {
+        self.context_refiner.iter().all(|b| b.qkv_fusion_engaged())
+            && self.noise_refiner.iter().all(|b| b.qkv_fusion_engaged())
+            && self
+                .ref_image_refiner
+                .iter()
+                .all(|b| b.qkv_fusion_engaged())
+            && self.double_stream.iter().all(|b| b.qkv_fusion_engaged())
+            && self.single_stream.iter().all(|b| b.qkv_fusion_engaged())
+    }
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────────────────────────
@@ -359,18 +409,9 @@ pub(crate) fn slice_axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
     Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
 }
 
-/// Expand `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`, repeating each kv head `groups` times
-/// consecutively (= `repeat_interleave` over the head axis, matching the reference).
-pub(crate) fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, s, hkv, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(3)?; // [b, s, hkv, 1, hd]
-    let x = mlx_rs::ops::broadcast_to(&x, &[b, s, hkv, groups, hd])?;
-    Ok(x.reshape(&[b, s, hkv * groups, hd])?)
-}
+// The GQA `repeat_interleave` that used to live here is now `mlx_gen::qkv::repeat_kv` (SC-18319,
+// knob 10) — the identical `expand_dims → broadcast_to → reshape`, parameterized by which of the two
+// layouts the stream is in.
 
 /// diffusers `get_timestep_embedding(x, dim, flip_sin_to_cos=True, downscale_freq_shift=0,
 /// max_period=10000)`: `freq_i = 10000^(−i/half)`, `emb = x·freq`, `concat([cos, sin], -1)` (cos

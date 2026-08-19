@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -49,6 +49,7 @@ pub const MODEL_ID: &str = "z_image";
 pub struct ZImageBaseGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    text_encoder_source: gen_core::ValidatedEncoderSource,
     device: Device,
     dtype: DType,
     loaded_quant: Option<gen_core::Quant>,
@@ -171,8 +172,9 @@ impl Generator for ZImageBaseGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        let pipe = Pipeline::load(
+        let pipe = Pipeline::load_with_text_encoder(
             &self.root,
+            self.text_encoder_source.clone(),
             &self.device,
             self.dtype,
             &self.adapters,
@@ -239,6 +241,8 @@ impl Generator for ZImageBaseGenerator {
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -299,6 +303,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
+    gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle z_image does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -310,7 +315,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    if spec.identity.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "candle z_image does not support identity weights".into(),
+        ));
+    }
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, &root)?;
     let loaded_quant = crate::memory_strategy::snapshot_quant_tier(spec, MODEL_ID)?;
+    let load_time_quant =
+        text_encoder_source.load_time_quant_bits(loaded_quant.map(Quant::bits), MODEL_ID)?;
+    if let Some(bits) = load_time_quant {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {MODEL_ID} requires a selected text encoder already packed at Q{bits}; this provider does not quantize a dense Z-Image encoder on the fly"
+        )));
+    }
     // Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype.
     let device = candle_gen::default_device()?;
     #[cfg(any(feature = "cuda", test))]
@@ -320,6 +338,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(ZImageBaseGenerator {
         descriptor: descriptor(),
         root,
+        text_encoder_source,
         device,
         dtype: DType::BF16,
         loaded_quant,
@@ -343,12 +362,23 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image};
 
+    fn valid_model_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("model root");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.path().join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("valid encoder fixture");
+        root
+    }
+
     /// The seam under test: resolving `"z_image"` through the family registry returns this candle
     /// base generator. `load`
     /// is tensor-lazy, so a nonexistent weights dir still resolves (the absent tier marker is dense).
     #[test]
     fn base_registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("z_image", &spec)
@@ -403,7 +433,8 @@ mod tests {
     /// still rejected clearly. Uses the lazy generator (no GPU).
     #[test]
     fn validate_accepts_cfg_and_reference_and_rejects_unsupported() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let root = valid_model_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
         let g = crate::provider_registry()
             .unwrap()
             .load("z_image", &spec)

@@ -7,7 +7,10 @@ use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTran
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor, StepSupport};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::memory_strategy::{MemoryProviderContract, MemoryRunContext, MemorySafetyDecision};
+use crate::memory_strategy::{
+    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport,
+};
 use crate::runtime::{LoadSpec, Quant, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
@@ -123,6 +126,62 @@ pub struct ModelRegistration {
     pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
+/// The validated on-disk shape of a caller-owned model routed through a registered generator.
+///
+/// The shape is explicit because family identity alone cannot prove that a File, fused checkpoint,
+/// component directory, or ComfyUI tree is loadable by the same provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelSource {
+    TransformerFile,
+    FusedCheckpoint,
+    TransformerDirectory,
+    ComfyUiTree,
+}
+
+/// The request surface selected for an imported source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImportedModelOperation {
+    Generate,
+    Edit,
+    Pose,
+    MultiPhase,
+}
+
+/// Provider-owned route from one imported source shape and operation to the ordinary generator
+/// registration that actually validates and loads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedModelRegistration {
+    pub family: &'static str,
+    pub source: ImportedModelSource,
+    pub operation: ImportedModelOperation,
+    pub provider_id: &'static str,
+    /// Source-shape-specific staged components. When present, this replaces the ordinary
+    /// provider descriptor's component list because an imported loader can consume a different
+    /// artifact shape from the published snapshot loader (for example an SDXL fused checkpoint
+    /// still needs caller-staged tokenizer assets).
+    pub required_components: Option<&'static [&'static str]>,
+    /// Whether this source shape inherits the provider's LoRA/LoKr flags. Set false only for a
+    /// structural loader refusal that is narrower than the ordinary provider (for example a full
+    /// Mage fine-tune whose moved base weights cannot safely take an adapter fitted to the published
+    /// checkpoint).
+    pub inherit_adapters: bool,
+}
+
+/// Provider-owned encoder-contract alias for a real route assembled outside an ordinary
+/// [`ModelRegistration`].
+///
+/// Bespoke edit/control routes often reuse a registered base generator's prompt encoder while
+/// loading the denoiser through a platform-specific path.  The alias keeps that relationship in
+/// the inference composition root: callers resolve the authored route id and never need to know or
+/// hardcode which registered base provider owns its [`crate::EncoderContract`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderContractRouteRegistration {
+    /// The externally routed provider id (for example a composed control route).
+    pub route_id: &'static str,
+    /// The ordinary registered generator whose descriptor is the sole contract oracle.
+    pub provider_id: &'static str,
+}
+
 /// Optional, pre-load memory-strategy contract registration for one provider route id.
 ///
 /// Kept separate from [`ModelRegistration`] so every existing provider remains source-compatible:
@@ -153,6 +212,261 @@ pub struct MemoryRegistration {
 pub struct MemoryContractFixtureRegistration {
     pub provider_id: &'static str,
     pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
+    /// Complete, weights-free registry-load surface for this provider.
+    ///
+    /// A caller-selected `LoadSpec` is not a contract inventory: it can hide a rung whose
+    /// availability changes with numeric tier, residency policy, or materialization shape.  The
+    /// provider therefore owns an explicit finite witness set.  Catalog dumps and conformance walk
+    /// every witness; they never substitute one convenient default spec.
+    pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
+}
+
+/// Optional selector-aware resolver for a [`MemoryContractFixtureRegistration`].
+///
+/// Most providers can construct a weights-free contract from the witness [`LoadSpec`] alone. A
+/// prepacked provider cannot: `LoadSpec::quantize` means "pack this dense source at load time", while
+/// [`MemoryContractSurfaceSelector::tier`] names the already-resolved artifact tier. Those are
+/// deliberately different production shapes. Registering this additive resolver lets such a
+/// provider consume the explicit selector tier without overloading `LoadSpec::quantize` or teaching
+/// a downstream capability consumer a provider-specific interpretation.
+#[derive(Clone, Copy)]
+pub struct MemoryContractSurfaceResolverRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&MemoryContractSurfaceSpec) -> Result<MemoryProviderContract>,
+}
+
+/// Explicit, weights-free proof that a [`MemoryRegistration`] has no optimized contract surface.
+///
+/// Resident-only providers still participate in the reconciliation gate: they must publish this
+/// typed witness rather than disappearing from the inventory by omission. Every declared selector
+/// is constructed and checked to ensure all non-resident strategies remain [`MemoryStrategySupport::Missing`].
+#[derive(Clone, Copy)]
+pub struct ResidentOnlyMemoryContractRegistration {
+    pub provider_id: &'static str,
+    pub contract: fn(&LoadSpec) -> Result<MemoryProviderContract>,
+    pub surface_specs: fn() -> Vec<MemoryContractSurfaceSpec>,
+}
+
+/// Numeric tier named by a weights-free memory-contract surface witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryContractSurfaceTier {
+    Bf16,
+    Q4,
+    Q8,
+    Nvfp4,
+}
+
+impl MemoryContractSurfaceTier {
+    fn load_spec(self) -> LoadSpec {
+        let spec = LoadSpec::new(crate::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        match self {
+            Self::Bf16 => spec,
+            Self::Q4 => spec.with_quant(crate::Quant::Q4),
+            Self::Q8 => spec.with_quant(crate::Quant::Q8),
+            Self::Nvfp4 => spec.with_quant(crate::Quant::Nvfp4),
+        }
+    }
+}
+
+/// Exact selector axes for one shipped registry-load contract witness.
+///
+/// Registry routes consume provisioned snapshot directories. Single-file imports are a separate,
+/// ad-hoc loader surface and are intentionally not allowed to stand in for the catalog contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryContractSurfaceSelector {
+    /// Numeric tier of the already-resolved catalog artifact. This is an output fact, not a request
+    /// to quantize a dense [`LoadSpec`] at load time.
+    pub tier: MemoryContractSurfaceTier,
+    pub offload_policy: crate::OffloadPolicy,
+    pub load_shape: crate::LoadShape,
+}
+
+impl MemoryContractSurfaceSelector {
+    fn matches_spec(self, spec: &LoadSpec) -> bool {
+        let tier_matches = match self.tier {
+            MemoryContractSurfaceTier::Bf16 => {
+                spec.quantize.is_none() && spec.precision == crate::Precision::Bf16
+            }
+            MemoryContractSurfaceTier::Q4 => spec.quantize == Some(crate::Quant::Q4),
+            MemoryContractSurfaceTier::Q8 => spec.quantize == Some(crate::Quant::Q8),
+            MemoryContractSurfaceTier::Nvfp4 => spec.quantize == Some(crate::Quant::Nvfp4),
+        };
+        tier_matches
+            && self.offload_policy == spec.offload_policy
+            && self.load_shape == spec.load_shape
+    }
+
+    pub fn id(self) -> &'static str {
+        match (self.tier, self.offload_policy, self.load_shape) {
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "bf16:resident:eager",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "bf16:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "bf16:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Bf16,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "bf16:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q4:resident:eager",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q4:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q4:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Q4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q4:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q8:resident:eager",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q8:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "q8:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Q8,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "q8:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "nvfp4:resident:eager",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "nvfp4:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "nvfp4:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Nvfp4,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "nvfp4:sequential:deferred",
+        }
+    }
+}
+
+/// A provider-owned, weights-free input to one contract surface.
+pub struct MemoryContractSurfaceSpec {
+    pub selector: MemoryContractSurfaceSelector,
+    pub spec: LoadSpec,
+}
+
+impl MemoryContractSurfaceSpec {
+    /// Explicit resolved artifact tier supplied to selector-aware provider fixtures.
+    pub const fn resolved_artifact_tier(&self) -> MemoryContractSurfaceTier {
+        self.selector.tier
+    }
+}
+
+/// One fully constructed contract surface returned by [`ProviderRegistry::memory_contract_surfaces`].
+pub struct MemoryContractSurface {
+    pub selector: MemoryContractSurfaceSelector,
+    pub spec: LoadSpec,
+    pub contract: MemoryProviderContract,
+    pub composed: bool,
+}
+
+impl MemoryContractSurface {
+    /// Explicit resolved artifact tier emitted to downstream capability facts.
+    pub const fn resolved_artifact_tier(&self) -> MemoryContractSurfaceTier {
+        self.selector.tier
+    }
+}
+
+fn registry_memory_contract_surface_specs(
+    tiers: &[MemoryContractSurfaceTier],
+) -> Vec<MemoryContractSurfaceSpec> {
+    let mut surfaces = Vec::with_capacity(tiers.len() * 4);
+    for &tier in tiers {
+        for offload_policy in [
+            crate::OffloadPolicy::Resident,
+            crate::OffloadPolicy::Sequential,
+        ] {
+            for load_shape in [
+                crate::LoadShape::EagerMaterialization,
+                crate::LoadShape::DeferredMaterialization,
+            ] {
+                let selector = MemoryContractSurfaceSelector {
+                    tier,
+                    offload_policy,
+                    load_shape,
+                };
+                let spec = tier
+                    .load_spec()
+                    .with_offload_policy(offload_policy)
+                    .with_load_shape(load_shape);
+                surfaces.push(MemoryContractSurfaceSpec { selector, spec });
+            }
+        }
+    }
+    surfaces
+}
+
+/// Complete numeric/load-policy surface shipped by the MLX registry.
+pub fn mlx_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+    ])
+}
+
+/// Common numeric/load-policy surface shipped by Candle registry providers.
+pub fn candle_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+    ])
+}
+
+/// Candle surface for providers that additionally expose the explicit NVFP4 load tier.
+pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+        MemoryContractSurfaceTier::Nvfp4,
+    ])
 }
 
 /// Provider-owned, weights-free executable fixture for one implemented memory strategy.
@@ -328,8 +642,12 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
+    imported_models: Vec<ImportedModelRegistration>,
+    encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
+    memory_contract_surface_resolver: Vec<MemoryContractSurfaceResolverRegistration>,
+    resident_only_memory_contract: Vec<ResidentOnlyMemoryContractRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
@@ -362,6 +680,16 @@ impl ProviderRegistryBuilder {
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
     builder_registration_method!(
+        register_imported_model,
+        imported_models,
+        ImportedModelRegistration
+    );
+    builder_registration_method!(
+        register_encoder_contract_route,
+        encoder_contract_routes,
+        EncoderContractRouteRegistration
+    );
+    builder_registration_method!(
         register_activation_memory,
         activation_memory,
         ActivationMemoryRegistration
@@ -375,6 +703,16 @@ impl ProviderRegistryBuilder {
         register_memory_contract_fixture,
         memory_contract_fixture,
         MemoryContractFixtureRegistration
+    );
+    builder_registration_method!(
+        register_memory_contract_surface_resolver,
+        memory_contract_surface_resolver,
+        MemoryContractSurfaceResolverRegistration
+    );
+    builder_registration_method!(
+        register_resident_only_memory_contract,
+        resident_only_memory_contract,
+        ResidentOnlyMemoryContractRegistration
     );
     builder_registration_method!(
         register_memory_behavior,
@@ -462,6 +800,113 @@ impl ProviderRegistryBuilder {
         }
         ensure_unique!(generators, "generator");
         {
+            let mut route_ids = std::collections::BTreeSet::new();
+            for registration in &self.encoder_contract_routes {
+                if !is_registry_ident(registration.route_id) {
+                    return Err(Error::Msg(
+                        "encoder-contract route id must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if !route_ids.insert(registration.route_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate encoder-contract route id '{}'",
+                        registration.route_id
+                    )));
+                }
+            }
+            for registration in &self.encoder_contract_routes {
+                if self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.route_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' shadows a registered generator",
+                        registration.route_id
+                    )));
+                }
+                let Some(descriptor) = self
+                    .generators
+                    .iter()
+                    .map(|generator| (generator.descriptor)())
+                    .find(|descriptor| descriptor.id == registration.provider_id)
+                else {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets unregistered generator '{}'",
+                        registration.route_id, registration.provider_id
+                    )));
+                };
+                if descriptor.encoder_contract.is_none() {
+                    return Err(Error::Msg(format!(
+                        "encoder-contract route '{}' targets generator '{}' with no encoder contract",
+                        registration.route_id, registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
+            let mut routes = std::collections::BTreeSet::new();
+            for registration in &self.imported_models {
+                if !is_registry_ident(registration.family) {
+                    return Err(Error::Msg(
+                        "imported-model route family must be a non-empty lowercase registry identifier"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(required) = registration.required_components {
+                    if required.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "imported-model route '{}'/{:?}/{:?} declares an empty required-components override; use None instead",
+                            registration.family, registration.source, registration.operation
+                        )));
+                    }
+                    let mut component_ids = std::collections::BTreeSet::new();
+                    for component in required {
+                        if component.is_empty() || component.chars().any(char::is_whitespace) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} has an empty or whitespace-padded required component",
+                                registration.family, registration.source, registration.operation
+                            )));
+                        }
+                        if !component_ids.insert(*component) {
+                            return Err(Error::Msg(format!(
+                                "imported-model route '{}'/{:?}/{:?} repeats required component '{}'",
+                                registration.family,
+                                registration.source,
+                                registration.operation,
+                                component
+                            )));
+                        }
+                    }
+                }
+                let key = (
+                    registration.family,
+                    registration.source,
+                    registration.operation,
+                );
+                if !routes.insert(key) {
+                    return Err(Error::Msg(format!(
+                        "duplicate imported-model route for family '{}' ({:?}/{:?})",
+                        registration.family, registration.source, registration.operation
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "imported-model route '{}'/{:?}/{:?} targets unregistered generator '{}'",
+                        registration.family,
+                        registration.source,
+                        registration.operation,
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
+        {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
                 if !ids.insert(registration.provider_id) {
@@ -504,6 +949,46 @@ impl ProviderRegistryBuilder {
                 {
                     return Err(Error::Msg(format!(
                         "memory-contract fixture '{}' has no matching memory strategy",
+                        registration.provider_id
+                    )));
+                }
+            }
+            let mut resolver_ids = std::collections::BTreeSet::new();
+            for registration in &self.memory_contract_surface_resolver {
+                if !resolver_ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate memory-contract surface resolver provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !ids.contains(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract surface resolver '{}' has no matching contract-surface fixture",
+                        registration.provider_id
+                    )));
+                }
+            }
+            let mut resident_only_ids = std::collections::BTreeSet::new();
+            for registration in &self.resident_only_memory_contract {
+                if !resident_only_ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate resident-only memory-contract witness provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if ids.contains(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .memory_strategy
+                    .iter()
+                    .any(|memory| memory.provider_id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "resident-only memory-contract witness '{}' has no matching memory strategy",
                         registration.provider_id
                     )));
                 }
@@ -572,8 +1057,14 @@ impl ProviderRegistryBuilder {
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
+            imported_models: self.imported_models.into_boxed_slice(),
+            encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
+            memory_contract_surface_resolver: self
+                .memory_contract_surface_resolver
+                .into_boxed_slice(),
+            resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
@@ -594,8 +1085,12 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
+    imported_models: Box<[ImportedModelRegistration]>,
+    encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
     memory_contract_fixture: Box<[MemoryContractFixtureRegistration]>,
+    memory_contract_surface_resolver: Box<[MemoryContractSurfaceResolverRegistration]>,
+    resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
@@ -631,12 +1126,75 @@ macro_rules! explicit_registry_kind {
                     ))
                 })?;
             self.ensure_quant_supported(id, spec)?;
-            (registration.load)(spec)
+            spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };
 }
 
 impl ProviderRegistry {
+    /// Resolve the encoder contract for an ordinary generator or an explicitly registered bespoke
+    /// route. Unknown routes, and ordinary generators that do not support substitution, return
+    /// `None`; aliases are validated at registry construction and cannot target another alias or a
+    /// provider without a contract.
+    pub fn provider_encoder_contract(&self, id: &str) -> Option<crate::EncoderContract> {
+        if let Some(descriptor) = self
+            .generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == id)
+        {
+            return descriptor.encoder_contract;
+        }
+        let provider_id = self
+            .encoder_contract_routes
+            .iter()
+            .find(|registration| registration.route_id == id)?
+            .provider_id;
+        self.generators
+            .iter()
+            .map(|registration| (registration.descriptor)())
+            .find(|descriptor| descriptor.id == provider_id)?
+            .encoder_contract
+    }
+
+    /// Every provider-owned bespoke route participating in encoder-contract lookup.
+    pub fn encoder_contract_routes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &EncoderContractRouteRegistration> {
+        self.encoder_contract_routes.iter()
+    }
+
+    /// Every provider-owned imported-source route in this explicit platform catalog.
+    pub fn imported_models(&self) -> impl ExactSizeIterator<Item = &ImportedModelRegistration> {
+        self.imported_models.iter()
+    }
+
+    /// Resolve an exact imported source shape and operation to the descriptor of the generator that
+    /// will actually load it. Missing is an explicit unsupported answer.
+    pub fn imported_model_descriptor(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+    ) -> Option<ModelDescriptor> {
+        let route = self.imported_models.iter().find(|route| {
+            route.family == family && route.source == source && route.operation == operation
+        })?;
+        let mut descriptor = self
+            .generators
+            .iter()
+            .find(|registration| (registration.descriptor)().id == route.provider_id)
+            .map(|registration| (registration.descriptor)())?;
+        if !route.inherit_adapters {
+            descriptor.capabilities.supports_lora = false;
+            descriptor.capabilities.supports_lokr = false;
+        }
+        if let Some(required_components) = route.required_components {
+            descriptor.required_components = required_components;
+        }
+        Some(descriptor)
+    }
+
     /// Provider-owned warm 1024² activation transient for `id`.
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
@@ -666,6 +1224,137 @@ impl ProviderRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &MemoryContractFixtureRegistration> {
         self.memory_contract_fixture.iter()
+    }
+
+    pub fn memory_contract_surface_resolver_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &MemoryContractSurfaceResolverRegistration> {
+        self.memory_contract_surface_resolver.iter()
+    }
+
+    pub fn resident_only_memory_contract_registrations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ResidentOnlyMemoryContractRegistration> {
+        self.resident_only_memory_contract.iter()
+    }
+
+    /// Construct every provider-owned registry-load contract witness without opening weights.
+    ///
+    /// Coverage is fail-closed in both directions: each memory registration must have exactly one
+    /// paired surface fixture or explicit resident-only witness (builder validation rejects overlap
+    /// and orphans). Every declaration must publish a non-empty unique selector set and construct a
+    /// contract for the paired provider id. Resident-only declarations are checked across the same
+    /// axes but omitted from the returned optimized-surface inventory. This is the seam consumed by
+    /// generated capability dumps; it deliberately has no caller-supplied `LoadSpec`.
+    pub fn memory_contract_surfaces(&self) -> Result<Vec<MemoryContractSurface>> {
+        let mut out = Vec::new();
+        for registration in &self.memory_strategy {
+            let fixture = self
+                .memory_contract_fixture
+                .iter()
+                .find(|fixture| fixture.provider_id == registration.provider_id);
+            let resident_only = self
+                .resident_only_memory_contract
+                .iter()
+                .find(|witness| witness.provider_id == registration.provider_id);
+            let surface_resolver = self
+                .memory_contract_surface_resolver
+                .iter()
+                .find(|resolver| resolver.provider_id == registration.provider_id);
+            let (surface_specs, contract_factory, is_resident_only) = match (fixture, resident_only) {
+                (Some(fixture), None) => (fixture.surface_specs, fixture.contract, false),
+                (None, Some(witness)) => (witness.surface_specs, witness.contract, true),
+                (None, None) => {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has neither a weights-free contract-surface fixture nor a resident-only witness",
+                        registration.provider_id
+                    )))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::Msg(format!(
+                        "memory-strategy registration '{}' has both a contract-surface fixture and a resident-only witness",
+                        registration.provider_id
+                    )))
+                }
+            };
+            let surface_specs = surface_specs();
+            if surface_specs.is_empty() {
+                return Err(Error::Msg(format!(
+                    "memory-contract witness '{}' publishes no surface selectors",
+                    registration.provider_id
+                )));
+            }
+            let mut selectors = std::collections::BTreeSet::new();
+            for surface in surface_specs {
+                if !surface.selector.matches_spec(&surface.spec) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract witness '{}' selector '{}' does not match its LoadSpec",
+                        registration.provider_id,
+                        surface.selector.id()
+                    )));
+                }
+                if !selectors.insert(surface.selector.id()) {
+                    return Err(Error::Msg(format!(
+                        "memory-contract witness '{}' repeats surface selector '{}'",
+                        registration.provider_id,
+                        surface.selector.id()
+                    )));
+                }
+                let contract = match surface_resolver {
+                    Some(resolver) => (resolver.contract)(&surface),
+                    None => contract_factory(&surface.spec),
+                }
+                .map_err(|error| {
+                    Error::Msg(format!(
+                        "memory-contract witness '{}' failed surface '{}': {error}",
+                        registration.provider_id,
+                        surface.selector.id()
+                    ))
+                })?;
+                if contract.provider_id != registration.provider_id {
+                    return Err(Error::Msg(format!(
+                        "memory-contract witness '{}' surface '{}' returned contract for '{}'",
+                        registration.provider_id,
+                        surface.selector.id(),
+                        contract.provider_id
+                    )));
+                }
+                if is_resident_only {
+                    let optimized = contract.strategies.iter().find(|capability| {
+                        capability.strategy != MemoryStrategy::Resident
+                            && capability.support != MemoryStrategySupport::Missing
+                    });
+                    if let Some(capability) = optimized {
+                        return Err(Error::Msg(format!(
+                            "resident-only memory-contract witness '{}' surface '{}' exposes {:?} as {:?}",
+                            registration.provider_id,
+                            surface.selector.id(),
+                            capability.strategy,
+                            capability.support
+                        )));
+                    }
+                    let errors = contract.conformance_errors();
+                    if !errors.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "resident-only memory-contract witness '{}' surface '{}' is malformed: {}",
+                            registration.provider_id,
+                            surface.selector.id(),
+                            errors.join("; ")
+                        )));
+                    }
+                    continue;
+                }
+                out.push(MemoryContractSurface {
+                    selector: surface.selector,
+                    spec: surface.spec,
+                    contract,
+                    composed: self
+                        .composed_memory_strategy_ids
+                        .contains(&registration.provider_id),
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub fn memory_behavior_registrations(
@@ -787,7 +1476,9 @@ impl ProviderRegistry {
             .find(|registration| (registration.descriptor)().id == id)
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
         match registration.footprint {
-            Some(footprint) => footprint(spec).map(Some),
+            Some(footprint) => spec
+                .read_prepared_files_unchanged(|| footprint(spec))
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -815,7 +1506,7 @@ impl ProviderRegistry {
         else {
             return Ok(None);
         };
-        let contract = (registration.contract)(spec)?;
+        let contract = spec.read_prepared_files_unchanged(|| (registration.contract)(spec))?;
         let errors = contract.conformance_errors();
         if !errors.is_empty() {
             return Err(Error::Msg(format!(
@@ -919,6 +1610,11 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
         &ctx,
         &[("id", d.id), ("family", d.family), ("backend", d.backend)],
     );
+    if let Some(contract) = d.encoder_contract {
+        if let Err(error) = contract.validate_definition() {
+            errs.push(format!("{ctx}: {error}"));
+        }
+    }
     let caps = &d.capabilities;
     if caps.max_count == 0 {
         errs.push(format!(
@@ -1037,6 +1733,63 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             "{ctx}: supports_conversation_history is set but ConditioningKind::ConversationHistory \
              is not in `conditioning` — path-A requests would be rejected by the allowlist"
         ));
+    }
+    if let Some(space) = d.denoiser_output_latent_space {
+        let validation = space.validation();
+        if validation.zero_channels {
+            errs.push(format!("{ctx}: latent-space channel count is 0"));
+        }
+        if validation.zero_spatial_compression {
+            errs.push(format!(
+                "{ctx}: latent-space spatial compression is {}x{} — both factors must be non-zero",
+                space.spatial_compression.height, space.spatial_compression.width
+            ));
+        }
+        if let crate::latent::LatentPatchLayout::Packed {
+            patch_height,
+            patch_width,
+        } = space.patch_layout
+        {
+            if validation.zero_packed_patch {
+                errs.push(format!(
+                    "{ctx}: packed latent patch is {patch_height}x{patch_width} — both factors must be non-zero"
+                ));
+            }
+        }
+        match space.normalization {
+            crate::latent::LatentNormalization::Affine { .. } => {
+                let (scale, shift) = space
+                    .normalization
+                    .affine_values()
+                    .expect("matched affine normalization");
+                if validation.invalid_affine {
+                    errs.push(format!(
+                        "{ctx}: affine latent normalization has invalid scale={scale:?} shift={shift:?}"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::PerChannel(stats) => {
+                if validation.per_channel_count_mismatch {
+                    errs.push(format!(
+                        "{ctx}: latent space declares {} channels but normalization {:?} hashes {}",
+                        space.channels, stats.identity, stats.channels
+                    ));
+                }
+                if validation.invalid_per_channel_metadata {
+                    errs.push(format!(
+                        "{ctx}: per-channel latent normalization must have a non-empty, whitespace-free identity and non-zero content hash"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::LearnedPerChannel { .. } => {
+                if validation.invalid_learned_identity {
+                    errs.push(format!(
+                        "{ctx}: learned latent normalization identity must be non-empty and whitespace-free"
+                    ));
+                }
+            }
+            crate::latent::LatentNormalization::Identity => {}
+        }
     }
     // Required components (sc-13658): the weights-free advertisement of the named model components a
     // consumer must provision (see `ModelDescriptor::required_components`). Each declared id must be a
@@ -1370,6 +2123,8 @@ mod tests {
 
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_test_model",
@@ -1411,6 +2166,8 @@ mod tests {
 
     fn dummy_delegated_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_delegated_test_model",
@@ -1438,6 +2195,8 @@ mod tests {
     // read as ZERO — so the provider-owned split is what finds it.
     fn dummy_footprint_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_footprint_model",
@@ -1462,6 +2221,65 @@ mod tests {
         const DUMMY_FOOTPRINT_GENERATOR_REGISTRATION =
             dummy_footprint_descriptor => dummy_footprint_load;
         footprint = dummy_footprint
+    }
+
+    #[cfg(unix)]
+    static PREPARED_CALLBACK_REBIND: std::sync::Mutex<Option<(PathBuf, PathBuf, PathBuf)>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn rebind_prepared_callback_file() -> Result<()> {
+        let (selected, staged_b, staged_a) = PREPARED_CALLBACK_REBIND
+            .lock()
+            .expect("callback rebinding lock")
+            .take()
+            .expect("callback rebinding fixture");
+        std::fs::rename(staged_b, &selected)?;
+        std::fs::rename(staged_a, &selected)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "prepared_callback_model",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: dummy_caps(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        rebind_prepared_callback_file()?;
+        Ok(Box::new(DummyGen {
+            desc: prepared_callback_descriptor(),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_footprint(_spec: &LoadSpec) -> Result<PerComponentBytes> {
+        rebind_prepared_callback_file()?;
+        Ok(PerComponentBytes::default())
+    }
+
+    #[cfg(unix)]
+    fn prepared_callback_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        rebind_prepared_callback_file()?;
+        Ok(MemoryProviderContract::compatibility_default(
+            "prepared_callback_model",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
     }
 
     struct DummyTrainer {
@@ -1518,6 +2336,8 @@ mod tests {
     // Multi-provider fixtures verify that independently named constants compose into one catalog.
     fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_a",
@@ -1530,6 +2350,8 @@ mod tests {
 
     fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "dummy_multi_gen_b",
@@ -1747,6 +2569,75 @@ mod tests {
         assert_eq!(g.descriptor().modality, Modality::Image);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_file_identity_guards_load_footprint_and_memory_callbacks() {
+        use std::os::unix::fs::symlink;
+
+        fn spec_with_rebinding_callback(tag: &str) -> (tempfile::TempDir, LoadSpec) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let first = dir.path().join(format!("{tag}-blob-a"));
+            let second = dir.path().join(format!("{tag}-blob-b"));
+            let selected = dir.path().join(format!("{tag}.safetensors"));
+            let staged_b = dir.path().join(format!("{tag}-staged-b.safetensors"));
+            let staged_a = dir.path().join(format!("{tag}-staged-a.safetensors"));
+            std::fs::write(&first, b"same-size-a").expect("write A");
+            std::fs::write(&second, b"same-size-b").expect("write B");
+            symlink(&first, &selected).expect("select A");
+            symlink(&second, &staged_b).expect("stage B link");
+            symlink(&first, &staged_a).expect("stage replacement A link");
+            let mut spec = LoadSpec::new(WeightsSource::File(selected.clone()));
+            spec.prepare_file_sources().expect("prepare A identity");
+            *PREPARED_CALLBACK_REBIND
+                .lock()
+                .expect("callback rebinding lock") = Some((selected, staged_b, staged_a));
+            (dir, spec)
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: prepared_callback_descriptor,
+                load: prepared_callback_load,
+                footprint: Some(prepared_callback_footprint),
+            })
+            .register_memory_strategy(MemoryRegistration {
+                provider_id: "prepared_callback_model",
+                contract: prepared_callback_memory_contract,
+                safety_check:
+                    crate::memory_strategy::default_registered_memory_strategy_safety_check,
+            })
+            .build()
+            .expect("callback-boundary registry");
+
+        let (_load_dir, load_spec) = spec_with_rebinding_callback("load");
+        let load_error = registry
+            .load("prepared_callback_model", &load_spec)
+            .err()
+            .expect("load callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(load_error.contains("entry changed"), "got: {load_error}");
+
+        let (_footprint_dir, footprint_spec) = spec_with_rebinding_callback("footprint");
+        let footprint_error = registry
+            .footprint("prepared_callback_model", &footprint_spec)
+            .expect_err("footprint callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            footprint_error.contains("entry changed"),
+            "got: {footprint_error}"
+        );
+
+        let (_memory_dir, memory_spec) = spec_with_rebinding_callback("memory");
+        let memory_error = registry
+            .memory_strategy_contract("prepared_callback_model", &memory_spec)
+            .expect_err("memory callback A -> B -> recreated A must fail")
+            .to_string();
+        assert!(
+            memory_error.contains("entry changed"),
+            "got: {memory_error}"
+        );
+    }
+
     #[test]
     fn explicit_registry_resolves_minimal_catalog() {
         let registry = ProviderRegistryBuilder::new()
@@ -1768,6 +2659,54 @@ mod tests {
             "dummy_test_model"
         );
         assert!(registry.trainers().next().is_none());
+    }
+
+    #[test]
+    fn encoder_contract_route_registration_fails_closed() {
+        let missing_target = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_provider",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target an unregistered provider")
+            .to_string();
+        assert!(missing_target.contains("targets unregistered generator"));
+
+        let target_without_contract = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "dummy_test_model",
+            })
+            .build()
+            .err()
+            .expect("an encoder route cannot target a provider without a contract")
+            .to_string();
+        assert!(target_without_contract.contains("with no encoder contract"));
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_a",
+            })
+            .register_encoder_contract_route(EncoderContractRouteRegistration {
+                route_id: "dummy_route",
+                provider_id: "missing_b",
+            })
+            .build()
+            .err()
+            .expect("duplicate encoder routes must fail before resolution")
+            .to_string();
+        assert!(duplicate.contains("duplicate encoder-contract route id"));
+
+        let ordinary = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(ordinary.provider_encoder_contract("dummy_test_model"), None);
+        assert_eq!(ordinary.provider_encoder_contract("unknown_route"), None);
     }
 
     fn composed_memory_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
@@ -1814,7 +2753,84 @@ mod tests {
         MemoryContractFixtureRegistration {
             provider_id: "dummy_weights_free_route",
             contract: weights_free_fixture_contract,
+            surface_specs: mlx_memory_contract_surface_specs,
         };
+
+    fn selector_aware_fixture_contract(
+        surface: &MemoryContractSurfaceSpec,
+    ) -> Result<MemoryProviderContract> {
+        let mut contract = weights_free_fixture_contract(&surface.spec)?;
+        contract.load_shape = surface.spec.load_shape;
+        if surface.selector.tier == MemoryContractSurfaceTier::Q4
+            && surface.selector.load_shape == crate::LoadShape::DeferredMaterialization
+        {
+            let capability = contract
+                .strategies
+                .iter_mut()
+                .find(|capability| {
+                    capability.strategy == MemoryStrategy::BoundedTransformerResidency
+                })
+                .unwrap();
+            capability.support = MemoryStrategySupport::Implemented;
+            capability.parameters.transformer_window_sizes = vec![1];
+            capability.parameters.transformer_window_components =
+                vec![crate::memory_strategy::TransformerComponent::Dit];
+            contract.lifecycle.transformer_window_materialization = true;
+        }
+        Ok(contract)
+    }
+
+    const DUMMY_SURFACE_RESOLVER: MemoryContractSurfaceResolverRegistration =
+        MemoryContractSurfaceResolverRegistration {
+            provider_id: "dummy_weights_free_route",
+            contract: selector_aware_fixture_contract,
+        };
+
+    const DUMMY_RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
+        ResidentOnlyMemoryContractRegistration {
+            provider_id: "dummy_weights_free_route",
+            contract: weights_free_fixture_contract,
+            surface_specs: mlx_memory_contract_surface_specs,
+        };
+
+    fn false_resident_only_contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        let mut contract = weights_free_fixture_contract(spec)?;
+        contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .support = MemoryStrategySupport::Implemented;
+        Ok(contract)
+    }
+
+    fn empty_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+        Vec::new()
+    }
+
+    fn duplicate_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+        let first = mlx_memory_contract_surface_specs().remove(0);
+        let duplicate = mlx_memory_contract_surface_specs().remove(0);
+        vec![first, duplicate]
+    }
+
+    fn mismatched_surface_spec() -> Vec<MemoryContractSurfaceSpec> {
+        let mut surface = mlx_memory_contract_surface_specs().remove(0);
+        surface.selector.tier = MemoryContractSurfaceTier::Q4;
+        vec![surface]
+    }
+
+    fn wrong_provider_fixture_contract(_spec: &LoadSpec) -> Result<MemoryProviderContract> {
+        Ok(MemoryProviderContract::compatibility_default(
+            "wrong_provider",
+            crate::memory_strategy::MemoryBackendRealization::MlxMetal {
+                bounded_wired_residency: false,
+                lazy_or_mmap_materialization: true,
+                explicit_evaluation_and_synchronization: true,
+                cache_eviction: true,
+            },
+        ))
+    }
 
     #[test]
     fn production_registry_resolution_never_uses_the_weights_free_factory() {
@@ -1860,6 +2876,185 @@ mod tests {
         assert!(
             duplicate.contains("duplicate memory-contract fixture provider id"),
             "{duplicate}"
+        );
+
+        let orphan_resolver = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .err()
+            .expect("a selector-aware resolver without a finite fixture must fail")
+            .to_string();
+        assert!(orphan_resolver.contains("has no matching contract-surface fixture"));
+
+        let duplicate_resolver = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .err()
+            .expect("duplicate selector-aware resolvers must fail")
+            .to_string();
+        assert!(duplicate_resolver.contains("duplicate memory-contract surface resolver"));
+    }
+
+    #[test]
+    fn selector_aware_resolver_receives_the_explicit_resolved_artifact_tier() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_memory_contract_surface_resolver(DUMMY_SURFACE_RESOLVER)
+            .build()
+            .unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let implemented: Vec<_> = surfaces
+            .iter()
+            .filter(|surface| {
+                surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support
+                    == MemoryStrategySupport::Implemented
+            })
+            .map(|surface| surface.selector)
+            .collect();
+        assert_eq!(implemented.len(), 2);
+        assert!(implemented.iter().all(|selector| {
+            selector.tier == MemoryContractSurfaceTier::Q4
+                && selector.load_shape == crate::LoadShape::DeferredMaterialization
+        }));
+        assert_eq!(
+            registry
+                .memory_contract_surface_resolver_registrations()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn contract_surface_inventory_fails_closed_on_missing_empty_duplicate_and_wrong_provider() {
+        let missing = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("a missing fixture must fail")
+            .to_string();
+        assert!(
+            missing.contains(
+                "neither a weights-free contract-surface fixture nor a resident-only witness"
+            ),
+            "{missing}"
+        );
+
+        for (surface_specs, expected) in [
+            (
+                empty_surface_specs as fn() -> Vec<MemoryContractSurfaceSpec>,
+                "publishes no surface selectors",
+            ),
+            (duplicate_surface_specs, "repeats surface selector"),
+            (mismatched_surface_spec, "does not match its LoadSpec"),
+        ] {
+            let error = ProviderRegistryBuilder::new()
+                .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+                .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+                    provider_id: "dummy_weights_free_route",
+                    contract: weights_free_fixture_contract,
+                    surface_specs,
+                })
+                .build()
+                .unwrap()
+                .memory_contract_surfaces()
+                .err()
+                .expect("an invalid surface inventory must fail")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let wrong_provider = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+                provider_id: "dummy_weights_free_route",
+                contract: wrong_provider_fixture_contract,
+                surface_specs: mlx_memory_contract_surface_specs,
+            })
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("a wrong-provider fixture must fail")
+            .to_string();
+        assert!(
+            wrong_provider.contains("returned contract for 'wrong_provider'"),
+            "{wrong_provider}"
+        );
+    }
+
+    #[test]
+    fn resident_only_witnesses_are_explicit_excluded_and_mutation_checked() {
+        let orphan = ProviderRegistryBuilder::new()
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("a resident-only witness must pair with a memory strategy")
+            .to_string();
+        assert!(
+            orphan.contains("has no matching memory strategy"),
+            "{orphan}"
+        );
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .unwrap();
+        assert_eq!(
+            registry.resident_only_memory_contract_registrations().len(),
+            1
+        );
+        assert!(registry.memory_contract_surfaces().unwrap().is_empty());
+
+        let overlap = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_memory_contract_fixture(DUMMY_WEIGHTS_FREE_CONTRACT_FIXTURE)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("a route cannot be both enumerated and resident-only")
+            .to_string();
+        assert!(overlap.contains("has both a contract-surface fixture and a resident-only witness"));
+
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .register_resident_only_memory_contract(DUMMY_RESIDENT_ONLY_WITNESS)
+            .build()
+            .err()
+            .expect("resident-only witnesses must be unique")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate resident-only memory-contract witness provider id"),
+            "{duplicate}"
+        );
+
+        let mutated = ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(DUMMY_WEIGHTS_FREE_MEMORY_REGISTRATION)
+            .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
+                contract: false_resident_only_contract,
+                ..DUMMY_RESIDENT_ONLY_WITNESS
+            })
+            .build()
+            .unwrap()
+            .memory_contract_surfaces()
+            .err()
+            .expect("an optimized rung cannot hide behind a resident-only witness")
+            .to_string();
+        assert!(
+            mutated.contains("exposes BoundedDecode as Implemented"),
+            "{mutated}"
         );
     }
 
@@ -2007,6 +3202,158 @@ mod tests {
             error.to_string(),
             "duplicate generator id 'dummy_test_model' in explicit registry"
         );
+    }
+
+    #[test]
+    fn imported_routes_are_exact_and_project_the_selected_provider() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_test_model",
+                required_components: Some(&["imported_component"]),
+                inherit_adapters: true,
+            })
+            .build()
+            .expect("exact imported route");
+
+        let selected = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+            )
+            .expect("registered shape and operation resolve");
+        assert_eq!(selected.id, "dummy_test_model");
+        assert_eq!(selected.required_components, &["imported_component"]);
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::FusedCheckpoint,
+                ImportedModelOperation::Generate,
+            )
+            .is_none());
+        assert!(registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Edit,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn imported_route_can_withdraw_structurally_invalid_adapter_inheritance() {
+        fn adapter_descriptor() -> ModelDescriptor {
+            let mut descriptor = dummy_descriptor();
+            descriptor.id = "dummy_adapter_model";
+            descriptor.capabilities.supports_lora = true;
+            descriptor.capabilities.supports_lokr = true;
+            descriptor
+        }
+        fn adapter_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+            Ok(Box::new(DummyGen {
+                desc: adapter_descriptor(),
+            }))
+        }
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: adapter_descriptor,
+                load: adapter_load,
+                footprint: None,
+            })
+            .register_imported_model(ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_adapter_model",
+                required_components: None,
+                inherit_adapters: false,
+            })
+            .build()
+            .expect("structurally restricted imported route");
+
+        let ordinary = (registry.generators().next().unwrap().descriptor)();
+        assert!(ordinary.capabilities.supports_lora);
+        assert!(ordinary.capabilities.supports_lokr);
+        let imported = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerDirectory,
+                ImportedModelOperation::Generate,
+            )
+            .unwrap();
+        assert!(!imported.capabilities.supports_lora);
+        assert!(!imported.capabilities.supports_lokr);
+    }
+
+    #[test]
+    fn imported_routes_reject_duplicates_and_unknown_targets() {
+        let route = ImportedModelRegistration {
+            family: "test",
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components: None,
+            inherit_adapters: true,
+        };
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_imported_model(route)
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("duplicate route must fail")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate imported-model route"),
+            "{duplicate}"
+        );
+
+        let unknown = ProviderRegistryBuilder::new()
+            .register_imported_model(route)
+            .build()
+            .err()
+            .expect("unknown target must fail")
+            .to_string();
+        assert!(
+            unknown.contains("targets unregistered generator"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn imported_routes_reject_malformed_family_and_component_metadata() {
+        let route = |family, required_components| ImportedModelRegistration {
+            family,
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "dummy_test_model",
+            required_components,
+            inherit_adapters: true,
+        };
+        for malformed in [
+            route("", None),
+            route(" test", None),
+            route("Krea", None),
+            route("krea 2", None),
+            route("test", Some(&[])),
+            route("test", Some(&[""])),
+            route("test", Some(&["base snapshot"])),
+            route("test", Some(&["base_snapshot", "base_snapshot"])),
+        ] {
+            assert!(
+                ProviderRegistryBuilder::new()
+                    .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                    .register_imported_model(malformed)
+                    .build()
+                    .is_err(),
+                "malformed imported metadata must fail registry construction"
+            );
+        }
     }
 
     #[test]
@@ -2806,6 +4153,8 @@ mod tests {
         // A stub audio generator that advertises VoiceEmbedding conditioning.
         let tts = DummyGen {
             desc: ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy_tts",
@@ -2989,6 +4338,53 @@ mod tests {
         assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
 
         let broken = ModelDescriptor {
+            encoder_contract: Some(crate::EncoderContract {
+                architecture: "qwen3",
+                hidden_size: 8,
+                intermediate_size: 12,
+                num_hidden_layers: 2,
+                num_attention_heads: 2,
+                num_key_value_heads: 3,
+                head_dim: 4,
+                vocab_size: 16,
+                output_width: 8,
+                loaded_hidden_layers: 2,
+                requires_final_norm: true,
+                requires_lm_head: false,
+                hidden_activation: "silu",
+                attention_dropout: crate::EncoderConfigFloat::new(0.0),
+                rms_norm_eps: crate::EncoderConfigFloat::new(1e-6),
+                qk_norm_eps: Some(crate::EncoderConfigFloat::new(1e-6)),
+                rope_theta: crate::EncoderConfigFloat::new(1_000_000.0),
+                max_position_embeddings: 4_096,
+                attention_bias: crate::EncoderConfigBool::Required(false),
+                tie_word_embeddings: crate::EncoderConfigBool::Required(true),
+                tokenizer: crate::EncoderTokenizerContract {
+                    family: "test-qwen3",
+                    binding: crate::EncoderTokenizerBinding::RetainBase,
+                    artifact_candidates: &["tokenizer/tokenizer.json"],
+                    required_tokens: &[],
+                },
+                prompt_executions: &[crate::EncoderPromptExecutionContract {
+                    purpose: "test",
+                    template: crate::EncoderPromptTemplate::QwenInstruct,
+                    add_special_tokens: true,
+                    length: crate::EncoderPromptLengthPolicy::RightTruncate { max_tokens: 8 },
+                    padding: crate::EncoderPromptPadding::None,
+                    prefix_trim: 0,
+                }],
+                bos_token_id: None,
+                eos_token_id: None,
+                image_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+                mrope_section: &[],
+                mrope_interleaved: None,
+                selected_hidden_layers: &[2],
+                packing: None,
+                dense_storage_dtype_probe: None,
+            }),
+            denoiser_output_latent_space: None,
             control_kinds: None,
             // Blank + duplicate required-component ids (sc-13658) — unstageable / ambiguous keys.
             required_components: &["", "voice_embedding", "voice_embedding"],
@@ -3014,6 +4410,7 @@ mod tests {
         let has = |needle: &str| errs.iter().any(|e| e.contains(needle));
         assert!(has("id \"Bad Id\""), "{errs:?}");
         assert!(has("family \"\""), "{errs:?}");
+        assert!(has("invalid text encoder contract"), "{errs:?}");
         assert!(has("max_count is 0"), "{errs:?}");
         assert!(has("min_size 512 > max_size 256"), "{errs:?}");
         assert!(has("explicit-size multiple is 0"), "{errs:?}");
@@ -3031,6 +4428,8 @@ mod tests {
 
         // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
         let zeroed = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed",
@@ -3051,6 +4450,8 @@ mod tests {
     #[test]
     fn model_descriptor_errors_flags_conversation_history_flag_without_kind() {
         let half_wired = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "convo",
@@ -3089,6 +4490,8 @@ mod tests {
     #[test]
     fn audio_descriptor_with_zero_size_bounds_passes_sweep() {
         let audio = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "zeroed_audio",
@@ -3135,6 +4538,8 @@ mod tests {
     fn visual_descriptor_with_invalid_size_bounds_still_fails_sweep() {
         // Video, zero bounds → the Default-0 footgun still fires.
         let video_zero = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "video_zero",
@@ -3157,6 +4562,8 @@ mod tests {
 
         // Image, inverted bounds → the inverted-bounds message still fires.
         let image_inverted = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "image_inverted",
@@ -3179,6 +4586,8 @@ mod tests {
 
         // `Both` (emits image or video) is a visual modality too — zero bounds still fail.
         let both_zero = ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "both_zero",

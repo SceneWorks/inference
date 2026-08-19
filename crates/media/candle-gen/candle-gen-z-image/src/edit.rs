@@ -38,14 +38,13 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, PreviewSink, Progress};
+use candle_gen::gen_core::{Image, PreviewSink, Progress, WeightsSource};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
 use candle_transformers::models::z_image::transformer::{
     Config as DitConfig, ZImageTransformer2DModel,
 };
@@ -53,6 +52,7 @@ use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEnc
 
 // Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
 use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
+use crate::pipeline::{Pipeline, TextEnc};
 
 /// The transformer + latents run bf16 (Z-Image native, the validated candle txt2img dtype); the VAE
 /// encoder runs f32 (the encode path's dtype) and its mean is cast to bf16 for the init latent.
@@ -76,6 +76,10 @@ pub struct ZImageEditPaths {
     /// The `Tongyi-MAI/Z-Image-Turbo` base snapshot dir (`tokenizer/`, `text_encoder/`, `transformer/`,
     /// `vae/`).
     pub base: PathBuf,
+    /// Explicit text-encoder substitution selected for this route. `None` preserves the bundled
+    /// `<base>/text_encoder` source byte-for-byte. An override is exhaustively validated and pinned
+    /// before its tensor payload opens.
+    pub text_encoder: Option<WeightsSource>,
 }
 
 /// One Z-Image img2img / edit request. No negative/guidance — Z-Image-Turbo is guidance-distilled.
@@ -123,7 +127,7 @@ impl Default for ZImageEditRequest {
 /// encoder (deterministic mean encode of the source).
 pub struct ZImageEdit {
     device: Device,
-    text_encoder: ZImageTextEncoder,
+    text_encoder: TextEnc,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
@@ -143,10 +147,16 @@ impl ZImageEdit {
         let device = candle_gen::default_device()?;
         let root = paths.base.clone();
 
-        let text_encoder = ZImageTextEncoder::new(
-            &TextEncoderConfig::z_image(),
-            component_vb(&root, "text_encoder", DTYPE, &device)?,
-        )?;
+        let builtin = candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder"));
+        let selected = paths.text_encoder.as_ref().unwrap_or(&builtin);
+        let validated = crate::ENCODER_CONTRACT
+            .validate_source_against_base(selected, &root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let pipeline =
+            Pipeline::load_with_text_encoder(&root, validated, &device, DTYPE, &[], None);
+        let text = pipeline.load_text_phase()?;
+        let text_encoder = text.text_encoder;
+        let tokenizer = text.tokenizer;
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         // sc-9032: no-op `flash-attn` feature removed; accelerated dispatch is never wired behind a
@@ -164,7 +174,6 @@ impl ZImageEdit {
             component_vb(&root, "vae", ENC_DTYPE, &device)?.pp("encoder"),
         )?;
 
-        let tokenizer = common::build_tokenizer(&root, "z-image edit")?;
         Ok(Self {
             device,
             text_encoder,
@@ -174,6 +183,34 @@ impl ZImageEdit {
             vae_encoder,
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
+        })
+    }
+
+    /// Load through the exact prepared text-encoder receipt retained by the caller.
+    pub fn load_with_spec(
+        paths: &ZImageEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+    ) -> Result<Self> {
+        match &spec.weights {
+            WeightsSource::Dir(admitted_root) if admitted_root == &paths.base => {}
+            WeightsSource::Dir(admitted_root) => {
+                return Err(CandleError::Msg(format!(
+                    "z-image edit: runtime base {} differs from admitted base {}",
+                    paths.base.display(),
+                    admitted_root.display()
+                )));
+            }
+            WeightsSource::File(_) => {
+                return Err(CandleError::Msg(
+                    "z-image edit: admitted base must be the runtime snapshot directory".to_owned(),
+                ));
+            }
+        }
+        spec.read_prepared_files_unchanged(|| {
+            Self::load(&ZImageEditPaths {
+                base: paths.base.clone(),
+                text_encoder: spec.text_encoder.clone(),
+            })
         })
     }
 
@@ -333,6 +370,28 @@ fn component_vb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_rejects_wrong_selected_encoder_before_transformer_load() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let encoder = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(encoder.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        let config_path = encoder.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vocab_size"] = serde_json::json!(crate::ENCODER_CONTRACT.vocab_size - 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let error = ZImageEdit::load(&ZImageEditPaths {
+            base: snapshot.path().to_path_buf(),
+            text_encoder: Some(WeightsSource::Dir(encoder.path().to_path_buf())),
+        })
+        .err()
+        .expect("wrong encoder must reject before transformer or VAE load")
+        .to_string();
+        assert!(error.contains("field vocab_size"), "{error}");
+    }
 
     #[test]
     fn request_defaults() {

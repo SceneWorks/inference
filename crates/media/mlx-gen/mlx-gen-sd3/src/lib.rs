@@ -116,6 +116,7 @@ pub fn register_providers(
         .register_generator(model::LARGE_REGISTRATION)
         .register_memory_strategy(model::LARGE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(MODEL_ID, spec),
         })
@@ -123,6 +124,7 @@ pub fn register_providers(
         .register_generator(model::TURBO_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: TURBO_MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(TURBO_MODEL_ID, spec),
         })
@@ -130,6 +132,7 @@ pub fn register_providers(
         .register_generator(model::MEDIUM_REGISTRATION)
         .register_memory_strategy(model::MEDIUM_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: MEDIUM_MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(MEDIUM_MODEL_ID, spec),
         })
@@ -162,6 +165,85 @@ mod explicit_registry_tests {
             ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
         );
         assert_eq!(explicit_trainers, ["sd3_5_large", "sd3_5_medium"]);
+    }
+
+    /// SC-18606: the whole registered trio must appear in the typed contract-surface inventory with
+    /// the SAME published ladder shape. Before this story Large-Turbo and Medium occupied 12
+    /// surfaces each while declaring nothing, so the audit inventory saw them and the matrix
+    /// reported no optimized tier for either.
+    #[test]
+    fn every_sd3_variant_publishes_the_full_typed_surface_inventory() {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let registry = super::provider_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in [
+            super::MODEL_ID,
+            super::TURBO_MODEL_ID,
+            super::MEDIUM_MODEL_ID,
+        ] {
+            let provider: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider.len(), 12, "{provider_id}");
+
+            let count = |strategy| {
+                provider
+                    .iter()
+                    .filter(|surface| {
+                        surface
+                            .contract
+                            .capability(strategy)
+                            .expect("complete SD3.5 ladder")
+                            .support
+                            == MemoryStrategySupport::Implemented
+                    })
+                    .count()
+            };
+            assert_eq!(count(MemoryStrategy::Resident), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::StagedResidency), 6, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::BoundedDecode), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::BoundedAttention), 12, "{provider_id}");
+            // Dense-only: the one-block window materializes on-disk BF16 tensors, so the packed
+            // tiers cannot stream and only the staged deferred selector qualifies.
+            assert_eq!(
+                count(MemoryStrategy::BoundedTransformerResidency),
+                1,
+                "{provider_id}"
+            );
+            let streaming: Vec<_> = provider
+                .iter()
+                .filter(|surface| {
+                    surface
+                        .contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support
+                        == MemoryStrategySupport::Implemented
+                })
+                .map(|surface| surface.selector.id())
+                .collect();
+            assert_eq!(streaming, ["bf16:sequential:deferred"], "{provider_id}");
+            assert!(
+                provider.iter().all(|surface| {
+                    !surface.composed
+                        && surface.contract.asset_facts == Default::default()
+                        && surface.selector.offload_policy == surface.spec.offload_policy
+                        && surface.selector.load_shape == surface.spec.load_shape
+                        && surface
+                            .contract
+                            .calibration
+                            .as_ref()
+                            .is_some_and(|identity| {
+                                identity.fingerprint.starts_with(
+                                    crate::memory_strategy::STATIC_BEHAVIOR_FINGERPRINT,
+                                )
+                            })
+                }),
+                "{provider_id}"
+            );
+        }
     }
 
     #[test]

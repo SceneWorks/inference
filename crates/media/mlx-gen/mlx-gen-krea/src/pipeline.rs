@@ -26,7 +26,6 @@
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch;
 use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
@@ -35,16 +34,17 @@ use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{
     resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, PreviewSink,
-    Progress, Result, TimestepConvention,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 
 use std::path::Path;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use crate::control::Krea2ControlBranch;
-use crate::loader::{load_text_encoder, load_transformer_with_stream, load_vision_tower};
+use crate::loader::{
+    load_text_encoder_from_source, load_transformer_with_stream, load_vision_tower_from_source,
+};
 use crate::multiphase::{PhaseSlice, ResolvedPhase};
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{
@@ -170,9 +170,9 @@ impl TurboOptions {
 pub struct KreaText {
     tok: KreaTokenizer,
     te: KreaTextEncoder,
-    /// Snapshot root, retained so the vision tower can be loaded lazily on the first grounded encode
-    /// (F-072) rather than eagerly for every variant.
-    root: PathBuf,
+    /// The checkpoint-coupled visual tower remains on the builtin multimodal source when the
+    /// language tower is substituted.
+    vision_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
     /// Qwen3-VL vision tower for image-grounded (edit) encoding (epic 10871 P2). LAZY (F-072): `None`
     /// until the first `encode_grounded`/`run_vision`, so the Turbo/Raw t2i, img2img, and pose-control
     /// paths — which never ground on an image — pay neither its ~0.6 GB residency nor its load time,
@@ -187,10 +187,23 @@ impl KreaText {
     /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
+        let selected = crate::model::ENCODER_CONTRACT.source_for_load(
+            &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+            root,
+        )?;
+        Self::from_snapshot_with_text_encoder(root, &selected)
+    }
+
+    pub(crate) fn from_snapshot_with_text_encoder(
+        root: &Path,
+        text_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    ) -> Result<Self> {
+        let vision_encoder_source = resolve_vision_encoder_source(root)?;
         Ok(Self {
-            tok: KreaTokenizer::from_snapshot(root)?,
-            te: load_text_encoder(root)?,
-            root: root.to_path_buf(),
+            tok: KreaTokenizer::from_validated_source(text_encoder_source)?,
+            te: text_encoder_source
+                .read_unchanged(|source| load_text_encoder_from_source(root, source))?,
+            vision_encoder_source,
             vision: RefCell::new(None),
         })
     }
@@ -200,6 +213,10 @@ impl KreaText {
     /// quant-target set — the monolithic `KreaPipeline::quantize` did `te` + `dit`, not the VAE/vision).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.te.quantize(bits)
+    }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.te.materialize_weights()
     }
 
     /// Encode a plain text prompt → the DiT text context `[1, n_tok, 12, 2560]` (the 12 selected
@@ -216,7 +233,10 @@ impl KreaText {
     /// never pay for it. Idempotent.
     pub fn ensure_vision(&self) -> Result<()> {
         if self.vision.borrow().is_none() {
-            let tower = load_vision_tower(&self.root)?;
+            let tower = read_validated_vision_source(
+                &self.vision_encoder_source,
+                load_vision_tower_from_source,
+            )?;
             *self.vision.borrow_mut() = Some(tower);
         }
         Ok(())
@@ -253,6 +273,24 @@ impl KreaText {
         let gv = self.run_vision(sources)?;
         self.encode_grounded_from_vision(&gv, prompt)
     }
+}
+
+fn resolve_vision_encoder_source(root: &Path) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
+    crate::model::ENCODER_CONTRACT
+        .validate_source(&WeightsSource::Dir(root.join("text_encoder")))
+        .map_err(Into::into)
+}
+
+/// Validate the edit-only vision config/header contract immediately before the lazy backend read.
+fn read_validated_vision_source<T>(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    read: impl FnOnce(&WeightsSource) -> Result<T>,
+) -> Result<T> {
+    source.validate_vision(
+        &crate::model::VISION_ENCODER_CONTRACT,
+        &crate::model::ENCODER_CONTRACT,
+    )?;
+    source.read_unchanged(read)
 }
 
 /// The **heavy render phase** of a Krea 2 pipeline (epic 10834 Phase 1, sc-11101): the single-stream
@@ -551,7 +589,8 @@ impl KreaHeavy {
     }
 
     /// Install Raw-trained LoRA/LoKr adapters onto the single-stream DiT (sc-7911). The shared
-    /// [`apply_adapters_strict_with_diff_patch`] seam parses PEFT/diffusers/kohya/LoKr files, folds
+    /// [`mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch`] parses
+    /// PEFT/diffusers/kohya/LoKr files, folds
     /// alpha/rank, and pushes a residual onto each matched `AdaptableLinear` — erroring (never silently
     /// dropping) on an adapter target that matches no module. The `Krea2Transformer` adapter host routes
     /// the trained `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}` paths (+ `text_fusion` +
@@ -564,9 +603,7 @@ impl KreaHeavy {
     /// low-rank residual pass, and dense on every tier (the projector is never quantized), so the fold
     /// survives the subsequent `quantize`.
     pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
-        apply_adapters_strict_with_diff_patch(&mut self.dit, specs, "krea_2")?;
-        self.dit.capture_block_adapters();
-        Ok(())
+        self.dit.apply_adapters_strict(specs, true)
     }
 
     /// A **geometry-only** target latent `[1, 16, H/8, W/8]` of zeros (F-073). The step-invariant
@@ -704,6 +741,7 @@ impl KreaHeavy {
             control_scale,
             None,
             None,
+            None,
             opts,
             cancel,
             &PreviewSink::default(),
@@ -749,6 +787,7 @@ impl KreaHeavy {
         plan: &ControlPlan,
         branch: &Krea2ControlBranch,
         control_scale: f32,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
@@ -797,7 +836,7 @@ impl KreaHeavy {
                     .to_owned(),
             ));
         }
-        self.decode_latents_native_tiled(&lat, decode_tiling, cancel)
+        self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -1099,13 +1138,8 @@ impl KreaHeavy {
         let mut plans = Vec::with_capacity(phases.len());
         for phase in phases {
             // A cheap (refcounted) job-local clone whose adapter stack we own for this job.
-            let mut dit = self.dit.clone();
-            dit.clear_adapters();
             let specs = crate::multiphase::phase_spec_subset(phase, all_specs);
-            if !specs.is_empty() {
-                mlx_gen::adapters::loader::apply_adapters_strict(&mut dit, &specs, "krea_2")?;
-            }
-            dit.capture_block_adapters();
+            let dit = self.dit.clone_for_multiphase(&specs)?;
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
             let prep_neg = if phase.guidance > 0.0 {
@@ -1444,39 +1478,48 @@ impl KreaHeavy {
         opts: &TurboOptions,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let decoded = match decoder {
-            // PiD binds its request-selected 2048/256 tile plan when the decoder is minted. The
-            // native 512/64 TilingConfig is therefore constructed only for the native Qwen VAE.
-            Some(decoder) => decoder.decode(lat)?,
-            None => match opts.decode_tiling()?.as_ref() {
-                Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
-                None => self.vae.decode(lat)?,
-            },
-        }
-        .as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
+        self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)
     }
 
-    /// Decode a latent through the **native Qwen-VAE**, memory-bounded by tiling when `decode_tiling` is
-    /// `Some` (sc-11747). The control lane never routes a PiD decoder (the pose lane is native-VAE only),
-    /// so this is the control decode seam: `Some(cfg)` runs [`QwenVae::decode_tiled`] (the tiled decode
-    /// selected by the budget gate), `None` the single-pass [`QwenVae::decode`]. Same
-    /// `decoded_to_image` post-step (`clip(x·0.5 + 0.5, 0, 1)`, dropping the singleton temporal axis) as
-    /// [`Self::decode_latents`], so a tiled and an untiled decode yield the same image up to the blend
-    /// tolerance. `cancel` lets the tiled decode abort between tiles.
-    fn decode_latents_native_tiled(
+    /// Decode through the shared trait seam. The native Qwen VAE implements tiled decode; PiD inherits
+    /// the forwarding default and therefore does not accidentally consume native-VAE tile geometry.
+    /// The control lane passes no decoder override and reaches the native implementation through the
+    /// same seam.
+    fn decode_latents_with_tiling(
         &self,
         lat: &Array,
+        decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        let decoded = match decode_tiling {
-            Some(cfg) => self.vae.decode_tiled(lat, cfg, Some(cancel))?,
-            None => self.vae.decode(lat)?,
-        }
-        .as_dtype(Dtype::Float32)?;
-        decoded_to_image(&decoded)
+        decode_latents_via_seam(&self.vae, decoder, lat, decode_tiling, cancel)
     }
+}
+
+/// Engine-level decode route shared by Krea's resident, sequential, control, img2img, and edit
+/// entry points. Kept independent of `KreaHeavy` so its dispatch and byte-preserving post-process can
+/// be regression-tested without constructing the multi-gigabyte model aggregate.
+fn decode_latents_via_seam(
+    native: &dyn LatentDecoder,
+    decoder: Option<&dyn LatentDecoder>,
+    lat: &Array,
+    decode_tiling: Option<&TilingConfig>,
+    cancel: &CancelFlag,
+) -> Result<Image> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let decoder = decoder.unwrap_or(native);
+    mlx_gen::ensure_decoder_compatible(
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
+        decoder,
+    )?;
+    let decoded = match decode_tiling {
+        Some(cfg) => decoder.decode_tiled(lat, cfg, Some(cancel))?,
+        None => decoder.decode(lat)?,
+    }
+    .as_dtype(Dtype::Float32)?;
+    decoded_to_image(&decoded)
 }
 
 /// The assembled Krea 2 Turbo pipeline: the [`KreaText`] encode phase + the [`KreaHeavy`] render phase.
@@ -1917,12 +1960,194 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     use super::*;
 
+    #[test]
+    fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+
+        let source = resolve_vision_encoder_source(fixture.path())
+            .expect("ordinary text construction must admit a language-valid vision-less snapshot");
+        let opened = Cell::new(false);
+        let error = read_validated_vision_source::<()>(&source, |_| {
+            opened.set(true);
+            Err(mlx_gen::Error::Msg(
+                "vision payload unexpectedly opened".into(),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+        assert!(
+            !opened.get(),
+            "edit admission must fail before the vision payload loader runs"
+        );
+    }
+
+    struct DecodeSpy {
+        output: Array,
+        calls: Cell<usize>,
+    }
+
+    impl DecodeSpy {
+        fn new(output: Array) -> Self {
+            Self {
+                output,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+            Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Array) -> Result<Array> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn legacy_decode_latents(decoder: &dyn LatentDecoder, latents: &Array) -> Image {
+        let decoded = decoder
+            .decode(latents)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        decoded_to_image(&decoded).unwrap()
+    }
+
+    /// SC-18309 N1: compare Krea's exact historical no-override decode expression with the engine
+    /// helper now used by every resident/sequential/base/control/edit route. Distinct channel/frame
+    /// values make the NCTHW singleton drop and RGB interleave observable. The PiD arm proves an
+    /// override still wins and ignores native tile geometry through the trait forwarding default.
+    #[test]
+    fn decode_engine_keeps_native_and_pid_dispatch_byte_exact() {
+        let latents = Array::from_slice(&[0.0f32; 16 * 2 * 3], &[1, 16, 2, 3]);
+        let native_output = Array::from_slice(
+            &[
+                -1.0f32, -0.5, 0.0, 0.5, 1.0, 0.25, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25, -0.75, -0.25,
+                0.25, 0.75, -1.0, 1.0,
+            ],
+            &[1, 3, 1, 2, 3],
+        );
+        let legacy = DecodeSpy::new(native_output.clone());
+        let expected = legacy_decode_latents(&legacy, &latents);
+        let native = DecodeSpy::new(native_output);
+        let cancel = CancelFlag::new();
+        let got = decode_latents_via_seam(&native, None, &latents, None, &cancel).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(native.calls.get(), 1);
+
+        let native = DecodeSpy::new(Array::zeros::<f32>(&[1, 3, 1, 2, 3]).unwrap());
+        let pid_output = Array::from_slice(&vec![1.0f32; 3 * 4 * 5], &[1, 3, 4, 5]);
+        let legacy_pid = DecodeSpy::new(pid_output.clone());
+        let expected_pid = legacy_decode_latents(&legacy_pid, &latents);
+        let pid = DecodeSpy::new(pid_output);
+        let cfg = TilingConfig::spatial_only(16, 4);
+        let got =
+            decode_latents_via_seam(&native, Some(&pid), &latents, Some(&cfg), &cancel).unwrap();
+        assert_eq!(got, expected_pid);
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
+
     fn zero_velocity(x: &Array, _sigma: f32) -> Result<Array> {
         Ok(Array::zeros::<f32>(x.shape())?)
+    }
+
+    #[test]
+    fn public_snapshot_text_phase_rejects_the_wrong_encoder_before_tokenizer_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            mlx_gen::gen_core::EncoderContract {
+                hidden_size: crate::model::ENCODER_CONTRACT.hidden_size + 1,
+                ..crate::model::ENCODER_CONTRACT
+            },
+        )
+        .unwrap();
+
+        let error = KreaText::from_snapshot(fixture.path())
+            .err()
+            .expect("an incompatible public snapshot must fail before loading the tokenizer")
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+        assert!(!error.contains("tokenizer"), "{error}");
+    }
+
+    #[test]
+    fn edit_vision_contract_rejects_missing_and_wrong_visual_surface_at_admission() {
+        let mut headers = crate::model::VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                data_bytes: shape.iter().product::<usize>() as u64 * 2,
+                name,
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect::<Vec<_>>();
+        headers.remove(0);
+        let error = crate::model::VISION_ENCODER_CONTRACT
+            .validate_tensor_headers(&headers, std::path::Path::new("missing-visual"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("visual.patch_embed.proj.weight"), "{error}");
+
+        let missing = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &missing.path().join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(missing.path().join("text_encoder")))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vision_config"), "{error}");
+
+        let wrong = tempfile::tempdir().unwrap();
+        let component = wrong.path().join("text_encoder");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &component,
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let config_path = component.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["vision_config"]["out_hidden_size"] =
+            serde_json::json!(crate::model::ENCODER_CONTRACT.hidden_size + 1);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let source = crate::model::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(component))
+            .unwrap();
+        let error = source
+            .validate_vision(
+                &crate::model::VISION_ENCODER_CONTRACT,
+                &crate::model::ENCODER_CONTRACT,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("out_hidden_size"), "{error}");
     }
 
     #[test]

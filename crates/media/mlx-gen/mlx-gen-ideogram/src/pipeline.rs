@@ -660,6 +660,10 @@ impl Ideogram4Heavy {
             // decodes correctly): NCHW → FLUX-order `patchify_latents` → BN-normalize → the student's
             // input space (identical to what flux2/lens hand PiD). Output NCHW [1,3,4H,4W] → NHWC.
             Some(d) => {
+                mlx_gen::ensure_decoder_layout(
+                    Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                    d,
+                )?;
                 let nchw = latent.transpose_axes(&[0, 3, 1, 2])?; // [1,32,gh·2,gw·2]
                 let patched = patchify_latents(&nchw)?; // [1,128,gh,gw] (c,ph,pw)
                 let normed = self.vae.bn_normalize_nchw(&patched)?; // BN-normalize (FLUX order)

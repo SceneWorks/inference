@@ -1,14 +1,28 @@
-//! sc-2808 gate: the Wan z16 VAE **tiled** decode ([`WanVae::decode_tiled`], non-causal `T→4T`,
-//! spatial ×8) must reproduce the `mlx_video` reference `WanVAE.decode_tiled` — the overlapping
-//! spatial/temporal tiles, trapezoidally blended, must match the reference's tiled output bit-for-bit
-//! (up to the conv float-ordering gap, like the S2 decode gate).
+//! sc-2808 / sc-19753 gate for the Wan z16 VAE **tiled** decode ([`WanVae::decode_tiled`],
+//! non-causal `T→4T`, spatial ×8).
 //!
-//! Why match the *reference tiled* output and not a single-pass decode: tiling is **not** identical
-//! to a one-shot decode (each tile's causal conv sees zero-pad at its boundary instead of neighbour
-//! data — the residual lives at the seams, hidden by overlap+blend). On the tiny **random**-weight
-//! fixture that residual is ~40% (no learned smoothness), so tiled-vs-untiled is only meaningful on a
-//! real VAE (`wan_tiled_close_to_single_pass_real`, `#[ignore]`). The exact gate is tiled-vs-
-//! reference-tiled, both carrying the same seam effects.
+//! ## Why this gate was rewritten (sc-19753)
+//!
+//! It used to assert that our tiled decode reproduces the `mlx_video` reference
+//! `WanVAE.decode_tiled` bit-for-bit. That is **no longer the claim**, deliberately: the reference
+//! hoists only the denormalize and runs the *whole* decoder per tile, so every spatial tile's
+//! `middle.1` softmax self-attention attends over its own crop's `H·W` token set instead of the
+//! frame's. sc-19753 moved the attention-bearing middle blocks into a dense head, which is a
+//! knowing divergence from the reference. Pinning the old equality would have frozen the defect.
+//!
+//! So the golden is now load-bearing for two *different* claims, and both are checked below:
+//!
+//! 1. **The decoder port and the blend machinery are still exact.** Reconstructing the reference's
+//!    own shape — tile the whole decoder — still matches the golden to `mean_rel ≈ 1.4e-7`. This
+//!    keeps the original gate's full strength on everything except the policy that changed.
+//! 2. **The new policy is closer to a dense decode than the reference's is.** On this fixture the
+//!    bounded decode halves the divergence from a single-pass decode (`mean_rel` 0.34 → 0.18).
+//!
+//! Tiling is still **not** identical to a one-shot decode — each tile's causal conv sees zero-pad at
+//! its boundary instead of neighbour data, and on the tiny **random**-weight fixture (no learned
+//! smoothness) that residual dominates. That is why claim 2 is a *relative* improvement rather than
+//! a tolerance; the absolute quality check remains `wan_tiled_close_to_single_pass_real`
+//! (`#[ignore]`, real weights).
 //!
 //! Self-contained committed golden (`tools/dump_s2_tiling_fixtures.py`, the tiny `dim=4` z16 VAE +
 //! the reference tiled IO). Runs on Metal in CI — no real weights. Shared geometry: `mlx_gen::tiling`.
@@ -17,7 +31,8 @@ use std::path::PathBuf;
 
 use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen_wan::WanVae;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_wan::{WanSingleFrameDecoder, WanVae, WanVideoDecoder};
 use mlx_rs::random;
 
 /// The dump's tiling config (`dump_s2_tiling_fixtures.py`): spatial 64px/32, temporal 16f/8.
@@ -47,8 +62,8 @@ fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {
     (max_abs, sum_abs / sum_ref.max(1e-9))
 }
 
-#[test]
-fn wan_tiled_decode_matches_reference() {
+/// Load the committed tiny z16 VAE plus the reference's tiled input/output.
+fn golden() -> (WanVae, mlx_rs::Array, mlx_rs::Array) {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/s2_tiling.safetensors"
@@ -56,30 +71,79 @@ fn wan_tiled_decode_matches_reference() {
     let w = Weights::from_file(path)
         .unwrap_or_else(|e| panic!("read {path}: {e} (run tools/dump_s2_tiling_fixtures.py)"));
     let vae = WanVae::from_weights(&w).expect("build tiny WanVae");
+    let tiled_in = w.require("tiled_in").expect("tiled_in").clone();
+    let tiled_out = w.require("tiled_out").expect("tiled_out").clone();
+    (vae, tiled_in, tiled_out)
+}
 
-    let tiled_in = w.require("tiled_in").expect("tiled_in");
-    let exp = w.require("tiled_out").expect("tiled_out");
+/// The reference's own tiling shape: tile the **whole** decoder. Denormalization is a per-channel
+/// affine, so denormalizing inside each tile (what [`WanVae::decode`] does) is algebraically the
+/// same as the reference's hoisted denormalize — which makes this an exact reconstruction of the
+/// pre-sc-19753 route from public API alone.
+fn reference_shape_tiled(
+    vae: &WanVae,
+    latent: &mlx_rs::Array,
+    cfg: &TilingConfig,
+) -> mlx_rs::Array {
+    let sh = latent.shape();
+    let plan = cfg.plan(VaeTiling::WAN, sh[2], sh[3], sh[4]);
+    mlx_gen::vae_tiling::tiled_decode(latent, &plan, [2, 3, 4], None, |tile| vae.decode(tile))
+        .expect("reference-shape tiled decode")
+}
 
+/// Claim 1 — the **decoder port and the blend machinery** still reproduce the reference exactly.
+///
+/// sc-19753 changed which computation is tiled, not how the decoder computes or how tiles are
+/// blended. Driving the reference's own shape through our decoder must therefore still land on the
+/// golden within the same conv float-ordering envelope as the S2 single-pass decode gate. A real
+/// port regression — a wrong layer, a wrong blend mask, a wrong tile offset — still fails here.
+#[test]
+fn reference_tiling_shape_still_matches_the_reference() {
+    let (vae, tiled_in, exp) = golden();
     let cfg = golden_cfg();
     let sh = tiled_in.shape();
     assert!(
         cfg.needs_tiling(VaeTiling::WAN, sh[2], sh[3], sh[4]),
         "golden latent must actually tile"
     );
-    let got = vae
-        .decode_tiled(tiled_in, &cfg, None)
-        .expect("tiled decode");
+    let got = reference_shape_tiled(&vae, &tiled_in, &cfg);
     assert_eq!(got.shape(), exp.shape(), "tiled decode shape");
 
     let (max_abs, mean_rel) = diff(got.as_slice::<f32>(), exp.as_slice::<f32>());
-    println!(
-        "[tiled vs reference] shape={:?} max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}",
-        got.shape()
-    );
-    // Same conv float-ordering envelope as the S2 single-pass decode gate (mean_rel < 1e-3).
+    println!("[reference shape vs golden] max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
     assert!(
         mean_rel < 1e-3,
-        "tiled decode diverged from reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
+        "the decoder port diverged from the reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
+    );
+}
+
+/// Claim 2 — the sc-19753 policy is **closer to a dense decode** than the reference's policy.
+///
+/// This is the executed defect control for the middle-block attention. `reference_shape_tiled`
+/// re-runs the exact route this story replaced; the shipped `decode_tiled` must track a single-pass
+/// decode strictly better than it does, because the reference gives every spatial tile its own
+/// attention token set while ours attends over the whole frame once.
+///
+/// A relative claim rather than a tolerance, because on this tiny random-weight fixture the causal
+/// conv zero-pad seam residual dominates both numbers and is untouched by this story.
+#[test]
+fn bounded_decode_is_closer_to_dense_than_reference_tiling() {
+    let (vae, tiled_in, _) = golden();
+    let cfg = golden_cfg();
+    let dense = vae.decode(&tiled_in).expect("single-pass decode");
+    let reference = reference_shape_tiled(&vae, &tiled_in, &cfg);
+    let bounded = vae
+        .decode_tiled(&tiled_in, &cfg, None)
+        .expect("bounded decode");
+    assert_eq!(bounded.shape(), dense.shape());
+
+    let (_, reference_rel) = diff(reference.as_slice::<f32>(), dense.as_slice::<f32>());
+    let (_, bounded_rel) = diff(bounded.as_slice::<f32>(), dense.as_slice::<f32>());
+    println!("[vs dense] reference={reference_rel:.3e} bounded={bounded_rel:.3e}");
+    assert!(
+        bounded_rel < reference_rel * 0.75,
+        "keeping the middle-block attention whole must materially reduce the divergence from a \
+         dense decode: bounded={bounded_rel:.3e} vs reference={reference_rel:.3e}"
     );
 }
 
@@ -104,6 +168,126 @@ fn wan_tiled_fallback_is_single_pass() {
         mean_rel < 1e-6,
         "no-tiling fallback must equal single-pass decode"
     );
+}
+
+/// SC-18309 N1: the generic z16 video adapter is an exact identity around the historical VAE
+/// decode, while the image adapter performs only the documented rank lift and leading-frame slice.
+/// The checked-in tiny VAE makes this a real de-normalization/decoder/output-layout regression gate.
+#[test]
+fn wan_z16_adapters_are_byte_exact_to_legacy_routes() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_vae.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let video_latent = w.require("dec_in").unwrap();
+
+    let legacy_video = vae.decode(video_latent).unwrap();
+    let seam_video = WanVideoDecoder::new(&vae).decode(video_latent).unwrap();
+    assert_eq!(seam_video.shape(), legacy_video.shape());
+    assert_eq!(
+        seam_video.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy_video.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+
+    let image_latent = video_latent
+        .take_axis(mlx_rs::Array::from_int(0), 2)
+        .unwrap();
+    let lifted = image_latent.expand_dims(2).unwrap();
+    let legacy_image = vae
+        .decode(&lifted)
+        .unwrap()
+        .take_axis(mlx_rs::Array::from_slice(&[0i32], &[1]), 2)
+        .unwrap();
+    let seam_image = WanSingleFrameDecoder::new(&vae)
+        .decode(&image_latent)
+        .unwrap();
+    assert_eq!(seam_image.shape(), legacy_image.shape());
+    assert_eq!(
+        seam_image.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy_image.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// Valid z16 video and still-image latents prove that both an actually-firing plan and an actually
+/// non-firing monolithic fallback observe pre-cancellation before any decode work. The explicit
+/// `needs_tiling` assertions prevent malformed shapes from making the route classification vacuous.
+#[test]
+fn wan_z16_valid_firing_and_fallback_routes_precancel() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_tiling.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let video = w.require("tiled_in").unwrap(); // [1,16,6,12,12]
+    let video_shape = video.shape();
+    let firing = golden_cfg();
+    let fallback = TilingConfig::spatial_only(4096, 64);
+    assert!(firing.needs_tiling(
+        VaeTiling::WAN,
+        video_shape[2],
+        video_shape[3],
+        video_shape[4]
+    ));
+    assert!(!fallback.needs_tiling(
+        VaeTiling::WAN,
+        video_shape[2],
+        video_shape[3],
+        video_shape[4]
+    ));
+
+    let image = video.take_axis(mlx_rs::Array::from_int(0), 2).unwrap(); // [1,16,12,12]
+    let image_shape = image.shape();
+    assert!(firing.needs_tiling(VaeTiling::WAN, 1, image_shape[2], image_shape[3]));
+    assert!(!fallback.needs_tiling(VaeTiling::WAN, 1, image_shape[2], image_shape[3]));
+
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [firing, fallback] {
+        assert!(matches!(
+            WanVideoDecoder::new(&vae).decode_tiled(video, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            WanSingleFrameDecoder::new(&vae).decode_tiled(&image, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(video, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
+}
+
+/// Malformed-input dominance is independent of the valid firing/fallback proof above: cancellation
+/// must still win before adapter rank checks or inherent VAE shape inspection.
+#[test]
+fn wan_z16_precancel_wins_before_malformed_input_validation() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/s2_tiling.safetensors"
+    );
+    let w = Weights::from_file(path).unwrap();
+    let vae = WanVae::from_weights(&w).unwrap();
+    let malformed = mlx_rs::Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [golden_cfg(), TilingConfig::spatial_only(4096, 64)] {
+        assert!(matches!(
+            WanVideoDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            WanSingleFrameDecoder::new(&vae).decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            vae.decode_tiled(&malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 /// Min/max/mean of a slice, plus the count of "flat" frames (per-frame range below `eps` — the

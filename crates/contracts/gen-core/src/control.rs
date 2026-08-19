@@ -30,7 +30,7 @@
 use crate::error::{Error, Result};
 use crate::generator::{Conditioning, ControlKind, GenerationRequest};
 use crate::media::Image;
-use crate::runtime::{LoadSpec, WeightsSource};
+use crate::runtime::{LoadSpec, WeightsSource, BASE_SNAPSHOT_COMPONENT};
 use std::path::Path;
 
 /// Which [`ControlKind`]s a control branch accepts. The Fun-Controlnet-Union checkpoints are a
@@ -243,6 +243,48 @@ pub fn require_component<'a>(
     })
 }
 
+/// Resolve the multi-component snapshot paired with a provider's primary source.
+///
+/// Snapshot-backed loads keep their historical `weights = Dir(snapshot)` shape. A single-file DiT
+/// instead uses `weights = File(dit)` and must carry the shared tokenizer/text-encoder/VAE/config
+/// tree under [`BASE_SNAPSHOT_COMPONENT`]. Keeping the DiT in the primary slot is load-bearing: it
+/// makes the registry, cache, fit gate, and provenance all identify the bytes that actually vary for
+/// an imported model, while the companion remains independently keyed in `components`.
+pub fn require_base_snapshot<'a>(spec: &'a LoadSpec, model_id: &str) -> Result<&'a Path> {
+    match &spec.weights {
+        WeightsSource::Dir(path) => Ok(path),
+        WeightsSource::File(_) => match require_component(
+            spec,
+            BASE_SNAPSHOT_COMPONENT,
+            model_id,
+            "base snapshot (tokenizer/text-encoder/VAE/config)",
+        )? {
+            WeightsSource::Dir(path) => Ok(path),
+            WeightsSource::File(path) => Err(Error::Msg(format!(
+                "{model_id}: component '{BASE_SNAPSHOT_COMPONENT}' must be a snapshot directory, \
+                 not the single file {}",
+                path.display()
+            ))),
+        },
+    }
+}
+
+/// Resolve one conditionally-staged component as a single file.
+pub fn require_component_file<'a>(
+    spec: &'a LoadSpec,
+    id: &str,
+    model_id: &str,
+    label: &str,
+) -> Result<&'a Path> {
+    match require_component(spec, id, model_id, label)? {
+        WeightsSource::File(path) => Ok(path),
+        WeightsSource::Dir(path) => Err(Error::Msg(format!(
+            "{model_id}: component '{id}' ({label}) must be a single file, not directory {}",
+            path.display()
+        ))),
+    }
+}
+
 /// **Reject unrecognized component keys** (epic 13657) — the [`LoadSpec::components`] guard that
 /// mirrors the hand-written per-slot `Error::Unsupported` guards a provider writes for the typed slots
 /// it does not support (e.g. chatterbox rejecting `control`/`ip_adapter`).
@@ -325,6 +367,8 @@ mod tests {
     fn stub(accepted: AcceptedControlKinds) -> Stub {
         Stub {
             descriptor: ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "stub_control",

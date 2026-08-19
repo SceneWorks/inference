@@ -703,33 +703,25 @@ fn the_eight_gb_verdict_with_the_full_ladder() {
 }
 
 /// **SC-15510 AC: production tile/chunk/block-window candidate ranges are exposed to the harness** —
-/// swept against the exact decode, with the rejected edges re-checked so the exclusion cannot rot.
+/// swept against the exact decode across the complete SC-19753 native candidate ladder.
 ///
 /// ## The reference is the UNTILED decode, not the default tile
 ///
-/// This test first compared every candidate against the 512 px default and failed on 768 with a
-/// 46/255 delta — which proves nothing about 768, because both arms were tiled and neither is ground
-/// truth. Tiling this GroupNorm VAE perturbs per-tile norm statistics, so *any* two tile edges differ;
-/// the question a candidate has to answer is how far it is from the **untiled** decode, which is the
-/// exact output. So the reference here is a `Resident`, untiled render at the same seed.
+/// The question a candidate has to answer is how far it is from the **untiled** decode, which is the
+/// exact output. The SC-19753 implementation preserves the full activation's GroupNorm statistics in
+/// every tile; this test guards that property on real weights and still uses a `Resident`, untiled
+/// render at the same seed as the reference.
 ///
-/// ## Both halves matter
-///
-/// The published set must be seam-free, and the rejected set must still be rejected. Asserting only
-/// the first would let the ladder silently re-widen; asserting only the second would let it silently
-/// narrow to a single point, which is the state SC-15508 refuses to call Verified. See
-/// [`DECODE_TILE_EDGES`] for the measured table this bound comes from.
+/// The exact seven-point domain is asserted as well as swept so the test cannot go green by silently
+/// narrowing the production ladder. See [`DECODE_TILE_EDGES`] for the measured table.
 #[test]
 #[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn every_declared_decode_candidate_runs_and_preserves_the_image() {
-    use mlx_gen_z_image::memory_strategy::{
-        DECODE_OVERLAP, DECODE_TILE_EDGE, DECODE_TILE_EDGES, DECODE_TILE_EDGES_REJECTED,
-    };
+    use mlx_gen_z_image::memory_strategy::{DECODE_OVERLAP, DECODE_TILE_EDGE, DECODE_TILE_EDGES};
 
-    /// The seam-free bound, in max RGB8 channel distance from the exact decode. Set from the measured
-    /// gap between the two groups — the admitted set tops out at 48/255 and the rejected set starts at
-    /// 64/255 — so it sits in a 33% void rather than being tuned against one candidate.
-    const SEAM_FREE_MAX_DELTA: u8 = 56;
+    /// The product quality bar, in max RGB8 channel distance from the exact decode. The SC-19753
+    /// sweep's worst candidate measured 15/255, leaving substantial headroom below this bound.
+    const SEAM_FREE_MAX_DELTA: u8 = 48;
 
     println!(
         "\n== rung-2 decode ladder — tier {} — {}",
@@ -750,13 +742,13 @@ fn every_declared_decode_candidate_runs_and_preserves_the_image() {
         "tile edge", "published", "decode GiB", "request GiB", "max Δ", "mean Δ"
     );
 
+    assert_eq!(
+        DECODE_TILE_EDGES,
+        &[768, 640, 512, 448, 384, 320, 256],
+        "the measured domain must not silently narrow"
+    );
     let mut published: Vec<(u32, usize, u8)> = Vec::new();
-    let mut rejected: Vec<(u32, u8)> = Vec::new();
-    for (&edge, is_published) in DECODE_TILE_EDGES
-        .iter()
-        .map(|e| (e, true))
-        .chain(DECODE_TILE_EDGES_REJECTED.iter().map(|e| (e, false)))
-    {
+    for &edge in DECODE_TILE_EDGES {
         let r = run(Some(GenerationMemory {
             tile_vae_decode: true,
             decode_tile_edge: Some(edge),
@@ -766,32 +758,19 @@ fn every_declared_decode_candidate_runs_and_preserves_the_image() {
         let (max, mean) = image_delta(&r.image, &exact.image);
         println!(
             "  {edge:>10}  {:>9}  {:>12.3}  {:>12.3}  {max:>8}  {mean:>10.4}",
-            if is_published { "yes" } else { "rejected" },
+            "yes",
             gib(r.decode_bytes),
             gib(r.request_bytes())
         );
-        if is_published {
-            published.push((edge, r.decode_bytes, max));
-        } else {
-            rejected.push((edge, max));
-        }
+        published.push((edge, r.decode_bytes, max));
     }
 
-    // Every published candidate is seam-free against the exact decode...
+    // Every published candidate is seam-free against the exact decode.
     for (edge, _, max) in &published {
         assert!(
             *max <= SEAM_FREE_MAX_DELTA,
             "published tile edge {edge} is {max}/255 from the exact decode, beyond the \
              {SEAM_FREE_MAX_DELTA}/255 seam-free bound — it does not belong in the ladder"
-        );
-    }
-    // ...and every rejected one is still genuinely worse, so the exclusion is a measured fact rather
-    // than a stale comment. If this half fails, the ladder should WIDEN, not the bound.
-    for (edge, max) in &rejected {
-        assert!(
-            *max > SEAM_FREE_MAX_DELTA,
-            "tile edge {edge} now measures {max}/255 — it is seam-free and should be promoted into \
-             DECODE_TILE_EDGES rather than left rejected"
         );
     }
     assert!(
@@ -806,8 +785,7 @@ fn every_declared_decode_candidate_runs_and_preserves_the_image() {
     );
 
     // Across the published set the decode peak is monotone in the tile edge — that is the whole reason
-    // a ladder is a ladder, and it is what lets a selector trade peak for forward count. (It does NOT
-    // hold below 512: 448 measures 4.645 GiB against 512's 4.363. Another reason those are out.)
+    // a ladder is a ladder, and it is what lets a selector trade peak for forward count.
     for pair in published.windows(2) {
         let ((wide, wide_bytes, _), (narrow, narrow_bytes, _)) = (pair[0], pair[1]);
         assert!(

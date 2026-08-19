@@ -26,7 +26,7 @@ use crate::loaders::{
 };
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{AutoEncoderKL, SIZE_MULTIPLE};
+use crate::{SdxlVaeDecoder, SIZE_MULTIPLE};
 
 const DTYPE: DType = DType::F16;
 
@@ -82,7 +82,7 @@ impl Default for SdxlDetailRequest {
 pub struct SdxlDetail {
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
     vae_encoder: VaeMomentsEncoder,
     controlnet: ControlNet,
     sampler: EulerAncestralSampler,
@@ -185,7 +185,7 @@ impl SdxlDetail {
             &conditioning,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents, None)
+        decode_image(&self.vae, &latents, None, Some(&req.cancel))
     }
 
     fn encode_source(&self, source: &Image, width: u32, height: u32) -> Result<Tensor> {

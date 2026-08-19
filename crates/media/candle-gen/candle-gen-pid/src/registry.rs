@@ -13,6 +13,11 @@
 //!
 //! Byte-identical to `mlx-gen-pid`'s registry (same numerics; the two backends share the checkpoints).
 
+use candle_gen::gen_core::{
+    LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
+    SD3_LATENT_SPACE, SDXL_LATENT_SPACE,
+};
+
 /// Which release a checkpoint comes from.
 ///
 /// `Res2k` = 2048-trained, used as a 4× (512→2048) decoder. `Res2kTo4k` = multi-resolution-trained
@@ -42,6 +47,8 @@ pub enum LatentNorm {
 pub struct BackboneSpec {
     /// The canonical (alias-resolved) latent-space tag.
     pub latent_space: &'static str,
+    /// Typed input contract advertised by the decoder minted for this backbone.
+    pub input_latent_space: LatentSpace,
     /// Latent channel count fed to the LQ adapter (`net.lq_latent_channels`). **Not** always the
     /// VAE's raw channel count: the flux2 student consumes the *packed* 128-ch latent (32 raw ×
     /// 2×2 patchify), so this is 128 for flux2 even though `AutoencoderKLFlux2` is 32-ch (sc-7847).
@@ -77,6 +84,7 @@ impl BackboneSpec {
 
 const QWENIMAGE: BackboneSpec = BackboneSpec {
     latent_space: "qwenimage",
+    input_latent_space: QWEN_KREA_Z16_LATENT_SPACE,
     latent_channels: 16,
     latent_norm: LatentNorm::PerChannelMeanStd,
     latent_spatial_down_factor: 8,
@@ -92,6 +100,7 @@ const QWENIMAGE: BackboneSpec = BackboneSpec {
 
 const FLUX: BackboneSpec = BackboneSpec {
     latent_space: "flux",
+    input_latent_space: FLUX1_LATENT_SPACE,
     latent_channels: 16,
     // pipeline_registry.py: vae_scale_factor=0.3611, vae_shift_factor=0.1159 (== our z-image VAE).
     latent_norm: LatentNorm::Affine {
@@ -110,6 +119,7 @@ const FLUX: BackboneSpec = BackboneSpec {
 
 const SD3: BackboneSpec = BackboneSpec {
     latent_space: "sd3",
+    input_latent_space: SD3_LATENT_SPACE,
     latent_channels: 16,
     latent_norm: LatentNorm::Affine {
         scale: 1.5305,
@@ -126,6 +136,7 @@ const SD3: BackboneSpec = BackboneSpec {
 
 const SDXL: BackboneSpec = BackboneSpec {
     latent_space: "sdxl",
+    input_latent_space: SDXL_LATENT_SPACE,
     latent_channels: 4,
     latent_norm: LatentNorm::Affine {
         scale: 0.13025,
@@ -142,6 +153,7 @@ const SDXL: BackboneSpec = BackboneSpec {
 
 const FLUX2: BackboneSpec = BackboneSpec {
     latent_space: "flux2",
+    input_latent_space: FLUX2_PACKED_LATENT_SPACE,
     // RE-VERIFIED + RESOLVED at wiring time (sc-7847): the PiD student is fed the **packed 128-ch**
     // BN-normalized latent (`net.lq_latent_channels=128`), NOT the 32-ch raw VAE latent. The "32" in
     // `pipeline_registry.py::DiffusionPipelineConfig` is the *VAE* channel count (used only to unpack);
@@ -267,5 +279,28 @@ mod tests {
         assert!(lookup("dinov2").is_none());
         assert!(lookup("siglip").is_none());
         assert!(lookup("nonsense").is_none());
+    }
+
+    #[test]
+    fn every_pid_backbone_exposes_the_typed_decoder_input_contract() {
+        let cases = [
+            ("qwenimage", QWEN_KREA_Z16_LATENT_SPACE),
+            ("qwenimage-2512", QWEN_KREA_Z16_LATENT_SPACE),
+            ("flux", FLUX1_LATENT_SPACE),
+            ("zimage", FLUX1_LATENT_SPACE),
+            ("zimage-turbo", FLUX1_LATENT_SPACE),
+            ("sd3", SD3_LATENT_SPACE),
+            ("sdxl", SDXL_LATENT_SPACE),
+            ("flux2", FLUX2_PACKED_LATENT_SPACE),
+            ("flux2-klein-4b", FLUX2_PACKED_LATENT_SPACE),
+            ("flux2-klein-9b", FLUX2_PACKED_LATENT_SPACE),
+        ];
+        for (backbone, expected) in cases {
+            assert_eq!(
+                lookup(backbone).unwrap().input_latent_space,
+                expected,
+                "{backbone}"
+            );
+        }
     }
 }

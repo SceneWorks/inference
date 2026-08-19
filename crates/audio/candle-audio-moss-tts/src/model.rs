@@ -117,6 +117,8 @@ pub const LANGUAGES: &[&str] = &[
 /// at the token level), with `max_speakers = 2`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[CODEC_COMPONENT_ID],
         id: MODEL_ID,

@@ -59,6 +59,11 @@
 //! ## What each rung is worth here (measured, Apple M5 Max, real `z_image_turbo`, 1024², 4 steps,
 //! staged residency, count 1 — `tests/block_residency_real_weights.rs`)
 //!
+//! **Historical pre-SC-19753 calibration.** The denoise-only rung-4 deltas below remain useful, but
+//! the request peaks and binding-phase claims include the retired whole-tail decoder. SC-19753's
+//! layer-wise decode materially changes them, so v4 five-rung evidence must replace those fields
+//! before they are treated as current admission data.
+//!
 //! Staged **denoise** peak, every hosted tier:
 //!
 //! | tier | rungs 1-3 (the SC-15615 top) | + rung 4 | cut | request peak | bound by |
@@ -77,7 +82,7 @@
 //! 3.191 windowed (+9%, against +4-8% unconstrained), and q8 under a 6 GiB cap lands at a 4.768 GiB
 //! request peak.
 //!
-//! **Both q4 and q8 fit an 8 GiB budget** on both host classes (4.363 / 5.087 GiB unconstrained,
+//! **In that historical capture, both q4 and q8 fit an 8 GiB budget** on both host classes (4.363 / 5.087 GiB unconstrained,
 //! 4.363 / 4.768 constrained, against 6.0 GiB usable after the generic gate's 2 GiB reserve). q8 was
 //! SC-15615's open question — it concluded only rung 4 could move it, and predicted the binding phase
 //! would become the Qwen text encoder. Both hold. **Disclosure:** measured on a 128 GB machine with
@@ -87,8 +92,8 @@
 //!
 //! **Rung 4 cuts the denoise phase by 61%** — 2.86 GiB, an order of magnitude more than rung 3's
 //! measured 0.245 GiB on this lane — and in doing so it **moves the binding phase off the denoise**.
-//! The q4 request peak is now the *decode* (4.363 GiB), which is why SC-15510's other half, the
-//! widened [`DECODE_TILE_EDGES`] ladder, is the lever that matters next. Rung 3's small saving is not
+//! In that capture the q4 request peak became the *decode* (4.363 GiB). The v4 recapture will replace
+//! that binding-phase result for the layer-wise decoder. Rung 3's small saving is not
 //! a defect: MLX's fused SDPA never materializes the `[B,H,Sq,Sk]` score tensor that Candle's
 //! `attention_basic` does, so the same knob buys a lazy-graph cut here and a bounded score matrix
 //! there (SC-15615 pins the mechanism with an inert never-chunks control).
@@ -139,7 +144,8 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::asset_facts::{
-    projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
+    projected_safetensors_bytes, projected_safetensors_tensors, projected_tensor_headers_bytes,
+    ResidentProjection,
 };
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -156,13 +162,11 @@ use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
 use mlx_gen::GenerationRequest;
 use mlx_gen::{Quant, WeightsSource};
 
-/// The **default** decode tile edge for the native VAE — the 512 px parity sweet spot for this
-/// GroupNorm VAE (sc-13571). A request that names no geometry decodes here, which is what keeps every
-/// pre-SC-15510 render byte-identical.
+/// The **default** decode tile edge for the native VAE — the calibrated 512 px policy point
+/// (sc-13571). SC-19753 preserves full-activation GroupNorm statistics at every admitted edge.
 pub const DECODE_TILE_EDGE: u32 = 512;
-/// The decode overlap paired with [`DECODE_TILE_EDGE`], and the only native overlap advertised: the
-/// tile ladder trades peak against seam risk on the edge, and moving both axes at once would make a
-/// calibration row un-attributable.
+/// The decode overlap paired with [`DECODE_TILE_EDGE`], and the only native overlap advertised.
+/// It remains part of policy identity, although layer-wise halo/core arithmetic does not blend it.
 pub const DECODE_OVERLAP: u32 = 64;
 
 /// The native VAE's production tile-edge ladder (SC-15510), output pixels, at [`DECODE_OVERLAP`].
@@ -170,56 +174,40 @@ pub const DECODE_OVERLAP: u32 = 64;
 /// Before this the contract advertised the single hardcoded 512, which is accurate but collides with
 /// SC-15508's *"a single-point pass cannot mark untested production parameters Verified"*.
 ///
-/// **The candidate set was measured, not inherited.** SC-15510's own note proposed adopting the
-/// current-pin-verified `768/640/512/448/384/320/256` ladder on the grounds that both families drive
-/// the same `mlx_gen::vae_tiling` machinery. That ladder is SceneWorks'
-/// `memory-mlx-adapter` probe sweep, and it was measured on the **Qwen** VAE — a different
-/// decoder. Sharing the tiling machinery does not transfer a candidate set any more than sharing a
-/// rung's name transfers its magnitude between backends; what transfers is the mechanism, and the
-/// numbers have to be re-measured on the decoder that will run them. Swept against the **exact
-/// untiled decode** on real q4 weights at 1024² (`tests/block_residency_real_weights.rs`):
+/// **The candidate set was measured, not inherited.** SC-19753 changed tiled decode so GroupNorm
+/// statistics are computed from the full activation and reused by each spatial tile. The complete
+/// native ladder was then re-swept against the **exact untiled decode** on the provisioned q4
+/// Z-Image snapshot at 1024² (`tests/block_residency_real_weights.rs`, Actions run 31918926833):
 ///
 /// | tile | decode peak | max Δ vs exact | mean Δ |
 /// |---:|---:|---:|---:|
-/// | untiled | 19.422 GiB | — | — |
-/// | 768 | 8.089 | 48 | 2.82 |
-/// | 640 | 5.795 | 41 | 2.42 |
-/// | **512** (default) | **4.363** | **46** | **2.09** |
-/// | 448 | 4.645 | 64 | 2.90 |
-/// | 384 | 3.896 | 72 | 3.01 |
-/// | 320 | 4.051 | 74 | 3.05 |
-/// | 256 | 3.157 | 83 | 3.34 |
+/// | untiled | 19.474 GiB | — | — |
+/// | 768 | 8.595 | 5 | 0.0242 |
+/// | 640 | 6.840 | 9 | 0.0265 |
+/// | **512** (default) | **6.129** | **15** | **0.0306** |
+/// | 448 | 5.376 | 10 | 0.0293 |
+/// | 384 | 4.708 | 13 | 0.0292 |
+/// | 320 | 4.548 | 12 | 0.0328 |
+/// | 256 | 4.457 | 13 | 0.0352 |
 ///
-/// Two things fall out, and both are why the ladder stops at 512:
-///
-/// 1. **Below 512 the image measurably degrades** — max Δ jumps 46 → 64 → 83 and mean Δ rises
-///    monotonically. That is the sc-13571 comment ("smaller tiles would drift the per-tile norm
-///    statistics") confirmed by measurement on this GroupNorm VAE. `GenerationMemory`'s levers are
-///    documented as *quality-preserving*; a tile that visibly seams is a quality trade, not a rung.
-/// 2. **And it buys nothing at the request level.** Every sub-512 tile leaves the request peak at
-///    4.898 GiB, because the denoise phase binds there — and the decode peak is not even monotone
-///    (4.645 at 448 is *worse* than 4.363 at 512). Paying image quality for no admission win is a
-///    strictly bad trade.
-///
-/// The separation is clean rather than marginal: the admitted set tops out at 48/255 and the rejected
-/// set starts at 64/255, a 33% gap, which is what the sweep's bound is set from.
+/// Every candidate is now well inside the product's 48/255 max-channel quality bar, and peak decode
+/// memory decreases monotonically as the tile narrows. The former sub-512 rejection was evidence of
+/// per-tile GroupNorm drift, not an inherent quality limit of those tile sizes; retaining it after the
+/// normalization fix would make the selector refuse measured, quality-preserving memory savings.
 ///
 /// 640 and 768 cost *more* decode memory than the default and are published anyway, because the
 /// ladder is a **domain**, not a recommendation: at a larger output a 512 px tile is many more
 /// forwards, and the selector — not this file — owns the peak-vs-latency choice. Selection is the
 /// worker's; this is the set it may choose from.
 ///
-/// Why widening mattered at all: decode is **tier-independent** — measured 4.363 GiB (q4) and
-/// 4.364 GiB (q8) at 1024², because after `shed_dit` only the ~150 MB VAE remains and the rest is the
-/// tiled-decode transient — and after rung 4 lands it becomes the *binding* phase on q4.
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512];
+/// Decode remains tier-independent after `shed_dit`: only the VAE and tiled-decode transient remain.
+/// The historical default stays 512, so an unparameterized request does not change; the worker may
+/// select the newly verified narrower points when a tighter memory budget requires them.
+pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256];
 
-/// Tile edges swept and **rejected** by measurement (see [`DECODE_TILE_EDGES`]), kept so the sweep can
-/// re-assert the exclusion rather than leaving it as a comment that drifts.
-///
-/// A future VAE change that made these seam-free would show up as this list failing its rejection
-/// check — which is the point. Silently dropping them would leave nothing to notice that with.
-pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[448, 384, 320, 256];
+/// Native tile edges currently rejected by measurement. SC-19753's full ladder re-sweep admitted all
+/// seven candidates; the named empty set keeps the domain split explicit for future calibration work.
+pub const DECODE_TILE_EDGES_REJECTED: &[u32] = &[];
 
 /// The **PiD overlay route's** decode tile-edge ladder (SC-15510), output pixels.
 ///
@@ -393,7 +381,7 @@ pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORE
 /// execution structure change in a way that invalidates measurements taken against this provider.
 ///
 /// Load shape is a typed evidence-key axis; this content fingerprint remains shape-independent.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v3";
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "z-image-mlx-independent-materialization-v4";
 
 /// This provider's two bounded-decode routes, reconciled by the shared
 /// [`DecodeRoutes`](mlx_gen_pid::DecodeRoutes) (SC-15775).
@@ -448,7 +436,7 @@ pub fn memory_strategy_contract(
     //    intra-phase block materialization are separate axes.
     let streamable = matches!(spec.weights, mlx_gen::WeightsSource::Dir(_))
         && matches!(spec.load_shape, mlx_gen::LoadShape::DeferredMaterialization);
-    let (asset_facts, resident_components) = asset_facts(spec, streamable)?;
+    let (asset_facts, resident_components) = asset_facts(provider_id, spec, streamable)?;
     memory_strategy_contract_with_asset_facts(
         provider_id,
         spec,
@@ -556,6 +544,7 @@ fn memory_strategy_contract_with_asset_facts(
                 },
             })
             .collect(),
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
             native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
                 tile_edges: routes.native_edges().to_vec(),
@@ -595,11 +584,22 @@ fn memory_strategy_contract_with_asset_facts(
 /// has no component tree, so its base-model fields stay `0` (the truthful "unknown", not a guess);
 /// a separately addressed control checkpoint remains independently countable.
 fn asset_facts(
+    provider_id: &str,
     spec: &LoadSpec,
     streamable: bool,
 ) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
-    let components = match &spec.weights {
+    let (mut components, effective_quant) = match &spec.weights {
         WeightsSource::Dir(root) => {
+            // This is the same resolver every concrete loader captures for its safety gate and
+            // selected-encoder policy. Besides naming a packed turnkey when no override was
+            // requested, it fails closed on requested-vs-packed transformer mismatches before facts
+            // can describe a tier the runtime would refuse.
+            let effective_quant = loaded_tier(spec, provider_id)?.quant;
+            // Heavy components follow the actual load call: only `spec.quantize` invokes their
+            // in-memory `quantize` methods. A packed transformer with no request does make that tier
+            // the model policy for a dense selected text encoder, but it does *not* implicitly pack a
+            // separately dense VAE or ControlNet. Existing affine triples are preserved by the shared
+            // header projector in either case.
             let project = |path: &std::path::Path| {
                 projected_safetensors_bytes(path, |_| match spec.quantize {
                     Some(quant) => ResidentProjection::GroupQuantized {
@@ -609,16 +609,38 @@ fn asset_facts(
                     None => ResidentProjection::Stored,
                 })
             };
-            mlx_gen::PerComponentBytes {
-                text_encoder: project(&root.join("text_encoder"))?,
-                dit: project(&root.join("transformer"))?,
-                vae: project(&root.join("vae"))?,
-            }
+            (
+                mlx_gen::PerComponentBytes {
+                    text_encoder: 0,
+                    dit: project(&root.join("transformer"))?,
+                    vae: project(&root.join("vae"))?,
+                },
+                effective_quant,
+            )
         }
         // A combined single-file checkpoint cannot be split into the three contract components.
         // Zero remains the truthful unknown; the independently addressed control is still exact.
-        WeightsSource::File(_) => mlx_gen::PerComponentBytes::default(),
+        WeightsSource::File(_) => (mlx_gen::PerComponentBytes::default(), None),
     };
+    if let WeightsSource::Dir(root) = &spec.weights {
+        let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+        // Runtime derives this conversion from the effective transformer tier, not directly from
+        // `spec.quantize`: a packed Q4/Q8 base with no explicit request still quantizes a dense
+        // selected encoder to the loaded tier. Matching already-packed selections return `None` and
+        // keep their exact stored triples; packed mismatches reject here exactly as at load.
+        let load_time_quant_bits =
+            selected.load_time_quant_bits(effective_quant.map(Quant::bits), provider_id)?;
+        components.text_encoder = projected_tensor_headers_bytes(
+            &selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?,
+            |_| match load_time_quant_bits {
+                Some(bits) => ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                },
+                None => ResidentProjection::Stored,
+            },
+        )?;
+    }
     let resident_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
         None => Vec::new(),
@@ -919,12 +941,265 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_typed_sparse_safetensors(
+        path: &std::path::Path,
+        tensors: &[(String, &'static str, Vec<usize>)],
+    ) -> u64 {
+        use std::io::Write as _;
+
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape) in tensors {
+            let width = match *dtype {
+                "F16" | "BF16" => 2_u64,
+                "F32" | "U32" => 4_u64,
+                dtype => panic!("unsupported test dtype {dtype}"),
+            };
+            let bytes = shape
+                .iter()
+                .try_fold(width, |total, dimension| {
+                    total.checked_mul(*dimension as u64)
+                })
+                .unwrap();
+            let end = offset.checked_add(bytes).unwrap();
+            header.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + offset).unwrap();
+        offset
+    }
+
+    fn quantizable_probe_bytes(bits: i32) -> u64 {
+        match bits {
+            4 => 72,
+            8 => 136,
+            _ => panic!("test supports Q4/Q8 only"),
+        }
+    }
+
+    fn write_dense_quantizable_probe(path: &std::path::Path, name: &str) -> u64 {
+        write_typed_sparse_safetensors(path, &[(name.to_owned(), "BF16", vec![2, 64])])
+    }
+
+    fn write_packed_quantizable_probe(path: &std::path::Path, name: &str, bits: i32) -> u64 {
+        write_typed_sparse_safetensors(
+            path,
+            &[
+                (
+                    format!("{name}.weight"),
+                    "U32",
+                    vec![2, 64 * bits as usize / 32],
+                ),
+                (format!("{name}.scales"), "BF16", vec![2, 1]),
+                (format!("{name}.biases"), "BF16", vec![2, 1]),
+            ],
+        )
+    }
+
+    fn install_component_tier_fixture(root: &std::path::Path, packed_bits: Option<i32>) {
+        let transformer = root.join("transformer");
+        let vae = root.join("vae");
+        match packed_bits {
+            Some(bits) => {
+                std::fs::write(
+                    transformer.join("config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+                assert_eq!(
+                    write_packed_quantizable_probe(
+                        &transformer.join("model.safetensors"),
+                        "blocks.0.attn.to_q",
+                        bits,
+                    ),
+                    quantizable_probe_bytes(bits)
+                );
+            }
+            None => {
+                let config = transformer.join("config.json");
+                if config.exists() {
+                    std::fs::remove_file(config).unwrap();
+                }
+                assert_eq!(
+                    write_dense_quantizable_probe(
+                        &transformer.join("model.safetensors"),
+                        "blocks.0.attn.to_q.weight",
+                    ),
+                    256
+                );
+            }
+        }
+        assert_eq!(
+            write_dense_quantizable_probe(
+                &vae.join("model.safetensors"),
+                "decoder.attn.to_q.weight",
+            ),
+            256
+        );
+    }
+
+    fn write_dense_control_fixture(path: &std::path::Path) -> u64 {
+        write_typed_sparse_safetensors(
+            path,
+            &[
+                (
+                    "control_layers.0.attn.to_q.weight".to_owned(),
+                    "BF16",
+                    vec![2, 64],
+                ),
+                (
+                    "control_all_x_embedder.2-2.weight".to_owned(),
+                    "BF16",
+                    vec![2, 33],
+                ),
+                (
+                    "control_all_x_embedder.2-2.bias".to_owned(),
+                    "BF16",
+                    vec![2],
+                ),
+            ],
+        )
+    }
+
+    fn expected_conditioning_bytes(bits: Option<i32>) -> u64 {
+        let contract = crate::ENCODER_CONTRACT;
+        let attention_width = contract.num_attention_heads * contract.head_dim;
+        let kv_width = contract.num_key_value_heads * contract.head_dim;
+        let matrix_elements = contract.vocab_size * contract.hidden_size
+            + contract.loaded_hidden_layers
+                * (2 * attention_width * contract.hidden_size
+                    + 2 * kv_width * contract.hidden_size
+                    + 3 * contract.intermediate_size * contract.hidden_size);
+        let matrix_elements = u64::try_from(matrix_elements).unwrap();
+        let matrix_bytes = match bits {
+            Some(bits) => {
+                matrix_elements * u64::try_from(bits).unwrap() / 8 + matrix_elements / 64 * 4
+            }
+            None => matrix_elements * 2,
+        };
+        let vector_bytes = u64::try_from(
+            contract.loaded_hidden_layers * (2 * contract.hidden_size + 2 * contract.head_dim) * 2,
+        )
+        .unwrap();
+        matrix_bytes + vector_bytes
+    }
+
     fn write_snapshot(root: &std::path::Path) {
-        for component in ["text_encoder", "transformer", "vae"] {
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+    }
+
+    fn append_sparse_f16_tensor(path: &std::path::Path, name: &str, shape: &[usize]) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        let start = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap_or(0);
+        let bytes = shape
+            .iter()
+            .try_fold(2_u64, |total, dimension| {
+                total.checked_mul(*dimension as u64)
+            })
+            .unwrap();
+        let end = start.checked_add(bytes).unwrap();
+        assert!(header
+            .insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            )
+            .is_none());
+        let encoded = serde_json::to_vec(&header).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EncoderSelection {
+        Builtin,
+        OverrideDir,
+        OverrideFile,
+        CompleteSnapshot,
+    }
+
+    fn snapshot_spec_with_encoder(
+        tmp: &tempfile::TempDir,
+        quant: Option<Quant>,
+        selection: EncoderSelection,
+    ) -> (std::path::PathBuf, LoadSpec, std::path::PathBuf) {
+        let root = tmp.path().join("snapshot");
+        write_snapshot(&root);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        spec.quantize = quant;
+        let selected = match selection {
+            EncoderSelection::Builtin => root.join("text_encoder"),
+            EncoderSelection::OverrideDir | EncoderSelection::OverrideFile => {
+                let selected = tmp.path().join("selected-text-encoder");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected,
+                    crate::ENCODER_CONTRACT,
+                )
+                .unwrap();
+                spec.text_encoder = Some(match selection {
+                    EncoderSelection::OverrideDir => WeightsSource::Dir(selected.clone()),
+                    EncoderSelection::OverrideFile => {
+                        WeightsSource::File(selected.join("model.safetensors"))
+                    }
+                    _ => unreachable!(),
+                });
+                selected
+            }
+            EncoderSelection::CompleteSnapshot => {
+                let selected = tmp.path().join("selected-snapshot");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected.join("text_encoder"),
+                    crate::ENCODER_CONTRACT,
+                )
+                .unwrap();
+                spec.text_encoder = Some(WeightsSource::Dir(selected.clone()));
+                selected.join("text_encoder")
+            }
+        };
+        (root, spec, selected.join("model.safetensors"))
     }
 
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
@@ -948,6 +1223,268 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
         assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
+    }
+
+    #[test]
+    fn conditioning_prices_only_the_materialized_36_layer_language_surface() {
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+                EncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (root, spec, selected_path) =
+                    snapshot_spec_with_encoder(&tmp, quant, selection);
+                let conditioning = || {
+                    memory_strategy_contract(crate::model::MODEL_ID, &spec)
+                        .unwrap()
+                        .asset_facts
+                        .conditioning_bytes
+                };
+                let baseline = conditioning();
+                let selected = crate::ENCODER_CONTRACT
+                    .source_for_load(&spec, &root)
+                    .unwrap();
+                let names = selected
+                    .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
+                    .unwrap()
+                    .into_iter()
+                    .map(|header| header.name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(names.contains("model.layers.35.self_attn.q_proj.weight"));
+                assert!(!names
+                    .iter()
+                    .any(|name| name.starts_with("model.layers.36.")));
+                assert!(!names.contains("model.norm.weight"));
+
+                for (name, shape) in [
+                    (
+                        "model.norm.weight",
+                        vec![crate::ENCODER_CONTRACT.hidden_size],
+                    ),
+                    ("model.unrelated_projection.weight", vec![17]),
+                ] {
+                    append_sparse_f16_tensor(&selected_path, name, &shape);
+                    assert_eq!(
+                        conditioning(),
+                        baseline,
+                        "{quant:?} {selection:?} charged an unmaterialized tensor {name}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn tiered_asset_spec(
+        tmp: &tempfile::TempDir,
+        base_packed_bits: Option<i32>,
+        requested: Option<Quant>,
+        selection: EncoderSelection,
+        selected_packed_bits: Option<i32>,
+    ) -> (LoadSpec, std::path::PathBuf) {
+        let (root, spec, selected_path) = snapshot_spec_with_encoder(tmp, requested, selection);
+        install_component_tier_fixture(&root, base_packed_bits);
+        if let Some(bits) = selected_packed_bits {
+            gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                selected_path.parent().unwrap(),
+                crate::ENCODER_CONTRACT,
+                Some(bits),
+            )
+            .unwrap();
+        }
+        let control = tmp.path().join("control.safetensors");
+        assert_eq!(write_dense_control_fixture(&control), 392);
+        (spec, control)
+    }
+
+    fn is_control_registration(registration: &mlx_gen::gen_core::MemoryRegistration) -> bool {
+        matches!(
+            registration.provider_id,
+            crate::model_control::MODEL_ID | crate::model_base_control::MODEL_ID
+        )
+    }
+
+    fn assert_all_route_asset_facts(
+        spec: &LoadSpec,
+        control: &std::path::Path,
+        expected_conditioning: u64,
+        expected_transformer: u64,
+        expected_decoder: u64,
+        expected_control: u64,
+        label: &str,
+    ) {
+        for registration in memory_registrations() {
+            let control_route = is_control_registration(&registration);
+            let mut route_spec = spec.clone();
+            if control_route {
+                route_spec.control = Some(WeightsSource::File(control.to_path_buf()));
+            }
+            let contract = (registration.contract)(&route_spec).unwrap_or_else(|error| {
+                panic!(
+                    "{} {label} memory contract failed: {error}",
+                    registration.provider_id
+                )
+            });
+            let facts = contract.asset_facts;
+            assert_eq!(
+                facts.conditioning_bytes, expected_conditioning,
+                "{} {label}: conditioning",
+                registration.provider_id
+            );
+            assert_eq!(
+                facts.transformer_bytes, expected_transformer,
+                "{} {label}: transformer",
+                registration.provider_id
+            );
+            assert_eq!(
+                facts.decoder_bytes, expected_decoder,
+                "{} {label}: decoder",
+                registration.provider_id
+            );
+            assert_eq!(
+                facts.base_bytes,
+                expected_conditioning + expected_transformer + expected_decoder,
+                "{} {label}: base",
+                registration.provider_id
+            );
+            assert_eq!(
+                facts.overlay_bytes,
+                if control_route { expected_control } else { 0 },
+                "{} {label}: control",
+                registration.provider_id
+            );
+            assert_eq!(
+                contract
+                    .resident_components()
+                    .iter()
+                    .map(|component| component.resident_bytes)
+                    .sum::<u64>(),
+                facts.overlay_bytes,
+                "{} {label}: decomposed control facts",
+                registration.provider_id
+            );
+        }
+    }
+
+    #[test]
+    fn prepacked_base_quantizes_every_dense_selected_encoder_surface_to_the_effective_tier() {
+        for bits in [4, 8] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (spec, control) = tiered_asset_spec(&tmp, Some(bits), None, selection, None);
+                assert_all_route_asset_facts(
+                    &spec,
+                    &control,
+                    expected_conditioning_bytes(Some(bits)),
+                    quantizable_probe_bytes(bits),
+                    256,
+                    392,
+                    &format!("prepacked Q{bits} + dense {selection:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matching_prepacked_selected_encoders_stay_exact_and_mismatches_reject_every_route() {
+        for base_bits in [4, 8] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+            ] {
+                let matching = tempfile::tempdir().unwrap();
+                let (spec, control) =
+                    tiered_asset_spec(&matching, Some(base_bits), None, selection, Some(base_bits));
+                assert_all_route_asset_facts(
+                    &spec,
+                    &control,
+                    expected_conditioning_bytes(Some(base_bits)),
+                    quantizable_probe_bytes(base_bits),
+                    256,
+                    392,
+                    &format!("matching prepacked Q{base_bits} {selection:?}"),
+                );
+
+                let mismatched = tempfile::tempdir().unwrap();
+                let selected_bits = if base_bits == 4 { 8 } else { 4 };
+                let (spec, control) = tiered_asset_spec(
+                    &mismatched,
+                    Some(base_bits),
+                    None,
+                    selection,
+                    Some(selected_bits),
+                );
+                for registration in memory_registrations() {
+                    let mut route_spec = spec.clone();
+                    if is_control_registration(&registration) {
+                        route_spec.control = Some(WeightsSource::File(control.clone()));
+                    }
+                    let error = (registration.contract)(&route_spec)
+                        .expect_err("a packed selected-encoder mismatch must reject")
+                        .to_string();
+                    assert!(
+                        error.contains(&format!("pre-quantized Q{selected_bits}"))
+                            && error.contains(&format!("model policy is Q{base_bits}")),
+                        "{} Q{base_bits}/Q{selected_bits} {selection:?}: {error}",
+                        registration.provider_id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_base_requested_quant_still_projects_every_runtime_quantized_component() {
+        for (bits, requested) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (spec, control) =
+                    tiered_asset_spec(&tmp, None, Some(requested), selection, None);
+                assert_all_route_asset_facts(
+                    &spec,
+                    &control,
+                    expected_conditioning_bytes(Some(bits)),
+                    quantizable_probe_bytes(bits),
+                    quantizable_probe_bytes(bits),
+                    quantizable_probe_bytes(bits) + 136,
+                    &format!("dense + requested Q{bits} {selection:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matching_request_over_a_prepacked_base_still_quantizes_dense_attachments() {
+        for (bits, requested) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (spec, control) = tiered_asset_spec(
+                &tmp,
+                Some(bits),
+                Some(requested),
+                EncoderSelection::Builtin,
+                None,
+            );
+            assert_all_route_asset_facts(
+                &spec,
+                &control,
+                expected_conditioning_bytes(Some(bits)),
+                quantizable_probe_bytes(bits),
+                quantizable_probe_bytes(bits),
+                quantizable_probe_bytes(bits) + 136,
+                &format!("matching Q{bits} request over prepacked base"),
+            );
+        }
     }
 
     /// A selection carrying exactly the parameters the rungs up to and including `strategy` own —
@@ -1000,6 +1537,7 @@ mod tests {
 
     fn context_for(strategy: MemoryStrategy, use_pid: bool) -> MemoryRunContext {
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: selection_for(strategy, use_pid),
             calibration_abi: MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
@@ -1147,7 +1685,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (root, spec) = tier_spec(&tmp, "packed-mismatch", Some(8), Some(Quant::Q4));
         for registration in memory_registrations() {
-            let contract = (registration.contract)(&spec).unwrap();
+            let error = (registration.contract)(&spec)
+                .expect_err("asset-fact resolution must reject the impossible requested tier")
+                .to_string();
+            assert!(
+                error.contains("pre-quantized Q8") && error.contains("Q4"),
+                "{}: {error}",
+                registration.provider_id
+            );
+            // The independently callable admission seam retains the same defense in depth even
+            // when fed a weights-free declaration that intentionally skips asset inspection.
+            let contract =
+                weights_free_memory_strategy_contract(registration.provider_id, &spec).unwrap();
             let decision = (registration.safety_check)(
                 &spec,
                 &contract,
@@ -1274,10 +1823,29 @@ mod tests {
         const STACK_RESIDENT_BYTES: u64 = 72;
         const PERSISTENT_RESIDENT_BYTES: u64 = 136;
         const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        let selected = crate::ENCODER_CONTRACT
+            .source_for_load(&spec, &root)
+            .unwrap();
+        let expected_conditioning_bytes = projected_tensor_headers_bytes(
+            &selected
+                .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
+                .unwrap(),
+            |_| ResidentProjection::GroupQuantized {
+                bits: Quant::Q4.bits(),
+                group_size: crate::quant::GROUP_SIZE as usize,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes,
+            expected_conditioning_bytes
+        );
         assert_eq!(contract.asset_facts.transformer_bytes, 72);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
-        assert_eq!(contract.asset_facts.base_bytes, 76);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            expected_conditioning_bytes + 74
+        );
         assert_eq!(contract.asset_facts.overlay_bytes, CONTROL_RESIDENT_BYTES);
         let component = contract
             .resident_components()
@@ -1486,10 +2054,10 @@ mod tests {
             .parameters
             .decode_tile_edges
             .contains(&DECODE_TILE_EDGE));
-        // The set is measured, not inherited (see `DECODE_TILE_EDGES`): the sub-512 edges Qwen ships
-        // were swept on real weights and rejected for seaming without buying a request-level saving.
-        assert_eq!(DECODE_TILE_EDGES, &[768, 640, 512]);
-        assert_eq!(DECODE_TILE_EDGES_REJECTED, &[448, 384, 320, 256]);
+        // The set is measured, not inherited (see `DECODE_TILE_EDGES`): SC-19753 re-swept the full
+        // ladder after tiled decode began preserving full-activation GroupNorm statistics.
+        assert_eq!(DECODE_TILE_EDGES, &[768, 640, 512, 448, 384, 320, 256]);
+        assert!(DECODE_TILE_EDGES_REJECTED.is_empty());
         // The two sets are disjoint, and a rejected edge is refused end to end — not merely absent
         // from a doc comment.
         for &rejected in DECODE_TILE_EDGES_REJECTED {

@@ -34,8 +34,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
-    "mlx-sys": ("pmetal-mlx-sys", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
+    "mlx-rs": ("pmetal-mlx-rs", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
+    "mlx-sys": ("pmetal-mlx-sys", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
@@ -296,6 +296,42 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "follows DECODE_TILE_EDGE: candle's list is the single full edge, mlx's is three measured "
         "tile edges."
     ),
+    ("flux2", "DEV_ENCODER_CONTRACT"): (
+        "per-backend encoder realization of the same Mistral checkpoint (sc-18306): candle "
+        "materializes only the 30 layers its deepest selected hidden-state tap needs and skips the "
+        "final norm and LM head; mlx loads the full 40-layer stack with final norm and LM head "
+        "through its shared decoder loader. Loaded subset, not geometry."
+    ),
+    ("flux2", "DEV_PROMPT_EXECUTIONS"): (
+        "mlx declares one extra execution, `flux2_dev_caption_upsample` — the caption-upsample "
+        "path only the MLX lane wires. The executions the two backends share are identical."
+    ),
+    ("flux2", "DEV_TOKENIZER_CONTRACT"): (
+        "each backend pins the special tokens its own execution consumes: candle audits the "
+        "mistral `<pad>` token its padding path emits; mlx audits `</s>` and the pixtral `[IMG]` "
+        "token its caption-upsample execution needs."
+    ),
+    ("flux2", "KLEIN_ENCODER_CONTRACT"): (
+        "same shape as DEV_ENCODER_CONTRACT: candle loads 27 of Qwen3's 36 layers (deepest tap), "
+        "mlx loads all 36 through its shared decoder loader."
+    ),
+    ("kolors", "SIZE_MULTIPLE"): (
+        "candle validates only the SDXL VAE /8 stride; mlx enforces the structural "
+        "`PRODUCTION_SPATIAL_MULTIPLE` of 32 (`8 * 2^2`, the U-Net's two exact skip joins) — the "
+        "same deliberate strict/loose split as sdxl's SIZE_MULTIPLE below."
+    ),
+    ("krea", "ENCODER_CONTRACT"): (
+        "per-backend packing capability, not geometry: mlx's packed loader accepts a "
+        "single-file artifact (`supports_file: true`) and needs no dense dtype probe; candle "
+        "requires a directory artifact and probes `language_model.layers.0.input_layernorm.weight` "
+        "to classify dense storage."
+    ),
+    ("krea", "PROMPT_EXECUTIONS"): (
+        "the `krea_t2i` execution's length policy differs by lane: candle rejects prompts above "
+        "1024 tokens at admission, mlx leaves the length unbounded. A per-backend admission "
+        "posture from the sc-18306 sweep, recorded here rather than settled by copying either "
+        "side."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."
@@ -321,6 +357,16 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "(`config.rs`), mlx's is the *trainer* id in `training.rs`, which by the "
         "`TrainerDescriptor::id` convention is the Base checkpoint's `mage_flow_base`."
     ),
+    ("qwen-image", "ENCODER_CONTRACT"): (
+        "follows TOKENIZER_CONTRACT: the encoder contract embeds the tokenizer contract, so the "
+        "artifact-candidate difference recorded there surfaces here too. Every geometry field "
+        "agrees."
+    ),
+    ("qwen-image", "TOKENIZER_CONTRACT"): (
+        "candle resolves the tokenizer from two artifact candidates (`tokenizer/tokenizer.json`, "
+        "then `processor/tokenizer.json`); mlx ships only the first. A loader search path, not "
+        "geometry."
+    ),
     ("qwen-image", "DEFAULT_STEPS"): (
         "candle 30, mlx 4, and both carry a long doc comment arguing its own value. mlx keeps the "
         "fork's verbatim function-signature default rather than silently diverging from it, and "
@@ -340,6 +386,12 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "`&[1, 2, 4, 8, 15, 30]`, behind `#[cfg(any(feature = \"cuda\", test))]` and with no doc "
         "comment of its own. A caller picks from whichever backend it is running on."
     ),
+    ("sdxl", "SIZE_MULTIPLE"): (
+        "8 vs 32, both documented on purpose: candle validates the VAE /8 stride only; mlx "
+        "enforces `8 * 2^2 = 32` because its U-Net mirrors exact skip concatenations and an odd "
+        "intermediate extent would break the joins. Same split as kolors, which shares the "
+        "SDXL U-Net."
+    ),
     ("wan", "VAE_TILING"): (
         "the z48 halves agree (`VaeTiling::WAN22` on both); the z16 halves differ in "
         "`causal_temporal`, and `candle-gen-wan/src/vae16.rs` says so in the doc comment directly "
@@ -357,6 +409,18 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
     ("wan", "WAN_Z48_VAE_TILING"): (
         "as WAN_Z16_VAE_TILING: `Ti2vProviderVae::VAE_TILING` reached through each backend's own "
         "module path."
+    ),
+    ("z-image", "ENCODER_CONTRACT"): (
+        "the two backends declare different `qk_norm_eps` for the same Qwen3 encoder: candle 1e-6, "
+        "mlx 1e-5. Which one the released checkpoint's config actually carries is an open question "
+        "this merge deliberately does not settle by copying either side — the sc-18306 sweep "
+        "shipped both lanes green with these values. Exempted so the value question stays visible "
+        "instead of being resolved by whichever backend someone copies."
+    ),
+    ("z-image", "PROMPT_EXECUTIONS"): (
+        "the `z_image_prompt` execution pads differently by lane: candle applies no padding, mlx "
+        "right-pads to the 512-token max with the qwen pad token. A per-backend batching posture, "
+        "not geometry."
     ),
     ("z-image", "DECODE_OVERLAP"): (
         "the same per-backend measured VAE tile overlap as `flux.DECODE_OVERLAP`: candle 128 on "
@@ -2215,6 +2279,13 @@ def _canonical_const_value(value: str, declarations: dict[str, set[str]], depth:
         return "text:" + _normalize_const_value(value)
     single = _single_valued(declarations)
     text = RUST_BACKEND_SHIM.sub("backend::", RUST_PATH_QUALIFIER.sub("", value))
+    # The shared contracts crate is reachable both through a backend shim
+    # (`candle_gen::gen_core::X` / `mlx_gen::gen_core::X`) and bare (`use …::gen_core;` then
+    # `gen_core::X`). The sc-18306 encoder-contract sweep writes it bare on the candle side and
+    # shimmed on the mlx side, so without this fold every contract constant reads as divergent on
+    # spelling alone. `backend::` is kept for non-gen_core paths, where a bare name really can be a
+    # different (crate-local) item.
+    text = text.replace("backend::gen_core::", "gen_core::")
     text = _fold_const_arithmetic(text, single)
 
     numbers = _const_numbers(text, single)

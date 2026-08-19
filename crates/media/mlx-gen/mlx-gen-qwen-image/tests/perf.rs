@@ -130,8 +130,8 @@ fn max_abs(a: &Array) -> f32 {
 /// # Why this is the accumulation floor and not a fusion defect — the two decisive controls
 ///
 /// **1. Depth.** Same weights, same 512² input, `num_layers` truncated (which sizes the `blocks`
-/// Vec only — `set_compile_glue` is a process-global atomic in `mlx-gen/src/nn.rs`, so the fusion
-/// is fully on at every row). Every column is measured, not derived:
+/// Vec only — `set_compile_glue` remains enabled on the render thread, so the fusion is fully on at
+/// every row). Every column is measured, not derived:
 ///
 /// | layers | `max|Δ|` | `max|out|` | rel | rel in ULP |
 /// |---|---|---|---|---|

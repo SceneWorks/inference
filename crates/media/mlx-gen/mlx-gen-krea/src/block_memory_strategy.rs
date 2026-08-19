@@ -45,7 +45,9 @@
 //! (29.2% lower), with max/mean pixel delta zero. Native and PiD decode domains remain disjoint and
 //! are validated against `use_pid` at both admission and request-scope configuration.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
+};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryGeometry;
 use mlx_gen::gen_core::{
@@ -62,6 +64,19 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+/// The Wan terminal decoder has not been measured as part of Krea's whole-request ladder. A separate
+/// identity prevents native-decoder evidence from being reused and forces conservative
+/// asset-facts + headroom estimation (including SceneWorks' estimate margin).
+pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
+    "krea-2-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
+
+fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+    if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
+        WAN_DECODER_CALIBRATION_FINGERPRINT
+    } else {
+        MEMORY_CALIBRATION_FINGERPRINT
+    }
+}
 
 fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
     mlx_gen_pid::DecodeRoutes::new_core(provider_id, [DECODE_TILE_EDGE], DECODE_OVERLAP)
@@ -75,7 +90,7 @@ pub(crate) fn is_streamable_spec(provider_id: &str, spec: &LoadSpec) -> CoreResu
     let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
     plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
         && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     Ok(plan.streamable_transformer)
 }
@@ -92,7 +107,7 @@ fn resolved_load_plan(
     let mut plan = crate::model::resolve_load_plan(spec, root, provider_id)?;
     plan.streamable_transformer = matches!(spec.offload_policy, OffloadPolicy::Sequential)
         && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     Ok(plan)
 }
@@ -101,6 +116,14 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        crate::model::validate_native_krea_spec(spec, provider_id)
+            .map_err(|error| CoreError::Msg(error.to_string()))?;
+        let base = mlx_gen::require_base_snapshot(spec, provider_id)?;
+        // The native loader is retained and smoke-tested as reopenable, but File has no promoted
+        // rung-4 measurement. Keep authorization Missing until source-specific evidence exists.
+        return native_memory_strategy_contract_from_spec(provider_id, spec, base, false);
+    }
     Ok(memory_strategy_contract_with_plan(provider_id, spec)?.0)
 }
 
@@ -108,12 +131,13 @@ pub(crate) fn memory_strategy_contract_with_plan(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<(MemoryProviderContract, crate::model::ResolvedLoadPlan)> {
-    let _ = crate::model::component_footprint(spec)?;
+    let _ = crate::model::component_footprint_for(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(
             "krea memory facts require a snapshot directory".to_owned(),
         ));
     };
+    let plan = resolved_load_plan(provider_id, spec)?;
     let project = |path: &std::path::Path, select: &dyn Fn(&str) -> bool| -> CoreResult<u64> {
         projected_safetensors_bytes(path, |tensor| {
             if let Some(quant) = spec.quantize.filter(|_| select(&tensor.name)) {
@@ -126,17 +150,50 @@ pub(crate) fn memory_strategy_contract_with_plan(
             }
         })
     };
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => {
+            projected_safetensors_bytes(path, |_| ResidentProjection::Stored)?
+        }
+        Some(WeightsSource::File(path)) => spec.read_file_unchanged_if_prepared(path, |p| {
+            projected_safetensors_bytes(p, |_| ResidentProjection::Stored)
+        })?,
+        None => 0,
+    };
+    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        plan.effective_quant.map(mlx_gen::Quant::bits),
+        provider_id,
+    )?;
+    let mut vision_bytes = 0;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+        let vision_headers = vision.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
+        vision_bytes =
+            projected_tensor_headers_bytes(&vision_headers, |_| ResidentProjection::Stored)?;
+    }
+    let selected_text_encoder_bytes =
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+            CoreError::Msg(format!(
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
+            ))
+        })?;
     let components = mlx_gen::PerComponentBytes {
-        text_encoder: project(
-            &root.join("text_encoder"),
-            &crate::convert::is_text_encoder_quant_target,
-        )?,
+        text_encoder: selected_text_encoder_bytes,
         dit: project(&root.join("transformer"), &|name| {
             crate::convert::is_transformer_quant_target(name)
         })?,
-        vae: project(&root.join("vae"), &|_| false)?,
+        // The native Qwen VAE remains resident for reference/edit encoding; Wan is an additive
+        // terminal decoder, so the contract prices both rather than reusing native measurements.
+        vae: project(&root.join("vae"), &|_| false)?.saturating_add(alternate_decoder_bytes),
     };
-    let plan = resolved_load_plan(provider_id, spec)?;
     Ok((
         memory_strategy_contract_with_components(
             provider_id,
@@ -159,6 +216,73 @@ pub(crate) fn weights_free_memory_strategy_contract(
         spec,
         Default::default(),
         plan.streamable_transformer,
+    )
+}
+
+/// The witness self-check every Krea surface resolver runs first: the explicit resolved artifact tier
+/// must agree with the witness `LoadSpec`, the source must be a provisioned snapshot directory, and
+/// the selector's residency/materialization axes must be the ones the spec carries.
+///
+/// Shared with the pose-control resolver in [`crate::memory_strategy`] (sc-18451) so the two families
+/// cannot drift into different notions of a well-formed witness.
+pub(crate) fn surface_selector_matches_spec(
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<()> {
+    let tier_matches = match surface.resolved_artifact_tier() {
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16 => {
+            surface.spec.precision == Precision::Bf16 && surface.spec.quantize.is_none()
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => {
+            surface.spec.quantize == Some(mlx_gen::Quant::Q4)
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => {
+            surface.spec.quantize == Some(mlx_gen::Quant::Q8)
+        }
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+    };
+    if tier_matches
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && surface.selector.offload_policy == surface.spec.offload_policy
+        && surface.selector.load_shape == surface.spec.load_shape
+    {
+        Ok(())
+    } else {
+        Err(CoreError::Msg(format!(
+            "Krea memory surface selector '{}' does not match its weights-free LoadSpec",
+            surface.selector.id()
+        )))
+    }
+}
+
+/// Resolve the finite catalog surface from its explicit already-packed artifact tier.
+///
+/// The generic Q4/Q8 witness carries `LoadSpec::quantize` only so its selector is self-checking. A
+/// real Krea turnkey has a matching packed marker and therefore reaches production with
+/// `load_time_quant_bits == None`; interpreting the synthetic witness as a dense source would falsely
+/// withdraw both packed tiers. This resolver publishes only the source-derived load eligibility and
+/// deliberately retains zero asset facts. Production contract construction remains responsible for
+/// proving the selected snapshot marker and tensor inventory.
+pub(crate) fn weights_free_memory_strategy_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    surface_selector_matches_spec(surface)?;
+    crate::model::validate_base_krea_load_axes(&surface.spec, provider_id)
+        .map_err(|error| CoreError::Msg(error.to_string()))?;
+    let streamable = matches!(
+        surface.resolved_artifact_tier(),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+            | mlx_gen::gen_core::MemoryContractSurfaceTier::Q8
+    ) && surface.spec.precision == Precision::Bf16
+        && matches!(surface.spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(surface.spec.load_shape, LoadShape::DeferredMaterialization)
+        && !crate::model::adapters_have_diff_patch_for_spec(&surface.spec)?;
+    memory_strategy_contract_with_components(
+        provider_id,
+        &surface.spec,
+        Default::default(),
+        streamable,
     )
 }
 
@@ -196,7 +320,7 @@ fn memory_strategy_contract_with_components(
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(spec),
         spec.load_shape,
     ));
     contract.asset_facts.base_bytes = components
@@ -275,27 +399,98 @@ fn memory_strategy_contract_with_components(
 /// Exact contract for the supported community single-file DiT composition. The native I8 format is
 /// dequantized projection-by-projection to bf16, while its scale/descriptor tensors are consumed and
 /// dropped; the text encoder and VAE remain sourced from the resident base snapshot.
+///
+/// Keeping the snapshot and imported forms on the same provider/calibration identity is intentional:
+/// the implementation, phase model, and non-transformer components are the same. The promoted-memory
+/// evidence matrix does not currently have a load-source axis, however. Consequently a published
+/// snapshot (`Dir`) rung-4 cell must not be described as an imported-file measurement merely because
+/// this contract can re-open a pinned `File`; the `File` route needs its own real-path measurement
+/// before release evidence may claim that cell. The lower-level loader may still be reopened for its
+/// story smoke; the public contract must pass `streamable = false` until that evidence exists.
+pub(crate) fn native_memory_strategy_contract_from_spec(
+    provider_id: &str,
+    spec: &LoadSpec,
+    base_snapshot_dir: &std::path::Path,
+    streamable: bool,
+) -> CoreResult<MemoryProviderContract> {
+    let stored = |path: &std::path::Path, what: &str| -> CoreResult<u64> {
+        projected_safetensors_bytes(path, |_| ResidentProjection::Stored).map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: native {what} asset facts for '{}': {error}",
+                path.display()
+            ))
+        })
+    };
+    let dit_file = match &spec.weights {
+        WeightsSource::File(path) => path,
+        WeightsSource::Dir(path) => {
+            return Err(CoreError::Msg(format!(
+                "{provider_id}: native memory facts require a single-file DiT, not directory {}",
+                path.display()
+            )))
+        }
+    };
+    let alternate_decoder_bytes = match spec.components.get(mlx_gen::VAE_COMPONENT) {
+        Some(WeightsSource::Dir(path)) => stored(path, "alternate Wan decoder")?,
+        Some(WeightsSource::File(path)) => {
+            spec.read_file_unchanged_if_prepared(path, |p| stored(p, "alternate Wan decoder"))?
+        }
+        None => 0,
+    };
+    let selected_text_encoder =
+        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+    let expected_language_bits =
+        crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
+    let language_bytes = crate::model::selected_language_resident_bytes(
+        &selected_text_encoder,
+        expected_language_bits,
+        provider_id,
+    )?;
+    let mut vision_bytes = 0;
+    if matches!(
+        provider_id,
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+    ) {
+        let builtin = crate::model::ENCODER_CONTRACT.validate_source_against_base(
+            &WeightsSource::Dir(base_snapshot_dir.join("text_encoder")),
+            base_snapshot_dir,
+        )?;
+        let headers = builtin.materialized_vision_tensor_headers(
+            &crate::model::VISION_ENCODER_CONTRACT,
+            &crate::model::ENCODER_CONTRACT,
+        )?;
+        vision_bytes = projected_tensor_headers_bytes(&headers, |_| ResidentProjection::Stored)?;
+    }
+    let selected_text_encoder_bytes =
+        language_bytes.checked_add(vision_bytes).ok_or_else(|| {
+            CoreError::Msg(format!(
+                "{provider_id}: selected language plus builtin vision resident byte overflow"
+            ))
+        })?;
+    let components = mlx_gen::PerComponentBytes {
+        text_encoder: selected_text_encoder_bytes,
+        dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
+            native_dit_transformer_bytes(provider_id, p, spec.quantize)
+        })?,
+        vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?
+            .saturating_add(alternate_decoder_bytes),
+    };
+    memory_strategy_contract_with_components(provider_id, spec, components, streamable)
+}
+
+/// Compatibility shim for the pre-registry native loader. New call sites carry the base snapshot in
+/// `LoadSpec::components` and use [`native_memory_strategy_contract_from_spec`].
+#[cfg(test)]
 pub(crate) fn native_memory_strategy_contract(
     provider_id: &str,
     dit_file: &std::path::Path,
     base_snapshot_dir: &std::path::Path,
 ) -> CoreResult<MemoryProviderContract> {
-    let base_spec = LoadSpec::new(WeightsSource::Dir(base_snapshot_dir.to_path_buf()));
-    let mut contract = memory_strategy_contract(provider_id, &base_spec).map_err(|error| {
-        CoreError::Msg(format!(
-            "{provider_id}: native base snapshot asset facts for '{}': {error}",
-            base_snapshot_dir.display()
-        ))
-    })?;
-    let transformer_bytes = native_dit_transformer_bytes(provider_id, dit_file)?;
-    contract.asset_facts.transformer_bytes = transformer_bytes;
-    contract.asset_facts.base_bytes = contract
-        .asset_facts
-        .conditioning_bytes
-        .checked_add(transformer_bytes)
-        .and_then(|bytes| bytes.checked_add(contract.asset_facts.decoder_bytes))
-        .ok_or_else(|| CoreError::Msg("krea native resident byte sum overflow".to_owned()))?;
-    Ok(contract)
+    let spec = LoadSpec::new(WeightsSource::File(dit_file.to_path_buf())).with_component(
+        mlx_gen::BASE_SNAPSHOT_COMPONENT,
+        WeightsSource::Dir(base_snapshot_dir.to_path_buf()),
+    );
+    native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
 /// Resident bytes of a community single-file native DiT: I8 projections materialize to bf16, their
@@ -305,10 +500,19 @@ pub(crate) fn native_memory_strategy_contract(
 pub(crate) fn native_dit_transformer_bytes(
     provider_id: &str,
     dit_file: &std::path::Path,
+    quant: Option<mlx_gen::Quant>,
 ) -> CoreResult<u64> {
     projected_safetensors_bytes(dit_file, |tensor| {
         if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
             ResidentProjection::Omit
+        } else if let Some(quant) = quant.filter(|_| {
+            crate::native_remap::native_dit_key_to_diffusers(&tensor.name)
+                .is_some_and(|name| crate::convert::is_transformer_quant_target(&name))
+        }) {
+            ResidentProjection::GroupQuantized {
+                bits: quant.bits(),
+                group_size: crate::quant::GROUP_SIZE as usize,
+            }
         } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
             ResidentProjection::Bfloat16
         } else {
@@ -330,6 +534,7 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
+        validate_memory_behavior_route(contract.provider_id.as_str(), context)?;
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             decode_routes(contract.provider_id.as_str())?
                 .validate(
@@ -353,6 +558,62 @@ pub(crate) fn safety_check(
     )
 }
 
+fn validate_memory_behavior_route(provider_id: &str, context: &MemoryRunContext) -> CoreResult<()> {
+    if context.overlay.is_some() {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: base Krea memory routes use typed request axes and no overlay"
+        )));
+    }
+    let route_matches = match provider_id {
+        crate::model::KREA_2_TURBO_ID => matches!(
+            (
+                &context.mode,
+                context.geometry.reference_count,
+                context.has_phases
+            ),
+            (mlx_gen::gen_core::MemoryMode::TextToImage, 0, false)
+                | (mlx_gen::gen_core::MemoryMode::ImageToImage, 1, false)
+        ),
+        crate::model::KREA_2_RAW_ID => {
+            matches!(
+                (
+                    &context.mode,
+                    context.geometry.reference_count,
+                    context.has_phases
+                ),
+                (mlx_gen::gen_core::MemoryMode::TextToImage, 0, false)
+                    | (mlx_gen::gen_core::MemoryMode::ImageToImage, 1, false)
+            ) || matches!(
+                (
+                    &context.mode,
+                    context.geometry.reference_count,
+                    context.has_phases
+                ),
+                (mlx_gen::gen_core::MemoryMode::TextToImage, 0, true)
+            ) && !context.use_pid
+        }
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID => matches!(
+            (
+                &context.mode,
+                context.geometry.reference_count,
+                context.has_phases
+            ),
+            (mlx_gen::gen_core::MemoryMode::Edit, 1 | 2, false)
+        ),
+        _ => false,
+    };
+    if !route_matches {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: unsupported base Krea memory route {:?} with {} references, use_pid={}, has_phases={}",
+            context.mode,
+            context.geometry.reference_count,
+            context.use_pid,
+            context.has_phases
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -371,48 +632,123 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
         return Ok(Vec::new());
     }
     let quant = crate::model::effective_base_quant_tier(spec, &contract.provider_id)?;
-    let is_edit = contract.provider_id.contains("edit");
     let tier = MemoryNumericTier {
         precision: spec.precision,
         quant,
         component_precision_floors: &[],
     };
-    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
-        mode: if is_edit {
-            mlx_gen::gen_core::MemoryMode::Edit
-        } else {
-            mlx_gen::gen_core::MemoryMode::TextToImage
-        },
-        reference_count: u32::from(is_edit),
-        use_pid,
-        has_phases: false,
-        overlay: None,
+    let mut routes = match contract.provider_id.as_str() {
+        crate::model::KREA_2_TURBO_ID | crate::model::KREA_2_RAW_ID => vec![
+            (mlx_gen::gen_core::MemoryMode::TextToImage, 0, false, true),
+            (mlx_gen::gen_core::MemoryMode::ImageToImage, 1, false, true),
+        ],
+        crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID => vec![
+            (mlx_gen::gen_core::MemoryMode::Edit, 1, false, true),
+            (mlx_gen::gen_core::MemoryMode::Edit, 2, false, true),
+        ],
+        provider_id => {
+            return Err(CoreError::Msg(format!(
+                "unsupported base Krea memory behavior provider '{provider_id}'"
+            )))
+        }
     };
-    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    if contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
-        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
+    if contract.provider_id == crate::model::KREA_2_RAW_ID {
+        routes.push((mlx_gen::gen_core::MemoryMode::TextToImage, 0, true, false));
+    }
+    let mut fixtures = Vec::new();
+    for (mode, reference_count, has_phases, permits_pid) in routes {
+        let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: mode.clone(),
+            reference_count,
+            use_pid,
+            has_phases,
+            // Adapters, PiD, references, and phase presence are already typed request axes. Krea's
+            // provider contract has no second string overlay identity for those same facts.
+            overlay: None,
+        };
+        fixtures.push(executable_memory_behavior_fixture(
             mlx_gen::gen_core::standard_memory_behavior_context(
                 contract,
                 strategy,
                 tier,
-                route(true),
+                route(false),
             )?,
         ));
+        if permits_pid
+            && contract.pid_decode_routes.is_some()
+            && contract.engages(strategy, MemoryStrategy::BoundedDecode)
+        {
+            fixtures.push(executable_memory_behavior_fixture(
+                mlx_gen::gen_core::standard_memory_behavior_context(
+                    contract,
+                    strategy,
+                    tier,
+                    route(true),
+                )?,
+            ));
+        }
     }
     Ok(fixtures)
+}
+
+fn executable_memory_behavior_fixture(
+    context: MemoryRunContext,
+) -> mlx_gen::gen_core::MemoryBehaviorFixture {
+    let mut fixture = mlx_gen::gen_core::MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free Krea memory behavior".to_owned();
+    let reference = || mlx_gen::Image {
+        width: 1,
+        height: 1,
+        pixels: vec![0, 0, 0],
+    };
+    fixture.request.conditioning = match (
+        &fixture.context.mode,
+        fixture.context.geometry.reference_count,
+    ) {
+        (mlx_gen::gen_core::MemoryMode::TextToImage, 0) => Vec::new(),
+        (mlx_gen::gen_core::MemoryMode::ImageToImage, 1) => {
+            vec![mlx_gen::Conditioning::Reference {
+                image: reference(),
+                strength: Some(1.0),
+            }]
+        }
+        (mlx_gen::gen_core::MemoryMode::Edit, 1) => {
+            vec![mlx_gen::Conditioning::Reference {
+                image: reference(),
+                strength: None,
+            }]
+        }
+        (mlx_gen::gen_core::MemoryMode::Edit, 2) => {
+            vec![mlx_gen::Conditioning::MultiReference {
+                images: vec![reference(), reference()],
+            }]
+        }
+        _ => unreachable!("provider-owned route validation constructs only executable fixtures"),
+    };
+    if fixture.context.has_phases {
+        fixture.request.phases = Some(vec![
+            mlx_gen::GenerationPhase {
+                steps: 1,
+                ..Default::default()
+            },
+            mlx_gen::GenerationPhase {
+                steps: 1,
+                ..Default::default()
+            },
+        ]);
+    }
+    fixture
 }
 
 pub(crate) fn registered_begin_request(
@@ -535,6 +871,12 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+            crate::model::VISION_ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"quantization":{"bits":4,"group_size":64}}"#,
@@ -557,6 +899,312 @@ mod tests {
     }
 
     #[test]
+    fn base_selector_surfaces_publish_all_prepacked_tiers_and_fail_closed_on_mutation() {
+        let providers = [
+            crate::model::KREA_2_TURBO_ID,
+            crate::model::KREA_2_RAW_ID,
+            crate::model::KREA_2_EDIT_ID,
+            crate::model::KREA_2_TURBO_EDIT_ID,
+        ];
+        for provider_id in providers {
+            let mut implemented = 0;
+            for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+                let contract =
+                    weights_free_memory_strategy_surface_contract(provider_id, &surface).unwrap();
+                let expected = surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization;
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert_eq!(contract.provider_id, provider_id);
+                assert_eq!(contract.asset_facts, Default::default());
+            }
+            assert_eq!(
+                implemented, 3,
+                "{provider_id}: bf16, q4, and q8 must all be represented"
+            );
+        }
+
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 sequential deferred surface");
+
+        let mut tier_mismatch = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        tier_mismatch.spec.quantize = Some(Quant::Q8);
+        for provider_id in providers {
+            assert!(
+                weights_free_memory_strategy_surface_contract(provider_id, &tier_mismatch).is_err()
+            );
+        }
+
+        let mut file_source = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        file_source.spec.weights = WeightsSource::File("/krea.safetensors".into());
+        for provider_id in providers {
+            assert!(
+                weights_free_memory_strategy_surface_contract(provider_id, &file_source).is_err()
+            );
+        }
+
+        let mut control = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        control.spec.control = Some(WeightsSource::File("/control.safetensors".into()));
+        for provider_id in providers {
+            assert!(weights_free_memory_strategy_surface_contract(provider_id, &control).is_err());
+        }
+
+        let mut unknown_component = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+            selector: q4.selector,
+            spec: q4.spec.clone(),
+        };
+        unknown_component.spec.components.insert(
+            "unknown".into(),
+            WeightsSource::File("/unknown.safetensors".into()),
+        );
+        for provider_id in providers {
+            assert!(
+                weights_free_memory_strategy_surface_contract(provider_id, &unknown_component)
+                    .is_err()
+            );
+        }
+
+        let mut wan_vae = q4;
+        wan_vae.spec.components.insert(
+            mlx_gen::VAE_COMPONENT.into(),
+            WeightsSource::File("/wan-vae.safetensors".into()),
+        );
+        for provider_id in providers {
+            let wan_contract = weights_free_memory_strategy_surface_contract(provider_id, &wan_vae)
+                .expect("supported Wan VAE component must remain selector-admissible");
+            assert_eq!(
+                wan_contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Implemented
+            );
+            assert_eq!(wan_contract.asset_facts, Default::default());
+        }
+    }
+
+    #[test]
+    fn base_selector_preserves_supported_compositions_and_refuses_dense_diff_btr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let low_rank = tmp.path().join("low-rank.safetensors");
+        let dense_diff = tmp.path().join("dense-diff.safetensors");
+        write_minimal_safetensors(&low_rank);
+        write_diff_patch(&dense_diff);
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 sequential deferred surface");
+
+        for provider_id in [
+            crate::model::KREA_2_TURBO_ID,
+            crate::model::KREA_2_RAW_ID,
+            crate::model::KREA_2_EDIT_ID,
+            crate::model::KREA_2_TURBO_EDIT_ID,
+        ] {
+            for kind in [AdapterKind::Lora, AdapterKind::Lokr] {
+                let mut composed = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+                    selector: q4.selector,
+                    spec: q4
+                        .spec
+                        .clone()
+                        .with_adapters(vec![AdapterSpec::new(low_rank.clone(), 1.0, kind)])
+                        .with_pid(
+                            WeightsSource::File(tmp.path().join("pid.safetensors")),
+                            WeightsSource::Dir(tmp.path().join("gemma")),
+                        )
+                        .with_text_encoder(WeightsSource::Dir(
+                            tmp.path().join("external-text-encoder"),
+                        )),
+                };
+                composed.spec.components.insert(
+                    mlx_gen::VAE_COMPONENT.into(),
+                    WeightsSource::File(tmp.path().join("wan-vae.safetensors")),
+                );
+                let contract =
+                    weights_free_memory_strategy_surface_contract(provider_id, &composed)
+                        .expect("low-rank + PiD + external TE + Wan VAE remains admissible");
+                assert_eq!(
+                    contract
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Implemented,
+                    "{provider_id} {kind:?}"
+                );
+            }
+
+            let dense = mlx_gen::gen_core::MemoryContractSurfaceSpec {
+                selector: q4.selector,
+                spec: q4.spec.clone().with_adapters(vec![AdapterSpec::new(
+                    dense_diff.clone(),
+                    1.0,
+                    AdapterKind::Lora,
+                )]),
+            };
+            let contract = weights_free_memory_strategy_surface_contract(provider_id, &dense)
+                .expect("dense diff is a truthful non-streamable contract, not a resolver error");
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing,
+                "{provider_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_behavior_routes_are_executable_and_fail_closed_on_typed_mutation() {
+        let q4 = mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+            .into_iter()
+            .find(|surface| {
+                surface.resolved_artifact_tier() == mlx_gen::gen_core::MemoryContractSurfaceTier::Q4
+                    && surface.selector.offload_policy == OffloadPolicy::Sequential
+                    && surface.selector.load_shape == LoadShape::DeferredMaterialization
+            })
+            .expect("q4 sequential deferred surface");
+
+        for provider_id in [
+            crate::model::KREA_2_TURBO_ID,
+            crate::model::KREA_2_RAW_ID,
+            crate::model::KREA_2_EDIT_ID,
+            crate::model::KREA_2_TURBO_EDIT_ID,
+        ] {
+            let contract = weights_free_memory_strategy_surface_contract(provider_id, &q4).unwrap();
+            let fixtures = registered_valid_fixture(
+                &q4.spec,
+                &contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            )
+            .unwrap();
+            let descriptor = match provider_id {
+                crate::model::KREA_2_TURBO_ID => crate::model::descriptor(),
+                crate::model::KREA_2_RAW_ID => crate::model::raw_descriptor(),
+                crate::model::KREA_2_EDIT_ID => crate::model::edit_descriptor(),
+                crate::model::KREA_2_TURBO_EDIT_ID => crate::model::turbo_edit_descriptor(),
+                _ => unreachable!(),
+            };
+            for fixture in &fixtures {
+                assert_eq!(
+                    registered_safety_check(&q4.spec, &contract, &fixture.context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}: {:?}",
+                    fixture.context
+                );
+                crate::model::validate_request(&descriptor, &fixture.request).unwrap_or_else(
+                    |error| panic!("{provider_id} fixture is not executable: {error}"),
+                );
+                assert_eq!(
+                    fixture.request.use_pid, fixture.context.use_pid,
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    fixture.request.phases.is_some(),
+                    fixture.context.has_phases,
+                    "{provider_id}"
+                );
+            }
+
+            let mut wrong_mode = fixtures[0].context.clone();
+            wrong_mode.mode = if matches!(
+                provider_id,
+                crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
+            ) {
+                MemoryMode::ImageToImage
+            } else {
+                MemoryMode::Edit
+            };
+            wrong_mode.geometry.reference_count = 1;
+            wrong_mode.has_reference = true;
+            assert!(matches!(
+                registered_safety_check(&q4.spec, &contract, &wrong_mode),
+                MemorySafetyDecision::Reject { .. }
+            ));
+
+            let mut wrong_references = fixtures[0].context.clone();
+            wrong_references.geometry.reference_count = 3;
+            wrong_references.has_reference = true;
+            assert!(matches!(
+                registered_safety_check(&q4.spec, &contract, &wrong_references),
+                MemorySafetyDecision::Reject { .. }
+            ));
+
+            let mut wrong_phases = if provider_id == crate::model::KREA_2_RAW_ID {
+                fixtures
+                    .iter()
+                    .find(|fixture| {
+                        fixture.context.mode == MemoryMode::ImageToImage
+                            && !fixture.context.has_phases
+                    })
+                    .unwrap()
+                    .context
+                    .clone()
+            } else {
+                fixtures[0].context.clone()
+            };
+            wrong_phases.has_phases = true;
+            assert!(matches!(
+                registered_safety_check(&q4.spec, &contract, &wrong_phases),
+                MemorySafetyDecision::Reject { .. }
+            ));
+
+            let mut overlay = fixtures[0].context.clone();
+            overlay.overlay = Some("references:1".to_owned());
+            assert!(matches!(
+                registered_safety_check(&q4.spec, &contract, &overlay),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(registered_begin_request(provider_id, &q4.spec, &contract, &overlay).is_err());
+
+            if provider_id == crate::model::KREA_2_RAW_ID {
+                let mut pid_multiphase = fixtures
+                    .iter()
+                    .find(|fixture| fixture.context.has_phases)
+                    .unwrap()
+                    .context
+                    .clone();
+                pid_multiphase.use_pid = true;
+                assert!(matches!(
+                    registered_safety_check(&q4.spec, &contract, &pid_multiphase),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn identical_fingerprint_is_separated_by_typed_load_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, deferred_spec) = fixture(&tmp);
@@ -575,12 +1223,45 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn alternate_decoder_is_additive_to_native_decoder_asset_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_root, spec) = fixture(&tmp);
+        let native = memory_strategy_contract("krea_2_turbo", &spec).unwrap();
+        let donor = tmp.path().join("wan-vae.safetensors");
+        write_minimal_safetensors(&donor);
+        let composite = memory_strategy_contract(
+            "krea_2_turbo",
+            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+        )
+        .unwrap();
+        assert_eq!(
+            composite.asset_facts.decoder_bytes,
+            native.asset_facts.decoder_bytes + 2,
+            "Krea keeps its Qwen VAE for conditioning and adds the Wan terminal decoder"
+        );
+        assert_eq!(
+            composite.asset_facts.base_bytes,
+            native.asset_facts.base_bytes + 2
+        );
+        assert_eq!(
+            composite.calibration.as_ref().unwrap().fingerprint,
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            "native whole-request measurements must not authorize the composite decoder path"
+        );
+        assert_eq!(
+            native.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+    }
+
     fn resident_context(
         contract: &MemoryProviderContract,
         quant: Option<Quant>,
     ) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         MemoryRunContext {
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),
@@ -809,6 +1490,49 @@ mod tests {
     }
 
     #[test]
+    fn imported_base_component_inventory_rejects_missing_empty_and_corrupt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
+        let native = root.join("native.safetensors");
+        write_native_i8_safetensors(&native);
+        let spec = LoadSpec::new(WeightsSource::File(native)).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+
+        for component in ["text_encoder", "vae"] {
+            let file = root.join(component).join("model.safetensors");
+            for (case, replacement) in [
+                ("empty", Some(Vec::new())),
+                ("corrupt", Some(b"corrupt".to_vec())),
+                ("missing", None),
+            ] {
+                match replacement {
+                    Some(bytes) => std::fs::write(&file, bytes).unwrap(),
+                    None => std::fs::remove_file(&file).unwrap(),
+                }
+                let error = memory_strategy_contract("krea_2_turbo", &spec)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(component) || error.contains("safetensors"),
+                    "{component}/{case}: {error}"
+                );
+                if component == "text_encoder" {
+                    gen_core_testkit::write_encoder_contract_fixture(
+                        &root.join("text_encoder"),
+                        crate::model::ENCODER_CONTRACT,
+                    )
+                    .expect("restore validation-complete text encoder fixture");
+                } else {
+                    write_minimal_safetensors(&file);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn low_rank_overlay_is_admissible_but_dense_diff_patch_is_not() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, mut spec) = fixture(&tmp);
@@ -903,14 +1627,20 @@ mod tests {
     }
 
     #[test]
-    fn non_reopenable_or_wrong_loader_shapes_do_not_advertise_rung_four() {
+    fn file_contract_withholds_rung_four_but_lower_level_loader_remains_reopenable() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, base) = fixture(&tmp);
         let mut resident = base.clone();
         resident.offload_policy = OffloadPolicy::Resident;
         let mut eager = base.clone();
         eager.load_shape = LoadShape::EagerMaterialization;
-        let file = LoadSpec::new(WeightsSource::File(root.join("single.safetensors")))
+        let native = root.join("single.safetensors");
+        write_native_i8_safetensors(&native);
+        let file = LoadSpec::new(WeightsSource::File(native))
+            .with_component(
+                mlx_gen::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(root.clone()),
+            )
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
         for spec in [resident, eager] {
@@ -923,11 +1653,105 @@ mod tests {
                 MemoryStrategySupport::Missing
             );
         }
-        let error = memory_strategy_contract("krea_2_turbo", &file)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("snapshot directory"), "{error}");
+        let file_contract =
+            native_memory_strategy_contract_from_spec("krea_2_turbo", &file, &root, true).unwrap();
+        assert_eq!(
+            file_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented,
+            "the registry File source is lstat-pinned and reopened for each transformer window"
+        );
+        let registered = memory_strategy_contract("krea_2_turbo", &file).unwrap();
+        assert_eq!(
+            registered
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing,
+            "a reopenable implementation is not authorization without File-specific evidence"
+        );
+        assert!(!registered.lifecycle.transformer_window_materialization);
+        assert!(
+            crate::model::native_file_streamable(&file).unwrap(),
+            "explicit Sequential + Deferred execution may use the pinned File stream seam even while automatic authorization stays Missing"
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn imported_file_contract_matches_the_base_loader_for_every_typed_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = fixture(&tmp);
+        let native = root.join("single.safetensors");
+        write_native_i8_safetensors(&native);
+        let valid = LoadSpec::new(WeightsSource::File(native)).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(root.join("control.safetensors")));
+        let mut extra_control = valid.clone();
+        extra_control
+            .extra_controls
+            .push(WeightsSource::File(root.join("extra-control.safetensors")));
+        let mut ip_adapter = valid.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir(root.join("ip-adapter")));
+        let mut identity = valid.clone();
+        identity.identity = Some(mlx_gen::gen_core::IdentityWeights::default());
+        let mut text_encoder = valid.clone();
+        let external_text_encoder = root.join("external-text");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_text_encoder,
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete selected text encoder fixture");
+        text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
+        let mut unknown_component = valid.clone();
+        unknown_component.components.insert(
+            "unknown".into(),
+            WeightsSource::File(root.join("unknown.safetensors")),
+        );
+        let mut missing_base = valid.clone();
+        missing_base.components.clear();
+        let accepted_adapter = valid.clone().with_adapters(vec![AdapterSpec::new(
+            root.join("adapter.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )]);
+        let accepted_pid = valid.clone().with_pid(
+            WeightsSource::File(root.join("pid.safetensors")),
+            WeightsSource::Dir(root.join("gemma")),
+        );
+        let accepted_deferred = valid
+            .clone()
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        for (case, spec, expected) in [
+            ("valid", valid.clone(), true),
+            ("adapter", accepted_adapter, true),
+            ("pid", accepted_pid, true),
+            ("deferred", accepted_deferred, true),
+            ("precision", precision, false),
+            ("quantize", valid.clone().with_quant(Quant::Q4), true),
+            ("control", control, false),
+            ("extra_control", extra_control, false),
+            ("ip_adapter", ip_adapter, false),
+            ("identity", identity, false),
+            ("text_encoder", text_encoder, true),
+            ("unknown_component", unknown_component, false),
+            ("missing_base", missing_base, false),
+        ] {
+            let loader = crate::model::validate_native_krea_spec(&spec, "krea_2_turbo").is_ok();
+            let contract = memory_strategy_contract("krea_2_turbo", &spec).is_ok();
+            assert_eq!(loader, expected, "loader validation for {case}");
+            assert_eq!(contract, loader, "contract/loader parity for {case}");
+        }
     }
 
     #[test]
@@ -937,10 +1761,10 @@ mod tests {
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 7_843_069_440);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
-        assert_eq!(contract.asset_facts.base_bytes, 260);
+        assert_eq!(contract.asset_facts.base_bytes, 7_843_069_698);
         for strategy in [
             MemoryStrategy::Resident,
             MemoryStrategy::BoundedDecode,
@@ -959,10 +1783,37 @@ mod tests {
             assert_eq!(
                 contract.capability(strategy).unwrap().support,
                 MemoryStrategySupport::Missing,
-                "the single-file ConvRot composition has no reopenable per-phase/per-block source"
+                "the compatibility helper intentionally models the historical eager load; registry File specs carry the reopenable lifecycle"
             );
         }
         assert!(contract.conformance_errors().is_empty());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn edit_prices_the_materialized_vision_surface_while_t2i_excludes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let (t2i, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_TURBO_ID, &spec)
+            .expect("t2i contract");
+        let (edit, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_EDIT_ID, &spec)
+            .expect("edit contract");
+        let vision = crate::model::ENCODER_CONTRACT
+            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), &root)
+            .unwrap();
+        let vision_bytes = projected_tensor_headers_bytes(
+            &vision
+                .materialized_vision_tensor_headers(
+                    &crate::model::VISION_ENCODER_CONTRACT,
+                    &crate::model::ENCODER_CONTRACT,
+                )
+                .unwrap(),
+            |_| ResidentProjection::Stored,
+        )
+        .unwrap();
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - t2i.asset_facts.conditioning_bytes,
+            vision_bytes
+        );
     }
 }

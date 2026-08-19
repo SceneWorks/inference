@@ -21,17 +21,18 @@
 /// **This is operation- and runtime-specific, not a universal "any tensor over 2^31 is wrong" law**
 /// (sc-12438 corrected the earlier universal framing). It stood in for several distinct 0.31.2 failures
 /// sharing the 2^31-element (`i32`) threshold — but **sc-12748: on this repo's current pin (MLX 0.32.0
-/// via `pmetal-mlx-rs 932beb4e` + the sc-12746 pad/concat copy-gate patch) every op the tiled/untiled
-/// video decode touches above the bound is now int64-safe.** Measured at `128×D×480×848` (`D=41` →
+/// via `pmetal-mlx-rs eb76c4ba` + the sc-12746 pad/concat copy-gate patch) every operation the
+/// tiled/untiled video decode actually uses above the bound is now int64-safe.** Re-probed on this
+/// exact pin on 2026-08-11 at `128×D×480×848` (`D=41` →
 /// 2,136,145,920 = 0.995×; `D=42` → 2,188,247,040 = 1.019×) with position-dependent data compared only
 /// on sub-bound slices (`mlx-gen/tests/mlx_write_bound_probe.rs`):
 ///
-/// | operation | on 0.31.2 | on this pin (0.32.0 fork `932beb4e` + patch) |
+/// | operation | on 0.31.2 | on this pin (0.32.0 fork `eb76c4ba` + patch) |
 /// |---|---|---|
 /// | `conv3d` 8→128, output over the bound | **wrong** from ~1.007× (per-thread output offset in the Metal steel-conv kernel overflows `int32`) | **EXACT** — MLX PR #3524 promoted those offsets to `size_t` (probe-verified, `first_bad=-1`) |
 /// | `pad` to a full output over the bound (the tiled accumulator's placement op) | **wrong** from ~1.003× | **EXACT** — the sc-12746 `pad-copy-int64.patch` gates the copy on the addressable span (probe-verified) |
 /// | `concatenate` over the bound (same `copy_gpu_inplace` path) | **wrong** | **EXACT** — same copy-gate patch (probe-verified) |
-/// | `reshape(-1)` / `flatten` at over-bound size | **overflow** (flat `i32` shape-product) | **works** (probe-verified `reshape(-1)_ok=true` at 2.19e9) |
+/// | reshape at over-bound size | **overflow** (flat `i32` shape-product) | **mixed** — a single `reshape(-1)` dimension still raises, while a multi-dimensional reshape whose individual dimensions fit `i32` is exact above the bound; `contiguous` uses that verified multi-dimensional path |
 /// | `from_slice` (host `Vec` → over-bound `Array`) | **overflow** — mlx-rs asserts `len == shape.product::<i32>()` (MLX #3327) | **still i32-capped** — a fork-side mlx-rs bug, unfixed; the one residual (the decode paths read back via `as_slice`, never `from_slice` the full output) |
 /// | reading back (`as_slice`) an over-bound array | correct | correct |
 ///
@@ -45,9 +46,11 @@
 ///    future MLX regression re-breaking conv or a future full-res op the probes don't cover).
 ///  - **Assembled-output write** (`mlx_gen::vae_tiling::check_output_writable`): the full
 ///    `output`/`weights` accumulators a tiled decode builds by `pad`-and-add and reads back via
-///    `reshape`+`as_slice`. Every one of those ops is now int64-safe (rows above), so the sc-12438
-///    **refusal is lifted** — an over-bound assembled output now RENDERS. `check_output_writable` is kept
-///    as a narrow backstop for the one residual, a `from_slice` host materialization the decode never
+///    `contiguous`'s multi-dimensional `reshape`+`as_slice` path. Every operation in that path is now
+///    int64-safe (rows above), so the sc-12438
+///    **refusal is lifted** — an over-bound assembled output now RENDERS. A single-dimension flatten
+///    remains rejected but is not used by this path. `check_output_writable` is kept as a narrow
+///    backstop for the remaining possible host-materialization hazard, a `from_slice` the decode never
 ///    does — a retained latent tripwire with **no production caller** today (sc-12926), ready to wire
 ///    if future code from_slices an output-scale host buffer.
 ///  - **Mochi's decode guard** (`mlx-gen-mochi`'s `decode_body`): its over-bound write is `block_out`'s

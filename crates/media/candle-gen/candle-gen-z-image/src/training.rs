@@ -407,7 +407,7 @@ impl FlowMatchTrainer for ZImageTrainer {
         // F-133 (sc-11190): the trainer's caption encode is parity-critical with inference, so the
         // tokenizer policy lives in one home (`common::tokenizer_config`) — a policy change (sc-8646
         // class) now can't land in inference and silently miss the trainer.
-        let tokenizer = crate::common::build_tokenizer(&self.root, "z_image trainer")?;
+        let tokenizer = crate::common::build_tokenizer_from_base(&self.root, "z_image trainer")?;
         let text_encoder = ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
             flow_match::component_vb(&self.root, "text_encoder", device, DType::F32, LABEL)?,

@@ -36,7 +36,7 @@ succeeds. Neither path accepts an unbound, self-attested parity result.
 ## Fingerprint grammar
 
 A calibration content fingerprint is lowercase ASCII kebab tokens with exactly one positive `vN`
-token and no leading zeroes, for example `z-image-mlx-independent-materialization-v3`.
+token and no leading zeroes, for example `z-image-mlx-independent-materialization-v4`.
 
 The fingerprint names content whose change invalidates a calibration. It is not a second encoding of
 typed evidence axes: backend, tier, load shape, mode, geometry, strategy composition, and strategy

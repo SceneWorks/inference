@@ -43,6 +43,15 @@ fn te_dir(tier: &std::path::Path) -> std::path::PathBuf {
     tier.join("text_encoder")
 }
 
+fn streamable(weights: &Weights, dir: &std::path::Path, cfg: &ZTextEncoderConfig) -> TextEncoder {
+    let source = WeightsSource::Dir(dir.to_path_buf());
+    let validated = mlx_gen_z_image::ENCODER_CONTRACT
+        .validate_source(&source)
+        .expect("exact Z-Image text-encoder contract");
+    TextEncoder::from_validated_streamable_source(weights, validated, "model", cfg)
+        .expect("streamed encoder")
+}
+
 /// Max absolute difference over the two conditioning tensors, cast to f32.
 fn max_abs_delta(a: &Array, b: &Array) -> f32 {
     assert_eq!(a.shape(), b.shape(), "conditioning shape changed");
@@ -85,9 +94,7 @@ fn the_streamed_encoder_matches_the_resident_encoder_exactly() {
     mlx_rs::transforms::eval([&resident_out]).expect("eval");
     drop(resident);
 
-    let streamed =
-        TextEncoder::from_streamable_source(&w, WeightsSource::Dir(dir.clone()), "model", &cfg)
-            .expect("streamed encoder");
+    let streamed = streamable(&w, &dir, &cfg);
     assert!(streamed.is_streamable());
     drop(w);
 
@@ -129,8 +136,7 @@ fn the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer() {
     mlx_rs::transforms::eval([&expected]).expect("eval");
     drop(resident);
 
-    let streamed = TextEncoder::from_streamable_source(&w, WeightsSource::Dir(dir), "model", &cfg)
-        .expect("streamed encoder");
+    let streamed = streamable(&w, &dir, &cfg);
     drop(w);
     let got = streamed
         .forward(&input_ids, &attention_mask)
@@ -216,8 +222,7 @@ fn the_window_bounds_the_conditioning_peak() {
     drop(resident);
     clear_cache();
 
-    let streamed = TextEncoder::from_streamable_source(&w, WeightsSource::Dir(dir), "model", &cfg)
-        .expect("streamed encoder");
+    let streamed = streamable(&w, &dir, &cfg);
     drop(w);
 
     println!(
@@ -294,8 +299,7 @@ fn a_cancel_stops_the_streamed_encoder_at_a_window_boundary() {
     let (input_ids, attention_mask) = inputs(&tier);
 
     let w = Weights::from_dir(&dir).expect("weights");
-    let streamed = TextEncoder::from_streamable_source(&w, WeightsSource::Dir(dir), "model", &cfg)
-        .expect("streamed encoder");
+    let streamed = streamable(&w, &dir, &cfg);
     drop(w);
 
     let cancel = CancelFlag::default();

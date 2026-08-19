@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::{FfnChunk, GraphEvalCadence};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, CancelFlag, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::pipeline::auto_tiling_budgeted_z16_quality_overlap;
@@ -54,7 +55,7 @@ fn decode_tiling(
 /// levers therefore bound the *denoise* peak for headroom + the larger buckets (1280×704) and are the
 /// shared-layer "practice" the story carries to Wan/Bernini; they are not what unblocks 832×480.
 ///
-/// - `eval_per_block` — caps the peak at ~one block's activations instead of the whole 40-block lazy
+/// - `eval_cadence` — caps the peak at ~one block's activations instead of the whole 40-block lazy
 ///   graph. Bit-exact, near-zero cost.
 /// - `ffn_seq_chunk` — bounds the `[L, ffn_dim]` FFN intermediate (the largest denoise transient).
 /// - `attn_query_chunk` — OFF by default (SDPA is flash here, so chunking the query path only adds
@@ -65,10 +66,34 @@ fn decode_tiling(
 /// by Metal tile-rounding, cosine ≈ 1). Overridable via `MLX_GEN_WAN_*` env
 /// (see [`DitMemoryConfig::from_env`]).
 const SCAIL2_MEM_DEFAULT: DitMemoryConfig = DitMemoryConfig {
-    ffn_seq_chunk: Some(8192),
+    ffn_seq_chunk: Some(FfnChunk::from_nonzero(
+        match std::num::NonZeroU32::new(8192) {
+            Some(rows) => rows,
+            None => unreachable!(),
+        },
+    )),
     attn_query_chunk: None,
-    eval_per_block: true,
+    eval_cadence: Some(GraphEvalCadence::EVERY_BLOCK),
 };
+
+/// The execution-domain surface the SCAIL-2 descriptor advertises (sc-18317).
+///
+/// Both numeric domains accept any positive value by construction rather than a measured candidate
+/// set: [`mlx_gen_wan::map_seq_chunks`] degrades an over-large chunk to one whole-sequence call, and a
+/// cadence wider than the 40-block trunk simply forces no evaluation inside it (the step's own
+/// end-of-step evaluation is unchanged), so the mechanism is exact over the whole range and this
+/// declaration claims no per-value measurement. CFG batching stays
+/// `Unsupported`: SCAIL-2's guidance is the shared Wan solver's, with no selectable batching axis.
+///
+/// Note what is deliberately absent: the attention query chunk. Bounding attention scratch is the
+/// memory ladder's rung 3, and exposing a second request control over the same mechanism would let a
+/// selector and the ladder disagree about one request's attention budget.
+pub(crate) const EXECUTION_SURFACE: mlx_gen::gen_core::ExecutionSurface =
+    mlx_gen::gen_core::ExecutionSurface {
+        graph_eval_cadence_blocks: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
+        ffn_chunk_rows: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
+        cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Unsupported,
+    };
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride,
 /// and the 28-channel mask pools 8×, so both the full and half grids must stay integer + even.
 ///
@@ -110,6 +135,12 @@ pub struct Scail2Job<'a> {
     pub fps: u32,
     pub segment_len: usize,
     pub segment_overlap: usize,
+    /// The request's typed execution/memory block (sc-18317), carried verbatim from
+    /// `GenerationRequest::memory` so the two knobs this provider consumes — the graph-evaluation
+    /// cadence and the FFN chunk — reach `DitMemoryConfig` through
+    /// [`DitMemoryConfig::with_request`]. `None` (the direct-caller default) leaves
+    /// `SCAIL2_MEM_DEFAULT` exactly as it was before this story.
+    pub memory: Option<mlx_gen::gen_core::GenerationMemory>,
 }
 
 /// Align a **resolved driving-clip** dimension to [`DIM_ALIGN`] (down, with a min-one-tile floor —
@@ -471,7 +502,14 @@ pub fn generate(
             Dtype::Float32
         });
         // sc-5681: bound the per-step activation peak so the high-resolution buckets don't OOM.
-        d.set_memory_config(DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT));
+        // sc-18317: the request's typed selections overlay LAST, so epic 18304's planner outranks both
+        // this provider's own default and the environment for the two knobs it selects — while a
+        // request that selects neither leaves `SCAIL2_MEM_DEFAULT` exactly as it was. The values are
+        // already domain-admitted by the shared request floor against `EXECUTION_SURFACE`.
+        d.set_memory_config(DitMemoryConfig::with_request(
+            DitMemoryConfig::from_env(SCAIL2_MEM_DEFAULT),
+            job.memory.as_ref(),
+        ));
         // Quantize the attention + FFN Linears in place (Q4 default in the SceneWorks worker). The
         // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
         if let Some(q) = quant {
@@ -840,6 +878,7 @@ mod tests {
             fps: 16,
             segment_len: 81,
             segment_overlap: 5,
+            memory: None,
         };
         let inaccessible = AdapterSpec::new(
             std::path::PathBuf::from("/sc16198-missing/adapter.safetensors"),

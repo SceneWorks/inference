@@ -1024,6 +1024,8 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
 /// tracked with the other additive descriptor gaps as `sc-15041`.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: None,
         control_kinds: None,
         required_components: &[],
         id: variant.model_id(),

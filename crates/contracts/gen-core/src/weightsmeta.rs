@@ -183,11 +183,43 @@ pub struct SafetensorsTensorHeader {
 impl SafetensorsTensorHeader {
     /// Whether Candle's shared `Weights` loader casts this source dtype to its requested float
     /// compute dtype. Integer and boolean tensors remain stored-width.
+    ///
+    /// `F8_E4M3` is deliberately **excluded**: `candle_gen::weights::coerce_float` only casts
+    /// `F16 | BF16 | F32 | F64`, so an fp8 payload stays at its stored width and needs an explicit,
+    /// route-owned dequantization contract (paired `weight_scale`/`scales` companions) before it can
+    /// be priced. Admission guards therefore fail closed on fp8 through this predicate; a route that
+    /// genuinely accepts fp8 declares it explicitly, the way
+    /// [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
             Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64
         )
+    }
+
+    /// Checked element count described by the tensor shape.
+    pub fn element_count(&self) -> Result<u64> {
+        self.shape.iter().try_fold(1_u64, |count, dimension| {
+            let dimension = u64::try_from(*dimension).map_err(|_| {
+                Error::Msg(format!(
+                    "tensor {:?} has an unrepresentable dimension",
+                    self.name
+                ))
+            })?;
+            count
+                .checked_mul(dimension)
+                .ok_or_else(|| Error::Msg(format!("tensor {:?} element count overflow", self.name)))
+        })
+    }
+
+    /// Checked bytes after a loader materializes each logical element at `width` bytes.
+    pub fn materialized_bytes(&self, width: u64) -> Result<u64> {
+        self.element_count()?.checked_mul(width).ok_or_else(|| {
+            Error::Msg(format!(
+                "tensor {:?} {width}-byte materialization size overflow",
+                self.name
+            ))
+        })
     }
 }
 
@@ -268,6 +300,34 @@ pub fn safetensors_path_tensor_headers(
                         path.display()
                     ))
                 })?;
+                let element_count = info.shape.iter().try_fold(1_u64, |count, dimension| {
+                    let dimension = u64::try_from(*dimension).map_err(|_| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has an unrepresentable dimension",
+                            path.display()
+                        ))
+                    })?;
+                    count.checked_mul(dimension).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has a shape product overflow",
+                            path.display()
+                        ))
+                    })
+                })?;
+                let expected_bytes = element_count
+                    .checked_mul(info.dtype.size() as u64)
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "safetensors tensor {name:?} in {} has a byte-size overflow",
+                            path.display()
+                        ))
+                    })?;
+                if data_bytes != expected_bytes {
+                    return Err(Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
+                        path.display(), info.dtype, info.shape
+                    )));
+                }
                 Ok((
                     start,
                     end,
@@ -821,6 +881,59 @@ mod tests {
         assert!(!root.exists(), "fixture root survived: {}", root.display());
     }
 
+    /// `is_float` answers exactly one question: does `candle_gen::weights::coerce_float` cast this
+    /// source dtype to the requested compute dtype? Every admission guard prices a "float" tensor at
+    /// the compute width and refuses everything else, so widening this set silently reprices — and
+    /// silently *admits* — checkpoints those guards were written to reject.
+    ///
+    /// `F8_E4M3` was widened in once (f9dfb4785) with no consumer and reverted here: fp8 stays at
+    /// stored width through `coerce_float`, so admitting it here would let an fp8 checkpoint through
+    /// a guard that then mis-prices it. Routes that really accept fp8 opt in explicitly (see
+    /// `encoder_contract`'s ComfyUI fp8 policy).
+    ///
+    /// The expectation is derived from an exhaustive dtype sweep rather than pinned as a count, so a
+    /// new safetensors dtype is classified deliberately instead of quietly inheriting `false`.
+    #[test]
+    fn is_float_admits_only_candle_cast_float_dtypes() {
+        const ALL_DTYPES: &[Dtype] = &[
+            Dtype::BOOL,
+            Dtype::U8,
+            Dtype::I8,
+            Dtype::F8_E5M2,
+            Dtype::F8_E4M3,
+            Dtype::I16,
+            Dtype::U16,
+            Dtype::F16,
+            Dtype::BF16,
+            Dtype::I32,
+            Dtype::U32,
+            Dtype::F32,
+            Dtype::F64,
+            Dtype::I64,
+            Dtype::U64,
+        ];
+
+        let admitted = ALL_DTYPES
+            .iter()
+            .copied()
+            .filter(|dtype| {
+                SafetensorsTensorHeader {
+                    name: "w".to_owned(),
+                    dtype: *dtype,
+                    shape: vec![1],
+                    data_bytes: dtype.size() as u64,
+                }
+                .is_float()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            admitted,
+            vec![Dtype::F16, Dtype::BF16, Dtype::F32, Dtype::F64],
+            "is_float must admit exactly the dtypes coerce_float casts"
+        );
+    }
+
     #[test]
     fn lokr_network_type_predicate() {
         assert!(is_lokr_network_type(Some("lokr")));
@@ -1139,6 +1252,22 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn header_only_reader_rejects_shape_dtype_payload_mismatch() {
+        let tmp = fixture_dir("gencore_header_shape_bytes_");
+        let path = tmp.path().join("wrong-bytes.safetensors");
+        let header = br#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0_u8; 4]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = safetensors_path_tensor_headers(&path)
+            .expect_err("shape/dtype byte mismatch must fail closed")
+            .to_string();
+        assert!(error.contains("requires 8"), "{error}");
     }
 
     #[test]

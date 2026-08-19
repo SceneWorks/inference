@@ -868,6 +868,10 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
             cache_eviction: true,
         },
         strategies: strategies(streamable),
+        // No decode-quality geometry table is declared for this route, and that is a statement of
+        // fact rather than a declared-but-refused authority — identical to every other MLX video
+        // provider after the sc-18325 sweep.
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape,
         // The shared graph is sufficient: rung 1 is selected explicitly and depends on nothing, and
@@ -1226,7 +1230,16 @@ pub const MEMORY_CONTRACT_FIXTURE: mlx_gen::gen_core::MemoryContractFixtureRegis
     mlx_gen::gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_contract,
+        surface_specs: memory_contract_surface_specs,
     };
+
+/// The shared MLX Bf16/Q4/Q8 witness set: this provider ships all three tiers and both eager and
+/// deferred (sc-18662) materialization shapes, so no selector filter is needed. A local name (the
+/// wan/ltx idiom) so the fixture registration spells identically across the two backends for the
+/// cross-backend geometry gate.
+fn memory_contract_surface_specs() -> Vec<mlx_gen::gen_core::MemoryContractSurfaceSpec> {
+    mlx_gen::gen_core::mlx_memory_contract_surface_specs()
+}
 
 /// The executable behavior seam every optimized implemented rung must have.
 pub const MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
@@ -1760,6 +1773,10 @@ mod tests {
             reference_count: 0,
         };
         let context = |geometry: MemoryGeometry, use_pid: bool| MemoryRunContext {
+            // The optimized StagedResidency probe must clear the shared authority gate to reach
+            // the geometry clauses under test; Calibrated matches the fixture's real calibration
+            // handshake above.
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
                 tier: MemoryNumericTier {

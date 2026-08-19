@@ -14,9 +14,10 @@
 //! [`layer_norm_2d`] is.
 
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::{conv2d as conv2d_op, multiply};
+use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
+use mlx_gen::nn::conv2d_general;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -79,18 +80,15 @@ impl Conv2d {
 
     /// NHWC in, NHWC out.
     pub fn forward(&self, x_nhwc: &Array) -> Result<Array> {
-        let y = conv2d_op(
+        conv2d_general(
             x_nhwc,
             &self.weight,
+            self.bias.as_ref(),
             (self.stride, self.stride),
             (self.padding, self.padding),
             (1, 1),
             self.groups,
-        )?;
-        Ok(match &self.bias {
-            Some(b) => mlx_rs::ops::add(&y, b)?,
-            None => y,
-        })
+        )
     }
 }
 

@@ -242,29 +242,56 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     // --- krea --------------------------------------------------------------------------------
     // Only the DiT differs across the five ids: `krea_2_edit` runs on Raw, `krea_2_turbo_edit` the
-    // same edit surface on Turbo (`mlx-gen-krea/src/lib.rs:34`). The VAE is `Qwen/Qwen-Image`'s, as
-    // Krea's own `vae/config.json` declares. The Qwen3-VL-4B tower is a pinned hole.
+    // same edit surface on Turbo (`mlx-gen-krea/src/lib.rs:34`). The native VAE is
+    // `Qwen/Qwen-Image`'s, as Krea's own `vae/config.json` declares. Every id can instead load the
+    // Wan 2.1 VAE through the registered alternate-decoder seam, so its component is part of each
+    // composite row just like the optional PiD component. The Qwen3-VL-4B tower is a pinned hole.
     ProviderComponents {
         provider_id: "krea_2_turbo",
-        components: &["krea_2_turbo", "qwen_image", "nvidia_pid_students"],
+        components: &[
+            "krea_2_turbo",
+            "qwen_image",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     ProviderComponents {
         provider_id: "krea_2_raw",
-        components: &["krea_2_raw", "qwen_image", "nvidia_pid_students"],
+        components: &[
+            "krea_2_raw",
+            "qwen_image",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     ProviderComponents {
         provider_id: "krea_2_edit",
-        components: &["krea_2_raw", "qwen_image", "nvidia_pid_students"],
+        components: &[
+            "krea_2_raw",
+            "qwen_image",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     ProviderComponents {
         provider_id: "krea_2_turbo_edit",
-        components: &["krea_2_turbo", "qwen_image", "nvidia_pid_students"],
+        components: &[
+            "krea_2_turbo",
+            "qwen_image",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     // The in-house pose branch (`SceneWorks/krea2-pose-controlnet-beta`) is a NOT FOUND hole — it
     // declares `experimental-research-only` with no text behind it.
     ProviderComponents {
         provider_id: "krea_2_turbo_control",
-        components: &["krea_2_turbo", "qwen_image", "nvidia_pid_students"],
+        components: &[
+            "krea_2_turbo",
+            "qwen_image",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     // --- krea-realtime -----------------------------------------------------------------------
     // Its "stock Wan" trio is Wan **2.1**, not 2.2 — see the `WAN2_1_T2V_14B_DIFFUSERS` row, which
@@ -351,7 +378,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // artifact.
     ProviderComponents {
         provider_id: "qwen_image",
-        components: &["qwen_image", "qwen_image_lightning", "nvidia_pid_students"],
+        components: &[
+            "qwen_image",
+            "qwen_image_lightning",
+            "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
+        ],
     },
     ProviderComponents {
         provider_id: "qwen_image_control",
@@ -360,6 +392,7 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "qwen_image_2512_fun_controlnet_union",
             "qwen_image_lightning",
             "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
         ],
     },
     ProviderComponents {
@@ -368,6 +401,7 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "qwen_image_edit",
             "qwen_image_edit_2511_lightning",
             "nvidia_pid_students",
+            "wan2_1_t2v_14b_diffusers",
         ],
     },
     // --- sana --------------------------------------------------------------------------------
@@ -788,6 +822,46 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+    }
+
+    /// The decoder registry's `license_component` is not ornamental metadata: every compatible
+    /// provider row must carry it, and the emitted manifest must therefore expose the complete
+    /// base-plus-Wan component union. The gen-core mutation test proves dropping the donor is red.
+    #[test]
+    fn alternate_decoder_composites_are_in_the_derived_manifest() {
+        assert_eq!(
+            gen_core::decoder_license_conformance_errors(
+                "mlx",
+                gen_core::DECODER_OPTIONS,
+                component_licenses(),
+                provider_components(),
+            ),
+            Vec::<String>::new()
+        );
+
+        let option = gen_core::DECODER_OPTIONS
+            .iter()
+            .find(|option| option.id == gen_core::WAN_2_1_VAE_DECODER_ID)
+            .expect("Wan decoder is registered");
+        let value: serde_json::Value =
+            serde_json::from_str(&component_licenses_manifest_json()).unwrap();
+        for provider_id in option.eligible_provider_ids {
+            let provider = value["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|provider| provider["provider_id"] == *provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} has a manifest row"));
+            assert!(
+                provider["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|component| component == option.license_component),
+                "{provider_id} must expose the selected decoder's component union"
+            );
+            assert!(provider["terms"].is_array(), "terms remain derived");
+        }
     }
 
     /// Every registered id either carries a mapping row with at least one resolvable component, or

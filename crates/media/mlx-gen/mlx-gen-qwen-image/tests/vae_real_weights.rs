@@ -7,8 +7,10 @@
 //!   cargo test -p mlx-gen-qwen-image --release --test vae_real_weights -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
-use mlx_gen_qwen_image::QwenVae;
-use mlx_rs::Array;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
+use mlx_gen_qwen_image::{load_vae, QwenVae};
+use mlx_rs::{random, Array};
+use std::path::PathBuf;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -47,6 +49,46 @@ fn vae_decode_matches_fork_golden() {
     // bound tolerates the few image-border pixels that diverge in f32 after upsample+conv.
     assert!(mean < 2e-3, "VAE decode mean-rel regressed: {mean:.3e}");
     assert!(peak < 1.5e-2, "VAE decode peak-rel regressed: {peak:.3e}");
+}
+
+/// SC-18309 N1 hardware gate: the native Qwen trait entry is exactly the former direct VAE call.
+/// This is bitwise because both arms execute the same MLX model, not cross-framework tolerance.
+#[test]
+#[ignore = "needs real Qwen-Image VAE weights"]
+fn native_decode_seam_is_byte_exact_and_precancelled() {
+    let snapshot = PathBuf::from(
+        std::env::var("MLX_GEN_QWEN_SNAPSHOT")
+            .expect("set MLX_GEN_QWEN_SNAPSHOT to the Qwen-Image MLX tier root"),
+    );
+    let vae = load_vae(&snapshot).unwrap();
+    let key = random::key(18_309).unwrap();
+    let latent = random::normal::<f32>(&[1, 16, 1, 8, 8], None, None, Some(&key)).unwrap();
+    let legacy = QwenVae::decode(&vae, &latent).unwrap();
+    let seam = LatentDecoder::decode(&vae, &latent).unwrap();
+    legacy.eval().unwrap();
+    seam.eval().unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(8, 2),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            QwenVae::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            LatentDecoder::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
 }
 
 #[test]

@@ -89,13 +89,11 @@ fn profile(provider_id: &str) -> gen_core::Result<ProviderProfile> {
     }
 }
 
-fn path(source: &WeightsSource) -> &std::path::Path {
-    match source {
-        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
-    }
-}
-
 fn streamable(spec: &LoadSpec) -> bool {
+    // File and Dir intentionally share this provider/calibration identity: their executable phase
+    // graph and output semantics are the same. The evidence matrix has no load-source axis, however,
+    // so a Dir-measured rung-4 cell cannot be claimed for File. Keep imported File rung 4 Missing
+    // until its pinned/re-openable implementation is independently measured.
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && spec.adapters.is_empty()
@@ -105,11 +103,213 @@ fn streamable(spec: &LoadSpec) -> bool {
         && spec.identity.is_none()
 }
 
-fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
+fn ggml_projection_bytes(
+    tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    quant: Quant,
+    component: &str,
+) -> gen_core::Result<u64> {
+    let [out, input] = tensor.shape.as_slice() else {
+        return tensor.materialized_bytes(4);
+    };
+    if !input.is_multiple_of(32) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "FLUX.2 {component} projection {:?} has input width {input}, which cannot be folded to {quant:?}",
+            tensor.name
+        )));
+    }
+    let elements = u64::try_from(*out)
+        .ok()
+        .and_then(|out| {
+            u64::try_from(*input)
+                .ok()
+                .and_then(|input| out.checked_mul(input))
+        })
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "FLUX.2 {component} projection {:?} element count overflow",
+                tensor.name
+            ))
+        })?;
+    let bytes_per_block = match quant {
+        // Candle's load-time fold uses native GGML Q4_0/Q8_0: 32 values plus one f16 scale.
+        Quant::Q4 => 18_u64,
+        Quant::Q8 => 34_u64,
+        Quant::Nvfp4 => {
+            return Err(gen_core::Error::Unsupported(
+                "FLUX.2 File imports do not support NVFP4 folding".into(),
+            ))
+        }
+    };
+    (elements / 32).checked_mul(bytes_per_block).ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "FLUX.2 {component} projection {:?} packed byte size overflow",
+            tensor.name
+        ))
+    })
+}
+
+fn f32_or_packed_component_bytes(
+    path: &std::path::Path,
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+    inline_fp8_scales: bool,
+) -> gen_core::Result<u64> {
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    f32_or_packed_tensor_headers(
+        &tensors,
+        quant,
+        component,
+        keep_embedding_dense,
+        inline_fp8_scales,
+        &path.display().to_string(),
+    )
+}
+
+fn f32_or_packed_tensor_headers(
+    tensors: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+    inline_fp8_scales: bool,
+    source: &str,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+    use std::collections::HashMap;
+
+    if tensors.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "FLUX.2 {component} '{source}' contains no tensors"
+        )));
+    }
+    let by_name: HashMap<&str, &gen_core::weightsmeta::SafetensorsTensorHeader> = tensors
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
+    let packed_bases = tensors
+        .iter()
+        .filter_map(|tensor| tensor.name.strip_suffix(".scales"))
+        .collect::<std::collections::HashSet<_>>();
+    tensors.iter().try_fold(0_u64, |total, tensor| {
+        let source_only =
+            tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".input_scale");
+        if source_only {
+            return Ok(total);
+        }
+
+        if tensor
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| tensor.name.strip_suffix(".biases"))
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            return Ok(total);
+        }
+
+        if let Some(base) = tensor
+            .name
+            .strip_suffix(".weight")
+            .filter(|base| packed_bases.contains(base))
+        {
+            let scales_name = format!("{base}.scales");
+            let biases_name = format!("{base}.biases");
+            let scales = by_name.get(scales_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} packed weight {:?} is missing {scales_name:?}",
+                    tensor.name
+                ))
+            })?;
+            let biases = by_name.get(biases_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} packed weight {:?} is missing {biases_name:?}",
+                    tensor.name
+                ))
+            })?;
+            let loaded = candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                tensor,
+                scales,
+                biases,
+                candle_gen::quant::MLX_GROUP_SIZE,
+            )?;
+            return total.checked_add(loaded).ok_or_else(|| {
+                gen_core::Error::Msg(format!("FLUX.2 {component} resident byte sum overflow"))
+            });
+        }
+
+        if inline_fp8_scales && tensor.dtype == Dtype::F8_E4M3 {
+            let Some(base) = tensor.name.strip_suffix(".weight") else {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} fp8 tensor {:?} is not a projection weight",
+                    tensor.name
+                )));
+            };
+            let scale_name = format!("{base}.weight_scale");
+            let scale = by_name.get(scale_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} fp8 weight {:?} is missing {scale_name:?}",
+                    tensor.name
+                ))
+            })?;
+            if scale.element_count()? == 0 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} scale {scale_name:?} is empty"
+                )));
+            }
+        }
+
+        let loaded = match tensor.dtype {
+            // Both the imported map (`build_comfyui_dit_map`) and snapshot VarBuilders request the
+            // pipeline's F32 dtype. Accepted integer tensors are therefore cast to F32 too; a rank-2
+            // projection then takes the same GGML fold as a floating source when Q4/Q8 is selected.
+            Dtype::U8
+            | Dtype::U16
+            | Dtype::U32
+            | Dtype::I16
+            | Dtype::I32
+            | Dtype::I64
+            | Dtype::F8_E4M3
+            | Dtype::F16
+            | Dtype::BF16
+            | Dtype::F32
+            | Dtype::F64 => {
+                if let Some(quant) = quant.filter(|_| {
+                    tensor.name.ends_with(".weight")
+                        && tensor.shape.len() == 2
+                        && !(keep_embedding_dense && tensor.name.ends_with("embed_tokens.weight"))
+                }) {
+                    ggml_projection_bytes(tensor, quant, component)?
+                } else {
+                    tensor.materialized_bytes(4)?
+                }
+            }
+            dtype => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "FLUX.2 {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                    tensor.name
+                )))
+            }
+        };
+        total.checked_add(loaded).ok_or_else(|| {
+            gen_core::Error::Msg(format!("FLUX.2 {component} resident byte sum overflow"))
+        })
+    })
+}
+
+fn resident_components(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<Vec<MemoryResidentComponent>> {
     let mut out = Vec::new();
     if provider_id == FLUX2_DEV_ID {
         if let Some(control) = spec.control.as_ref() {
-            let resident_bytes = gen_core::weightsmeta::safetensors_path_bytes(path(control));
+            let resident_bytes = match control {
+                WeightsSource::Dir(path) => gen_core::weightsmeta::safetensors_path_bytes(path),
+                WeightsSource::File(path) => {
+                    spec.read_file_unchanged_if_prepared(path, |p| -> gen_core::Result<u64> {
+                        Ok(gen_core::weightsmeta::safetensors_path_bytes(p))
+                    })?
+                }
+            };
             if resident_bytes > 0 {
                 out.push(MemoryResidentComponent {
                     id: "flux2_dev_fun_controlnet_union".to_owned(),
@@ -123,19 +323,85 @@ fn resident_components(provider_id: &str, spec: &LoadSpec) -> Vec<MemoryResident
             }
         }
     }
-    out
+    Ok(out)
 }
 
-pub fn provider_contract_for(
+pub(crate) fn composed_provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let profile = profile(provider_id)?;
+    if provider_id == FLUX2_KLEIN_9B_ID && matches!(spec.weights, WeightsSource::File(_)) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id} does not support imported single-file weights; only flux2_dev does"
+        )));
+    }
     let streamable = streamable(spec);
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
-            .unwrap_or_default();
-    let resident_components = resident_components(provider_id, spec);
+    let mut components = match &spec.weights {
+        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
+            spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap_or_default(),
+        WeightsSource::File(dit) => {
+            let base = gen_core::require_base_snapshot(spec, provider_id)?;
+            let quant = resolved_quant(spec)?;
+            PerComponentBytes {
+                text_encoder: f32_or_packed_component_bytes(
+                    &base.join("text_encoder"),
+                    quant,
+                    "base text encoder",
+                    true,
+                    false,
+                )?,
+                dit: spec.read_file_unchanged_if_prepared(dit, |p| {
+                    f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
+                })?,
+                vae: f32_or_packed_component_bytes(
+                    &base.join("vae"),
+                    None,
+                    "base VAE",
+                    false,
+                    false,
+                )?,
+            }
+        }
+    };
+    // An explicit encoder is a load-bearing authored selection, so price the same route-specific,
+    // contract-validated tensor surface the concrete loader materializes. Raw direct-shard sums can
+    // include a complete alternate snapshot's unused visual tower, unloaded decoder tail, or other
+    // unrelated tensors and would make the fit gate disagree with the admitted runtime.
+    let base = gen_core::require_base_snapshot(spec, provider_id)?;
+    let has_authored_encoder =
+        spec.text_encoder.is_some() || base.join("text_encoder/config.json").is_file();
+    if has_authored_encoder {
+        let variant = match provider_id {
+            FLUX2_DEV_ID => Flux2Variant::Dev,
+            FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+            _ => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "unknown FLUX.2 memory provider {provider_id}"
+                )))
+            }
+        };
+        let selected = variant.encoder_contract().source_for_planning(spec, base)?;
+        let headers = selected.materialized_language_tensor_headers(&variant.encoder_contract())?;
+        let text_encoder_quant = (provider_id == FLUX2_DEV_ID)
+            .then(|| resolved_quant(spec))
+            .transpose()?
+            .flatten();
+        components.text_encoder = f32_or_packed_tensor_headers(
+            &headers,
+            text_encoder_quant,
+            "selected text encoder",
+            true,
+            false,
+            "selected direct-shard inventory",
+        )?;
+    }
+    let resident_components = resident_components(provider_id, spec)?;
     let overlay_bytes = resident_components
         .iter()
         .map(|component| component.resident_bytes)
@@ -185,6 +451,7 @@ pub fn provider_contract_for(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         // This provider's constrained implementations load request-scoped phases. The explicit
@@ -248,6 +515,23 @@ pub fn provider_contract_for(
     })
 }
 
+pub fn provider_contract_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    let variant = match provider_id {
+        FLUX2_DEV_ID => Flux2Variant::Dev,
+        FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 memory provider {provider_id}"
+            )))
+        }
+    };
+    crate::validate_load_spec(variant, spec)?;
+    composed_provider_contract_for(provider_id, spec)
+}
+
 pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     provider_contract_for(FLUX2_DEV_ID, spec)
 }
@@ -264,10 +548,11 @@ pub fn contract_for_variant(
 }
 
 fn packed_quant(spec: &LoadSpec) -> gen_core::Result<Option<Quant>> {
+    // Imported ComfyUI File weights carry their own fp8 representation and may request the same
+    // explicit on-the-fly Q4/Q8 fold as the historical shim. They do not have a snapshot transformer
+    // config from which a packed tier could be inferred.
     let WeightsSource::Dir(root) = &spec.weights else {
-        return Err(gen_core::Error::Unsupported(
-            "flux2_dev: numeric tier requires a snapshot directory".to_owned(),
-        ));
+        return Ok(None);
     };
     let config = root.join("transformer/config.json");
     let packed = match std::fs::read_to_string(&config) {
@@ -936,6 +1221,398 @@ mod tests {
         spec
     }
 
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn append_sparse_f16_tensor(path: &std::path::Path, name: &str, shape: &[usize]) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut encoded_len = [0_u8; 8];
+        file.read_exact(&mut encoded_len).unwrap();
+        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        let start = header
+            .values()
+            .filter_map(|entry| entry["data_offsets"][1].as_u64())
+            .max()
+            .unwrap_or(0);
+        let bytes = shape
+            .iter()
+            .try_fold(2_u64, |total, dimension| {
+                total.checked_mul(*dimension as u64)
+            })
+            .unwrap();
+        let end = start.checked_add(bytes).unwrap();
+        assert!(header
+            .insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            )
+            .is_none());
+        let encoded = serde_json::to_vec(&header).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EncoderSelection {
+        Builtin,
+        OverrideDir,
+        OverrideFile,
+        CompleteSnapshot,
+    }
+
+    fn directory_spec_with_encoder(
+        tmp: &tempfile::TempDir,
+        variant: Flux2Variant,
+        selection: EncoderSelection,
+    ) -> (LoadSpec, std::path::PathBuf) {
+        let root = tmp.path().join("base");
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_typed_safetensors(
+                &root.join(component).join("model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            variant.encoder_contract(),
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        let selected = match selection {
+            EncoderSelection::Builtin => tmp.path().join("base/text_encoder"),
+            EncoderSelection::OverrideDir | EncoderSelection::OverrideFile => {
+                let selected = tmp.path().join("selected-text-encoder");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected,
+                    variant.encoder_contract(),
+                )
+                .unwrap();
+                spec.text_encoder = Some(match selection {
+                    EncoderSelection::OverrideDir => WeightsSource::Dir(selected.clone()),
+                    EncoderSelection::OverrideFile => {
+                        WeightsSource::File(selected.join("model.safetensors"))
+                    }
+                    _ => unreachable!(),
+                });
+                selected
+            }
+            EncoderSelection::CompleteSnapshot => {
+                let selected = tmp.path().join("selected-snapshot");
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &selected.join("text_encoder"),
+                    variant.encoder_contract(),
+                )
+                .unwrap();
+                spec.text_encoder = Some(WeightsSource::Dir(selected.clone()));
+                selected.join("text_encoder")
+            }
+        };
+        (spec, selected)
+    }
+
+    fn packed_dev_directory_spec(tmp: &tempfile::TempDir, bits: i32) -> LoadSpec {
+        let root = tmp.path().join("packed-dev");
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_typed_safetensors(
+                &root.join(component).join("model.safetensors"),
+                &[("probe", "BF16", &[1], 2)],
+            );
+        }
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+            Some(bits),
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.quantize = Some(match bits {
+            4 => Quant::Q4,
+            8 => Quant::Q8,
+            _ => panic!("test supports Q4/Q8 only"),
+        });
+        spec
+    }
+
+    fn file_spec(tmp: &tempfile::TempDir, quant: Option<Quant>) -> LoadSpec {
+        let root = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.weight", "BF16", &[4], 8),
+                ("decoder.bias", "U8", &[4], 4),
+            ],
+        );
+        let dit = tmp.path().join("dit.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[
+                ("double_blocks.0.img_mlp.0.weight", "F8_E4M3", &[2, 32], 64),
+                ("double_blocks.0.img_mlp.0.weight_scale", "F32", &[], 4),
+                ("double_blocks.0.img_mlp.0.input_scale", "F32", &[], 4),
+                ("double_blocks.0.img_mlp.2.weight", "U8", &[2, 32], 64),
+                ("double_blocks.0.img_mlp.0.bias", "F16", &[2], 4),
+            ],
+        );
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root));
+        spec.quantize = quant;
+        spec
+    }
+
+    #[test]
+    fn imported_file_asset_facts_follow_fp8_dequant_and_ggml_packing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dense_spec = file_spec(&tmp, None);
+        let dense = provider_contract(&dense_spec).unwrap();
+        let dense_conditioning = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(
+                &dense_spec,
+                gen_core::require_base_snapshot(&dense_spec, FLUX2_DEV_ID).unwrap(),
+            )
+            .unwrap();
+        let dense_conditioning = f32_or_packed_tensor_headers(
+            &dense_conditioning.tensor_headers().unwrap(),
+            None,
+            "selected text encoder",
+            true,
+            false,
+            "test inventory",
+        )
+        .unwrap();
+        assert_eq!(dense.asset_facts.conditioning_bytes, dense_conditioning);
+        assert_eq!(dense.asset_facts.transformer_bytes, 520);
+        assert_eq!(dense.asset_facts.decoder_bytes, 32);
+
+        let packed_spec = file_spec(&tmp, Some(Quant::Q4));
+        let packed = provider_contract(&packed_spec).unwrap();
+        let packed_conditioning = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(
+                &packed_spec,
+                gen_core::require_base_snapshot(&packed_spec, FLUX2_DEV_ID).unwrap(),
+            )
+            .unwrap();
+        let packed_conditioning = f32_or_packed_tensor_headers(
+            &packed_conditioning.tensor_headers().unwrap(),
+            Some(Quant::Q4),
+            "selected text encoder",
+            true,
+            false,
+            "test inventory",
+        )
+        .unwrap();
+        assert_eq!(packed.asset_facts.conditioning_bytes, packed_conditioning);
+        assert_eq!(packed.asset_facts.transformer_bytes, 36 + 36 + 8);
+        assert_eq!(packed.asset_facts.decoder_bytes, 32);
+        assert_eq!(
+            packed.asset_facts.base_bytes,
+            packed_conditioning + packed.asset_facts.transformer_bytes + 32
+        );
+    }
+
+    #[test]
+    fn imported_file_contract_and_loader_share_the_full_typed_field_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = file_spec(&tmp, Some(Quant::Q4));
+        let mut cases = vec![("valid", valid.clone())];
+        cases.push(("dense-is-accepted", file_spec(&tmp, None)));
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        cases.push(("precision-is-accepted", precision));
+        let mut pid = valid.clone();
+        pid.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+            gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+        });
+        cases.push(("pid-is-accepted", pid));
+
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        cases.push(("adapter", adapter));
+        let mut nvfp4 = valid.clone();
+        nvfp4.quantize = Some(Quant::Nvfp4);
+        cases.push(("nvfp4", nvfp4));
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        cases.push(("control", control));
+        let mut extra = valid.clone();
+        extra
+            .extra_controls
+            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
+        cases.push(("extra-control", extra));
+        let mut ip = valid.clone();
+        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
+        cases.push(("ip-adapter", ip));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        cases.push(("identity", identity));
+        let mut external_te = valid.clone();
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &external_te_root,
+            crate::config::DEV_ENCODER_CONTRACT,
+            Some(4),
+        )
+        .unwrap();
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
+        cases.push(("external-text-encoder", external_te));
+        let mut unknown = valid.clone();
+        unknown.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        cases.push(("unknown-component", unknown));
+
+        for (name, spec) in cases {
+            assert_eq!(
+                crate::validate_load_spec(Flux2Variant::Dev, &spec).is_ok(),
+                provider_contract(&spec).is_ok(),
+                "File loader/contract validation drift for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_encoder_asset_facts_ignore_unmaterialized_route_tensors() {
+        for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
+            for selection in [
+                EncoderSelection::Builtin,
+                EncoderSelection::OverrideDir,
+                EncoderSelection::OverrideFile,
+                EncoderSelection::CompleteSnapshot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (spec, selected) = directory_spec_with_encoder(&tmp, variant, selection);
+                let conditioning = || {
+                    provider_contract_for(variant.id(), &spec)
+                        .unwrap()
+                        .asset_facts
+                        .conditioning_bytes
+                };
+                let baseline = conditioning();
+                let prefix = match variant {
+                    Flux2Variant::Klein9b => "model",
+                    Flux2Variant::Dev => "language_model.model",
+                };
+                for (name, shape) in [
+                    ("visual.unused.weight".to_owned(), vec![17]),
+                    (
+                        format!(
+                            "{prefix}.layers.{}.unused_projection.weight",
+                            variant.encoder_contract().loaded_hidden_layers
+                        ),
+                        vec![19],
+                    ),
+                    (format!("{prefix}.unused_projection.weight"), vec![23]),
+                ] {
+                    append_sparse_f16_tensor(&selected.join("model.safetensors"), &name, &shape);
+                    assert_eq!(
+                        conditioning(),
+                        baseline,
+                        "{} {selection:?} charged ignored tensor {name}",
+                        variant.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_dev_conditioning_prices_the_runtime_qtensor_format_once() {
+        let contract = crate::config::DEV_ENCODER_CONTRACT;
+        let attention_width = contract.num_attention_heads * contract.head_dim;
+        let kv_width = contract.num_key_value_heads * contract.head_dim;
+        let matrix_elements = contract.vocab_size * contract.hidden_size
+            + contract.loaded_hidden_layers
+                * (2 * attention_width * contract.hidden_size
+                    + 2 * kv_width * contract.hidden_size
+                    + 3 * contract.intermediate_size * contract.hidden_size);
+        let dense_vector_bytes = contract.loaded_hidden_layers * 2 * contract.hidden_size * 4;
+
+        for (bits, bytes_per_block) in [(4, 20_u64), (8, 34_u64)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = packed_dev_directory_spec(&tmp, bits);
+            let expected = u64::try_from(matrix_elements / candle_gen::quant::QUANT_BLOCK).unwrap()
+                * bytes_per_block
+                + u64::try_from(dense_vector_bytes).unwrap();
+            assert_eq!(
+                provider_contract(&spec)
+                    .unwrap()
+                    .asset_facts
+                    .conditioning_bytes,
+                expected,
+                "Q{bits} must count each Q4_1/Q8_0 tensor and no transient affine sidecars"
+            );
+        }
+    }
+
+    #[test]
+    fn klein_load_and_memory_contract_reject_the_same_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/klein.safetensors".into()))
+            .with_component(
+                gen_core::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir("/tmp/klein-base".into()),
+            );
+        let load_error = crate::load_klein(&spec)
+            .err()
+            .expect("Klein loader must reject File")
+            .to_string();
+        let contract_error = klein_provider_contract(&spec).unwrap_err().to_string();
+        assert_eq!(contract_error, load_error);
+        assert!(contract_error.contains("only flux2_dev"));
+    }
+
     fn capability(
         contract: &MemoryProviderContract,
         strategy: MemoryStrategy,
@@ -1079,7 +1756,7 @@ mod tests {
     fn klein_contract_never_inherits_dev_control_residency_identity() {
         let mut spec = spec();
         spec.control = Some(WeightsSource::File("control.safetensors".into()));
-        let contract = klein_provider_contract(&spec).unwrap();
+        let contract = composed_provider_contract_for(FLUX2_KLEIN_9B_ID, &spec).unwrap();
         let MemoryFormulaKind::ComponentPhaseEnvelope {
             resident_components,
             ..

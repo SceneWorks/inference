@@ -77,7 +77,7 @@ use super::{EncoderLayer, ZTextEncoderConfig};
 /// / ComfyUI-normalized `Weights` has none, so those loads simply do not construct a stream and the
 /// contract declares the text-encoder scope unavailable for them, exactly as the DiT stream does.
 pub(crate) struct TextEncoderBlockStream {
-    source: WeightsSource,
+    validated: mlx_gen::gen_core::ValidatedEncoderSource,
     /// Key prefix for the stack, so block `n` is `{base}.{n}` (`"model.layers"` on a real snapshot).
     base: String,
     cfg: ZTextEncoderConfig,
@@ -89,9 +89,13 @@ pub(crate) struct TextEncoderBlockStream {
 }
 
 impl TextEncoderBlockStream {
-    pub(crate) fn new(source: WeightsSource, prefix: &str, cfg: ZTextEncoderConfig) -> Self {
+    pub(crate) fn new_validated(
+        validated: mlx_gen::gen_core::ValidatedEncoderSource,
+        prefix: &str,
+        cfg: ZTextEncoderConfig,
+    ) -> Self {
         Self {
-            source,
+            validated,
             base: super::join(prefix, "layers"),
             cfg,
             quant_bits: None,
@@ -108,10 +112,17 @@ impl TextEncoderBlockStream {
 
     /// Open a fresh lazy view of the encoder's weights. Called once per window by `run_windowed`.
     pub(crate) fn open(&self) -> Result<Weights> {
-        match &self.source {
+        let open = |source: &WeightsSource| match source {
             WeightsSource::Dir(dir) => Weights::from_dir(dir),
             WeightsSource::File(file) => Weights::from_file(file),
-        }
+        };
+        self.validated.read_unchanged(open)
+    }
+
+    /// Recheck the retained receipt after a lazy window graph has actually been evaluated. Opening
+    /// a `Weights` view is not the payload read on MLX, so the guard must also span the later eval.
+    fn ensure_source_unchanged(&self) -> Result<()> {
+        self.validated.read_unchanged::<(), Error>(|_| Ok(()))
     }
 
     /// Materialize encoder layer `index` out of `view`, quantized exactly like its resident twin, then
@@ -201,11 +212,54 @@ pub(crate) fn run_windowed_layers(
             })
         },
         |carry: &EncoderCarry| {
-            Ok(mlx_rs::transforms::eval([
-                &carry.prev,
-                &carry.second_to_last,
-            ])?)
+            mlx_rs::transforms::eval([&carry.prev, &carry.second_to_last])?;
+            stream.ensure_source_unchanged()
         },
     )?;
     Ok(out.second_to_last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validated_stream_rechecks_source_before_each_deferred_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        let source = crate::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(fixture.path().to_path_buf()))
+            .unwrap();
+        let stream =
+            TextEncoderBlockStream::new_validated(source, "model", ZTextEncoderConfig::z_image());
+
+        std::fs::write(fixture.path().join("config.json"), b"{}\n").unwrap();
+        let error = stream
+            .open()
+            .err()
+            .expect("a deferred reopen must reject a post-validation replacement")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    fn validated_stream_rechecks_source_after_a_lazy_view_was_opened() {
+        let fixture = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), crate::ENCODER_CONTRACT)
+            .unwrap();
+        let source = crate::ENCODER_CONTRACT
+            .validate_source(&WeightsSource::Dir(fixture.path().to_path_buf()))
+            .unwrap();
+        let stream =
+            TextEncoderBlockStream::new_validated(source, "model", ZTextEncoderConfig::z_image());
+
+        let _lazy_view = stream.open().unwrap();
+        std::fs::write(fixture.path().join("config.json"), b"{}\n").unwrap();
+        let error = stream
+            .ensure_source_unchanged()
+            .expect_err("payload evaluation must retain the source guard after lazy open")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
+    }
 }

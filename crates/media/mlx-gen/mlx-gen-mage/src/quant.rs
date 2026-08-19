@@ -134,6 +134,19 @@ pub const COMPONENT_PRECISION_FLOORS: &[ComponentPrecisionFloor] = &[
     },
 ];
 
+/// The descriptor declaration filtered to the floors active for one selected numeric tier.
+///
+/// Both current Mage floors are Q4-only. Q8 and dense BF16 still publish the declaration through
+/// the descriptor, but their request/evidence receipts must be empty: they apply no promotion.
+pub(crate) const fn active_component_precision_floors(
+    selected: Option<Quant>,
+) -> &'static [ComponentPrecisionFloor] {
+    match selected {
+        Some(Quant::Q4) => COMPONENT_PRECISION_FLOORS,
+        _ => &[],
+    }
+}
+
 /// The width `base` is actually packed at when tier `requested` was asked for.
 ///
 /// The **single seam** every packing path calls — the offline converter
@@ -208,5 +221,11 @@ mod descriptor_floor_tests {
         assert!(COMPONENT_PRECISION_FLOORS
             .iter()
             .all(|floor| { floor.selected_tier == Quant::Q4 && floor.resident_tier == Quant::Q8 }));
+        assert_eq!(
+            active_component_precision_floors(Some(Quant::Q4)),
+            COMPONENT_PRECISION_FLOORS
+        );
+        assert!(active_component_precision_floors(Some(Quant::Q8)).is_empty());
+        assert!(active_component_precision_floors(None).is_empty());
     }
 }

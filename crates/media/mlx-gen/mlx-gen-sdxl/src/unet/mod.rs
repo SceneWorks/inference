@@ -199,6 +199,33 @@ impl UNet2DConditionModel {
         Ok(())
     }
 
+    /// Evaluate the retained U-Net representation one module at a time. This is the final step of
+    /// fused-file Q4/Q8 loading: linears have already been replaced by packed projections, so the
+    /// walk bounds dense source evaluation to the convolution/norm leaves that intentionally stay
+    /// dense plus one packed projection at a time.
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.conv_in.materialize_weights()?;
+        self.timesteps.materialize_weights()?;
+        self.time_embedding.materialize_weights()?;
+        self.add_time_proj.materialize_weights()?;
+        self.add_embedding.materialize_weights()?;
+        for block in &self.down_blocks {
+            block.materialize_weights()?;
+        }
+        self.mid_resnet0.materialize_weights()?;
+        self.mid_transformer.materialize_weights()?;
+        self.mid_resnet1.materialize_weights()?;
+        for block in &self.up_blocks {
+            block.materialize_weights()?;
+        }
+        mlx_rs::transforms::eval([&self.conv_norm_out_w, &self.conv_norm_out_b])?;
+        self.conv_out.materialize_weights()?;
+        if let Some(projection) = &self.encoder_hid_proj {
+            projection.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     /// Toggle SDPA-segment gradient checkpointing across every cross-attention transformer (sc-4941):
     /// down/up blocks + the mid transformer. Training-only; opt-in (the SDXL first-step working set
     /// fits unified memory without it, so the trainer gates this on `gradient_checkpointing` rather

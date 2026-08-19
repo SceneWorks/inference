@@ -92,8 +92,8 @@ fn inputs(img_seq: i32, txt_seq: i32) -> (Array, Array) {
 }
 
 /// Load the real transformer at a chosen depth. `layers < 60` truncates the `blocks` Vec only
-/// (`transformer.rs`); it does not touch `set_compile_glue`, which is a process-global atomic in
-/// `mlx-gen/src/nn.rs` — so the depth series really is the same fusion at a shorter stack.
+/// (`transformer.rs`); it does not touch the request/thread-local `set_compile_glue` setting — so
+/// the depth series really is the same fusion at a shorter stack.
 fn load(root: &Path, layers: usize, edit: bool) -> QwenTransformer {
     let mut w = Weights::from_dir(root.join("transformer")).expect("weights");
     remap_transformer_keys(&mut w);

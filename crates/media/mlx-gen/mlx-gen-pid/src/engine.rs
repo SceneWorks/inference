@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_rs::Dtype;
 
+use mlx_gen::gen_core::LatentSpace;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     flow_capture_plan, CancelFlag, Error, GenerationRequest, PidWeights, Result, WeightsSource,
@@ -41,6 +42,8 @@ pub struct PidEngine {
     weights: Weights,
     /// Per-latent-space backbone config (`sr4x` topology + the space's LQ latent-channel count).
     cfg: PidConfig,
+    /// Exact latent contract selected by the backbone registry.
+    input_latent_space: LatentSpace,
     /// The released 4-step SDE distill sampler config.
     sampler_cfg: SamplerConfig,
     /// The Gemma-2-2b caption encoder (loaded once; the projection runs per caption).
@@ -92,6 +95,7 @@ impl PidEngine {
         Ok(Self {
             weights,
             cfg,
+            input_latent_space: spec.input_latent_space,
             sampler_cfg: SamplerConfig::distill_4step(),
             caption,
             ckpt_prefix: "",
@@ -138,7 +142,8 @@ impl PidEngine {
             self.cfg.sr_scale,
             self.cfg.latent_spatial_down_factor,
             seed,
-        ))
+        )
+        .with_input_latent_space(self.input_latent_space))
     }
 }
 

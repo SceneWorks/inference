@@ -727,7 +727,13 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64, device: &Device) ->
 /// and reads the size from the tensor (never `latent*8`).
 fn decode(vae: &AutoEncoderKL, pid: Option<&PidDecoder>, lat: &Tensor) -> Result<Image> {
     let decoded = match pid {
-        Some(pid) => pid.decode(lat)?,
+        Some(pid) => {
+            candle_gen::ensure_decoder_compatible(
+                Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                pid,
+            )?;
+            pid.decode(lat)?
+        }
         None => vae.decode(lat)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
     };
     let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;

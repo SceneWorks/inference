@@ -114,7 +114,7 @@ mod vae_tiling_assignment_tests {
 // unchanged.
 //
 // The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
-// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+// request/thread-local setting is shared with the FLUX family.
 pub(crate) use mlx_gen::nn::compile_glue;
 pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
@@ -128,6 +128,7 @@ pub fn register_providers(
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
             contract: memory_strategy::weights_free_memory_strategy_contract,
+            surface_specs: memory_strategy::memory_contract_surface_specs,
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
@@ -400,7 +401,7 @@ mod compile_glue_guard_tests {
         }
         assert!(compile_glue(), "guard restores the prior (on) on drop");
 
-        // Leave the global eager, as the reference-parity gates expect.
+        // Leave this thread eager, as the reference-parity gates expect.
         set_compile_glue(false);
     }
 }

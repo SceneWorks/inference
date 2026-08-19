@@ -41,6 +41,7 @@ fn real_weight_fun_control() {
 
     let paths = QwenFunControlPaths {
         qwen_base: env_path("QWEN_FUN_BASE"),
+        text_encoder: None,
         controlnet: env_path("QWEN_FUN_NET"),
         adapters: Vec::new(),
     };
@@ -80,6 +81,7 @@ fn real_weight_fun_control() {
         drop(model);
         let adapted = QwenFunControl::load(&QwenFunControlPaths {
             qwen_base: env_path("QWEN_FUN_BASE"),
+            text_encoder: None,
             controlnet: env_path("QWEN_FUN_NET"),
             adapters: vec![candle_gen::gen_core::AdapterSpec::new(
                 adapter.into(),

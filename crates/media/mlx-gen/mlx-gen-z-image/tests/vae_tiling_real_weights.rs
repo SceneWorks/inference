@@ -7,10 +7,10 @@
 //!   cargo test -p mlx-gen-z-image --release --test vae_tiling_real_weights -- --ignored --nocapture
 //!
 //! The Z-Image VAE is a diffusers AutoencoderKL whose up-blocks + `conv_norm_out` use **GroupNorm**
-//! (spatially global statistics), so per-tile stats drift slightly from the whole-image ones and the
-//! parity is APPROXIMATE — visually seam-free (verified by eye), not bit-exact like an RMSNorm VAE. The
-//! assertion therefore guards only against gross seams/corruption; the measured 512 px residual is
-//! ~1.1% of pixels differing by >8.
+//! (spatially global statistics). Since SC-19753 the bounded path computes those statistics over the
+//! full activation and tiles only halo-expanded 3×3 convolutions. Floating-point execution order can
+//! still make parity approximate, but there is no per-crop normalization model. The assertion uses the
+//! same 48/255 maximum-error bar as production decode-quality admission.
 
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::FlowMatchEuler;
@@ -100,5 +100,9 @@ fn tiled_decode_matches_single_pass() {
         frac8 < 0.03,
         "tiled decode grossly diverges from single-pass: {:.3}% of pixels differ by >8",
         100.0 * frac8
+    );
+    assert!(
+        max_d <= 48,
+        "layer-wise tiled decode exceeds the production 48/255 quality bar: {max_d}/255"
     );
 }

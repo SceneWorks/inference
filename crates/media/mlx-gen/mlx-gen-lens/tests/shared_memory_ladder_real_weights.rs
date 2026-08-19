@@ -206,6 +206,21 @@ fn shared_ladder_terminal_result() {
     let process_baseline_active = get_active_memory();
     let process_baseline_cache = get_cache_memory();
     let generator = load();
+    // SC-18605: the printed identity has to come from the contract this run actually loaded. The
+    // measured constant used to be printed unconditionally, so a `lens_turbo` or non-Q4 run — routes
+    // this runner accepts by env, and which SC-15800 explicitly did *not* calibrate — would stamp the
+    // measured `lens` Q4 fingerprint onto its own RESULT line. Those routes now declare the ladder,
+    // so the mislabeling went from latent to reachable.
+    let fingerprint = generator
+        .memory_strategy_contract()
+        .and_then(|contract| contract.calibration.as_ref())
+        .map(|identity| identity.fingerprint.clone())
+        .unwrap_or_else(|| format!("uncalibrated-estimate:{}:{:?}", provider(), tier()));
+    assert_eq!(
+        fingerprint == mlx_gen_lens::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        provider() == "lens" && tier() == Some(Quant::Q4),
+        "only the exact measured lens Q4 route may report the shared-ladder calibration identity"
+    );
     let arms = [
         ("resident", resident_memory()),
         ("staged", staged_memory()),
@@ -341,7 +356,7 @@ fn shared_ladder_terminal_result() {
         "TERMINAL_RESULT status=pass provider={} tier={:?} fingerprint={} load_shape={:?} size={} resident_peak_bytes={} rung4_peak_bytes={} cancel_recovery_peak_bytes={} decode_fault_recovery_peak_bytes={} process_baseline_active_bytes={} process_baseline_cache_bytes={} post_clear_active_bytes={} post_clear_cache_bytes={}",
         provider(),
         tier(),
-        mlx_gen_lens::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        fingerprint,
         LoadShape::DeferredMaterialization,
         edge(),
         resident_peak,
@@ -357,7 +372,7 @@ fn shared_ladder_terminal_result() {
         "RESULT status=pass provider={} tier={:?} fingerprint={} size={} decode_edge={} decode_overlap={} attention_chunk_size={} transformer_window_size={} transformer_component=both resident_peak_gib={:.3} rung4_peak_gib={:.3}",
         provider(),
         tier(),
-        mlx_gen_lens::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        fingerprint,
         edge(),
         mlx_gen_lens::memory_strategy::DECODE_TILE_EDGE,
         mlx_gen_lens::memory_strategy::DECODE_OVERLAP,

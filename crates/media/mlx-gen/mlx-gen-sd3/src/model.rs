@@ -251,15 +251,13 @@ fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3He
     if !spec.adapters.is_empty() {
         crate::adapters::apply_sd3_adapters(&mut transformer, &spec.adapters)?;
     }
-    if variant == Sd3Variant::Large && crate::memory_strategy::structurally_streamable(spec) {
-        let inventory = crate::artifact_inventory::Sd3ArtifactInventory::verify(spec)?.ok_or_else(
-            || {
-                Error::Unsupported(
-                    "sd3 deferred transformer materialization requires the exact calibrated Stable Diffusion 3.5 Large BF16 HF artifact"
-                        .to_owned(),
-                )
-            },
-        )?;
+    // SC-18606: the one-block window is variant-generic. `stream_inventory` is the SAME seam
+    // `memory_strategy::contract_for` consults to decide whether to publish
+    // `BoundedTransformerResidency` as `Implemented`, so a route can never advertise a rung this
+    // loader would then decline to attach — nor the reverse. `None` (an unstreamable selector or a
+    // snapshot with no readable `transformer/` subtree) leaves the resident block stack in place,
+    // exactly matching the rung-4-`Missing` contract the same spec produces.
+    if let Some(inventory) = crate::artifact_inventory::stream_inventory(variant.id(), spec)? {
         transformer = transformer.with_block_stream(inventory, arch);
         transformer.finalize_block_stream()?;
     }

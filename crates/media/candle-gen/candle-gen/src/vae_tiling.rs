@@ -28,8 +28,17 @@
 //! The driver's tiling **decisions and numerics are unchanged** from the two hand-copied bodies: same
 //! narrow offsets, same trapezoidal outer-product blend, same `maximum(1e-8)` normalize — so decoded
 //! output is byte-identical for a given plan + decode closure.
+//!
+//! **sc-18320 note — the separable blend fold is MLX-only for now.** `mlx-gen`'s tiled decode
+//! re-associated its accumulation by axis and factorized the blend normalizer into per-axis 1-D
+//! vectors because its `pad`-to-full placement materialized a full-output-sized transient per tile.
+//! This driver never had that blow-up: its `slice_assign` accumulators update only each tile's
+//! destination slice, so the sole full-size buffers are the `output` and `weights` accumulators
+//! themselves. Retiring the full-size `weights` buffer here (the remaining, smaller win) is left to
+//! the backend-convergence epic (sc-19048's mandate).
 
-use candle_core::{Error, Result, Tensor};
+use candle_core::{DType, Error, Result, Tensor};
+use gen_core::CancelFlag;
 
 #[cfg(test)]
 use gen_core::tiling::TemporalOverlapPolicy;
@@ -318,6 +327,326 @@ where
              frame count."
         )),
     })
+}
+
+/// Global GroupNorm statistics for an **NCHW** activation (sc-19753) — the candle twin of
+/// `mlx_gen::vae_tiling::GlobalGroupNorm`.
+///
+/// Whole-decode VAE tiling is not normalization-correct: every tile computes GroupNorm against its
+/// own crop, while a dense decode normalizes against the whole image. This context reduces the full
+/// activation once to per-batch/per-group mean and inverse standard deviation, then applies those
+/// same statistics to halo-expanded convolution crops. Only the tiny statistics tensors are kept;
+/// the full normalized activation is never materialized.
+///
+/// The arithmetic tracks [`candle_nn::GroupNorm`] exactly, including its dtype dance: statistics and
+/// the normalize are computed in f32 for f16/bf16 inputs, and the result is cast back **before** the
+/// per-channel affine, which is where candle applies it.
+pub struct GlobalGroupNorm {
+    /// `[B, G, 1]`, f32.
+    mean: Tensor,
+    /// `[B, G, 1]`, f32 — `1 / sqrt(var + eps)`.
+    inv_std: Tensor,
+    /// `[1, C, 1, 1]`, input dtype.
+    weight: Tensor,
+    /// `[1, C, 1, 1]`, input dtype.
+    bias: Tensor,
+    groups: usize,
+    channels: usize,
+    dtype: DType,
+}
+
+impl GlobalGroupNorm {
+    /// Capture dense GroupNorm statistics for an NCHW rank-4 activation. `weight`/`bias` are the
+    /// `[C]` affine parameters, exactly as [`fn@candle_nn::group_norm`] loads them.
+    pub fn new(
+        x: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        groups: usize,
+        eps: f64,
+    ) -> crate::Result<Self> {
+        let (b, c, h, w) = x.dims4()?;
+        if groups == 0 || c % groups != 0 {
+            return Err(crate::CandleError::Msg(format!(
+                "global group norm: channel count {c} not divisible by groups {groups}"
+            )));
+        }
+        if weight.dims() != [c] || bias.dims() != [c] {
+            return Err(crate::CandleError::Msg(format!(
+                "global group norm: affine shapes must both be [{c}], got {:?} and {:?}",
+                weight.dims(),
+                bias.dims()
+            )));
+        }
+        let dtype = x.dtype();
+        let internal = match dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        // candle reduces over `(C/G)·H·W` per (batch, group) — the same partition as its
+        // `reshape((b, num_groups, hidden_size))`.
+        let hidden = (c / groups) * h * w;
+        let grouped = x.reshape((b, groups, hidden))?.to_dtype(internal)?;
+        let mean = (grouped.sum_keepdim(2)? / hidden as f64)?;
+        let centered = grouped.broadcast_sub(&mean)?;
+        let var = (centered.sqr()?.sum_keepdim(2)? / hidden as f64)?;
+        let inv_std = (var + eps)?.sqrt()?.recip()?;
+        Ok(Self {
+            mean,
+            inv_std,
+            weight: weight.reshape((1, c, 1, 1))?,
+            bias: bias.reshape((1, c, 1, 1))?,
+            groups,
+            channels: c,
+            dtype,
+        })
+    }
+
+    /// Normalize one NCHW crop with the full activation's statistics and affine parameters.
+    pub fn apply(&self, tile: &Tensor) -> crate::Result<Tensor> {
+        let (b, c, h, w) = tile.dims4()?;
+        if c != self.channels {
+            return Err(crate::CandleError::Msg(format!(
+                "global group norm crop must be NCHW with {} channels, got {c}",
+                self.channels
+            )));
+        }
+        let internal = match self.dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden = (c / self.groups) * h * w;
+        let grouped = tile
+            .reshape((b, self.groups, hidden))?
+            .to_dtype(internal)?
+            .broadcast_sub(&self.mean)?
+            .broadcast_mul(&self.inv_std)?;
+        Ok(grouped
+            .to_dtype(self.dtype)?
+            .reshape((b, c, h, w))?
+            .broadcast_mul(&self.weight)?
+            .broadcast_add(&self.bias)?)
+    }
+}
+
+/// Apply one NCHW 3×3 / pad-1 convolution with bounded spatial work and exact convolution halos
+/// (sc-19753) — the candle twin of `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc`.
+///
+/// The output is partitioned into non-overlapping cores. Each input crop expands by one pixel on
+/// every available side, `preprocess` runs on that halo-expanded crop (typically global-stat
+/// GroupNorm + SiLU), and the convolution's halo is cropped away before assembly. Internal tile
+/// boundaries therefore never observe synthetic padding and never require a blend. `max_tile_edge`
+/// bounds the expanded convolution input, not merely the written core.
+///
+/// `conv` receives the preprocessed crop and must apply the 3×3 pad-1 convolution.
+pub fn tiled_conv2d_3x3_nchw<P, C>(
+    x: &Tensor,
+    max_tile_edge: usize,
+    cancel: Option<&CancelFlag>,
+    preprocess: P,
+    conv: C,
+) -> crate::Result<Tensor>
+where
+    P: Fn(&Tensor) -> crate::Result<Tensor>,
+    C: Fn(&Tensor) -> crate::Result<Tensor>,
+{
+    let (_b, _c, height, width) = x.dims4()?;
+    if max_tile_edge < 3 {
+        return Err(crate::CandleError::Msg(format!(
+            "tiled conv2d needs max_tile_edge >= 3, got {max_tile_edge}"
+        )));
+    }
+    if height <= max_tile_edge && width <= max_tile_edge {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(crate::CandleError::Canceled);
+        }
+        return conv(&preprocess(x)?);
+    }
+
+    const HALO: usize = 1;
+    let core_edge = max_tile_edge - 2 * HALO;
+    let mut rows = Vec::new();
+    let mut y0 = 0usize;
+    while y0 < height {
+        let y1 = (y0 + core_edge).min(height);
+        let input_y0 = y0.saturating_sub(HALO);
+        let input_y1 = (y1 + HALO).min(height);
+        let mut cores = Vec::new();
+        let mut x0 = 0usize;
+        while x0 < width {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(crate::CandleError::Canceled);
+            }
+            let x1 = (x0 + core_edge).min(width);
+            let input_x0 = x0.saturating_sub(HALO);
+            let input_x1 = (x1 + HALO).min(width);
+
+            let tile = x.narrow(2, input_y0, input_y1 - input_y0)?.narrow(
+                3,
+                input_x0,
+                input_x1 - input_x0,
+            )?;
+            let convolved = conv(&preprocess(&tile)?)?;
+            let core = convolved
+                .narrow(2, y0 - input_y0, y1 - y0)?
+                .narrow(3, x0 - input_x0, x1 - x0)?
+                .contiguous()?;
+            cores.push(core);
+            x0 = x1;
+        }
+        rows.push(Tensor::cat(&cores, 3)?);
+        y0 = y1;
+    }
+
+    if rows.is_empty() {
+        return Err(crate::CandleError::Msg(
+            "tiled conv2d produced no tiles".into(),
+        ));
+    }
+    Ok(Tensor::cat(&rows, 2)?)
+}
+
+#[cfg(test)]
+mod global_group_norm_tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_nn::Module;
+
+    /// A position-dependent NCHW activation, so per-crop statistics differ observably from the
+    /// dense ones and any comparison against them discriminates.
+    fn activation(b: usize, c: usize, h: usize, w: usize) -> Tensor {
+        let data = (0..(b * c * h * w))
+            .map(|i| {
+                let y = (i / w % h) as f32;
+                let x = (i % w) as f32;
+                (i as f32 * 0.071).sin() + y * 0.17 - x * 0.09
+            })
+            .collect::<Vec<_>>();
+        Tensor::from_vec(data, (b, c, h, w), &Device::Cpu).unwrap()
+    }
+
+    fn ramp(n: usize, base: f32, step: f32) -> Tensor {
+        let data = (0..n).map(|i| base + i as f32 * step).collect::<Vec<_>>();
+        Tensor::from_vec(data, n, &Device::Cpu).unwrap()
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// Applied to the whole activation, the global-statistics normalize must reproduce candle's own
+    /// `GroupNorm` — otherwise the layer-wise path would be tracking the wrong dense reference.
+    #[test]
+    fn whole_activation_matches_candle_group_norm() {
+        let (b, c, h, w, groups) = (2, 8, 5, 7, 4);
+        let x = activation(b, c, h, w);
+        let weight = ramp(c, 0.7, 0.013);
+        let bias = ramp(c, -0.04, 0.011);
+        let dense = candle_nn::GroupNorm::new(weight.clone(), bias.clone(), c, groups, 1e-6)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
+        let got = global.apply(&x).unwrap();
+        assert_eq!(got.dims(), dense.dims());
+        assert!(max_abs(&got, &dense) < 1e-6);
+    }
+
+    /// The layer-wise pair — global statistics plus halo/core convolution tiling — must track the
+    /// dense `GroupNorm → SiLU → 3×3 conv` layer. Mutation-discriminating: normalizing each crop
+    /// against itself (the defect) moves this comparison by orders of magnitude.
+    #[test]
+    fn global_stat_tiled_conv_tracks_the_dense_layer() {
+        let (b, c, h, w, groups) = (1, 8, 7, 9, 4);
+        let out_c = 3;
+        let x = activation(b, c, h, w);
+        let weight = ramp(c, 0.7, 0.013);
+        let bias = ramp(c, -0.04, 0.011);
+        let kernel = Tensor::from_vec(
+            (0..(out_c * c * 3 * 3))
+                .map(|i| (i as f32 * 0.037).sin() * 0.025)
+                .collect::<Vec<_>>(),
+            (out_c, c, 3, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let conv_bias = ramp(out_c, 0.02, -0.01);
+        let conv = candle_nn::Conv2d::new(
+            kernel,
+            Some(conv_bias),
+            candle_nn::Conv2dConfig {
+                padding: 1,
+                ..Default::default()
+            },
+        );
+
+        let norm =
+            candle_nn::GroupNorm::new(weight.clone(), bias.clone(), c, groups, 1e-6).unwrap();
+        let dense = conv
+            .forward(&candle_nn::ops::silu(&norm.forward(&x).unwrap()).unwrap())
+            .unwrap();
+
+        let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
+        let tiled = tiled_conv2d_3x3_nchw(
+            &x,
+            5,
+            None,
+            |tile| Ok(candle_nn::ops::silu(&global.apply(tile)?)?),
+            |tile| Ok(conv.forward(tile)?),
+        )
+        .unwrap();
+        assert_eq!(tiled.dims(), dense.dims());
+        let delta = max_abs(&tiled, &dense);
+        assert!(
+            delta < 2e-5,
+            "global-stat tiled layer diverged from dense GroupNorm+conv: max|delta|={delta:.3e}"
+        );
+
+        // Mutation control: per-crop statistics — the defect this guards — do NOT track the dense
+        // layer, so the assertion above is not vacuously satisfied by any tiling.
+        let per_crop = tiled_conv2d_3x3_nchw(
+            &x,
+            5,
+            None,
+            |tile| {
+                let local = GlobalGroupNorm::new(tile, &weight, &bias, groups, 1e-6)?;
+                Ok(candle_nn::ops::silu(&local.apply(tile)?)?)
+            },
+            |tile| Ok(conv.forward(tile)?),
+        )
+        .unwrap();
+        assert!(
+            max_abs(&per_crop, &dense) > 1e-3,
+            "per-crop normalization must be observably different from the dense layer"
+        );
+    }
+
+    /// A pre-tripped cancel is observed on both the tiled and the single-tile fall-through path.
+    #[test]
+    fn tiled_conv_honors_a_pretripped_cancel() {
+        let x = activation(1, 8, 7, 9);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        for edge in [5usize, 4096] {
+            let result = tiled_conv2d_3x3_nchw(
+                &x,
+                edge,
+                Some(&cancel),
+                |tile: &Tensor| -> crate::Result<Tensor> { Ok(tile.clone()) },
+                |tile: &Tensor| -> crate::Result<Tensor> { Ok(tile.clone()) },
+            );
+            assert!(matches!(result, Err(crate::CandleError::Canceled)));
+        }
+    }
 }
 
 #[cfg(test)]

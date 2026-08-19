@@ -32,35 +32,21 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::{WAN_Z48_MEAN as VAE22_MEAN, WAN_Z48_STD as VAE22_STD};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::vae_common::{
-    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
+    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
+    validate_decoder_tiling, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
 const CACHE_T: i32 = 2;
 /// Channel-L2 norm floor (reference `mx.maximum(l2_sq, 1e-24)`).
 const NORM_EPS: f32 = 1e-24;
-
-/// Per-channel latent normalization for z_dim=48 (reference `VAE22_MEAN`/`VAE22_STD`). These are
-/// architecture constants (not learned), hardcoded here and gated by the fixture.
-const VAE22_MEAN: [f32; 48] = [
-    -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813,
-    0.0891, 0.1570, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108,
-    -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230, -0.0313,
-    -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944,
-    0.3573, -0.0548, -0.1681, -0.0667,
-];
-const VAE22_STD: [f32; 48] = [
-    0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901,
-    0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
-    0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944,
-    0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
-];
 
 /// vae22 fixed structure (dim_mult [1,2,4,4], 2 res-blocks/stage).
 const DIM_MULT_LEN: usize = 4;
@@ -1097,11 +1083,29 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_upsample_tail(&self.forward_middle(x)?)
+    }
+
+    /// The **globally-scoped** half: `conv1` → the three middle blocks, at latent resolution
+    /// (sc-19753).
+    ///
+    /// `middle.1` is an [`AttentionBlock`] whose softmax spans every `H·W` spatial token of a frame
+    /// ([`AttentionBlock::forward`]), so a spatial tile that runs it attends only to its own crop.
+    /// The channel-L2 [`rms_norm_last`] used throughout this VAE reduces only the last (channel)
+    /// axis and is genuinely tiling-invariant; the attention is the op that is not.
+    fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
         x = self.middle.0.forward(&x)?;
         x = self.middle.1.forward(&x)?;
         x = self.middle.2.forward(&x)?;
         eval(&x)?;
+        Ok(x)
+    }
+
+    /// The **spatially-local** half: the `UpResBlock` stack and the `Head22` epilogue. Convolutions,
+    /// nearest upsample, channel-duplicating shortcuts and the per-position channel-L2 norm only.
+    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+        let mut x = middle.clone();
         for up in &self.upsamples {
             x = up.forward(&x, true)?;
             eval(&x)?;
@@ -1214,6 +1218,57 @@ pub struct Wan22Vae {
     compute_dtype: Dtype,
 }
 
+/// Generic decode adapter for the Wan 2.2 z48 video VAE. The underlying implementation is
+/// channels-last; the trait boundary normalizes its decoded output to NCTHW like the other decoders.
+pub struct Wan22VideoDecoder<'a> {
+    vae: &'a Wan22Vae,
+}
+
+impl<'a> Wan22VideoDecoder<'a> {
+    pub fn new(vae: &'a Wan22Vae) -> Self {
+        Self { vae }
+    }
+
+    fn to_ncthw(decoded: &Array) -> Result<Array> {
+        let shape = decoded.shape();
+        if shape.len() != 5 || shape[4] != 3 {
+            return Err(Error::Msg(format!(
+                "Wan z48 decoder produced invalid [B,T,H,W,3] output {shape:?}"
+            )));
+        }
+        Ok(decoded.transpose_axes(&[0, 4, 1, 2, 3])?)
+    }
+}
+
+impl LatentDecoder for Wan22VideoDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::WAN_Z48_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Self::to_ncthw(&self.vae.decode(latents)?)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let shape = latents.shape();
+        if shape.len() != 4 {
+            return Err(Error::Msg(format!(
+                "Wan z48 video decoder expects [C,T,H,W], got {shape:?}"
+            )));
+        }
+        validate_decoder_tiling(tiling, VaeTiling::WAN22, shape[1])?;
+        Self::to_ncthw(&self.vae.decode_tiled(latents, tiling, cancel)?)
+    }
+}
+
 impl Wan22Vae {
     /// Geometry owned by the concrete causal z48 decoder.
     pub const VAE_TILING: VaeTiling = VaeTiling::WAN22;
@@ -1305,16 +1360,30 @@ impl Wan22Vae {
         contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)
     }
 
-    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last latent
-    /// `[1,T,H,W,z]` into overlapping tiles, decodes each (denorm + conv2 + decoder + unpatchify +
-    /// clamp), and trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
+    /// Decode with **tiling** for memory-bounded large/long video. Splits the channels-last middle
+    /// feature map into overlapping tiles, runs the upsample tail + unpatchify + clamp on each, and
+    /// trapezoidally blends. Falls back to single-pass [`Self::decode`] when `cfg` doesn't fire.
     /// vae22 upsamples 16× spatially, 4× temporally, **causally** ([`VaeTiling::WAN22`]).
+    ///
+    /// **Normalization semantics (sc-19753).** Denormalize, `conv2` and the decoder's middle blocks
+    /// — including the spatial self-attention — run **once** on the full latent
+    /// (`Decoder3d::forward_middle`); only the spatially-local tail is tiled. This previously ran
+    /// the whole decoder per tile, so every spatial tile's `middle.1` softmax attended over its own
+    /// crop's token set instead of the frame's. The middle blocks are shape-preserving at latent
+    /// resolution, so the tile plan is unchanged.
+    ///
+    /// **Memory cost of the dense head**, as for the z16 sibling: the middle feature map is
+    /// materialized whole, but at *latent* resolution and in `compute_dtype`, so it is a fraction of
+    /// the full-size output accumulator the tiling already required.
     pub fn decode_tiled(
         &self,
         latent_czthw: &Array,
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let z = self.to_channels_last(latent_czthw)?; // [1,T,H,W,z]
         let sh = z.shape();
         let (f, h, w) = (sh[1], sh[2], sh[3]);
@@ -1322,16 +1391,20 @@ impl Wan22Vae {
             return self.decode_cl(&z);
         }
         let denorm = add(&multiply(&z, &self.std)?, &self.mean)?;
+        // The attention-bearing middle blocks run once, in `compute_dtype`, on the full latent.
+        let middle = self.decoder.forward_middle(
+            &self
+                .conv2
+                .forward(&denorm.as_dtype(self.compute_dtype)?, None)?,
+        )?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile decode adds the 2× spatial
+        // Channels-last: channel axis last, tiled axes [1, 2, 3]. Per-tile work adds the 2× spatial
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile
         // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
         // accumulators are unchanged (the clamp scalars promote each tile back to f32).
-        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], cancel, |tile| {
-            let tile = tile.as_dtype(self.compute_dtype)?;
-            let x = self.conv2.forward(&tile, None)?;
-            let dec = self.decoder.forward(&x)?;
+        tile_decode_accumulate(&middle, &plan, [1, 2, 3], cancel, |tile| {
+            let dec = self.decoder.forward_upsample_tail(tile)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })

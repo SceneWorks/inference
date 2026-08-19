@@ -30,6 +30,17 @@ class InvalidTransfer(RuntimeError):
     pass
 
 
+def require_exclusive_regular_file(path: Path, label: str) -> None:
+    if not path.is_file() or path.is_symlink():
+        raise InvalidTransfer(f"{label} must be a regular, non-symlink file")
+    try:
+        link_count = path.stat().st_nlink
+    except OSError as error:
+        raise InvalidTransfer(f"cannot inspect {label}: {error}") from error
+    if link_count != 1:
+        raise InvalidTransfer(f"{label} must have exactly one hard link, found {link_count}")
+
+
 def revision(path: Path) -> str:
     resolved = path.resolve()
     marker = resolved / REVISION_MARKER
@@ -142,6 +153,62 @@ def verify(
     print(f"verified exact {len(FILES)}-file Candle Mage transfer bundle under {output}")
 
 
+def migrate_edit_variant_manifest_hash_only(
+    output: Path,
+    generation_snapshot: Path,
+    edit_snapshot: Path,
+    edit_base_snapshot: Path,
+    edit_turbo_snapshot: Path,
+) -> None:
+    """Rebind only the nested edit-variant manifest after its strict migration."""
+    actual = document(
+        output,
+        generation_snapshot,
+        edit_snapshot,
+        edit_base_snapshot,
+        edit_turbo_snapshot,
+    )
+    manifest_path = output / MANIFEST
+    require_exclusive_regular_file(manifest_path, "Candle transfer manifest")
+    try:
+        expected = validate_manifest(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise InvalidTransfer(f"invalid Candle transfer manifest: {error}") from error
+
+    target = "mage_edit_variants_manifest.json"
+    if {
+        key: value for key, value in expected.items() if key != "files"
+    } != {
+        key: value for key, value in actual.items() if key != "files"
+    }:
+        raise InvalidTransfer("legacy Candle transfer manifest revisions are not exact")
+    expected_files = {record["name"]: record for record in expected["files"]}
+    actual_files = {record["name"]: record for record in actual["files"]}
+    mismatches = {
+        name for name in FILES if expected_files[name] != actual_files[name]
+    }
+    if mismatches != {target}:
+        raise InvalidTransfer(
+            "legacy Candle transfer manifest must differ only at "
+            f"{target}, found {sorted(mismatches)}"
+        )
+
+    migrated = dict(expected)
+    migrated["files"] = [actual_files[name] for name in FILES]
+    manifest_path.write_text(json.dumps(migrated, indent=2) + "\n", encoding="utf-8")
+    verify(
+        output,
+        generation_snapshot,
+        edit_snapshot,
+        edit_base_snapshot,
+        edit_turbo_snapshot,
+        False,
+    )
+    print(f"migrated only {target} in {manifest_path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gen", required=True, type=Path)
@@ -149,17 +216,22 @@ def main() -> int:
     parser.add_argument("--edit-base", required=True, type=Path)
     parser.add_argument("--edit-turbo", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--write-manifest", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write-manifest", action="store_true")
+    mode.add_argument("--migrate-edit-variant-manifest-hash-only", action="store_true")
     args = parser.parse_args()
     try:
-        verify(
+        paths = (
             args.output.resolve(),
             args.gen.resolve(),
             args.edit.resolve(),
             args.edit_base.resolve(),
             args.edit_turbo.resolve(),
-            args.write_manifest,
         )
+        if args.migrate_edit_variant_manifest_hash_only:
+            migrate_edit_variant_manifest_hash_only(*paths)
+        else:
+            verify(*paths, args.write_manifest)
     except InvalidTransfer as error:
         print(f"Mage Candle transfer verification FAILED: {error}")
         return 1

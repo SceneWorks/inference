@@ -22,8 +22,8 @@ use std::time::Instant;
 use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadShape, LoadSpec,
     MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
-    MemoryRunContext, MemoryRunOutcome, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
-    Precision, Progress, Quant, WeightsSource,
+    MemoryOptimizationAuthority, MemoryRunContext, MemoryRunOutcome, MemorySelection,
+    MemoryStrategy, MemoryStrategyParameters, Precision, Progress, Quant, WeightsSource,
 };
 
 use candle_gen_z_image::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
@@ -404,6 +404,7 @@ fn render_base_ladder_at(
     contract.validate_selection(&selection).unwrap();
     let calibration = contract.calibration.as_ref().unwrap();
     let context = MemoryRunContext {
+        optimization_authority: MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: calibration.abi,
         calibration_fingerprint: calibration.fingerprint.clone(),
@@ -743,6 +744,7 @@ fn load_packed_base_control(snapshot_env: &str, tier: &str) {
 
     ZImageControl::load(&ZImageControlPaths {
         snapshot,
+        text_encoder: None,
         control,
         adapters: Vec::new(),
         base: true,
@@ -801,6 +803,7 @@ fn packed_base_control_q4_honors_control_cfg_warm_repeat_and_cleanup() {
     );
     let model = ZImageControl::load(&ZImageControlPaths {
         snapshot,
+        text_encoder: None,
         control,
         adapters: Vec::new(),
         base: true,

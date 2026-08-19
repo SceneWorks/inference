@@ -15,6 +15,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::{ValidatedEncoderSource, WeightsSource};
 use candle_gen::{CandleError, Result};
 
 use crate::config::TextEncoderConfig;
@@ -113,14 +114,16 @@ pub fn image_gather_index(
     out
 }
 
-/// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype`.
-fn component_vb(
-    root: &Path,
-    sub: &str,
+fn selected_encoder_vb(
+    source: &WeightsSource,
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    candle_gen::component_vb(root, sub, dtype, device, "qwen edit")
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    let files = candle_gen::resolve_weight_files(path, "qwen edit selected text encoder")?;
+    candle_gen::mmap_var_builder(&files, dtype, device)
 }
 
 /// Load the Qwen-Image-**Edit** vision-language conditioning encoder from a `Qwen/Qwen-Image-Edit`
@@ -130,15 +133,63 @@ pub fn load_vision_language_encoder(
     root: &Path,
     device: &Device,
 ) -> Result<QwenVisionLanguageEncoder> {
-    let te_vb = component_vb(root, "text_encoder", ENC_DTYPE, device)?;
-    let lm = QwenTextEncoder::new(&TextEncoderConfig::qwen_image(), te_vb.clone())?;
-    let visual = VisionTransformer::new(te_vb, &VisionConfig::qwen_image_edit())?;
+    let selected = validate_builtin_vision_encoder_source(root)?;
+    load_vision_language_encoder_with_text_encoder(&selected, &selected, device)
+}
+
+/// Admit the built-in Edit vision tower against the exact Qwen language + vision contracts without
+/// opening tensor payloads. The returned pin is retained by request-scoped loaders so deferred
+/// residency cannot move the vision load outside the constructor-time validation boundary.
+pub(crate) fn validate_builtin_vision_encoder_source(
+    root: &Path,
+) -> Result<ValidatedEncoderSource> {
+    let vision = crate::ENCODER_CONTRACT
+        .validate_source_against_base(
+            &candle_gen::gen_core::WeightsSource::Dir(root.join("text_encoder")),
+            root,
+        )
+        .map_err(CandleError::from)?;
+    vision
+        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+        .map_err(CandleError::from)?;
+    Ok(vision)
+}
+
+/// Load the Edit conditioning encoder from provider-validated decoder-LM and built-in vision pins.
+/// The selected contract is deliberately decoder-only; inheriting `visual.*` from an arbitrary
+/// alternate would silently broaden compatibility beyond the registry descriptor. This stays
+/// crate-private because [`ValidatedEncoderSource`] receipts are not branded with the contract that
+/// produced them; every caller must enter through a Qwen validation seam first.
+pub(crate) fn load_vision_language_encoder_with_text_encoder(
+    selected: &ValidatedEncoderSource,
+    vision: &ValidatedEncoderSource,
+    device: &Device,
+) -> Result<QwenVisionLanguageEncoder> {
+    let lm = selected.read_unchanged(|source| -> Result<QwenTextEncoder> {
+        Ok(QwenTextEncoder::new(
+            &TextEncoderConfig::qwen_image(),
+            selected_encoder_vb(source, ENC_DTYPE, device)?,
+        )?)
+    })?;
+    let visual = vision.read_unchanged(|source| -> Result<VisionTransformer> {
+        VisionTransformer::new(
+            selected_encoder_vb(source, ENC_DTYPE, device)?,
+            &VisionConfig::qwen_image_edit(),
+        )
+    })?;
     Ok(QwenVisionLanguageEncoder::new(lm, visual))
 }
 
 #[cfg(test)]
 mod tests {
     use super::image_gather_index;
+
+    #[test]
+    fn validated_receipt_loader_stays_crate_private() {
+        let source = include_str!("vision_language.rs");
+        assert!(source.contains("\npub(crate) fn load_vision_language_encoder_with_text_encoder("));
+        assert!(!source.contains("\npub fn load_vision_language_encoder_with_text_encoder("));
+    }
 
     #[test]
     fn gather_replaces_image_tokens_in_order() {

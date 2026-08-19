@@ -168,6 +168,7 @@ pub fn reference_backbone_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         // PiD has its own decoder and candidate domain. It must fail closed until that route adopts
         // an explicit ladder rather than silently consuming the native FLUX VAE plan.
         pid_decode_routes: None,

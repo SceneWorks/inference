@@ -47,7 +47,8 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::attention::{slice_axis, AttentionBudget};
 use mlx_gen::block_residency::BlockPlan;
-use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
+use mlx_gen::nn::{conv2d_general, gelu_tanh, silu, timestep_sincos};
+use mlx_gen::qkv::{FusedQkvProjection, QkvPart};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -190,18 +191,15 @@ impl Conv {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let y = mlx_rs::ops::conv2d(
+        conv2d_general(
             x,
             &self.w,
+            self.b.as_ref(),
             (self.stride, self.stride),
             (self.padding, self.padding),
             (1, 1),
             self.groups,
-        )?;
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
-        }
+        )
     }
 }
 
@@ -211,9 +209,15 @@ impl Conv {
 
 /// `SanaLinearAttnProcessor2_0`: ReLU linear attention over the token axis. Input/output `[B, N, C]`.
 struct LinearSelfAttn {
-    to_q: AdaptableLinear,
-    to_k: AdaptableLinear,
-    to_v: AdaptableLinear,
+    /// SC-18319 P4: `to_q`/`to_k`/`to_v` behind one adapter/quant-aware packed matrix. All three read
+    /// the SAME activation `x` (this is a genuine self-attention), which is the precondition for
+    /// packing them; `attn2` is deliberately NOT fused for exactly the opposite reason (see
+    /// [`CrossAttn`]).
+    ///
+    /// Note this is orthogonal to SANA's entry in `qkv::EXEMPTIONS`: that exemption is about the
+    /// *prologue* (ReLU linear attention has no softmax and no RoPE, so `qkv::prepare` cannot serve
+    /// it), not about the projection weights, which pack on the same terms as any other family's.
+    qkv: FusedQkvProjection,
     to_out: AdaptableLinear,
     /// Sprint `qk_norm = "rms_norm_across_heads"` (sc-8490): RMSNorm over the full projected query /
     /// key (the whole `inner_dim`), applied BEFORE the head split and the ReLU. `None` for base SANA.
@@ -238,9 +242,11 @@ impl LinearSelfAttn {
         };
         Ok(Self {
             // attention_bias=false → q/k/v bias-free; to_out.0 carries a bias.
-            to_q: crate::quant::lin(w, &format!("{prefix}.to_q"), false)?,
-            to_k: crate::quant::lin(w, &format!("{prefix}.to_k"), false)?,
-            to_v: crate::quant::lin(w, &format!("{prefix}.to_v"), false)?,
+            qkv: FusedQkvProjection::new(
+                crate::quant::lin(w, &format!("{prefix}.to_q"), false)?,
+                crate::quant::lin(w, &format!("{prefix}.to_k"), false)?,
+                crate::quant::lin(w, &format!("{prefix}.to_v"), false)?,
+            ),
             to_out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), true)?,
             norm_q,
             norm_k,
@@ -253,17 +259,22 @@ impl LinearSelfAttn {
     fn forward(&self, x: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, n) = (sh[0], sh[1]);
-        let inner = self.to_q.base_shape()[0];
+        // The query projection's own `out` — read from the PROBE surface, so asking the geometry
+        // question never dismantles the pack (SC-18319).
+        let inner = self.qkv.part_facts(QkvPart::Q).base_shape[0];
         let hd = inner / self.heads;
+
+        // One matmul when the pack is engaged, three when it is not; the packed weight is the row-wise
+        // concatenation of the three bases and a matmul's output rows are independent, so the three
+        // projections are bit-identical either way.
+        let (q_proj, k_proj, v_proj) = self.qkv.forward(x)?;
 
         // qk_norm = "rms_norm_across_heads": RMSNorm over the full `inner_dim`, BEFORE the head split
         // (diffusers applies `attn.norm_q(query)` / `attn.norm_k(key)` to the `[B,N,inner]` projection).
-        let q_proj = self.to_q.forward(x)?;
         let q_proj = match &self.norm_q {
             Some(g) => rms_norm(&q_proj, g, self.qk_norm_eps)?,
             None => q_proj,
         };
-        let k_proj = self.to_k.forward(x)?;
         let k_proj = match &self.norm_k {
             Some(g) => rms_norm(&k_proj, g, self.qk_norm_eps)?,
             None => k_proj,
@@ -276,7 +287,7 @@ impl LinearSelfAttn {
         };
         let q = relu(&to_bh_d_n(q_proj)?)?.as_dtype(F32)?; // [B,H,hd,N]
         let k = relu(&to_bh_d_n(k_proj)?)?.as_dtype(F32)?; // [B,H,hd,N]
-        let v = to_bh_d_n(self.to_v.forward(x)?)?.as_dtype(F32)?; // [B,H,hd,N]
+        let v = to_bh_d_n(v_proj)?.as_dtype(F32)?; // [B,H,hd,N]
 
         // Reference pads value with a ones-row then divides by it. Algebraically identical f32 split:
         //   num = (V·Kᵀ)·Q : [B,H,hd,N]   den = (Σ_n K)·Q : [B,H,1,N]
@@ -308,6 +319,15 @@ impl LinearSelfAttn {
 // Standard cross-attention (attn2) to the caption embedding.
 // ----------------------------------------------------------------------------------------------
 
+/// **Deliberately NOT fused** (SC-18319 P4). `to_q` reads the image stream `x` while `to_k`/`to_v`
+/// read the projected caption `kv` — two different tensors. `FusedQkvProjection` computes all three
+/// from ONE activation, so packing this triple would silently compute the keys and values from the
+/// query stream: a running model with garbage cross-attention and no error.
+///
+/// `try_pack` cannot catch it. `caption_projection` has already mapped the caption to `inner_dim`
+/// (2240), so all three `in_features` match, every part shares `bits`/`group_size`, and 2240 = 64·35
+/// is group-aligned on both axes — the predicate compares *widths*, never provenance. The refusal has
+/// to be structural in the code, which is what keeping the three fields separate here is.
 struct CrossAttn {
     to_q: AdaptableLinear,
     to_k: AdaptableLinear,

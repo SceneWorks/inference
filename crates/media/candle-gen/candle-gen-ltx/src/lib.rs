@@ -811,6 +811,8 @@ impl Generator for LtxGenerator {
 /// supported through the shared additive adapter core.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::LTX_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,

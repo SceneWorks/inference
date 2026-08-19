@@ -448,6 +448,76 @@ impl Krea2Transformer {
         Ok(())
     }
 
+    /// CPU-stage imported checkpoint fold. Quantized trunk projections land directly on `device`;
+    /// dense-kept global leaves and norms migrate afterward, avoiding a full dense-DiT device peak.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> candle_gen::Result<()> {
+        let TransformerBlocks::Resident(blocks) = &mut self.blocks else {
+            return Err(candle_gen::CandleError::Msg(
+                "Krea streamed blocks cannot be load-time quantized".into(),
+            ));
+        };
+        for block in blocks {
+            block.quantize_onto(quant, device)?;
+        }
+        self.text_fusion.quantize_onto(quant, device)?;
+        for projection in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            projection.to_device(device)?;
+        }
+        self.txt_in_norm.move_to_device(device)?;
+        self.final_norm.move_to_device(device)?;
+        self.final_sstable = self.final_sstable.to_device(device)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
+    /// Count projections that currently own additive residual tensors. Test-only introspection for
+    /// proving the production multi-phase driver releases a live final subset, not merely that it
+    /// emits a release callback. This walks the same complete surface as [`Self::clear_adapters`].
+    #[cfg(test)]
+    pub(crate) fn adapted_projection_count(&mut self) -> candle_gen::Result<usize> {
+        let mut count = 0_usize;
+        // sc-18477 widened `visit_adaptable_mut` to yield the whole `QLinear` (so the ConvRot int8
+        // projections are visitable too), so reach the additive residual through `as_adapt_mut`
+        // exactly as the front-end leaves below already do. A projection with no adapt form owns no
+        // residual and therefore does not count.
+        self.visit_adaptable_mut(&mut |_, projection| {
+            count += usize::from(
+                projection
+                    .as_adapt_mut()
+                    .is_some_and(|adapter| adapter.is_adapted()),
+            );
+            Ok(())
+        })?;
+        for projection in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            count += usize::from(
+                projection
+                    .as_adapt_mut()
+                    .is_some_and(|adapter| adapter.is_adapted()),
+            );
+        }
+        Ok(count)
+    }
+
     /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
     /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
     /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it
@@ -591,9 +661,19 @@ impl Krea2Transformer {
                     // fresh view, and re-`mmap`ing per window would buy a guarantee the type already
                     // gives. See `candle_gen::block_window`'s module docs for why Candle discharges
                     // MLX's freshness obligation structurally instead of by re-opening.
-                    || Ok(std::sync::Arc::clone(weights)),
+                    || {
+                        weights.ensure_source_unchanged()?;
+                        Ok(std::sync::Arc::clone(weights))
+                    },
                     |mut state, view, range| {
-                        let blocks = materialize_window(view, cfg, &dit_plan, range)?;
+                        let blocks = view.read_source_unchanged(|| {
+                            let blocks = materialize_window(view, cfg, &dit_plan, range)?;
+                            // Candle's CUDA copies are asynchronous. Drain them before the pin's
+                            // post-read check so source replacement during the last/single window is
+                            // rejected before the materialized block can execute.
+                            view.device().synchronize()?;
+                            Ok(blocks)
+                        })?;
                         for block in &blocks {
                             // Finer than the driver's per-window gate, deliberately (sc-16003): one
                             // block is ~2 s at 2048², and a cancel unread until the window ends is

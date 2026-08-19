@@ -47,6 +47,7 @@ fn context(
     let predicted_peak_bytes =
         (generation_peak_gb(tier, width, height, 1) * 1_000_000_000.0).round() as u64;
     MemoryRunContext {
+        optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
         selection: MemorySelection {
             strategy: MemoryStrategy::Resident,
             parameters: MemoryStrategyParameters::default(),

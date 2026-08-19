@@ -116,6 +116,8 @@ fn text_encoder_storage(root: &Path) -> Result<TextEncoderStorage> {
 /// quant (gpt-oss MoE experts sc-3172 + DiT linears sc-3175).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id,
@@ -1152,13 +1154,22 @@ mod tests {
             .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(Quant::Q4);
+        // SC-18605 corrected the disposition this arm reads: the rung is declared here, because the
+        // engine can execute it. What SC-15800 found is that the Q4 request peak does not improve,
+        // and that is now recorded as the absence of a *measured* identity rather than as an absent
+        // rung — so the route stays admissible only behind an explicit estimate.
+        let contract = crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, &spec)
+            .expect("the measurement route must still build its contract");
         assert!(matches!(
-            crate::memory_strategy::memory_strategy_contract(MODEL_ID_TURBO, &spec)
-                .unwrap()
+            contract
                 .capability(mlx_gen::gen_core::MemoryStrategy::BoundedTransformerResidency)
                 .map(|capability| &capability.support),
-            Some(mlx_gen::gen_core::MemoryStrategySupport::Missing)
+            Some(mlx_gen::gen_core::MemoryStrategySupport::Implemented)
         ));
+        assert!(
+            contract.calibration.is_none(),
+            "the Q4 non-win must remain unadvertised as measured evidence"
+        );
 
         let run = |window: Option<u32>| {
             let generator = q4_measurement_generator(&spec).unwrap();
@@ -1523,21 +1534,7 @@ mod tests {
         // The family catalog resolves both ids. Component access is intentionally request-scoped,
         // so a missing snapshot is not touched until generation begins.
         for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
-            let spec = LoadSpec {
-                weights: WeightsSource::Dir("/nonexistent/lens".into()),
-                quantize: None,
-                precision: Precision::Bf16,
-                control: None,
-                ip_adapter: None,
-                adapters: Vec::new(),
-                extra_controls: Vec::new(),
-                pid: None,
-                identity: None,
-                text_encoder: None,
-                offload_policy: Default::default(),
-                load_shape: Default::default(),
-                components: Default::default(),
-            };
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
             let generator = crate::provider_registry()
                 .unwrap()
                 .load(id, &spec)
@@ -1548,27 +1545,11 @@ mod tests {
 
     #[test]
     fn load_rejects_unsupported_overlays_not_quant() {
-        let base = LoadSpec {
-            weights: WeightsSource::Dir("/nonexistent/lens".into()),
-            quantize: None,
-            precision: Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-            load_shape: Default::default(),
-            components: Default::default(),
-        };
+        let base = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()));
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
         // any weights load.
-        let with_control = LoadSpec {
-            control: Some(WeightsSource::Dir("/nonexistent/cn".into())),
-            ..base.clone()
-        };
+        let mut with_control = base.clone();
+        with_control.control = Some(WeightsSource::Dir("/nonexistent/cn".into()));
         let err = match load_with(&with_control, TURBO_DEFAULTS) {
             Ok(_) => panic!("control must be rejected"),
             Err(e) => e.to_string(),
@@ -1577,10 +1558,8 @@ mod tests {
 
         // Quantize is NOT rejected (sc-3172). Construction remains lazy, so the bogus weights path
         // is deferred until generation just like the unquantized path.
-        let quant = LoadSpec {
-            quantize: Some(Quant::Q8),
-            ..base.clone()
-        };
+        let mut quant = base;
+        quant.quantize = Some(Quant::Q8);
         let generator = load_with(&quant, TURBO_DEFAULTS)
             .unwrap_or_else(|err| panic!("quantize must be accepted (sc-3172); got: {err}"));
         assert_eq!(generator.descriptor().id, MODEL_ID_TURBO);
@@ -1783,6 +1762,165 @@ mod tests {
         build_residency(&spec, MODEL_ID_BASE)
             .expect("a packed turnkey with no quantize requested must load at its shipped tier");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// SC-18605 reachability: the declared rung-4 ladder is reached by the production route.
+    ///
+    /// A declaration nothing routes to is the defect this epic exists to remove, so this walks the
+    /// whole production chain for **both** providers on a real registry load rather than asserting
+    /// the contract in isolation: `provider_registry().load` → the loaded generator's own contract →
+    /// its safety gate → its request scope → the `GenerationMemory` block that scope writes → the
+    /// engine's own `resolve_transformer_windows`, which is the exact call `generate_memory_impl`
+    /// makes to turn that block into a physical block window. If any link were missing the chain
+    /// stops here, not in a real-weight run nobody can execute off-host.
+    #[test]
+    fn declared_rung_four_is_reached_by_the_production_route_for_both_providers() {
+        use mlx_gen::gen_core::{
+            MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+            MemoryOptimizationAuthority, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+            TransformerComponent, MEMORY_CALIBRATION_ABI,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        for id in [MODEL_ID_TURBO, MODEL_ID_BASE] {
+            let root = tier_fixture(&tmp, &["transformer", "text_encoder", "vae"], 4);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_quant(Quant::Q4)
+                .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+                .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+            let generator = crate::provider_registry()
+                .unwrap()
+                .load(id, &spec)
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+            let contract = generator
+                .memory_strategy_contract()
+                .expect("a loaded Lens generator publishes its contract");
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                mlx_gen::gen_core::MemoryStrategySupport::Implemented,
+                "{id}: the Q4 deferred route declares rung 4"
+            );
+
+            let tier = MemoryNumericTier {
+                precision: mlx_gen::Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            };
+            let selection = contract
+                .representative_selection(MemoryStrategy::BoundedTransformerResidency, tier, false)
+                .unwrap_or_else(|error| panic!("{id}: rung 4 must be selectable: {error}"));
+            // `lens` measures this exact route and `lens_turbo` does not, so the two providers reach
+            // the same rung through different authorities. Reading both off the contract rather than
+            // hard-coding them is what makes this an audit of each engine instead of an alias check.
+            let (authority, fingerprint) = match contract.calibration.as_ref() {
+                Some(identity) => (
+                    MemoryOptimizationAuthority::Calibrated,
+                    identity.fingerprint.clone(),
+                ),
+                None => (MemoryOptimizationAuthority::Estimated, String::new()),
+            };
+            let context = MemoryRunContext {
+                selection,
+                optimization_authority: authority,
+                calibration_abi: MEMORY_CALIBRATION_ABI,
+                calibration_fingerprint: fingerprint,
+                load_shape: mlx_gen::LoadShape::DeferredMaterialization,
+                mode: MemoryMode::TextToImage,
+                has_reference: false,
+                use_pid: false,
+                has_phases: true,
+                geometry: MemoryGeometry {
+                    width: 256,
+                    height: 256,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                overlay: None,
+                budget: MemoryBudget {
+                    total_bytes: 64 * 1024 * 1024 * 1024,
+                    committed_bytes: 0,
+                    reclaimable_bytes: 0,
+                    reserved_headroom_bytes: 0,
+                },
+                predicted_peak_bytes: 1024,
+                cache_state: MemoryCacheState::Cold,
+                evidence_revision: "sc-18605-reachability".to_owned(),
+            };
+            assert_eq!(
+                generator.memory_strategy_safety_check(&context),
+                MemorySafetyDecision::Accept,
+                "{id}: the production safety gate must admit its own declared rung"
+            );
+            let mut scope = generator
+                .begin_memory_strategy_request(&context)
+                .unwrap_or_else(|error| panic!("{id}: {error}"))
+                .unwrap_or_else(|| panic!("{id}: an implemented rung must open a request scope"));
+            let mut request = GenerationRequest {
+                width: 256,
+                height: 256,
+                count: 1,
+                ..Default::default()
+            };
+            scope.configure_request(&mut request).unwrap();
+            let memory = request
+                .memory
+                .unwrap_or_else(|| panic!("{id}: the scope must write a memory block"));
+            assert!(memory.stream_transformer_blocks, "{id}");
+            assert!(memory.tile_vae_decode, "{id}");
+            assert!(memory.chunk_attention, "{id}");
+            // The two providers genuinely differ here and the difference is pinned rather than
+            // papered over. Rung 4 does not engage rung 1 by cost order, so staging rides the
+            // provider-specific prerequisite edge that only the measured `lens` Q4 route declares;
+            // `lens_turbo` reaches the same block window over a warm pair instead. Both are real
+            // engine compositions — `run_staged_request_scoped` accepts `streamable` with staging
+            // either on or off.
+            assert_eq!(
+                memory.stage_residency,
+                id == MODEL_ID_BASE,
+                "{id}: staged residency must follow the declared prerequisite edge"
+            );
+            assert_eq!(
+                memory.stage_residency,
+                contract.engages(
+                    MemoryStrategy::BoundedTransformerResidency,
+                    MemoryStrategy::StagedResidency
+                ),
+                "{id}"
+            );
+            assert_eq!(
+                memory.transformer_window_component,
+                Some(TransformerComponent::Both),
+                "{id}"
+            );
+
+            // The engine gate itself, on the same streamability facts `load_with` recorded.
+            let text = crate::memory_strategy::can_stream_text(&spec).unwrap();
+            let dit = crate::memory_strategy::can_stream_dit(&spec).unwrap();
+            assert_eq!(
+                resolve_transformer_windows(&request, text, dit).unwrap(),
+                (Some(1), Some(1)),
+                "{id}: the configured request must resolve to a real two-trunk block window"
+            );
+
+            // Mutating the one engine fact rung 4 depends on turns the same request into a refusal,
+            // so the assertion above is bound to that fact rather than to a default.
+            assert!(
+                resolve_transformer_windows(&request, false, dit).is_err(),
+                "{id}"
+            );
+            assert!(
+                resolve_transformer_windows(&request, text, false).is_err(),
+                "{id}"
+            );
+
+            drop(scope);
+            drop(generator);
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     #[test]

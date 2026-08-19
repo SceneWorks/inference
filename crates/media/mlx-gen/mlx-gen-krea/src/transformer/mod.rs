@@ -67,9 +67,45 @@ pub struct Krea2Transformer {
     final_sstable: Array, // [1, 2, hidden]
 }
 
+fn resident_block_slots(cfg: &Krea2Config, resident_blocks: bool) -> usize {
+    if resident_blocks {
+        cfg.num_layers
+    } else {
+        0
+    }
+}
+
+fn clone_for_multiphase_with<T: Clone>(
+    source: &T,
+    clear: impl FnOnce(&mut T),
+    apply: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<T> {
+    let mut phase = source.clone();
+    clear(&mut phase);
+    apply(&mut phase)?;
+    Ok(phase)
+}
+
 impl Krea2Transformer {
     /// Build from a loaded `transformer/` weight set (already validated by [`crate::convert`]).
     pub fn from_weights(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::from_weights_with_block_residency(w, cfg, true)
+    }
+
+    /// Build only the tensors that remain resident around a deferred transformer-block stream.
+    ///
+    /// The 28 uniform `transformer_blocks` are deliberately not assembled here. Their source arrays
+    /// therefore never enter the resident object (and are not part of the constructor's pin-bound
+    /// `materialize_accessed` set); each denoise window reopens and consumes only its exact blocks.
+    pub(crate) fn from_weights_deferred(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
+        Self::from_weights_with_block_residency(w, cfg, false)
+    }
+
+    fn from_weights_with_block_residency(
+        w: &Weights,
+        cfg: &Krea2Config,
+        resident_blocks: bool,
+    ) -> Result<Self> {
         let (heads, kv, hd, eps) = (
             cfg.num_attention_heads as i32,
             cfg.num_kv_heads as i32,
@@ -109,7 +145,7 @@ impl Krea2Transformer {
                 hd,
                 eps,
             )?,
-            blocks: (0..cfg.num_layers)
+            blocks: (0..resident_block_slots(cfg, resident_blocks))
                 .map(|i| {
                     SingleStreamBlock::from_weights(
                         w,
@@ -138,6 +174,17 @@ impl Krea2Transformer {
         self
     }
 
+    /// Arm bounded residency from a native/ComfyUI single-file DiT. The pinned source is reopened
+    /// and native-key-normalized for every block window; the extension-bearing loader path is kept
+    /// verbatim rather than canonicalized to an extensionless cache blob.
+    pub(crate) fn with_native_block_stream(mut self, source: mlx_gen::PinnedWeightsFile) -> Self {
+        self.block_stream = Some(crate::block_stream::KreaBlockStream::new_native(
+            source,
+            self.cfg.clone(),
+        ));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_block_stream(
         mut self,
@@ -156,8 +203,15 @@ impl Krea2Transformer {
         window_size: Option<usize>,
         cancel: &'a mlx_gen::CancelFlag,
     ) -> Result<Option<crate::block_stream::BlockWindow<'a>>> {
-        let Some(size) = window_size else {
-            return Ok(None);
+        let size = match window_size {
+            Some(size) => size,
+            // A genuinely deferred transformer has no resident block fallback. Even when an older
+            // caller omitted the request-level rung-4 flag, keep execution correct and physically
+            // bounded by using the family-calibrated window rather than traversing an empty stack.
+            None if self.blocks.is_empty() && self.block_stream.is_some() => {
+                crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE as usize
+            }
+            None => return Ok(None),
         };
         if self.block_stream.is_none() {
             return Err(mlx_gen::Error::Unsupported(
@@ -166,16 +220,92 @@ impl Krea2Transformer {
             ));
         }
         Ok(Some(crate::block_stream::BlockWindow {
-            plan: mlx_gen::block_residency::BlockPlan::new(self.blocks.len(), size)?,
+            plan: mlx_gen::block_residency::BlockPlan::new(self.cfg.num_layers, size)?,
             cancel,
         }))
     }
 
     /// Re-snapshot the forward-time adapter stacks after a load or a job-local multi-phase reapply.
     pub(crate) fn capture_block_adapters(&mut self) {
-        if let Some(stream) = self.block_stream.as_mut() {
-            stream.capture_adapters(&mut self.blocks);
+        if !self.blocks.is_empty() {
+            if let Some(stream) = self.block_stream.as_mut() {
+                stream.capture_adapters(&mut self.blocks);
+            }
         }
+    }
+
+    /// Apply load-time adapters while preserving a genuinely deferred block stack.
+    ///
+    /// A resident transformer routes directly through its real blocks. A deferred transformer opens
+    /// a lazy, non-evaluated adapter proxy surface, runs the same strict loader, snapshots only the
+    /// resulting residual stacks into [`KreaBlockStream`], and immediately drops every proxy base.
+    pub(crate) fn apply_adapters_strict(
+        &mut self,
+        specs: &[mlx_gen::AdapterSpec],
+        with_diff_patch: bool,
+    ) -> Result<()> {
+        let deferred = self.blocks.is_empty() && self.block_stream.is_some();
+        if deferred {
+            self.blocks = self
+                .block_stream
+                .as_ref()
+                .expect("checked above")
+                .adapter_proxy_blocks()?;
+        }
+
+        let result = if with_diff_patch {
+            mlx_gen::adapters::loader::apply_adapters_strict_with_diff_patch(self, specs, "krea_2")
+                .map(|_| ())
+        } else {
+            mlx_gen::adapters::loader::apply_adapters_strict(self, specs, "krea_2").map(|_| ())
+        }
+        .and_then(|()| self.materialize_adapter_payloads());
+
+        if result.is_ok() {
+            self.capture_block_adapters();
+        }
+        if deferred {
+            // Proxy blocks contain only lazy base handles plus adapter stacks. The stream now owns
+            // the latter; retaining the former would recreate whole-stack residency by accident.
+            self.blocks.clear();
+        }
+        result
+    }
+
+    /// Build the job-local DiT clone used by one multi-phase slice, with exactly that slice's
+    /// low-rank adapter subset. Deferred clones keep no resident block proxies after replay.
+    pub(crate) fn clone_for_multiphase(&self, specs: &[mlx_gen::AdapterSpec]) -> Result<Self> {
+        clone_for_multiphase_with(self, Krea2Transformer::clear_adapters, |dit| {
+            if !specs.is_empty() {
+                dit.apply_adapters_strict(specs, false)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn materialize_adapter_payloads(&mut self) -> Result<()> {
+        for linear in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            linear.materialize_adapters()?;
+        }
+        self.text_fusion.materialize_adapters()?;
+        for block in &mut self.blocks {
+            block.materialize_adapters()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_block_count(&self) -> usize {
+        self.blocks.len()
     }
 
     fn disarm_block_stream(&mut self) {
@@ -613,6 +743,7 @@ impl Krea2Transformer {
         attention: AttentionPlan<'_>,
     ) -> Result<(Array, Array)> {
         let Some(window) = window else {
+            self.require_resident_blocks()?;
             for block in &self.blocks {
                 states.0 = block
                     .forward_budgeted(&states.0, positive.0, positive.1, positive.2, attention)?;
@@ -627,12 +758,13 @@ impl Krea2Transformer {
                     .to_owned(),
             )
         })?;
-        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
             return Err(mlx_gen::Error::Msg(format!(
                 "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
                 window.plan.n_blocks(),
                 stream.n_blocks(),
-                self.blocks.len()
+                self.cfg.num_layers
             )));
         }
         mlx_gen::block_residency::run_windowed(
@@ -671,6 +803,7 @@ impl Krea2Transformer {
         attention: AttentionPlan<'_>,
     ) -> Result<Array> {
         let Some(window) = window else {
+            self.require_resident_blocks()?;
             for block in &self.blocks {
                 combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
             }
@@ -682,12 +815,13 @@ impl Krea2Transformer {
                     .to_owned(),
             )
         })?;
-        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
             return Err(mlx_gen::Error::Msg(format!(
                 "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
                 window.plan.n_blocks(),
                 stream.n_blocks(),
-                self.blocks.len()
+                self.cfg.num_layers
             )));
         }
         mlx_gen::block_residency::run_windowed(
@@ -720,6 +854,7 @@ impl Krea2Transformer {
         inject: &mut impl FnMut(usize, Array, i32) -> Result<Array>,
     ) -> Result<Array> {
         let Some(window) = window else {
+            self.require_resident_blocks()?;
             for (index, block) in self.blocks.iter().enumerate() {
                 combined = inject(index, combined, cap_len)?;
                 combined = block.forward_budgeted(&combined, tvec, rcos, rsin, attention)?;
@@ -732,12 +867,13 @@ impl Krea2Transformer {
                     .to_owned(),
             )
         })?;
-        if window.plan.n_blocks() != self.blocks.len() || stream.n_blocks() != self.blocks.len() {
+        if window.plan.n_blocks() != self.cfg.num_layers || stream.n_blocks() != self.cfg.num_layers
+        {
             return Err(mlx_gen::Error::Msg(format!(
                 "krea: block plan covers {} blocks and the stream {}, but the DiT has {}",
                 window.plan.n_blocks(),
                 stream.n_blocks(),
-                self.blocks.len()
+                self.cfg.num_layers
             )));
         }
         mlx_gen::block_residency::run_windowed(
@@ -756,6 +892,17 @@ impl Krea2Transformer {
             },
             |state: &Array| Ok(mlx_rs::transforms::eval([state])?),
         )
+    }
+
+    fn require_resident_blocks(&self) -> Result<()> {
+        if self.blocks.len() == self.cfg.num_layers {
+            return Ok(());
+        }
+        Err(mlx_gen::Error::Unsupported(format!(
+            "krea: resident execution requires {} transformer blocks, but this deferred model holds {}",
+            self.cfg.num_layers,
+            self.blocks.len()
+        )))
     }
 
     /// Velocity prediction with **per-single-stream-block gradient checkpointing** (sc-7577, training
@@ -925,7 +1072,7 @@ impl Krea2Transformer {
     /// Number of single-stream `transformer_blocks` (`num_layers`) — the trainer's gradient-checkpoint
     /// bookkeeping indexes per block.
     pub fn num_blocks(&self) -> usize {
-        self.blocks.len()
+        self.cfg.num_layers
     }
 
     /// Patch-embed a latent through the frozen base `img_in` (the SAME embedder the noisy image latent
@@ -997,6 +1144,31 @@ impl Krea2Transformer {
         Ok(())
     }
 
+    /// Materialize retained weights projection-by-projection.  When called after `quantize`, each
+    /// projection evaluates its packed representation and releases the dense file-backed graph
+    /// before the next projection, avoiding a full-dense imported-DiT peak.
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for projection in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            projection.materialize_weights()?;
+        }
+        self.txt_in_norm.materialize_weights()?;
+        self.text_fusion.materialize_weights()?;
+        for block in &self.blocks {
+            block.materialize_weights()?;
+        }
+        self.final_norm.materialize_weights()?;
+        mlx_rs::transforms::eval([&self.final_sstable])?;
+        Ok(())
+    }
+
     /// Clear **every** adapter stack on the DiT — the global projections, the single-stream blocks, and
     /// the text-fusion aggregator — back to the bare frozen base (epic 13879, sc-13884). The forward-time
     /// counterpart to a `set_adapters(vec![])` per module, used by the multi-phase driver to reset before
@@ -1015,6 +1187,9 @@ impl Krea2Transformer {
         self.txt_in_l1.set_adapters(Vec::new());
         self.txt_in_l2.set_adapters(Vec::new());
         self.final_linear.set_adapters(Vec::new());
+        if let Some(stream) = self.block_stream.as_mut() {
+            stream.clear_adapters();
+        }
         // The per-block + text-fusion targets, via the enumerated adapter paths (each resolves through
         // `adaptable_mut`, per the `AdaptableHost` contract). `adaptable_paths` borrows `&self` and
         // returns owned strings, so the subsequent `&mut self` resolves are unencumbered.
@@ -1028,9 +1203,7 @@ impl Krea2Transformer {
 }
 
 #[cfg(test)]
-pub(crate) fn executable_test_fixture(
-    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<Krea2Transformer> {
+fn executable_test_weights() -> (Weights, Krea2Config) {
     let mut cfg = Krea2Config::turbo();
     cfg.hidden_size = 8;
     cfg.num_attention_heads = 1;
@@ -1119,6 +1292,14 @@ pub(crate) fn executable_test_fixture(
         }
     }
 
+    (weights, cfg)
+}
+
+#[cfg(test)]
+pub(crate) fn executable_test_fixture(
+    materializations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Krea2Transformer> {
+    let (weights, cfg) = executable_test_weights();
     Ok(Krea2Transformer::from_weights(&weights, &cfg)?.with_test_block_stream(materializations))
 }
 
@@ -1317,6 +1498,175 @@ mod tests {
     fn assert_exact(left: &Array, right: &Array) {
         mlx_rs::transforms::eval([left, right]).unwrap();
         assert_eq!(left.as_slice::<f32>(), right.as_slice::<f32>());
+    }
+
+    #[test]
+    fn deferred_storage_plan_has_zero_resident_block_slots() {
+        let cfg = Krea2Config::turbo();
+        assert_eq!(resident_block_slots(&cfg, false), 0);
+        assert_eq!(resident_block_slots(&cfg, true), cfg.num_layers);
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct MockMultiphaseClone {
+        cleared: bool,
+    }
+
+    fn write_lazy_lora_payload(path: &std::path::Path, value: f32) {
+        let mut header = br#"{"a":{"dtype":"F32","shape":[8,2],"data_offsets":[0,64]},"b":{"dtype":"F32","shape":[2,8],"data_offsets":[64,128]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = Vec::with_capacity(8 + header.len() + 128);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        for _ in 0..32 {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn multiphase_replay_materializes_lora_before_the_prepared_pin_postcheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("phase-lora.safetensors");
+        let replacement = dir.path().join("phase-lora-replacement.safetensors");
+        write_lazy_lora_payload(&source, 0.25);
+        write_lazy_lora_payload(&replacement, -0.75);
+        let mut spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(dir.path().join("unused-base")))
+                .with_adapters(vec![mlx_gen::AdapterSpec::new(
+                    source.clone(),
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )]);
+        spec.prepare_file_sources().unwrap();
+
+        let result: mlx_gen::Result<MockMultiphaseClone> =
+            spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+                clone_for_multiphase_with(
+                    &MockMultiphaseClone::default(),
+                    |phase| phase.cleared = true,
+                    |phase| {
+                        assert!(phase.cleared, "phase adapters must replay after clear");
+                        let weights = Weights::from_file(&spec.adapters[0].path)?;
+                        let adapter = Adapter::Lora {
+                            a: weights.require("a")?.clone(),
+                            b: weights.require("b")?.clone(),
+                            scale: 1.0,
+                        };
+                        std::fs::rename(&replacement, &source)?;
+                        adapter.materialize()
+                    },
+                )
+            });
+        let error = result.expect_err("A to B phase adapter replacement must invalidate its pin");
+        assert!(error.to_string().contains("changed after load"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device to build the executable transformer fixture"]
+    fn deferred_construction_retains_no_base_blocks() {
+        let (weights, cfg) = executable_test_weights();
+        let resident = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let source_blocks = resident.blocks.clone();
+        assert_eq!(source_blocks.len(), cfg.num_layers);
+
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let mut deferred = Krea2Transformer::from_weights_deferred(&weights, &cfg).unwrap();
+        deferred.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            cfg.clone(),
+            source_blocks,
+            Arc::clone(&materializations),
+        ));
+
+        assert_eq!(
+            deferred.resident_block_count(),
+            0,
+            "the deferred constructor must not retain the uniform base block stack"
+        );
+        assert_eq!(deferred.num_blocks(), cfg.num_layers);
+        assert!(
+            deferred
+                .block_window(None, &mlx_gen::CancelFlag::new())
+                .unwrap()
+                .is_some(),
+            "a deferred model must never fall through to an empty resident traversal"
+        );
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            0,
+            "construction must not materialize any streamed block"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an accessible Apple Metal device to serialize and reload adapter tensors"]
+    fn deferred_adapter_proxy_is_dropped_and_replays_exact_block_lora() {
+        let (weights, cfg) = executable_test_weights();
+        let resident = Krea2Transformer::from_weights(&weights, &cfg).unwrap();
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let mut deferred = Krea2Transformer::from_weights_deferred(&weights, &cfg).unwrap();
+        deferred.block_stream = Some(crate::block_stream::KreaBlockStream::for_test(
+            cfg.clone(),
+            resident.blocks.clone(),
+            Arc::clone(&materializations),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let adapter_path = dir.path().join("block-lora.safetensors");
+        let down = Array::from_slice(&[0.01_f32; 16], &[2, 8]);
+        let up = Array::from_slice(&[0.02_f32; 16], &[8, 2]);
+        Array::save_safetensors(
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    &down,
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    &up,
+                ),
+            ],
+            None,
+            &adapter_path,
+        )
+        .unwrap();
+        deferred
+            .apply_adapters_strict(
+                &[mlx_gen::AdapterSpec::new(
+                    adapter_path,
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            deferred.resident_block_count(),
+            0,
+            "adapter routing proxies must be dropped after their residuals are captured"
+        );
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let stream = deferred.block_stream.as_ref().unwrap();
+        let mut empty = Weights::empty();
+        let mut block0 = stream.materialize(&mut empty, 0).unwrap();
+        assert_eq!(
+            block0
+                .adaptable_mut(&["attn", "to_q"])
+                .unwrap()
+                .adapters()
+                .len(),
+            1,
+            "the exact block LoRA must be replayed on window materialization"
+        );
+        let mut block1 = stream.materialize(&mut empty, 1).unwrap();
+        assert!(block1
+            .adaptable_mut(&["attn", "to_q"])
+            .unwrap()
+            .adapters()
+            .is_empty());
     }
 
     #[test]

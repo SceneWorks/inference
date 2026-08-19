@@ -621,6 +621,10 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies: strategies(),
+        // No decode-quality geometry table is declared for this route, and that is a statement of
+        // fact rather than a declared-but-refused authority — identical to every other candle
+        // video provider after the sc-18325 sweep.
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: LOAD_SHAPE,
         additional_prerequisites: Vec::new(),
@@ -741,7 +745,15 @@ pub const MEMORY_CONTRACT_FIXTURE: candle_gen::gen_core::MemoryContractFixtureRe
     candle_gen::gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_contract,
+        surface_specs: memory_contract_surface_specs,
     };
+
+/// The shared Bf16/Q4/Q8 witness set: exactly the tiers this crate ships (bf16 base plus the
+/// sc-20267 packed Q4/Q8 tiers). A local name (the wan/ltx idiom) so the fixture registration
+/// spells identically across the two backends for the cross-backend geometry gate.
+fn memory_contract_surface_specs() -> Vec<candle_gen::gen_core::MemoryContractSurfaceSpec> {
+    candle_gen::gen_core::candle_memory_contract_surface_specs()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1093,6 +1105,10 @@ mod tests {
 
     fn context(strategy: MemoryStrategy) -> MemoryRunContext {
         MemoryRunContext {
+            // Inert for the Resident probe this fixture serves (the authority gate fires only for
+            // optimized strategies); Calibrated matches every other provider's weights-free
+            // safety-check context.
+            optimization_authority: candle_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy,
                 tier: MemoryNumericTier {

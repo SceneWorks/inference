@@ -45,10 +45,16 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. rev 932beb4e = MLX 0.32.0 bump + pad/concat >i32::MAX copy-gate fix
-# + regenerated patches (epic 12742). See crates/media/mlx-gen/Cargo.toml for the full SHA lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "932beb4e60db44d378ffa1fe648defea59b5cbd0" }
+# MLX fork pinned by commit SHA. The pinned rev is 7151a9b2 = a858aaa1 + three tier-3 Apple
+# cross-build fixes (mlx-sys bindgen stops binding the SDK's libc malloc/realloc, which nightly
+# build-std rejects under suspicious_runtime_symbol_definitions; the cross-apple workflow asserts the
+# emitted metallib triples and selects the completed build output). Rust API and MLX core are
+# unchanged from a858aaa1, which adds P3's exact phase-1 epilogues, complete
+# Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
+# collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
+# See mlx-gen/Cargo.toml for lineage.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

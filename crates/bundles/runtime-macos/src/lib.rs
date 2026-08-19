@@ -2,6 +2,8 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+#[cfg(feature = "perf-bench")]
+pub use mlx_gen_catalog::benchmark_toggle_capabilities;
 #[cfg(feature = "media")]
 pub use mlx_gen_catalog::media;
 #[cfg(feature = "media")]
@@ -11,6 +13,10 @@ pub use runtime_catalog::{
     core_llm, gen_core, memory_strategy, RuntimeCatalog, RuntimeCatalogSnapshot,
     VideoDecodeMemoryProfile,
 };
+
+/// Stable P6 workload/result schemas and fail-closed validation for the real-weight MLX harness.
+#[cfg(feature = "perf-bench")]
+pub mod perf_bench;
 
 #[cfg(feature = "media")]
 /// Resolve a provider-owned conservative VAE decode profile for contract-safe memory composition.
@@ -77,6 +83,19 @@ pub const SUPPORTED_TARGET_TRIPLES: &[&str] = &["aarch64-apple-darwin"];
 pub const NATIVE_PREREQUISITES: &[&str] = &["macOS 26.2+", "Xcode Metal toolchain"];
 
 fn media_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    #[cfg(feature = "media")]
+    {
+        mlx_gen_catalog::provider_registry()
+    }
+
+    #[cfg(not(feature = "media"))]
+    {
+        gen_core::ProviderRegistryBuilder::new().build()
+    }
+}
+
+/// Complete weights-free memory-contract surface for capability generation and reconciliation.
+pub fn memory_contract_surface_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
     #[cfg(feature = "media")]
     {
         mlx_gen_catalog::provider_registry()
@@ -258,6 +277,8 @@ mod tests {
 
         fn dummy_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "dummy-audio",

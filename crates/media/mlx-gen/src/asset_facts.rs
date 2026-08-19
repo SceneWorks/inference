@@ -40,6 +40,18 @@ pub fn projected_safetensors_tensors(
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<Vec<ResidentTensorBytes>> {
     let tensors = safetensors_path_tensor_headers(path)?;
+    projected_tensor_headers(&tensors, projection)
+}
+
+/// Project an already validated tensor-header inventory into the bytes MLX will retain.
+///
+/// Selected text encoders use this entry point with
+/// [`gen_core::ValidatedEncoderSource::tensor_headers`] so a recursive path walk cannot price
+/// nested files that neither MLX nor Candle loads as direct shards.
+pub fn projected_tensor_headers(
+    tensors: &[SafetensorsTensorHeader],
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+) -> Result<Vec<ResidentTensorBytes>> {
     if tensors.is_empty() {
         return Err(Error::Msg(
             "safetensors source contains no tensor headers".to_owned(),
@@ -152,6 +164,22 @@ pub fn projected_safetensors_bytes(
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
 ) -> Result<u64> {
     projected_safetensors_tensors(path, projection)?
+        .into_iter()
+        .try_fold(0_u64, |total, tensor| {
+            total.checked_add(tensor.resident_bytes).ok_or_else(|| {
+                Error::Msg(format!(
+                    "resident byte sum overflow at tensor {:?}",
+                    tensor.name
+                ))
+            })
+        })
+}
+
+pub fn projected_tensor_headers_bytes(
+    tensors: &[SafetensorsTensorHeader],
+    projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
+) -> Result<u64> {
+    projected_tensor_headers(tensors, projection)?
         .into_iter()
         .try_fold(0_u64, |total, tensor| {
             total.checked_add(tensor.resident_bytes).ok_or_else(|| {
