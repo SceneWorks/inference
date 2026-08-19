@@ -45,8 +45,12 @@ fn duration_head_matches_reference_all_modalities() {
     let head = DurationHead::from_weights(&w, &device).expect("build DurationHead");
 
     let golden_device = Device::Cpu;
-    let g = Weights::from_file(&std::path::PathBuf::from(GOLDEN), &golden_device, DType::F32)
-        .expect("golden");
+    let g = Weights::from_file(
+        &std::path::PathBuf::from(GOLDEN),
+        &golden_device,
+        DType::F32,
+    )
+    .expect("golden");
     let video = g.require("video_tokens").unwrap();
     let audio = g.require("audio_tokens").unwrap();
 

@@ -5,8 +5,8 @@
 //! `AttentionPooler`).
 //!
 //! Architecture (15 tensors, `model_patches/ltx-2.5-duration-head-bf16.safetensors`; hyperparameters
-//! pinned in [`gen_core::duration_head::hparams`] — the checkpoint's own `config.duration_head`
-//! metadata section ships empty, see that module's docs):
+//! pinned in `mlx_gen::gen_core::duration_head::hparams` — the checkpoint's own
+//! `config.duration_head` metadata section ships empty, see that module's docs):
 //!
 //! * `video_input_proj` / `audio_input_proj` — per-modality `Linear(cross_attention_dim,
 //!   pooler_hidden_dim)`, each followed by an additive learnable modality embedding
@@ -106,7 +106,11 @@ impl DurationHead {
     /// Predict duration in **seconds** (already exponentiated, matching upstream
     /// `DurationHead.forward`). `video_tokens`: `(B, T_v, 4096)`, or `None`; `audio_tokens`:
     /// `(B, T_a, 2048)`, or `None`. At least one must be given. Returns `(B,)`.
-    pub fn forward(&self, video_tokens: Option<&Array>, audio_tokens: Option<&Array>) -> Result<Array> {
+    pub fn forward(
+        &self,
+        video_tokens: Option<&Array>,
+        audio_tokens: Option<&Array>,
+    ) -> Result<Array> {
         if video_tokens.is_none() && audio_tokens.is_none() {
             return Err(Error::Msg(
                 "ltx duration_head: forward requires at least one of video_tokens / audio_tokens"
@@ -115,11 +119,19 @@ impl DurationHead {
         }
         let mut groups: Vec<Array> = Vec::with_capacity(2);
         if let Some(v) = video_tokens {
-            let proj = linear(&v.as_dtype(Dtype::Float32)?, &self.video_proj_w, &self.video_proj_b)?;
+            let proj = linear(
+                &v.as_dtype(Dtype::Float32)?,
+                &self.video_proj_w,
+                &self.video_proj_b,
+            )?;
             groups.push(add(&proj, &self.video_mod_emb)?);
         }
         if let Some(a) = audio_tokens {
-            let proj = linear(&a.as_dtype(Dtype::Float32)?, &self.audio_proj_w, &self.audio_proj_b)?;
+            let proj = linear(
+                &a.as_dtype(Dtype::Float32)?,
+                &self.audio_proj_w,
+                &self.audio_proj_b,
+            )?;
             groups.push(add(&proj, &self.audio_mod_emb)?);
         }
         let tokens = if groups.len() == 1 {
@@ -208,10 +220,7 @@ mod tests {
             "duration_head.video_input_proj.bias".into(),
             fill(&[hd], 0.01),
         );
-        m.insert(
-            "duration_head.video_modality_emb".into(),
-            fill(&[hd], 0.01),
-        );
+        m.insert("duration_head.video_modality_emb".into(), fill(&[hd], 0.01));
         m.insert(
             "duration_head.audio_input_proj.weight".into(),
             fill(&[hd, audio_dim], 0.001),
@@ -220,10 +229,7 @@ mod tests {
             "duration_head.audio_input_proj.bias".into(),
             fill(&[hd], 0.01),
         );
-        m.insert(
-            "duration_head.audio_modality_emb".into(),
-            fill(&[hd], 0.01),
-        );
+        m.insert("duration_head.audio_modality_emb".into(), fill(&[hd], 0.01));
         m.insert(
             "duration_head.attention_pooler.query_tokens".into(),
             fill(&[hparams::NUM_QUERIES as i32, hd], 0.01),
@@ -328,7 +334,10 @@ mod tests {
             &mut predict,
         )
         .unwrap();
-        assert_eq!(calls, 1, "the real forward pass must be reached exactly once");
+        assert_eq!(
+            calls, 1,
+            "the real forward pass must be reached exactly once"
+        );
         let frames = frames.expect("auto-duration opted in");
         assert_eq!((frames - 1) % 8, 0, "frames={frames}");
 

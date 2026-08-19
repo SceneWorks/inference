@@ -5,8 +5,8 @@
 //! `packages/ltx-core/src/ltx_core/duration_head/duration_head.py`), the architecture (per-modality
 //! input projections + additive modality embeddings → a 4-head `AttentionPooler` cross-attending one
 //! learnable query → a small MLP → log-duration → `exp`), and the pinned hyperparameters
-//! ([`gen_core::duration_head::hparams`], shared with the MLX port so both backends read from one
-//! source of truth).
+//! (`candle_gen::gen_core::duration_head::hparams`, shared with the MLX port so both backends read
+//! from one source of truth).
 //!
 //! Runs entirely in **f32** (same rationale as `mlx_gen_ltx::duration_head`: a tiny "quality island"
 //! utility component, not part of the hot denoise loop, so there is no reason to pay for bf16
@@ -93,7 +93,11 @@ impl DurationHead {
     /// Predict duration in **seconds** (already exponentiated, matching upstream
     /// `DurationHead.forward`). `video_tokens`: `(B, T_v, 4096)`, or `None`; `audio_tokens`:
     /// `(B, T_a, 2048)`, or `None`. At least one must be given. Returns `(B,)`.
-    pub fn forward(&self, video_tokens: Option<&Tensor>, audio_tokens: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        video_tokens: Option<&Tensor>,
+        audio_tokens: Option<&Tensor>,
+    ) -> Result<Tensor> {
         if video_tokens.is_none() && audio_tokens.is_none() {
             return Err(Error::Msg(
                 "ltx duration_head: forward requires at least one of video_tokens / audio_tokens"
@@ -102,11 +106,19 @@ impl DurationHead {
         }
         let mut groups: Vec<Tensor> = Vec::with_capacity(2);
         if let Some(v) = video_tokens {
-            let proj = linear(&v.to_dtype(DType::F32)?, &self.video_proj_w, &self.video_proj_b)?;
+            let proj = linear(
+                &v.to_dtype(DType::F32)?,
+                &self.video_proj_w,
+                &self.video_proj_b,
+            )?;
             groups.push(proj.broadcast_add(&self.video_mod_emb)?);
         }
         if let Some(a) = audio_tokens {
-            let proj = linear(&a.to_dtype(DType::F32)?, &self.audio_proj_w, &self.audio_proj_b)?;
+            let proj = linear(
+                &a.to_dtype(DType::F32)?,
+                &self.audio_proj_w,
+                &self.audio_proj_b,
+            )?;
             groups.push(proj.broadcast_add(&self.audio_mod_emb)?);
         }
         let tokens = if groups.len() == 1 {
@@ -129,9 +141,18 @@ impl DurationHead {
         let q = linear(&queries, &self.q_w, &self.q_b)?;
         let k = linear(&tokens, &self.k_w, &self.k_b)?;
         let v = linear(&tokens, &self.v_w, &self.v_b)?;
-        let q = q.reshape((b, nq, nh, head_dim))?.transpose(1, 2)?.contiguous()?; // (b,nh,nq,hd)
-        let k = k.reshape((b, t, nh, head_dim))?.transpose(1, 2)?.contiguous()?; // (b,nh,t,hd)
-        let v = v.reshape((b, t, nh, head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q = q
+            .reshape((b, nq, nh, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?; // (b,nh,nq,hd)
+        let k = k
+            .reshape((b, t, nh, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?; // (b,nh,t,hd)
+        let v = v
+            .reshape((b, t, nh, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let scale = 1.0 / (head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         let weights = candle_gen::candle_nn::ops::softmax_last_dim(&scores)?;
@@ -314,7 +335,10 @@ mod tests {
             &mut predict,
         )
         .unwrap();
-        assert_eq!(calls, 1, "the real forward pass must be reached exactly once");
+        assert_eq!(
+            calls, 1,
+            "the real forward pass must be reached exactly once"
+        );
         let frames = frames.expect("auto-duration opted in");
         assert_eq!((frames - 1) % 8, 0, "frames={frames}");
 

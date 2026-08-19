@@ -185,7 +185,13 @@ pub fn resolve_auto_duration_frames(
     }
     let min_frames = ((range.min_seconds * frame_rate).round()).max(1.0) as u32;
     let max_frames = ((range.max_seconds * frame_rate).round()).max(min_frames as f32) as u32;
-    seconds_to_clamped_num_frames(predicted_seconds, frame_rate, min_frames, max_frames, time_scale)
+    seconds_to_clamped_num_frames(
+        predicted_seconds,
+        frame_rate,
+        min_frames,
+        max_frames,
+        time_scale,
+    )
 }
 
 /// The engine-boundary opt-in seam (sc-18774 acceptance: "surface it as an explicit opt-in ...; a
@@ -196,16 +202,16 @@ pub fn resolve_auto_duration_frames(
 ///
 /// 1. `explicit_frames` is `Some` → returned as-is; `predict_seconds` is **never called** — an
 ///    explicit request always wins over prediction, proven by the
-///    [`explicit_duration_wins_and_never_predicts`] test below (a spy `predict_seconds` that panics
+///    `explicit_duration_wins_and_never_predicts` test below (a spy `predict_seconds` that panics
 ///    if invoked).
 /// 2. `explicit_frames` is `None` and `auto_duration` is `Some(range)` → `predict_seconds` is
 ///    called exactly once (the reachability contract: opting in must actually reach the head, not
-///    merely declare support for it — see [`opt_in_reaches_the_predict_hook`]), and its seconds
-///    prediction is resolved to a frame count via [`resolve_auto_duration_frames`].
+///    merely declare support for it — see the `opt_in_reaches_the_predict_hook` test), and its
+///    seconds prediction is resolved to a frame count via [`resolve_auto_duration_frames`].
 /// 3. Neither is set → `Ok(None)`: auto-duration is **explicit opt-in only**; a caller that never
-///    sets it must never have `predict_seconds` invoked (see
-///    [`neither_flag_never_calls_predict`]) — a defaulted-off flag that fires anyway would defeat
-///    the whole point of proving reachability separately from declaration.
+///    sets it must never have `predict_seconds` invoked (see the `neither_flag_never_calls_predict`
+///    test) — a defaulted-off flag that fires anyway would defeat the whole point of proving
+///    reachability separately from declaration.
 ///
 /// `predict_seconds` is injected so callers (and this module's tests) can supply the real
 /// `DurationHead::forward` or a spy independently of this resolution logic — the same seam pattern
@@ -239,8 +245,20 @@ mod tests {
     #[test]
     fn snap_matches_reference_values() {
         // Pinned against the upstream formula `((frames - 1) // 8) * 8 + 1`.
-        for (frames, want) in [(1, 1), (8, 1), (9, 9), (16, 9), (17, 17), (24, 17), (25, 25)] {
-            assert_eq!(snap_frames_to_grid(frames, 8).unwrap(), want, "frames={frames}");
+        for (frames, want) in [
+            (1, 1),
+            (8, 1),
+            (9, 9),
+            (16, 9),
+            (17, 17),
+            (24, 17),
+            (25, 25),
+        ] {
+            assert_eq!(
+                snap_frames_to_grid(frames, 8).unwrap(),
+                want,
+                "frames={frames}"
+            );
         }
     }
 
@@ -293,7 +311,8 @@ mod tests {
     fn clamp_and_snap_hold_at_min_and_max_bounds() {
         let range = AutoDurationRange::default();
         let below_min = resolve_auto_duration_frames(0.01, 24.0, range, TEMPORAL_GRID).unwrap();
-        let above_max = resolve_auto_duration_frames(1_000_000.0, 24.0, range, TEMPORAL_GRID).unwrap();
+        let above_max =
+            resolve_auto_duration_frames(1_000_000.0, 24.0, range, TEMPORAL_GRID).unwrap();
         assert_eq!((below_min - 1) % TEMPORAL_GRID, 0);
         assert_eq!((above_max - 1) % TEMPORAL_GRID, 0);
         // Clamped toward (not past) the requested bounds: below_min sits at/near the snapped-up
@@ -331,7 +350,7 @@ mod tests {
     /// defensive final guard, not a literal port of upstream's fixup alone.
     #[test]
     fn narrow_window_still_returns_a_valid_grid_point() {
-        let range = AutoDurationRange::new(2.2826559577605403, 2.6795361998095593).unwrap();
+        let range = AutoDurationRange::new(2.282_656, 2.679_536).unwrap();
         let frames = resolve_auto_duration_frames(56.634_225, 8.0, range, TEMPORAL_GRID).unwrap();
         assert_eq!((frames - 1) % TEMPORAL_GRID, 0, "frames={frames}");
         assert!(frames >= 1);
@@ -371,7 +390,9 @@ mod tests {
     /// if called at all, so a passing test proves the prediction path is never reached.
     #[test]
     fn explicit_duration_wins_and_never_predicts() {
-        let mut predict = || -> Result<f32> { panic!("predict_seconds must not be called when explicit_frames is Some") };
+        let mut predict = || -> Result<f32> {
+            panic!("predict_seconds must not be called when explicit_frames is Some")
+        };
         let got = resolve_request_num_frames(
             Some(121),
             Some(AutoDurationRange::default()),
@@ -414,7 +435,8 @@ mod tests {
     fn neither_flag_never_calls_predict() {
         let mut predict =
             || -> Result<f32> { panic!("predict_seconds must not be called when opted out") };
-        let got = resolve_request_num_frames(None, None, 24.0, TEMPORAL_GRID, &mut predict).unwrap();
+        let got =
+            resolve_request_num_frames(None, None, 24.0, TEMPORAL_GRID, &mut predict).unwrap();
         assert_eq!(got, None);
     }
 

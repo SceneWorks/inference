@@ -44,8 +44,7 @@ fn rel_err(got: f32, want: f32) -> f32 {
 #[ignore = "needs the real ltx-2.5-duration-head-bf16.safetensors (~4 MB)"]
 fn duration_head_matches_reference_all_modalities() {
     let path = duration_head_file();
-    let w = Weights::from_file(&path)
-        .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+    let w = Weights::from_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
     let head = DurationHead::from_weights(&w).expect("build DurationHead");
 
     let g = Weights::from_file(GOLDEN).expect("golden");
@@ -58,13 +57,13 @@ fn duration_head_matches_reference_all_modalities() {
         ("both", Some(video), Some(audio)),
     ];
     for (name, v, a) in cases {
-        let want = g
-            .require(&format!("seconds_{name}"))
-            .unwrap()
-            .item::<f32>();
+        let want = g.require(&format!("seconds_{name}")).unwrap().item::<f32>();
         let got = head.predict_seconds(v, a).expect("predict_seconds");
         let err = rel_err(got, want);
         eprintln!("{name}: got={got:.6} want={want:.6} rel_err={err:.3e}");
-        assert!(err < 5e-3, "{name}: rel_err {err:.3e} too high (got {got}, want {want})");
+        assert!(
+            err < 5e-3,
+            "{name}: rel_err {err:.3e} too high (got {got}, want {want})"
+        );
     }
 }
