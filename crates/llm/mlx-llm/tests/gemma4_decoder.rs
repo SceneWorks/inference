@@ -233,6 +233,137 @@ fn gemma4_last_position_logits_agree_between_entry_points() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The batched seam: one caller-built RoPE pair cannot serve two head dims
+// ---------------------------------------------------------------------------------------------
+
+/// `decode_logits_masked` must **refuse** a Gemma 4 model.
+///
+/// It takes one caller-built `(cos, sin)` pair. That is every uniform architecture's entire RoPE,
+/// but Gemma 4's `full_attention` layers rotate a 512-wide head against the sliding layers' 256 —
+/// no single pair can carry both. Accepting it would silently rotate eight of the forty-eight
+/// layers with the wrong table and the wrong frequencies, and the output would still be finite,
+/// still be plausibly-scaled, and still be wrong. The refusal is the contract; this pins it.
+#[test]
+fn gemma4_is_refused_by_the_single_rope_table_entry_point() {
+    let g = goldens();
+    let model = fixture_model(&g);
+    let ids = prompt_ids(&g);
+    let s = ids.len() as i32;
+
+    // The primary (sliding) tables, exactly what a uniform caller would have built.
+    let (cos, sin) = model
+        .rope_tables(&(0..s).collect::<Vec<_>>(), 1, s)
+        .expect("primary rope tables");
+    let mask = Array::zeros::<f32>(&[1, 1, s, s])
+        .unwrap()
+        .as_dtype(model.compute_dtype())
+        .unwrap();
+
+    let err = model
+        .decode_logits_masked(&input_ids(&ids), &mut model.new_cache(), &cos, &sin, &mask)
+        .expect_err("a Gemma 4 model must not accept a single RoPE pair");
+    let m = err.to_string();
+    assert!(
+        m.contains("decode_logits_masked_at"),
+        "the refusal must name the entry point that does work: {m}"
+    );
+    assert!(
+        m.contains("Gemma 4"),
+        "the refusal must say what it is refusing: {m}"
+    );
+}
+
+/// A left-padded batched prefill through `decode_logits_masked_at` reproduces each row's
+/// single-sequence logits.
+///
+/// This is the only test that reaches the `AttnMask::Additive` arm of the per-layer window logic:
+/// a sliding layer must intersect its window with the caller's padding mask (they are both
+/// "0 keeps, a large negative blocks", so the intersection is their sum) and hand the fused kernel
+/// a mask in the query dtype — an f32 mask does not promote to bf16 and the kernel rejects it
+/// outright. Nothing else in the suite passes an explicit mask to a Gemma 4 model.
+///
+/// It also pins the per-row RoPE: the two rows sit at different pad offsets, so every layer type's
+/// table has to be built from the row's own positions rather than a shared arange.
+///
+/// Rows are compared against `decode_logits_all` on the *unpadded* prompt, so padding that leaked
+/// into attention, a window applied at the wrong offset, or a dropped second RoPE table all fail.
+#[test]
+fn gemma4_left_padded_batch_matches_per_row_single_sequence_logits() {
+    let g = goldens();
+    let model = fixture_model(&g);
+    let full = prompt_ids(&g);
+    let vocab = model.config().vocab_size as usize;
+
+    // Row 0 is the whole prompt; row 1 is a shorter one, left-padded to the same width. The shorter
+    // row is what makes the padding mask load-bearing.
+    let rows: [Vec<i32>; 2] = [full.clone(), full[..4].to_vec()];
+    let width = full.len() as i32;
+    assert!(
+        rows[1].len() < full.len(),
+        "the second row must be shorter or nothing is padded"
+    );
+
+    // The left-padded batch, its per-row absolute positions, and its additive mask — the same
+    // construction `decode::batch`'s prefill uses.
+    let mut ids: Vec<i32> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    let mut mask: Vec<f32> = Vec::new();
+    for row in &rows {
+        let pad = width - row.len() as i32;
+        for c in 0..width {
+            if c < pad {
+                ids.push(0); // pad id
+                positions.push(0);
+            } else {
+                ids.push(row[(c - pad) as usize]);
+                positions.push(c - pad);
+            }
+        }
+        for i in 0..width {
+            for j in 0..width {
+                // Causal, and a key is attendable only if it is a real token. The diagonal is
+                // always kept so a pure-padding query row is never fully masked (whose softmax
+                // would be NaN); those rows are discarded anyway.
+                let ok = j <= i && (j >= pad || j == i);
+                mask.push(if ok { 0.0 } else { f32::NEG_INFINITY });
+            }
+        }
+    }
+    let batch = rows.len() as i32;
+    let ids = Array::from_slice(&ids, &[batch, width]);
+    let mask = Array::from_slice(&mask, &[batch, 1, width, width])
+        .as_dtype(model.compute_dtype())
+        .unwrap();
+
+    let mut cache = model.new_cache();
+    let batched = host(
+        &model
+            .decode_logits_masked_at(&ids, &mut cache, &positions, &mask)
+            .expect("batched left-padded prefill"),
+    );
+    assert_eq!(batched.len(), rows.len() * vocab);
+
+    for (r, row) in rows.iter().enumerate() {
+        let mut solo_cache = model.new_cache();
+        let solo = host(
+            &model
+                .decode_logits_all(&input_ids(row), &mut solo_cache, 0)
+                .expect("single-sequence forward"),
+        );
+        let want = &solo[solo.len() - vocab..];
+        let got = &batched[r * vocab..(r + 1) * vocab];
+        assert_abs_close(
+            got,
+            want,
+            &format!(
+                "batch row {r} (pad {}) vs its single-sequence logits",
+                width - row.len() as i32
+            ),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Cached decode: the per-layer window and the two RoPE schedules must survive an offset
 // ---------------------------------------------------------------------------------------------
 
