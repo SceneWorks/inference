@@ -343,16 +343,38 @@ pub fn run_curated_sampler(
     )
 }
 
-/// Tracks the callback phase for curated solvers that evaluate the model twice per outer step.
+/// Model evaluations ONE INTERIOR step of `solver` spends.
 ///
-/// Heun evaluates at the next schedule sigma for its corrector, while DPM++ SDE evaluates at an
-/// off-schedule midpoint. Neither evaluation is a new denoise step. Keeping this small adapter at
-/// the MLX driver seam avoids widening the backend-neutral sampler trait solely for decorative
-/// output while still exposing the exact outer-step cadence to providers.
+/// Derived from the shared [`gen_core::sampling::Solver::model_evals`] contract instead of being
+/// restated per solver here — a duplicated table is exactly what went stale (sc-20417). Over a
+/// standard trailing-zero schedule `model_evals(1)` is the lone terminal evaluation and
+/// `model_evals(2)` is one interior step plus that terminal one, so their difference is precisely
+/// the interior-step cost: 1 for the single-evaluation solvers (`euler`, `dpmpp_2m`, `uni_pc`,
+/// `abnorsett_4m`, …), 2 for `heun` / `dpmpp_sde`, and 7 for `rk6_7s`. gen-core matches `Solver`
+/// exhaustively inside `model_evals` and pins every number against the ACTUAL denoise-call count
+/// (`model_evals_matches_actual_denoise_calls_for_every_solver`), so a newly added solver can never
+/// reach this observer with a silently wrong cadence — the way a hand-copied match arm could.
+fn evals_per_interior_step(solver: gen_core::sampling::Solver) -> usize {
+    solver
+        .model_evals(2)
+        .saturating_sub(solver.model_evals(1))
+        .max(1)
+}
+
+/// Tracks the callback phase for curated solvers that evaluate the model more than once per outer
+/// step.
+///
+/// Heun evaluates at the next schedule sigma for its corrector, DPM++ SDE at an off-schedule
+/// midpoint, and `rk6_7s` at six further Runge–Kutta stage abscissae inside the step. None of those
+/// is a new denoise step. Keeping this small adapter at the MLX driver seam avoids widening the
+/// backend-neutral sampler trait solely for decorative output while still exposing the exact
+/// outer-step cadence to providers.
 struct CuratedStepObserver {
     solver: gen_core::sampling::Solver,
     step: usize,
-    correction_pending: bool,
+    /// Inner (corrector / midpoint / RK-stage) evaluations still owed to the outer step already
+    /// reported. Zero outside a multi-evaluation step.
+    pending_inner_evals: usize,
 }
 
 impl CuratedStepObserver {
@@ -360,41 +382,34 @@ impl CuratedStepObserver {
         Self {
             solver,
             step: 0,
-            correction_pending: false,
+            pending_inner_evals: 0,
         }
     }
 
     fn is_step_start(&mut self, sigmas: &[f32], sigma: f32) -> bool {
-        if self.correction_pending {
-            self.correction_pending = false;
+        if self.pending_inner_evals > 0 {
+            self.pending_inner_evals -= 1;
             return false;
         }
 
         let step = self.step;
         self.step = self.step.saturating_add(1);
-        let evaluates_twice = match self.solver {
-            gen_core::sampling::Solver::Heun | gen_core::sampling::Solver::DpmppSde => true,
-            gen_core::sampling::Solver::Euler
-            | gen_core::sampling::Solver::EulerAncestral
-            | gen_core::sampling::Solver::Dpmpp2m
-            | gen_core::sampling::Solver::UniPc
-            | gen_core::sampling::Solver::Lcm
-            | gen_core::sampling::Solver::Ddim
-            | gen_core::sampling::Solver::ErSde
-            | gen_core::sampling::Solver::Dpmpp2mSde => false,
+        // Only an INTERIOR step ever spends more than one evaluation: the terminal step to σ = 0 and
+        // a degenerate leading σ == 0 node are a single evaluation for every curated solver.
+        let is_interior = sigma != 0.0 && sigmas.get(step + 1).is_some_and(|&next| next != 0.0);
+        self.pending_inner_evals = if is_interior {
+            evals_per_interior_step(self.solver) - 1
+        } else {
+            0
         };
-        let has_correction = evaluates_twice
-            && sigma != 0.0
-            && sigmas.get(step + 1).is_some_and(|&next| next != 0.0);
-        self.correction_pending = has_correction;
         true
     }
 }
 
 /// [`run_curated_sampler`] with a best-effort observer of the raw, unscaled latent at the start of
-/// each actual solver step. Heun corrector evaluations and DPM++ SDE midpoint evaluations are
-/// deliberately suppressed. The legacy wrapper supplies a no-op hook, preserving the exact
-/// numerical integration path and output bytes.
+/// each actual solver step. Heun corrector evaluations, DPM++ SDE midpoint evaluations and
+/// `rk6_7s` inner Runge–Kutta stage evaluations are deliberately suppressed. The legacy wrapper
+/// supplies a no-op hook, preserving the exact numerical integration path and output bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn run_curated_sampler_with_latent_hook(
     sampler_name: Option<&str>,
@@ -552,9 +567,10 @@ pub fn run_flow_sampler(
 }
 
 /// [`run_flow_sampler`] with a best-effort observer of the raw flow latent at each actual outer
-/// solver step. Multi-evaluation solvers expose only their outer-step input: Heun correctors and
-/// DPM++ SDE midpoint evaluations are suppressed by [`run_curated_sampler_with_latent_hook`]. The
-/// legacy wrapper supplies an inert observer and therefore preserves the numerical path exactly.
+/// solver step. Multi-evaluation solvers expose only their outer-step input: Heun correctors,
+/// DPM++ SDE midpoint evaluations and `rk6_7s` inner RK stages are suppressed by
+/// [`run_curated_sampler_with_latent_hook`]. The legacy wrapper supplies an inert observer and
+/// therefore preserves the numerical path exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn run_flow_sampler_with_latent_hook(
     sampler_name: Option<&str>,
@@ -1271,20 +1287,15 @@ mod tests {
     #[test]
     fn mlx_drives_every_curated_solver_to_finite_output() {
         // The P2 deliverable: every gen-core curated sampler runs end-to-end over mlx_rs::Array.
+        // This iterates `Solver::ALL` rather than a hand-written name list (which had gone stale at
+        // 8 entries once already): a solver added to the curated menu joins MLX coverage
+        // automatically, and can never silently drop out of it.
         let ops = MlxLatentOps;
         let ms = FlowModelSampling::new(TimestepConvention::Sigma);
         let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
         let x_init = arr(&[0.2, -0.5, 1.0, 0.3]);
-        for name in [
-            "euler",
-            "euler_ancestral",
-            "heun",
-            "dpmpp_2m",
-            "dpmpp_sde",
-            "uni_pc",
-            "lcm",
-            "ddim",
-        ] {
+        for solver in gen_core::sampling::Solver::ALL {
+            let name = solver.name();
             let sampler =
                 gen_core::sampling::sampler_by_name::<MlxLatentOps>(name).expect("known solver");
             let mut dn = |x: &Array, s: f32| {
@@ -1385,6 +1396,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed, sigmas[..4]);
+    }
+
+    /// sc-20417: `rk6_7s` spends SEVEN evaluations on every interior step (six of them at inner
+    /// Runge–Kutta stage abscissae) and one on the terminal step. The raw-latent hook must still fire
+    /// exactly once per outer step, at the outer-step σ — the multi-eval suppression is a count, not
+    /// a "second evaluation" boolean.
+    #[test]
+    fn raw_latent_hook_suppresses_rk6_7s_inner_stage_evaluations() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let mut observed = Vec::new();
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_curated_sampler_with_latent_hook(
+            Some("rk6_7s"),
+            &ms,
+            &sigmas,
+            arr(&[0.3, -1.1, 2.0]),
+            0,
+            &cancel,
+            &mut progress,
+            |_latent, sigma| observed.push(sigma),
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(observed, sigmas[..4]);
+    }
+
+    /// sc-20417: `abnorsett_4m` is one evaluation per step (its multistep startup ramp raises order,
+    /// never evaluation count), so every evaluation IS an outer step start.
+    #[test]
+    fn raw_latent_hook_observes_every_abnorsett_4m_step() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let mut observed = Vec::new();
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        run_curated_sampler_with_latent_hook(
+            Some("abnorsett_4m"),
+            &ms,
+            &sigmas,
+            arr(&[0.3, -1.1, 2.0]),
+            0,
+            &cancel,
+            &mut progress,
+            |_latent, sigma| observed.push(sigma),
+            |_xin, _t| Ok(arr(&[0.7, -0.2, 0.4])),
+        )
+        .unwrap();
+        assert_eq!(observed, sigmas[..4]);
+    }
+
+    /// The observer's per-interior-step evaluation count is DERIVED from the shared
+    /// `Solver::model_evals` contract, so it stays correct for every curated solver — including any
+    /// added later — without a second table to keep in sync.
+    #[test]
+    fn interior_step_eval_counts_track_the_shared_model_evals_contract() {
+        use gen_core::sampling::Solver;
+        for solver in Solver::ALL {
+            let per_step = super::evals_per_interior_step(solver);
+            // 10 nominal steps = 9 interior steps + 1 terminal evaluation.
+            assert_eq!(
+                solver.model_evals(10),
+                9 * per_step + 1,
+                "{}: interior-step cost out of sync with model_evals",
+                solver.name()
+            );
+            assert!(
+                per_step >= 1,
+                "{}: interior step must evaluate",
+                solver.name()
+            );
+        }
+        assert_eq!(super::evals_per_interior_step(Solver::Euler), 1);
+        assert_eq!(super::evals_per_interior_step(Solver::Heun), 2);
+        assert_eq!(super::evals_per_interior_step(Solver::Rk67s), 7);
+        assert_eq!(super::evals_per_interior_step(Solver::Abnorsett4m), 1);
     }
 
     #[test]

@@ -50,8 +50,8 @@ pub use schedulers::{
     schedule_sigmas, simple_sigmas, Scheduler,
 };
 pub use solvers::{
-    sampler_by_name, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde, EulerAncestral, Heun, Lcm, Solver,
-    UniPc,
+    sampler_by_name, Abnorsett4m, AbnorsettState, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde,
+    EulerAncestral, Heun, Lcm, Rk67s, Solver, UniPc, ABNORSETT_ORDER,
 };
 pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
 
