@@ -32,6 +32,7 @@
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod bundle;
 pub mod conditioning;
 pub mod config;
 pub mod connector;
@@ -55,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointLayout;
 #[cfg(test)]
 use candle_gen::gen_core::AdapterKind;
 use candle_gen::gen_core::{
@@ -1063,6 +1065,30 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
     // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
     gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    // Layout gate (sc-18757): which LTX generation this checkpoint holds is decided by its declared
+    // `model_version` — NOT by which files are present and NOT by their names. This engine implements
+    // the LTX-2.3 all-in-one component set; an LTX-2.5 split bundle carries a different DiT, a Gemma 4
+    // text encoder and a diffusion VAE, so it is refused here, by version, with the version named.
+    // Without this gate a 2.5 tree fell through to `ltx_checkpoint_in`, which picks a file by NAME and
+    // would have handed the 2.5 transformer to the 2.3 loader. `crate::bundle` resolves the split
+    // layout for the engine that implements it.
+    let layout_probe = match &spec.weights {
+        WeightsSource::File(p) => p.clone(),
+        WeightsSource::Dir(_) => root.clone(),
+    };
+    let declared_version = bundle::declared_model_version(&layout_probe)?;
+    if gen_core::ltx_checkpoint::layout_for_declared_version(declared_version.as_deref())
+        == LtxCheckpointLayout::Split
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "ltx_2_3_distilled: {} declares model_version {:?}, which ships as a split-component \
+             bundle (per-component transformer / text encoder / video VAE / audio VAE / duration \
+             head / latent upsamplers, each with its own config). This engine loads the all-in-one \
+             LTX-2.3 layout only.",
+            layout_probe.display(),
+            declared_version.unwrap_or_default(),
+        )));
+    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle ltx does not support on-the-fly Q4/Q8 quantization yet".into(),

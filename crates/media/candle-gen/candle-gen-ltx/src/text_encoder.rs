@@ -8,21 +8,26 @@
 //! embed.*`); the connector under `model.diffusion_model.video_embeddings_connector.*`. Runs bf16.
 //!
 //! sc-18763: the math below (`normed_hidden`) is the V2 (`PER_TOKEN_RMS`) caption feature
-//! extractor, and it's the ONLY one this crate implements — see
-//! [`crate::config::TextEncoderFeatureVersion`] for the upstream-mirroring detection function.
-//! Construction (both [`LtxTextEncoder::new`] and [`LtxTextEncoder::new_av`], via `require_v2`
-//! below) validates against [`crate::config::TextEncoderFeatureConfig::ltx_2_3`], which is
-//! currently a **hardcoded, compile-time-checked constant** (this crate has no
-//! `embedded_config.json` reader yet) — NOT a live per-checkpoint config-driven check the way the
-//! mlx side is. Real config-driven validation on this backend is being wired through sc-18757's
-//! config-threading surface; see the module note in `config.rs` for detail.
+//! extractor, and it's the ONLY one this crate implements. Construction (both
+//! [`LtxTextEncoder::new`] and [`LtxTextEncoder::new_av`], via `require_v2` below) validates
+//! against [`AvConfig::ltx_2_3`](crate::config::AvConfig::ltx_2_3)'s `caption_feature_version` —
+//! the same production-canonical LTX-2.3 constant the AvDiT build path uses, itself validated
+//! through `gen_core::ltx_checkpoint::caption_feature_version` (sc-18757's shared, upstream-
+//! mirroring detector both backends fold onto as of the 2026-08-19 coordinator review — this
+//! crate previously carried its own duplicate detection logic here).
+//!
+//! This is still a **compile-time constant check**, not a per-checkpoint one: `LtxTextEncoder`'s
+//! constructors don't yet take a loaded `AvConfig`/bundle (that threading is a separate, larger
+//! surface change outside this story's scope), so the gate below only catches the constant
+//! drifting away from what the shared detector accepts — not a real checkpoint's own config. Real
+//! per-checkpoint threading for this specific gate remains open, matching `AvConfig`'s own
+//! module-level note on split-bundle loading (sc-18757).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
 
-use crate::config::{
-    ConnectorConfig, GemmaConfig, TextEncoderFeatureConfig, TextEncoderFeatureVersion,
-};
+use crate::config::{AvConfig, ConnectorConfig, GemmaConfig};
 use crate::connector::Connector;
 use crate::gemma::GemmaEncoder;
 use crate::quant::{qlinear, QLinear};
@@ -201,18 +206,19 @@ impl LtxTextEncoder {
 /// so this one call site covers both constructors.
 ///
 /// This currently checks a **hardcoded, compile-time constant**
-/// ([`TextEncoderFeatureConfig::ltx_2_3`]), not a live per-checkpoint config value — this crate
-/// doesn't yet thread real config through construction (sc-18757 is wiring that). It still catches
-/// a real class of bug (someone editing that constant away from what upstream's detection accepts
-/// without noticing), just not a per-checkpoint one yet. Do not describe this as "config-driven"
-/// the way the mlx backend's genuinely-JSON-driven check is (sc-18763 coordinator review).
+/// ([`AvConfig::ltx_2_3`](crate::config::AvConfig::ltx_2_3)'s `caption_feature_version`), not a
+/// live per-checkpoint config value — `LtxTextEncoder`'s constructors don't yet take a loaded
+/// `AvConfig`, so this is not the same thing as the split-bundle, per-checkpoint reads
+/// `AvConfig::from_bundle` performs elsewhere in this crate (sc-18757). It still catches a real
+/// class of bug (someone editing the constant away from what the shared detector accepts without
+/// noticing), just not a per-checkpoint one yet. Do not describe this as "config-driven" the way
+/// the mlx backend's genuinely-JSON-driven check is (sc-18763 coordinator review).
 fn require_v2() -> Result<()> {
-    let cfg = TextEncoderFeatureConfig::ltx_2_3()?;
-    if cfg.version != TextEncoderFeatureVersion::V2 {
+    let version = AvConfig::ltx_2_3().caption_feature_version;
+    if version != CaptionFeatureVersion::V2 {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
-             selected {:?}, which this port does not implement",
-            cfg.version
+             selected {version:?}, which this port does not implement"
         )));
     }
     Ok(())

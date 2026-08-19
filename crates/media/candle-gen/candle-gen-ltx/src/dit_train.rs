@@ -467,6 +467,7 @@ mod tests {
             audio_max_pos: 20,
             cross_inner: 12,
             cross_max_pos: 20,
+            caption_feature_version: AvConfig::ltx_2_3().caption_feature_version,
             audio_ff_bias: true,
         }
     }

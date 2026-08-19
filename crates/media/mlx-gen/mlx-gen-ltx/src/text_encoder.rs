@@ -17,18 +17,20 @@
 //! sc-18763: `normed_hidden` below is the V2 (`PER_TOKEN_RMS`) caption feature extractor, and it's
 //! the ONLY one this crate implements. That was previously implicit — nothing checked the loaded
 //! model actually selected V2 before running this math. [`LtxTextEncoder::from_weights`] /
-//! [`LtxTextEncoder::from_weights_av`] now require `ltx_cfg.text_encoder_feature_version == V2`
-//! (see [`crate::config::TextEncoderFeatureVersion`] and its upstream-mirroring detection),
-//! erroring loudly instead of silently running V2 math against a V1-shaped checkpoint.
+//! [`LtxTextEncoder::from_weights_av`] now require `ltx_cfg.caption_feature_version == V2` (see
+//! `gen_core::ltx_checkpoint::caption_feature_version`, sc-18757's shared, upstream-mirroring
+//! detector both backends fold onto as of the 2026-08-19 coordinator review), erroring loudly
+//! instead of silently running V2 math against a V1-shaped checkpoint.
 
 use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
 use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use crate::config::{LtxConfig, TextEncoderFeatureVersion};
+use crate::config::LtxConfig;
 use crate::connector::Connector;
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
@@ -264,11 +266,11 @@ impl LtxTextEncoder {
 /// is the V2 math unconditionally — running it against a V1-shaped checkpoint would silently
 /// produce plausible-looking, wrong conditioning (the exact failure mode the story called out).
 fn require_v2(ltx_cfg: &LtxConfig) -> Result<()> {
-    if ltx_cfg.text_encoder_feature_version != TextEncoderFeatureVersion::V2 {
+    if ltx_cfg.caption_feature_version != CaptionFeatureVersion::V2 {
         return Err(Error::Msg(format!(
             "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
              selected {:?}, which this port does not implement",
-            ltx_cfg.text_encoder_feature_version
+            ltx_cfg.caption_feature_version
         )));
     }
     Ok(())
@@ -279,19 +281,22 @@ mod version_gate_tests {
     use super::*;
     use crate::config::LtxConfig;
 
+    // `LtxConfig::validated` (the fallible caption-detection step) is private to `crate::config`,
+    // so these synthetic configs set the field directly rather than routing through it — `require_v2`
+    // only cares about the field's value, not how a real load path resolved it. The detection logic
+    // itself (`gen_core::ltx_checkpoint::caption_feature_version`) has its own coverage in
+    // `crate::config`'s tests and in `gen_core::ltx_checkpoint`'s own test module.
+
     fn v1_config() -> LtxConfig {
-        // No embedded_config.json at all resolves to V1 (see `video_only_defaults`).
-        LtxConfig::video_only_defaults()
+        let mut cfg = LtxConfig::video_only_defaults();
+        cfg.caption_feature_version = CaptionFeatureVersion::V1;
+        cfg
     }
 
     fn v2_config() -> LtxConfig {
-        LtxConfig::from_embedded_transformer(&serde_json::json!({
-            "caption_proj_before_connector": true,
-            "caption_projection_first_linear": false,
-            "caption_proj_input_norm": false,
-            "caption_projection_second_linear": false,
-        }))
-        .expect("valid V2 config")
+        let mut cfg = LtxConfig::video_only_defaults();
+        cfg.caption_feature_version = CaptionFeatureVersion::V2;
+        cfg
     }
 
     #[test]

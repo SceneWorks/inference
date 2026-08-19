@@ -17,6 +17,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use mlx_gen::gen_core::ltx_checkpoint::{
+    caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
+};
 use mlx_gen::{Error, Result};
 
 /// Rotary-embedding layout. LTX-2.3 uses [`RopeType::Split`] (the 2.0 default is interleaved).
@@ -35,169 +38,6 @@ impl RopeType {
     }
 }
 
-/// Caption feature-extractor version selected for the S1 text-encoder's caption/connector-input
-/// path, per upstream's exact detection (`_create_feature_extractor`, Lightricks/LTX-2 @
-/// `d1511477`, `text_encoders/gemma/encoders/encoder_configurator.py:163-200`). sc-18763: this
-/// selection was previously implicit — `LtxTextEncoder` always ran the V2 math with no named
-/// decision — which is exactly the shape of bug the story called out: a checkpoint that resolved
-/// to V1 would have silently run V2 math and produced plausible-looking, wrong conditioning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextEncoderFeatureVersion {
-    /// V1 ("19B" in upstream's naming): the caption projection lives inside the transformer, no
-    /// per-token-RMS feature path. **Not ported** — [`LtxTextEncoder`](crate::text_encoder::LtxTextEncoder)
-    /// only implements V2 math, so selecting V1 is itself a construction-time error.
-    V1,
-    /// V2 ("22B"): per-token RMS norm → rescale → dual (video + audio) aggregate embeds. The only
-    /// feature-extractor path this crate implements. Measured directly on the real 2.5
-    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header (all 4 keys present, matching
-    /// `V2_EXPECTED_CONFIG` exactly) and on the **already-hosted** `SceneWorks/ltx-2.3-mlx`
-    /// tier's `embedded_config.json` (the legacy 2-key shape `is_legacy_two_key_v2_shape` in this
-    /// module carves out) — both select V2 (sc-18763; the tier finding is a 2026-08-18
-    /// coordinator-review correction of an earlier version of this doc comment that had instead
-    /// measured the upstream *dense* `ltx-2.3-22b-dev.safetensors` checkpoint, which the loader
-    /// never reads).
-    V2,
-}
-
-/// One of the four keys upstream's `_V2_EXPECTED_CONFIG` uses to detect V2, with the exact value
-/// it must carry.
-struct V2ConfigKey {
-    name: &'static str,
-    expected: bool,
-}
-
-/// Upstream's `_V2_EXPECTED_CONFIG` (`encoder_configurator.py:163-168`), exactly.
-const V2_EXPECTED_CONFIG: [V2ConfigKey; 4] = [
-    V2ConfigKey {
-        name: "caption_proj_before_connector",
-        expected: true,
-    },
-    V2ConfigKey {
-        name: "caption_projection_first_linear",
-        expected: false,
-    },
-    V2ConfigKey {
-        name: "caption_proj_input_norm",
-        expected: false,
-    },
-    V2ConfigKey {
-        name: "caption_projection_second_linear",
-        expected: false,
-    },
-];
-
-/// Whether one of the 4 [`V2_EXPECTED_CONFIG`] keys is absent, present with a boolean value, or
-/// present with some other JSON value type. Upstream's detection is a **key-presence** check
-/// (`transformer_config.keys() & _V2_EXPECTED_CONFIG.keys()`) followed by a **value** comparison —
-/// a key present with a non-bool value counts as present for the first check and then always fails
-/// the second (a string/number is never `==` a bool), landing in the "unknown config" error, not
-/// silently treated as absent. `Option<bool>` alone cannot express that distinction (it collapses
-/// "absent" and "present but the wrong type" to `None`), which is why this exists (sc-18763 review
-/// point 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyPresence {
-    Absent,
-    Bool(bool),
-    NonBool,
-}
-
-/// The exact 2-of-4-key shape the **already-hosted** `SceneWorks/ltx-2.3-mlx` tier's
-/// `embedded_config.json` carries: measured directly (2026-08-18, sc-18763 coordinator review)
-/// against every cached snapshot/quant variant on this machine (`01df27d308…` and `254989c3ca…`,
-/// q4/q8/bf16) — `caption_projection_first_linear` and `caption_projection_second_linear` are
-/// present and `false`; `caption_proj_before_connector` and `caption_proj_input_norm` are **absent**
-/// entirely. This predates the two extra keys this story added detection for: the converter that
-/// produced these tiers ran before the audit, so every already-installed 2.3 tier is missing them.
-///
-/// Upstream's own detection would call this "partial V2 config" and raise (`NotImplementedError`)
-/// — that is not survivable here: it would break `LtxConfig::from_model_dir` on every existing
-/// installed 2.3 tier the first time this code runs, and re-publishing them is out of scope for
-/// this story. So this exact shape — and *only* this exact shape — is carved out as V2 explicitly.
-/// Any other partial combination (a different pair of keys, a single key, 3 of 4, or this same pair
-/// with a non-`false` value) still errors via the general partial/mismatch logic below; the carve-
-/// out check runs first specifically so it cannot silently widen to cover those.
-fn is_legacy_two_key_v2_shape(present: &[KeyPresence; 4]) -> bool {
-    present[0] == KeyPresence::Absent // caption_proj_before_connector
-        && present[1] == KeyPresence::Bool(false) // caption_projection_first_linear
-        && present[2] == KeyPresence::Absent // caption_proj_input_norm
-        && present[3] == KeyPresence::Bool(false) // caption_projection_second_linear
-}
-
-/// Port of upstream's exact-match detection logic (`_create_feature_extractor`,
-/// `encoder_configurator.py:171-209`), extended with the legacy carve-out above: V1 iff none of
-/// the 4 [`V2_EXPECTED_CONFIG`] keys are present; V2 iff [`is_legacy_two_key_v2_shape`] matches, or
-/// all 4 are present and match exactly; anything else (a different partial key set, or a present
-/// key with an unexpected value) is config drift and **errors loudly** rather than silently falling
-/// back to V1 — the story's "verify, do not assume" mandate.
-///
-/// `present[i]` describes `V2_EXPECTED_CONFIG[i].name`'s state in the source config. This mirrors
-/// upstream's `transformer_config.keys() & _V2_EXPECTED_CONFIG.keys()` intersection, which is
-/// intentionally NOT the same thing as this crate's `get_bool(t, key, default)` helper — that
-/// helper cannot tell "absent" apart from "present with the default value".
-fn detect_text_encoder_feature_version(
-    present: [KeyPresence; 4],
-) -> Result<TextEncoderFeatureVersion> {
-    let present_count = present
-        .iter()
-        .filter(|v| **v != KeyPresence::Absent)
-        .count();
-    if present_count == 0 {
-        return Ok(TextEncoderFeatureVersion::V1);
-    }
-    if is_legacy_two_key_v2_shape(&present) {
-        return Ok(TextEncoderFeatureVersion::V2);
-    }
-    if present_count < V2_EXPECTED_CONFIG.len() {
-        let missing: Vec<&str> = V2_EXPECTED_CONFIG
-            .iter()
-            .zip(present.iter())
-            .filter(|(_, v)| **v == KeyPresence::Absent)
-            .map(|(k, _)| k.name)
-            .collect();
-        return Err(Error::Msg(format!(
-            "ltx: partial V2 caption-feature-extractor config — missing keys: {}",
-            missing.join(", ")
-        )));
-    }
-    let mismatched: Vec<String> = V2_EXPECTED_CONFIG
-        .iter()
-        .zip(present.iter())
-        .filter_map(|(k, v)| match v {
-            KeyPresence::Bool(got) if *got == k.expected => None,
-            KeyPresence::Bool(got) => Some(format!("{}={got} (expected {})", k.name, k.expected)),
-            KeyPresence::NonBool => Some(format!(
-                "{}=<non-bool value> (expected {})",
-                k.name, k.expected
-            )),
-            KeyPresence::Absent => unreachable!("present_count == 4 checked above"),
-        })
-        .collect();
-    if !mismatched.is_empty() {
-        return Err(Error::Msg(format!(
-            "ltx: unknown caption-feature-extractor config: {}",
-            mismatched.join(", ")
-        )));
-    }
-    Ok(TextEncoderFeatureVersion::V2)
-}
-
-/// The four V2-detection flags, read directly for **presence** (not [`get_bool`]'s
-/// presence-blind default) from the `transformer` block of `embedded_config.json`. A key present
-/// with a non-bool JSON value reads as [`KeyPresence::NonBool`], not "absent".
-fn read_v2_presence_flags(t: &Value) -> [KeyPresence; 4] {
-    let mut out = [KeyPresence::Absent; 4];
-    for (slot, key) in out.iter_mut().zip(V2_EXPECTED_CONFIG.iter()) {
-        *slot = match t.get(key.name) {
-            None => KeyPresence::Absent,
-            Some(v) => match v.as_bool() {
-                Some(b) => KeyPresence::Bool(b),
-                None => KeyPresence::NonBool,
-            },
-        };
-    }
-    out
-}
-
 /// The full LTX transformer config. Dimension-parametric: every field is read from
 /// `embedded_config.json` where present, falling back to the reference's hardcoded defaults.
 #[derive(Clone, Debug)]
@@ -214,6 +54,14 @@ pub struct LtxConfig {
     pub caption_channels: i32,
     pub caption_projection_first_linear: bool,
     pub caption_projection_second_linear: bool,
+    /// Which caption feature extractor this checkpoint's config selects — resolved from the
+    /// transformer section's four `caption_proj*` keys by
+    /// [`caption_feature_version`], never from a per-model constant or a
+    /// weight probe. LTX-2.3 declares only the legacy pair and resolves to
+    /// [`CaptionFeatureVersion::V2`] through the measured carve-out; LTX-2.5 declares all four.
+    /// Only set by the fallible constructors ([`LtxConfig::from_model_dir`] /
+    /// [`LtxConfig::from_bundle`]), because an undetectable shape is a load error, not a default.
+    pub caption_feature_version: CaptionFeatureVersion,
     /// adaLN-single scale_shift_table row count: **9** for the gated family, **6** otherwise.
     pub adaln_embedding_coefficient: i32,
     pub apply_gated_attention: bool,
@@ -238,10 +86,6 @@ pub struct LtxConfig {
     pub connector_num_learnable_registers: i32,
     pub connector_positional_embedding_max_pos: i32,
     pub connector_apply_gated_attention: bool,
-    /// The S1 caption feature-extractor version (sc-18763), explicit and config-driven — see
-    /// [`TextEncoderFeatureVersion`]. [`LtxTextEncoder::from_weights`](crate::text_encoder::LtxTextEncoder::from_weights)
-    /// rejects anything but `V2`.
-    pub text_encoder_feature_version: TextEncoderFeatureVersion,
 
     // --- Audio stack (sc-2684 AudioVideo) ---
     pub audio_num_attention_heads: i32,
@@ -318,6 +162,9 @@ impl LtxConfig {
             caption_channels: 3840,
             caption_projection_first_linear: true,
             caption_projection_second_linear: true,
+            // The 2.0 fallback has no `caption_proj*` keys at all, which is exactly upstream's V1
+            // condition. A real checkpoint overwrites this in `validated`.
+            caption_feature_version: CaptionFeatureVersion::V1,
             adaln_embedding_coefficient: 6,
             apply_gated_attention: false,
             cross_attention_adaln: false,
@@ -349,18 +196,15 @@ impl LtxConfig {
             audio_ff_bias: true,
             connector_ff_bias: true,
             use_keyframes_abs_pos_embedding: false,
-            // No `embedded_config.json` at all ⇒ none of the four V2-detection keys are present ⇒
-            // V1 by the same reasoning `detect_text_encoder_feature_version` applies to a real,
-            // sparse config (sc-18763). Never hit by 2.3/2.5, which both ship the file.
-            text_encoder_feature_version: TextEncoderFeatureVersion::V1,
         }
     }
 
     /// Build the config from the `transformer` block of a parsed `embedded_config.json`,
-    /// reproducing `generate_av.py`'s field resolution exactly. Fallible (sc-18763): a
-    /// corrupted/unknown caption-feature-extractor config combination errors here rather than
-    /// being silently treated as V1 (see `detect_text_encoder_feature_version` in this module).
-    pub fn from_embedded_transformer(t: &Value) -> Result<Self> {
+    /// reproducing `generate_av.py`'s field resolution exactly. Infallible — the caption
+    /// feature-extractor selection (config-driven, sc-18763/sc-18757) is a separate fallible step,
+    /// [`validated`](Self::validated), because it is keyed on **key presence** in `t`, which this
+    /// dimension-parametric mapper does not otherwise need to distinguish from "absent ⇒ default".
+    pub fn from_embedded_transformer(t: &Value) -> Self {
         let mut cfg = Self::video_only_defaults();
 
         // Plain dimension-parametric reads (default = the reference's hardcoded value).
@@ -500,13 +344,7 @@ impl LtxConfig {
                 get_i32(t, "audio_caption_channels", cfg.audio_caption_channels);
         }
 
-        // S1 caption feature-extractor version (sc-18763) — explicit, config-driven selection.
-        // Detection reads the four V2 keys for PRESENCE directly off `t` (not through the
-        // presence-blind `get_bool` helper above), matching upstream's `dict.keys()` intersection.
-        cfg.text_encoder_feature_version =
-            detect_text_encoder_feature_version(read_v2_presence_flags(t))?;
-
-        Ok(cfg)
+        cfg
     }
 
     /// Load the config from a model directory's `embedded_config.json` (the `transformer` block).
@@ -522,19 +360,42 @@ impl LtxConfig {
         let t = root_cfg
             .get("transformer")
             .ok_or_else(|| Error::Msg("ltx: embedded_config.json missing `transformer`".into()))?;
-        let cfg = Self::from_embedded_transformer(t)?;
-        // F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
-        // reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
-        // (wrong output, no error), reject the only value the engine does not implement. The 2.0
-        // interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
-        if cfg.rope_type != RopeType::Split {
+        Self::from_embedded_transformer(t).validated(t)
+    }
+
+    /// Build the config from a **split bundle's** transformer component (sc-18757).
+    ///
+    /// The LTX-2.5 transformer file carries its own `config.transformer` in `__metadata__`; this
+    /// reads that section and only that section. An absent section is an error naming the component
+    /// and the file — never a fall-through to the 2.3 shape, which would build a 48-layer 2.3 DiT
+    /// against 2.5 weights.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let transformer = bundle.require(LtxComponent::Transformer)?;
+        let section = transformer.config()?;
+        Self::from_embedded_transformer(section).validated(section)
+    }
+
+    /// Apply the load-time gates that reject checkpoint values this engine does not implement, and
+    /// resolve the config-driven caption feature-extractor selection.
+    ///
+    /// F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
+    /// reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
+    /// (wrong output, no error), reject the only value the engine does not implement. The 2.0
+    /// interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
+    ///
+    /// `transformer` is the source config section, needed because the caption-extractor selection is
+    /// keyed on **key presence**, not just parsed values — `caption_projection_first_linear: false`
+    /// and "absent" mean different things to it, and the parsed struct cannot distinguish them.
+    fn validated(mut self, transformer: &Value) -> Result<Self> {
+        if self.rope_type != RopeType::Split {
             return Err(Error::Msg(
                 "ltx: rope_type != \"split\" is not supported (only the LTX-2.3 split RoPE is \
                  implemented); interleaved (2.0) RoPE is not ported"
                     .into(),
             ));
         }
-        Ok(cfg)
+        self.caption_feature_version = caption_feature_version(transformer)?;
+        Ok(self)
     }
 }
 
@@ -740,30 +601,51 @@ impl LtxVaeConfig {
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
-            Some(v) => {
-                let cfg = Self::from_embedded_vae(v)?;
-                // F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE
-                // decoder HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the
-                // values the engine does not implement instead of silently mis-running a ts-conditioned
-                // or reflect-padded checkpoint (the old doc claimed a "config gate" that never existed).
-                if cfg.timestep_conditioning {
-                    return Err(Error::Msg(
-                        "ltx: vae.timestep_conditioning=true is not supported (the decoder runs the \
-                         non-ts-conditioned 2.3 path only)"
-                            .into(),
-                    ));
-                }
-                if cfg.spatial_padding_mode != "zeros" {
-                    return Err(Error::Msg(format!(
-                        "ltx: vae.spatial_padding_mode={:?} is not supported (the decoder hardcodes \
-                         \"zeros\" padding)",
-                        cfg.spatial_padding_mode
-                    )));
-                }
-                Ok(cfg)
-            }
+            // sc-18765 made `from_embedded_vae` fallible (`latent_log_var` parses into a typed enum)
+            // and inlined the F-075 gates here; sc-18757 extracted those same gates into `validated`
+            // so the split-bundle path applies them identically. Keep both: propagate the parse
+            // error, then run the shared gate.
+            Some(v) => Self::from_embedded_vae(v)?.validated(),
             None => Ok(Self::defaults()),
         }
+    }
+
+    /// Build the config from a **split bundle's** video-VAE component (sc-18757).
+    ///
+    /// `component` selects which of the two LTX-2.5 video VAEs to read
+    /// ([`LtxComponent::ConvVideoVae`] or [`LtxComponent::DiffusionVideoVae`]); each ships as its
+    /// own file with its own `config.vae`. Unlike [`from_model_dir`](Self::from_model_dir) — where
+    /// an absent `vae` block means "this 2.3 tree predates the embedded config", so the 2.3 defaults
+    /// are the right answer — a split component file that carries no `config.vae` is an **error**:
+    /// the whole point of the split layout is that each component declares its own structure, and a
+    /// 2.3-shaped default here would build the wrong block ladder against 2.5 weights.
+    pub fn from_bundle(bundle: &LtxBundle, component: LtxComponent) -> Result<Self> {
+        let vae = bundle.require(component)?;
+        Self::from_embedded_vae(vae.config()?)?.validated()
+    }
+
+    /// Apply the load-time gates that reject checkpoint values this decoder does not implement.
+    ///
+    /// F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE decoder
+    /// HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the values the
+    /// engine does not implement instead of silently mis-running a ts-conditioned or reflect-padded
+    /// checkpoint (the old doc claimed a "config gate" that never existed).
+    fn validated(self) -> Result<Self> {
+        if self.timestep_conditioning {
+            return Err(Error::Msg(
+                "ltx: vae.timestep_conditioning=true is not supported (the decoder runs the \
+                 non-ts-conditioned 2.3 path only)"
+                    .into(),
+            ));
+        }
+        if self.spatial_padding_mode != "zeros" {
+            return Err(Error::Msg(format!(
+                "ltx: vae.spatial_padding_mode={:?} is not supported (the decoder hardcodes \
+                 \"zeros\" padding)",
+                self.spatial_padding_mode
+            )));
+        }
+        Ok(self)
     }
 }
 
@@ -847,6 +729,25 @@ impl AudioVaeConfig {
             Some(v) => Self::from_ddconfig(v),
             None => Self::defaults(),
         })
+    }
+
+    /// Build the config from a **split bundle's** audio-VAE component (sc-18757).
+    ///
+    /// The LTX-2.5 audio VAE file owns `config.audio_vae` (and, beside it, `config.vocoder` — see
+    /// [`VocoderConfig::from_bundle`]). The `ddconfig` structure sits at
+    /// `audio_vae.model.params.ddconfig`, exactly as in the all-in-one layout; a file that flattens
+    /// it onto the `audio_vae` block itself is accepted too, since both spellings appear across
+    /// LTX-2.x extracts and neither is a *default* — the values still come from this component's own
+    /// config. An absent `config.audio_vae` is an error, not the 2.3 shape.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        let block = audio.config()?;
+        let dd = block
+            .get("model")
+            .and_then(|v| v.get("params"))
+            .and_then(|v| v.get("ddconfig"))
+            .unwrap_or(block);
+        Ok(Self::from_ddconfig(dd))
     }
 }
 
@@ -1008,6 +909,18 @@ impl VocoderConfig {
             None => Self::defaults(),
         })
     }
+
+    /// Build the config from a **split bundle's** audio-VAE component (sc-18757).
+    ///
+    /// The vocoder has no file of its own: LTX-2.5 ships it inside the audio-VAE component, whose
+    /// metadata carries `config.audio_vae` **and** `config.vocoder`. This reads that sibling section
+    /// off the same file; an absent one is an error naming the component, not the HiFi-GAN defaults.
+    pub fn from_bundle(bundle: &LtxBundle) -> Result<Self> {
+        let audio = bundle.require(LtxComponent::AudioVae)?;
+        Ok(Self::from_embedded_vocoder(
+            audio.config_section("vocoder")?,
+        ))
+    }
 }
 
 /// The `split_model.json` manifest's quantization fields. The reference `generate_av.py` drives
@@ -1148,7 +1061,7 @@ mod tests {
     /// `embedded_config.json`, a different, older converter artifact). Only
     /// `caption_projection_first_linear`/`caption_projection_second_linear` are present (both
     /// `false`); `caption_proj_before_connector`/`caption_proj_input_norm` are absent — the legacy
-    /// 2-key shape [`is_legacy_two_key_v2_shape`] carves out.
+    /// 2-key shape `CAPTION_V2_LEGACY_KEYS` (gen-core's `ltx_checkpoint` module) carves out.
     fn ltx23_transformer() -> Value {
         serde_json::json!({
             "_class_name": "AVTransformer3DModel",
@@ -1189,7 +1102,10 @@ mod tests {
 
     #[test]
     fn ltx23_config_matches_reference_build_logic() {
-        let cfg = LtxConfig::from_embedded_transformer(&ltx23_transformer()).unwrap();
+        let t = ltx23_transformer();
+        let cfg = LtxConfig::from_embedded_transformer(&t)
+            .validated(&t)
+            .unwrap();
         // Gated family → adaLN coeff 9.
         assert!(cfg.apply_gated_attention);
         assert_eq!(cfg.adaln_embedding_coefficient, 9);
@@ -1199,13 +1115,12 @@ mod tests {
         assert!(!cfg.caption_projection_second_linear);
         assert_eq!(cfg.caption_channels, 4096);
         assert_eq!(cfg.audio_caption_channels, 32 * 64);
-        // sc-18763 (coordinator review): the REAL shipped tier only carries the legacy 2-key shape
-        // (verified against every cached SceneWorks/ltx-2.3-mlx snapshot on this machine) — it
-        // resolves to V2 via the explicit legacy carve-out, not the strict 4-key match.
-        assert_eq!(
-            cfg.text_encoder_feature_version,
-            TextEncoderFeatureVersion::V2
-        );
+        // sc-18763 (coordinator review, detector-collapse round): the REAL shipped tier only
+        // carries the legacy 2-key shape (verified against every cached SceneWorks/ltx-2.3-mlx
+        // snapshot on this machine) — it resolves to V2 via gen-core's `caption_feature_version`
+        // legacy carve-out, not the strict 4-key match. This is the single shared detector both
+        // backends now fold onto (sc-18757); mlx-gen-ltx no longer duplicates the detection logic.
+        assert_eq!(cfg.caption_feature_version, CaptionFeatureVersion::V2);
         // Audio stack dims (sc-2684).
         assert_eq!(cfg.audio_inner_dim(), 2048);
         assert_eq!(cfg.audio_connector_num_attention_heads, 32);
@@ -1260,8 +1175,8 @@ mod tests {
 
     #[test]
     fn ltx25_config_sets_exactly_the_measured_delta() {
-        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer()).unwrap();
-        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer()).unwrap();
+        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer());
+        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer());
 
         // The two measured keys flip.
         assert!(cfg23.ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
@@ -1302,24 +1217,23 @@ mod tests {
             "audio_positional_embedding_max_pos": [42],
             "av_ca_timestep_scale_multiplier": 2000.0,
         });
-        let cfg = LtxConfig::from_embedded_transformer(&t).unwrap();
+        let cfg = LtxConfig::from_embedded_transformer(&t);
         assert_eq!(cfg.audio_in_channels, 256);
         assert_eq!(cfg.audio_out_channels, 257);
         assert_eq!(cfg.audio_positional_embedding_max_pos, 42);
         assert_eq!(cfg.av_ca_timestep_scale_multiplier, 2000);
         // No V2 keys present in `t` at all ⇒ V1 (not an error — a fully-absent config is a clean
-        // detection, distinct from a *partial* or *mismatched* one; see the `text_encoder_feature_*`
-        // tests below).
+        // detection, distinct from a *partial* or *mismatched* one; see the
+        // "caption feature-extractor version selection" tests below, which exercise the shared
+        // detector directly rather than through this infallible field-mapper).
         assert_eq!(
-            cfg.text_encoder_feature_version,
-            TextEncoderFeatureVersion::V1
+            caption_feature_version(&t).unwrap(),
+            CaptionFeatureVersion::V1
         );
         // The float-typed integer is read via the same getter for the non-audio multiplier too.
         let t2 = serde_json::json!({ "timestep_scale_multiplier": 3000.0 });
         assert_eq!(
-            LtxConfig::from_embedded_transformer(&t2)
-                .unwrap()
-                .timestep_scale_multiplier,
+            LtxConfig::from_embedded_transformer(&t2).timestep_scale_multiplier,
             3000
         );
     }
@@ -1334,6 +1248,15 @@ mod tests {
     }
 
     // --- sc-18763: caption feature-extractor version selection ------------------------------------
+    //
+    // Detector collapse (sc-18757/#688, 2026-08-19 coordinator review): `mlx-gen-ltx` no longer
+    // duplicates upstream's V1/V2 detection logic — `gen_core::ltx_checkpoint::caption_feature_
+    // version` is the single shared detector both backends fold onto. These tests are KEPT (per
+    // the coordinator's explicit instruction) but now call that shared function directly instead
+    // of a local `detect_text_encoder_feature_version` twin, so this crate still pins its own
+    // regression coverage of the cases its `LtxConfig`/fixtures care about, without a second copy
+    // of the classification rule. `gen_core::ltx_checkpoint`'s own test module covers the same 8
+    // cases exhaustively (verified to agree with these before the collapse).
 
     /// The 2.5 transformer config's V2-detection keys, measured directly off the real
     /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header
@@ -1351,19 +1274,17 @@ mod tests {
     #[test]
     fn ltx25_config_selects_v2() {
         // Acceptance (sc-18763): a test asserts the extractor version chosen for a 2.5 config is V2.
-        let cfg = LtxConfig::from_embedded_transformer(&ltx25_v2_keys()).unwrap();
         assert_eq!(
-            cfg.text_encoder_feature_version,
-            TextEncoderFeatureVersion::V2
+            caption_feature_version(&ltx25_v2_keys()).unwrap(),
+            CaptionFeatureVersion::V2
         );
     }
 
     #[test]
     fn no_v2_keys_present_selects_v1_not_an_error() {
-        let cfg = LtxConfig::from_embedded_transformer(&serde_json::json!({})).unwrap();
         assert_eq!(
-            cfg.text_encoder_feature_version,
-            TextEncoderFeatureVersion::V1
+            caption_feature_version(&serde_json::json!({})).unwrap(),
+            CaptionFeatureVersion::V1
         );
     }
 
@@ -1378,8 +1299,7 @@ mod tests {
             "caption_proj_before_connector": true,
             "caption_projection_first_linear": false,
         });
-        let err = LtxConfig::from_embedded_transformer(&corrupted)
-            .expect_err("partial V2 key set must error");
+        let err = caption_feature_version(&corrupted).expect_err("partial V2 key set must error");
         let msg = err.to_string();
         assert!(msg.contains("partial"), "unexpected error message: {msg}");
         assert!(msg.contains("caption_proj_input_norm"));
@@ -1389,90 +1309,71 @@ mod tests {
     #[test]
     fn all_four_keys_present_but_wrong_value_errors_loudly() {
         // All 4 keys present (so it's not "partial"), but one value disagrees with
-        // `_V2_EXPECTED_CONFIG` — config drift the reference itself raises `NotImplementedError` on.
+        // `CAPTION_V2_EXPECTED_CONFIG` — config drift the reference itself raises
+        // `NotImplementedError` on.
         let mut corrupted = ltx25_v2_keys();
         corrupted["caption_proj_before_connector"] = serde_json::json!(false);
-        let err = LtxConfig::from_embedded_transformer(&corrupted)
-            .expect_err("mismatched V2 key value must error");
+        let err =
+            caption_feature_version(&corrupted).expect_err("mismatched V2 key value must error");
         let msg = err.to_string();
-        assert!(msg.contains("unknown"), "unexpected error message: {msg}");
-        assert!(msg.contains("caption_proj_before_connector"));
+        assert!(msg.contains("caption_proj_before_connector"), "{msg}");
     }
 
     #[test]
     fn present_non_bool_value_errors_as_unknown_config_not_silent_v1() {
         // sc-18763 coordinator review point 3: a key present with a non-bool JSON value must count
         // as PRESENT (matching upstream's `dict.keys()` semantics) and then fail the value
-        // comparison — landing in "unknown config", never silently treated as absent/V1.
+        // comparison — landing in an error, never silently treated as absent/V1.
         let corrupted = serde_json::json!({
             "caption_proj_before_connector": "yes", // non-bool — must not read as absent
             "caption_projection_first_linear": false,
             "caption_proj_input_norm": false,
             "caption_projection_second_linear": false,
         });
-        let err = LtxConfig::from_embedded_transformer(&corrupted)
+        let err = caption_feature_version(&corrupted)
             .expect_err("a present non-bool value must error, not resolve V1");
-        let msg = err.to_string();
-        assert!(msg.contains("unknown"), "unexpected error message: {msg}");
-        assert!(msg.contains("caption_proj_before_connector"));
+        assert!(err.to_string().contains("caption_proj_before_connector"));
     }
 
     #[test]
     fn present_non_bool_value_in_a_partial_set_still_counts_as_present() {
-        // A non-bool value at a legacy-shape key position means this is NOT the legacy shape
-        // (`is_legacy_two_key_v2_shape` requires an exact `Bool(false)`), and the non-bool key
-        // still counts toward `present_count` (not toward "missing") — so with only 3 of 4 keys
-        // "present" (1 non-bool + 2 absent), this is "partial", not "unknown value on all 4".
+        // A non-bool value at a legacy-shape key position means this is NOT the legacy shape (the
+        // carve-out requires an exact boolean `false`), and the non-bool key still counts toward
+        // "declared" (not toward "missing") — so with only 2 of 4 keys declared here, this is
+        // "partial", not "unknown value on all 4".
         let corrupted = serde_json::json!({
             "caption_projection_first_linear": "false", // non-bool, string not JSON bool
             "caption_projection_second_linear": false,
         });
-        let err = LtxConfig::from_embedded_transformer(&corrupted)
+        let err = caption_feature_version(&corrupted)
             .expect_err("must error, not silently resolve to the legacy V2 shape");
-        let msg = err.to_string();
-        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+        assert!(err.to_string().contains("partial"));
     }
 
     #[test]
     fn legacy_two_key_shape_with_a_true_value_is_not_the_carve_out() {
         // Same two key NAMES as the shipped legacy shape, but a `true` instead of `false` — the
-        // carve-out is exact-match, not name-only. Both keys present (so not "partial"; the other
-        // two are still absent, so it IS partial here) — the point is it must not resolve V2.
+        // carve-out is exact-match, not name-only.
         let corrupted = serde_json::json!({
             "caption_projection_first_linear": true,
             "caption_projection_second_linear": false,
         });
-        let err = LtxConfig::from_embedded_transformer(&corrupted)
+        let err = caption_feature_version(&corrupted)
             .expect_err("a wrong-valued near-miss of the legacy shape must not resolve V2");
         assert!(err.to_string().contains("partial"));
     }
 
     #[test]
-    fn text_encoder_requires_v2_config_to_build() {
-        // The engine only implements V2 math (`LtxTextEncoder::from_weights`) — building a text
-        // encoder from a V1-selected config must be rejected there, not silently mis-run. Exercised
-        // directly against `detect_text_encoder_feature_version` here; the construction-time gate
-        // itself is covered in `text_encoder.rs`'s tests.
-        use KeyPresence::{Absent, Bool};
+    fn the_shipped_legacy_shape_selects_v2() {
+        // The exact legacy 2-key shape shipped tiers carry (sc-18763 coordinator review) — pinned
+        // directly here in addition to `ltx23_config_matches_reference_build_logic`'s full fixture.
+        let legacy = serde_json::json!({
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+        });
         assert_eq!(
-            detect_text_encoder_feature_version([Absent, Absent, Absent, Absent]).unwrap(),
-            TextEncoderFeatureVersion::V1
-        );
-        assert_eq!(
-            detect_text_encoder_feature_version([
-                Bool(true),
-                Bool(false),
-                Bool(false),
-                Bool(false)
-            ])
-            .unwrap(),
-            TextEncoderFeatureVersion::V2
-        );
-        // The exact legacy 2-key shape shipped tiers carry (sc-18763 coordinator review).
-        assert_eq!(
-            detect_text_encoder_feature_version([Absent, Bool(false), Absent, Bool(false)])
-                .unwrap(),
-            TextEncoderFeatureVersion::V2
+            caption_feature_version(&legacy).unwrap(),
+            CaptionFeatureVersion::V2
         );
     }
 
