@@ -202,8 +202,9 @@ impl LtxConfig {
     /// Build the config from the `transformer` block of a parsed `embedded_config.json`,
     /// reproducing `generate_av.py`'s field resolution exactly. Infallible — the caption
     /// feature-extractor selection (config-driven, sc-18763/sc-18757) is a separate fallible step,
-    /// [`validated`](Self::validated), because it is keyed on **key presence** in `t`, which this
-    /// dimension-parametric mapper does not otherwise need to distinguish from "absent ⇒ default".
+    /// `validated` (private to this module), because it is keyed on **key presence** in `t`, which
+    /// this dimension-parametric mapper does not otherwise need to distinguish from "absent ⇒
+    /// default".
     pub fn from_embedded_transformer(t: &Value) -> Self {
         let mut cfg = Self::video_only_defaults();
 
