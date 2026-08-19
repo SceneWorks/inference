@@ -174,6 +174,14 @@ impl TransformerConfig {
             "timestep_scale_multiplier",
             cfg.timestep_scale_multiplier,
         );
+        // sc-18758's two video-stream flags, parsed from the SECTION rather than inherited from the
+        // 2.3 constants — this is the whole point of a config-driven reader, and the real 2.5 header
+        // stamps `ff_bias:false` / `use_keyframes_abs_pos_embedding:true`. The defaults are the
+        // reference's own absent-key fallbacks (`True` / `False`), written as literals so they stay
+        // anchored to the reference rather than to whichever constant `ltx_2_3()` happens to carry.
+        // Mirrors mlx-gen-ltx's reader exactly.
+        cfg.ff_bias = get_bool(t, "ff_bias", true);
+        cfg.use_keyframes_abs_pos_embedding = get_bool(t, "use_keyframes_abs_pos_embedding", false);
         cfg
     }
 }
@@ -255,6 +263,10 @@ impl AvConfig {
         cfg.audio_max_pos =
             get_i32_array_first(t, "audio_positional_embedding_max_pos", cfg.audio_max_pos);
         cfg.cross_max_pos = cfg.video.rope_max_pos[0].max(cfg.audio_max_pos);
+        // The audio-stream FFN bias flag. Defaults `true` (the reference's absent-key fallback):
+        // measured against the real 2.5 headers, they carry NO `audio_ff_bias` key at all, so it is
+        // NOT part of the 2.3→2.5 delta and must not be flipped alongside `ff_bias`.
+        cfg.audio_ff_bias = get_bool(t, "audio_ff_bias", true);
         cfg.caption_feature_version = caption_feature_version(t)?;
         Ok(cfg)
     }
@@ -327,6 +339,10 @@ impl ConnectorConfig {
         cfg.max_pos = get_i32_array_first(t, "connector_positional_embedding_max_pos", cfg.max_pos);
         cfg.norm_eps = get_f64(t, "norm_eps", cfg.norm_eps);
         cfg.rope_theta = get_f64(t, "positional_embedding_theta", cfg.rope_theta);
+        // The connector's OWN FFN bias flag, independent of the DiT's `ff_bias`. Neither the 2.3 nor
+        // the shipped 2.5 checkpoint sets it, so it takes the reference's absent-key default
+        // (`True`) — but it is read rather than assumed, so a checkpoint that does set it is honored.
+        cfg.ff_bias = get_bool(t, "connector_ff_bias", true);
         cfg
     }
 
@@ -901,6 +917,53 @@ mod component_config_tests {
         assert_eq!(cfg.audio_max_pos, 12);
         // `cross_pe_max_pos = max(video_max_pos[0], audio_max_pos)` — derived, not declared.
         assert_eq!(cfg.cross_max_pos, 24);
+    }
+
+    /// The measured 2.3→2.5 delta, read FROM JSON rather than from a constant. Mirrors mlx's
+    /// `ltx_2_5_transformer_delta_is_read_from_config`.
+    ///
+    /// `from_transformer_config` used to ignore all three flags and hand back the 2.3 constants, so
+    /// the first real-2.5 consumer of `AvConfig::from_bundle` on candle would have built a
+    /// biased-FFN, no-keyframes DiT against weights that disagree — and candle would have silently
+    /// diverged from mlx, whose reader parsed them.
+    #[test]
+    fn the_2_5_ff_bias_and_keyframe_delta_is_read_from_config() {
+        // Exactly what the real `ltx-2.5-22b-{distilled,dev}-transformer-bf16.safetensors` headers
+        // stamp: `ff_bias:false` + `use_keyframes_abs_pos_embedding:true`, and NO `audio_ff_bias` /
+        // `connector_ff_bias` key at all.
+        let mut section = transformer_section();
+        section["ff_bias"] = serde_json::json!(false);
+        section["use_keyframes_abs_pos_embedding"] = serde_json::json!(true);
+
+        let cfg = AvConfig::from_transformer_config(&section).expect("V1: no caption_proj* keys");
+        assert!(!cfg.video.ff_bias);
+        assert!(cfg.video.use_keyframes_abs_pos_embedding);
+        // NOT part of the delta — absent from the real header, so both keep the reference `True`.
+        assert!(cfg.audio_ff_bias);
+        assert!(ConnectorConfig::from_transformer_config(&section).ff_bias);
+        assert!(ConnectorConfig::audio_from_transformer_config(&section).ff_bias);
+
+        // The 2.3 section (none of the three keys) reproduces the reference absent-key fallbacks,
+        // and matches the hardcoded 2.3 constants.
+        let base = AvConfig::from_transformer_config(&transformer_section())
+            .expect("V1: no caption_proj* keys");
+        assert!(base.video.ff_bias);
+        assert!(!base.video.use_keyframes_abs_pos_embedding);
+        assert!(base.audio_ff_bias);
+        assert_eq!(base.video.ff_bias, AvConfig::ltx_2_3().video.ff_bias);
+        assert_eq!(
+            base.video.use_keyframes_abs_pos_embedding,
+            AvConfig::ltx_2_3().video.use_keyframes_abs_pos_embedding
+        );
+
+        // Every flag is genuinely read, not inherited: flipping each away from its default lands.
+        let mut flipped = transformer_section();
+        flipped["audio_ff_bias"] = serde_json::json!(false);
+        flipped["connector_ff_bias"] = serde_json::json!(false);
+        let cfg = AvConfig::from_transformer_config(&flipped).expect("V1: no caption_proj* keys");
+        assert!(!cfg.audio_ff_bias);
+        assert!(!ConnectorConfig::from_transformer_config(&flipped).ff_bias);
+        assert!(!ConnectorConfig::audio_from_transformer_config(&flipped).ff_bias);
     }
 
     #[test]
