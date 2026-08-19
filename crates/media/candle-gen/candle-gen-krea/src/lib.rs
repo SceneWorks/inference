@@ -1118,7 +1118,16 @@ pub fn descriptor() -> ModelDescriptor {
             // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
             // native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
+            // Krea 2 is epic 20414's first acceptance target, so it is the one family validated for
+            // the GATED advanced multi-pass schedules (`linear_quadratic` / `bong_tangent`,
+            // sc-20416) on top of the curated eight. Every route here resolves its schedule through
+            // `candle_gen::resolve_flow_schedule` -> `gen_core::sampling::schedule_sigmas`, so the
+            // advertisement and the honoring are the same code path. Families that have NOT been
+            // validated keep the bare `curated_scheduler_names()` menu — that is the gate.
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                &candle_gen::advanced_pass_scheduler_names(),
+            ),
             supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,

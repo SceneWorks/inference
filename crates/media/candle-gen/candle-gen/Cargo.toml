@@ -63,3 +63,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
 [dev-dependencies]
 # Self-removing fixture roots for the training-driver tests (sc-17704).
 tempfile = { workspace = true }
+# The shared σ-schedule golden table (epic 20414, sc-20416): `sampler::tests` replays the SAME
+# fixture the mlx-gen twin replays, which is how "both backends receive identical coefficients" is
+# enforced in CI. Test-only — it never compiles into a production build.
+sceneworks-gen-core-testkit = { workspace = true }

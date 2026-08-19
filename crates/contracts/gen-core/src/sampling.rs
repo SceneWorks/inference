@@ -46,8 +46,10 @@ pub use model_sampling::{
     ModelSampling, PredictionType,
 };
 pub use schedulers::{
-    beta_sigmas, ddim_uniform_sigmas, exponential_sigmas, karras_sigmas, normal_sigmas,
-    schedule_sigmas, simple_sigmas, Scheduler,
+    beta_sigmas, bong_tangent_sigmas, ddim_uniform_sigmas, exponential_sigmas, karras_sigmas,
+    linear_quadratic_sigmas, normal_sigmas, schedule_sigmas, simple_sigmas, try_schedule_sigmas,
+    ScheduleError, Scheduler, BONG_TANGENT_PIVOT, BONG_TANGENT_SLOPE,
+    LINEAR_QUADRATIC_THRESHOLD_NOISE,
 };
 pub use solvers::{
     sampler_by_name, Abnorsett4m, AbnorsettState, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde,
