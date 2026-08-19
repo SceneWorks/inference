@@ -756,8 +756,18 @@ pub const ABNORSETT_ORDER: usize = 4;
 /// subtraction cancels) by the equivalent series `I_m = h^{m+1}·m!·Σ_{i≥0} (−h)^i/(m+1+i)!`. These are the
 /// `φ`-function combinations of the exponential-integrator literature (`I_0 = h·φ_1(−h)`, and
 /// generally `I_m = h^{m+1}·m!·φ_{m+1}(−h)`).
+///
+/// **`h == 0` is a supported degenerate input, not a bug:** a schedule whose adjacent σ values are
+/// equal (dense f32-rounded ramps can collide) gives `λ_{n+1} − λ_n = 0`, and every integral over an
+/// empty interval is exactly `0`. Returning zeros makes [`exp_ab_weights`] all-zero, so the step
+/// reduces to `x ← e^{−0}·x = x` — an exact identity, which is the correct answer for a step that
+/// advances nowhere. (The zero vector is also what the series branch computes analytically; it is
+/// returned explicitly so debug and release builds agree and neither panics.)
 fn exp_kernel_integrals(h: f64, k: usize) -> Vec<f64> {
-    debug_assert!(h > 0.0 && h.is_finite(), "exp_kernel_integrals: h = {h}");
+    debug_assert!(h >= 0.0 && h.is_finite(), "exp_kernel_integrals: h = {h}");
+    if h == 0.0 {
+        return vec![0.0; k];
+    }
     let mut out = Vec::with_capacity(k);
     if h < 1.0 {
         // Series branch: for h < 1 the recursion computes I_m ≈ h^{m+1}/(m+1) as a difference of
@@ -948,7 +958,10 @@ impl Abnorsett4m {
                 x = x0;
                 continue;
             }
-            let h = lambda(s_next) - lam; // > 0 (σ descends)
+            // h = λ_{n+1} − λ_n ≥ 0 (σ descends). h == 0 when a schedule repeats a σ value (dense
+            // f32 ramps can collide): `exp_kernel_integrals` returns zeros there, so the update
+            // below is the exact identity `x ← 1·x`, in debug builds as well as release.
+            let h = lambda(s_next) - lam;
             let hist = &state.history; // oldest first; last = current step's x0
                                        // deltas[j] = λ_{n−j} − λ_n: 0 for the current node, strictly negative for older ones.
             let deltas: Vec<f64> = hist.iter().rev().map(|(l, _)| l - lam).collect();
@@ -2048,5 +2061,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Equal adjacent (positive) σ values — which f32-rounded dense schedules really do produce —
+    /// give `h = λ_{n+1} − λ_n = 0`. That must be an exact identity step in DEBUG builds too, never
+    /// a `debug_assert` panic that release builds silently skip.
+    #[test]
+    fn abnorsett_equal_adjacent_sigmas_step_is_identity_without_panicking() {
+        // Every moment integral over an empty interval is exactly zero, so every quadrature weight
+        // is zero and the update collapses to `x ← e^{−0}·x`.
+        assert_eq!(exp_kernel_integrals(0.0, 4), vec![0.0_f64; 4]);
+        assert_eq!(exp_ab_weights(&[0.0, -0.3, -0.7], 0.0), vec![0.0_f64; 3]);
+
+        let ops = CpuLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let x_init = vec![0.3_f32, -1.1, 2.0, 0.05];
+        let mut dn = |xx: &Vec<f32>, s: f32| Ok(toy_denoised(xx, s));
+
+        // The bare duplicate step `[σ, σ]` leaves the latent bitwise untouched.
+        let mut state = AbnorsettState::new();
+        let held = Abnorsett4m
+            .sample_with_state(&ops, &mut dn, x_init.clone(), &[0.8_f32, 0.8], &mut state)
+            .unwrap();
+        assert_eq!(held, x_init, "h = 0 must be an exact identity step");
+
+        // …and a duplicate embedded mid-schedule neither panics nor poisons the rest of the pass.
+        let out = Sampler::<CpuLatentOps>::sample(
+            &Abnorsett4m,
+            &ops,
+            &ms,
+            &mut dn,
+            x_init.clone(),
+            &[1.0_f32, 0.8, 0.8, 0.6, 0.0],
+            0,
+        )
+        .unwrap();
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "duplicate σ mid-schedule produced non-finite output"
+        );
     }
 }

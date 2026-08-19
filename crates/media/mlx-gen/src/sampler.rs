@@ -1271,26 +1271,15 @@ mod tests {
     #[test]
     fn mlx_drives_every_curated_solver_to_finite_output() {
         // The P2 deliverable: every gen-core curated sampler runs end-to-end over mlx_rs::Array.
-        // (The list had gone stale at 8 entries; it again covers the full curated menu —
-        // er_sde/dpmpp_2m_sde from sc-10519 and rk6_7s/abnorsett_4m from sc-20417.)
+        // This iterates `Solver::ALL` rather than a hand-written name list (which had gone stale at
+        // 8 entries once already): a solver added to the curated menu joins MLX coverage
+        // automatically, and can never silently drop out of it.
         let ops = MlxLatentOps;
         let ms = FlowModelSampling::new(TimestepConvention::Sigma);
         let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
         let x_init = arr(&[0.2, -0.5, 1.0, 0.3]);
-        for name in [
-            "euler",
-            "euler_ancestral",
-            "heun",
-            "dpmpp_2m",
-            "dpmpp_sde",
-            "uni_pc",
-            "lcm",
-            "ddim",
-            "er_sde",
-            "dpmpp_2m_sde",
-            "rk6_7s",
-            "abnorsett_4m",
-        ] {
+        for solver in gen_core::sampling::Solver::ALL {
+            let name = solver.name();
             let sampler =
                 gen_core::sampling::sampler_by_name::<MlxLatentOps>(name).expect("known solver");
             let mut dn = |x: &Array, s: f32| {
