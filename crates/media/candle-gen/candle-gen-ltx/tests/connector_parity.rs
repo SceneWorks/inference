@@ -55,7 +55,16 @@ fn nv_from_mask01(mask01: &Tensor) -> CoreResult<usize> {
 /// `TierPaths::connector_vb` — the same remapper `lib.rs`'s `new_av` call site uses), rooted the
 /// same way: `model.diffusion_model.` (the connector's `video_embeddings_connector.*` /
 /// `audio_embeddings_connector.*` prefixes sit under that).
-fn connector_root(device: &Device) -> CoreResult<candle_gen::candle_nn::VarBuilder<'static>> {
+///
+/// Returns `candle_gen::Result` (not `candle_core::Result`/`CoreResult`) because
+/// `TierPaths::connector_vb` itself returns `candle_gen::Result` (`CandleError`, the crate's own
+/// rich error type) — `CandleError: From<candle_core::Error>` lets `?` widen a `candle_core`
+/// error INTO `candle_gen::Result` here, but not the reverse (that direction would need
+/// `From<CandleError> for candle_core::Error`, which the orphan rule forbids since neither type is
+/// local to this crate). Matches `tests/vae_encode_parity.rs`'s exact pattern.
+fn connector_root(
+    device: &Device,
+) -> candle_gen::Result<candle_gen::candle_nn::VarBuilder<'static>> {
     let base = std::env::var("LTX_BASE_DIR").expect("set LTX_BASE_DIR to the q4/q8 tier directory");
     let paths = TierPaths::detect(std::path::Path::new(&base), None)
         .expect("LTX_BASE_DIR must contain quantize_config.json and transformer.safetensors");
@@ -66,7 +75,7 @@ fn connector_root(device: &Device) -> CoreResult<candle_gen::candle_nn::VarBuild
 
 #[test]
 #[ignore = "needs real eros connector weights (candle CUDA tier) and a CUDA GPU"]
-fn video_connector_matches_reference() -> CoreResult<()> {
+fn video_connector_matches_reference() -> candle_gen::Result<()> {
     let device = Device::new_cuda(0)?;
     let root = connector_root(&device)?;
     let conn = Connector::new(root, &ConnectorConfig::ltx_2_3())?;
@@ -89,7 +98,7 @@ fn video_connector_matches_reference() -> CoreResult<()> {
 
 #[test]
 #[ignore = "needs real eros connector weights (candle CUDA tier) and a CUDA GPU"]
-fn audio_connector_matches_reference() -> CoreResult<()> {
+fn audio_connector_matches_reference() -> candle_gen::Result<()> {
     // sc-2684 / sc-5495: the audio connector is the same architecture at audio dims (32×64=2048).
     let device = Device::new_cuda(0)?;
     let root = connector_root(&device)?;

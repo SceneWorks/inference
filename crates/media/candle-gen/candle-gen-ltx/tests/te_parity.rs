@@ -21,6 +21,13 @@
 
 #![cfg(feature = "cuda")]
 
+// Test functions return `candle_gen::Result` (not `candle_core::Result`/`CoreResult`), matching
+// `tests/vae_encode_parity.rs`: `TierPaths::gemma_vb`/`connector_vb` return `candle_gen::Result`
+// (`CandleError`, the crate's rich error type) — `CandleError: From<candle_core::Error>` lets `?`
+// widen a `candle_core` error INTO `candle_gen::Result`, never the reverse (that direction would
+// need `From<CandleError> for candle_core::Error`, which the orphan rule forbids). A test fn
+// declared `candle_core::Result` that calls a `TierPaths` accessor fails to compile with "? could
+// not convert the error" — this is exactly that failure mode, fixed here.
 use candle_gen::candle_core::{safetensors, DType, Device, Result as CoreResult, Tensor};
 use candle_gen_ltx::config::{ConnectorConfig, GemmaConfig};
 use candle_gen_ltx::text_encoder::LtxTextEncoder;
@@ -63,7 +70,7 @@ fn mask01_from_golden(attention_mask: &Tensor) -> CoreResult<Vec<u32>> {
 
 #[test]
 #[ignore = "needs Gemma-3-12B shards (candle CUDA tier), a CUDA GPU, and tools/golden/ltx_te_golden.safetensors"]
-fn full_text_encoder_matches_reference() -> CoreResult<()> {
+fn full_text_encoder_matches_reference() -> candle_gen::Result<()> {
     let device = Device::new_cuda(0)?;
     let paths = tier_paths();
     let gemma_vb = paths.gemma_vb(DType::BF16, &device)?;
@@ -109,7 +116,7 @@ fn full_text_encoder_matches_reference() -> CoreResult<()> {
 
 #[test]
 #[ignore = "needs Gemma-3-12B shards (candle CUDA tier), a CUDA GPU, and tools/golden/ltx_te_golden.safetensors"]
-fn full_text_encoder_av_matches_reference() -> CoreResult<()> {
+fn full_text_encoder_av_matches_reference() -> candle_gen::Result<()> {
     let device = Device::new_cuda(0)?;
     let paths = tier_paths();
     let gemma_vb = paths.gemma_vb(DType::BF16, &device)?;
