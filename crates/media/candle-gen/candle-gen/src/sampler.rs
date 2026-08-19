@@ -829,6 +829,8 @@ mod tests {
             "ddim",
             "er_sde",
             "dpmpp_2m_sde",
+            "rk6_7s",
+            "abnorsett_4m",
         ] {
             let sampler = sampler_by_name::<CandleLatentOps>(name).expect("known solver");
             // Smooth velocity field v = 0.25·x + 0.1.
@@ -988,6 +990,37 @@ mod tests {
         assert_ne!(vec1(&run(Some("heun"))), vec1(&run(None)));
     }
 
+    /// sc-20417: the driver's per-eval progress hook fires exactly `Solver::model_evals` times for
+    /// the multi-eval rk6_7s (7 per interior step, 1 terminal) and the multistep abnorsett_4m
+    /// (1 per step, startup ramp included) — the cancellation check rides the same `denoise`
+    /// callback, so this pins the eval-accounting seam end-to-end through the candle driver.
+    #[test]
+    fn driver_progress_fires_once_per_model_eval_for_new_solvers() {
+        use gen_core::sampling::Solver;
+        let steps = 6usize;
+        let sigmas = build_flow_sigmas(steps, compute_mu(image_seq_len(512, 512), steps));
+        for name in ["rk6_7s", "abnorsett_4m"] {
+            let cancel = CancelFlag::new();
+            let count = std::cell::Cell::new(0u32);
+            let mut progress = |_p: Progress| count.set(count.get() + 1);
+            let out = run_flow_sampler(
+                Some(name),
+                TimestepConvention::Sigma,
+                &sigmas,
+                t(&[0.2, -0.5, 1.0, 0.3]),
+                7,
+                &cancel,
+                &mut progress,
+                None,
+                |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+            )
+            .unwrap();
+            assert!(vec1(&out).iter().all(|v| v.is_finite()));
+            let want = Solver::from_name(name).unwrap().model_evals(steps) as u32;
+            assert_eq!(count.get(), want, "{name}: progress events != model evals");
+        }
+    }
+
     /// The driver bridges cancellation: a flag tripped before the first eval surfaces as the typed
     /// `CandleError::Canceled` (not a stringified `Msg`).
     #[test]
@@ -1056,7 +1089,9 @@ mod tests {
                 "lcm",
                 "ddim",
                 "er_sde",
-                "dpmpp_2m_sde"
+                "dpmpp_2m_sde",
+                "rk6_7s",
+                "abnorsett_4m"
             ]
         );
         assert_eq!(

@@ -1271,6 +1271,8 @@ mod tests {
     #[test]
     fn mlx_drives_every_curated_solver_to_finite_output() {
         // The P2 deliverable: every gen-core curated sampler runs end-to-end over mlx_rs::Array.
+        // (The list had gone stale at 8 entries; it again covers the full curated menu —
+        // er_sde/dpmpp_2m_sde from sc-10519 and rk6_7s/abnorsett_4m from sc-20417.)
         let ops = MlxLatentOps;
         let ms = FlowModelSampling::new(TimestepConvention::Sigma);
         let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
@@ -1284,6 +1286,10 @@ mod tests {
             "uni_pc",
             "lcm",
             "ddim",
+            "er_sde",
+            "dpmpp_2m_sde",
+            "rk6_7s",
+            "abnorsett_4m",
         ] {
             let sampler =
                 gen_core::sampling::sampler_by_name::<MlxLatentOps>(name).expect("known solver");
