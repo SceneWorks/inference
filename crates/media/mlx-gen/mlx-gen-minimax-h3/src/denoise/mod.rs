@@ -61,7 +61,10 @@
 //! the surviving ones still dominating the clock (sc-19452, sc-19505). Reading the status bit is
 //! exact and clock-free — but only because the `eval` here is **synchronous**. Switching this call
 //! to `async_eval` would turn the reading into a race against the completion event and must
-//! revisit `tests/joint_denoise.rs` and `tests/pipeline.rs` together.
+//! revisit `tests/joint_denoise.rs`, `tests/pipeline.rs` and `tests/duration_sweep_real.rs`
+//! together — the last one's per-step peak/active segmentation also assumes each step's work is
+//! materialized before its progress tick, so under `async_eval` its segments would smear across
+//! ticks and its allocation gates would false-RED.
 
 pub mod geometry;
 pub mod packing;

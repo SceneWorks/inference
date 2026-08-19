@@ -412,6 +412,52 @@ jobs:
           sw_vers
           xcodebuild -version
           cmake --version
+      # sc-19556 CI-disk mitigation. On 2026-08-19 this lane hit the runner's disk wall three
+      # attempts running: attempt 1 died with `ar: libmlx.a: No space left on device` inside the
+      # MLX native build during "Test LLM+audio macOS bundle", and attempts 2-3 killed the runner
+      # outright (it could no longer write its own `_diag` log). Two things stack up:
+      #   * the hosted `macos-15-arm64` image ships NINE Xcode installs (16.0 through 26.3) plus the
+      #     Android SDK. This lane uses exactly one Xcode and no Android at all, so that payload is
+      #     pure dead weight sitting on the same volume as `target/`.
+      #   * this lane runs four cargo invocations with four different feature sets, and on any branch
+      #     whose manifest set differs from `main` the rust-cache restore is a prefix match
+      #     ("full match: false" — the failing run restored `...-c5bb8f3b` under key `...-e634915e`),
+      #     so the restored ~1.2 GB target/ is kept AND a second generation of artifacts is built on
+      #     top of it. Branches whose manifests match `main` get "full match: true" and never build
+      #     that second generation, which is why they passed the same day on the same image.
+      # We cannot shrink the second generation without a full rebuild, so reclaim the image payload
+      # instead. This step is diagnostics + deletion only: it never fails the job.
+      - name: Reclaim runner disk
+        run: |
+          set +e
+          echo "--- disk before reclaim ---"
+          df -h /
+          resolve() { ( cd "$1" >/dev/null 2>&1 && pwd -P ); }
+          keep="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer.*##')"
+          case "$keep" in
+            /Applications/Xcode*.app)
+              keep_real="$(resolve "$keep")"
+              echo "active Xcode: $keep_real"
+              for app in /Applications/Xcode*.app; do
+                [ -e "$app" ] || continue
+                if [ "$(resolve "$app")" = "$keep_real" ]; then
+                  echo "keep  $app"
+                  continue
+                fi
+                echo "prune $app"
+                sudo rm -rf "$app"
+              done
+              ;;
+            *)
+              # DEVELOPER_DIR is CommandLineTools or unset — we cannot tell which Xcode the later
+              # steps will select, so prune nothing rather than guess.
+              echo "active developer dir is '${keep:-<none>}', not an Xcode bundle; skipping Xcode prune"
+              ;;
+          esac
+          sudo rm -rf "$HOME/Library/Android" "$HOME/.android"
+          echo "--- disk after reclaim ---"
+          df -h /
+          exit 0
       - name: Ensure Metal compiler
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then
@@ -445,6 +491,18 @@ jobs:
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos
+      # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
+      # else in this job, so it is free to drop before the four cargo invocations start stacking
+      # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
+      # the 2026-08-19 disk failures had no data for. Diagnostics only; never fails the job.
+      - name: Disk after rustdoc
+        if: always()
+        run: |
+          set +e
+          rm -rf target/doc
+          df -h /
+          du -sh target 2>/dev/null
+          exit 0
       # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
       # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
       # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
@@ -463,13 +521,42 @@ jobs:
         run: >-
           cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after MLX package tests
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after LLM-only bundle
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
       # profile — and this is the one platform where that combination is cross-backend.
       - name: Test LLM+audio macOS bundle
         run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
+      # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
+      # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
+      # only; never fails the job.
+      - name: Disk after LLM+audio bundle
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
       # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
       # (no lane passes --features metal to Clippy), and without --all-targets it did not even
