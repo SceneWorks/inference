@@ -169,8 +169,13 @@ pub struct EncoderContract {
     pub hidden_activation: &'static str,
     pub attention_dropout: EncoderConfigFloat,
     pub rms_norm_eps: EncoderConfigFloat,
-    /// Runtime epsilon for per-head q/k RMSNorm when that operation exists. It may differ from the
-    /// decoder-block epsilon (MLX Z-Image intentionally uses the mlx default 1e-5).
+    /// Runtime epsilon for per-head q/k RMSNorm when that operation exists. It is the epsilon the
+    /// checkpoint's own config declares for that norm — for the Qwen3-family encoders that is
+    /// `rms_norm_eps`, because `Qwen3Attention` builds `q_norm`/`k_norm` from it and the released
+    /// configs declare no separate qk-norm key. A backend whose runtime uses its library's default
+    /// instead has a defect here, not a variant: that is what sc-17137's review found in MLX
+    /// Z-Image (1e-5 against the checkpoint's 1e-6). It is a separate field because an architecture
+    /// that *does* publish a distinct qk-norm epsilon must be able to say so.
     pub qk_norm_eps: Option<EncoderConfigFloat>,
     pub rope_theta: EncoderConfigFloat,
     pub max_position_embeddings: usize,

@@ -102,6 +102,40 @@ def _download_kwargs(model: dict) -> dict:
     return kwargs
 
 
+def _retire_stale_materialization_provenance(model: dict, snapshot: Path) -> None:
+    """Drop provenance an interrupted earlier attempt left behind, after a complete refetch.
+
+    A canonical model at a cache-shaped path can carry a `MATERIALIZATION_INCOMPLETE` marker: the
+    staging path publishes it before any transfer, so any interruption of a main-era run against
+    this destination leaves one. `verify_materialization_provenance` refuses on that marker
+    unconditionally, and nothing on the cache-heal path used to remove it — so the heal re-fetched
+    multi-GB through the cache, failed verification on the marker again, and reported the failure as
+    an `expected_files` shortfall. Every run, forever. The staging path recovers the same state by
+    unlinking and restaging; this is that semantics for the destinations staging does not own.
+
+    Only ever called after the cache-correct fetch has returned, so the marker is describing an
+    attempt that has been superseded byte for byte. A stray receipt is dropped for the same reason
+    and on the same evidence — the caller only heals models that declare no alternate source, so
+    any receipt here is left over from a manifest row that no longer exists, and the staging path
+    already unlinks it (`receipt_path.unlink(missing_ok=True)`) before its own download.
+    """
+    for name in (MATERIALIZATION_INCOMPLETE, MATERIALIZATION_RECEIPT):
+        path = snapshot / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError(
+                f"{model['key']} snapshot at {snapshot} carries an unsafe {name} entry, so the "
+                "cache-correct fetch cannot retire it. Remove it by hand and re-run."
+            )
+        if not path.exists():
+            continue
+        print(
+            f"retiring the superseded {name} left in {snapshot} by an earlier interrupted "
+            "materialization",
+            flush=True,
+        )
+        path.unlink()
+
+
 def _heal_in_cache(
     model: dict,
     snapshot: Path,
@@ -152,7 +186,11 @@ def _heal_in_cache(
             "at a plain directory outside any models--*/snapshots/* layout."
         ) from error
     # Nothing is written into the snapshot directory by hand -- no revision marker. The cache
-    # names the revision in the directory itself, and `verify_snapshot` reads it from there.
+    # names the revision in the directory itself, and `verify_snapshot` reads it from there. What
+    # an EARLIER attempt wrote by hand is retired, though: an incomplete marker left in a canonical
+    # cache directory outlives the interruption it recorded and would otherwise fail every future
+    # run, after the download, with a message about the wrong thing.
+    _retire_stale_materialization_provenance(model, snapshot)
     try:
         verify_snapshot(
             model,

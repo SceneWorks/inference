@@ -766,6 +766,150 @@ class CacheResidentSnapshotTests(unittest.TestCase):
             # The cache names the revision in the directory itself; nothing is stamped into it.
             self.assertFalse((snapshot / MARKER).exists())
 
+    def test_cache_heal_retires_a_stale_incomplete_marker_and_then_stays_cached(self) -> None:
+        """The state an interrupted main-era staging run leaves in a canonical cache directory.
+
+        `verify_materialization_provenance` refuses on `MATERIALIZATION_INCOMPLETE`
+        unconditionally, so a marker the cache heal did not remove survived its own fetch: every
+        run re-materialized the whole repo and then failed the re-verify, reporting a
+        provenance refusal through a message about `expected_files`. The second `ensure_snapshot`
+        below is the half that would have kept failing forever.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            self.fill(snapshot)
+            (snapshot / MATERIALIZATION_INCOMPLETE).write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "canonical_repository": MODEL["repository"],
+                        "canonical_revision": MODEL["revision"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.fill(snapshot)
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, download))
+            self.assertEqual(len(calls), 1)
+            self.assertFalse((snapshot / MATERIALIZATION_INCOMPLETE).exists())
+            verify_snapshot(MODEL, snapshot)
+            # The recovery is the point: the next run costs nothing at all.
+            self.assertFalse(ensure_snapshot(MODEL, snapshot, download))
+            self.assertEqual(len(calls), 1)
+
+    def test_cache_heal_retires_a_receipt_a_retired_alternate_source_left(self) -> None:
+        """The same shape one row-edit away: a model that used to declare an alternate source.
+
+        Its receipt stays in the cache directory, `verify_materialization_provenance` calls an
+        unexpected receipt a failure for a model that declares no source, and the plain-directory
+        path already unlinks one before its own download. Only the cache heal did not.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            self.fill(snapshot)
+            (snapshot / MATERIALIZATION_RECEIPT).write_text(
+                json.dumps(completed_materialization_receipt(MIRRORED_MODEL, snapshot)) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "unexpected alternate-source"):
+                verify_snapshot(MODEL, snapshot)
+
+            self.assertTrue(ensure_snapshot(MODEL, snapshot, lambda **kwargs: None))
+            self.assertFalse((snapshot / MATERIALIZATION_RECEIPT).exists())
+            verify_snapshot(MODEL, snapshot)
+
+    def test_cache_heal_refuses_an_unsafe_incomplete_marker_instead_of_unlinking_it(self) -> None:
+        """Retiring provenance is a targeted unlink of a regular file, never an rm of whatever is
+        at that name. A directory or a symlink there is not a marker this run wrote."""
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            self.fill(snapshot)
+            (snapshot / MATERIALIZATION_INCOMPLETE).mkdir()
+            with self.assertRaisesRegex(RuntimeError, "unsafe .* entry"):
+                ensure_snapshot(MODEL, snapshot, lambda **kwargs: None)
+            self.assertTrue((snapshot / MATERIALIZATION_INCOMPLETE).is_dir())
+
+    def test_cache_heal_threads_the_strict_provenance_flag_into_its_re_verify(self) -> None:
+        """The heal's own `verify_snapshot` must carry the flag, not silently drop it.
+
+        Two-sided, because a heal that ignored the flag would also pass the pristine half. The
+        strict gate accepts a canonical `snapshots/<revision>` directory only while it carries no
+        `.sceneworks-model-revision` marker — a marker means this script wrote the directory, and
+        then it owes a receipt. No shipped lane pairs the flag with a canonical model (all six
+        strict invocations name alternate-source rows), so this pins the plumbing.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            calls = []
+
+            def download(**kwargs) -> None:
+                calls.append(kwargs)
+                self.fill(snapshot)
+
+            self.assertTrue(
+                ensure_snapshot(
+                    MODEL, snapshot, download, require_materialization_provenance=True
+                )
+            )
+            self.assertEqual(len(calls), 1)
+
+            (snapshot / MARKER).write_text(MODEL["revision"] + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "requires either"):
+                ensure_snapshot(
+                    MODEL, snapshot, download, require_materialization_provenance=True
+                )
+            # The same directory, the same heal, without the flag: accepted.
+            self.assertFalse(ensure_snapshot(MODEL, snapshot, download))
+
+    def test_a_receipt_model_at_a_cache_path_stages_under_strict_provenance(self) -> None:
+        """The combined path: alternate source, cache-shaped destination, strict flag, and a stale
+        incomplete marker on top.
+
+        An alternate-source model is heal-ELIGIBLE by location and still must not take the cache
+        heal — its bytes come from a different repository and revision than the directory names, so
+        a `cache_dir` fetch would land them in a sibling. It takes staging instead, which is what
+        publishes the receipt the strict gate then demands.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_cache_snapshot(Path(temporary))
+            (snapshot / MATERIALIZATION_INCOMPLETE).write_text("{}\n", encoding="utf-8")
+            calls = []
+
+            def download(**kwargs) -> str:
+                calls.append(kwargs)
+                staging = Path(kwargs["local_dir"])
+                self.fill(staging)
+                return str(staging)
+
+            self.assertTrue(
+                ensure_snapshot(
+                    MIRRORED_MODEL,
+                    snapshot,
+                    download,
+                    require_materialization_provenance=True,
+                )
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["repo_id"], MIRRORED_MODEL["materialization_repository"])
+            self.assertEqual(calls[0]["revision"], MIRRORED_MODEL["materialization_revision"])
+            self.assertNotIn("cache_dir", calls[0])
+            self.assertFalse((snapshot / MATERIALIZATION_INCOMPLETE).exists())
+            self.assertTrue((snapshot / MATERIALIZATION_RECEIPT).is_file())
+            verify_snapshot(MIRRORED_MODEL, snapshot, require_materialization_provenance=True)
+            # And the receipt is what carries it: strip it and the strict gate refuses again,
+            # because a directory this script wrote is not a pristine canonical cache.
+            (snapshot / MATERIALIZATION_RECEIPT).unlink()
+            with self.assertRaisesRegex(RuntimeError, "requires either"):
+                verify_snapshot(
+                    MIRRORED_MODEL, snapshot, require_materialization_provenance=True
+                )
+
     def test_absent_cache_resident_snapshot_heals_through_the_cache(self) -> None:
         # The fresh-runner state: the revision directory does not exist yet. `local_dir` would
         # still resolve the blob into this path and then copy it onto itself.
