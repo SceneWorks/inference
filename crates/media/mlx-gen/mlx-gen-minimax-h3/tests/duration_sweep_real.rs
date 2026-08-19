@@ -292,8 +292,10 @@ fn render(root: &std::path::Path, width: u32, height: u32, frames: i32, steps: u
         step_active.remove(0);
     }
     // Resetting the counter per tick split the render's high-water into segments; the maximum over
-    // those segments (plus the tail that covers the last step and the VAE decode) is the same number
-    // the un-instrumented harness reported, so the peak column is unchanged by the instrumentation.
+    // those segments (plus the decode-only tail) is the same number the un-instrumented harness
+    // reported, so the peak column is unchanged by the instrumentation. The tail is decode-only:
+    // the last step's compute is materialized by the synchronous per-step eval and sampled at its
+    // own tick, so nothing of the denoise loop leaks past the final tick into the tail segment.
     let tail_peak = mlx_rs::memory::get_peak_memory() as u64;
     let peak_bytes = conditioning_peak
         .max(tail_peak)
