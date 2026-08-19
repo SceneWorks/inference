@@ -1508,7 +1508,14 @@ impl DenoisePlanExecution {
                 resolved.insert("seed".to_string(), json_seed(record.resolved.seed));
                 resolved.insert(
                     "adapters".to_string(),
-                    Value::Array(record.resolved.adapters.iter().map(adapter_to_json).collect()),
+                    Value::Array(
+                        record
+                            .resolved
+                            .adapters
+                            .iter()
+                            .map(adapter_to_json)
+                            .collect(),
+                    ),
                 );
                 object.insert("resolved".to_string(), Value::Object(resolved));
                 object.insert(

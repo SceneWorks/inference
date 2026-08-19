@@ -211,7 +211,13 @@ pub fn check_pass_schedule_shape(builder: &PassScheduleBuilder<'_>) -> Result<()
 /// same solver driven directly over the family's own schedule with the same seed (the legacy
 /// single-trajectory shape).
 pub fn check_one_pass_equivalence(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
-    for sampler in ["euler", "dpmpp_2m", "rk6_7s", "abnorsett_4m", "euler_ancestral"] {
+    for sampler in [
+        "euler",
+        "dpmpp_2m",
+        "rk6_7s",
+        "abnorsett_4m",
+        "euler_ancestral",
+    ] {
         let job_seed = 42_u64;
         let plan = plan_for(vec![pass(6, sampler, 1.0)], job_seed)?;
         let (out, _) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
@@ -221,9 +227,8 @@ pub fn check_one_pass_equivalence(builder: &PassScheduleBuilder<'_>) -> Result<(
         let sigmas = builder(&plan.passes[0], 6);
         let solver = sampler_by_name::<CpuLatentOps>(sampler)
             .ok_or_else(|| format!("one-pass equivalence: unknown solver {sampler:?}"))?;
-        let mut dn = |x: &Vec<f32>, s: f32| {
-            gc_denoise(&ops, &m, x, s, |xin, _t| Ok(stub_velocity(xin)))
-        };
+        let mut dn =
+            |x: &Vec<f32>, s: f32| gc_denoise(&ops, &m, x, s, |xin, _t| Ok(stub_velocity(xin)));
         let want = solver
             .sample(&ops, &m, &mut dn, x_init(), &sigmas, job_seed)
             .map_err(|e| format!("one-pass equivalence: direct run failed: {e}"))?;
@@ -269,9 +274,11 @@ pub fn check_boundary_renoise(builder: &PassScheduleBuilder<'_>) -> Result<(), S
         ));
     }
     if host.first_latent_of_pass[1] != expected_entry {
-        return Err("boundary re-noise: pass 2's entry latent is not the deterministic \
+        return Err(
+            "boundary re-noise: pass 2's entry latent is not the deterministic \
                     noise_scaling blend of pass 1's output with the pass-2 renoise stream"
-            .to_owned());
+                .to_owned(),
+        );
     }
     if host.first_latent_of_pass[1] == after_pass_1 {
         return Err(
@@ -549,8 +556,7 @@ mod tests {
             }
             s
         };
-        let err =
-            check_one_pass_equivalence(&broken).expect_err("a drifting builder must fail");
+        let err = check_one_pass_equivalence(&broken).expect_err("a drifting builder must fail");
         assert!(err.contains("one-pass equivalence"), "{err}");
     }
 

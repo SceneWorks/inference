@@ -1452,8 +1452,7 @@ impl Krea {
                         },
                     )?;
                     let mut images = Vec::with_capacity(req.count as usize);
-                    let mut first_execution: Option<mlx_gen::gen_core::DenoisePlanExecution> =
-                        None;
+                    let mut first_execution: Option<mlx_gen::gen_core::DenoisePlanExecution> = None;
                     for n in 0..req.count {
                         let seed = base_seed.wrapping_add(n as u64);
                         // Image n re-resolves the plan at its own job seed (`seed + n`, the batch

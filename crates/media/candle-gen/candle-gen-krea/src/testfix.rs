@@ -295,9 +295,7 @@ pub(crate) fn tiny_native_transformer_fixture(
 /// + `config.json`) — the BUILT-IN load route twin of [`tiny_native_transformer_fixture`], for tests
 /// that must prove the snapshot branch of a driver (sc-20418). Same production latent surface
 /// (`LATENT_CHANNELS == 16`, patch 2) so `init_noise` traverses the real path.
-pub(crate) fn tiny_snapshot_transformer_fixture(
-    tmp: &tempfile::TempDir,
-) -> (PathBuf, Krea2Config) {
+pub(crate) fn tiny_snapshot_transformer_fixture(tmp: &tempfile::TempDir) -> (PathBuf, Krea2Config) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let fixture = N.fetch_add(1, Ordering::Relaxed);
     let root = tmp.path().join(format!("krea_tiny_snapshot_{fixture}"));

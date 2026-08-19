@@ -3536,7 +3536,10 @@ mod tests {
                     "transformer_blocks.0.attn.to_q.lora_A.weight".to_string(),
                     down,
                 ),
-                ("transformer_blocks.0.attn.to_q.lora_B.weight".to_string(), up),
+                (
+                    "transformer_blocks.0.attn.to_q.lora_B.weight".to_string(),
+                    up,
+                ),
             ]),
             &path,
         )
@@ -3583,7 +3586,10 @@ mod tests {
         .unwrap();
         let got = outputs[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let want = legacy.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(got, want, "one-pass chain must equal the single-pass driver");
+        assert_eq!(
+            got, want,
+            "one-pass chain must equal the single-pass driver"
+        );
         let execution = execution.expect("first image records the execution");
         assert_eq!(execution.passes.len(), 1);
         assert!(!execution.passes[0].renoised);
@@ -3685,8 +3691,7 @@ mod tests {
                 dp_pass(1, "euler", 0.5, vec![]),
             ],
         );
-        let (outputs, _, loads, decodes) =
-            dp_run(&dit, &root, None, &[], &context, &req).unwrap();
+        let (outputs, _, loads, decodes) = dp_run(&dit, &root, None, &[], &context, &req).unwrap();
         assert_eq!(loads, 0);
         assert_eq!(decodes, 2);
         let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -3711,8 +3716,7 @@ mod tests {
                 }],
             )],
         );
-        let (_, _, loads, decodes) =
-            dp_run(&dit, &root, None, &[lora], &context, &req).unwrap();
+        let (_, _, loads, decodes) = dp_run(&dit, &root, None, &[lora], &context, &req).unwrap();
         assert_eq!(loads, 1);
         assert_eq!(decodes, 1);
     }

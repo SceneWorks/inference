@@ -1051,8 +1051,12 @@ impl Generator for KreaGenerator {
                     if dp_plan.is_some() =>
                 {
                     let comps = &resident.components;
-                    let (context, negative) =
-                        pipeline::encode_denoise_pass_contexts(comps.text(), req, raw, dp_need_neg)?;
+                    let (context, negative) = pipeline::encode_denoise_pass_contexts(
+                        comps.text(),
+                        req,
+                        raw,
+                        dp_need_neg,
+                    )?;
                     let job = pipeline::DenoisePassJob {
                         root: &self.root,
                         native_dit: self.native_dit.as_ref(),
@@ -4527,8 +4531,8 @@ mod tests {
             }]),
             ..base.clone()
         };
-        let err =
-            ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, true, &with_override).unwrap_err();
+        let err = ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, true, &with_override)
+            .unwrap_err();
         assert!(err.to_string().contains("diff-patch"), "{err}");
         ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, true, &base).unwrap();
         ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, false, &with_override).unwrap();

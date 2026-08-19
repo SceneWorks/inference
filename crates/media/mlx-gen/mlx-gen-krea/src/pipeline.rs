@@ -1398,8 +1398,9 @@ impl KreaHeavy {
     ) -> Result<DenoisePassPlans> {
         validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2")?;
         let geom = Self::geom_latent(width, height)?;
-        let pass_uses_cfg =
-            |pass: &mlx_gen::gen_core::ResolvedDenoisePass| is_raw && pass.guidance.unwrap_or(0.0) > 0.0;
+        let pass_uses_cfg = |pass: &mlx_gen::gen_core::ResolvedDenoisePass| {
+            is_raw && pass.guidance.unwrap_or(0.0) > 0.0
+        };
         let neg_prep = |dit: &Krea2Transformer, needed: bool| -> Result<Option<JointPrep>> {
             if !needed {
                 return Ok(None);

@@ -379,10 +379,7 @@ struct MenuDishonest {
 }
 
 impl MenuDishonest {
-    fn new(
-        reject_sampler: Option<&'static str>,
-        reject_scheduler: Option<&'static str>,
-    ) -> Self {
+    fn new(reject_sampler: Option<&'static str>, reject_scheduler: Option<&'static str>) -> Self {
         let mut desc = stub_desc(STUB_ID);
         desc.capabilities.samplers = vec!["euler", "heun"];
         desc.capabilities.schedulers = vec!["normal", "linear_quadratic"];
@@ -405,8 +402,7 @@ impl Generator for MenuDishonest {
                 return Err(Error::Msg(format!("{STUB_ID}: sampler {rejected} refused")));
             }
         }
-        if let (Some(rejected), Some(requested)) =
-            (self.reject_scheduler, req.scheduler.as_deref())
+        if let (Some(rejected), Some(requested)) = (self.reject_scheduler, req.scheduler.as_deref())
         {
             if requested == rejected {
                 return Err(Error::Msg(format!(

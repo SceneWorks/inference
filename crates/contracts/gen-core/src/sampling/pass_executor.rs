@@ -123,8 +123,11 @@ pub trait DenoisePassHost<L: LatentOps> {
     /// Build the **full fresh** σ schedule for this pass's resolved scheduler at `schedule_steps`
     /// steps (descending, trailing `0.0` — the family's ordinary schedule builder). Called once per
     /// pass, before any integration.
-    fn build_schedule(&mut self, pass: &ResolvedDenoisePass, schedule_steps: usize)
-        -> Result<Vec<f32>>;
+    fn build_schedule(
+        &mut self,
+        pass: &ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> Result<Vec<f32>>;
 
     /// Apply this pass's pass-local state (guidance selection, adapter weight overrides). Called
     /// after the boundary re-noise and before the first evaluation of the pass.
@@ -135,8 +138,12 @@ pub trait DenoisePassHost<L: LatentOps> {
     /// The model forward at `(x_in, timestep)` returning the RAW (already CFG-combined) output the
     /// model's prediction type expects — velocity for FLOW, ε for EPS. Any per-pass guidance
     /// combine lives inside this call.
-    fn predict(&mut self, pass: &ResolvedDenoisePass, x: &L::Latent, timestep: f32)
-        -> Result<L::Latent>;
+    fn predict(
+        &mut self,
+        pass: &ResolvedDenoisePass,
+        x: &L::Latent,
+        timestep: f32,
+    ) -> Result<L::Latent>;
 
     /// Revert this pass's pass-local state. Runs even when the pass errored or was cancelled, so
     /// the provider is never left with pass-local overrides applied (no poisoned state).
@@ -487,7 +494,13 @@ mod tests {
 
     #[test]
     fn one_pass_plan_matches_a_direct_solver_run_bitwise() {
-        for sampler in ["euler", "dpmpp_2m", "rk6_7s", "abnorsett_4m", "euler_ancestral"] {
+        for sampler in [
+            "euler",
+            "dpmpp_2m",
+            "rk6_7s",
+            "abnorsett_4m",
+            "euler_ancestral",
+        ] {
             let job_seed = 42_u64;
             let plan = plan_for(vec![pass(6, sampler, 1.0)], job_seed);
             let mut host = StubHost::new();
@@ -763,7 +776,11 @@ mod tests {
         assert_eq!(execution.passes[1].effective_steps, 2);
         assert_eq!(
             execution.total_model_evals,
-            execution.passes.iter().map(|p| p.model_evals).sum::<usize>()
+            execution
+                .passes
+                .iter()
+                .map(|p| p.model_evals)
+                .sum::<usize>()
         );
 
         // JSON: seeds are strings, requested rides beside resolved.
