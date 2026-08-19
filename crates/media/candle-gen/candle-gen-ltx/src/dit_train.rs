@@ -205,10 +205,11 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    /// `bias` is `TransformerConfig::ff_bias` (sc-18758) — see `crate::transformer::FeedForward::load`.
+    fn load(vb: VarBuilder, bias: bool) -> Result<Self> {
         Ok(Self {
-            proj_in: linear(&vb.pp("net.0"), "proj")?,
-            proj_out: linear(&vb.pp("net"), "2")?,
+            proj_in: qlinear(&vb.pp("net.0"), "proj", bias)?,
+            proj_out: qlinear(&vb.pp("net"), "2", bias)?,
         })
     }
 
@@ -256,7 +257,7 @@ impl TrainBlock {
         Ok(Self {
             attn1: TrainAttention::load(vb.pp("attn1"), cfg.num_heads, cfg.head_dim, cfg.norm_eps)?,
             attn2: TrainAttention::load(vb.pp("attn2"), cfg.num_heads, cfg.head_dim, cfg.norm_eps)?,
-            ff: FeedForward::load(vb.pp("ff"))?,
+            ff: FeedForward::load(vb.pp("ff"), cfg.ff_bias)?,
             scale_shift_table: table("scale_shift_table")?,
             prompt_scale_shift_table: table("prompt_scale_shift_table")?,
             eps: cfg.norm_eps,
@@ -458,12 +459,15 @@ mod tests {
                 rope_theta: 10000.0,
                 rope_max_pos: [20, 64, 64],
                 timestep_scale_multiplier: 1000.0,
+                ff_bias: true,
+                use_keyframes_abs_pos_embedding: false,
             },
             audio_heads: 1,
             audio_head_dim: 12,
             audio_max_pos: 20,
             cross_inner: 12,
             cross_max_pos: 20,
+            audio_ff_bias: true,
         }
     }
 
