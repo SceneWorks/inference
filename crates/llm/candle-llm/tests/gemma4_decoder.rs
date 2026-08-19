@@ -570,6 +570,285 @@ fn gemma4_k_eq_v_layers_have_no_value_projection_in_the_checkpoint() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// checkpoint layout
+// ---------------------------------------------------------------------------------------------
+
+/// Gemma 4 unified ships **both** weight layouts: `Gemma4UnifiedForConditionalGeneration` nests the
+/// text decoder under `model.language_model.*`, while a text-only export (and the LTX-2.5 packed
+/// encoder, re-rooted on unpack) keeps the plain `model.*` one. The loader probes the checkpoint
+/// rather than guessing from config — the nesting is a checkpoint fact, not a config one.
+///
+/// Re-root the fixture's weight map and require the *same* goldens: a probe that guessed wrong
+/// fails on the first weight lookup, and one that quietly fell back to the plain stem would build a
+/// model from nothing.
+#[test]
+fn gemma4_nested_language_model_layout_loads_to_the_same_goldens() {
+    let g = goldens();
+
+    // `model.<rest>` -> `model.language_model.<rest>`, which is where the VLM wrapper puts it.
+    let mut nested = serde_json::Map::new();
+    for (key, spec) in g["weights"].as_object().unwrap() {
+        let rest = key
+            .strip_prefix("model.")
+            .unwrap_or_else(|| panic!("unexpected weight key {key}"));
+        nested.insert(format!("model.language_model.{rest}"), spec.clone());
+    }
+    let nested = Value::Object(nested);
+    assert!(
+        nested
+            .get("model.language_model.embed_tokens.weight")
+            .is_some(),
+        "the probe keys on the nested embedding"
+    );
+
+    let m = match build(&g["config"], &nested, &[]) {
+        Ok(m) => m,
+        Err(e) => panic!("the loader must find the nested decoder: {e}"),
+    };
+    let want = g["hidden_states"]["layers"].as_array().unwrap();
+    let shape = usizes(&g["hidden_states"]["shape"]);
+    assert_stack_from_golden_embeds(&m, want, &shape, "nested layout");
+
+    let ids = input_ids(&ids_of(&g["prompt"]), &Device::Cpu).unwrap();
+    let mut cache = m.new_cache();
+    let logits = m.decode_logits_all(&ids, &mut cache, 0).unwrap();
+    assert_abs_close(
+        &host(&logits),
+        &floats(&g["logits"]["data"]),
+        1e-4,
+        "nested layout logits",
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// the batched (left-padded, explicit-mask) decode path
+// ---------------------------------------------------------------------------------------------
+
+/// The blocked-attention fill the production batch path uses (`decode::batch`'s `MASK_NEG`), and
+/// the pad token it left-pads with.
+const MASK_NEG: f32 = -1e30;
+const PAD_ID: i32 = 0;
+
+/// A left-padded batched **prefill** through `decode_logits_masked` reproduces each row's
+/// single-sequence logits.
+///
+/// This is the only test that reaches the `AttnMask::Additive` arm of the per-layer window logic
+/// (`LlamaAttention::combined_sliding_mask`): a `sliding_attention` layer must *intersect* its
+/// window with the caller's padding mask rather than replace it — both are "0 keeps, a large
+/// negative blocks", so the intersection is their sum. Nothing else in the suite hands a Gemma 4
+/// model an explicit mask.
+///
+/// It also pins the per-layer-type RoPE table selection under `rope_tables`: the two rows sit at
+/// different pad offsets, so each layer type's table has to be built from the row's **own**
+/// positions rather than a shared arange — and the `full_attention` layers must still read the
+/// proportional table, not the sliding one.
+///
+/// Rows are compared against `decode_logits_all` on the *unpadded* prompt, so padding that leaked
+/// into attention, a window applied at the wrong offset, or a dropped second RoPE table all fail.
+#[test]
+fn gemma4_left_padded_batch_prefill_matches_per_row_single_sequence_logits() {
+    let g = goldens();
+    let m = model(&g);
+    let full = ids_of(&g["prompt"]);
+    let vocab = m.config().vocab_size as usize;
+
+    // Row 0 is the whole prompt; row 1 is shorter, left-padded to the same width. The shorter row
+    // is what makes the padding mask load-bearing.
+    let rows: [Vec<i32>; 2] = [full.clone(), full[..4].to_vec()];
+    let width = full.len() as i32;
+    assert!(
+        rows[1].len() < full.len(),
+        "the second row must be shorter or nothing is padded"
+    );
+    assert!(
+        width as usize
+            > g["config"]["text_config"]["sliding_window"]
+                .as_u64()
+                .unwrap() as usize,
+        "the prompt must outrun the window or the sliding layers are plain causal"
+    );
+
+    // The left-padded batch, its per-row absolute positions, and its additive mask — built exactly
+    // the way `decode::batch::build_prefill` builds them.
+    let mut ids: Vec<i32> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    let mut mask: Vec<f32> = Vec::new();
+    for row in &rows {
+        let pad = width - row.len() as i32;
+        for c in 0..width {
+            if c < pad {
+                ids.push(PAD_ID);
+                positions.push(0);
+            } else {
+                ids.push(row[(c - pad) as usize]);
+                positions.push(c - pad);
+            }
+        }
+        for i in 0..width {
+            for j in 0..width {
+                // Causal, and a key is attendable only if it is a real token. The diagonal is
+                // always kept so a pure-padding query row is never fully masked (whose softmax
+                // would be NaN); those rows are discarded anyway.
+                let ok = j <= i && (j >= pad || j == i);
+                mask.push(if ok { 0.0 } else { MASK_NEG });
+            }
+        }
+    }
+    let batch = rows.len();
+    let w = width as usize;
+    let ids_t = Tensor::from_vec(
+        ids.iter().map(|&i| i as u32).collect::<Vec<u32>>(),
+        (batch, w),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let mask_t = Tensor::from_vec(mask, (batch, 1, w, w), &Device::Cpu)
+        .unwrap()
+        .to_dtype(m.compute_dtype())
+        .unwrap();
+    let tables = m.rope_tables(&positions, batch as i32, width).unwrap();
+    assert!(
+        tables.is_per_layer_type(),
+        "a Gemma 4 model must build two position tables"
+    );
+
+    let mut cache = m.new_cache();
+    let batched = host(
+        &m.decode_logits_masked(&ids_t, &mut cache, &tables, &mask_t)
+            .expect("batched left-padded prefill"),
+    );
+    assert_eq!(batched.len(), batch * vocab);
+
+    for (r, row) in rows.iter().enumerate() {
+        let mut solo_cache = m.new_cache();
+        let solo = host(
+            &m.decode_logits_all(&input_ids(row, &Device::Cpu).unwrap(), &mut solo_cache, 0)
+                .expect("single-sequence forward"),
+        );
+        let want = &solo[solo.len() - vocab..];
+        let got = &batched[r * vocab..(r + 1) * vocab];
+        assert_abs_close(
+            got,
+            want,
+            1e-4,
+            &format!(
+                "batch row {r} (pad {}) vs its single-sequence logits",
+                width - row.len() as i32
+            ),
+        );
+    }
+}
+
+/// The same path at `q_len == 1`: a left-padded batched **decode step** must reproduce each row's
+/// own cached single-sequence step.
+///
+/// A prefill-only check cannot see this. At `q_len == 1` the window band is bottom-right aligned
+/// over the *whole cache* rather than over a square, so a sliding layer that computed its offset
+/// from the query length instead of `k_len - q_len` is correct in prefill and wrong here — and the
+/// per-row RoPE now has to place one token per row at a different absolute position.
+#[test]
+fn gemma4_left_padded_batch_decode_step_matches_per_row_single_sequence_logits() {
+    let g = goldens();
+    let m = model(&g);
+    let full = ids_of(&g["prompt"]);
+    let vocab = m.config().vocab_size as usize;
+    let rows: [Vec<i32>; 2] = [full.clone(), full[..4].to_vec()];
+    let width = full.len() as i32;
+    let next: [i32; 2] = [6, 9];
+
+    // Prefill the padded batch, then feed one new token per row.
+    let mut ids: Vec<i32> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    let mut mask: Vec<f32> = Vec::new();
+    for row in &rows {
+        let pad = width - row.len() as i32;
+        for c in 0..width {
+            if c < pad {
+                ids.push(PAD_ID);
+                positions.push(0);
+            } else {
+                ids.push(row[(c - pad) as usize]);
+                positions.push(c - pad);
+            }
+        }
+        for i in 0..width {
+            for j in 0..width {
+                let ok = j <= i && (j >= pad || j == i);
+                mask.push(if ok { 0.0 } else { MASK_NEG });
+            }
+        }
+    }
+    let batch = rows.len();
+    let w = width as usize;
+    let ids_t = Tensor::from_vec(
+        ids.iter().map(|&i| i as u32).collect::<Vec<u32>>(),
+        (batch, w),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let mask_t = Tensor::from_vec(mask, (batch, 1, w, w), &Device::Cpu)
+        .unwrap()
+        .to_dtype(m.compute_dtype())
+        .unwrap();
+    let mut cache = m.new_cache();
+    let tables = m.rope_tables(&positions, batch as i32, width).unwrap();
+    m.decode_logits_masked(&ids_t, &mut cache, &tables, &mask_t)
+        .expect("batched prefill");
+
+    // The decode step: `[b, 1]` ids, per-row absolute positions, and the `[b, 1, 1, k_total]` mask
+    // `decode::batch::decode_mask` builds — every cached key except this row's left-pad region.
+    let k_total = width + 1;
+    let step_ids = Tensor::from_vec(
+        next.iter().map(|&t| t as u32).collect::<Vec<u32>>(),
+        (batch, 1),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let step_positions: Vec<i32> = rows.iter().map(|r| r.len() as i32).collect();
+    let mut step_mask: Vec<f32> = Vec::new();
+    for row in &rows {
+        let pad = width - row.len() as i32;
+        for j in 0..k_total {
+            step_mask.push(if j >= pad { 0.0 } else { MASK_NEG });
+        }
+    }
+    let step_mask = Tensor::from_vec(step_mask, (batch, 1, 1, k_total as usize), &Device::Cpu)
+        .unwrap()
+        .to_dtype(m.compute_dtype())
+        .unwrap();
+    let step_tables = m.rope_tables(&step_positions, batch as i32, 1).unwrap();
+    let batched = host(
+        &m.decode_logits_masked(&step_ids, &mut cache, &step_tables, &step_mask)
+            .expect("batched decode step"),
+    );
+    assert_eq!(batched.len(), batch * vocab);
+
+    for (r, row) in rows.iter().enumerate() {
+        let mut solo = m.new_cache();
+        m.decode_logits(&input_ids(row, &Device::Cpu).unwrap(), &mut solo, 0)
+            .expect("solo prefill");
+        let want = host(
+            &m.decode_logits(
+                &input_ids(&[next[r]], &Device::Cpu).unwrap(),
+                &mut solo,
+                row.len() as i32,
+            )
+            .expect("solo decode step"),
+        );
+        let got = &batched[r * vocab..(r + 1) * vocab];
+        assert_abs_close(
+            got,
+            &want,
+            1e-4,
+            &format!(
+                "decode-step row {r} (pad {}) vs its single-sequence step",
+                width - row.len() as i32
+            ),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // paths that cannot serve a per-layer-type stack
 // ---------------------------------------------------------------------------------------------
 
@@ -593,6 +872,33 @@ fn gemma4_paged_cache_names_the_per_layer_head_shape_it_cannot_hold() {
     let mut contiguous = m.new_cache();
     m.decode_logits(&ids, &mut contiguous, 0)
         .expect("the contiguous cache holds per-layer shapes");
+}
+
+/// Interleaved multimodal RoPE is a **whole-model** schedule (Qwen3-VL's): it has no per-layer-type
+/// form, so running it on a Gemma 4 model would silently apply the sliding schedule to every layer
+/// — plausible numbers, wrong model. It must refuse by name instead.
+#[test]
+fn gemma4_refuses_interleaved_mrope_by_name() {
+    let g = goldens();
+    let m = model(&g);
+    let prompt = ids_of(&g["prompt"]);
+    let embeds = m.embed(&input_ids(&prompt, &Device::Cpu).unwrap()).unwrap();
+    let positions: Vec<i32> = (0..prompt.len() as i32).collect();
+    let visual = vec![false; prompt.len()];
+
+    let mut cache = m.new_cache();
+    let err = match m.decode_logits_from_embeds_mrope_deepstack(
+        &embeds,
+        [&positions, &positions, &positions],
+        &mut cache,
+        &visual,
+        &[],
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("M-RoPE cannot describe a per-layer-type RoPE stack"),
+    };
+    assert!(err.contains("multimodal RoPE"), "{err}");
+    assert!(err.contains("per layer type"), "{err}");
 }
 
 /// The continuous-batching `Throughput` path sizes one shared block pool from a single
