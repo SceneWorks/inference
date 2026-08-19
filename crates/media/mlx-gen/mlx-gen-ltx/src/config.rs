@@ -1260,8 +1260,8 @@ mod tests {
 
     #[test]
     fn ltx25_config_sets_exactly_the_measured_delta() {
-        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer());
-        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer());
+        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer()).unwrap();
+        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer()).unwrap();
 
         // The two measured keys flip.
         assert!(cfg23.ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
