@@ -149,10 +149,15 @@ pub fn seconds_to_clamped_num_frames(
             "ltx duration_head: invalid frame bounds [{min_frames}, {max_frames}]"
         )));
     }
-    let raw = (seconds * frame_rate).round();
+    // f64 + round-half-to-even, matching upstream's Python `round()` exactly (`helpers.py:579`):
+    // Python's built-in `round()` on a float is banker's rounding, NOT round-half-away-from-zero.
+    // `f32::round()` is round-half-away-from-zero, so a naive port diverges by a full grid step at
+    // any exactly-representable `.5` product — see `round_ties_to_even_matches_upstream_python_
+    // round_at_exact_half` below.
+    let raw = ((seconds as f64) * (frame_rate as f64)).round_ties_even();
     // Clamp in float space (matches upstream's clamp-before-snap order); saturating `as u32` casts
     // are safe in Rust regardless, but this keeps the clamp explicit and readable.
-    let raw_frames = raw.clamp(min_frames as f32, max_frames as f32) as u32;
+    let raw_frames = raw.clamp(min_frames as f64, max_frames as f64) as u32;
     let mut frames = snap_frames_to_grid(raw_frames, time_scale)?;
     if frames < min_frames {
         let ceil_div = (min_frames - 1).div_ceil(time_scale);
@@ -183,8 +188,12 @@ pub fn resolve_auto_duration_frames(
             "ltx duration_head: frame_rate must be positive, got {frame_rate}"
         )));
     }
-    let min_frames = ((range.min_seconds * frame_rate).round()).max(1.0) as u32;
-    let max_frames = ((range.max_seconds * frame_rate).round()).max(min_frames as f32) as u32;
+    // f64 + round-half-to-even here too, matching upstream's Python `round()` (`blocks.py:874-875`)
+    // — see the matching comment in `seconds_to_clamped_num_frames`.
+    let min_frames =
+        (((range.min_seconds as f64) * (frame_rate as f64)).round_ties_even()).max(1.0) as u32;
+    let max_frames = (((range.max_seconds as f64) * (frame_rate as f64)).round_ties_even())
+        .max(min_frames as f64) as u32;
     seconds_to_clamped_num_frames(
         predicted_seconds,
         frame_rate,
@@ -196,6 +205,12 @@ pub fn resolve_auto_duration_frames(
 
 /// The engine-boundary opt-in seam (sc-18774 acceptance: "surface it as an explicit opt-in ...; a
 /// request with an explicit duration must never be silently overridden by the prediction").
+///
+/// No `ltx_2_5` pipeline exists yet (that is sc-18778, Phase 5 of epic 18755) and nothing in
+/// production calls this function until sc-18778's `model.rs` consumes it — today it is proven by
+/// this module's own tests plus the per-backend reachability tests wiring a real `DurationHead::
+/// forward` through it (`mlx-gen-ltx`/`candle-gen-ltx`'s `duration_head::tests::opt_in_seam_
+/// reaches_the_real_forward_pass`).
 ///
 /// Resolution order, mirroring upstream's `_resolve_num_frames` precedence ("an explicit
 /// `--num-frames` wins ... otherwise `--auto-duration` if given, else unset"):
@@ -302,6 +317,35 @@ mod tests {
             let got = resolve_auto_duration_frames(seconds, 25.0, range, TEMPORAL_GRID).unwrap();
             assert_eq!(got, want, "seconds={seconds}");
         }
+    }
+
+    /// Pins round-half-to-even (banker's rounding, matching Python's `round()`) at an exact `.5`
+    /// tie: `4.03125 * 16.0 == 64.5` exactly (`4.03125 == 129/32`, exactly representable in both
+    /// f32 and f64), so `round_ties_even(64.5) == 64` (64 is even) — never `65`, which is what a
+    /// naive `f32::round()` (round-half-away-from-zero) port would give. The two are NOT
+    /// interchangeable here: this single tie flows through both the raw-seconds rounding
+    /// (`seconds_to_clamped_num_frames`) and the range-bound rounding
+    /// (`resolve_auto_duration_frames`'s own `min_frames`/`max_frames`), and resolves to a
+    /// different final frame count a full grid step apart depending on which rounding rule is used
+    /// (57, round-half-even vs. 65, round-half-away — worked by hand in this test's body).
+    #[test]
+    fn round_ties_to_even_matches_upstream_python_round_at_exact_half() {
+        let tie_seconds = 4.03125_f32; // 129/32
+        let fps = 16.0_f32; // 4.03125 * 16.0 == 64.5 exactly
+                            // A degenerate single-point range forces min_frames == max_frames == round(64.5), and the
+                            // predicted seconds hits the same tie, so the final result reflects the rounding rule
+                            // directly rather than being masked by the clamp:
+                            //   round-half-even: min=max=raw=64 -> snap(64)=57 (undershoots min_frames=64) -> the
+                            //     undershoot fixup's ceil-to-grid lands on 65, capped at max_frames=64 -> the final
+                            //     defensive guard re-snaps to the largest valid grid point at/below 64, which is 57.
+                            //   round-half-away (the bug this test guards against): min=max=raw=65 -> snap(65)=65
+                            //     (65 is itself a valid 8k+1 grid point) -> no fixup needed -> 65.
+        let range = AutoDurationRange::new(tie_seconds, tie_seconds).unwrap();
+        let frames = resolve_auto_duration_frames(tie_seconds, fps, range, TEMPORAL_GRID).unwrap();
+        assert_eq!(
+            frames, 57,
+            "round-half-to-even at the 64.5 tie must resolve to 64, not 65"
+        );
     }
 
     /// Acceptance: "A test proves the clamp and the `n % 8 == 1` snap both hold across the range,
