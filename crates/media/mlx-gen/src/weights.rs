@@ -282,6 +282,20 @@ impl Weights {
         self.tensors.keys().map(String::as_str)
     }
 
+    /// Every stored key that has **not** been read through [`get`](Self::get)/[`require`](Self::require)
+    /// so far — the complement of `remove_accessed`'s tracking set. A loader-conformance test builds a
+    /// candidate weight map, constructs the model against it, then asserts this is empty to prove no
+    /// tensor was silently ignored (sc-18758: e.g. a config that says `ff_bias:false` must not merely
+    /// skip *requiring* the bias — a test wants to also confirm nothing else in the map went unread).
+    pub fn unused_keys(&self) -> Vec<&str> {
+        let accessed = self.accessed.borrow();
+        self.tensors
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !accessed.contains(*k))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tensors.len()
     }
