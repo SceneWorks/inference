@@ -86,8 +86,13 @@ pub fn sdpa(
 ) -> Result<Array> {
     // MLX has no fused sliding-window mode; materialize the window into an additive mask and run the
     // ordinary explicit-mask path (which the chunked-prefill mitigation already slices correctly).
+    //
+    // The mask is built in f32 and cast to the query dtype: the fused kernel requires the mask type
+    // to *promote* to the output type, and f32 does not promote to bf16 — a cached decode in bf16
+    // (every real Gemma 4 forward) fails outright without this cast.
     if let AttnMask::SlidingCausal { window } = mask {
-        let m = sliding_causal_mask(queries.shape()[2], keys.shape()[2], window)?;
+        let m = sliding_causal_mask(queries.shape()[2], keys.shape()[2], window)?
+            .as_dtype(queries.dtype())?;
         return sdpa(queries, keys, values, scale, AttnMask::Additive(&m));
     }
     let (heads, q_len, head_dim) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);

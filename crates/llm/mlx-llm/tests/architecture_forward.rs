@@ -522,8 +522,12 @@ fn qwen3_vl() -> Case {
 /// Every architecture the shared [`ModelConfig`] serves through the generic decoder.
 ///
 /// Qwen3.6 (`qwen3_5`) is absent on purpose: `ModelConfig::from_json` declines it, and it is served
-/// by its own `Qwen35Config`/`Qwen35Model`. Gemma 4 is absent because its decoder does not exist yet
-/// (sc-18760); when it does, it belongs here.
+/// by its own `Qwen35Config`/`Qwen35Model`. Gemma 4 is absent for a different reason: its decoder
+/// landed in sc-18760 but it is not a *uniform* architecture, so it cannot share this file's
+/// one-shape-per-model fixture builder. It is pinned by `tests/gemma4_decoder.rs` instead, against
+/// a reference oracle rather than a captured-on-the-base-branch golden. These goldens still guard
+/// it indirectly: sc-18760 rewrote the decoder loop these eight architectures run through, and any
+/// drift it introduced fails here.
 fn cases() -> Vec<Case> {
     vec![
         llama(),
