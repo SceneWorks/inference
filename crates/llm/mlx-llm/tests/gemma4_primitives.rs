@@ -274,36 +274,47 @@ fn build_empty_causal_lm(cfg: ModelConfig) -> Result<CausalLm, mlx_llm::Error> {
     CausalLm::from_weights(&Weights::from_map(HashMap::new()), "", cfg)
 }
 
-/// The generic decoder must **refuse Gemma 4 by name** until sc-18760 / sc-18761 wire the
-/// per-layer-type attention block.
+/// sc-18769's blanket "Gemma 4 is unsupported" refusal is **gone** (sc-18760 built the decoder), so
+/// a Gemma 4 build must now fail the ordinary way — on the first tensor it cannot find — rather
+/// than on an architecture check.
 ///
-/// This story makes a Gemma 4 config parse, which is what turns a previously-clear "unsupported
-/// architecture" refusal into a cryptic missing-`v_proj` failure three quarters of the way through
-/// a load. The typed refusal replaces it, and names both the reason and the successor stories.
+/// The empty weight map makes that the whole assertion: reaching a missing-tensor error proves the
+/// loader got past the architecture guard and into real weight lookups.
 #[test]
-fn generic_decoder_declines_gemma4_until_the_decoder_stories_land() {
+fn generic_decoder_no_longer_refuses_gemma4_by_architecture() {
     let cfg: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
     let cfg = ModelConfig::from_json(&cfg).expect("the config layer must still parse it");
     assert!(cfg.is_gemma4());
     match build_empty_causal_lm(cfg) {
         Err(e) => {
             let m = e.to_string();
-            assert!(m.contains("Gemma 4"), "{m}");
             assert!(
-                m.contains("sc-18760"),
-                "the refusal must name the successor: {m}"
+                !m.contains("sc-18760") && !m.contains("sc-18761"),
+                "the placeholder refusal must be gone now that the decoder is built: {m}"
             );
             assert!(
-                m.contains("sc-18761"),
-                "the refusal must name the successor: {m}"
-            );
-            assert!(
-                !m.contains("v_proj"),
-                "must refuse up front, not die on a weight lookup: {m}"
+                m.contains("embed_tokens") || m.contains("missing") || m.contains("Missing"),
+                "an empty weight map must fail on a weight lookup, not an architecture check: {m}"
             );
         }
-        Ok(_) => panic!("the uniform decoder must not claim to have built a Gemma 4 model"),
+        Ok(_) => panic!("an empty weight map cannot produce a model"),
     }
+}
+
+/// `use_bidirectional_attention: "all"` is refused at load: it makes every token attend both ways,
+/// which needs a *symmetric* window this decoder does not build. Refusing beats silently running
+/// the model causally — the numbers would look plausible and be wrong everywhere.
+#[test]
+fn gemma4_bidirectional_all_is_refused_by_the_decoder() {
+    let mut cfg: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
+    cfg["text_config"]["use_bidirectional_attention"] = Value::from("all");
+    let cfg = ModelConfig::from_json(&cfg).expect("the config layer parses it");
+    let err = build_empty_causal_lm(cfg).expect_err("must refuse");
+    let m = err.to_string();
+    assert!(
+        m.contains("bidirectional") && m.contains("symmetric"),
+        "the refusal must name what is unsupported and why: {m}"
+    );
 }
 
 /// The schedule is derived when `layer_types` is absent and read verbatim when present — and the
