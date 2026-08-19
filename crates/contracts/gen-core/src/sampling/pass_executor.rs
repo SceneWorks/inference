@@ -19,7 +19,8 @@
 //!    `steps + 1` nodes are kept — [`denoise_pass_schedule_steps`] / [`terminal_pass_segment`]),
 //!    and is integrated by a **freshly boxed solver** — so multistep history
 //!    ([`AbnorsettState`](super::AbnorsettState), UniPC/DPM++ buffers) structurally cannot leak
-//!    across a pass boundary: each [`Sampler::sample`] call owns its own state.
+//!    across a pass boundary: each [`Sampler::sample`](super::Sampler::sample) call owns its own
+//!    state.
 //! 4. **Progress is aggregated by effective model evaluations** across the whole chain
 //!    ([`Solver::model_evals`] per pass segment): one [`Progress::Step`] per model evaluation,
 //!    `current` strictly `1..=total` over the chain, so a 2-pass `rk6_7s` + `euler` chain reports a

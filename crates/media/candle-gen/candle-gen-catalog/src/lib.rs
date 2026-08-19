@@ -1068,7 +1068,11 @@ mod preview_advertising {
             // sc-16950's inventory, restated as counts so a blanked route is a diff here too: the
             // pose-control route, the seven `pipeline` render routes (Turbo three-stage / t2i /
             // img2img, Raw t2i / multi-phase / img2img, and the shared Turbo+Raw edit), and the one
-            // deliberately dark trainer site.
+            // deliberately dark trainer site. sc-20418 adds one DIRECT emission in `preview.rs`:
+            // the chained denoise-pass render numbers frames by the executor's chain-global outer
+            // step (each pass owns a fresh schedule, so there is no single σ array for the shared
+            // driver's counter to key on) and emits through `PreviewHook::emit_step` — the SCM
+            // step-keyed precedent, not a bespoke denoise loop.
             routes: &[
                 FileRoutes {
                     file: "control_provider.rs",
@@ -1080,6 +1084,12 @@ mod preview_advertising {
                     file: "pipeline.rs",
                     hooked: 7,
                     direct: 0,
+                    dark: &[],
+                },
+                FileRoutes {
+                    file: "preview.rs",
+                    hooked: 0,
+                    direct: 1,
                     dark: &[],
                 },
                 FileRoutes {
@@ -3130,9 +3140,18 @@ mod preview_advertising {
             [("training.rs".to_string(), 1)],
             "the trainer sample render is the only Krea sampler site with no sink to emit into"
         );
-        assert!(
-            wiring.direct.is_empty(),
-            "Krea emits through the shared driver, not through a bespoke loop"
+        let direct: Vec<(String, usize)> = wiring
+            .direct
+            .iter()
+            .map(|emission| (emission.file.clone(), emission.count))
+            .collect();
+        assert_eq!(
+            direct,
+            [("preview.rs".to_string(), 1)],
+            "the one direct emission is the chained denoise-pass chain preview (sc-20418): the \
+             chain has no single σ array for the shared driver's counter to key on, so it numbers \
+             frames by the executor's chain-global outer step through PreviewHook::emit_step — \
+             every denoise loop itself still runs through the shared driver"
         );
         assert!(wiring.emits());
     }

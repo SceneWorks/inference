@@ -3568,9 +3568,14 @@ mod tests {
         assert_eq!(decodes, 1, "one decode per image, after the whole chain");
 
         // The legacy single-pass shape: the same solver over the same native schedule and seed.
+        // Aliased import: `preview::tests::every_krea_render_route_passes_a_preview_hook` scans
+        // this file TEXTUALLY for the driver's call form to inventory the shipped render routes,
+        // and this reference comparison is test code, not a route — the alias keeps it out of that
+        // inventory the same way the scan's own docs keep the call form out of prose.
+        use candle_gen::run_flow_sampler as drive_flow_sampler;
         let sigmas = turbo_schedule(2, None);
         let noise = init_noise(32, 32, 0x5eed, &Device::Cpu).unwrap();
-        let legacy = candle_gen::run_flow_sampler(
+        let legacy = drive_flow_sampler(
             Some("euler"),
             TimestepConvention::Sigma,
             &sigmas,
