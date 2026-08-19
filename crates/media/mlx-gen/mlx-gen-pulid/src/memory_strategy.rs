@@ -1,4 +1,32 @@
 //! Shared image-memory ladder for the bespoke PuLID-FLUX MLX route.
+//!
+//! ## Envelope vs. structure in the request route gate (sc-20569 twin)
+//!
+//! The route gate carries two kinds of clause and they must not be confused — the same distinction
+//! SC-20569 established for mlx-gen-sensenova (PR #699) and PR #700 mirrored into mlx-gen-flux. A
+//! **structural** clause (the loaded mode/reference/overlay match, PiD requested without a loaded
+//! PiD overlay, request phases) states what THIS loaded route can do at all — no authority changes
+//! that — and stays fail-closed unconditionally. The **envelope** clause (the calibrated-geometry
+//! block) states what the `2026-08-04` PuLID-FLUX Q4 campaign MEASURED: 1024x1024, batch 1, one
+//! frame. That is a statement about which evidence exists, not about what the engine can render.
+//!
+//! The PuLID descriptor accepts `256..=2048` per side, and the SceneWorks image lane deliberately
+//! does NOT enforce a model's advertised `limits.resolutions` (sc-12384): `ImageRequest` only
+//! sanity-clamps `width`/`height` to `256..=4096` and hands them to the engine as-is, so any
+//! API/MCP caller may name an off-cell but engine-legal geometry for a `pulid_flux_dev`
+//! `character_image` job. This clause fired on ANY optimized-rung selection regardless of
+//! authority, so such a request was hard-refused instead of being admitted on the caller's
+//! estimate. Only a context that also claims measured evidence
+//! (`optimization_authority == Calibrated`) is held to the measured cell; an `Estimated` claim —
+//! exactly what `AdmissionPath::Legacy` in the SceneWorks fit gate carries for an out-of-envelope
+//! request — must degrade to that legacy/estimated admission instead of refusing.
+//!
+//! Every clause inside the route gate therefore builds a `CoreError::Msg`, not
+//! `CoreError::Unsupported`. `standard_memory_strategy_safety_check` stringifies a route-gate error
+//! into `MemorySafetyDecision::Reject` immediately (`error.to_string()`), so nothing downstream can
+//! read the type, while `begin_with` types the surviving string as `Unsupported` once at the
+//! request boundary. Building `Unsupported` inside the closure too doubled the prefix into
+//! `unsupported: unsupported: …` — the same secondary defect SC-20569 fixed in mlx-gen-sensenova.
 
 use std::fs::File;
 use std::io::Read;
@@ -7,8 +35,8 @@ use std::path::{Path, PathBuf};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBehaviorFixture,
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryMode, MemoryNumericTier,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, Result as CoreResult,
+    MemoryOptimizationAuthority, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 use sha2::{Digest, Sha256};
@@ -231,19 +259,28 @@ pub fn safety_check(
             || context.has_phases
             || context.overlay.as_deref() != Some("identity")
         {
-            return Err(CoreError::Unsupported("pulid_flux: memory route requires one identity reference, overlay=identity, native VAE decode, and no request phases".into()));
+            return Err(CoreError::Msg("pulid_flux: memory route requires one identity reference, overlay=identity, native VAE decode, and no request phases".into()));
         }
+        // sc-20569 twin: `claims_measured_evidence` is the same envelope/structure discriminator the
+        // SenseNova and FLUX route gates use. An optimized rung admitted behind a legacy/estimated
+        // authority has NOT claimed to be graded against the measured cell, so it must degrade to
+        // admission instead of refusing; only a `Calibrated` claim off the measured cell fails
+        // closed, because admitting THAT would grade a request against evidence captured at a
+        // different geometry.
+        let claims_measured_evidence =
+            context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
         if contract
             .calibration
             .as_ref()
             .is_some_and(|id| id.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
             && context.selection.strategy.is_optimized()
+            && claims_measured_evidence
             && (context.geometry.width != 1024
                 || context.geometry.height != 1024
                 || context.geometry.batch != 1
                 || context.geometry.frames != 1)
         {
-            return Err(CoreError::Unsupported("pulid_flux: calibrated geometry is exactly 1024x1024, batch 1, one frame/reference".into()));
+            return Err(CoreError::Msg("pulid_flux: calibrated geometry is exactly 1024x1024, batch 1, one frame/reference".into()));
         }
         Ok(())
     };
@@ -320,6 +357,9 @@ fn begin_with(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
+    // already-rendered string, so the route gate deliberately hands back plain reasons (see
+    // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
@@ -430,6 +470,242 @@ mod tests {
             MemorySafetyDecision::Reject { .. }
         ));
         assert!(registered_begin_request(&spec, &contract, &phases).is_err());
+    }
+
+    /// Engine-legal, off-measured-cell geometries a real `pulid_flux_dev` request can name. The
+    /// SceneWorks manifest advertises only `1024x1024` in `limits.resolutions`, but the image lane
+    /// deliberately does NOT enforce that list (sc-12384): `ImageRequest` sanity-clamps
+    /// `width`/`height` to `256..=4096` and hands them to the engine, and this descriptor accepts
+    /// `256..=2048` per side. So every pair below reaches the route gate from an API/MCP caller.
+    const OFF_CELL_GEOMETRIES: [(u32, u32); 4] =
+        [(768, 768), (1024, 1024), (1280, 720), (720, 1280)];
+
+    /// `pulid_flux_dev`'s manifest `limits.count`. SceneWorks pins the provider-facing `batch` to
+    /// one forward pass today — `pulid_memory_inputs` hard-sets `count: 1` and `request_batch`
+    /// returns 1 (sc-16194), because a multi-image job is a sequential loop — but the gate is a
+    /// provider-owned seam and any caller may set it, so the degrade is proven across the full
+    /// advertised count axis rather than at the worker's current pin.
+    const MANIFEST_COUNTS: [u32; 3] = [1, 2, 4];
+
+    fn calibrated_contract(spec: &LoadSpec) -> MemoryProviderContract {
+        let mut contract = weights_free_contract(spec).unwrap();
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        ));
+        contract
+    }
+
+    fn identity_route() -> MemoryBehaviorRoute {
+        MemoryBehaviorRoute {
+            mode: MemoryMode::ImageToImage,
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some("identity".into()),
+        }
+    }
+
+    fn route_context(
+        spec: &LoadSpec,
+        contract: &MemoryProviderContract,
+        strategy: MemoryStrategy,
+    ) -> MemoryRunContext {
+        mlx_gen::gen_core::standard_memory_behavior_context(
+            contract,
+            strategy,
+            MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+            identity_route(),
+        )
+        .unwrap()
+    }
+
+    /// sc-20569 twin (mlx-gen-pulid): every engine-legal geometry/count off the measured
+    /// 1024x1024/batch-1/frame-1 cell used to be refused unconditionally by the calibrated-geometry
+    /// envelope clause whenever an optimized rung was selected, regardless of authority. A context
+    /// that does NOT claim measured evidence — `AdmissionPath::Legacy` in the SceneWorks fit gate,
+    /// whether it synthesized an estimate ladder or froze to the resident baseline — must be
+    /// ADMITTED at every such cell, and must be able to open a request scope.
+    #[test]
+    fn off_cell_geometry_and_count_degrade_to_legacy_admission() {
+        let spec = spec();
+        let contract = calibrated_contract(&spec);
+
+        let mut admitted = 0;
+        for (width, height) in OFF_CELL_GEOMETRIES {
+            for batch in MANIFEST_COUNTS {
+                for (authority, strategy) in [
+                    (
+                        MemoryOptimizationAuthority::Estimated,
+                        MemoryStrategy::BoundedAttention,
+                    ),
+                    (
+                        MemoryOptimizationAuthority::Estimated,
+                        MemoryStrategy::BoundedTransformerResidency,
+                    ),
+                    (
+                        MemoryOptimizationAuthority::Resident,
+                        MemoryStrategy::Resident,
+                    ),
+                ] {
+                    let label =
+                        format!("{width}x{height} batch {batch} {authority:?}/{strategy:?}");
+                    let mut context = route_context(&spec, &contract, strategy);
+                    context.optimization_authority = authority;
+                    context.geometry.width = width;
+                    context.geometry.height = height;
+                    context.geometry.batch = batch;
+                    assert_eq!(
+                        safety_check(&spec, &contract, &context),
+                        MemorySafetyDecision::Accept,
+                        "{label}"
+                    );
+                    assert!(
+                        registered_begin_request(&spec, &contract, &context)
+                            .unwrap_or_else(|error| panic!("{label}: {error}"))
+                            .is_some(),
+                        "{label}"
+                    );
+                    admitted += 1;
+                }
+            }
+        }
+        assert_eq!(
+            admitted,
+            OFF_CELL_GEOMETRIES.len() * MANIFEST_COUNTS.len() * 3,
+            "four geometries x three counts x three legacy dispositions"
+        );
+    }
+
+    /// A `Calibrated` claim off the measured cell must STILL fail closed — admitting it would grade
+    /// the request against evidence captured at a different geometry. This is the other half of the
+    /// conditioning: dropping `claims_measured_evidence` makes the degrade test above pass on its
+    /// own, so this test is what pins the clause to the authority rather than deleting it.
+    #[test]
+    fn a_measured_claim_off_the_campaign_cell_still_refuses() {
+        let spec = spec();
+        let contract = calibrated_contract(&spec);
+        for (width, height, batch, frames) in [
+            (768, 768, 1, 1),
+            (1280, 720, 1, 1),
+            (1024, 1024, 2, 1),
+            (1024, 1024, 1, 2),
+        ] {
+            let mut context = route_context(
+                &spec,
+                &contract,
+                MemoryStrategy::BoundedTransformerResidency,
+            );
+            assert_eq!(
+                context.optimization_authority,
+                MemoryOptimizationAuthority::Calibrated,
+                "the behavior context must claim measured evidence by default"
+            );
+            context.geometry.width = width;
+            context.geometry.height = height;
+            context.geometry.batch = batch;
+            context.geometry.frames = frames;
+            let label = format!("{width}x{height} batch {batch} frames {frames}");
+            assert!(
+                matches!(
+                    safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("calibrated geometry is exactly 1024x1024")
+                ),
+                "{label}: a measured claim off the campaign cell must fail closed"
+            );
+            assert!(
+                registered_begin_request(&spec, &contract, &context).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    /// The degrade must not weaken the STRUCTURAL refusals. No amount of estimate authority makes a
+    /// clean PuLID load answer a text-to-image request, run without its identity reference, drop the
+    /// `identity` overlay, admit PiD it never loaded, or run a multi-phase trajectory. Each axis is
+    /// mutated on its own so every guard is asked its own question.
+    #[test]
+    fn structural_refusals_are_not_weakened_by_the_legacy_degrade() {
+        let spec = spec();
+        let contract = calibrated_contract(&spec);
+        let mut legacy = route_context(&spec, &contract, MemoryStrategy::BoundedAttention);
+        legacy.optimization_authority = MemoryOptimizationAuthority::Estimated;
+        legacy.geometry.width = 768;
+        legacy.geometry.height = 768;
+        // The unmutated legacy context is admitted, so each rejection below is attributable to the
+        // one axis it mutates rather than to the off-cell geometry it carries.
+        assert_eq!(
+            safety_check(&spec, &contract, &legacy),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut wrong_mode = legacy.clone();
+        wrong_mode.mode = MemoryMode::TextToImage;
+        let mut no_reference = legacy.clone();
+        no_reference.geometry.reference_count = 0;
+        no_reference.has_reference = false;
+        let mut no_overlay = legacy.clone();
+        no_overlay.overlay = None;
+        let mut use_pid = legacy.clone();
+        use_pid.use_pid = true;
+        let mut has_phases = legacy.clone();
+        has_phases.has_phases = true;
+        for (label, context) in [
+            ("wrong_mode", wrong_mode),
+            ("no_reference", no_reference),
+            ("no_overlay", no_overlay),
+            ("use_pid", use_pid),
+            ("has_phases", has_phases),
+        ] {
+            assert!(
+                matches!(
+                    safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("memory route requires one identity reference")
+                ),
+                "{label}: structural refusal must survive the legacy degrade"
+            );
+            assert!(
+                registered_begin_request(&spec, &contract, &context).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    /// sc-20569 twin secondary: `begin_with` used to double-stringify a route-gate refusal —
+    /// `standard_memory_strategy_safety_check` renders the route gate's error into
+    /// `MemorySafetyDecision::Reject` once (`error.to_string()`), and `begin_with` typed that
+    /// already-rendered string as `Unsupported` again, printing
+    /// `unsupported: unsupported: pulid_flux: …`. Exactly one prefix must reach the caller.
+    #[test]
+    fn a_route_refusal_surfaces_the_unsupported_prefix_exactly_once() {
+        let spec = spec();
+        let contract = calibrated_contract(&spec);
+        let mut context = route_context(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        );
+        context.geometry.width = 768;
+        context.geometry.height = 768;
+        let error = match registered_begin_request(&spec, &contract, &context) {
+            Ok(_) => panic!("a measured claim off the campaign cell must still refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error.matches("unsupported: ").count(),
+            1,
+            "the rendered refusal must carry one `unsupported: ` prefix: {error}"
+        );
+        assert!(
+            error.starts_with(&format!("unsupported: {}: ", crate::pulid_flux::MODEL_ID)),
+            "{error}"
+        );
     }
 
     #[test]
