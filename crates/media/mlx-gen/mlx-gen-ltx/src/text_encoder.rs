@@ -181,6 +181,7 @@ impl LtxTextEncoder {
             ltx_cfg.audio_connector_attention_head_dim,
             ltx_cfg.positional_embedding_theta,
             ltx_cfg.connector_positional_embedding_max_pos,
+            ltx_cfg.connector_ff_bias,
             dtype,
         )?;
         Ok(FeatureHead {

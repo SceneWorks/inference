@@ -76,6 +76,7 @@ fn audio_connector_matches_reference() {
         cfg.audio_connector_attention_head_dim,
         cfg.positional_embedding_theta,
         cfg.connector_positional_embedding_max_pos,
+        cfg.connector_ff_bias,
         mlx_rs::Dtype::Float32,
     )
     .expect("build audio connector");

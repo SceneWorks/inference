@@ -22,6 +22,9 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 # Parse the packed tier's `quantize_config.json` group_size (sc-9545 tier ingestion).
 serde_json = { workspace = true }
+# I2V conditioning-image CRF re-compression (sc-18759 `image_crf`) — JPEG encode/decode as the
+# lossy re-compression step (see `image_crf` module docs for the H.264-parity caveat).
+image = { workspace = true }
 
 [features]
 default = []

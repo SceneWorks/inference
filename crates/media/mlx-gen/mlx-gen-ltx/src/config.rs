@@ -258,6 +258,33 @@ pub struct LtxConfig {
     pub audio_positional_embedding_max_pos: i32,
     /// Cross-modal gate timestep multiplier (`av_ca_timestep_scale_multiplier`, 1000 in 2.3).
     pub av_ca_timestep_scale_multiplier: i32,
+
+    // --- sc-18758: the entire measured LTX-2.3→2.5 transformer config delta (two keys). Both are
+    // absent from the 2.3 `embedded_config.json`, so the defaults below reproduce 2.3 byte-for-byte;
+    // 2.5 sets `ff_bias:false` (video only — see `ff_bias`'s own doc) and
+    // `use_keyframes_abs_pos_embedding:true`.
+    /// `ff_bias` — whether the **video** FFN's `proj_in`/`proj_out` Linears carry a bias. `true` for
+    /// 2.3 (absent ⇒ default); `false` for 2.5 (the checkpoint carries no `ff.proj_{in,out}.bias`).
+    pub ff_bias: bool,
+    /// `audio_ff_bias` — the audio-stream analog of [`ff_bias`](Self::ff_bias) (`audio_ff`). Parsed
+    /// independently (it is a distinct reference config key), but **not** part of the measured
+    /// 2.3→2.5 delta: verified against the real shipped header (both the distilled and dev
+    /// `transformer.safetensors`), the 2.5 metadata carries no `audio_ff_bias` key at all, so it
+    /// takes the reference absent-key default (`True`) same as 2.3 — all 96
+    /// `transformer_blocks.*.audio_ff.net.{0.proj,2}.bias` tensors are present and required in the
+    /// real 2.5 checkpoint. Kept as its own field (not hardcoded true) for fidelity to the reference
+    /// config surface, in case a future checkpoint does set it.
+    pub audio_ff_bias: bool,
+    /// `connector_ff_bias` — the `Embeddings1DConnector`'s own FFN bias flag (reference
+    /// `Embeddings1DConnectorConfigurator`/`AudioEmbeddings1DConnectorConfigurator`). Independent of
+    /// `ff_bias`: neither the 2.3 nor the shipped 2.5 checkpoint sets it, so it defaults `true` on
+    /// both — parsed here for full fidelity to the reference config surface, not because it is part
+    /// of the measured 2.3→2.5 delta.
+    pub connector_ff_bias: bool,
+    /// `use_keyframes_abs_pos_embedding` — whether the video stream carries a learned `(1, inner_dim)`
+    /// absolute-position marker added to single-pixel generated-keyframe tokens (the DFR keyframe-slot
+    /// path). `false` for 2.3 (absent ⇒ default, no such tensor); `true` for 2.5.
+    pub use_keyframes_abs_pos_embedding: bool,
 }
 
 impl LtxConfig {
@@ -318,6 +345,10 @@ impl LtxConfig {
             audio_connector_attention_head_dim: 64,
             audio_positional_embedding_max_pos: 20,
             av_ca_timestep_scale_multiplier: 1000,
+            ff_bias: true,
+            audio_ff_bias: true,
+            connector_ff_bias: true,
+            use_keyframes_abs_pos_embedding: false,
             // No `embedded_config.json` at all ⇒ none of the four V2-detection keys are present ⇒
             // V1 by the same reasoning `detect_text_encoder_feature_version` applies to a real,
             // sparse config (sc-18763). Never hit by 2.3/2.5, which both ship the file.
@@ -448,6 +479,13 @@ impl LtxConfig {
             cfg.av_ca_timestep_scale_multiplier,
         );
 
+        // sc-18758: the entire measured 2.3→2.5 delta. Both keys are absent from the 2.3
+        // `embedded_config.json`, so `get_bool`'s default (2.3's true/true/true/false) is exact.
+        cfg.ff_bias = get_bool(t, "ff_bias", true);
+        cfg.audio_ff_bias = get_bool(t, "audio_ff_bias", true);
+        cfg.connector_ff_bias = get_bool(t, "connector_ff_bias", true);
+        cfg.use_keyframes_abs_pos_embedding = get_bool(t, "use_keyframes_abs_pos_embedding", false);
+
         // caption_channels derivation (generate_av.py lines 1484–1498).
         let no_caption_proj =
             !cfg.caption_projection_first_linear && !cfg.caption_projection_second_linear;
@@ -530,6 +568,57 @@ impl VaeBlock {
     }
 }
 
+/// The encoder's log-variance head (`vae.latent_log_var`, reference `LogVarianceType`). It decides
+/// how many channels `conv_out` emits on top of the `latent_channels` means — which is why the
+/// deterministic port cares about it at all: it slices the means off the front and must know how
+/// wide the tail is meant to be, so a mode/weight disagreement is a load error rather than a silent
+/// mis-slice.
+///
+/// The LTX-2.5 conv VAE declares `uniform`; the LTX-2.5 DiffVAE's (otherwise identical) conv encoder
+/// declares `constant`. **Both yield the same normalized means**: the reference emits
+/// `latent_channels + 1` channels either way and, after building its `(means, logvar)` pair, keeps
+/// `normalize(sample[:, :latent_channels])` — `uniform` broadcasts the trailing channel as the
+/// logvar, `constant` throws it away and substitutes `approx_ln_0 = -30`. Neither touches the means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatentLogVar {
+    /// `latent_channels + 1` conv_out channels; the trailing channel is one shared log-variance.
+    Uniform,
+    /// `latent_channels + 1` conv_out channels; the trailing channel is discarded and the
+    /// log-variance is a constant. Same means as [`Uniform`](Self::Uniform).
+    Constant,
+    /// `2 · latent_channels` conv_out channels: means then per-channel log-variance.
+    PerChannel,
+    /// `latent_channels` conv_out channels, no log-variance head.
+    None,
+}
+
+impl LatentLogVar {
+    /// Parse the reference's `latent_log_var` string. Unknown values are rejected rather than
+    /// defaulted — an unrecognized mode changes the conv_out width, which would otherwise surface as
+    /// a wrong-looking latent instead of an error.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "uniform" => Ok(Self::Uniform),
+            "constant" => Ok(Self::Constant),
+            "per_channel" => Ok(Self::PerChannel),
+            "none" => Ok(Self::None),
+            other => Err(Error::Msg(format!(
+                "ltx: unknown vae.latent_log_var {other:?} (expected uniform | constant | \
+                 per_channel | none)"
+            ))),
+        }
+    }
+
+    /// The `conv_out` channel count this mode implies for a `latent_channels`-wide latent.
+    pub fn conv_out_channels(&self, latent_channels: i32) -> i32 {
+        match self {
+            Self::Uniform | Self::Constant => latent_channels + 1,
+            Self::PerChannel => 2 * latent_channels,
+            Self::None => latent_channels,
+        }
+    }
+}
+
 /// The LTX video VAE config (`embedded_config.json` → `vae`), driving the encoder + decoder
 /// structure. `decoder_blocks` is listed in **encoder** order (the decoder reverses it at build
 /// time, matching the reference `_build_up_blocks_from_config`).
@@ -545,6 +634,9 @@ pub struct LtxVaeConfig {
     /// `"zeros"` for 2.3 (the 2.0 default was `"reflect"`). Spatial conv padding mode. The decoder
     /// hardcodes `"zeros"`; any other value is **rejected at load** ([`Self::from_model_dir`], F-075).
     pub spatial_padding_mode: String,
+    /// The encoder's log-variance head. See [`LatentLogVar`]: it fixes the expected `conv_out`
+    /// width, which [`crate::vae::LtxVideoVae`] checks the encoder weights against.
+    pub latent_log_var: LatentLogVar,
     pub decoder_blocks: Vec<VaeBlock>,
     pub encoder_blocks: Vec<VaeBlock>,
 }
@@ -564,6 +656,7 @@ impl LtxVaeConfig {
             patch_size: 4,
             timestep_conditioning: false,
             spatial_padding_mode: "zeros".into(),
+            latent_log_var: LatentLogVar::Uniform,
             decoder_blocks: vec![
                 b("res_x", 4, 1),
                 b("compress_space", 0, 2),
@@ -589,22 +682,51 @@ impl LtxVaeConfig {
         }
     }
 
-    /// Parse the `vae` block of a parsed `embedded_config.json`.
-    pub fn from_embedded_vae(v: &Value) -> Self {
+    /// Parse the `vae` block of a parsed `embedded_config.json` (or of an LTX-2.5 VAE component
+    /// checkpoint's `__metadata__.config.vae`, which is the same shape).
+    ///
+    /// Two on-disk spellings are accepted, mirroring the reference `_prepare_video_encoder_kwargs`
+    /// (sc-18765):
+    ///  - **flat** `CausalVideoAutoencoder` (LTX-2.3 and the LTX-2.5 conv VAE): encoder fields sit on
+    ///    the `vae` block itself, latent width is `latent_channels`, block list is `encoder_blocks`;
+    ///  - **nested** `CausalDiffusionVAE` (the LTX-2.5 DiffVAE): the same conv encoder's fields sit
+    ///    under `vae.encoder`, where the latent width is that block's `out_channels` and the block
+    ///    list is spelled `blocks`. Its `decoder` is an `NADiffusionDecoder` and is NOT parsed here —
+    ///    `decoder_blocks` stays absent, so a caller that asks this config for a conv decoder gets
+    ///    the defaults rather than a decoder built from another architecture's config.
+    pub fn from_embedded_vae(v: &Value) -> Result<Self> {
         let mut cfg = Self::defaults();
-        cfg.latent_channels = get_i32(v, "latent_channels", cfg.latent_channels);
-        cfg.patch_size = get_i32(v, "patch_size", cfg.patch_size);
+        // The nested-encoder block, when present, wins for every encoder-side field.
+        let enc = v.get("encoder").filter(|e| e.is_object());
+        let enc_scope = enc.unwrap_or(v);
+
+        cfg.latent_channels = match enc {
+            Some(e) => get_i32(e, "out_channels", cfg.latent_channels),
+            None => get_i32(v, "latent_channels", cfg.latent_channels),
+        };
+        cfg.patch_size = get_i32(enc_scope, "patch_size", cfg.patch_size);
         cfg.timestep_conditioning = get_bool(v, "timestep_conditioning", cfg.timestep_conditioning);
-        if let Some(s) = v.get("spatial_padding_mode").and_then(Value::as_str) {
+        if let Some(s) = enc_scope
+            .get("spatial_padding_mode")
+            .or_else(|| v.get("spatial_padding_mode"))
+            .and_then(Value::as_str)
+        {
             cfg.spatial_padding_mode = s.to_string();
+        }
+        if let Some(s) = enc_scope.get("latent_log_var").and_then(Value::as_str) {
+            cfg.latent_log_var = LatentLogVar::parse(s)?;
         }
         if let Some(blocks) = parse_vae_blocks(v.get("decoder_blocks")) {
             cfg.decoder_blocks = blocks;
         }
-        if let Some(blocks) = parse_vae_blocks(v.get("encoder_blocks")) {
+        if let Some(blocks) = parse_vae_blocks(
+            enc_scope
+                .get("encoder_blocks")
+                .or_else(|| enc_scope.get("blocks")),
+        ) {
             cfg.encoder_blocks = blocks;
         }
-        cfg
+        Ok(cfg)
     }
 
     /// Load from a model directory's `embedded_config.json` (`vae` block). Falls back to
@@ -619,7 +741,7 @@ impl LtxVaeConfig {
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
             Some(v) => {
-                let cfg = Self::from_embedded_vae(v);
+                let cfg = Self::from_embedded_vae(v)?;
                 // F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE
                 // decoder HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the
                 // values the engine does not implement instead of silently mis-running a ts-conditioned
@@ -1110,6 +1232,62 @@ mod tests {
         assert_eq!(cfg.connector_num_learnable_registers, 128);
         assert_eq!(cfg.connector_positional_embedding_max_pos, 4096);
         assert!(cfg.connector_apply_gated_attention);
+        // sc-18758: 2.3's `embedded_config.json` carries neither key ⇒ defaults (true/true/true/false),
+        // reproducing the reference `ff_bias=True, audio_ff_bias=True,
+        // use_keyframes_abs_pos_embedding=False` fallbacks byte-for-byte.
+        assert!(cfg.ff_bias);
+        assert!(cfg.audio_ff_bias);
+        assert!(cfg.connector_ff_bias);
+        assert!(!cfg.use_keyframes_abs_pos_embedding);
+    }
+
+    /// An LTX-2.5 `transformer` block: identical to the 2.3 fixture except the real measured delta
+    /// keys — verified against the actual shipped header (both the distilled and dev
+    /// `transformer.safetensors`, read locally): `ff_bias:false` and
+    /// `use_keyframes_abs_pos_embedding:true`. The real metadata carries **no** `audio_ff_bias` key
+    /// at all (that field stays absent here too, matching the real fixture byte-for-byte), so it
+    /// takes the same absent-key default as 2.3.
+    fn ltx25_transformer() -> Value {
+        let mut t = ltx23_transformer();
+        let obj = t.as_object_mut().unwrap();
+        obj.insert("ff_bias".into(), serde_json::json!(false));
+        obj.insert(
+            "use_keyframes_abs_pos_embedding".into(),
+            serde_json::json!(true),
+        );
+        t
+    }
+
+    #[test]
+    fn ltx25_config_sets_exactly_the_measured_delta() {
+        let cfg23 = LtxConfig::from_embedded_transformer(&ltx23_transformer());
+        let cfg25 = LtxConfig::from_embedded_transformer(&ltx25_transformer());
+
+        // The two measured keys flip.
+        assert!(cfg23.ff_bias && !cfg23.use_keyframes_abs_pos_embedding);
+        assert!(!cfg25.ff_bias && cfg25.use_keyframes_abs_pos_embedding);
+        // `audio_ff_bias` and `connector_ff_bias` are NOT part of the delta — the real 2.5 checkpoint
+        // sets neither key, so both stay the reference default (true) on both configs.
+        assert!(cfg23.audio_ff_bias);
+        assert!(cfg25.audio_ff_bias);
+        assert!(cfg23.connector_ff_bias);
+        assert!(cfg25.connector_ff_bias);
+
+        // Everything else the epic orientation calls out as unchanged actually is unchanged: 48
+        // layers/32 heads/128 head-dim/4096 cross-attn/gated-attention/embeddings-connector/
+        // cross-attention-adaln/split-rope/float64-frequencies all match between the two configs.
+        assert_eq!(cfg23.num_layers, cfg25.num_layers);
+        assert_eq!(cfg23.num_attention_heads, cfg25.num_attention_heads);
+        assert_eq!(cfg23.attention_head_dim, cfg25.attention_head_dim);
+        assert_eq!(cfg23.cross_attention_dim, cfg25.cross_attention_dim);
+        assert_eq!(cfg23.apply_gated_attention, cfg25.apply_gated_attention);
+        assert_eq!(
+            cfg23.use_embeddings_connector,
+            cfg25.use_embeddings_connector
+        );
+        assert_eq!(cfg23.cross_attention_adaln, cfg25.cross_attention_adaln);
+        assert_eq!(cfg23.rope_type, cfg25.rope_type);
+        assert!(cfg23.double_precision_rope && cfg25.double_precision_rope);
     }
 
     #[test]
