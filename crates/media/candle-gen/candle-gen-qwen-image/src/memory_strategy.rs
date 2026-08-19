@@ -32,20 +32,184 @@ pub const CALIBRATION_FINGERPRINT: &str =
     "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
 
 fn streamable(spec: &LoadSpec) -> bool {
+    // File and Dir share the provider identity, but the evidence matrix has no source axis. Keep the
+    // imported path's rung 4 Missing until its pinned/re-openable implementation is measured directly;
+    // a snapshot measurement must not be claimed for a File source.
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
         && matches!(spec.weights, WeightsSource::Dir(_))
         && spec.adapters.is_empty()
         && spec.pid.is_none()
 }
 
+fn cast_component_bytes(
+    path: &std::path::Path,
+    float_width: u64,
+    component: &str,
+    validate_name: impl Fn(&str) -> gen_core::Result<()>,
+) -> gen_core::Result<u64> {
+    let tensors = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    cast_tensor_headers_bytes(&tensors, float_width, component, validate_name)
+}
+
+fn cast_tensor_headers_bytes(
+    tensors: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    float_width: u64,
+    component: &str,
+    validate_name: impl Fn(&str) -> gen_core::Result<()>,
+) -> gen_core::Result<u64> {
+    use gen_core::weightsmeta::Dtype;
+
+    if tensors.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "qwen-image imported {component} contains no tensors"
+        )));
+    }
+    tensors.iter().try_fold(0_u64, |total, tensor| {
+        validate_name(&tensor.name)?;
+        let resident = match tensor.dtype {
+            Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
+            Dtype::U16 => tensor.materialized_bytes(4)?,
+            Dtype::F8_E4M3
+            | Dtype::F16
+            | Dtype::BF16
+            | Dtype::F32
+            | Dtype::F64 => tensor.materialized_bytes(float_width)?,
+            dtype => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "qwen-image imported {component} tensor {:?} uses unsupported Candle dtype {dtype:?}",
+                    tensor.name
+                )))
+            }
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "qwen-image imported {component} resident byte sum overflow"
+            ))
+        })
+    })
+}
+
+fn imported_dit_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
+    const PREFIX: &str = "model.diffusion_model.";
+    cast_component_bytes(path, 2, "DiT", |name| {
+        let Some(mapped) = name.strip_prefix(PREFIX) else {
+            return Err(gen_core::Error::Msg(format!(
+                "qwen-image ComfyUI DiT tensor {name:?} is outside the required {PREFIX:?} namespace"
+            )));
+        };
+        if mapped.is_empty() {
+            return Err(gen_core::Error::Msg(
+                "qwen-image ComfyUI DiT tensor maps to an empty key".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
+    cast_component_bytes(path, 4, component, |_| Ok(()))
+}
+
+fn selected_language_encoder_bytes(
+    spec: &LoadSpec,
+    base: &std::path::Path,
+) -> gen_core::Result<u64> {
+    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let tensors = selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
+    cast_tensor_headers_bytes(&tensors, 4, "selected text encoder", |_| Ok(()))
+}
+
+fn base_vision_encoder_bytes(base: &std::path::Path) -> gen_core::Result<u64> {
+    let source = crate::ENCODER_CONTRACT
+        .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
+    let tensors = source.materialized_vision_tensor_headers(
+        &crate::VISION_ENCODER_CONTRACT,
+        &crate::ENCODER_CONTRACT,
+    )?;
+    cast_tensor_headers_bytes(&tensors, 4, "base vision encoder", |_| Ok(()))
+}
+
+fn conditioning_encoder_bytes(
+    provider_id: &str,
+    spec: &LoadSpec,
+    base: &std::path::Path,
+) -> gen_core::Result<u64> {
+    let language = selected_language_encoder_bytes(spec, base)?;
+    if provider_id != "qwen_image_edit" {
+        return Ok(language);
+    }
+    language
+        .checked_add(base_vision_encoder_bytes(base)?)
+        .ok_or_else(|| gen_core::Error::Msg("qwen-image conditioning byte sum overflow".into()))
+}
+
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    if provider_id == crate::MODEL_ID {
+        crate::validate_load_spec(spec)?;
+    }
     let streamable = streamable(spec);
-    let components =
-        PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["transformer"], &["vae"])
+    let base = gen_core::require_base_snapshot(spec, provider_id)?;
+    let components = match &spec.weights {
+        WeightsSource::Dir(_) => {
+            let mut components = PerComponentBytes::from_spec_subdirs(
+                spec,
+                &["text_encoder"],
+                &["transformer"],
+                &["vae"],
+            )
             .unwrap_or_default();
+            components.text_encoder = conditioning_encoder_bytes(provider_id, spec, base)?;
+            components
+        }
+        WeightsSource::File(path) => {
+            let vae = match spec.components.get(gen_core::COMFYUI_VAE_COMPONENT) {
+                Some(WeightsSource::Dir(path)) => f32_component_bytes(path, "VAE")?,
+                Some(WeightsSource::File(path)) => {
+                    spec.read_file_unchanged_if_prepared(path, |p| f32_component_bytes(p, "VAE"))?
+                }
+                None => f32_component_bytes(&base.join("vae"), "base VAE")?,
+            };
+            PerComponentBytes {
+                text_encoder: conditioning_encoder_bytes(provider_id, spec, base)?,
+                dit: spec.read_file_unchanged_if_prepared(path, imported_dit_bytes)?,
+                vae,
+            }
+        }
+    };
+    Ok(build_provider_contract(
+        provider_id,
+        spec,
+        streamable,
+        components,
+    ))
+}
+
+/// Build the route-exact contract used by catalog conformance without opening model assets.
+///
+/// Production resolution continues through [`provider_contract`], including exact encoder and
+/// component admission. The explicit fixture preserves the executable route declaration while
+/// intentionally publishing zero asset facts, as required by `MemoryContractFixtureRegistration`.
+pub(crate) fn weights_free_memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    Ok(build_provider_contract(
+        provider_id,
+        spec,
+        streamable(spec),
+        PerComponentBytes::default(),
+    ))
+}
+
+fn build_provider_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    components: PerComponentBytes,
+) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -82,7 +246,7 @@ pub(crate) fn provider_contract(
         })
         .collect();
 
-    Ok(MemoryProviderContract {
+    MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -91,6 +255,7 @@ pub(crate) fn provider_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
+        decode_geometry_policy_authoritative: false,
         // PiD owns a distinct decoder and tile domain. Until it accepts this explicit native-VAE
         // plan, optimized selections are rejected instead of silently applying the wrong geometry.
         pid_decode_routes: None,
@@ -148,7 +313,7 @@ pub(crate) fn provider_contract(
             overlay_bytes: 0,
         },
         runtime: gen_core::MemoryRuntimeSemantics::default(),
-    })
+    }
 }
 
 pub(crate) fn snapshot_quant_tier(
@@ -157,11 +322,7 @@ pub(crate) fn snapshot_quant_tier(
 ) -> gen_core::Result<Option<Quant>> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
-        WeightsSource::File(_) => {
-            return Err(gen_core::Error::Msg(format!(
-                "{provider_id}: actual numeric tier requires a snapshot directory"
-            )))
-        }
+        WeightsSource::File(_) => return Ok(None),
     };
     let config = root.join("transformer/config.json");
     let packed = std::fs::read_to_string(&config)
@@ -521,6 +682,23 @@ mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
 
+    #[test]
+    fn catalog_contract_fixtures_are_weights_free_but_production_admission_stays_strict() {
+        let spec = LoadSpec::new(WeightsSource::Dir(
+            "Z:\\nonexistent\\qwen-image-catalog-fixture".into(),
+        ));
+        for provider_id in [crate::MODEL_ID, "qwen_image_edit"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec)
+                .expect("catalog fixture must not traverse the synthetic source");
+            assert_eq!(contract.provider_id, provider_id);
+            assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+            assert!(
+                provider_contract(provider_id, &spec).is_err(),
+                "production admission must still validate {provider_id} assets"
+            );
+        }
+    }
+
     fn write_control(path: &std::path::Path) {
         let mut header =
             br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
@@ -534,9 +712,167 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut offset = 0_usize;
+        let mut header = serde_json::Map::new();
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn file_spec(tmp: &tempfile::TempDir) -> LoadSpec {
+        let root = tmp.path().join("base");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("vae")).unwrap();
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[("decoder.weight", "BF16", &[3], 6)],
+        );
+        let dit = tmp.path().join("dit.safetensors");
+        write_typed_safetensors(
+            &dit,
+            &[("model.diffusion_model.img_in.weight", "F8_E4M3", &[2, 4], 8)],
+        );
+        LoadSpec::new(WeightsSource::File(dit))
+            .with_component(gen_core::BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(root))
+    }
+
+    #[test]
+    fn imported_file_asset_facts_follow_dit_bf16_and_te_vae_f32_load_dtypes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = file_spec(&tmp);
+        let vae = tmp.path().join("imported-vae.safetensors");
+        write_typed_safetensors(&vae, &[("decoder.weight", "F16", &[5], 10)]);
+        spec.components.insert(
+            gen_core::COMFYUI_VAE_COMPONENT.into(),
+            WeightsSource::File(vae),
+        );
+        let contract = provider_contract("qwen_image", &spec).unwrap();
+        let encoder = crate::ENCODER_CONTRACT;
+        let attention = encoder.num_attention_heads * encoder.head_dim;
+        let kv = encoder.num_key_value_heads * encoder.head_dim;
+        let per_layer = attention * encoder.hidden_size
+            + 2 * kv * encoder.hidden_size
+            + encoder.hidden_size * attention
+            + 2 * encoder.intermediate_size * encoder.hidden_size
+            + encoder.hidden_size * encoder.intermediate_size
+            + 2 * encoder.hidden_size
+            + attention
+            + 2 * kv;
+        let conditioning_elements = encoder.vocab_size * encoder.hidden_size
+            + encoder.num_hidden_layers * per_layer
+            + encoder.hidden_size;
+        let conditioning_bytes = (conditioning_elements as u64) * 4;
+        assert_eq!(contract.asset_facts.conditioning_bytes, conditioning_bytes);
+        assert_eq!(contract.asset_facts.transformer_bytes, 2 * 4 * 2);
+        assert_eq!(contract.asset_facts.decoder_bytes, 5 * 4);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            conditioning_bytes + 2 * 4 * 2 + 5 * 4
+        );
+    }
+
+    #[test]
+    fn imported_file_contract_and_loader_share_the_full_typed_field_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = file_spec(&tmp);
+        let mut cases = vec![("valid", valid.clone())];
+
+        let mut precision = valid.clone();
+        precision.precision = Precision::Fp32;
+        cases.push(("precision-is-accepted", precision));
+        let mut pid = valid.clone();
+        pid.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(tmp.path().join("pid.safetensors")),
+            gemma: WeightsSource::Dir(tmp.path().join("gemma")),
+        });
+        cases.push(("pid-is-accepted", pid));
+
+        let mut adapter = valid.clone();
+        adapter.adapters.push(gen_core::AdapterSpec::new(
+            tmp.path().join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        cases.push(("adapter", adapter));
+        let mut quant = valid.clone();
+        quant.quantize = Some(Quant::Q4);
+        cases.push(("quant", quant));
+        let mut control = valid.clone();
+        control.control = Some(WeightsSource::File(tmp.path().join("control.safetensors")));
+        cases.push(("control", control));
+        let mut extra = valid.clone();
+        extra
+            .extra_controls
+            .push(WeightsSource::File(tmp.path().join("extra.safetensors")));
+        cases.push(("extra-control", extra));
+        let mut ip = valid.clone();
+        ip.ip_adapter = Some(WeightsSource::File(tmp.path().join("ip.safetensors")));
+        cases.push(("ip-adapter", ip));
+        let mut identity = valid.clone();
+        identity.identity = Some(gen_core::IdentityWeights::default());
+        cases.push(("identity", identity));
+        let mut external_te = valid.clone();
+        let external_te_root = tmp.path().join("external-te");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &external_te_root,
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        external_te.text_encoder = Some(WeightsSource::Dir(external_te_root));
+        cases.push(("external-text-encoder", external_te));
+        let mut unknown = valid.clone();
+        unknown.components.insert(
+            "unknown".into(),
+            WeightsSource::File(tmp.path().join("unknown.safetensors")),
+        );
+        cases.push(("unknown-component", unknown));
+        let mut vae_dir = valid.clone();
+        vae_dir.components.insert(
+            gen_core::COMFYUI_VAE_COMPONENT.into(),
+            WeightsSource::Dir(tmp.path().join("vae-dir")),
+        );
+        cases.push(("vae-dir", vae_dir));
+
+        for (name, spec) in cases {
+            assert_eq!(
+                crate::validate_load_spec(&spec).is_ok(),
+                provider_contract("qwen_image", &spec).is_ok(),
+                "File loader/contract validation drift for {name}"
+            );
+        }
+    }
+
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("qwen-candle-memory-spec");
-        for component in ["text_encoder", "transformer", "vae"] {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_control(&dir.join("model.safetensors"));
@@ -544,6 +880,73 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    #[test]
+    fn selected_encoder_pricing_ignores_nested_safetensors_that_the_loader_does_not_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image").unwrap();
+        let baseline = selected_language_encoder_bytes(&spec, root).unwrap();
+
+        let nested = root.join("text_encoder/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_control(&nested.join("not-a-direct-shard.safetensors"));
+
+        assert_eq!(
+            selected_language_encoder_bytes(&spec, root).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn edit_prices_selected_language_plus_base_vision_while_t2i_and_control_exclude_visual() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image").unwrap();
+        let language = selected_language_encoder_bytes(&spec, root).unwrap();
+        let vision = base_vision_encoder_bytes(root).unwrap();
+
+        let t2i = provider_contract("qwen_image", &spec).unwrap();
+        let control = provider_contract("qwen_image_2512_fun_control", &spec).unwrap();
+        let edit = provider_contract("qwen_image_edit", &spec).unwrap();
+        assert_eq!(t2i.asset_facts.conditioning_bytes, language);
+        assert_eq!(control.asset_facts.conditioning_bytes, language);
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes,
+            language.checked_add(vision).unwrap()
+        );
+
+        let alternate = tmp.path().join("alternate-language-only");
+        gen_core_testkit::write_encoder_contract_fixture(&alternate, crate::ENCODER_CONTRACT)
+            .unwrap();
+        let mut selected = spec.clone();
+        selected.text_encoder = Some(WeightsSource::Dir(alternate));
+        let selected_language = selected_language_encoder_bytes(&selected, root).unwrap();
+        assert_eq!(
+            provider_contract("qwen_image", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language,
+            "T2I must not inherit visual.* from the multimodal base"
+        );
+        assert_eq!(
+            provider_contract("qwen_image_2512_fun_control", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language,
+            "control must not inherit visual.* from the multimodal base"
+        );
+        assert_eq!(
+            provider_contract("qwen_image_edit", &selected)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            selected_language.checked_add(vision).unwrap(),
+            "Edit must combine the selected language-only tower with the pinned base vision tower"
+        );
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
@@ -621,6 +1024,12 @@ mod tests {
         std::fs::write(
             transformer.join("config.json"),
             br#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+            crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));

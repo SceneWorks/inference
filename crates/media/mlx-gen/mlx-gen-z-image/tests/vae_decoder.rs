@@ -3,7 +3,9 @@
 //! (small decoder mirroring `Decoder.__call__`: conv_in → mid → 2 up-blocks → norm-out →
 //! SiLU → conv_out). Tol 1e-2 (Metal fp32 convs).
 
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
+use mlx_gen::{CancelFlag, Error, LatentDecoder};
 use mlx_gen_z_image::vae::{Decoder, Vae, VaeDecoderConfig};
 use mlx_rs::ops::{add, all_close, multiply};
 use mlx_rs::Array;
@@ -73,4 +75,95 @@ fn vae_decode_applies_scale_shift_and_frame_axis() {
             .item::<bool>(),
         "Vae::decode scale/shift/frame-axis wrapper is wrong"
     );
+}
+
+/// SC-18309 N1: the real tiny VAE fixture's trait default is bit-for-bit the historical inherent
+/// decode, including scale/shift de-normalization and the singleton output frame. This is an exact
+/// comparison (not the tolerance used for cross-framework parity above).
+#[test]
+fn native_trait_decode_is_byte_exact_to_inherent_decode() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let latent = w.require("in.latent").unwrap();
+
+    let legacy = Vae::decode(&vae, latent).unwrap();
+    let seam = LatentDecoder::decode(&vae, latent).unwrap();
+    assert_eq!(seam.shape(), legacy.shape());
+    assert_eq!(
+        seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
+        legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
+    );
+}
+
+/// A pre-tripped cancel wins before rank validation, tiling selection, de-normalization, or the
+/// monolithic/head path. Both a plan that would tile and one that would fall back must return the
+/// same typed cancellation even for a deliberately malformed latent.
+#[test]
+fn native_tiled_decode_rejects_pre_cancel_before_all_tensor_work() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let malformed = Array::from_slice(&[1.0f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    for cfg in [
+        mlx_gen::tiling::TilingConfig::spatial_only(8, 2),
+        mlx_gen::tiling::TilingConfig::spatial_only(4096, 64),
+    ] {
+        assert!(matches!(
+            LatentDecoder::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            Vae::decode_tiled(&vae, &malformed, &cfg, Some(&cancel)),
+            Err(Error::Canceled)
+        ));
+    }
+}
+
+/// sc-19753: exercise the production `Vae::decode_tiled` seam, not only the shared convolution
+/// primitive. The fixture's position-dependent latent makes the old whole-tail/per-crop GroupNorm
+/// implementation diverge, while layer-wise global normalization tracks the dense decode.
+#[test]
+fn vae_tiled_decode_tracks_dense_with_global_group_norm() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let latent = w.require("in.latent").unwrap();
+    let sh = latent.shape();
+    let latent5 = latent.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+
+    let dense = vae.decode(&latent5).unwrap();
+    let tiled = vae
+        .decode_tiled(&latent5, &TilingConfig::spatial_only(8, 0), None)
+        .unwrap();
+    dense.eval().unwrap();
+    tiled.eval().unwrap();
+    assert_eq!(tiled.shape(), dense.shape());
+
+    let max_delta = dense
+        .as_slice::<f32>()
+        .iter()
+        .zip(tiled.as_slice::<f32>())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_delta < 2e-3,
+        "layer-wise tiled VAE diverged from dense decode: max|delta|={max_delta:.3e}"
+    );
+}
+
+#[test]
+fn vae_tiled_decode_honors_pretripped_cancel() {
+    let w = Weights::from_file(FIXTURE).unwrap();
+    let vae = Vae::from_weights(&w, "", &small_cfg()).unwrap();
+    let malformed = Array::from_slice(&[1.0_f32], &[1]);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+
+    for cfg in [
+        TilingConfig::spatial_only(8, 0),
+        TilingConfig::spatial_only(4096, 64),
+    ] {
+        let result = vae.decode_tiled(&malformed, &cfg, Some(&cancel));
+        assert!(matches!(result, Err(Error::Canceled)));
+    }
 }

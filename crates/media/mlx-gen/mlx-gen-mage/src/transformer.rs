@@ -46,7 +46,7 @@ use std::path::Path;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -636,6 +636,18 @@ impl AdaptableHost for MageTransformer {
             // it matches on the FULL path rather than a stripped remainder.
             ["norm_out", ..] | ["proj_out", ..] => self.final_layer.adaptable_mut(path),
             _ => None,
+        }
+    }
+
+    /// SC-18319 — forward the probe down to the blocks. See
+    /// [`MageTransformerBlock::adaptable_facts`].
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<LinearFacts> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_facts(rest),
+            _ => self.adaptable_mut(path).map(|l| LinearFacts::of(l)),
         }
     }
 

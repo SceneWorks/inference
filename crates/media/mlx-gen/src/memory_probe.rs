@@ -56,7 +56,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A running maximum of MLX `active + cache`, sampled on a background thread.
 ///
@@ -86,6 +86,165 @@ pub struct FootprintProbe {
 /// The default sampling interval: fast enough to catch a single VAE tile's transient (tens of ms on
 /// a host), slow enough that the two atomic reads cost nothing beside the work being measured.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One near-simultaneous read of MLX's live active and cache counters.
+///
+/// MLX exposes the counters through separate calls, so the pair is approximate rather than atomic;
+/// keeping both values from the same sampler tick is nevertheless strictly more honest than adding
+/// independent high-water marks that may never have coexisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocatorSample {
+    pub active_bytes: u64,
+    pub cache_bytes: u64,
+}
+
+impl AllocatorSample {
+    pub fn footprint_bytes(self) -> u64 {
+        self.active_bytes.saturating_add(self.cache_bytes)
+    }
+}
+
+/// Coverage and peak receipt from one fixed-cadence allocator sampling interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocatorProbeReport {
+    pub interval_micros: u64,
+    pub sample_count: u64,
+    pub periodic_sample_count: u64,
+    pub sampling_span_micros: u64,
+    pub max_gap_micros: u64,
+    pub sampled_active_peak_bytes: u64,
+    pub sampled_cache_peak_bytes: u64,
+    /// Maximum `active + cache` from one sampler tick, never a sum of independent maxima.
+    pub sampled_footprint_peak_bytes: u64,
+    /// Active bytes from the exact sampler tick that established `sampled_footprint_peak_bytes`.
+    pub footprint_peak_active_bytes: u64,
+    /// Cache bytes from the exact sampler tick that established `sampled_footprint_peak_bytes`.
+    pub footprint_peak_cache_bytes: u64,
+    pub boundary_active_bytes: u64,
+    pub boundary_cache_bytes: u64,
+}
+
+impl AllocatorProbeReport {
+    fn with_elapsed(
+        mut self,
+        first_elapsed_micros: u64,
+        elapsed_micros: u64,
+        periodic: bool,
+        sample: AllocatorSample,
+    ) -> Self {
+        let previous_elapsed = first_elapsed_micros.saturating_add(self.sampling_span_micros);
+        self.sample_count = self
+            .sample_count
+            .saturating_add(u64::from(self.sample_count > 0));
+        if periodic {
+            self.periodic_sample_count = self.periodic_sample_count.saturating_add(1);
+        }
+        self.sampling_span_micros = elapsed_micros.saturating_sub(first_elapsed_micros);
+        self.max_gap_micros = self
+            .max_gap_micros
+            .max(elapsed_micros.saturating_sub(previous_elapsed));
+        self.sampled_active_peak_bytes = self.sampled_active_peak_bytes.max(sample.active_bytes);
+        self.sampled_cache_peak_bytes = self.sampled_cache_peak_bytes.max(sample.cache_bytes);
+        let footprint = sample.footprint_bytes();
+        if footprint > self.sampled_footprint_peak_bytes {
+            self.sampled_footprint_peak_bytes = footprint;
+            self.footprint_peak_active_bytes = sample.active_bytes;
+            self.footprint_peak_cache_bytes = sample.cache_bytes;
+        }
+        self.boundary_active_bytes = sample.active_bytes;
+        self.boundary_cache_bytes = sample.cache_bytes;
+        self
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Background paired active/cache sampler used by phase-aware performance evidence.
+pub struct AllocatorProbe {
+    stop: Option<Sender<()>>,
+    handle: Option<std::thread::JoinHandle<AllocatorProbeReport>>,
+}
+
+impl AllocatorProbe {
+    pub fn start_default() -> Self {
+        Self::start(DEFAULT_INTERVAL)
+    }
+
+    pub fn start(interval: Duration) -> Self {
+        Self::start_with_sampler(interval, || AllocatorSample {
+            active_bytes: mlx_rs::memory::get_active_memory() as u64,
+            cache_bytes: mlx_rs::memory::get_cache_memory() as u64,
+        })
+    }
+
+    fn start_with_sampler<F>(interval: Duration, sample: F) -> Self
+    where
+        F: Fn() -> AllocatorSample + Send + 'static,
+    {
+        let (stop, rx) = channel::<()>();
+        let (ready_tx, ready_rx) = sync_channel::<()>(0);
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let first_elapsed = duration_micros(started.elapsed());
+            let first = sample();
+            let mut report = AllocatorProbeReport {
+                interval_micros: duration_micros(interval),
+                sample_count: 1,
+                periodic_sample_count: 0,
+                sampling_span_micros: 0,
+                max_gap_micros: 0,
+                sampled_active_peak_bytes: first.active_bytes,
+                sampled_cache_peak_bytes: first.cache_bytes,
+                sampled_footprint_peak_bytes: first.footprint_bytes(),
+                footprint_peak_active_bytes: first.active_bytes,
+                footprint_peak_cache_bytes: first.cache_bytes,
+                boundary_active_bytes: first.active_bytes,
+                boundary_cache_bytes: first.cache_bytes,
+            };
+            ready_tx
+                .send(())
+                .expect("allocator probe starter dropped before the first sample");
+            loop {
+                let periodic = matches!(rx.recv_timeout(interval), Err(RecvTimeoutError::Timeout));
+                let elapsed = duration_micros(started.elapsed());
+                report = report.with_elapsed(first_elapsed, elapsed, periodic, sample());
+                if !periodic {
+                    return report;
+                }
+            }
+        });
+        ready_rx
+            .recv()
+            .expect("allocator probe sampler panicked before the first sample");
+        Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        }
+    }
+
+    pub fn finish(mut self) -> AllocatorProbeReport {
+        self.stop_and_join()
+            .expect("allocator probe sampler panicked")
+    }
+
+    fn stop_and_join(&mut self) -> std::thread::Result<AllocatorProbeReport> {
+        drop(self.stop.take());
+        self.handle
+            .take()
+            .expect("an active allocator probe owns one sampler")
+            .join()
+    }
+}
+
+impl Drop for AllocatorProbe {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.stop_and_join();
+        }
+    }
+}
 
 impl FootprintProbe {
     /// Start sampling at [`DEFAULT_INTERVAL`].
@@ -240,5 +399,62 @@ mod tests {
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe.finish()));
         assert!(result.is_err(), "finish hid a sampler thread panic");
+    }
+
+    #[test]
+    fn paired_probe_never_sums_noncoincident_component_peaks() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let sampler_calls = Arc::clone(&calls);
+        let probe = AllocatorProbe::start_with_sampler(Duration::from_millis(2), move || {
+            if sampler_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                AllocatorSample {
+                    active_bytes: 100,
+                    cache_bytes: 0,
+                }
+            } else {
+                AllocatorSample {
+                    active_bytes: 0,
+                    cache_bytes: 90,
+                }
+            }
+        });
+        while calls.load(Ordering::Relaxed) < 2 {
+            std::thread::yield_now();
+        }
+        let report = probe.finish();
+
+        assert_eq!(report.sampled_active_peak_bytes, 100);
+        assert_eq!(report.sampled_cache_peak_bytes, 90);
+        assert_eq!(report.sampled_footprint_peak_bytes, 100);
+        assert_eq!(report.footprint_peak_active_bytes, 100);
+        assert_eq!(report.footprint_peak_cache_bytes, 0);
+        assert_ne!(report.sampled_footprint_peak_bytes, 190);
+        assert_eq!(
+            report.sample_count,
+            report.periodic_sample_count + 2,
+            "receipt must account for immediate, periodic, and final samples"
+        );
+    }
+
+    #[test]
+    fn paired_probe_records_interruptible_final_boundary_sample() {
+        let current = Arc::new(AtomicU64::new(11));
+        let sample = Arc::clone(&current);
+        let probe = AllocatorProbe::start_with_sampler(Duration::from_secs(3600), move || {
+            AllocatorSample {
+                active_bytes: sample.load(Ordering::Relaxed),
+                cache_bytes: 7,
+            }
+        });
+        current.store(99, Ordering::Relaxed);
+        let report = probe.finish();
+
+        assert_eq!(report.sample_count, 2);
+        assert_eq!(report.periodic_sample_count, 0);
+        assert_eq!(report.boundary_active_bytes, 99);
+        assert_eq!(report.boundary_cache_bytes, 7);
+        assert_eq!(report.sampled_footprint_peak_bytes, 106);
+        assert_eq!(report.footprint_peak_active_bytes, 99);
+        assert_eq!(report.footprint_peak_cache_bytes, 7);
     }
 }

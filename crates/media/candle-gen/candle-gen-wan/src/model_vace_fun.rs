@@ -620,6 +620,10 @@ impl Generator for WanVaceFunGenerator {
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        // VACE-Fun rides the same z16 Wan VAE as its VACE sibling (`ProviderVae = WanVae16`), so it
+        // declares the same denoiser latent space.
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::WAN_Z16_VIDEO_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID_VACE_FUN,

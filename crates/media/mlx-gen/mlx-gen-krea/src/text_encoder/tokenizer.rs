@@ -74,8 +74,23 @@ pub struct KreaTokenizer {
 impl KreaTokenizer {
     /// Load from a snapshot's `tokenizer/tokenizer.json`.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let source = crate::model::ENCODER_CONTRACT.validate_source_against_base(
+            &mlx_gen::WeightsSource::Dir(root.join("text_encoder")),
+            root,
+        )?;
+        Self::from_validated_source(&source)
+    }
+
+    pub(crate) fn from_validated_source(
+        source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    ) -> Result<Self> {
+        source.read_tokenizer_unchanged(Self::from_path)
+    }
+
+    fn from_path(path: &Path) -> Result<Self> {
         let inner = TextTokenizer::from_file(
-            root.as_ref().join("tokenizer").join("tokenizer.json"),
+            path,
             TokenizerConfig {
                 // We render the template string ourselves and call `encode_ids` directly, so the
                 // config template/padding are inert.

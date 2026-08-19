@@ -130,6 +130,8 @@ pub struct Flux2Edit {
     /// FLUX.2 edit composes the FLUX.2 VAE, so it loads the SAME `flux2` student ([`PID_BACKBONE`]) as the
     /// registered FLUX.2 provider.
     pid: Option<PidEngine>,
+    /// Complete caller-prepared identity retained across deferred request materialization.
+    prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
 impl Flux2Edit {
@@ -155,6 +157,27 @@ impl Flux2Edit {
         memory: GenerationMemory,
     ) -> Result<Self> {
         Self::load_variant_with_memory(paths, Flux2Variant::Dev, quant, memory)
+    }
+
+    /// Load the dev edit lane without a request-scoped ladder context while preserving the complete
+    /// caller-authored [`LoadSpec`](candle_gen::gen_core::LoadSpec), including a validated text
+    /// encoder substitution. Constrained memory still requires the context-bearing constructor.
+    pub fn load_dev_with_memory_spec(
+        paths: &Flux2EditPaths,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        Self::load_variant_with_memory_spec(paths, Flux2Variant::Dev, quant, spec, memory)
+    }
+
+    /// Klein counterpart to [`Self::load_dev_with_memory_spec`].
+    pub fn load_klein_with_memory_spec(
+        paths: &Flux2EditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        Self::load_variant_with_memory_spec(paths, Flux2Variant::Klein9b, None, spec, memory)
     }
 
     /// Context-bearing ladder entry point used by bespoke worker routes. This preserves the same
@@ -187,6 +210,20 @@ impl Flux2Edit {
         spec: &candle_gen::gen_core::LoadSpec,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
+        let mut model = spec.read_prepared_files_unchanged(|| {
+            Self::load_with_memory_context_inner(paths, variant, quant, spec, context)
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
+    }
+
+    fn load_with_memory_context_inner(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
         validate_base_binding(paths, spec)?;
         validate_memory_load_spec(variant, spec)?;
         let loaded_quant = crate::memory_strategy::resolved_quant(spec)
@@ -203,6 +240,20 @@ impl Flux2Edit {
         let memory = contract
             .generation_memory(&context.selection)
             .unwrap_or_default();
+        let text_encoder_source = variant
+            .encoder_contract()
+            .source_for_load(spec, &paths.root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        text_encoder_source
+            .load_time_quant_bits(
+                variant
+                    .is_dev()
+                    .then_some(loaded_quant)
+                    .flatten()
+                    .map(Quant::bits),
+                variant.id(),
+            )
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         Self::load_variant_bound(
             paths,
             variant,
@@ -210,6 +261,7 @@ impl Flux2Edit {
             memory,
             Some(contract),
             Some(context.clone()),
+            text_encoder_source,
         )
     }
 
@@ -230,17 +282,67 @@ impl Flux2Edit {
         quant: Option<Quant>,
         memory: GenerationMemory,
     ) -> Result<Self> {
-        let loaded_quant = if variant.is_dev() {
-            let mut spec = candle_gen::gen_core::LoadSpec::new(
-                candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
-            );
-            spec.quantize = quant;
-            crate::memory_strategy::resolved_quant(&spec)
-                .map_err(|error| CandleError::Msg(error.to_string()))?
-        } else {
-            quant
-        };
-        Self::load_variant_bound(paths, variant, loaded_quant, memory, None, None)
+        let mut spec = candle_gen::gen_core::LoadSpec::new(
+            candle_gen::gen_core::WeightsSource::Dir(paths.root.clone()),
+        );
+        spec.quantize = quant;
+        Self::load_variant_with_memory_spec_inner(paths, variant, quant, &spec, memory)
+    }
+
+    fn load_variant_with_memory_spec(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        let mut model = spec.read_prepared_files_unchanged(|| {
+            Self::load_variant_with_memory_spec_inner(paths, variant, quant, spec, memory)
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        Ok(model)
+    }
+
+    fn load_variant_with_memory_spec_inner(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+        spec: &candle_gen::gen_core::LoadSpec,
+        memory: GenerationMemory,
+    ) -> Result<Self> {
+        validate_memory_authority(memory, None, "flux2 edit")?;
+        validate_base_binding(paths, spec)?;
+        validate_memory_load_spec(variant, spec)?;
+        let loaded_quant = crate::memory_strategy::resolved_quant(spec)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        if quant.is_some() && quant != loaded_quant {
+            return Err(CandleError::Msg(format!(
+                "flux2 edit: requested {quant:?} but the authored snapshot resolves to {loaded_quant:?}"
+            )));
+        }
+        let text_encoder_source = variant
+            .encoder_contract()
+            .source_for_load(spec, &paths.root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        text_encoder_source
+            .load_time_quant_bits(
+                variant
+                    .is_dev()
+                    .then_some(loaded_quant)
+                    .flatten()
+                    .map(Quant::bits),
+                variant.id(),
+            )
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Self::load_variant_bound(
+            paths,
+            variant,
+            loaded_quant,
+            memory,
+            None,
+            None,
+            text_encoder_source,
+        )
     }
 
     fn load_variant_bound(
@@ -250,6 +352,7 @@ impl Flux2Edit {
         memory: GenerationMemory,
         memory_contract: Option<MemoryProviderContract>,
         admitted_context: Option<MemoryRunContext>,
+        text_encoder_source: candle_gen::gen_core::ValidatedEncoderSource,
     ) -> Result<Self> {
         validate_memory_authority(memory, admitted_context.as_ref(), "flux2 edit")?;
         let optimized =
@@ -262,10 +365,11 @@ impl Flux2Edit {
         let device = candle_gen::default_device()?;
         // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
         // sc-7853); the edit provider passes `None`.
-        let pipe = Pipeline::load(
+        let pipe = Pipeline::load_with_text_encoder(
             variant,
             loaded_quant,
             &paths.root,
+            text_encoder_source,
             &device,
             None,
             paths.adapters.clone(),
@@ -297,6 +401,7 @@ impl Flux2Edit {
             admitted_context,
             lifecycle: std::sync::Mutex::new(()),
             pid: None,
+            prepared_spec: None,
         })
     }
 
@@ -305,7 +410,11 @@ impl Flux2Edit {
     /// `PID_BACKBONE` (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
     /// instead of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
-        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device)?);
+        validate_prepared_pid(self.prepared_spec.as_ref(), pid, "flux2 edit")?;
+        self.pid = Some(read_with_prepared_spec(
+            self.prepared_spec.as_ref(),
+            || PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device),
+        )?);
         Ok(self)
     }
 
@@ -341,13 +450,15 @@ impl Flux2Edit {
         crate::run_bespoke_request(
             &self.lifecycle,
             || {
-                ensure_ordinary_generate_allowed(self.admitted_context.as_ref(), "flux2 edit")?;
-                validate_memory_authority(
-                    self.memory,
-                    self.admitted_context.as_ref(),
-                    "flux2 edit",
-                )?;
-                self.generate_inner(req, references, on_progress)
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    ensure_ordinary_generate_allowed(self.admitted_context.as_ref(), "flux2 edit")?;
+                    validate_memory_authority(
+                        self.memory,
+                        self.admitted_context.as_ref(),
+                        "flux2 edit",
+                    )?;
+                    self.generate_inner(req, references, on_progress)
+                })
             },
             || self.pipe.device.synchronize(),
         )
@@ -366,21 +477,23 @@ impl Flux2Edit {
         crate::run_bespoke_request(
             &self.lifecycle,
             || {
-                let admitted = self.admitted_context.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "flux2 edit: model was not loaded with a memory context".to_owned(),
-                    )
-                })?;
-                let contract = self.memory_contract.as_ref().ok_or_else(|| {
-                    CandleError::Msg(
-                        "flux2 edit: admitted model lost its memory contract".to_owned(),
-                    )
-                })?;
-                validate_admitted_context(admitted, context, "flux2 edit")?;
-                validate_memory_request(context, req, references.len())?;
-                crate::memory_strategy::validate_context(contract, context, self.loaded_quant)
-                    .map_err(|error| CandleError::Msg(error.to_string()))?;
-                self.generate_inner(req, references, on_progress)
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "flux2 edit: model was not loaded with a memory context".to_owned(),
+                        )
+                    })?;
+                    let contract = self.memory_contract.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "flux2 edit: admitted model lost its memory contract".to_owned(),
+                        )
+                    })?;
+                    validate_admitted_context(admitted, context, "flux2 edit")?;
+                    validate_memory_request(context, req, references.len())?;
+                    crate::memory_strategy::validate_context(contract, context, self.loaded_quant)
+                        .map_err(|error| CandleError::Msg(error.to_string()))?;
+                    self.generate_inner(req, references, on_progress)
+                })
             },
             || self.pipe.device.synchronize(),
         )
@@ -628,10 +741,16 @@ impl Flux2Edit {
         let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
         // Decode the final latent: native FLUX.2 VAE by default, or the `flux2` PiD student (4× SR) when
         // this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044). Both take the same
-        // unpacked latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
+        // packed-grid latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
         let pid_decoder = self.pid_decoder_for(req)?;
         let decoded = match &pid_decoder {
-            Some(pid) => pid.decode(&packed)?, // [1,3,4H,4W]
+            Some(pid) => {
+                candle_gen::ensure_decoder_layout(
+                    Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
+                    pid,
+                )?;
+                pid.decode(&packed)? // [1,3,4H,4W]
+            }
             None if self.memory.tile_vae_decode => vae.decode_packed_tiled(
                 &packed,
                 self.memory
@@ -709,6 +828,37 @@ impl Flux2Edit {
     }
 }
 
+fn read_with_prepared_spec<T>(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match spec {
+        Some(spec) => spec.read_prepared_files_unchanged(read),
+        None => read(),
+    }
+}
+
+fn validate_prepared_pid(
+    spec: Option<&candle_gen::gen_core::LoadSpec>,
+    requested: &PidWeights,
+    label: &str,
+) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    let admitted = spec.pid.as_ref().ok_or_else(|| {
+        CandleError::Msg(format!(
+            "{label}: cannot attach PiD outside the prepared load specification"
+        ))
+    })?;
+    if admitted.checkpoint != requested.checkpoint || admitted.gemma != requested.gemma {
+        return Err(CandleError::Msg(format!(
+            "{label}: requested PiD weights differ from the prepared load specification"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_base_binding(
     paths: &Flux2EditPaths,
     spec: &candle_gen::gen_core::LoadSpec,
@@ -740,14 +890,10 @@ fn validate_memory_load_spec(
     if spec.ip_adapter.is_some() {
         unsupported.push("ip_adapter");
     }
-    if spec.pid.is_some() {
-        unsupported.push("pid");
-    }
+    // PiD is the one intentional two-step component: the prepared constructor retains this exact
+    // spec, then `with_pid` checks argument equality and loads it under the same receipt.
     if spec.identity.is_some() {
         unsupported.push("identity");
-    }
-    if spec.text_encoder.is_some() {
-        unsupported.push("text_encoder");
     }
     if !spec.components.is_empty() {
         unsupported.push("components");
@@ -1032,14 +1178,31 @@ mod tests {
         let mut ip_adapter = base();
         ip_adapter.ip_adapter = Some(WeightsSource::Dir(PathBuf::from("ip-adapter")));
         let mut pid = base();
-        pid.pid = Some(PidWeights {
+        let admitted_pid = PidWeights {
             checkpoint: WeightsSource::File(PathBuf::from("pid.safetensors")),
             gemma: WeightsSource::Dir(PathBuf::from("gemma")),
-        });
+        };
+        pid.pid = Some(admitted_pid.clone());
+        assert!(
+            validate_memory_load_spec(Flux2Variant::Klein9b, &pid).is_ok(),
+            "the edit provider realizes PiD through the bound with_pid step"
+        );
+        assert!(validate_prepared_pid(Some(&pid), &admitted_pid, "flux2 edit").is_ok());
+        let mismatched_pid = PidWeights {
+            checkpoint: WeightsSource::File(PathBuf::from("other-pid.safetensors")),
+            gemma: admitted_pid.gemma.clone(),
+        };
+        assert!(validate_prepared_pid(Some(&pid), &mismatched_pid, "flux2 edit").is_err());
+        assert!(validate_prepared_pid(Some(&base()), &admitted_pid, "flux2 edit").is_err());
+        assert!(validate_prepared_pid(None, &admitted_pid, "flux2 edit").is_ok());
         let mut identity = base();
         identity.identity = Some(IdentityWeights::default());
         let mut text_encoder = base();
         text_encoder.text_encoder = Some(WeightsSource::Dir(PathBuf::from("external-te")));
+        assert!(
+            validate_memory_load_spec(Flux2Variant::Klein9b, &text_encoder).is_ok(),
+            "typed encoder substitutions are realized by the edit memory route"
+        );
         let components = base().with_component(
             "unwired_component",
             WeightsSource::File(PathBuf::from("component.safetensors")),
@@ -1049,9 +1212,7 @@ mod tests {
             ("control", control),
             ("extra_controls", extra_controls),
             ("ip_adapter", ip_adapter),
-            ("pid", pid),
             ("identity", identity),
-            ("text_encoder", text_encoder),
             ("components", components),
         ] {
             let error = validate_memory_load_spec(Flux2Variant::Klein9b, &spec)
@@ -1077,6 +1238,66 @@ mod tests {
         .err()
         .expect("legacy constrained edit load must fail");
         assert!(error.to_string().contains("exact admitted context"));
+    }
+
+    #[test]
+    fn edit_spec_loader_consumes_authored_text_encoder_before_device_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        let selected = tmp.path().join("selected");
+        std::fs::create_dir_all(&root).unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected,
+            Flux2Variant::Dev.encoder_contract(),
+        )
+        .unwrap();
+        let config_path = selected.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["hidden_size"] = serde_json::json!(7);
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let paths = Flux2EditPaths {
+            root: root.clone(),
+            adapters: Vec::new(),
+        };
+        let spec =
+            candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(root))
+                .with_text_encoder(candle_gen::gen_core::WeightsSource::Dir(selected));
+        let error =
+            Flux2Edit::load_dev_with_memory_spec(&paths, None, &spec, GenerationMemory::default())
+                .err()
+                .expect("authored wrong-shape encoder must reject before device load")
+                .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+    }
+
+    #[test]
+    fn planning_without_tokenizer_is_metadata_only_but_load_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        let selected = tmp.path().join("selected-component");
+        std::fs::create_dir_all(&root).unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &selected,
+            Flux2Variant::Dev.encoder_contract(),
+        )
+        .unwrap();
+        let paths = Flux2EditPaths {
+            root: root.clone(),
+            adapters: Vec::new(),
+        };
+        let spec =
+            candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(root))
+                .with_text_encoder(candle_gen::gen_core::WeightsSource::Dir(selected));
+
+        crate::memory_strategy::provider_contract(&spec)
+            .expect("memory planning must not require a runtime tokenizer receipt");
+        let error =
+            Flux2Edit::load_dev_with_memory_spec(&paths, None, &spec, GenerationMemory::default())
+                .err()
+                .expect("actual load must require the retained tokenizer receipt")
+                .to_string();
+        assert!(error.contains("no retained tokenizer artifact"), "{error}");
     }
 
     /// The request defaults match the klein edit production knobs (1024², 4 distilled steps, CFG-free).

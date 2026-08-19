@@ -110,9 +110,24 @@ pub(crate) fn tokenizer_config() -> TokenizerConfig {
 
 /// Build the Z-Image Qwen tokenizer from `root/tokenizer/tokenizer.json`. `label` names the site in the
 /// error (`"z-image"`, `"z-image edit"`, `"z-image control"`).
-pub(crate) fn build_tokenizer(root: &std::path::Path, label: &str) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(root.join("tokenizer/tokenizer.json"), tokenizer_config())
-        .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+pub(crate) fn build_tokenizer(
+    source: &candle_gen::gen_core::ValidatedTokenizerSource,
+    label: &str,
+) -> Result<TextTokenizer> {
+    source.read_unchanged(|path| {
+        TextTokenizer::from_file(path, tokenizer_config())
+            .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+    })
+}
+
+pub(crate) fn build_tokenizer_from_base(
+    root: &std::path::Path,
+    label: &str,
+) -> Result<TextTokenizer> {
+    let source = crate::ENCODER_CONTRACT
+        .tokenizer_for_base(root)
+        .map_err(CandleError::from)?;
+    build_tokenizer(&source, label)
 }
 
 /// Prompt → the Qwen chat-template token ids (non-empty), erroring on an empty tokenization. Shared by
@@ -271,6 +286,42 @@ pub(crate) fn encode_mean(
     Ok(latents.to_dtype(out_dtype)?)
 }
 
+/// Native Z-Image VAE adapter for the generic latent-decoder seam. The vendored VAE owns the
+/// `/scaling_factor + shift_factor` de-normalization; this wrapper deliberately adds no tensor
+/// transform and only preserves the historical f32 output contract.
+struct ZImageLatentDecoder<'a> {
+    vae: &'a AutoEncoderKL,
+}
+
+impl<'a> ZImageLatentDecoder<'a> {
+    fn new(vae: &'a AutoEncoderKL) -> Self {
+        Self { vae }
+    }
+}
+
+impl LatentDecoder for ZImageLatentDecoder<'_> {
+    fn input_latent_space(&self) -> Option<&candle_gen::gen_core::LatentSpace> {
+        Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE)
+    }
+
+    fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        Ok(self.vae.decode(latents)?.to_dtype(DType::F32)?)
+    }
+}
+
+fn decode_selected(
+    native: &dyn LatentDecoder,
+    override_decoder: Option<&dyn LatentDecoder>,
+    latents: &Tensor,
+) -> Result<Tensor> {
+    let decoder = override_decoder.unwrap_or(native);
+    candle_gen::ensure_decoder_compatible(
+        Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+        decoder,
+    )?;
+    decoder.decode(latents)
+}
+
 /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`]. The VAE applies its own
 /// `/scaling_factor + shift_factor` un-scale inside `decode`; `postprocess_image` maps the `[-1, 1]`
 /// output to `[0, 255]` u8. Byte-identical across the three entry points.
@@ -286,10 +337,12 @@ pub(crate) fn decode(
     // is applied inside `decode`). PiD emits a larger `[1,3,4H,4W]` tensor; `postprocess_image` reads
     // the size from the tensor (never `latent*8`).
     let latents = latents.squeeze(LATENT_FRAME_AXIS)?;
-    let decoded = match pid {
-        Some(pid) => pid.decode(&latents)?,
-        None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]
-    };
+    let native = ZImageLatentDecoder::new(vae);
+    let decoded = decode_selected(
+        &native,
+        pid.map(|decoder| decoder as &dyn LatentDecoder),
+        &latents,
+    )?;
     decoded_to_image(&decoded)
 }
 
@@ -314,7 +367,73 @@ pub(crate) fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct DecodeSpy {
+        output: Tensor,
+        calls: Cell<usize>,
+    }
+
+    impl LatentDecoder for DecodeSpy {
+        fn input_latent_space(&self) -> Option<&candle_gen::gen_core::LatentSpace> {
+            Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE)
+        }
+
+        fn decode(&self, _latents: &Tensor) -> Result<Tensor> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.output.clone())
+        }
+    }
+
+    /// SC-18309 N1: compare the actual tiny AutoEncoderKL's historical no-override expression with
+    /// the complete engine decode route byte-for-byte. This covers the singleton-frame squeeze and
+    /// the VAE's real scale/shift de-normalization. A distinct synthetic PiD arm then pins override
+    /// precedence, NCHW post-processing, and output-size discovery independently of model weights.
+    #[test]
+    fn decode_route_keeps_native_and_override_bytes_exact() {
+        use candle_gen::candle_nn::{VarBuilder, VarMap};
+        use candle_transformers::models::z_image::vae::VaeConfig;
+
+        let device = Device::Cpu;
+        let cfg = VaeConfig {
+            in_channels: 3,
+            out_channels: 3,
+            latent_channels: 16,
+            block_out_channels: vec![32],
+            layers_per_block: 1,
+            scaling_factor: 0.3611,
+            shift_factor: 0.1159,
+            norm_num_groups: 32,
+        };
+        let vars = VarMap::new();
+        let vae =
+            AutoEncoderKL::new(&cfg, VarBuilder::from_varmap(&vars, DType::F32, &device)).unwrap();
+        let values = (0..(16 * 2 * 3))
+            .map(|index| index as f32 * 0.01 - 0.4)
+            .collect::<Vec<_>>();
+        let latent5 = Tensor::from_vec(values, (1, 16, 1, 2, 3), &device).unwrap();
+        let latent4 = latent5.squeeze(LATENT_FRAME_AXIS).unwrap();
+        let legacy = vae.decode(&latent4).unwrap().to_dtype(DType::F32).unwrap();
+        let expected = decoded_to_image(&legacy).unwrap();
+        assert_eq!(decode(&vae, None, &latent5).unwrap(), expected);
+
+        let native = DecodeSpy {
+            output: Tensor::zeros((1, 3, 2, 3), DType::F32, &device).unwrap(),
+            calls: Cell::new(0),
+        };
+        let pid = DecodeSpy {
+            output: Tensor::ones((1, 3, 4, 5), DType::F32, &device).unwrap(),
+            calls: Cell::new(0),
+        };
+        let selected = decode_selected(&native, Some(&pid), &latent4).unwrap();
+        let image = decoded_to_image(&selected).unwrap();
+        assert_eq!((image.width, image.height), (5, 4));
+        assert!(image.pixels.iter().all(|pixel| *pixel == 255));
+        assert_eq!(native.calls.get(), 0);
+        assert_eq!(pid.calls.get(), 1);
+    }
 
     /// The shared preprocess resizes/fits per policy and maps `[0,255] → [-1,1]` in CHW f32. A solid
     /// white source ⇒ all ≈ 1.0; a truncated buffer errors; `RequireExact` rejects an off-size image

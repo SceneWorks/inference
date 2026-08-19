@@ -115,10 +115,12 @@ pub fn build_lora_targets<H: AdaptableHost>(
     let mut params: LoraParams = HashMap::new();
     for (i, path) in target_paths.iter().enumerate() {
         let segs: Vec<&str> = path.split('.').collect();
-        let lin = host.adaptable_mut(&segs).ok_or_else(|| -> crate::Error {
+        // SC-18319 — target *sizing* only reads the base shape, so it goes through the PROBE half.
+        // `bind_lora_params` below is the mutation that installs the trainable stack (and unfuses).
+        let facts = host.adaptable_facts(&segs).ok_or_else(|| -> crate::Error {
             format!("LoRA target does not resolve on the model: {path}").into()
         })?;
-        let shape = lin.base_shape(); // [out, in]
+        let shape = facts.base_shape; // [out, in]
         let (out_f, in_f) = (shape[0], shape[1]);
 
         let a_key: Rc<str> = Rc::from(format!("{path}.lora_a"));
@@ -323,10 +325,11 @@ pub fn build_lokr_targets<H: AdaptableHost>(
     };
     for (i, path) in target_paths.iter().enumerate() {
         let segs: Vec<&str> = path.split('.').collect();
-        let lin = host.adaptable_mut(&segs).ok_or_else(|| -> crate::Error {
+        // SC-18319 — factor sizing is shape-only, so the PROBE half; `bind_lokr_params` mutates.
+        let facts = host.adaptable_facts(&segs).ok_or_else(|| -> crate::Error {
             format!("LoKr target does not resolve on the model: {path}").into()
         })?;
-        let shape = lin.base_shape(); // [out, in]
+        let shape = facts.base_shape; // [out, in]
         let (out_a, out_b) = factorization(shape[0], factor);
         let (in_a, in_b) = factorization(shape[1], factor);
 

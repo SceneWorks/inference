@@ -138,6 +138,10 @@ impl Headers {
                 self.component, tensor.shape
             )));
         }
+        // FP8 posture: `is_float` excludes `F8_E4M3`. MLX Wan reads canonical BF16 storage (see
+        // `stored`/`materialized` below) through the plain `Weights::from_file` path, which rejects
+        // fp8 files outright — the fp8-decoding loader (`from_file_with_fp8`) is opt-in and this
+        // provider does not use it, so refusing fp8 here matches the loader it prices for.
         if require_float && !tensor.is_float() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: {} tensor {name} must be floating, got {:?}",
@@ -716,6 +720,9 @@ fn build_contract(
             cache_eviction: false,
         },
         strategies: strategies(),
+        // Wan declares no decode-quality geometry policy table, so this route carries no semantic
+        // decode authority — the fail-closed default every non-declaring provider contract uses.
+        decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
         additional_prerequisites: Vec::new(),
@@ -1225,10 +1232,25 @@ pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::M
     safety_check: registered_safety_check,
 };
 
+/// TI2V-5B witnesses each shared MLX tier exactly once. `supported_load_surface` admits only a
+/// directory-backed BF16 **Resident/Eager** load, so the sequential and deferred selectors of the
+/// shared MLX default have no constructible contract; publishing them would fail the registry
+/// surface walk for the entire MLX catalog. The tier axis is the only one this provider varies.
+pub(crate) fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::mlx_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| {
+            surface.selector.offload_policy == OffloadPolicy::Resident
+                && surface.selector.load_shape == LoadShape::EagerMaterialization
+        })
+        .collect()
+}
+
 pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_memory_strategy_contract,
+        surface_specs: memory_contract_surface_specs,
     };
 
 pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
@@ -1247,6 +1269,37 @@ mod tests {
     };
     use std::io::Write;
     use std::path::PathBuf;
+
+    /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
+    /// fixture publishes and fails the entire MLX catalog when one errors, so the published witness
+    /// set must be exactly the set this provider can build. Asserting it here localizes the failure
+    /// to this provider instead of surfacing it as eight red `mlx-gen-catalog` tests.
+    #[test]
+    fn every_published_contract_surface_builds_and_only_resident_eager_is_published() {
+        let surfaces = (MEMORY_FIXTURE.surface_specs)();
+        assert_eq!(
+            surfaces.len(),
+            gen_core::mlx_memory_contract_surface_specs().len() / 4,
+            "one witness per shared MLX tier, Resident/Eager only"
+        );
+        for surface in &surfaces {
+            assert_eq!(surface.selector.offload_policy, OffloadPolicy::Resident);
+            assert_eq!(surface.selector.load_shape, LoadShape::EagerMaterialization);
+            (MEMORY_FIXTURE.contract)(&surface.spec).unwrap_or_else(|error| {
+                panic!("surface {} must build: {error}", surface.selector.id())
+            });
+        }
+        assert!(
+            gen_core::mlx_memory_contract_surface_specs()
+                .into_iter()
+                .filter(
+                    |surface| surface.selector.offload_policy != OffloadPolicy::Resident
+                        || surface.selector.load_shape != LoadShape::EagerMaterialization
+                )
+                .all(|surface| weights_free_memory_strategy_contract(&surface.spec).is_err()),
+            "a surface that now builds must be published, not filtered out"
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct HeaderTensor {
@@ -1845,6 +1898,10 @@ mod tests {
         assert!(loaded.memory_strategy_contract().is_none());
         assert!(matches!(
             loaded.memory_strategy_safety_check(&MemoryRunContext {
+                // This probe asserts the Sequential route declares no contract at all, so the
+                // authority value is inert here; Calibrated matches every other provider's
+                // weights-free safety-check context.
+                optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
                 selection: gen_core::MemorySelection {
                     strategy: MemoryStrategy::BoundedDecode,
                     parameters: MemoryStrategyParameters::default(),

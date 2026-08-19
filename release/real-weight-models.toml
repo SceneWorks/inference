@@ -101,6 +101,40 @@ expected_files = [
 key = "flux-1-dev"
 repository = "black-forest-labs/FLUX.1-dev"
 revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+# The canonical BFL repository is gated, but the macOS PiD lane runs without a runner token.
+# Materialize cache misses from the public SceneWorks MLX matrix's dense `bf16/` projection while
+# retaining the canonical revision identity used by the Windows operator A/B. At these immutable
+# commits every required file and every referenced shard has the same size and LFS SHA-256 as the
+# canonical diffusers tree; the alternate-source receipt records the exact projection.
+materialization_repository = "SceneWorks/flux1-dev-mlx"
+materialization_revision = "323fd12d79f78ad444e882e8d8e871914584f2b9"
+materialization_path_prefix = "bf16"
+materialization_expected_files = [
+    "LICENSE.md",
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "text_encoder_2/config.json",
+    "text_encoder_2/model-00001-of-00002.safetensors",
+    "text_encoder_2/model-00002-of-00002.safetensors",
+    "text_encoder_2/model.safetensors.index.json",
+    "tokenizer/merges.txt",
+    "tokenizer/special_tokens_map.json",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/vocab.json",
+    "tokenizer_2/special_tokens_map.json",
+    "tokenizer_2/spiece.model",
+    "tokenizer_2/tokenizer.json",
+    "tokenizer_2/tokenizer_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 license = "FLUX-1-dev Non-Commercial License"
 size_class = "very-large"
 profiles = ["media-cuda-residency-ab", "media-macos"]
@@ -370,6 +404,26 @@ expected_files = [
     "q8/transformer/config.json",
     "q8/transformer/model.safetensors",
     "q8/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# SC-18309 N1 needs only the real SDXL VAE to prove that the shared native decode seam is byte-
+# exact to the former direct engine expression. Keep this as an exact two-file projection instead
+# of materializing the 13.5 GB full SDXL matrix on the rw-mage runner.
+key = "sdxl-base-mlx-vae-bf16"
+repository = "SceneWorks/sdxl-base-mlx"
+revision = "36699bb8a6353e61c920e3bf19f0e6f8e4151c55"
+license = "CreativeML Open RAIL++-M"
+size_class = "medium"
+profiles = ["media-macos"]
+environment = ["SDXL_N1_SNAPSHOT"]
+download_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
+]
+expected_files = [
+    "bf16/vae/config.json",
+    "bf16/vae/diffusion_pytorch_model.fp16.safetensors",
 ]
 
 [[models]]
@@ -1423,10 +1477,48 @@ expected_files = [
 key = "mage-flow"
 repository = "microsoft/Mage-Flow"
 revision = "faca09c18c1c19458e7fbc3f7bce6f7a7d4d01a9"
+# Microsoft withdrew the canonical Hub repository. This immutable public mirror records 24/24 LFS
+# objects and 43/43 model files byte-matching the canonical revision; only card/licence metadata was
+# added. Preserve the canonical revision marker so the independently produced Mage oracle bundle
+# and existing Windows caches stay valid, but make new materializations anonymous and reproducible.
+materialization_repository = "SceneWorks/Mage-Flow"
+materialization_revision = "5f6455818d8ca80ce780e9c01b9e0de1d8c5f9db"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_SNAPSHOT"]
+# The mirrors also publish q4/q8/bf16 conversion tiers. Fetch the complete canonical root model
+# surface, not those additional projections: four whole-repo downloads would waste ~56 GiB on the
+# 192 GiB rw-mage runner before the PiD lane materializes its own FLUX snapshot.
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -1445,10 +1537,41 @@ expected_files = [
 key = "mage-flow-edit-base"
 repository = "microsoft/Mage-Flow-Edit-Base"
 revision = "8654a7bc0283ab2946385230b5b2eb944e0b76ea"
+materialization_repository = "SceneWorks/Mage-Flow-Edit-Base"
+materialization_revision = "6c119cdac7ce7cf8c1ab4990d9c8ca18641f2c5d"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_BASE_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -1467,10 +1590,41 @@ expected_files = [
 key = "mage-flow-edit-turbo"
 repository = "microsoft/Mage-Flow-Edit-Turbo"
 revision = "14427bd7627d3a25436497a5939e1096f6a0d523"
+materialization_repository = "SceneWorks/Mage-Flow-Edit-Turbo"
+materialization_revision = "75c11a2957aca2c78272984375502105b2b235ab"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_TURBO_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -1492,10 +1646,41 @@ expected_files = [
 key = "mage-flow-edit"
 repository = "microsoft/Mage-Flow-Edit"
 revision = "b01d524f86498b7dabcc4b3572c6d264d786a16e"
+materialization_repository = "SceneWorks/Mage-Flow-Edit"
+materialization_revision = "dbd4a9c07faca94491ad88ab21225d62e054d9cc"
 license = "MIT"
 size_class = "very-large"
 profiles = ["media-macos", "media-cuda"]
 environment = ["MAGE_EDIT_SNAPSHOT"]
+download_files = [
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "transformer/*",
+    "vae/*",
+]
+materialization_expected_files = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "text_encoder/.gitattributes",
+    "text_encoder/README.md",
+    "text_encoder/chat_template.json",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/merges.txt",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/preprocessor_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/video_preprocessor_config.json",
+    "text_encoder/vocab.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 expected_files = [
     "model_index.json",
     "scheduler/scheduler_config.json",
@@ -1531,12 +1716,27 @@ expected_files = [
     "q4/vae.safetensors",
 ]
 
+[[models]]
+# SC-18315 uses only the stock Wan z16 VAE from Krea Realtime's q8 tier as Krea 2's experimental
+# alternate terminal decoder. Keep this as a standalone exact-file projection: the correctness lane
+# must not materialize the unrelated complete repository or silently widen this donor dependency.
+key = "krea-realtime-14b-mlx-wan-z16-vae-q8"
+repository = "SceneWorks/krea-realtime-14b-mlx"
+revision = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["media-macos"]
+environment = ["KREA_ALTERNATE_DECODER_WAN_VAE_SNAPSHOT"]
+download_files = ["q8/vae.safetensors"]
+expected_files = ["q8/vae.safetensors"]
+
 # sc-18213 (epic 18093) — `SceneWorks/krea-2-turbo-mlx`, the Krea 2 Turbo IMAGE re-host
 # `mlx-gen-krea` actually loads (`KREA_TURBO_DIR` points one level in, at a tier dir). NOT related
 # to `krea-realtime-14b-mlx` above beyond the vendor name: that is a Wan-2.1 video model. The repo
-# ships three self-contained diffusers-layout tiers; the epic-18093 right-size calibration measures
-# per artifact x tier and each tier is provisioned independently (bf16 alone is ~33 GiB), so the
-# binding is keyed per tier — the flux2-klein-9b-mlx-q4 shape. All three keys share one
+# ships three self-contained diffusers-layout tiers. The explicit SC-18315 correctness lane uses
+# q4 only; the epic-18093 right-size calibration keeps bf16/q8 operator-only. Each tier is
+# provisioned independently (bf16 alone is ~33 GiB), so the binding is keyed per tier — the
+# flux2-klein-9b-mlx-q4 shape. All three keys share one
 # repository + revision; sibling tiers present on disk are still inventoried by
 # `verify_model_snapshot.py --inventory-output`, so a multi-tier snapshot changes the inventory
 # sha rather than silently reusing a single-tier one.
@@ -1598,7 +1798,6 @@ license = "Krea 2 Community License"
 size_class = "very-large"
 profiles = ["media-macos"]
 environment = ["KREA_TURBO_DIR"]
-unwired_reason = "operator-run epic-18093 right-size calibration on authoritative Apple hardware; pinned to bind capture evidence to exact weights (sc-18213), no CI lane dispatches the krea-2-turbo harnesses"
 download_files = ["q4/*", "LICENSE.pdf"]
 expected_files = [
     "LICENSE.pdf",

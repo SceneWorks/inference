@@ -13,6 +13,7 @@ pub mod blocks;
 use mlx_rs::ops::{add, divide, multiply, split, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
 use mlx_gen::nn::silu;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::vae_tiling::tiled_decode;
@@ -20,18 +21,6 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, LatentDecoder, Result};
 
 use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
-
-// fork QwenVAE.LATENTS_{MEAN,STD}, reshaped to (1, 16, 1, 1, 1) for NCTHW broadcast.
-#[rustfmt::skip]
-const LATENTS_MEAN: [f32; 16] = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
-];
-#[rustfmt::skip]
-const LATENTS_STD: [f32; 16] = [
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916,
-];
 
 /// Image → 32-ch (sliced to 16) latent. 4 down-stages (3 spatial-downsample), then a mid-block.
 pub struct Encoder3D {
@@ -121,9 +110,18 @@ impl Decoder3D {
 
     /// The **upsample tail**: `up_blocks → norm_out → SiLU → conv_out`. Every op here is spatially LOCAL
     /// — resnet convs, nearest-2× + conv upsamplers, the per-position channel-L2 `norm_out`, and the head
-    /// conv — so it tiles seam-free (overlap + trapezoidal blend absorbs the conv halo). This is also
-    /// where the decode memory spike lives (the 8× spatial growth), so tiling it is what bounds the peak
-    /// (sc-11747). `x` is the pre-upsample head output at latent resolution.
+    /// conv — so it is **normalization-correct under tiling**: no statistic here is scoped to a tile, and
+    /// a tile's interior is bit-identical to the dense decode's (proved in
+    /// `tests/vae_tiling_normalization_proof.rs`, sc-19753). This is also where the decode memory spike
+    /// lives (the 8× spatial growth), so tiling it is what bounds the peak (sc-11747). `x` is the
+    /// pre-upsample head output at latent resolution.
+    ///
+    /// ⚠️ Tile-*safe* is not seam-*free*. The tail's receptive field is **98 output px** — each stage
+    /// contributes 6 (3 resnets × 2 `k=3` convs) at its own resolution, each upsample doubles the
+    /// accumulated radius and adds 1, `conv_out` adds 1 — which is **wider than the 64 px overlap**
+    /// `TilingConfig::auto` ships. The trapezoidal blend attenuates that conv halo; it does not remove
+    /// it, so a residual seam term is expected by design. What tiling this stage cannot introduce is a
+    /// per-tile *statistic*, which is the sc-19753 property and the one the tests pin.
     pub(super) fn forward_upsample_tail(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         for block in &self.up_blocks {
@@ -197,17 +195,18 @@ impl QwenVae {
     /// geometry lives in [`mlx_gen::tiling`] and the Array loop in [`mlx_gen::vae_tiling`]. No clamp here
     /// (the single-pass [`decode`](Self::decode) doesn't clamp either — the `[-1,1]` clamp is applied
     /// later by the engine's `decoded_to_image`), so the tiled output matches the untiled one to within
-    /// the blend tolerance.
+    /// the blend tolerance — the *conv-halo* seam term described on
+    /// `Decoder3D::forward_upsample_tail`, which the shipped 64 px overlap attenuates rather than
+    /// eliminates. It is never a per-tile normalization or attention term: that is the sc-19753
+    /// property, pinned by `tests/vae_tiling_normalization_proof.rs`.
     pub fn decode_tiled(
         &self,
         latents: &Array,
         cfg: &TilingConfig,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
-        let l = to_5d(latents)?;
-        let sh = l.shape(); // [B, 16, T(=1), H, W]
-        let (f, h, w) = (sh[2], sh[3], sh[4]);
-        if !cfg.needs_tiling(VaeTiling::QWEN_IMAGE, f, h, w) {
+        let (l, f, h, w, needs_tiling) = tiled_decode_preamble(latents, cfg, cancel)?;
+        if !needs_tiling {
             return self.decode(latents);
         }
         // Head (denormalize → post_quant_conv → conv_in → mid-block global attention) runs ONCE on the
@@ -237,8 +236,24 @@ impl QwenVae {
 /// same latent space (`mlx-gen-pid`, sc-7843/7845) implements the same trait so an engine can swap
 /// between them at the decode call site.
 impl LatentDecoder for QwenVae {
+    fn input_latent_space(&self) -> Option<&mlx_gen::gen_core::LatentSpace> {
+        Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE)
+    }
+
     fn decode(&self, latents: &Array) -> Result<Array> {
         QwenVae::decode(self, latents)
+    }
+
+    fn decode_tiled(
+        &self,
+        latents: &Array,
+        tiling: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        QwenVae::decode_tiled(self, latents, tiling, cancel)
     }
 }
 
@@ -249,5 +264,44 @@ fn to_5d(x: &Array) -> Result<Array> {
         Ok(x.reshape(&[s[0], s[1], 1, s[2], s[3]])?)
     } else {
         Ok(x.clone())
+    }
+}
+
+/// The complete work-free preamble for Qwen's native tiled decode. Cancellation is intentionally
+/// first: a pre-tripped request must not validate/reshape a malformed tensor, choose a plan, enter
+/// the monolithic fallback, or execute the globally-scoped head.
+fn tiled_decode_preamble(
+    latents: &Array,
+    cfg: &TilingConfig,
+    cancel: Option<&CancelFlag>,
+) -> Result<(Array, i32, i32, i32, bool)> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(mlx_gen::Error::Canceled);
+    }
+    let latent5 = to_5d(latents)?;
+    let shape = latent5.shape();
+    let (frames, height, width) = (shape[2], shape[3], shape[4]);
+    let needs_tiling = cfg.needs_tiling(VaeTiling::QWEN_IMAGE, frames, height, width);
+    Ok((latent5, frames, height, width, needs_tiling))
+}
+
+#[cfg(test)]
+mod tiled_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn pre_cancel_wins_for_firing_and_non_firing_plans_before_validation() {
+        let malformed = Array::from_slice(&[1.0f32], &[1]);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        for cfg in [
+            TilingConfig::spatial_only(8, 2),
+            TilingConfig::spatial_only(4096, 64),
+        ] {
+            assert!(matches!(
+                tiled_decode_preamble(&malformed, &cfg, Some(&cancel)),
+                Err(mlx_gen::Error::Canceled)
+            ));
+        }
     }
 }

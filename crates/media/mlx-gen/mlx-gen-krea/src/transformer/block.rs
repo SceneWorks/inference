@@ -23,6 +23,24 @@ use super::rope::apply_interleaved_rope;
 use super::{join, repeat_kv};
 use crate::quant::lin;
 
+fn materialize_host_adapters(host: &mut impl AdaptableHost) -> Result<()> {
+    for path in host.adaptable_paths() {
+        let parts: Vec<&str> = path.split('.').collect();
+        // SC-18319 — this walks EVERY projection, and `materialize_adapters` on an empty stack is a
+        // no-op, so the PROBE half decides and the `&mut` is taken only where there is a stack to
+        // evaluate. Resolving `&mut`-first would unfuse a whole model to evaluate nothing.
+        if host
+            .adaptable_facts(&parts)
+            .is_some_and(|f| f.adapter_count > 0)
+        {
+            host.adaptable_mut(&parts)
+                .expect("resolved through the probe above")
+                .materialize_adapters()?;
+        }
+    }
+    Ok(())
+}
+
 /// `1.0 + a`, broadcasting the scalar (the `(1 + scale)` modulation factor).
 fn plus1(a: &Array) -> Result<Array> {
     Ok(add(a, Array::from_f32(1.0))?)
@@ -65,6 +83,11 @@ impl RmsScale {
         let dt = x.dtype();
         let y = rms_norm(&x.as_dtype(Dtype::Float32)?, &self.weight, self.eps)?;
         Ok(y.as_dtype(dt)?)
+    }
+
+    pub(super) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.weight])?;
+        Ok(())
     }
 }
 
@@ -221,6 +244,14 @@ impl GatedAttention {
         }
         Ok(())
     }
+
+    fn materialize_weights(&self) -> Result<()> {
+        for projection in [&self.q, &self.k, &self.v, &self.gate, &self.o] {
+            projection.materialize_weights()?;
+        }
+        self.norm_q.materialize_weights()?;
+        self.norm_k.materialize_weights()
+    }
 }
 
 /// LoRA/LoKr target routing for the gated attention (sc-7577 / sc-7578): the diffusers leaf names
@@ -274,6 +305,12 @@ impl SwiGlu {
         self.up.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         self.down.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.gate.materialize_weights()?;
+        self.up.materialize_weights()?;
+        self.down.materialize_weights()
     }
 
     /// Cast the projection weights to the training compute `dtype` in place (sc-7577).
@@ -346,6 +383,13 @@ impl TextFusionBlock {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
+    }
+
+    fn materialize_weights(&self) -> Result<()> {
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
     }
 
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
@@ -462,6 +506,14 @@ impl SingleStreamBlock {
         self.mlp.quantize(bits)
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.scale_shift_table])?;
+        self.prenorm.materialize_weights()?;
+        self.postnorm.materialize_weights()?;
+        self.attn.materialize_weights()?;
+        self.mlp.materialize_weights()
+    }
+
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.attn.set_sdpa_checkpoint(on);
     }
@@ -472,6 +524,10 @@ impl SingleStreamBlock {
         }
         self.attn.cast_weights(dtype)?;
         self.mlp.cast_weights(dtype)
+    }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        materialize_host_adapters(self)
     }
 }
 
@@ -574,6 +630,17 @@ impl TextFusionTransformer {
         Ok(())
     }
 
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        for block in &self.layerwise {
+            block.materialize_weights()?;
+        }
+        self.projector.materialize_weights()?;
+        for block in &self.refiner {
+            block.materialize_weights()?;
+        }
+        Ok(())
+    }
+
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         for b in &mut self.layerwise {
             b.set_sdpa_checkpoint(on);
@@ -592,6 +659,13 @@ impl TextFusionTransformer {
             b.cast_weights(dtype)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn materialize_adapters(&mut self) -> Result<()> {
+        // `projector` is routable for explicit adapter files but is not enumerated by
+        // `adaptable_paths`; include it explicitly so its payload cannot escape the pin guard.
+        self.projector.materialize_adapters()?;
+        materialize_host_adapters(self)
     }
 }
 

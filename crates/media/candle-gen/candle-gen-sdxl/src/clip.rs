@@ -126,6 +126,31 @@ impl ClipTextEmbeddings {
             position_ids,
         })
     }
+
+    fn move_to_device(&mut self, device: &Device) -> Result<()> {
+        self.token_embedding = nn::Embedding::new(
+            self.token_embedding.embeddings().to_device(device)?,
+            self.token_embedding.hidden_size(),
+        );
+        self.position_embedding = nn::Embedding::new(
+            self.position_embedding.embeddings().to_device(device)?,
+            self.position_embedding.hidden_size(),
+        );
+        self.position_ids = self.position_ids.to_device(device)?;
+        Ok(())
+    }
+}
+
+fn layer_norm_to_device(norm: &mut nn::LayerNorm, device: &Device) -> Result<()> {
+    let weight = norm.weight().to_device(device)?;
+    let bias = norm.bias().map(|bias| bias.to_device(device)).transpose()?;
+    *norm = match (norm.remove_mean(), bias) {
+        (true, Some(bias)) => nn::LayerNorm::new(weight, bias, norm.eps()),
+        (true, None) => nn::LayerNorm::new_no_bias(weight, norm.eps()),
+        (false, None) => nn::LayerNorm::rms_norm(weight, norm.eps()),
+        (false, Some(_)) => unreachable!("RMSNorm cannot carry a bias"),
+    };
+    Ok(())
 }
 
 impl Module for ClipTextEmbeddings {
@@ -218,6 +243,18 @@ impl ClipAttention {
         self.out_proj.forward(&attn_output)
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        for projection in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.out_proj,
+        ] {
+            projection.quantize_dequant_onto(quant, device)?;
+        }
+        Ok(())
+    }
+
     /// Test-only: whether every attention projection loaded packed (a pre-quantized MLX tier).
     #[cfg(test)]
     fn all_packed(&self) -> bool {
@@ -266,6 +303,11 @@ impl ClipMlp {
         self.fc2.forward(&self.activation.forward(&xs)?)
     }
 
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.fc1.quantize_dequant_onto(quant, device)?;
+        self.fc2.quantize_dequant_onto(quant, device)
+    }
+
     #[cfg(test)]
     fn all_packed(&self) -> bool {
         self.fc1.is_quantized() && self.fc2.is_quantized()
@@ -304,6 +346,13 @@ impl ClipEncoderLayer {
         let xs = self.layer_norm2.forward(&xs)?;
         let xs = self.mlp.forward(&xs)?;
         xs + residual
+    }
+
+    fn quantize_onto(&mut self, quant: candle_gen::gen_core::Quant, device: &Device) -> Result<()> {
+        self.self_attn.quantize_onto(quant, device)?;
+        self.mlp.quantize_onto(quant, device)?;
+        layer_norm_to_device(&mut self.layer_norm1, device)?;
+        layer_norm_to_device(&mut self.layer_norm2, device)
     }
 }
 
@@ -361,6 +410,20 @@ impl ClipTextTransformer {
             encoder,
             final_layer_norm,
         })
+    }
+
+    /// CPU-stage a fused CLIP tower, fold each projection directly onto `device`, and move only the
+    /// dense embeddings/norms. The quantized forward remains the established dequant-dense arm.
+    pub(crate) fn quantize_onto(
+        &mut self,
+        quant: candle_gen::gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        self.embeddings.move_to_device(device)?;
+        for layer in &mut self.encoder.layers {
+            layer.quantize_onto(quant, device)?;
+        }
+        layer_norm_to_device(&mut self.final_layer_norm, device)
     }
 
     // https://github.com/huggingface/transformers/blob/674f750a57431222fa2832503a108df3badf1564/src/transformers/models/clip/modeling_clip.py#L678

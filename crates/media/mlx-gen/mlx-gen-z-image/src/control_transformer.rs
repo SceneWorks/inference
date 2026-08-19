@@ -19,7 +19,7 @@
 use mlx_rs::error::Exception;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply};
-use mlx_rs::transforms::compile::compile;
+use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use crate::control_transformer_block::ZImageControlBlock;
@@ -57,6 +57,39 @@ const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
+}
+
+const SITE_ADD_HINT: &str = "z_image::control_transformer::add_hint";
+
+fn add_hint_impl(
+    (x, hint, scale): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(hint, scale)?)
+}
+
+thread_local! {
+    static RETAINED_ADD_HINT: std::cell::RefCell<Option<mlx_gen::nn::RetainedTernary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_add_hint(args: (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_ADD_HINT.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedTernary::new(compile_retained(add_hint_impl, true))
+            })
+            .call(SITE_ADD_HINT, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_add_hint((input, input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
 }
 
 pub struct ZImageControlTransformer {
@@ -684,13 +717,19 @@ impl AdaptableHost for ZImageControlTransformer {
 /// promotes the bf16 base stream to f32 here exactly as before (the sc-2720 mixed-precision flow).
 fn add_hint(x: &Array, hint: &Array, scale: f32) -> Result<Array> {
     let sc = scalar(scale);
-    let f = |(x, h, sc): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(h, sc)?)
-    };
     if crate::compile_glue() {
-        Ok(compile(f, true)((x, hint, &sc))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_add_hint((x, hint, &sc))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_ADD_HINT,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(add_hint_impl, true)((x, hint, &sc))?)
+        }
     } else {
-        Ok(f((x, hint, &sc))?)
+        mlx_gen::diagnostics::record_fallback(SITE_ADD_HINT, "compiled_glue_disabled");
+        Ok(add_hint_impl((x, hint, &sc))?)
     }
 }
 

@@ -258,8 +258,17 @@ impl IpAdapterKolors {
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
         // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local
         // (its immutable `&self` borrow ends before the `&mut self.unet` call below).
-        let (context, pooled, batch) =
-            common::cfg_batch_context(&req.prompt, &req.negative, use_guide, |p| self.encode(p))?;
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            &req.negative,
+            use_guide,
+            // sc-18317: this provider is driven directly by the worker through its own
+            // `IpAdapterKolorsRequest`, which carries no `GenerationMemory` and therefore no execution
+            // selection — so the mode is this lane's fixed convention, stated rather than
+            // implied. `cfg_batch_context` still refuses anything else.
+            candle_gen::gen_core::CfgBatching::Batched,
+            |p| self.encode(p),
+        )?;
         // Project the ChatGLM3 context to the cross-attention width once up front — the vendored UNet
         // (unlike `KolorsUNet`) has no `encoder_hid_proj`, so its context must already be 2048-wide.
         let projected = self.encoder_hid_proj.forward(&context)?;

@@ -30,9 +30,10 @@ use mlx_gen::{
     gen_core, require_base_dir, require_control, AcceptedControlKinds, Capabilities,
     ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
     Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource,
+    Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 use std::path::Path;
 
 use crate::control_transformer::QwenFunControlBranch;
@@ -55,6 +56,8 @@ pub const MODEL_ID: &str = "qwen_image_control";
 /// conditioning. LoRA/LoKr (character identity) is on the base transformer.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
         control_kinds: Some(accepted_kinds()),
         required_components: &[],
         id: MODEL_ID,
@@ -116,6 +119,7 @@ struct QwenControlHeavyOwned {
     vae: QwenVae,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
     pid: Option<PidEngine>,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically whether
@@ -125,6 +129,7 @@ struct QwenControlHeavy<'a> {
     controlnet: &'a QwenFunControlBranch,
     vae: &'a QwenVae,
     pid: Option<&'a PidEngine>,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl QwenControlHeavyOwned {
@@ -134,6 +139,7 @@ impl QwenControlHeavyOwned {
             controlnet: &self.controlnet,
             vae: &self.vae,
             pid: self.pid.as_ref(),
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -153,6 +159,8 @@ impl QwenControlHeavyOwned {
 /// `max(text-encoder, DiT+control+VAE)`. Both use the same per-phase loaders, so the components are
 /// byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    mlx_gen::gen_core::reject_unknown_components(spec, &[VAE_COMPONENT], MODEL_ID)?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
     // Resolve the base dir + required control checkpoint up front — fail-fast for BOTH policies — then
     // the always-warm tokenizer, then the shared [`build_residency`] dispatch.
     let (root, _control) = resolve_base_and_control(spec)?;
@@ -166,11 +174,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let tokenizer = loader::load_tokenizer(root)?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageControl {
         descriptor: descriptor(),
         tokenizer,
-        residency: build_residency(spec)?,
+        residency: build_residency_with_source(spec, text_encoder_source)?,
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
@@ -186,14 +196,25 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// composition is byte-identical to the pre-seam one. The deferral is weight-free-testable: under
 /// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
 /// eager-load and fail the "Sequential defers" unit test.
+#[cfg(test)]
 fn build_residency(spec: &LoadSpec) -> Result<Residency<QwenTextEncoder, QwenControlHeavyOwned>> {
+    let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
+    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
+    build_residency_with_source(spec, text_encoder_source)
+}
+
+fn build_residency_with_source(
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Residency<QwenTextEncoder, QwenControlHeavyOwned>> {
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
         move || {
-            let (root, _control) = resolve_base_and_control(&spec_text)?;
-            load_text_encoder_only(root)
+            let (_root, _control) = resolve_base_and_control(&spec_text)?;
+            load_text_encoder_only(&text_encoder_source)
         },
         move |use_pid| {
             let (root, control) = resolve_base_and_control(&spec_heavy)?;
@@ -224,8 +245,10 @@ fn resolve_base_and_control(spec: &LoadSpec) -> Result<(&Path, &WeightsSource)> 
 /// Load the Qwen2.5-VL text encoder — the phase-A component dropped first under `Sequential`. Never
 /// quantized (the fork's transformer-only quant scope), so the `Resident` and `Sequential` paths build
 /// byte-identical encoders.
-fn load_text_encoder_only(root: &Path) -> Result<QwenTextEncoder> {
-    loader::load_text_encoder(root)
+fn load_text_encoder_only(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<QwenTextEncoder> {
+    source.read_unchanged(loader::load_text_encoder_from_source)
 }
 
 /// Load the heavy render-phase components — the base MMDiT transformer, the VACE control branch (both
@@ -293,11 +316,13 @@ fn load_heavy(
         None
     };
     let vae = loader::load_vae(root)?;
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(QwenControlHeavyOwned {
         transformer,
         controlnet,
         vae,
         pid,
+        alternate_decoder,
     })
 }
 
@@ -473,11 +498,17 @@ impl QwenImageControl {
                     capture_sigma,
                 )?;
                 let denoise_sigmas = &params.sigmas[..keep];
+                let decoder = pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder)
+                    .or_else(|| {
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder)
+                    });
                 let images = decode_and_collect(
                     heavy.vae,
-                    pid_decoder
-                        .as_ref()
-                        .map(|decoder| decoder as &dyn LatentDecoder),
+                    decoder,
                     decode_tiling.as_ref(),
                     req,
                     MODEL_ID,
@@ -525,7 +556,7 @@ impl QwenImageControl {
 // `gen_core::Result`.
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::control_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
@@ -599,19 +630,22 @@ mod tests {
     // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
     // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
     // default.
-    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/qwen-image-control-residency-test-snapshot".into(),
-        ))
-        .with_control(WeightsSource::Dir(
-            "/nonexistent/qwen-image-control-residency-test-control".into(),
-        ))
-        .with_offload_policy(policy)
+    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_control(WeightsSource::Dir(root.join("missing-control")))
+            .with_offload_policy(policy)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
+        let res = build_residency(&spec)
             .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
         assert!(
             res.is_sequential(),
@@ -621,7 +655,9 @@ mod tests {
 
     #[test]
     fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+        let fixture = tempfile::tempdir().expect("snapshot fixture");
+        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
+        let err = build_residency(&spec)
             .err()
             .expect("Resident must eager-load and fail on a missing snapshot dir");
         let msg = err.to_string();

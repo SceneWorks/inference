@@ -6,7 +6,7 @@ use mlx_rs::{
     error::Exception,
     fast::rms_norm,
     ops::{add, multiply, split, tanh},
-    transforms::compile::compile,
+    transforms::compile::{compile, compile_retained},
     Array,
 };
 
@@ -18,18 +18,57 @@ use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+const SITE_GATED: &str = "z_image::transformer_block::gated";
+
+fn gated_impl(
+    (x, gate, normed): (&Array, &Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    add(x, &multiply(gate, normed)?)
+}
+
+thread_local! {
+    static RETAINED_GATED: std::cell::RefCell<Option<mlx_gen::nn::RetainedTernary>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_gated(args: (&Array, &Array, &Array)) -> std::result::Result<Array, Exception> {
+    mlx_gen::nn::prepare_retained_compilation_thread();
+    RETAINED_GATED.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                mlx_gen::nn::RetainedTernary::new(compile_retained(gated_impl, true))
+            })
+            .call(SITE_GATED, args)
+    })
+}
+
+/// Exercise this module's production retained handle once for the release memory audit.
+#[doc(hidden)]
+pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
+    let output = retained_gated((input, input, input))?;
+    output.eval()?;
+    drop(output);
+    Ok(())
+}
+
 /// Gated residual `x + gate·normed` — one fused kernel (multiply + add) when the sc-2963 glue toggle
 /// is on; the `mx.fast` RMSNorm that produces `normed` stays eager. Dtype-preserving, bit-identical
 /// to the eager form (the mixed-precision flow, sc-2720, is untouched: the compiled closure casts
 /// nothing).
 fn gated(x: &Array, gate: &Array, normed: &Array) -> Result<Array> {
-    let f = |(x, g, n): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
-        add(x, &multiply(g, n)?)
-    };
     if crate::compile_glue() {
-        Ok(compile(f, true)((x, gate, normed))?)
+        if mlx_gen::nn::retained_compilation_requested() {
+            Ok(retained_gated((x, gate, normed))?)
+        } else {
+            mlx_gen::diagnostics::record_compile(
+                SITE_GATED,
+                mlx_gen::diagnostics::CompileDisposition::OneShot,
+            );
+            Ok(compile(gated_impl, true)((x, gate, normed))?)
+        }
     } else {
-        Ok(f((x, gate, normed))?)
+        mlx_gen::diagnostics::record_fallback(SITE_GATED, "compiled_glue_disabled");
+        Ok(gated_impl((x, gate, normed))?)
     }
 }
 

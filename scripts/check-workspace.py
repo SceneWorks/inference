@@ -34,8 +34,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
-    "mlx-sys": ("pmetal-mlx-sys", "932beb4e60db44d378ffa1fe648defea59b5cbd0"),
+    "mlx-rs": ("pmetal-mlx-rs", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
+    "mlx-sys": ("pmetal-mlx-sys", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
@@ -296,6 +296,11 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "follows DECODE_TILE_EDGE: candle's list is the single full edge, mlx's is three measured "
         "tile edges."
     ),
+    ("kolors", "SIZE_MULTIPLE"): (
+        "candle validates only the SDXL VAE /8 stride; mlx enforces the structural "
+        "`PRODUCTION_SPATIAL_MULTIPLE` of 32 (`8 * 2^2`, the U-Net's two exact skip joins) — the "
+        "same deliberate strict/loose split as sdxl's SIZE_MULTIPLE below."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."
@@ -339,6 +344,12 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "candidates the Metal kernel does not distinguish. candle publishes the CUDA ladder "
         "`&[1, 2, 4, 8, 15, 30]`, behind `#[cfg(any(feature = \"cuda\", test))]` and with no doc "
         "comment of its own. A caller picks from whichever backend it is running on."
+    ),
+    ("sdxl", "SIZE_MULTIPLE"): (
+        "8 vs 32, both documented on purpose: candle validates the VAE /8 stride only; mlx "
+        "enforces `8 * 2^2 = 32` because its U-Net mirrors exact skip concatenations and an odd "
+        "intermediate extent would break the joins. Same split as kolors, which shares the "
+        "SDXL U-Net."
     ),
     ("wan", "VAE_TILING"): (
         "the z48 halves agree (`VaeTiling::WAN22` on both); the z16 halves differ in "
@@ -384,6 +395,156 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "saving, so mlx publishes `&[1]` — 'one candidate is the honest domain either way'. candle "
         "publishes the CUDA ladder `&[1, 2, 4, 8, 15, 30]`."
     ),
+}
+
+# The same thing as CROSS_BACKEND_GEOMETRY_EXEMPTIONS, for a constant whose value is an *aggregate*:
+# the exemption names the sub-fields that diverge instead of the whole constant.
+#
+# Whole-constant exemptions are the wrong instrument for the encoder/tokenizer/prompt-execution
+# contracts. Each is one `const` holding twenty-odd behavior-bearing fields, so exempting the
+# constant to record that `loaded_hidden_layers` differs also exempts `hidden_size`, `head_dim`,
+# `vocab_size`, every required token id and every prompt length policy inside it — for exactly the
+# families whose two backends are known to have drifted once. A future divergence in any of them
+# would be swallowed by an exemption written about something else, which is the same shape of hole
+# sc-19419 was.
+#
+# A path addresses a sub-value the way the Rust reads: `.field` into a struct, `[key]` into a slice
+# whose elements name themselves (`purpose`, `role`), `[index]` into one whose elements do not. A
+# path present on only one side is that side's extra element. `Some(..)` is transparent — an
+# optional aggregate is addressed by its own fields — but `Some(x)` against `None` is one whole
+# value, because `None` has no fields to name.
+#
+# The staleness rule is per path, not per constant: a listed path whose two sides now agree fails,
+# and a diverging path nobody listed fails. Both halves are what make this narrower than the
+# whole-constant table rather than a re-spelling of it.
+CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS: dict[tuple[str, str], dict[str, str]] = {
+    ("flux2", "DEV_ENCODER_CONTRACT"): {
+        ".loaded_hidden_layers": (
+            "per-backend encoder realization of the same Mistral checkpoint (sc-18306): candle "
+            "materializes only the 30 layers its deepest selected hidden-state tap needs, mlx "
+            "loads the full 40-layer stack through its shared decoder loader. Loaded subset, not "
+            "geometry."
+        ),
+        ".requires_final_norm": (
+            "follows `loaded_hidden_layers`: candle stops at its deepest tap and never reads the "
+            "final decoder norm; mlx's caption-upsample route does."
+        ),
+        ".requires_lm_head": (
+            "follows `loaded_hidden_layers`: only the MLX lane wires caption upsampling, which is "
+            "what constructs the LM head."
+        ),
+        ".tokenizer.required_tokens[mistral_eos]": (
+            "one of the four special tokens only the MLX lane's caption-upsample execution "
+            "consumes; candle has no execution that emits or stops on `</s>`. See "
+            "`DEV_TOKENIZER_CONTRACT`, which this contract embeds."
+        ),
+        ".tokenizer.required_tokens[pixtral_image]": (
+            "as `mistral_eos`: a pixtral image token only the MLX caption-upsample execution needs."
+        ),
+        ".tokenizer.required_tokens[pixtral_image_break]": (
+            "as `mistral_eos`: a pixtral image token only the MLX caption-upsample execution needs."
+        ),
+        ".tokenizer.required_tokens[pixtral_image_end]": (
+            "as `mistral_eos`: a pixtral image token only the MLX caption-upsample execution needs."
+        ),
+        ".prompt_executions[flux2_dev_caption_upsample]": (
+            "the caption-upsample execution only the MLX lane wires. See `DEV_PROMPT_EXECUTIONS`, "
+            "which this contract embeds."
+        ),
+    },
+    ("flux2", "DEV_PROMPT_EXECUTIONS"): {
+        "[flux2_dev_caption_upsample]": (
+            "mlx declares one extra execution — the caption-upsample path only the MLX lane wires. "
+            "The executions the two backends share are compared field by field and agree."
+        ),
+    },
+    ("flux2", "DEV_TOKENIZER_CONTRACT"): {
+        ".required_tokens[mistral_eos]": (
+            "mlx audits four special tokens candle does not, all of them consumed by the "
+            "caption-upsample execution only the MLX lane wires: `</s>` here, the three pixtral "
+            "image tokens below. Every token the two backends both declare — including the "
+            "mistral `<pad>` candle's padding path emits — is identical, id and literal."
+        ),
+        ".required_tokens[pixtral_image]": (
+            "as `mistral_eos`: pixtral `[IMG]`, needed only by the MLX caption-upsample execution."
+        ),
+        ".required_tokens[pixtral_image_break]": (
+            "as `mistral_eos`: pixtral `[IMG_BREAK]`, needed only by the MLX caption-upsample "
+            "execution."
+        ),
+        ".required_tokens[pixtral_image_end]": (
+            "as `mistral_eos`: pixtral `[IMG_END]`, needed only by the MLX caption-upsample "
+            "execution."
+        ),
+    },
+    ("flux2", "KLEIN_ENCODER_CONTRACT"): {
+        ".loaded_hidden_layers": (
+            "same shape as `DEV_ENCODER_CONTRACT.loaded_hidden_layers`: candle loads 27 of Qwen3's "
+            "36 layers (its deepest tap), mlx loads all 36 through its shared decoder loader. "
+            "Every other field of this contract, tokenizer and executions included, agrees."
+        ),
+    },
+    ("krea", "ENCODER_CONTRACT"): {
+        ".packing.supports_file": (
+            "per-backend packing capability, not geometry: mlx's packed loader accepts a "
+            "single-file artifact, candle requires a directory artifact. Every other field of the "
+            "packing contract — group size, embedding and LM-head packing — agrees."
+        ),
+        ".dense_storage_dtype_probe": (
+            "follows `packing.supports_file`: candle probes "
+            "`language_model.layers.0.input_layernorm.weight` to classify dense storage, mlx's "
+            "packed loader needs no probe."
+        ),
+        ".prompt_executions[krea_t2i].length": (
+            "admission posture, not geometry — see `PROMPT_EXECUTIONS`, which this contract embeds."
+        ),
+        ".prompt_executions[krea_edit].length": (
+            "admission posture, not geometry — see `PROMPT_EXECUTIONS`, which this contract embeds."
+        ),
+    },
+    ("krea", "PROMPT_EXECUTIONS"): {
+        "[krea_t2i].length": (
+            "the length policy differs by lane: candle rejects prompts above 1024 tokens at "
+            "admission, mlx leaves the length unbounded. A per-backend admission posture from the "
+            "sc-18306 sweep, recorded here rather than settled by copying either side. Every other "
+            "field of the execution — template, special tokens, padding, prefix trim — agrees."
+        ),
+        "[krea_edit].length": (
+            "as `krea_t2i`, at the edit execution's own bound: candle rejects above 8192 tokens, "
+            "mlx is unbounded. Listed separately because it is a separate declaration — the "
+            "whole-constant exemption this replaced named only `krea_t2i` and silently covered "
+            "this one too."
+        ),
+    },
+    ("qwen-image", "ENCODER_CONTRACT"): {
+        ".tokenizer.artifact_candidates[1]": (
+            "the encoder contract embeds the tokenizer contract, so the loader search path "
+            "recorded on `TOKENIZER_CONTRACT` surfaces here too. Every geometry field agrees."
+        ),
+    },
+    ("qwen-image", "TOKENIZER_CONTRACT"): {
+        ".artifact_candidates[1]": (
+            "candle resolves the tokenizer from two artifact candidates "
+            "(`tokenizer/tokenizer.json`, then `processor/tokenizer.json`); mlx ships only the "
+            "first, so only candle declares a second. A loader search path, not geometry — the "
+            "first candidate and every required token agree."
+        ),
+    },
+    ("z-image", "ENCODER_CONTRACT"): {
+        ".prompt_executions[z_image_prompt].padding": (
+            "batching posture, not geometry — see `PROMPT_EXECUTIONS`, which this contract embeds. "
+            "`qk_norm_eps` used to be listed here as an open question and is now settled at the "
+            "checkpoint's 1e-6 on both lanes (sc-17137 sync review); this gate reds if it diverges "
+            "again."
+        ),
+    },
+    ("z-image", "PROMPT_EXECUTIONS"): {
+        "[z_image_prompt].padding": (
+            "the `z_image_prompt` execution pads differently by lane: candle applies no padding, "
+            "mlx right-pads to the 512-token max with the qwen pad token. A per-backend batching "
+            "posture, not geometry. The `z_image_empty_negative` execution agrees field for field."
+        ),
+    },
 }
 
 # Agreement alone is not correctness — the defect this gate exists for was two crates that would have
@@ -2215,6 +2376,13 @@ def _canonical_const_value(value: str, declarations: dict[str, set[str]], depth:
         return "text:" + _normalize_const_value(value)
     single = _single_valued(declarations)
     text = RUST_BACKEND_SHIM.sub("backend::", RUST_PATH_QUALIFIER.sub("", value))
+    # The shared contracts crate is reachable both through a backend shim
+    # (`candle_gen::gen_core::X` / `mlx_gen::gen_core::X`) and bare (`use …::gen_core;` then
+    # `gen_core::X`). The sc-18306 encoder-contract sweep writes it bare on the candle side and
+    # shimmed on the mlx side, so without this fold every contract constant reads as divergent on
+    # spelling alone. `backend::` is kept for non-gen_core paths, where a bare name really can be a
+    # different (crate-local) item.
+    text = text.replace("backend::gen_core::", "gen_core::")
     text = _fold_const_arithmetic(text, single)
 
     numbers = _const_numbers(text, single)
@@ -2238,6 +2406,179 @@ def _canonical_const_values(values: set[str], declarations: dict[str, set[str]])
     return {_canonical_const_value(value, declarations) for value in values}
 
 
+def _delimiter_span(text: str, open_index: int) -> int | None:
+    """Index of the delimiter closing the one at `open_index`, or None when it never closes.
+
+    String-literal aware for the same reason `_normalize_const_value` is: a brace or bracket inside
+    a token literal (`"<|im_start|>"` is safe, but a prompt template need not be) is content, not
+    structure.
+    """
+    openers = {"(": ")", "[": "]", "{": "}"}
+    if text[open_index] not in openers:
+        return None
+    stack = [text[open_index]]
+    index = open_index + 1
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < len(text) and text[index] != '"':
+                index += 2 if text[index] == "\\" else 1
+        elif char in openers:
+            stack.append(char)
+        elif char in openers.values():
+            if char != openers[stack.pop()]:
+                return None
+            if not stack:
+                return index
+        index += 1
+    return None
+
+
+def _canonical_leaf(value: str) -> str:
+    """Strip what only wraps a canonical value: the kind tag, `&`, and a transparent `Some`.
+
+    `Some` is unwrapped so an optional aggregate is addressed by the fields it actually holds
+    (`packing.supports_file`), while `Some(x)` against `None` still compares as one whole value —
+    the unwrap only happens when both sides are `Some`, because `None` has nothing to unwrap.
+    """
+    text = value
+    if text.startswith("text:"):
+        text = text[len("text:") :]
+    text = text.strip()
+    while text.startswith("&"):
+        text = text[1:].strip()
+    if text.startswith("Some(") and _delimiter_span(text, 4) == len(text) - 1:
+        return _canonical_leaf(text[5:-1])
+    return text
+
+
+def _slice_element_label(element: str) -> str | None:
+    """Label a slice element by its leading string field (`purpose`, `role`), else None.
+
+    Keying an element by its own name is what lets a backend that ships one MORE of something be
+    reported as that one extra element rather than as a wholesale divergence of the list.
+    """
+    text = _canonical_leaf(element)
+    open_index = text.find("{")
+    if not text.endswith("}") or open_index < 0:
+        return None
+    if _delimiter_span(text, open_index) != len(text) - 1:
+        return None
+    first = _split_top_level_args(text[open_index + 1 : -1])[0]
+    _, separator, rest = first.partition(":")
+    rest = rest.strip()
+    if not separator or len(rest) < 2 or not rest.startswith('"') or not rest.endswith('"'):
+        return None
+    return rest[1:-1]
+
+
+def _aggregate_parts(value: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Split one canonical value into its type head and labeled sub-values, or None for a leaf.
+
+    Struct fields are labeled `.name` and slice elements `[key]`, so a sub-value is addressed by a
+    path (`.packing.supports_file`, `.prompt_executions[krea_t2i].length`) that reads the same way
+    the Rust does.
+    """
+    text = _canonical_leaf(value)
+    if not text or text[-1] not in "}]":
+        return None
+    opener = "{" if text.endswith("}") else "["
+    open_index = text.find(opener)
+    if open_index < 0 or _delimiter_span(text, open_index) != len(text) - 1:
+        return None
+    head = text[:open_index]
+    items = [item for item in _split_top_level_args(text[open_index + 1 : -1]) if item.strip()]
+    if not items:
+        return head, []
+    if opener == "{":
+        fields: list[tuple[str, str]] = []
+        for item in items:
+            name, separator, rest = item.partition(":")
+            if not separator or not name.strip().isidentifier():
+                return None
+            fields.append(("." + name.strip(), rest))
+        return head, fields
+    labels = [_slice_element_label(item) for item in items]
+    if any(label is None for label in labels) or len(set(labels)) != len(labels):
+        labels = [str(index) for index in range(len(items))]
+    return head, [(f"[{label}]", item) for label, item in zip(labels, items)]
+
+
+def _value_divergences(left: str, right: str, path: str = "", depth: int = 0) -> list[str]:
+    """Every sub-value path at which two canonical values differ, coarsest-first.
+
+    Two values that will not decompose the same way — a leaf, a different type head, reordered
+    elements — yield the one path that contains them, so a divergence is always reported SOMEWHERE.
+    Nothing here can return an empty list for values that differ, which is what makes it safe to
+    treat "no unexempted path" as agreement.
+    """
+    if left == right:
+        return []
+    if depth > 8:
+        return [path or "."]
+    left_split = _aggregate_parts(left)
+    right_split = _aggregate_parts(right)
+    if left_split is None or right_split is None:
+        return [path or "."]
+    left_head, left_parts = left_split
+    right_head, right_parts = right_split
+    if left_head != right_head:
+        return [path or "."]
+    left_map = dict(left_parts)
+    right_map = dict(right_parts)
+    if len(left_map) != len(left_parts) or len(right_map) != len(right_parts):
+        return [path or "."]
+    shared = [label for label in left_map if label in right_map]
+    if shared != [label for label in right_map if label in left_map]:
+        # Same members in a different order. For a slice that is a real difference and there is no
+        # smaller path that carries it.
+        return [path or "."]
+    divergences: list[str] = []
+    for label, value in left_parts:
+        if label in right_map:
+            divergences.extend(
+                _value_divergences(value, right_map[label], path + label, depth + 1)
+            )
+        else:
+            divergences.append(path + label)
+    divergences.extend(path + label for label, _ in right_parts if label not in left_map)
+    return divergences
+
+
+def _narrowed_divergence_violations(
+    family: str,
+    constant: str,
+    candle_relative: str,
+    mlx_relative: str,
+    left: set[str],
+    right: set[str],
+    exempted_paths: dict[str, str],
+) -> list[str]:
+    """Hold a sub-field exemption to exactly the sub-fields it names."""
+    if len(left) != 1 or len(right) != 1:
+        return [
+            f"{family}: `{constant}` carries a sub-field divergence exemption but is declared with "
+            f"{len(left)}/{len(right)} different values across {candle_relative}/{mlx_relative}, so "
+            "the gate cannot tell which pair the exemption addresses — exempt the whole constant "
+            "with a written reason instead"
+        ]
+    diverging = _value_divergences(next(iter(left)), next(iter(right)))
+    violations = [
+        f"{family}: `{constant}{path}` diverges and is not one of the sub-fields its exemption "
+        f"names ({', '.join(sorted(exempted_paths))}): {candle_relative} and {mlx_relative} "
+        "disagree about it. Fix the backend that is wrong, or record this sub-field too"
+        for path in diverging
+        if path not in exempted_paths
+    ]
+    violations.extend(
+        f"{family}: `{constant}{path}` carries a sub-field divergence exemption but the two "
+        "backends now agree about it — delete that path from the exemption"
+        for path in sorted(set(exempted_paths) - set(diverging))
+    )
+    return violations
+
+
 def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
     """Fail when a family's two backends declare different geometry, in shipped code or in fixtures.
 
@@ -2256,6 +2597,12 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        divergence is a failure wherever the gate can resolve both sides to a common form, so the
        exemptions cannot outlive their subject where they are checkable at all — the table's own
        comment names the three entries that are not.
+
+       An *aggregate* constant — the encoder, tokenizer and prompt-execution contracts, each one
+       `const` holding twenty-odd behavior-bearing fields — is exempted per sub-field instead, in
+       ``CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS``, so that recording one known difference does not
+       stop comparing the rest of the aggregate. Every path that diverges must be listed, and every
+       listed path must still diverge.
 
        A family that shares *no* constant name is compared against nothing while every other clause
        passes, so that is a failure too, unless it is listed in
@@ -2317,11 +2664,27 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
             "CROSS_BACKEND_FIXTURE_FAMILIES, so its fixture geometry is not required to be declared "
             "at all — add it with the reason its two crates share fixture bytes"
         )
-    for family, constant in sorted(CROSS_BACKEND_GEOMETRY_EXEMPTIONS):
+    for family, constant in sorted(
+        set(CROSS_BACKEND_GEOMETRY_EXEMPTIONS) | set(CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS)
+    ):
         if family not in known:
             violations.append(
                 f"`{family}`: `{constant}` carries a divergence exemption but `{family}` is not a "
                 "dual-backend family any more — drop the exemption"
+            )
+    for family, constant in sorted(
+        set(CROSS_BACKEND_GEOMETRY_EXEMPTIONS) & set(CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS)
+    ):
+        violations.append(
+            f"`{family}`: `{constant}` carries both a whole-constant and a sub-field divergence "
+            "exemption. The whole-constant one wins and the sub-field paths would never be "
+            "checked — keep exactly one"
+        )
+    for (family, constant), paths in sorted(CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS.items()):
+        if not paths or any(not reason.strip() for reason in paths.values()):
+            violations.append(
+                f"`{family}`: `{constant}` carries a sub-field divergence exemption with a path "
+                "that has no written reason — a divergence with no reason is a defect"
             )
     for family in sorted(CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS):
         if family not in known:
@@ -2376,18 +2739,32 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
             left = _canonical_const_values(candle[constant], candle)
             right = _canonical_const_values(mlx[constant], mlx)
             exempted = (family, constant) in CROSS_BACKEND_GEOMETRY_EXEMPTIONS
-            if exempted:
+            narrowed = CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS.get((family, constant))
+            if exempted or narrowed is not None:
                 # Seen, whether or not it still diverges — so the "no longer declared on both
                 # sides" sweep below cannot also fire and report the opposite of what is true.
                 shared_exemptions.add((family, constant))
             if left == right:
-                if exempted:
+                if exempted or narrowed is not None:
                     violations.append(
                         f"{family}: `{constant}` carries a divergence exemption but the two "
                         "backends now agree about it — delete the exemption"
                     )
                 continue
             if exempted:
+                continue
+            if narrowed is not None:
+                violations.extend(
+                    _narrowed_divergence_violations(
+                        family,
+                        constant,
+                        candle_relative,
+                        mlx_relative,
+                        left,
+                        right,
+                        narrowed,
+                    )
+                )
                 continue
             violations.append(
                 f"{family}: `{constant}` diverges: {candle_relative} says "
@@ -2469,7 +2846,10 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
                     f"{sorted(mlx_fixtures[constant])}"
                 )
 
-    for family, constant in sorted(set(CROSS_BACKEND_GEOMETRY_EXEMPTIONS) - shared_exemptions):
+    for family, constant in sorted(
+        (set(CROSS_BACKEND_GEOMETRY_EXEMPTIONS) | set(CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS))
+        - shared_exemptions
+    ):
         if family in known and family not in CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES:
             violations.append(
                 f"{family}: `{constant}` carries a divergence exemption but is no longer declared "

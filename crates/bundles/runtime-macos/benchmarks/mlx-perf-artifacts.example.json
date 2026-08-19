@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "sceneworks.mlx-perf-artifacts.v2",
+  "benchmarkId": "sc-18321-cross-family-v1",
+  "artifacts": [
+    {
+      "key": "wan_q4",
+      "repository": "SceneWorks/wan2.2-ti2v-5b-mlx",
+      "resolvedRevision": "bb1b055249614cf9d7cf4373fbdbc184b77dee88",
+      "tier": "q4",
+      "path": "/absolute/path/to/wan2.2-ti2v-5b-mlx/snapshots/bb1b055249614cf9d7cf4373fbdbc184b77dee88/q4"
+    },
+    {
+      "key": "qwen_image_q4",
+      "repository": "SceneWorks/qwen-image-mlx",
+      "resolvedRevision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
+      "tier": "q4",
+      "path": "/absolute/path/to/qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/q4"
+    },
+    {
+      "key": "sdxl_bf16",
+      "repository": "SceneWorks/sdxl-base-mlx",
+      "resolvedRevision": "36699bb8a6353e61c920e3bf19f0e6f8e4151c55",
+      "tier": "bf16",
+      "path": "/absolute/path/to/sdxl-base-mlx/snapshots/36699bb8a6353e61c920e3bf19f0e6f8e4151c55/bf16"
+    }
+  ]
+}

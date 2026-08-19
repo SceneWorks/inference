@@ -19,10 +19,11 @@ use mlx_gen::{
 };
 
 use crate::inpaint::InpaintBlend;
+use crate::long_prompt::ChunkedTokens;
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
-use crate::vae::Autoencoder;
+use crate::vae::{Autoencoder, SdxlLatentDecoder};
 
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: u32 = 8;
@@ -43,6 +44,10 @@ pub fn text_time_ids(batch: i32) -> Array {
 
 /// Run both CLIP encoders over the (CFG) token batch and assemble the SDXL conditioning:
 /// `concat(te1.hidden[-2], te2.hidden[-2])` and `te2.pooled`. `tokens` is `[B, N]` (B=2 with CFG).
+///
+/// The **single-window** encode: `N` must fit CLIP's position table. It is unchanged since before
+/// sc-20528 and is what [`encode_conditioning_windows`] delegates to for every request that fits, so
+/// a ≤77-token render produces the identical conditioning it always did.
 pub fn encode_conditioning(
     te1: &ClipTextEncoder,
     te2: &ClipTextEncoder,
@@ -54,6 +59,53 @@ pub fn encode_conditioning(
     let h2 = &o2.hidden_states[o2.hidden_states.len() - 2];
     let conditioning = concatenate_axis(&[h1, h2], -1)?;
     Ok((conditioning, o2.pooled))
+}
+
+/// The production encode (sc-20528): one forward per CLIP window, the windows concatenated on the
+/// **sequence** axis — the A1111/compel "long prompt weighting" shape that lets SDXL condition on a
+/// prompt past CLIP's architectural 77-token context instead of losing its tail.
+///
+/// Returns `(conditioning [B, n·77, 2048], pooled [B, 1280])`. Cross-attention takes an arbitrary
+/// key/value length, so the grown sequence axis is a drop-in for the U-Net and every ControlNet.
+///
+/// Two properties the callers depend on:
+///
+/// - **`n == 1` is the legacy path, structurally.** A request whose rows all fit is a single window
+///   — the token batch
+///   [`tokenize_batch`](crate::tokenizer::ClipBpeTokenizer::tokenize_batch) has always built — and
+///   is handed straight to [`encode_conditioning`]: no re-wrap, no `cat`, nothing to drift.
+/// - **The pooled embed is window 0's.** Every window carries its own EOS, so the encoder's
+///   `argmax` over a concatenation would be ambiguous; diffusers' pooled text-embed is defined on
+///   the first window, and that is what the `add_embedding` micro-conditioning gets. The candle twin
+///   pools the same way.
+pub fn encode_conditioning_windows(
+    te1: &ClipTextEncoder,
+    te2: &ClipTextEncoder,
+    tokens: &ChunkedTokens,
+) -> Result<(Array, Array)> {
+    // The ≤77 request: the pre-sc-20528 encode, verbatim.
+    if let [only] = tokens.windows() {
+        return encode_conditioning(te1, te2, only);
+    }
+
+    let mut per_window: Vec<Array> = Vec::with_capacity(tokens.len());
+    let mut pooled: Option<Array> = None;
+    for window in tokens.windows() {
+        let o1 = te1.forward(window)?;
+        let o2 = te2.forward(window)?;
+        let h1 = &o1.hidden_states[o1.hidden_states.len() - 2];
+        let h2 = &o2.hidden_states[o2.hidden_states.len() - 2];
+        per_window.push(concatenate_axis(&[h1, h2], -1)?); // [B, 77, 2048]
+        if pooled.is_none() {
+            pooled = Some(o2.pooled);
+        }
+    }
+    let refs: Vec<&Array> = per_window.iter().collect();
+    let conditioning = concatenate_axis(&refs, 1)?; // [B, n·77, 2048]
+    let pooled = pooled.ok_or_else(|| {
+        Error::Msg("sdxl: tokenized request carried no CLIP windows to encode".into())
+    })?;
+    Ok((conditioning, pooled))
 }
 
 /// Components needed for one denoise run (borrowed from the loaded model). `sampler` is any
@@ -629,7 +681,7 @@ fn denoise_core(
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
     // fp16 (`max|Δ|=0`, compile_parity.rs), so it does not move the precision-load-bearing fp16
     // golden. The GELU/GEGLU activations are already compiled (sc-2721). Scoped + restored on drop by
-    // the RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    // the RAII guard (F-006/F-007) instead of leaking the render thread's setting into later work.
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
@@ -1116,14 +1168,18 @@ pub fn decode_image_tiled(
     tiling: Option<&mlx_gen::tiling::TilingConfig>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    let decoded = match (pid, tiling) {
-        (Some(d), _) => d
-            .decode(&latents.transpose_axes(&[0, 3, 1, 2])?)?
-            .transpose_axes(&[0, 2, 3, 1])?,
-        (None, Some(cfg)) => vae.decode_tiled(latents, cfg, cancel)?,
-        (None, None) => vae.decode(latents)?,
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    let native = SdxlLatentDecoder::new(vae);
+    let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
+    mlx_gen::ensure_decoder_compatible(Some(&mlx_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
+    let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
+    let decoded = match tiling {
+        Some(cfg) => decoder.decode_tiled(&nchw, cfg, cancel)?,
+        None => decoder.decode(&nchw)?,
     };
-    decoded_to_image(&decoded)
+    decoded_to_image(&decoded.transpose_axes(&[0, 2, 3, 1])?)
 }
 
 /// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed

@@ -592,8 +592,8 @@ pub fn generate_t2v_latents(
     // residuals, tanh-GELU FFN, split-RoPE rotation) through `mx.compile` — bit-exact and the biggest
     // per-step win of the rollout at video sequence (the FFN GELU dominates). Enabled here at the
     // production boundary (not inside the shared `denoise`, which the parity tests reuse eager).
-    // sc-4045/F-049: an RAII guard restores the prior process-global on return, so the eager parity
-    // gates aren't left running compiled after a generate.
+    // sc-4045/F-049: an RAII guard restores this thread's prior setting on return, so the eager
+    // parity gates aren't left running compiled after a generate.
     let _compile_glue = crate::CompileGlueGuard::enable();
     // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
     dit.set_lora_pass(0);
@@ -1037,7 +1037,7 @@ pub fn generate_av_latents(
     // sc-2963 (rollout of sc-2957): compiled elementwise glue across the joint video/audio/cross-modal
     // AvDiT forward — see `generate_t2v_latents`. Bit-exact, dtype-preserving, enabled at the
     // production boundary (the shared `denoise_av` stays eager for the parity tests). sc-4045/F-049:
-    // an RAII guard restores the prior process-global on return.
+    // an RAII guard restores the render thread's prior setting on return.
     let _compile_glue = crate::CompileGlueGuard::enable();
     // Stage 1: video init = conditioned+noised (replace-latent) or pure noise (T2V); audio = noise.
     let (vlat1, vstate1): (Array, Option<I2vConditioning>) = {
@@ -1181,7 +1181,7 @@ pub fn generate_av_latents_iclora(
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
     // sc-2963 compiled elementwise glue at the production boundary; sc-4045/F-049 RAII guard restores
-    // the prior process-global on return (the shared joint denoise stays eager for the parity tests).
+    // the render thread's prior setting on return (the shared joint denoise stays eager for parity).
     let _compile_glue = crate::CompileGlueGuard::enable();
     let (c, f, h1, w1) = grid_dims;
 

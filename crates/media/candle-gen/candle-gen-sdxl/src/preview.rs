@@ -13,8 +13,8 @@
 //!
 //! Every SDXL and Kolors denoise lane runs a **rank-4 spatial** latent `[1, 4, H/8, W/8]` from the
 //! first σ to the last. `crate::pipeline::Pipeline::render` builds `(1, 4, lat_h, lat_w)` directly,
-//! `crate::denoise::seeded_sigma_prior` returns the same NCHW shape, and the decode tail
-//! (`crate::pipeline::tiled_vae_decode`) takes exactly `[1, 4, h, w]`. So unlike Qwen-Image (packed
+//! `crate::denoise::seeded_sigma_prior` returns the same NCHW shape, and the decode seam
+//! (`crate::pipeline::SdxlLatentDecoder`) takes exactly `[1, 4, h, w]`. So unlike Qwen-Image (packed
 //! rank 3) or Anima (5-D Cosmos), SDXL needs **no layout adaptation at all** — there is no unpack
 //! step to write and none is written.
 //!

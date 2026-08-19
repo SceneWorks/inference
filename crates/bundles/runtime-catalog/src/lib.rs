@@ -888,6 +888,10 @@ mod tests {
     #[test]
     fn generator_capability_snapshot_tracks_descriptor_mutations() {
         let descriptor = gen_core::ModelDescriptor {
+            // Synthetic image parity probe: it advertises no substitutable text encoder and no
+            // decoder boundary, which is the fail-closed default both fields document.
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "parity-probe",
@@ -973,6 +977,8 @@ mod tests {
 
     fn candle_audio_descriptor() -> gen_core::ModelDescriptor {
         gen_core::ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "stub-audio",
@@ -985,6 +991,8 @@ mod tests {
 
     fn mlx_audio_descriptor() -> gen_core::ModelDescriptor {
         gen_core::ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
             control_kinds: None,
             required_components: &[],
             id: "stub-audio",
@@ -1408,6 +1416,8 @@ mod tests {
     fn rejects_audio_generator_id_colliding_with_media() {
         fn mlx_media_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "stub-audio", // deliberately the same id as the audio stub
@@ -1471,6 +1481,8 @@ mod tests {
     fn rejects_non_audio_modality_in_audio_lane() {
         fn candle_image_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "stub-audio",
@@ -1511,6 +1523,8 @@ mod tests {
     fn rejects_audio_modality_in_media_registry() {
         fn mlx_media_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "smuggled-audio",
@@ -1542,6 +1556,8 @@ mod tests {
     fn audio_conformance_errors_carry_the_audio_prefix() {
         fn malformed_audio_descriptor() -> gen_core::ModelDescriptor {
             gen_core::ModelDescriptor {
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
                 control_kinds: None,
                 required_components: &[],
                 id: "stub-audio",

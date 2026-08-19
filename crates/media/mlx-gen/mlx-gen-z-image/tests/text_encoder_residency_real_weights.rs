@@ -560,7 +560,7 @@ fn the_request_peak_effect_of_the_predicted_split() {
     );
     if !any_request_win {
         println!(
-            "  => NO-GO for z-image: every tier is bound by a different phase (decode at ~4.36 GiB),\n                  so the conditioning saving is real but invisible to the user. The justification for the\n                  component scope rests on the TE-dominant families instead."
+            "  => HISTORICAL PRE-SC-19753 NO-GO for z-image: every tier was bound by a different phase\n                  (whole-tail decode at ~4.36 GiB), so the conditioning saving was invisible to the user.\n                  Re-evaluate against v4 layer-wise-decode evidence; TE-dominant families remain the\n                  independent justification for the component scope."
         );
     }
     for (tier, split, cond, _, _, _) in &rows {

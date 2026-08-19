@@ -511,37 +511,84 @@ impl DConvDenoiser {
         concatenate_axis(&[unfolded, y, dct], -1).map_err(Into::into)
     }
 
-    /// `noise` NHWC `[B, H, W, 3]`, `cond` NHWC `[B, h, w, 384]`, `t` `[B]` → NHWC `[B, H, W, 3]`.
-    pub fn forward(&self, noise_nhwc: &Array, t: &Array, cond_nhwc: &Array) -> Result<Array> {
-        let sh = noise_nhwc.shape();
-        let (b, height, width) = (sh[0], sh[1], sh[2]);
-        let dtype = noise_nhwc.dtype();
-        let (patch, hidden, in_ch) = (self.shape.patch, self.shape.hidden, self.shape.in_channels);
-        let (hl, wl) = (height / patch, width / patch);
-        let length = hl * wl;
-
-        let c = self.conditioning(t, dtype)?;
-
-        // --- conditioning stream ------------------------------------------------------------
-        let mut s = self.s_embedder.forward(noise_nhwc, cond_nhwc)?;
+    /// The **latent-resolution conditioning stream** — `s_embedder` then the DiCo stack — returned
+    /// in its NHWC `[B, h, w, hidden]` layout rather than pre-flattened (sc-19753).
+    ///
+    /// This half is **globally scoped**: every [`DiCoBlock`] runs a squeeze-and-excite gate whose
+    /// pool is an average over the whole spatial extent
+    /// ([`DiCoCore::channel_attention`](super::dico::DiCoCore)), so evaluating it on a crop gives
+    /// that crop its own gate — the same defect class as a per-tile GroupNorm. A bounded decode
+    /// therefore runs this stream once on the full latent and only tiles
+    /// [`Self::per_pixel_tail`], which has no cross-position dependence at all.
+    ///
+    /// `noise_nhwc` is `None` on the folded zero-RGB decode path.
+    pub fn conditioning_stream(
+        &self,
+        noise_nhwc: Option<&Array>,
+        t: &Array,
+        cond_nhwc: &Array,
+    ) -> Result<Array> {
+        let c = self.conditioning(t, cond_nhwc.dtype())?;
+        let mut s = match noise_nhwc {
+            Some(noise) => self.s_embedder.forward(noise, cond_nhwc)?,
+            None => self
+                .s_embedder
+                .forward_zero_rgb(cond_nhwc, self.shape.bottleneck)?,
+        };
         for block in &self.blocks {
             s = block.forward(&s, &c)?;
         }
+        Ok(s)
+    }
+
+    /// The **per-latent-pixel tail**: `y_embedder_x` → `x_embedder` → `dec_net` → `final_layer` →
+    /// fold (sc-19753).
+    ///
+    /// Every operation here acts on one latent pixel's `[P², hidden_x]` row independently — a 1×1
+    /// convolution, a per-row projection, `SimpleMLPAdaLN` over the flattened `[B·L, …]` rows, and a
+    /// kernel==stride fold. There is no spatial mixing and no reduction across positions, so
+    /// evaluating it on a crop of `(s, cond)` is **exact**, not approximate: this is the half a
+    /// bounded decode may tile. It is also the output-resolution half — `hidden_x` values per
+    /// output pixel — i.e. the one worth bounding.
+    ///
+    /// `s_nhwc` is [`Self::conditioning_stream`]'s output at the same `(h, w)` crop as `cond_nhwc`;
+    /// `height`/`width` are that crop's **output** extent.
+    pub fn per_pixel_tail(
+        &self,
+        s_nhwc: &Array,
+        cond_nhwc: &Array,
+        noise_nhwc: Option<&Array>,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        // The x-embedder has exactly one valid input width per fold state; pairing them the other
+        // way round produced a shape error before this split and must stay an error, not a
+        // silently-ignored `noise` argument.
+        if noise_nhwc.is_some() == self.is_decode_folded() {
+            return Err(Error::Msg(format!(
+                "mage-vae per-pixel tail: decode_folded={} requires zero RGB to be {}",
+                self.is_decode_folded(),
+                if self.is_decode_folded() {
+                    "omitted"
+                } else {
+                    "supplied"
+                }
+            )));
+        }
+        let sh = cond_nhwc.shape();
+        let b = sh[0];
+        let (patch, hidden, in_ch) = (self.shape.patch, self.shape.hidden, self.shape.in_channels);
+        let (hl, wl) = (height / patch, width / patch);
         // [B, h, w, 384] -> [B·L, 384]; NHWC is already the reference's `permute(0,2,3,1)`
         // (`mage_vae.py:500`), and the row-major (h, w) flatten matches `unfold`'s column order.
-        let s = s.reshape(&[b * length, hidden])?;
+        let s = s_nhwc.reshape(&[b * hl * wl, hidden])?;
 
-        // --- per-pixel stream ---------------------------------------------------------------
-        // `unfold(noise, patch, stride=patch)` (`mage_vae.py:502`) — the exact inverse of the fold
-        // at the end of this function, since kernel == stride means no overlap accumulation.
-        //
-        // `decode` always passes zero noise, so this block is identically zero in production. It
-        // is computed for real rather than substituted with `zeros` anyway: this is a `pub fn`
-        // taking `noise_nhwc`, and silently ignoring the argument would give any future caller
-        // (an encode round-trip, or a multi-step use of the denoiser) a half-wrong answer with
-        // nothing to notice.
-        let x = self.decode_x_embedder_input(Some(noise_nhwc), height, width, cond_nhwc)?;
-        let x = self.x_embedder.forward_unfolded(&x)?; // [B·L, P², 32]
+        let input = self.decode_x_embedder_input(noise_nhwc, height, width, cond_nhwc)?;
+        let x = if self.is_decode_folded() {
+            self.x_embedder.forward_zero_rgb(&input)?
+        } else {
+            self.x_embedder.forward_unfolded(&input)?
+        }; // [B·L, P², 32]
         let x = self.dec_net.forward(&x, &s)?;
         let x = self.final_layer.forward(&x)?; // [B·L, P², 3]
 
@@ -550,6 +597,23 @@ impl DConvDenoiser {
         Ok(x.reshape(&[b, hl, wl, patch, patch, in_ch])?
             .transpose_axes(&[0, 1, 3, 2, 4, 5])?
             .reshape(&[b, height, width, in_ch])?)
+    }
+
+    /// `noise` NHWC `[B, H, W, 3]`, `cond` NHWC `[B, h, w, 384]`, `t` `[B]` → NHWC `[B, H, W, 3]`.
+    ///
+    /// Composed from [`Self::conditioning_stream`] + [`Self::per_pixel_tail`] so the dense path and
+    /// the bounded path cannot drift: there is one spelling of each half.
+    ///
+    /// `decode` always passes zero noise, so the per-pixel RGB contribution is identically zero in
+    /// production. It is computed for real rather than substituted with `zeros` anyway: this is a
+    /// `pub fn` taking `noise_nhwc`, and silently ignoring the argument would give any future caller
+    /// (an encode round-trip, or a multi-step use of the denoiser) a half-wrong answer with nothing
+    /// to notice.
+    pub fn forward(&self, noise_nhwc: &Array, t: &Array, cond_nhwc: &Array) -> Result<Array> {
+        let sh = noise_nhwc.shape();
+        let (height, width) = (sh[1], sh[2]);
+        let s = self.conditioning_stream(Some(noise_nhwc), t, cond_nhwc)?;
+        self.per_pixel_tail(&s, cond_nhwc, Some(noise_nhwc), height, width)
     }
 
     /// Exact decode specialization: RGB is known zero and the fixed DCT contribution was folded
@@ -561,28 +625,7 @@ impl DConvDenoiser {
         t: &Array,
         cond_nhwc: &Array,
     ) -> Result<Array> {
-        let sh = cond_nhwc.shape();
-        let b = sh[0];
-        let (patch, hidden, in_ch) = (self.shape.patch, self.shape.hidden, self.shape.in_channels);
-        let (hl, wl) = (height / patch, width / patch);
-        let length = hl * wl;
-        let c = self.conditioning(t, cond_nhwc.dtype())?;
-
-        let mut s = self
-            .s_embedder
-            .forward_zero_rgb(cond_nhwc, self.shape.bottleneck)?;
-        for block in &self.blocks {
-            s = block.forward(&s, &c)?;
-        }
-        let s = s.reshape(&[b * length, hidden])?;
-
-        let input = self.decode_x_embedder_input(None, height, width, cond_nhwc)?;
-        let x = self.x_embedder.forward_zero_rgb(&input)?;
-        let x = self.dec_net.forward(&x, &s)?;
-        let x = self.final_layer.forward(&x)?;
-
-        Ok(x.reshape(&[b, hl, wl, patch, patch, in_ch])?
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[b, height, width, in_ch])?)
+        let s = self.conditioning_stream(None, t, cond_nhwc)?;
+        self.per_pixel_tail(&s, cond_nhwc, None, height, width)
     }
 }

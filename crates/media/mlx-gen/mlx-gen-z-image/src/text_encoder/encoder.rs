@@ -105,9 +105,12 @@ impl TextEncoder {
     /// stack and runs the stream as a single full-width window, which is the same arithmetic at the
     /// same cost as resident. So this is a drop-in, and there is no state in which the encoder
     /// silently conditions on the bare embedding.
-    pub fn from_streamable_source(
+    /// Construct a streamed encoder whose source has already passed the provider's exact architecture
+    /// contract. The validator is retained by the block stream and rechecked before every window opens
+    /// its lazy view, so deferred materialization cannot outlive the validation boundary.
+    pub fn from_validated_streamable_source(
         w: &Weights,
-        source: mlx_gen::WeightsSource,
+        source: mlx_gen::gen_core::ValidatedEncoderSource,
         prefix: &str,
         cfg: &ZTextEncoderConfig,
     ) -> Result<Self> {
@@ -116,7 +119,7 @@ impl TextEncoder {
             embed_tokens,
             layers: Vec::new(),
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
-            stream: Some(super::stream::TextEncoderBlockStream::new(
+            stream: Some(super::stream::TextEncoderBlockStream::new_validated(
                 source, prefix, *cfg,
             )),
         })

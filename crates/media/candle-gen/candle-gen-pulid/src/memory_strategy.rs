@@ -34,6 +34,9 @@ fn resident_component(
 ) -> gen_core::Result<MemoryResidentComponent> {
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     let resident_bytes = headers.into_iter().try_fold(0_u64, |total, tensor| {
+        // FP8 posture: `is_float` excludes `F8_E4M3` precisely because the shared loader's
+        // `coerce_float` leaves fp8 at stored width. PuLID has no fp8 dequant seam, so an fp8
+        // identity/EVA checkpoint is refused here rather than priced as if it were upcast.
         if require_float_source && !tensor.is_float() {
             return Err(gen_core::Error::Msg(format!(
                 "{PROVIDER_ID}: {id} tensor {} uses {:?}; PuLID/EVA admission requires float-only weights because the shared loader preserves non-float storage width",

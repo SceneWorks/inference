@@ -50,6 +50,8 @@ pub const MODEL_ID: &str = "pulid_flux";
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
         id: MODEL_ID,
@@ -561,7 +563,7 @@ pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::IdentityWeights;
+    use mlx_gen::{IdentityWeights, LoadShape, OffloadPolicy, Quant};
 
     /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
     fn load_err(spec: &LoadSpec) -> String {
@@ -588,9 +590,10 @@ mod tests {
         );
 
         // Identity present but each sub-field missing in turn → named error for the missing one.
-        let base = |id: IdentityWeights| LoadSpec {
-            identity: Some(id),
-            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+        let base = |id: IdentityWeights| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()));
+            spec.identity = Some(id);
+            spec
         };
         let file = |p: &str| Some(WeightsSource::File(p.into()));
         let dir = |p: &str| Some(WeightsSource::Dir(p.into()));
@@ -815,6 +818,28 @@ mod tests {
             loaded_spec: LoadSpec::new(WeightsSource::Dir("/weightless-pulid".into())),
             identity_inventory: None,
         }
+    }
+
+    #[test]
+    fn registered_memory_fixture_is_an_executable_single_phase_request() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/flux".into()))
+            .with_quant(Quant::Q4)
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        let contract = crate::memory_strategy::weights_free_contract(&spec).unwrap();
+        let fixture = crate::memory_strategy::registered_fixture(
+            &spec,
+            &contract,
+            gen_core::MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0);
+
+        assert!(!fixture.context.has_phases);
+        assert!(fixture.request.phases.is_none());
+        assert_eq!(fixture.context.geometry.reference_count, 1);
+        assert_eq!(fixture.request.conditioning.len(), 1);
+        Generator::validate(&weightless_pulid(), &fixture.request).unwrap();
     }
 
     /// F-011 (sc-12463): `generate_impl` self-validates FIRST (`self.validate(req)?`, the sibling

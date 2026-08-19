@@ -4,6 +4,8 @@ use candle_gen::train::lora::{lora_linear_detect, lora_linear_no_bias_detect, Lo
 use candle_nn as nn;
 use candle_nn::Module;
 
+use super::{layer_norm_to_device, DenseGroupNorm};
+
 // sc-9416: every attention/FF/proj Linear in this vendored UNet packed-detects through the shared
 // `candle_gen::quant` seam — the MLX SDXL tiers (SceneWorks/sdxl-base-mlx q4/q8) pack the whole Linear
 // surface (attn `to_q/k/v/out.0`, GEGLU `ff.net.0.proj`, `ff.net.2`, and the linear `proj_in/proj_out`),
@@ -423,6 +425,12 @@ impl BasicTransformerBlock {
     ) -> Result<()> {
         f(&mut self.attn2)
     }
+
+    fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        layer_norm_to_device(&mut self.norm1, device)?;
+        layer_norm_to_device(&mut self.norm2, device)?;
+        layer_norm_to_device(&mut self.norm3, device)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -456,7 +464,7 @@ enum Proj {
 // Aka Transformer2DModel
 #[derive(Debug)]
 pub struct SpatialTransformer {
-    norm: nn::GroupNorm,
+    norm: DenseGroupNorm,
     proj_in: Proj,
     transformer_blocks: Vec<BasicTransformerBlock>,
     proj_out: Proj,
@@ -498,7 +506,7 @@ impl SpatialTransformer {
         group_size: usize,
     ) -> Result<Self> {
         let inner_dim = n_heads * d_head;
-        let norm = nn::group_norm(config.num_groups, in_channels, 1e-6, vs.pp("norm"))?;
+        let norm = DenseGroupNorm::new(config.num_groups, in_channels, 1e-6, vs.pp("norm"))?;
         let proj_in = if config.use_linear_projection {
             Proj::Linear(lora_linear_detect(
                 in_channels,
@@ -616,6 +624,14 @@ impl SpatialTransformer {
         }
         if let Proj::Linear(p) = &mut self.proj_out {
             f(p)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn move_norms_to(&mut self, device: &candle_core::Device) -> Result<()> {
+        self.norm.move_to_device(device)?;
+        for block in &mut self.transformer_blocks {
+            block.move_norms_to(device)?;
         }
         Ok(())
     }

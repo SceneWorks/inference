@@ -141,6 +141,8 @@ fn generation_descriptor(
     supports_negative_prompt: bool,
 ) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         id,
         family: config::FAMILY,
@@ -931,6 +933,8 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
     ModelDescriptor {
+        encoder_contract: None,
+        denoiser_output_latent_space: Some(&candle_gen::gen_core::MAGE_LATENT_SPACE),
         control_kinds: None,
         id: variant.id(),
         family: config::FAMILY,
@@ -1066,53 +1070,84 @@ pub fn register_providers(
         .register_generator(EDIT_TURBO_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION);
     #[cfg(feature = "cuda")]
-    let registry = registry
-        .register_memory_strategy(RL_MEMORY_REGISTRATION)
+    let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(RL_MEMORY_BEHAVIOR)
-        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
-        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
         .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
-        .register_memory_strategy(EDIT_BASE_MEMORY_REGISTRATION)
         .register_memory_behavior(EDIT_BASE_MEMORY_BEHAVIOR)
-        .register_memory_strategy(EDIT_TURBO_MEMORY_REGISTRATION)
         .register_memory_behavior(EDIT_TURBO_MEMORY_BEHAVIOR);
     registry
 }
 
-#[cfg(feature = "cuda")]
+/// Register the exhaustive weights-free memory-contract surface on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(RL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::MODEL_ID,
+            contract: memory_strategy::contract_rl,
+        })
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::BASE_MODEL_ID,
+            contract: memory_strategy::contract_base,
+        })
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::TURBO_MODEL_ID,
+            contract: memory_strategy::contract_turbo,
+        })
+        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::EDIT_MODEL_ID,
+            contract: memory_strategy::contract_edit,
+        })
+        .register_memory_strategy(EDIT_BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::EDIT_BASE_MODEL_ID,
+            contract: memory_strategy::contract_edit_base,
+        })
+        .register_memory_strategy(EDIT_TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: config::EDIT_TURBO_MODEL_ID,
+            contract: memory_strategy::contract_edit_turbo,
+        })
+}
+
 const RL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::MODEL_ID,
     contract: memory_strategy::contract_rl,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::BASE_MODEL_ID,
     contract: memory_strategy::contract_base,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::TURBO_MODEL_ID,
     contract: memory_strategy::contract_turbo,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::EDIT_MODEL_ID,
     contract: memory_strategy::contract_edit,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const EDIT_BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::EDIT_BASE_MODEL_ID,
     contract: memory_strategy::contract_edit_base,
     safety_check: memory_strategy::registered_safety_check,
 };
-#[cfg(feature = "cuda")]
 const EDIT_TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: config::EDIT_TURBO_MODEL_ID,
     contract: memory_strategy::contract_edit_turbo,

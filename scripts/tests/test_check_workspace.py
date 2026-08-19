@@ -951,11 +951,36 @@ class CrossBackendGeometryTests(unittest.TestCase):
     # The premise the `SHARED_FIXTURE_*` requirement rests on: one committed file, same bytes on both
     # sides. `_shares_a_fixture_file` re-derives it every run, so the synthetic pair has to have it.
     GOLDEN = "shared golden bytes\n"
+    # An aggregate constant per side, added only by the sub-field-exemption tests below. The two
+    # differ in exactly two places: `probe` (a `Some`/`None` leaf) and one extra execution the b
+    # side declares. Everything else — including the execution they share — agrees.
+    CONTRACT_A = (
+        "pub const EXECUTIONS: &[Execution] = &[\n"
+        '    Execution { purpose: "t2i", max_tokens: 1024 },\n'
+        "];\n"
+        "pub const CONTRACT: Contract = Contract {\n"
+        "    hidden_size: 8,\n"
+        "    executions: EXECUTIONS,\n"
+        '    probe: Some("layers.0.weight"),\n'
+        "};\n"
+    )
+    CONTRACT_B = (
+        "pub const EXECUTIONS: &[Execution] = &[\n"
+        '    Execution { purpose: "t2i", max_tokens: 1024 },\n'
+        '    Execution { purpose: "edit", max_tokens: 8192 },\n'
+        "];\n"
+        "pub const CONTRACT: Contract = Contract {\n"
+        "    hidden_size: 8,\n"
+        "    executions: EXECUTIONS,\n"
+        "    probe: None,\n"
+        "};\n"
+    )
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES = {}
         self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {}
+        self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS = {}
         self.gate.CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS = {}
         self.gate.CROSS_BACKEND_FIXTURE_FAMILIES = {
             "demo": "the synthetic pair commits one byte-identical golden"
@@ -1418,6 +1443,108 @@ class CrossBackendGeometryTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertIn("is not a dual-backend family any more", failure)
 
+    # --- clause: an aggregate is exempted per sub-field, not wholesale ---------------------------
+
+    def contracts(self, **overrides):
+        """`check` with the aggregate pair installed, so a sub-field exemption has a subject."""
+        files = {"a/src/contract.rs": self.CONTRACT_A, "b/src/contract.rs": self.CONTRACT_B}
+        files.update(overrides)
+        return self.check(**files)
+
+    def narrow(self, **paths) -> None:
+        """Exempt `CONTRACT` at the given paths, with a reason on each."""
+        self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS = {
+            ("demo", "CONTRACT"): {path: reason for path, reason in paths.items()},
+            ("demo", "EXECUTIONS"): {"[edit]": "only the b side ships the edit route"},
+        }
+
+    def test_a_sub_field_exemption_suppresses_exactly_the_paths_it_names(self) -> None:
+        """The paths address the value the way the Rust reads: `Some(..)` is transparent, and a
+        slice element is keyed by its own name rather than by position."""
+        self.narrow(
+            **{
+                ".probe": "only the a side probes for dense storage",
+                ".executions[edit]": "only the b side ships the edit route",
+            }
+        )
+        self.assertIsNone(self.contracts())
+
+    def test_a_new_divergence_inside_an_exempted_aggregate_is_caught(self) -> None:
+        """The whole point of narrowing. A whole-constant exemption written about `probe` would
+        swallow this silently — twenty-odd behavior-bearing fields exempted to record one."""
+        self.narrow(
+            **{
+                ".probe": "only the a side probes for dense storage",
+                ".executions[edit]": "only the b side ships the edit route",
+            }
+        )
+        failure = self.contracts(
+            **{"b/src/contract.rs": self.CONTRACT_B.replace("hidden_size: 8", "hidden_size: 9")}
+        )
+        self.assertIsNotNone(failure)
+        self.assertIn("`CONTRACT.hidden_size` diverges and is not one of the sub-fields", failure)
+
+    def test_a_new_divergence_inside_an_exempted_slice_element_is_caught(self) -> None:
+        """Reached through two levels of the path — the shared execution, then its own field."""
+        self.narrow(
+            **{
+                ".probe": "only the a side probes for dense storage",
+                ".executions[edit]": "only the b side ships the edit route",
+            }
+        )
+        drifted = self.CONTRACT_B.replace('"t2i", max_tokens: 1024', '"t2i", max_tokens: 2048')
+        failure = self.contracts(**{"b/src/contract.rs": drifted})
+        self.assertIsNotNone(failure)
+        self.assertIn("`CONTRACT.executions[t2i].max_tokens` diverges", failure)
+        self.assertIn("`EXECUTIONS[t2i].max_tokens` diverges", failure)
+
+    def test_a_sub_field_exemption_path_that_now_agrees_is_caught(self) -> None:
+        """Per path, not per constant: the rest of the aggregate still diverges, so the constant's
+        own staleness check would never fire for this."""
+        self.narrow(
+            **{
+                ".probe": "only the a side probes for dense storage",
+                ".executions[edit]": "only the b side ships the edit route",
+                ".hidden_size": "was different once",
+            }
+        )
+        failure = self.contracts()
+        self.assertIsNotNone(failure)
+        self.assertIn("`CONTRACT.hidden_size` carries a sub-field divergence exemption", failure)
+        self.assertIn("delete that path from the exemption", failure)
+
+    def test_a_sub_field_exemption_for_a_constant_that_now_agrees_is_caught(self) -> None:
+        self.narrow(**{".probe": "only the a side probes for dense storage"})
+        failure = self.contracts(**{"b/src/contract.rs": self.CONTRACT_A})
+        self.assertIsNotNone(failure)
+        self.assertIn("the two backends now agree about it", failure)
+
+    def test_a_constant_exempted_both_ways_is_caught(self) -> None:
+        """The whole-constant entry wins, so the paths would never be checked at all."""
+        self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS = {("demo", "CONTRACT"): "differs"}
+        self.narrow(**{".probe": "only the a side probes for dense storage"})
+        failure = self.contracts()
+        self.assertIsNotNone(failure)
+        self.assertIn("carries both a whole-constant and a sub-field divergence exemption", failure)
+
+    def test_a_sub_field_exemption_with_no_written_reason_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS = {("demo", "CONTRACT"): {".probe": "  "}}
+        failure = self.contracts()
+        self.assertIsNotNone(failure)
+        self.assertIn("has no written reason", failure)
+
+    def test_a_sub_field_exemption_naming_a_family_that_does_not_exist_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS = {("ghost", "CONTRACT"): {".x": "gone"}}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("is not a dual-backend family any more", failure)
+
+    def test_a_sub_field_exemption_for_a_constant_no_longer_declared_is_caught(self) -> None:
+        self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS = {("demo", "GONE"): {".x": "once"}}
+        failure = self.check()
+        self.assertIsNotNone(failure)
+        self.assertIn("is no longer declared on both sides", failure)
+
     def test_a_reference_block_naming_a_family_that_does_not_exist_is_caught(self) -> None:
         self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE["ghost"] = {"X": (1.0,)}
         failure = self.check()
@@ -1617,8 +1744,63 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
         families = {family for family, _, _ in self.gate._dual_backend_families(self.metadata)}
         for family, constant in self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS:
             self.assertIn(family, families, f"{family}/{constant}")
+        for family, constant in self.gate.CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS:
+            self.assertIn(family, families, f"{family}/{constant}")
         for family in self.gate.CROSS_BACKEND_GEOMETRY_REFERENCE:
             self.assertIn(family, families)
+
+    def test_no_aggregate_contract_carries_a_whole_constant_exemption(self) -> None:
+        """The encoder/tokenizer/prompt-execution contracts are exempted per sub-field. Asserted on
+        the shape of the name rather than on a list, so a family that starts declaring one of these
+        aggregates cannot quietly take the wholesale exemption instead: exempting `ENCODER_CONTRACT`
+        to record one field also stops comparing the twenty-odd others inside it."""
+        for family, constant in self.gate.CROSS_BACKEND_GEOMETRY_EXEMPTIONS:
+            self.assertFalse(
+                constant.endswith(("_ENCODER_CONTRACT", "_TOKENIZER_CONTRACT", "_EXECUTIONS"))
+                or constant in ("ENCODER_CONTRACT", "TOKENIZER_CONTRACT"),
+                f"{family}/{constant} is an aggregate — narrow it into "
+                "CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS",
+            )
+
+    def test_the_z_image_qk_norm_eps_is_the_checkpoint_value_on_both_lanes(self) -> None:
+        """sc-17137's sync review settled the one value the merge had left as an open question.
+
+        Z-Image's text encoder is exactly Qwen3-4B: the released config carries
+        `rms_norm_eps: 1e-06` and no separate qk-norm key, and `Qwen3Attention` builds
+        `q_norm`/`k_norm` from `rms_norm_eps`. MLX had shipped 1e-5, the `mlx_rs::fast::rms_norm`
+        library default. Pinned to the checkpoint value rather than merely "equal", because
+        converging both lanes onto the library default would satisfy the gate and still be wrong.
+        """
+        families = {
+            family: (candle, mlx)
+            for family, candle, mlx in self.gate._dual_backend_families(self.metadata)
+        }
+        candle, mlx = families["z-image"]
+        for crate in (candle, mlx):
+            declarations = self.gate._crate_pub_consts(crate, "src")
+            canonical = self.gate._canonical_const_values(
+                declarations["ENCODER_CONTRACT"], declarations
+            )
+            self.assertEqual(len(canonical), 1, str(crate))
+            fields = dict(self.gate._aggregate_parts(next(iter(canonical)))[1])
+            self.assertEqual(
+                self.gate._canonical_leaf(fields[".qk_norm_eps"]),
+                "gen_core::EncoderConfigFloat::new(1e-6)",
+                str(crate),
+            )
+            # The block-level epsilon the checkpoint declares, which is the value it is taken from.
+            self.assertEqual(
+                self.gate._canonical_leaf(fields[".rms_norm_eps"]),
+                "gen_core::EncoderConfigFloat::new(1e-6)",
+                str(crate),
+            )
+        # The runtime constant the MLX per-head norms are actually built with, not just the
+        # published contract: sc-17137's finding was the two disagreeing with the checkpoint
+        # together, and a contract nothing runs would be a claim rather than behavior.
+        runtime = self.gate._crate_pub_consts(mlx, "src")["QK_NORM_EPS"]
+        self.assertEqual(
+            self.gate._canonical_const_values(runtime, {}), {"number:(1e-06,)"}, str(mlx)
+        )
 
     def test_every_family_is_either_compared_or_recorded_as_uncompared(self) -> None:
         """Derived from the gate's own predicate, with no count kept here: for each swept family the

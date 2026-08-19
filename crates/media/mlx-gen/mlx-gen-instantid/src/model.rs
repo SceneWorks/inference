@@ -36,9 +36,9 @@ use mlx_gen_sdxl::unet::{ControlNet, UNet2DConditionModel};
 use mlx_gen_sdxl::vae::Autoencoder;
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise_curated, denoise_ip_multi_control,
-    encode_conditioning, load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
-    load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image, seeded_prior,
-    text_time_ids, ControlContext, Denoiser, LoraCoverage, PID_BACKBONE,
+    encode_conditioning_windows, load_controlnet, load_text_encoder_1_dtype,
+    load_text_encoder_2_dtype, load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image,
+    seeded_prior, text_time_ids, ControlContext, Denoiser, LoraCoverage, PID_BACKBONE,
 };
 
 use mlx_gen::image::resize_lanczos_u8;
@@ -476,10 +476,14 @@ impl InstantId {
 
         // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
         mlx_rs::random::seed(req.seed)?;
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
+        // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
+        // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
+        // which is the pre-sc-20528 encoding unchanged.
         let tokens = self
             .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
-        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+            .tokenize_windows(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning_windows(&self.te1, &self.te2, &tokens)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
 
         // Face tokens via the Resampler (CFG positive-first; uncond = Resampler(zeros)).
@@ -753,10 +757,14 @@ impl InstantId {
 
         // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
         mlx_rs::random::seed(req.seed)?;
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
+        // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
+        // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
+        // which is the pre-sc-20528 encoding unchanged.
         let tokens = self
             .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
-        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+            .tokenize_windows(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning_windows(&self.te1, &self.te2, &tokens)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
         let face_tokens = self.face_tokens(embedding, cfg_on)?;
 

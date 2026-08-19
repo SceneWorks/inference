@@ -92,6 +92,8 @@ impl ChromaVariant {
     /// (`supports_guidance = false`). LoRA/LoKr apply through the shared dense/packed adapter stack.
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
             control_kinds: None,
             required_components: &[],
             id: self.id(),

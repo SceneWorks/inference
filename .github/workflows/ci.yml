@@ -72,6 +72,11 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
+      # unconditional for every CI event and is itself required by the aggregate `CI gate`.
+      # A path-gated lane would let a docs-only topology violation merge without a verdict.
+      - name: Enforce feature-epic pull-request topology
+        run: python3 scripts/ci/feature_epic_policy.py
       # Every BASE_SHA below must name `github.event.merge_group.base_sha`. A merge_group event
       # carries NEITHER `pull_request.base.sha` NOR `before`, and the two consumers fail in
       # opposite directions on an empty base: select_lanes.py hard-errors (visible), while
@@ -503,6 +508,11 @@ jobs:
           df -h /
           du -sh target 2>/dev/null
           exit 0
+      - name: Reclaim Clippy and rustdoc artifacts before linking MLX tests
+        # The complete all-target Clippy graph plus rustdoc output exhausted the hosted macOS disk
+        # while the broad test graph was linking. Both gates have already succeeded, so rebuild the
+        # narrower lib/test profile from a clean target before the existing post-test reclamation.
+        run: cargo clean
       # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
       # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
       # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
@@ -530,6 +540,12 @@ jobs:
           du -sh target 2>/dev/null
           du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
           exit 0
+      - name: Reclaim broad MLX test artifacts before bundle profiles
+        # The complete MLX test graph has already passed. Its linked test artifacts do not fit on
+        # the hosted macOS image alongside the separately compiled runtime bundle profiles and the
+        # Candle Metal Clippy graph, so discard them before continuing with those unchanged gates.
+        # This mirrors the hosted Linux lane's post-Clippy reclamation boundary.
+        run: cargo clean
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
@@ -603,6 +619,15 @@ jobs:
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
         run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+      # SC-18318 acceptance is correctness-only: exercise the focused synthetic
+      # request-scoped exact-epilogue equality/receipt suite on a live Metal
+      # device. The p3_ filter is intentionally narrow and invokes no timing,
+      # memory, profiling, calibration, matrix, or real-weight path.
+      - name: Exercise exact P3 epilogues on NAX
+        env:
+          MLX_ENABLE_TF32: "1"
+          SCENEWORKS_REQUIRE_NAX: "1"
+        run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 
@@ -617,9 +642,11 @@ jobs:
   # CUDA box (sc-11990). `--tests` is load-bearing here: the break was in a test target, so a bare
   # `cargo build` would still have missed it.
   #
-  # Deliberately `--no-run`: compiling needs nvcc + MSVC but never creates a CUDA context or allocates
-  # VRAM, so this is safe to run on every PR on the shared self-hosted rig without competing for the GPU.
-  # Executing the CUDA tests stays in the manual `windows-cuda` lane below.
+  # The broad package build remains deliberately `--no-run`: compiling needs nvcc + MSVC but never
+  # creates a CUDA context or allocates VRAM, so this is safe to run on every PR on the shared
+  # self-hosted rig without competing for the GPU. One weights-free catalog conformance test executes
+  # below because it needs the CUDA-gated registration graph but never touches a device; executing the
+  # rest of the CUDA tests stays in the manual `windows-cuda` lane.
   windows-cuda-check:
     name: Candle CUDA compile check (Windows)
     needs: changes
@@ -701,6 +728,11 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+      - name: Execute weights-free CUDA catalog conformance (no GPU required)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
       # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
       # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
       # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is

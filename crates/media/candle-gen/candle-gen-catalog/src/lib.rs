@@ -54,6 +54,33 @@ pub mod providers {
 /// registered generator. Note `pulid` is bespoke here, whereas MLX ships it as `pulid_flux`.
 pub const BESPOKE_UTILITY_CRATES: &[&str] = &["depth", "face", "instantid", "pid", "pulid", "sam3"];
 
+/// Machine-readable disposition for a provider-owned memory contract that intentionally cannot be
+/// represented by an ordinary [`candle_gen::gen_core::MemoryRegistration`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BespokeMemoryRouteWaiver {
+    pub provider_id: &'static str,
+    pub crate_name: &'static str,
+    pub owner: &'static str,
+    pub reason: &'static str,
+    pub contract_path: &'static str,
+    pub verification_path: &'static str,
+}
+
+/// Descriptor-less Candle memory routes excluded from ordinary registry reconciliation.
+///
+/// PuLID is worker-owned and constructs a path-shaped FLUX + identity-stack contract through
+/// `PulidFlux::load_with_memory_context`; inventing a generator registration would make the public
+/// provider topology false. Consumers must reconcile this explicit waiver instead.
+pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
+    &[BespokeMemoryRouteWaiver {
+        provider_id: candle_gen_pulid::memory_strategy::PROVIDER_ID,
+        crate_name: "pulid",
+        owner: "candle-gen-pulid",
+        reason: "worker-owned bespoke route with a path-shaped memory contract and no LoadSpec/Generator registration",
+        contract_path: "crates/media/candle-gen/candle-gen-pulid/src/memory_strategy.rs",
+        verification_path: "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
+    }];
+
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     let registry = candle_gen_anima::register_providers(registry);
@@ -90,6 +117,30 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
 /// Build the complete explicit Candle media provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     register_providers(ProviderRegistryBuilder::new()).build()
+}
+
+/// Build the complete Candle registry contract surface without loading model weights or requiring
+/// CUDA. On CUDA builds the production catalog already owns these registrations; other platforms
+/// append the same contract-only registrations to the ordinary generator catalog.
+pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
+    let registry = register_providers(ProviderRegistryBuilder::new());
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_krea::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+    registry.build()
 }
 
 /// Resolve the load-bearing VAE geometry for a modelled Candle video generator.
@@ -410,10 +461,11 @@ mod preview_advertising {
     ///   ones own bespoke Euler loops. The same crate is `Denoise::Shared` and emits directly, which is
     ///   why both counts appear on one file's row below.
     /// * **The `_control` route ids in this crate are memory strategies, not descriptors.**
-    ///   `z_image_turbo_control` / `z_image_control` register a `MemoryRegistration` and nothing else,
-    ///   so they have no id to advertise here — exactly the `candle-gen-flux` control/IP shape, and the
-    ///   reason the two ids above cover nine lanes. `edit.rs`'s img2img provider is the same: a
-    ///   name-driven worker stream carrying a `preview` field on its own request type.
+    ///   `z_image_turbo_control` / `z_image_control` register memory contracts and their weights-free
+    ///   behavior seams, but no generator descriptor, so they have no id to advertise here — exactly
+    ///   the `candle-gen-flux` control/IP shape, and the reason the two ids above cover nine lanes.
+    ///   `edit.rs`'s img2img provider is the same: a name-driven worker stream carrying a `preview`
+    ///   field on its own request type.
     ///
     /// Z-Image also settles a question sc-16955 raised and sc-16956 half-answered. Its VAE is
     /// **byte-identical to FLUX.1-dev's** — the same `f5b59a26…40a3` container, whose `vae/config.json`
@@ -516,6 +568,7 @@ mod preview_advertising {
         "krea_2_turbo",
         "krea_2_raw",
         "krea_2_edit",
+        "krea_2_turbo_edit",
         "qwen_image",
         "anima_base",
         "anima_aesthetic",
@@ -3197,6 +3250,304 @@ mod preview_advertising {
         );
     }
 
+    #[test]
+    fn every_descriptorless_memory_route_has_one_machine_readable_waiver() {
+        let waivers = super::BESPOKE_MEMORY_ROUTE_WAIVERS;
+
+        // Shape, not population. This used to open with `waivers.len() == 1` and then index
+        // `waivers[0]`, so a second legitimate waiver would go RED without any coverage having been
+        // lost. The load-bearing claim is the derived set below: the waiver table names exactly the
+        // descriptor-less crates the source scan finds emitting — and every row is then validated on
+        // its own terms, so a second waiver is checked rather than merely counted.
+        let waived_crates = waivers
+            .iter()
+            .map(|waiver| format!("candle-gen-{}", waiver.crate_name))
+            .collect::<BTreeSet<_>>();
+        let descriptorless_memory_crates = BESPOKE_PROVIDER_CRATES
+            .iter()
+            .filter(|provider| scan(provider.dir).emits())
+            .map(|provider| provider.dir.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            waived_crates, descriptorless_memory_crates,
+            "the waiver table must name exactly the descriptor-less crates that emit"
+        );
+        assert_eq!(
+            waived_crates.len(),
+            waivers.len(),
+            "the waiver table must not repeat a crate"
+        );
+        // Non-vacuity: an empty scan would satisfy an empty-set equality while proving nothing.
+        assert!(
+            !waivers.is_empty(),
+            "at least one descriptor-less memory route is waived today; an empty table means the \
+             source scan resolved nothing"
+        );
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        // `candle_gen_root()` is `crates/media/candle-gen`; the waiver paths are repo-relative.
+        let repo_root = candle_gen_root()
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("crates/media/candle-gen sits three levels below the repo root")
+            .to_path_buf();
+        for waiver in waivers {
+            assert!(
+                super::BESPOKE_UTILITY_CRATES.contains(&waiver.crate_name),
+                "waived crate {:?} is not a declared descriptor-less utility crate",
+                waiver.crate_name
+            );
+            assert_eq!(
+                waiver.owner,
+                format!("candle-gen-{}", waiver.crate_name),
+                "a waiver's owner must be the crate that owns the route"
+            );
+            assert!(
+                !waiver.provider_id.trim().is_empty() && !waiver.reason.trim().is_empty(),
+                "waiver {:?} must name a route and a reason",
+                waiver.crate_name
+            );
+            // The evidence paths are the whole point of a machine-readable waiver: a moved or
+            // renamed contract silently turns the row into an unfalsifiable claim.
+            for path in [waiver.contract_path, waiver.verification_path] {
+                let expected_prefix = format!("crates/media/candle-gen/{}/src/", waiver.owner);
+                assert!(
+                    path.starts_with(&expected_prefix),
+                    "waiver {:?} cites {path:?}, which is outside its owning crate",
+                    waiver.crate_name
+                );
+                assert!(
+                    repo_root.join(path).is_file(),
+                    "waiver {:?} cites {path:?}, which does not exist",
+                    waiver.crate_name
+                );
+            }
+            // The waived route really is absent from both registries — that absence is what the
+            // waiver exists to document.
+            assert!(
+                registry.generators().all(|registration| {
+                    let id = (registration.descriptor)().id;
+                    id != waiver.provider_id && id != waiver.crate_name
+                }),
+                "waived route {:?} has a generator registration after all",
+                waiver.provider_id
+            );
+            assert!(
+                registry
+                    .memory_strategy_registrations()
+                    .all(|registration| registration.provider_id != waiver.provider_id),
+                "waived route {:?} has a memory-strategy registration after all",
+                waiver.provider_id
+            );
+        }
+    }
+
+    /// The crates that own a Candle memory-strategy registration, and how each one reaches the
+    /// catalog. Wiring only: like [`ProviderCrate`] this table names no provider id and no total, so
+    /// it cannot drift from one — the ids are read back out of a registry built from each crate
+    /// alone. Its membership is policed against the sources by
+    /// [`every_memory_route_crate_reaches_the_catalog`].
+    struct MemoryRouteCrate {
+        /// Directory name under `crates/media/candle-gen`.
+        dir: &'static str,
+        register_providers: fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder,
+        /// `Some` for a crate that publishes weights-free contract surfaces on every platform.
+        /// `None` marks a route reachable only through a CUDA-gated `register_providers` — the
+        /// asymmetry the old `24`/`23` registration pin used to encode.
+        register_surfaces: Option<fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder>,
+    }
+
+    const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
+        MemoryRouteCrate {
+            dir: "candle-gen-flux",
+            register_providers: candle_gen_flux::register_providers,
+            register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-flux2",
+            register_providers: candle_gen_flux2::register_providers,
+            register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-krea",
+            register_providers: candle_gen_krea::register_providers,
+            register_surfaces: Some(candle_gen_krea::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-lens",
+            register_providers: candle_gen_lens::register_providers,
+            register_surfaces: Some(candle_gen_lens::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-mage",
+            register_providers: candle_gen_mage::register_providers,
+            register_surfaces: Some(candle_gen_mage::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-minimax-h3",
+            register_providers: candle_gen_minimax_h3::register_providers,
+            register_surfaces: Some(candle_gen_minimax_h3::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-qwen-image",
+            register_providers: candle_gen_qwen_image::register_providers,
+            register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-wan",
+            register_providers: candle_gen_wan::register_providers,
+            register_surfaces: None,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-z-image",
+            register_providers: candle_gen_z_image::register_providers,
+            register_surfaces: Some(candle_gen_z_image::register_memory_contract_surfaces),
+        },
+    ];
+
+    /// Anchor the catalog's memory-strategy registration set to the provider crate sources.
+    ///
+    /// The surface/composed assertions in `every_registered_memory_strategy_rejects_cross_route_
+    /// decode_geometry` all read the same registry, so a registration that disappears together with
+    /// its fixture shrinks every one of them consistently and stays green. The old `24`/`23` pin was
+    /// the only thing anchoring that set to something outside the registry, and this test replaces
+    /// it with a source-derived anchor instead of the count.
+    ///
+    /// What it catches, each one mutation-checked:
+    ///
+    /// * A crate that owns a memory route in its sources but contributes nothing to the catalog —
+    ///   including the catalog forgetting to wire its `register_memory_contract_surfaces`, and a
+    ///   provider's own registration function quietly registering nothing.
+    /// * The mirror case: a route that is supposed to be CUDA-only turning up on a CPU catalog.
+    /// * A registration narrowed to a test-only gate. The scan reads `module_tree`'s *shipped* code,
+    ///   which strips `cfg(test)` items, so `cfg(any(feature = "cuda", test))` decaying to
+    ///   `cfg(test)` — the regression that would silently empty the CUDA catalog's Wan route — drops
+    ///   the crate out of the scan and fails the table comparison on every build, not just on CUDA.
+    /// * A crate gaining or losing memory registrations without updating [`MEMORY_ROUTE_CRATES`].
+    ///
+    /// The middle ground — a gate that still ships but stops naming `feature = "cuda"` — is not
+    /// checked here because the compiler already prevents it: the registration constants carry the
+    /// same gate, so widening only the call site fails to resolve them.
+    ///
+    /// What it does not catch: deleting a registration from a provider crate's own sources moves the
+    /// scan with it. That is a visible deletion in the owning crate rather than a silent wiring
+    /// regression, and the owning crate's tests cover it.
+    #[test]
+    fn every_memory_route_crate_reaches_the_catalog() {
+        const REGISTRATION_CALLS: [&str; 3] = [
+            "register_memory_strategy(",
+            "register_composed_memory_strategy(",
+            "register_resident_only_memory_contract(",
+        ];
+
+        // --- What the sources say ------------------------------------------------------------
+        let mut owns_memory_route = BTreeSet::new();
+        let mut publishes_surfaces = BTreeSet::new();
+        let mut crate_dirs: Vec<String> = std::fs::read_dir(candle_gen_root())
+            .expect("crates/media/candle-gen is readable")
+            .map(|entry| entry.expect("readable directory entry").path())
+            .filter(|path| path.join("src/lib.rs").is_file())
+            .map(|path| {
+                path.file_name()
+                    .expect("a crate directory has a name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            // The catalog composes the others; it registers no memory route of its own.
+            .filter(|dir| dir != "candle-gen-catalog")
+            .collect();
+        crate_dirs.sort();
+        assert!(
+            crate_dirs.len() > 1,
+            "the crate walk found nothing; every scan below would be vacuous"
+        );
+        for dir in &crate_dirs {
+            let src = candle_gen_root().join(dir).join("src");
+            let tree = module_tree(dir, &src);
+            // Stripped code, so a call named only in a comment cannot enrol a crate.
+            let code = tree.shipped.values().cloned().collect::<String>();
+            if REGISTRATION_CALLS.iter().any(|call| code.contains(call)) {
+                owns_memory_route.insert(dir.clone());
+            }
+            if code.contains("fn register_memory_contract_surfaces") {
+                publishes_surfaces.insert(dir.clone());
+            }
+        }
+        assert!(
+            !owns_memory_route.is_empty(),
+            "no crate registers a memory route; the table comparison below would be vacuous"
+        );
+
+        // --- The wiring table must match them ------------------------------------------------
+        let declared = MEMORY_ROUTE_CRATES
+            .iter()
+            .map(|owner| owner.dir.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            declared.len(),
+            MEMORY_ROUTE_CRATES.len(),
+            "the memory-route table must not repeat a crate"
+        );
+        assert_eq!(
+            declared, owns_memory_route,
+            "MEMORY_ROUTE_CRATES must cover exactly the crates whose sources register a memory route"
+        );
+        assert_eq!(
+            MEMORY_ROUTE_CRATES
+                .iter()
+                .filter(|owner| owner.register_surfaces.is_some())
+                .map(|owner| owner.dir.to_owned())
+                .collect::<BTreeSet<_>>(),
+            publishes_surfaces
+                .intersection(&owns_memory_route)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            "a row's register_surfaces must be Some exactly when its crate publishes weights-free \
+             contract surfaces"
+        );
+
+        // --- ...and the catalog must carry exactly what those crates contribute ---------------
+        let catalog_ids = super::memory_contract_surface_registry()
+            .expect("catalog")
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        let mut expected_ids = BTreeSet::new();
+        for owner in MEMORY_ROUTE_CRATES {
+            let mut builder = (owner.register_providers)(ProviderRegistryBuilder::new());
+            // Mirror `memory_contract_surface_registry`: the weights-free surfaces are appended only
+            // off CUDA, because on a CUDA build `register_providers` already carries the same ids and
+            // registering both would be a duplicate.
+            if !cfg!(feature = "cuda") {
+                if let Some(register) = owner.register_surfaces {
+                    builder = register(builder);
+                }
+            }
+            let ids = builder
+                .build()
+                .unwrap_or_else(|error| panic!("{}: {error}", owner.dir))
+                .memory_strategy_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<BTreeSet<_>>();
+            let reachable = owner.register_surfaces.is_some() || cfg!(feature = "cuda");
+            assert_eq!(
+                !ids.is_empty(),
+                reachable,
+                "{} contributes {} memory registrations on this build; expected {}",
+                owner.dir,
+                if ids.is_empty() { "no" } else { "some" },
+                if reachable { "some" } else { "none" }
+            );
+            expected_ids.extend(ids);
+        }
+        assert_eq!(
+            catalog_ids, expected_ids,
+            "the catalog's memory-strategy set must be exactly what the memory-route crates \
+             contribute on this build"
+        );
+    }
+
     /// The carried-over no-go set stays outside advertising, by exact id, and stays out of the
     /// allowlist. The reason is a settled finding (see [`NoGo`]), not an open question — candle must
     /// not re-run those fits.
@@ -3328,13 +3679,25 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // VACE-Fun occupies the already-settled Wan z16 no-go space, and MiniMax-H3 opens its own
-        // joint-space no-go: 53 registered generators = 29 wired + 21 no-go + 3 deferred.
-        assert_eq!(
-            (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (53, 29, 21, 3),
-            "moving a route between preview classes is a decision that must be written down here"
-        );
+        // Deliberately NOT a pinned total. Two consecutive main syncs (sc-18306+VACE-Fun, then
+        // MiniMax-H3+Krea Turbo edit) each tripped a frozen (registered, wired, no_go, deferred)
+        // tuple whose only failure mode was "two branches merged" — never a defect. The decision
+        // record this test exists for is the *classification*: the partition, disjointness, and
+        // classified == registered assertions above already force every new registration to be
+        // filed into exactly one class, in writing, in the three pinned id lists. What remains
+        // load-bearing here is that no class silently empties out.
+        for (label, len) in [
+            ("registered", registered.len()),
+            ("wired", wired.len()),
+            ("no-go", no_go.len()),
+            ("deferred", deferred.len()),
+        ] {
+            assert!(
+                len > 0,
+                "the {label} preview class must not be empty — an empty class means a whole \
+                 decision category was silently dropped, not that the catalog shrank honestly"
+            );
+        }
     }
 
     /// **No no-go family may acquire a preview fit, a fit producer, or an emission call** (sc-16961).
@@ -3987,12 +4350,409 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
+    fn every_registered_generator_advertises_its_exact_latent_space() {
+        use candle_gen::gen_core::{
+            LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
+            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
+            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+        };
+
+        fn expected(
+            descriptor: &candle_gen::gen_core::ModelDescriptor,
+        ) -> Option<&'static LatentSpace> {
+            match descriptor.family {
+                "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
+                "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
+                "flux" | "boogu" | "chroma" | "z-image" => Some(&FLUX1_LATENT_SPACE),
+                "stable-diffusion-3" => Some(&SD3_LATENT_SPACE),
+                "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
+                "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
+                "mage_flow" => Some(&MAGE_LATENT_SPACE),
+                "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
+                "sana" => Some(&SANA_LATENT_SPACE),
+                "seedvr2" => Some(&SEEDVR2_VIDEO_LATENT_SPACE),
+                "svd" => Some(&SVD_LATENT_SPACE),
+                // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
+                "sensenova-u1" => None,
+                // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
+                // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
+                // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
+                // external decoder can consume it, so the descriptor deliberately advertises
+                // nothing and fails closed against every decoder swap.
+                "minimax_h3" => None,
+                family => panic!(
+                    "{} has unclassified latent lineage for registered family {family}",
+                    descriptor.id
+                ),
+            }
+        }
+
         let registry = super::provider_registry().unwrap();
+        for registration in registry.generators() {
+            let descriptor = (registration.descriptor)();
+            assert_eq!(
+                descriptor.denoiser_output_latent_space,
+                expected(&descriptor),
+                "{} must advertise the latent space its decoder consumes",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let registry = super::provider_registry().unwrap();
+        let contract_registry = super::memory_contract_surface_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_conformance(&contract_registry);
+        let surfaces = contract_registry.memory_contract_surfaces().unwrap();
+
+        // Shape, not population. The registration/surface/composed totals used to be pinned as
+        // hand-maintained numbers (`24`/`23`, `21 * 12 + 2 * 16 [+ 6]`, `4`), which any legitimate
+        // catalog growth re-trips while saying nothing about *which* provider moved.
+        //
+        // Scope, stated precisely: every claim below reads the same registry, so it constrains that
+        // registry's *internal consistency* — a witness set that is orphaned, doubled, ragged, or
+        // mismatched against the composed-route seam. It cannot, on its own, notice a registration
+        // that vanished together with its fixture, because that shrinks both sides at once. The
+        // registration set is anchored to something outside the registry — the provider crate
+        // sources — by `every_memory_route_crate_reaches_the_catalog`, which is what replaced the
+        // `24`/`23` pin. Read the two together.
+
+        // Coverage is exact in both directions: each memory-strategy registration either publishes
+        // optimized surfaces or is a resident-only witness, and nothing else reaches the inventory.
+        let strategy_ids = contract_registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        let resident_only_ids = contract_registry
+            .resident_only_memory_contract_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            resident_only_ids.is_subset(&strategy_ids),
+            "resident-only witnesses without a memory-strategy registration: {:?}",
+            resident_only_ids
+                .difference(&strategy_ids)
+                .collect::<Vec<_>>()
+        );
+        let surfaced_ids = surfaces
+            .iter()
+            .map(|surface| surface.contract.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            surfaced_ids,
+            strategy_ids
+                .difference(&resident_only_ids)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "optimized surfaces must cover exactly the non-resident-only memory registrations"
+        );
+
+        // What the old `21 * 12 + 2 * 16 + 6` arithmetic was really asserting, per provider: a
+        // witness set is a full rectangle over the residency/materialization axes for every tier it
+        // publishes (12 = 3 tiers x 2 policies x 2 shapes, 16 = 4 tiers x 4, and TI2V-5B's 6 =
+        // 3 tiers x 2 policies x its single eager shape). Stated as a rectangle it is derived, so it
+        // holds at any catalog size — and on the tier and shape axes it is stronger, because a
+        // provider that dropped one (policy, shape) cell only moved the old global sum by
+        // coincidence.
+        //
+        // A rectangle alone cannot see a *whole* axis collapse, though: drop every Sequential
+        // surface and the remaining Resident-only set is still a perfect rectangle. The residency
+        // axis is the one with a universe that does not vary by provider — every Candle memory route
+        // is witnessed under both offload policies — so it is pinned to the `OffloadPolicy` enum
+        // rather than to the provider's own set. Tier and shape stay per-provider derived: those
+        // genuinely differ (TI2V-5B has no deferred block loader, tiers vary with what a route
+        // ships).
+        //
+        // `MemoryContractSurfaceSelector::id` is the stable `tier:policy:shape` encoding of the three
+        // axes, so splitting it recovers them without needing `Ord` on the runtime enums.
+        let axes = |id: &'static str| {
+            let mut parts = id.split(':');
+            let tier = parts.next().expect("selector ids start with a tier");
+            let policy = parts.next().expect("selector ids name a residency policy");
+            let shape = parts
+                .next()
+                .expect("selector ids name a materialization shape");
+            assert_eq!(parts.next(), None, "unexpected selector id shape: {id:?}");
+            (tier, policy, shape)
+        };
+        let offload_policy_universe = {
+            use candle_gen::gen_core::{
+                LoadShape, MemoryContractSurfaceSelector, MemoryContractSurfaceTier, OffloadPolicy,
+            };
+            // Exhaustiveness guard: a new `OffloadPolicy` variant has to be classified here on
+            // purpose instead of quietly shrinking the universe every provider is measured against.
+            fn _every_policy_is_listed(policy: OffloadPolicy) {
+                match policy {
+                    OffloadPolicy::Resident | OffloadPolicy::Sequential => {}
+                }
+            }
+            let tokens = [OffloadPolicy::Resident, OffloadPolicy::Sequential]
+                .into_iter()
+                .map(|offload_policy| {
+                    axes(
+                        MemoryContractSurfaceSelector {
+                            tier: MemoryContractSurfaceTier::Bf16,
+                            offload_policy,
+                            load_shape: LoadShape::EagerMaterialization,
+                        }
+                        .id(),
+                    )
+                    .1
+                })
+                .collect::<Vec<_>>();
+            let universe = tokens.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                universe.len(),
+                tokens.len(),
+                "each OffloadPolicy must encode a distinct selector token"
+            );
+            universe
+        };
+
+        let mut published = BTreeMap::<&str, BTreeSet<_>>::new();
+        for surface in &surfaces {
+            published
+                .entry(surface.contract.provider_id.as_str())
+                .or_default()
+                .insert(axes(surface.selector.id()));
+        }
+        for (provider_id, selectors) in &published {
+            let tiers = selectors
+                .iter()
+                .map(|(tier, ..)| *tier)
+                .collect::<BTreeSet<_>>();
+            let policies = selectors
+                .iter()
+                .map(|(_, policy, _)| *policy)
+                .collect::<BTreeSet<_>>();
+            let shapes = selectors
+                .iter()
+                .map(|(.., shape)| *shape)
+                .collect::<BTreeSet<_>>();
+            let mut rectangle = BTreeSet::new();
+            for tier in &tiers {
+                for policy in &policies {
+                    for shape in &shapes {
+                        rectangle.insert((*tier, *policy, *shape));
+                    }
+                }
+            }
+            assert_eq!(
+                *selectors, rectangle,
+                "{provider_id} publishes a ragged witness set: every tier it declares must be \
+                 witnessed on every residency/materialization combination it supports"
+            );
+            assert_eq!(
+                policies, offload_policy_universe,
+                "{provider_id} witnesses only the {policies:?} residency policies; every Candle \
+                 memory route must be witnessed across the whole OffloadPolicy universe \
+                 {offload_policy_universe:?}. A rectangle survives a whole axis collapsing, so this \
+                 is checked against the enum rather than against the provider's own set"
+            );
+        }
+
+        // Composed routes are exactly the memory registrations with no standalone generator:
+        // `register_memory_strategy` rejects an unmatched id, so `register_composed_memory_strategy`
+        // is the only seam that admits one. Deriving the set that way asserts the `composed` flag
+        // agrees with the registration seam rather than pinning how many composed routes exist.
+        let generator_ids = contract_registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect::<BTreeSet<_>>();
+        let observed_composed = surfaces
+            .iter()
+            .filter(|surface| surface.composed)
+            .map(|surface| surface.contract.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed_composed,
+            surfaced_ids
+                .iter()
+                .copied()
+                .filter(|id| !generator_ids.contains(id))
+                .collect::<BTreeSet<_>>(),
+            "the composed flag must mark exactly the generator-less memory routes"
+        );
+        assert!(
+            !observed_composed.is_empty(),
+            "the Candle catalog publishes composed memory routes; none were observed"
+        );
+
         let spec = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
             "/nonexistent".into(),
         ));
         gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
+    #[test]
+    fn krea_raw_and_edit_publish_exact_request_scoped_candle_surfaces() {
+        use candle_gen::gen_core::{
+            MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+        };
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for provider_id in ["krea_2_raw", "krea_2_edit", "krea_2_turbo_edit"] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            let tiers = provider_surfaces
+                .iter()
+                .map(|surface| surface.resolved_artifact_tier())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                tiers,
+                [
+                    MemoryContractSurfaceTier::Bf16,
+                    MemoryContractSurfaceTier::Q4,
+                    MemoryContractSurfaceTier::Q8,
+                ]
+                .into_iter()
+                .collect(),
+                "{provider_id}"
+            );
+            for surface in provider_surfaces {
+                assert!(!surface.composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    candle_gen::gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    "krea-candle-request-scoped-staged-residency-v1",
+                    "{provider_id}"
+                );
+                for strategy in MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        MemoryStrategy::Resident | MemoryStrategy::StagedResidency
+                    );
+                    assert_eq!(
+                        surface.contract.capability(strategy).unwrap().support
+                            == MemoryStrategySupport::Implemented,
+                        expected,
+                        "{provider_id}:{}:{strategy:?}",
+                        surface.selector.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn z_image_and_lens_publish_exact_typed_candle_rung_four_surfaces() {
+        use candle_gen::gen_core::{
+            LoadShape, MemoryContractSurfaceTier, MemoryStrategy, MemoryStrategySupport,
+            OffloadPolicy,
+        };
+
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        for (provider_id, expected_count, composed, fingerprint) in [
+            (
+                "z_image",
+                6,
+                false,
+                "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2",
+            ),
+            (
+                "z_image_turbo",
+                6,
+                false,
+                "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2",
+            ),
+            (
+                "z_image_control",
+                6,
+                true,
+                "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
+            ),
+            (
+                "z_image_turbo_control",
+                6,
+                true,
+                "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
+            ),
+            (
+                "lens",
+                2,
+                false,
+                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+            ),
+            (
+                "lens_turbo",
+                2,
+                false,
+                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+            ),
+        ] {
+            let provider_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|surface| surface.contract.provider_id == provider_id)
+                .collect();
+            assert_eq!(provider_surfaces.len(), 12, "{provider_id}");
+            let mut implemented = 0;
+            for surface in provider_surfaces {
+                let expected = if provider_id.starts_with("lens") {
+                    matches!(
+                        surface.resolved_artifact_tier(),
+                        MemoryContractSurfaceTier::Q4 | MemoryContractSurfaceTier::Q8
+                    ) && surface.selector.offload_policy == OffloadPolicy::Sequential
+                        && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                } else {
+                    matches!(
+                        surface.resolved_artifact_tier(),
+                        MemoryContractSurfaceTier::Bf16
+                            | MemoryContractSurfaceTier::Q4
+                            | MemoryContractSurfaceTier::Q8
+                    ) && surface.selector.load_shape == LoadShape::DeferredMaterialization
+                };
+                let rung = surface
+                    .contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .expect("complete Candle ladder");
+                assert_eq!(
+                    rung.support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    },
+                    "{}:{}",
+                    provider_id,
+                    surface.selector.id()
+                );
+                implemented += usize::from(expected);
+                assert_eq!(surface.composed, composed, "{provider_id}");
+                assert_eq!(
+                    surface.contract.calibration.as_ref().unwrap().fingerprint,
+                    fingerprint,
+                    "{provider_id}"
+                );
+                assert_eq!(
+                    surface.contract.asset_facts,
+                    candle_gen::gen_core::MemoryAssetFacts::default(),
+                    "{provider_id}: weights-free surfaces cannot claim real inventory"
+                );
+                if composed {
+                    assert!(
+                        surface.spec.control.is_some(),
+                        "{provider_id}:{} missing mandatory control source",
+                        surface.selector.id()
+                    );
+                }
+            }
+            assert_eq!(implemented, expected_count, "{provider_id}");
+        }
     }
 
     #[test]
@@ -4099,6 +4859,7 @@ mod tests {
                 "krea_2_turbo",
                 "krea_2_raw",
                 "krea_2_edit",
+                "krea_2_turbo_edit",
                 "lens_turbo",
                 "lens",
                 "ltx_2_3_distilled",
@@ -4161,7 +4922,10 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
-        // also generator ids, which is why 53 + 14 + 1 + 2 registrations are 58 distinct ids.
+        // also generator ids, which is why 54 + 14 + 1 + 2 registrations are 59 distinct ids. Both
+        // branches independently added one generator to the 53-id base (MiniMax-H3 joint-space
+        // no-go on the epic side, the Krea Turbo edit route on main), so the generator count here
+        // is their union (54), not either side's 53.
         //
         // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -4174,8 +4938,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 58);
-        assert_eq!(super::provider_components().len(), 49);
+        assert_eq!(distinct.len(), 59);
+        assert_eq!(super::provider_components().len(), 50);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

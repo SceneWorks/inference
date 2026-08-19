@@ -265,8 +265,21 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    let registry = registry.register_generator(model::REGISTRATION);
+    // The fleet shape (see candle-gen-flux): the memory route rides `register_providers` only on
+    // the build that can execute it; every other platform appends the same weights-free surfaces
+    // through `register_memory_contract_surfaces` from the catalog, and registering both would be
+    // a duplicate.
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry);
     registry
-        .register_generator(model::REGISTRATION)
+}
+
+/// Register only weights-free memory-contract surfaces; safe on every build platform.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
 }

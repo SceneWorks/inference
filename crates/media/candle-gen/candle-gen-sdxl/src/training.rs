@@ -69,10 +69,13 @@ use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
 use candle_transformers::models::stable_diffusion::{self, clip, StableDiffusionConfig};
 
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+use crate::SdxlVaeDecoder;
 
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
+// sc-20528: the shared CLIP long-prompt chunker, so an over-long caption/sample prompt windows the
+// same way the inference path windows an over-long prompt.
+use crate::long_prompt::ChunkPlan;
 use crate::pipeline::{
     resolve_tokenizer_file, resolve_vae_file, sdxl_alpha_schedule, snapshot_file, Clip,
     SdxlComponents, VAE_SCALE,
@@ -114,10 +117,10 @@ struct DualClip {
     g: clip::ClipTextTransformer,
     tok_l: Tokenizer,
     tok_g: Tokenizer,
-    l_max: usize,
-    l_pad: u32,
-    g_max: usize,
-    g_pad: u32,
+    /// Per-encoder CLIP windowing (sc-20528) — pad id + `max_position_embeddings` + the BOS/EOS
+    /// wrapper, so an over-long caption chunks exactly the way the inference path chunks a prompt.
+    plan_l: ChunkPlan,
+    plan_g: ChunkPlan,
     device: Device,
 }
 
@@ -166,70 +169,67 @@ impl DualClip {
             device,
             DType::F32,
         )?;
-        let l_pad = pad_id(&tok_l, l_cfg)?;
-        let g_pad = pad_id(&tok_g, g_cfg)?;
+        let plan_l = ChunkPlan::new(
+            &tok_l,
+            l_cfg.pad_with.as_deref(),
+            l_cfg.max_position_embeddings,
+        )?;
+        let plan_g = ChunkPlan::new(
+            &tok_g,
+            g_cfg.pad_with.as_deref(),
+            g_cfg.max_position_embeddings,
+        )?;
         Ok(Self {
             l,
             g,
             tok_l,
             tok_g,
-            l_max: l_cfg.max_position_embeddings,
-            l_pad,
-            g_max: g_cfg.max_position_embeddings,
-            g_pad,
+            plan_l,
+            plan_g,
             device: device.clone(),
         })
     }
 
+    /// The number of CLIP windows every text in `texts` must be encoded at so their conditionings
+    /// share a sequence length (sc-20528) — the max over both encoders and every text. `1` whenever
+    /// they all fit CLIP's context, which keeps the ordinary caption encoding unchanged.
+    fn plan_chunks(&self, texts: &[&str]) -> Result<usize> {
+        crate::long_prompt::common_chunks(
+            &[(&self.plan_l, &self.tok_l), (&self.plan_g, &self.tok_g)],
+            texts,
+        )
+    }
+
     /// Encode `caption` (no negative — training is CFG-off) to the SDXL dual-CLIP conditioning
-    /// `[1, 77, 2048]` = `cat([clip_L_hidden, clip_bigG_hidden], dim=-1)`, exactly the inference
-    /// `text_embeddings` concat (minus the `[uncond, cond]` batch stack).
+    /// `[1, n·77, 2048]` = `cat([clip_L_hidden, clip_bigG_hidden], dim=-1)`, exactly the inference
+    /// `text_embeddings` concat (minus the `[uncond, cond]` batch stack), at an explicit window count.
+    ///
+    /// Callers that later stack two encodings on the batch axis (the preview `[uncond, cond]` pair)
+    /// must pass a `chunks` computed over BOTH texts via [`Self::plan_chunks`] — otherwise a long
+    /// sample prompt and the empty negative would produce different sequence lengths.
+    fn encode_at(&self, caption: &str, chunks: usize) -> Result<Tensor> {
+        let rows_l = self.plan_l.rows_aligned(&self.tok_l, caption, chunks)?;
+        let rows_g = self.plan_g.rows_aligned(&self.tok_g, caption, chunks)?;
+        let mut windows: Vec<Tensor> = Vec::with_capacity(rows_l.len());
+        for (row_l, row_g) in rows_l.iter().zip(rows_g.iter()) {
+            let lt = Tensor::new(row_l.as_slice(), &self.device)?.unsqueeze(0)?;
+            let gt = Tensor::new(row_g.as_slice(), &self.device)?.unsqueeze(0)?;
+            let l = self.l.forward(&lt)?;
+            let g = self.g.forward(&gt)?;
+            windows.push(Tensor::cat(&[l, g], D::Minus1)?);
+        }
+        Ok(if windows.len() == 1 {
+            windows.remove(0)
+        } else {
+            Tensor::cat(&windows, 1)?
+        })
+    }
+
+    /// [`Self::encode_at`] at this caption's own natural window count — the dataset-caching path,
+    /// where each cached conditioning is consumed on its own (batch 1) and never stacked with another.
     fn encode(&self, caption: &str) -> Result<Tensor> {
-        let lt = tokenize_padded(&self.tok_l, self.l_max, self.l_pad, caption, &self.device)?;
-        let gt = tokenize_padded(&self.tok_g, self.g_max, self.g_pad, caption, &self.device)?;
-        let l = self.l.forward(&lt)?;
-        let g = self.g.forward(&gt)?;
-        Ok(Tensor::cat(&[l, g], D::Minus1)?)
+        self.encode_at(caption, self.plan_chunks(&[caption])?)
     }
-}
-
-/// Resolve a CLIP encoder's pad-token id from its tokenizer vocab + config `pad_with` (default
-/// `<|endoftext|>`).
-fn pad_id(tok: &Tokenizer, cfg: &clip::Config) -> Result<u32> {
-    let pad_token = cfg
-        .pad_with
-        .clone()
-        .unwrap_or_else(|| "<|endoftext|>".into());
-    tok.get_vocab(true)
-        .get(pad_token.as_str())
-        .copied()
-        .ok_or_else(|| CandleError::Msg(format!("pad token {pad_token:?} not in CLIP vocab")))
-}
-
-/// Tokenize `text`, pad to `max` with `pad`, and return a `[1, max]` id tensor (the inference encode
-/// closure, factored). Errors if the prompt exceeds the encoder's context.
-fn tokenize_padded(
-    tok: &Tokenizer,
-    max: usize,
-    pad: u32,
-    text: &str,
-    device: &Device,
-) -> Result<Tensor> {
-    let mut tokens = tok
-        .encode(text, true)
-        .map_err(|e| CandleError::Msg(format!("tokenize: {e}")))?
-        .get_ids()
-        .to_vec();
-    if tokens.len() > max {
-        return Err(CandleError::Msg(format!(
-            "caption too long: {} tokens > {max}",
-            tokens.len()
-        )));
-    }
-    while tokens.len() < max {
-        tokens.push(pad);
-    }
-    Ok(Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?)
 }
 
 /// A uniform integer DDPM timestep in `[0, NUM_TRAIN_TIMESTEPS)`, deterministic in `seed` (the
@@ -272,7 +272,7 @@ struct SamplePreview {
     prompts: Vec<String>,
     /// The f16-stable SDXL VAE decoder (`madebyollin/sdxl-vae-fp16-fix`), resident for the run so each
     /// preview decodes its final latent without a per-cadence reload.
-    vae: AutoEncoderKL,
+    vae: SdxlVaeDecoder,
 }
 
 /// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
@@ -297,7 +297,7 @@ struct SamplePreview {
 #[allow(clippy::too_many_arguments)]
 fn render_one_preview(
     unet: &UNet2DConditionModel,
-    vae: &AutoEncoderKL,
+    vae: &SdxlVaeDecoder,
     cond: &Tensor,
     cfg: &TrainingConfig,
     lat_h: usize,
@@ -309,7 +309,7 @@ fn render_one_preview(
     let latents = preview_latents(unet, cond, cfg, lat_h, lat_w, compute_dtype, seed, device)?;
     // The shared decode expects compute-dtype latents (like the inference curated loop); un-scale +
     // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
-    decode_image(vae, &latents, None)
+    decode_image(vae, &latents, None, None)
 }
 
 /// The curated denoise behind [`render_one_preview`] (sc-11173 / F-083), returning the final
@@ -634,11 +634,11 @@ impl SdxlTrainer {
         // --- load + cache: VAE latents (.mean × scale) + dual-CLIP conditioning ---
         on_progress(TrainingProgress::LoadingModel);
         let vae = {
-            let vb = candle_gen::mmap_var_builder(
-                &[resolve_vae_file(&self.component_paths.vae_fp16_fix)],
-                DType::F32,
-                device,
-            )?;
+            let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+            })?;
+            let vb =
+                candle_gen::mmap_var_builder(&[resolve_vae_file(vae_source)], DType::F32, device)?;
             VaeMomentsEncoder::new(vb, VAE_SCALE)?
         };
         let clip = DualClip::load(
@@ -671,20 +671,34 @@ impl SdxlTrainer {
         // *encoder*). `None` when sampling is off, so the no-preview path keeps the prior footprint.
         let preview: Option<SamplePreview> =
             if cfg.sample_every > 0 && !cfg.sample_prompts.is_empty() {
+                // sc-20528: the `[uncond, cond]` stack below is a batch-axis concat, so every row must
+                // share a sequence length — encode the empty negative AND every sample prompt at one
+                // window count computed over all of them (1 unless a sample prompt is over-long).
+                let sample_texts: Vec<&str> = std::iter::once("")
+                    .chain(
+                        cfg.sample_prompts
+                            .iter()
+                            .take(SAMPLE_PROMPT_CAP)
+                            .map(String::as_str),
+                    )
+                    .collect();
+                let chunks = clip.plan_chunks(&sample_texts)?;
                 // The empty-negative conditioning is prompt-independent — encode it once and reuse it
                 // as the CFG `uncond` row for every preview prompt.
-                let uncond = clip.encode("")?;
+                let uncond = clip.encode_at("", chunks)?;
                 let mut conds = Vec::new();
                 let mut prompts = Vec::new();
                 for prompt in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
-                    let cond = clip.encode(prompt)?;
+                    let cond = clip.encode_at(prompt, chunks)?;
                     conds.push(cache_frozen_encoder_output(
                         Tensor::cat(&[uncond.clone(), cond], 0)?.to_dtype(compute_dtype)?,
                     ));
                     prompts.push(prompt.clone());
                 }
-                let vae_decoder =
-                    load_sdxl_vae(&self.component_paths.vae_fp16_fix, device, compute_dtype)?;
+                let vae_source = self.component_paths.vae_fp16_fix.as_ref().ok_or_else(|| {
+                    CandleError::Msg("sdxl trainer requires the fp16-fix VAE component".into())
+                })?;
+                let vae_decoder = load_sdxl_vae(vae_source, device, compute_dtype)?;
                 Some(SamplePreview {
                     conds,
                     prompts,

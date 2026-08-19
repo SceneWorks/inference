@@ -6,17 +6,19 @@
 //!
 //! Identical to [`crate::model::Krea`] (Turbo) except a [`Krea2ControlBranch`] rides the DiT and
 //! `generate` threads a VAE-encoded pose skeleton through it. [`load`] needs the base snapshot
-//! (`spec.weights`, the DENSE `krea/Krea-2-Turbo` diffusers tree — NOT the packed Q4/Q8 turnkey the
-//! plain `krea_2_turbo` gen uses, because the branch is a composable-forward overlay trained on the bf16
-//! base) **and** the control overlay checkpoint (`spec.control`). Pose-only + dense bf16 (no quant, no
-//! negative prompt, no guidance), mirroring the candle `krea_2_turbo_control` engine.
+//! (`spec.weights`, either a dense `krea/Krea-2-Turbo` diffusers tree or a packed Q4/Q8 turnkey) and
+//! the control overlay checkpoint (`spec.control`). Pose-only with bf16 activations (the base weights
+//! may be dense or Q4/Q8; no negative prompt or guidance), mirroring the candle
+//! `krea_2_turbo_control` engine.
 
 use mlx_gen::gen_core;
 use mlx_gen::{
-    require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
-    Progress, Quant, Residency, Result,
+    require_base_snapshot, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
+    Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
+use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_gen::default_seed;
 
@@ -64,6 +66,13 @@ pub struct KreaTurboControl {
     memory_strategy: gen_core::MemoryProviderContract,
     loaded_precision: Precision,
     loaded_quant: Option<Quant>,
+    /// Constructor-time pins retained for every deferred imported base/control reopen.
+    _native_dit: Option<mlx_gen::PinnedWeightsFile>,
+    _native_control: Option<mlx_gen::PinnedWeightsFile>,
+    /// Physical block-reopen eligibility for this exact load. Imported File contracts keep rung 4
+    /// Missing until source-specific evidence exists, so this must not be derived from capability
+    /// support; it only permits an explicit, eligible request to use the already-pinned stream seam.
+    streamable_transformer: bool,
     /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
     /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
     /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
@@ -81,6 +90,7 @@ pub struct KreaTurboControl {
 struct ControlHeavyOwned {
     heavy: KreaHeavy,
     branch: Krea2ControlBranch,
+    alternate_decoder: Option<OwnedWanSingleFrameDecoder>,
     /// The effective base-DiT quant tier (`None` = dense bf16). Captured at load so the render-time
     /// geometry safety check can weigh the resident-weight footprint without re-deriving it from the
     /// (post-quant) modules.
@@ -98,6 +108,7 @@ struct ControlHeavyOwned {
 struct ControlHeavyRef<'a> {
     heavy: &'a KreaHeavy,
     branch: &'a Krea2ControlBranch,
+    alternate_decoder: Option<&'a OwnedWanSingleFrameDecoder>,
 }
 
 impl ControlHeavyOwned {
@@ -105,6 +116,7 @@ impl ControlHeavyOwned {
         ControlHeavyRef {
             heavy: &self.heavy,
             branch: &self.branch,
+            alternate_decoder: self.alternate_decoder.as_ref(),
         }
     }
 }
@@ -172,7 +184,13 @@ impl AdmittedControlGeometry {
         (self.0.width, self.0.height)
     }
 
-    fn turbo_options(self, req: &GenerationRequest, steps: usize, seed: u64) -> TurboOptions {
+    fn turbo_options(
+        self,
+        req: &GenerationRequest,
+        steps: usize,
+        seed: u64,
+        transformer_window_size: Option<usize>,
+    ) -> TurboOptions {
         TurboOptions {
             width: self.0.width,
             height: self.0.height,
@@ -180,10 +198,7 @@ impl AdmittedControlGeometry {
             seed,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
-            transformer_window_size: req
-                .memory
-                .and_then(|memory| memory.transformer_window_size)
-                .map(|window| window as usize),
+            transformer_window_size,
             memory: req.memory.unwrap_or_default(),
         }
     }
@@ -203,21 +218,46 @@ impl AdmittedControlGeometry {
 /// seam in sc-11126, F-180): `Resident` (default) builds every component now and holds it warm;
 /// `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop the text
 /// phase → denoise/decode). Both use the same per-phase loaders, so the components are byte-identical.
-/// Validity (base dir, control present, no quant, bf16) is checked up front either way.
+/// Validity (base present, control present, bf16 activations, and only supported Q4/Q8 packing) is
+/// checked up front either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
-    // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
+    // order): bf16 activations, a base snapshot, the required control overlay, and any requested
+    // supported Q4/Q8 weight packing.
     validate_control_spec(spec)?;
-    let loaded_quant = crate::model::effective_base_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return Ok(Box::new(build_native_krea_control_from_spec(spec)?));
+    }
+    // A Dir-backed base may still select a single-file pose overlay. Pin that overlay once at
+    // construction and retain the pin across every sequential reopen, exactly like the imported-DiT
+    // path below. The cloned spec points at the pin's canonical loader path.
+    let pinned_control = pin_control_source(spec)?;
+    let mut pinned_spec = spec.clone();
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
+    }
+    let loaded_quant =
+        crate::model::effective_base_quant_tier(&pinned_spec, KREA_2_TURBO_CONTROL_ID)?;
+    let memory_strategy = match &pinned_control {
+        Some(control) => control.read_unchanged(|_| {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, &pinned_spec)
+                .map_err(Error::from)
+        })?,
+        None => {
+            crate::memory_strategy::memory_strategy_contract(KREA_2_TURBO_CONTROL_ID, &pinned_spec)?
+        }
+    };
+    let residency = build_control_residency_with_pin(&pinned_spec, pinned_control.clone())?;
+    let streamable_transformer = memory_strategy.lifecycle.transformer_window_materialization;
     Ok(Box::new(KreaTurboControl {
         descriptor: descriptor(),
-        memory_strategy: crate::memory_strategy::memory_strategy_contract(
-            KREA_2_TURBO_CONTROL_ID,
-            spec,
-        )?,
+        memory_strategy,
         loaded_precision: spec.precision,
         loaded_quant,
-        residency: build_control_residency(spec)?,
+        _native_dit: None,
+        _native_control: pinned_control,
+        streamable_transformer,
+        residency,
     }))
 }
 
@@ -236,98 +276,224 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// against the base tier's architecture config), `adapters` (Raw-trained LoRA/LoKr) install onto the
 /// imported DiT before residency is finalized (the branch is never an adapter target), and the pose
 /// branch loads from `control` exactly as the snapshot control load does. Branch tier follows the
-/// base-DiT tier (sc-15799): the native loader dequantizes I8 files to bf16, so the in-memory base is
-/// always DENSE — `control_branch_quant_bits(None)` keeps the branch dense, matching the snapshot
-/// lane's dense-base behavior. Resident-only (the single-file DiT has no snapshot dir to re-load
-/// from, mirroring the t2i entrypoint); the memory contract keeps the `krea_2_turbo_control`
-/// provider identity + calibration fingerprint so promoted evidence resolves through the same
-/// selectors as the builtin lane.
+/// requested load-time base-DiT tier (sc-15799): Q8 keeps a Q8 branch, Q4 uses the declared Q8 branch
+/// floor, and no quantization request keeps both base and branch dense. A native I8 file is first
+/// materialized as bf16, then an explicit supported Q4/Q8 request quantizes the loaded base.
+///
+/// The memory contract keeps the `krea_2_turbo_control` provider identity and calibration fingerprint
+/// so same-provider evidence resolves through the same selectors; the pinned File source can also
+/// participate in the provider's staged lifecycle.
 pub fn load_control_from_native_dit_file(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<Box<dyn Generator>> {
-    Ok(Box::new(build_native_krea_control(
-        dit_file,
-        base_snapshot_dir,
-        control,
-        adapters,
-    )?))
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
+        )
+        .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
+        .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
+    load(&spec)
 }
 
 /// The concrete-[`KreaTurboControl`] assembly behind [`load_control_from_native_dit_file`] (which
 /// boxes the result) — the control twin of [`crate::model::build_native_krea`], returning the
 /// concrete type so in-crate harnesses can exercise the assembly directly.
+#[cfg(test)]
 pub(crate) fn build_native_krea_control(
     dit_file: impl AsRef<Path>,
     base_snapshot_dir: impl AsRef<Path>,
     control: impl AsRef<Path>,
     adapters: &[mlx_gen::AdapterSpec],
 ) -> Result<KreaTurboControl> {
-    let base = base_snapshot_dir.as_ref();
-    let control_file = control.as_ref();
-    // Architecture config from the resident turnkey (the single file ships no config.json) — kept
-    // first so every native control load proves the base tier is present before any tensor I/O.
-    let cfg = Krea2Config::from_snapshot(base)?;
-    let memory_strategy = crate::memory_strategy::native_memory_strategy_contract(
-        KREA_2_TURBO_CONTROL_ID,
-        dit_file.as_ref(),
-        base,
-        control_file,
-    )?;
-    let dit = crate::loader::load_transformer_from_native_file(dit_file.as_ref(), &cfg)?;
-    let vae = crate::vae::load_vae(base)?;
-    let mut heavy = KreaHeavy::from_parts(dit, vae);
-    // Adapters install BEFORE the branch rides the DiT, mirroring the snapshot control lane's
-    // load→apply order (`load_control_heavy`); fail-closed on any unmatched adapter target.
-    if !adapters.is_empty() {
-        heavy.apply_adapters(adapters)?;
+    let mut spec = LoadSpec::new(WeightsSource::File(dit_file.as_ref().to_path_buf()))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(base_snapshot_dir.as_ref().to_path_buf()),
+        )
+        .with_control(WeightsSource::File(control.as_ref().to_path_buf()))
+        .with_adapters(adapters.to_vec());
+    spec.prepare_file_sources()?;
+    build_native_krea_control_from_spec(&spec)
+}
+
+fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboControl> {
+    validate_control_spec(spec)?;
+    let WeightsSource::File(_) = &spec.weights else {
+        return Err(Error::Msg(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: imported control assembly requires a single-file DiT"
+        )));
+    };
+    let native_dit = spec
+        .weights_file_pin()?
+        .expect("File weights must resolve to a pin");
+    let base = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?.to_path_buf();
+    let pinned_control =
+        match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
+            WeightsSource::File(path) => Some(spec.file_pin_for(path)?),
+            WeightsSource::Dir(_) => None,
+        };
+    let mut pinned_spec = spec.clone();
+    pinned_spec.weights = WeightsSource::File(native_dit.loader_path().to_path_buf());
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
     }
-    let control_source = mlx_gen::WeightsSource::File(control_file.to_path_buf());
-    let mut branch = Krea2ControlBranch::from_source(&control_source, &cfg)?;
-    // sc-15799 tier integrity: the native loader materializes the imported DiT dense bf16 (I8 files
-    // are dequantized at load), so the base has no tier and the branch stays the dense bf16 it was
-    // trained as — the same consequence-of-the-base-tier rule the snapshot lane applies.
-    let base_tier = None;
-    let branch_bits = crate::memory::control_branch_quant_bits(None);
-    if let Some(bits) = branch_bits {
-        branch.quantize(bits)?;
-    }
-    let branch_tier = tier_from_bits(branch_bits);
-    let text = KreaText::from_snapshot(base)?;
-    let residency = Residency::resident(
-        text,
-        ControlHeavyOwned {
-            heavy,
-            branch,
-            base_tier,
-            branch_tier,
-            cfg,
+    // Physical File streaming and public authorization are separate. The explicit
+    // Sequential + Deferred path may reopen the retained DiT pin, while the contract below remains
+    // rung-4 Missing until File-specific evidence is promoted.
+    let reopenable = crate::model::native_file_streamable(spec)?;
+    let build_memory_contract = || {
+        crate::memory_strategy::native_memory_strategy_contract_from_spec(
+            KREA_2_TURBO_CONTROL_ID,
+            &pinned_spec,
+            &base,
+            false,
+        )
+        .map_err(Error::from)
+    };
+    let memory_strategy = native_dit.read_unchanged(|_| match &pinned_control {
+        Some(control) => control.read_unchanged(|_| build_memory_contract()),
+        None => build_memory_contract(),
+    })?;
+    let text_base = base.clone();
+    let text_encoder_source = crate::model::ENCODER_CONTRACT.source_for_load(spec, &base)?;
+    let expected_text_encoder_bits = crate::model::native_text_encoder_expected_quant_bits(&base)?;
+    let text_encoder_load_time_quant_bits = text_encoder_source
+        .load_time_quant_bits(expected_text_encoder_bits, KREA_2_TURBO_CONTROL_ID)?;
+    let heavy_base = base;
+    let heavy_spec = spec.clone();
+    let heavy_dit = native_dit.clone();
+    let heavy_control = pinned_control.clone();
+    let residency = Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            crate::model::load_krea_text_resolved(
+                &text_base,
+                &text_encoder_source,
+                text_encoder_load_time_quant_bits,
+            )
         },
-    );
+        move |_use_pid| {
+            load_native_control_heavy(
+                &heavy_spec,
+                &heavy_base,
+                &heavy_dit,
+                heavy_control.as_ref(),
+                reopenable,
+            )
+        },
+    )?;
     Ok(KreaTurboControl {
         descriptor: descriptor(),
         memory_strategy,
-        loaded_precision: Precision::Bf16,
-        loaded_quant: None,
+        loaded_precision: spec.precision,
+        loaded_quant: spec.quantize,
+        _native_dit: Some(native_dit),
+        _native_control: pinned_control,
+        streamable_transformer: reopenable,
         residency,
     })
 }
 
-/// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
-/// residencies): bf16 activation precision, a base snapshot dir, and the required pose overlay. Quant is
-/// allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both pack only the base DiT/TE,
-/// leaving activations bf16 — so there is no quant rejection here.
-fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+fn load_native_control_heavy(
+    spec: &LoadSpec,
+    base: &Path,
+    dit_file: &mlx_gen::PinnedWeightsFile,
+    pinned_control: Option<&mlx_gen::PinnedWeightsFile>,
+    streamable: bool,
+) -> Result<ControlHeavyOwned> {
+    let cfg = Krea2Config::from_snapshot(base)?;
+    let dit = if let Some(quant) = spec.quantize {
+        crate::loader::load_transformer_from_pinned_native_file_bounded(dit_file, &cfg, |dit| {
+            if !spec.adapters.is_empty() {
+                spec.read_files_unchanged(
+                    spec.adapters.iter().map(|adapter| &adapter.path),
+                    || dit.apply_adapters_strict(&spec.adapters, true),
+                )?;
+            }
+            dit.quantize(quant.bits())
+        })?
+    } else {
+        crate::loader::load_transformer_from_pinned_native_file_with_stream(
+            dit_file, &cfg, streamable,
+        )?
+    };
+    let vae = crate::vae::load_vae(base)?;
+    let mut heavy = KreaHeavy::from_parts(dit, vae);
+    if spec.quantize.is_none() && !spec.adapters.is_empty() {
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
+    }
+    let base_bits = spec.quantize.map(Quant::bits);
+    let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
+    let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
+    let branch = match (pinned_control, branch_bits) {
+        (Some(pinned), Some(bits)) => {
+            Krea2ControlBranch::from_pinned_file_bounded(pinned, &cfg, bits)?
+        }
+        (Some(pinned), None) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
+        (None, Some(bits)) => Krea2ControlBranch::from_source_bounded(control, &cfg, bits)?,
+        (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
+    };
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
+    Ok(ControlHeavyOwned {
+        heavy,
+        branch,
+        alternate_decoder,
+        base_tier: tier_from_bits(base_bits),
+        branch_tier: tier_from_bits(branch_bits),
+        cfg,
+    })
+}
+
+/// The **source-independent** load axes the pose-control composition accepts: bf16 activation
+/// precision, only the base-snapshot and alternate-decoder components, and an executable Wan decoder
+/// selection. Quant is allowed (sc-11727) — a pre-packed snapshot or a `spec.quantize` request both
+/// pack only the base DiT/TE, leaving activations bf16 — so there is no quant rejection here.
+///
+/// Split out of [`validate_control_spec`] (sc-18451) so the weights-free registry surface can apply
+/// exactly these axes. That surface's witness is a synthetic snapshot path carrying neither the base
+/// snapshot component nor the pose overlay, so it cannot run the presence checks below; sharing this
+/// one function is what stops the published declaration from admitting an axis the loader refuses.
+pub(crate) fn validate_control_load_axes(spec: &LoadSpec) -> Result<()> {
+    spec.validate_prepared_file_pins()?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default bf16 activation precision is wired (drop the \
              precision override); Q4/Q8 weight packing is orthogonal and IS supported"
         )));
     }
-    let _ = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
+    mlx_gen::gen_core::reject_unknown_components(
+        spec,
+        &[BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT],
+        KREA_2_TURBO_CONTROL_ID,
+    )?;
+    mlx_gen_wan::validate_selected_single_frame_decoder(spec, &descriptor())?;
+    Ok(())
+}
+
+/// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
+/// residencies): the [`validate_control_load_axes`] axes plus a base snapshot dir and the required pose
+/// overlay.
+pub(crate) fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
+    validate_control_load_axes(spec)?;
+    let _ = require_base_snapshot(spec, KREA_2_TURBO_CONTROL_ID)?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
+    if matches!(spec.weights, WeightsSource::File(_))
+        && (spec.ip_adapter.is_some()
+            || !spec.extra_controls.is_empty()
+            || spec.pid.is_some()
+            || spec.identity.is_some())
+    {
+        return Err(Error::Unsupported(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: imported pose control does not accept IP-adapter, extra-control, PiD, or identity fields"
+        )));
+    }
     Ok(())
 }
 
@@ -342,31 +508,44 @@ fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
 /// deferral is weight-free-testable: under
 /// `Sequential` this touches no component weights, so a dispatch that mapped `Sequential → Resident`
 /// (ignoring `offload_policy`) would eager-load here and fail the "Sequential defers" unit test.
+#[cfg(test)]
 fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, ControlHeavyOwned>> {
+    let pinned_control = pin_control_source(spec)?;
+    let mut pinned_spec = spec.clone();
+    if let Some(control) = &pinned_control {
+        pinned_spec.control = Some(WeightsSource::File(control.loader_path().to_path_buf()));
+    }
+    build_control_residency_with_pin(&pinned_spec, pinned_control)
+}
+
+fn pin_control_source(spec: &LoadSpec) -> Result<Option<mlx_gen::PinnedWeightsFile>> {
+    match require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")? {
+        WeightsSource::File(path) => Ok(Some(spec.file_pin_for(path)?)),
+        WeightsSource::Dir(_) => Ok(None),
+    }
+}
+
+fn build_control_residency_with_pin(
+    spec: &LoadSpec,
+    pinned_control: Option<mlx_gen::PinnedWeightsFile>,
+) -> Result<Residency<KreaText, ControlHeavyOwned>> {
     // Up-front fail-fast for both policies (precision + base dir + control present), so a direct call
     // (e.g. the F-180 unit test) rejects an invalid spec exactly as `load` does.
     validate_control_spec(spec)?;
     let spec_text = spec.clone();
     let spec_heavy = spec.clone();
+    let heavy_control = pinned_control;
     Residency::from_policy(
         spec.offload_policy,
         move || {
-            let root = require_base_dir(
-                &spec_text,
-                KREA_2_TURBO_CONTROL_ID,
-                "a base snapshot directory",
-            )?;
+            let root = require_base_snapshot(&spec_text, KREA_2_TURBO_CONTROL_ID)?;
             // Reuse the txt2img text loader so the Qwen3-VL TE packs identically (sc-11727): pre-packed
             // auto-detects, dense + `spec.quantize` quantizes at load, activations stay bf16.
             crate::model::load_krea_text(&spec_text, root, KREA_2_TURBO_CONTROL_ID)
         },
         move |_use_pid| {
-            let root = require_base_dir(
-                &spec_heavy,
-                KREA_2_TURBO_CONTROL_ID,
-                "a base snapshot directory",
-            )?;
-            load_control_heavy(&spec_heavy, root)
+            let root = require_base_snapshot(&spec_heavy, KREA_2_TURBO_CONTROL_ID)?;
+            load_control_heavy(&spec_heavy, root, heavy_control.as_ref())
         },
     )
 }
@@ -393,38 +572,50 @@ fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, Contro
 /// once claimed: 8.4 exceeds the whole branch, so it was never a weight-side quantity; the key is
 /// retracted and sc-16013 owns the re-measure.) `control_scale == 0` stays bit-exact to the base at any
 /// tier.
-fn load_control_heavy(spec: &LoadSpec, root: &Path) -> Result<ControlHeavyOwned> {
+fn load_control_heavy(
+    spec: &LoadSpec,
+    root: &Path,
+    pinned_control: Option<&mlx_gen::PinnedWeightsFile>,
+) -> Result<ControlHeavyOwned> {
     let plan = crate::model::resolve_load_plan(spec, root, KREA_2_TURBO_CONTROL_ID)?;
     let streamable_transformer = matches!(spec.offload_policy, mlx_gen::OffloadPolicy::Sequential)
         && matches!(
             spec.load_shape,
             mlx_gen::gen_core::LoadShape::DeferredMaterialization
         )
-        && !crate::model::adapters_have_diff_patch(&spec.adapters)
+        && !crate::model::adapters_have_diff_patch_for_spec(spec)?
         && plan.load_time_quant_bits.is_none();
     let mut heavy = KreaHeavy::from_snapshot_with_stream(root, streamable_transformer)?;
     if !spec.adapters.is_empty() {
-        heavy.apply_adapters(&spec.adapters)?;
+        spec.read_files_unchanged(spec.adapters.iter().map(|adapter| &adapter.path), || {
+            heavy.apply_adapters(&spec.adapters)
+        })?;
     }
     if let Some(bits) = crate::model::load_time_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)? {
         heavy.quantize(bits)?;
     }
     let control = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     let cfg = Krea2Config::from_snapshot(root)?;
-    let mut branch = Krea2ControlBranch::from_source(control, &cfg)?;
     // sc-15799 — tier integrity. The pose overlay always loads bf16 (it ships no `.scales`); pack it to
     // the tier the base tier implies, whether the base was packed at load or arrived pre-packed. No
     // device-budget reading: the branch's tier is a consequence of the user's tier choice, not a rung.
     let base_bits = crate::model::effective_base_quant_bits(spec, root, KREA_2_TURBO_CONTROL_ID)?;
     let base_tier = tier_from_bits(base_bits);
     let branch_bits = crate::memory::control_branch_quant_bits(base_bits);
-    if let Some(bits) = branch_bits {
-        branch.quantize(bits)?;
-    }
+    let branch = match (pinned_control, branch_bits) {
+        (Some(pinned), Some(bits)) => {
+            Krea2ControlBranch::from_pinned_file_bounded(pinned, &cfg, bits)?
+        }
+        (Some(pinned), None) => Krea2ControlBranch::from_pinned_file(pinned, &cfg)?,
+        (None, Some(bits)) => Krea2ControlBranch::from_source_bounded(control, &cfg, bits)?,
+        (None, None) => Krea2ControlBranch::from_source(control, &cfg)?,
+    };
     let branch_tier = tier_from_bits(branch_bits);
+    let alternate_decoder = mlx_gen_wan::load_selected_single_frame_decoder(spec, &descriptor())?;
     Ok(ControlHeavyOwned {
         heavy,
         branch,
+        alternate_decoder,
         base_tier,
         branch_tier,
         cfg,
@@ -478,6 +669,8 @@ impl KreaTurboControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let transformer_window_size =
+            crate::model::resolve_transformer_window(req, self.streamable_transformer)?;
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -569,11 +762,15 @@ impl KreaTurboControl {
                         req,
                         steps,
                         base_seed.wrapping_add(n as u64),
+                        transformer_window_size,
                     );
                     let img = heavy.heavy.render_control_from(
                         &plan,
                         heavy.branch,
                         control_scale,
+                        heavy
+                            .alternate_decoder
+                            .map(|decoder| decoder as &dyn LatentDecoder),
                         decode_tiling.as_ref(),
                         req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
@@ -645,7 +842,7 @@ impl Generator for KreaTurboControl {
 // the plain delegation `impl_generator!` expresses (the z-image control precedent).
 mlx_gen::register_generators! {
     pub(crate) const CONTROL_REGISTRATION = descriptor => load;
-    footprint = crate::model::component_footprint
+    footprint = crate::model::control_component_footprint
 }
 
 pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
@@ -674,6 +871,93 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
+    use std::path::PathBuf;
+
+    fn write_minimal_safetensors(path: &Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn incomplete_native_control_fixture(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let base = tmp.path().join("incomplete-base");
+        std::fs::create_dir_all(base.join("transformer")).unwrap();
+        std::fs::write(base.join("transformer/config.json"), "{}").unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
+        let dit = tmp.path().join("native-dit.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        (dit, base, control)
+    }
+
+    #[test]
+    fn sequential_native_control_retains_both_constructor_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        for component in ["text_encoder", "vae"] {
+            let dir = base.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &base.join("text_encoder"),
+            crate::model::ENCODER_CONTRACT,
+        )
+        .expect("validation-complete text encoder fixture");
+        let dit = tmp.path().join("dit.safetensors");
+        let control = tmp.path().join("control.safetensors");
+        write_minimal_safetensors(&dit);
+        write_minimal_safetensors(&control);
+        let mut spec = LoadSpec::new(WeightsSource::File(dit.clone()))
+            .with_component(BASE_SNAPSHOT_COMPONENT, WeightsSource::Dir(base))
+            .with_control(WeightsSource::File(control.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        spec.prepare_file_sources().unwrap();
+        let prepared_dit = spec.weights_file_pin().unwrap().unwrap();
+        let prepared_control = spec.file_pin_for(&control).unwrap();
+        let model = build_native_krea_control_from_spec(&spec).unwrap();
+        assert!(
+            model.streamable_transformer,
+            "an explicit Sequential + Deferred control File load must arm the base DiT stream"
+        );
+        assert_eq!(
+            model
+                .memory_strategy
+                .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Missing,
+            "physical control File streaming must not inherit the Dir evidence cell"
+        );
+        let dit_pin = model._native_dit.expect("native DiT pin");
+        let control_pin = model._native_control.expect("native control pin");
+        assert_eq!(dit_pin, prepared_dit, "DiT must reuse the cache-key token");
+        assert_eq!(
+            control_pin, prepared_control,
+            "control must reuse the cache-key token"
+        );
+
+        std::fs::write(&dit, b"replacement dit").unwrap();
+        std::fs::write(&control, b"replacement control").unwrap();
+        for (name, pin) in [("DiT", dit_pin), ("control", control_pin)] {
+            let error = pin
+                .ensure_unchanged()
+                .expect_err("later materialization must reject replacement")
+                .to_string();
+            assert!(error.contains("changed after load"), "{name}: {error}");
+        }
+    }
 
     #[test]
     fn decode_tiling_follows_only_the_selected_generation_memory() {
@@ -754,7 +1038,7 @@ mod tests {
         // fields after the gate. This mutation makes that distinction observable without weights.
         req.width = 1024;
         req.height = 768;
-        let opts = admitted.turbo_options(&req, 8, 42);
+        let opts = admitted.turbo_options(&req, 8, 42, None);
         assert_eq!((opts.width, opts.height), (640, 384));
         assert_eq!(opts.steps, 8);
         assert_eq!(opts.seed, 42);
@@ -787,72 +1071,66 @@ mod tests {
     }
 
     #[test]
-    fn native_control_load_missing_base_fails_at_config_read() {
-        // The native control entrypoint proves the base tier is present FIRST (arch-config read),
-        // exactly like the t2i native entrypoint — a bogus base fails there, before any tensor I/O.
-        let e = load_control_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            "/nonexistent-krea/control.safetensors",
-            &[],
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+    fn native_control_load_missing_base_fails_during_asset_inventory() {
+        // The native control entrypoint proves the base tier is present first, exactly like the t2i
+        // native entrypoint. An incomplete base fails during the fail-closed asset inventory before any
+        // tensor materialization.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base, control) = incomplete_native_control_fixture(&tmp);
+        let e = load_control_from_native_dit_file(&dit, &base, &control, &[])
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
-            e.contains("config.json") || e.contains("read"),
-            "expected the missing-base config-read error, got: {e}"
+            e.contains("native base VAE asset facts"),
+            "expected the missing-base inventory error, got: {e}"
         );
     }
 
     #[test]
     fn native_control_load_accepts_adapters_without_early_rejection() {
         // Adapters thread through the native control assembly (parity with the snapshot control
-        // load's `spec.adapters`) and must NOT be rejected at the door — with a bogus base the load
-        // still fails first at the config read, never at an "adapters unsupported" guard.
+        // load's `spec.adapters`) and must NOT be rejected at the door — with an incomplete base the
+        // load still fails first at asset inventory, never at an "adapters unsupported" guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, base, control) = incomplete_native_control_fixture(&tmp);
+        let adapter = tmp.path().join("style.safetensors");
+        write_minimal_safetensors(&adapter);
         let adapters = vec![mlx_gen::AdapterSpec::new(
-            std::path::PathBuf::from("/nonexistent-krea/style.safetensors"),
+            adapter,
             1.0,
             mlx_gen::AdapterKind::Lora,
         )];
-        let e = load_control_from_native_dit_file(
-            "/nonexistent-krea/dit.safetensors",
-            "/nonexistent-krea",
-            "/nonexistent-krea/control.safetensors",
-            &adapters,
-        )
-        .err()
-        .expect("missing base snapshot → err")
-        .to_string();
+        let e = load_control_from_native_dit_file(&dit, &base, &control, &adapters)
+            .err()
+            .expect("missing base snapshot → err")
+            .to_string();
         assert!(
             !e.to_lowercase().contains("not yet supported")
                 && !e.to_lowercase().contains("not supported"),
             "adapters must be accepted by the native control loader, got: {e}"
         );
+        assert!(
+            e.contains("native base VAE asset facts"),
+            "expected the missing-base inventory error, got: {e}"
+        );
     }
 
     #[test]
     fn native_control_valid_config_reaches_fail_closed_asset_sizing() {
-        // A parseable arch config advances the load to the memory contract's fail-closed component
-        // sizing, which requires the base text encoder / VAE and the pose overlay to actually hold
-        // tensor bytes — a torn base or missing overlay fails loudly here, before any weight load.
+        // Real pinned DiT/control files plus a parseable arch config remove ambient path and config
+        // ambiguity. The memory contract must fail at component sizing because the intentionally
+        // incomplete base has no text encoder / VAE, before any weight materialization.
         let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
-        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        let (dit, root, control) = incomplete_native_control_fixture(&root_tmp);
 
-        let e = load_control_from_native_dit_file(
-            root.join("missing-dit.safetensors"),
-            &root,
-            root.join("missing-control.safetensors"),
-            &[],
-        )
-        .err()
-        .expect("missing required components must fail")
-        .to_string();
+        let e = load_control_from_native_dit_file(&dit, &root, &control, &[])
+            .err()
+            .expect("missing required components must fail")
+            .to_string();
         assert!(
-            e.contains("asset facts"),
-            "expected the post-config asset-sizing stage, got: {e}"
+            e.contains("native base VAE asset facts"),
+            "expected the fail-closed base asset-sizing stage, got: {e}"
         );
         assert!(!e.contains("config.json"), "config was valid, got: {e}");
     }
@@ -867,11 +1145,11 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_base() {
+    fn load_rejects_single_file_without_companion_base() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/krea.safetensors".into()))
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
     }
 
     #[test]
@@ -939,10 +1217,10 @@ mod tests {
     /// `model::native_load_folds_edit_adapter`): the discriminating check the GPU-free tests can't
     /// run (the branch fold needs a real DiT/base/overlay). Set `KREA_NATIVE_DIT` to a ComfyUI
     /// single-file Krea 2 DiT (e.g. a community fine-tune), `KREA_TURBO_DIR` to a resident turnkey
-    /// snapshot tier (dense bf16), and `KREA_CONTROL_OVERLAY` to the converted pose control-branch
-    /// overlay. Asserts the concrete assembly carries the `krea_2_turbo_control` identity with the
-    /// dense-base ⇒ dense-branch tier consequence, so the imported composition is the builtin one
-    /// with only the DiT swapped.
+    /// snapshot tier (this fixture uses dense bf16), and `KREA_CONTROL_OVERLAY` to the converted pose
+    /// control-branch overlay. Asserts the concrete assembly carries the `krea_2_turbo_control`
+    /// identity with the dense-fixture branch tier, so the imported composition is the builtin one
+    /// with only the DiT swapped. The ordinary parity tests separately cover Q4/Q8 admission.
     #[test]
     #[ignore = "needs real weights: set KREA_NATIVE_DIT, KREA_TURBO_DIR, KREA_CONTROL_OVERLAY"]
     fn native_control_load_assembles_branch_on_imported_dit() {
@@ -981,8 +1259,8 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir(
             "/nonexistent/krea-control-residency-test-snapshot".into(),
         ))
-        .with_control(WeightsSource::File(
-            "/nonexistent/krea-control-residency-test-overlay.safetensors".into(),
+        .with_control(WeightsSource::Dir(
+            "/nonexistent/krea-control-residency-test-overlay".into(),
         ))
         .with_offload_policy(policy)
     }

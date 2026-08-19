@@ -73,11 +73,20 @@ impl BlockAdapters {
         let mut per_path = Vec::new();
         for path in B::ADAPTER_PATHS {
             let segments: Vec<&str> = path.split('.').collect();
-            if let Some(target) = block.adapter_target(&segments) {
-                let adapters = target.adapters();
-                if !adapters.is_empty() {
-                    per_path.push(((*path).to_owned(), adapters.to_vec()));
-                }
+            // SC-18319 — this walks EVERY path in the block, so it asks through the PROBE half and
+            // takes the `&mut` only where something is actually installed. Resolving `&mut`-first
+            // would unfuse every `FusedQkvProjection` in the stack during a capture that copies
+            // nothing.
+            if block
+                .adapter_facts(&segments)
+                .is_some_and(|f| f.adapter_count > 0)
+            {
+                let adapters = block
+                    .adapter_target(&segments)
+                    .expect("resolved through the probe above")
+                    .adapters()
+                    .to_vec();
+                per_path.push(((*path).to_owned(), adapters));
             }
         }
         Self { per_path }
@@ -108,7 +117,9 @@ impl BlockAdapters {
     fn verify<B: StreamBlock>(&self, block: &mut B, what: &str) -> Result<()> {
         for (path, adapters) in &self.per_path {
             let segments: Vec<&str> = path.split('.').collect();
-            let installed = block.adapter_target(&segments).map(|t| t.adapters().len());
+            // SC-18319 — a count is a probe question; the verify pass must not unfuse what the
+            // replay just rebuilt.
+            let installed = block.adapter_facts(&segments).map(|f| f.adapter_count);
             if installed != Some(adapters.len()) {
                 return Err(Error::Msg(format!(
                     "chroma block stream: {what} came back with {installed:?} adapters at `{path}` \

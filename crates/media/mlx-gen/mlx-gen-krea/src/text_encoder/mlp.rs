@@ -39,4 +39,10 @@ impl Qwen3Mlp {
         self.down.quantize(bits, None)?;
         Ok(())
     }
+
+    pub(crate) fn materialize_weights(&self) -> Result<()> {
+        self.gate.materialize_weights()?;
+        self.up.materialize_weights()?;
+        self.down.materialize_weights()
+    }
 }

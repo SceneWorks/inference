@@ -369,7 +369,13 @@ impl Pipeline {
     ) -> Result<Image> {
         let latents = unpack(latents, height as usize, width as usize)?;
         let decoded = match pid {
-            Some(pid) => pid.decode(&latents)?,
+            Some(pid) => {
+                candle_gen::ensure_decoder_compatible(
+                    Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
+                    pid,
+                )?;
+                pid.decode(&latents)?
+            }
             None => vae.decode(&latents)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
         };
         let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;

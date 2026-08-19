@@ -80,6 +80,7 @@ pub fn register_providers(
         .register_activation_memory(BASE_ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: "anima_base",
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract("anima_base", spec)
@@ -89,6 +90,7 @@ pub fn register_providers(
         .register_generator(model::AESTHETIC_REGISTRATION)
         .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: "anima_aesthetic",
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract("anima_aesthetic", spec)
@@ -98,6 +100,7 @@ pub fn register_providers(
         .register_generator(model::TURBO_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
             provider_id: "anima_turbo",
             contract: |spec| {
                 memory_strategy::weights_free_memory_strategy_contract("anima_turbo", spec)

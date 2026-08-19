@@ -10,10 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::SdxlVaeDecoder;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
-use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
 
 use candle_gen::gen_core::{AdapterSpec, WeightsSource};
 use candle_gen::{CandleError, Result};
@@ -164,19 +163,30 @@ pub fn load_vendored_unet_with_adapters(
 
 /// Load the f16-stable SDXL VAE (`madebyollin/sdxl-vae-fp16-fix`) from the caller-staged `vae_fp16_fix`
 /// component (epic 13657, sc-13663 — passed in, never self-fetched) at `dtype`. Resolution-agnostic —
-/// `build_vae` reads only the autoencoder sub-config.
+/// only the autoencoder sub-config is read.
+///
+/// Builds [`SdxlVaeDecoder`] rather than the stock `AutoEncoderKL` (sc-19753): the layer-wise
+/// bounded decode has to reach inside the decoder, which the upstream type does not allow. Only the
+/// decode half is loaded — `AutoEncoderKL::encode` was never called from this crate — so this also
+/// drops the encoder tower and `quant_conv` from residency.
+/// `tests/vae_decoder_parity.rs` pins that its decode matches `StableDiffusionConfig::sdxl`'s own
+/// `build_vae`, config included.
 pub fn load_sdxl_vae(
     vae_fp16_fix: &WeightsSource,
     device: &Device,
     dtype: DType,
-) -> Result<AutoEncoderKL> {
-    let config = StableDiffusionConfig::sdxl(None, None, None);
-    Ok(config.build_vae(resolve_vae_file(vae_fp16_fix), device, dtype)?)
+) -> Result<SdxlVaeDecoder> {
+    SdxlVaeDecoder::from_file(
+        &resolve_vae_file(vae_fp16_fix),
+        device,
+        dtype,
+        &crate::pipeline::sdxl_vae_config(),
+    )
 }
 
 /// Load the **deterministic VAE moments-encoder** for the SDXL edit path (sc-6037) — the encode
 /// counterpart of [`load_sdxl_vae`], built from the SAME f16-stable VAE checkpoint
-/// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposes only `decode` plus a
+/// (`madebyollin/sdxl-vae-fp16-fix`). candle's stock `AutoEncoderKL` exposed only `decode` plus a
 /// device-RNG `sample` (non-portable; the very thing sc-3673 banned), so `VaeMomentsEncoder`
 /// (vendored for the trainer, sc-5165) is reused to take the clean latent **mean** × `VAE_SCALE`
 /// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).

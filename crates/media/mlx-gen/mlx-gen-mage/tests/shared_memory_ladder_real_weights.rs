@@ -144,9 +144,13 @@ fn selection(
             MemoryNumericTier {
                 precision: Precision::Bf16,
                 quant: tier(),
-                component_precision_floors: (mlx_gen_mage::model::REGISTRATION.descriptor)()
-                    .capabilities
-                    .component_precision_floors,
+                component_precision_floors: if tier() == Some(Quant::Q4) {
+                    (mlx_gen_mage::model::REGISTRATION.descriptor)()
+                        .capabilities
+                        .component_precision_floors
+                } else {
+                    &[]
+                },
             },
             false,
         )
@@ -172,6 +176,7 @@ fn context(
         * 1_000_000_000.0)
         .round() as u64;
     MemoryRunContext {
+        optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
         calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
