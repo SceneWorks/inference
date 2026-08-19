@@ -80,6 +80,10 @@ pub use denoise_passes::{
     ResolvedDenoisePass, ResolvedDenoisePlan, DEFAULT_PASS_DENOISE, DENOISE_PASS_CONTRACT_VERSION,
     DENOISE_PASS_SEED_SALT, MAX_DENOISE_PASSES,
 };
+pub use denoise_passes::{
+    any_pass_overrides_adapters, pass_adapter_specs, DenoisePassExecutionRecord,
+    DenoisePlanExecution,
+};
 pub use encoder_contract::{
     read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
     EncoderConfigBool, EncoderConfigFloat, EncoderContract, EncoderPackingContract,
@@ -158,7 +162,8 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, DenoisePassReportSink,
+    FileStatFingerprint, IdentityWeights,
     LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
     PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
     Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,

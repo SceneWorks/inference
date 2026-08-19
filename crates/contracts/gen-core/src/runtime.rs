@@ -1863,6 +1863,46 @@ impl std::fmt::Debug for PromptEnhancementSink {
     }
 }
 
+/// Synchronous request-local sink for the chained denoise-pass **execution record**
+/// ([`DenoisePlanExecution`](crate::denoise_passes::DenoisePlanExecution), sc-20418).
+///
+/// A provider that executes a `denoisePasses` chain emits exactly **one** record per generation —
+/// the resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus the effective
+/// schedule/evaluation accounting — so upstream metadata persists what actually ran without
+/// re-deriving it. The inert default is free ([`PreviewSink`] pattern); an active consumer should
+/// forward the record promptly rather than serialize inside the callback. Requests with no
+/// `denoisePasses` never emit (the legacy single-pass path is byte-untouched).
+#[derive(Clone, Default)]
+pub struct DenoisePassReportSink(
+    Option<Arc<dyn Fn(crate::denoise_passes::DenoisePlanExecution) + Send + Sync>>,
+);
+
+impl DenoisePassReportSink {
+    pub fn new(
+        sink: impl Fn(crate::denoise_passes::DenoisePlanExecution) + Send + Sync + 'static,
+    ) -> Self {
+        Self(Some(Arc::new(sink)))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn emit(&self, record: crate::denoise_passes::DenoisePlanExecution) {
+        if let Some(sink) = &self.0 {
+            sink(record);
+        }
+    }
+}
+
+impl std::fmt::Debug for DenoisePassReportSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DenoisePassReportSink")
+            .field(&self.is_active())
+            .finish()
+    }
+}
+
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {

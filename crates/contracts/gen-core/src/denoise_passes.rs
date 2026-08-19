@@ -1378,6 +1378,168 @@ impl ResolvedDenoisePlan {
     }
 }
 
+// =================================================================================================
+// Execution records (sc-20418) — what the executor actually ran, for upstream metadata.
+// =================================================================================================
+
+/// The [`AdapterSpec`](crate::AdapterSpec) list one pass runs — **every** load-time adapter, with the
+/// pass's weight overrides folded into [`scale`](crate::AdapterSpec::scale) by index.
+///
+/// This is the executable form of the [`DenoisePass::adapters`] **override** semantics, and it is
+/// deliberately NOT the multiphase `phase_spec_subset` (which *selects* an active subset — empty ⇒
+/// bare base). Here an empty override list returns the load-time stack verbatim at its load-time
+/// scales, an entry with `weight: None` pins the load-time scale explicitly, and `weight: Some(w)`
+/// rescales that one adapter for this pass alone. Backend-neutral host math, shared by the candle and
+/// MLX providers so the two cannot drift.
+///
+/// **Precondition:** every override index is `< all_specs.len()` — [`validate_denoise_passes`] with a
+/// [`DenoisePassContext::loaded_adapters`] bound guarantees this; out-of-range indices are skipped
+/// defensively rather than panicking (the provider re-validates with the real count).
+#[must_use]
+pub fn pass_adapter_specs(
+    overrides: &[PhaseAdapter],
+    all_specs: &[crate::AdapterSpec],
+) -> Vec<crate::AdapterSpec> {
+    let mut specs: Vec<crate::AdapterSpec> = all_specs.to_vec();
+    for entry in overrides {
+        if let (Some(spec), Some(weight)) = (specs.get_mut(entry.adapter), entry.weight) {
+            spec.scale = weight;
+        }
+    }
+    specs
+}
+
+/// Whether any pass in `passes` carries an actual weight override (`weight: Some(_)`).
+///
+/// The discriminator a provider uses to decide between running the whole chain on its
+/// already-loaded model (no override anywhere ⇒ the load-time stack is untouched) and building a
+/// job-local re-adaptable model (any override ⇒ per-pass re-materialization on a job-local copy,
+/// never the shared resident). Entries with `weight: None` are documentation-only pins and do not
+/// force the job-local path.
+#[must_use]
+pub fn any_pass_overrides_adapters(passes: &[ResolvedDenoisePass]) -> bool {
+    passes
+        .iter()
+        .any(|p| p.adapters.iter().any(|a| a.weight.is_some()))
+}
+
+/// What one pass **actually executed** (sc-20418): the resolved contract values plus the effective
+/// schedule/evaluation accounting the executor measured. This is the per-pass record upstream
+/// metadata persists beside the render.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DenoisePassExecutionRecord {
+    /// The pass as the user requested it — `None` for the implicit one-pass plan of a request with
+    /// no `denoisePasses` (there is no requested pass object to echo). Attached by the provider via
+    /// [`DenoisePlanExecution::with_requested`], since the executor consumes only the resolved plan.
+    pub requested: Option<DenoisePass>,
+    /// The fully-resolved pass (explicit sampler/scheduler/steps/denoise/guidance/seed/adapters).
+    pub resolved: ResolvedDenoisePass,
+    /// The step count the pass's **full fresh schedule** was built for — `steps` expanded by the
+    /// Comfy-style `denoise` semantics (`⌊steps / denoise⌋` when `denoise < 1`).
+    pub schedule_steps: usize,
+    /// How many sigma nodes the schedule builder actually returned (a re-striding curated scheduler
+    /// may not return `schedule_steps + 1`).
+    pub schedule_len: usize,
+    /// The steps the executor actually integrated — the terminal segment's node count minus one.
+    pub effective_steps: usize,
+    /// The **effective model evaluations** this pass cost ([`Solver::model_evals`] over the
+    /// segment) — the unit the chain's aggregate progress is denominated in.
+    pub model_evals: usize,
+    /// Whether the executor re-noised the incoming latent before this pass (every pass after the
+    /// first; pass 0 consumes the request's initial latent verbatim).
+    pub renoised: bool,
+}
+
+/// The whole-chain execution record (sc-20418): one entry per executed pass plus the aggregate
+/// evaluation budget. Emitted once per generation through
+/// [`DenoisePassReportSink`](crate::DenoisePassReportSink) so upstream metadata records what actually
+/// ran without re-deriving it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DenoisePlanExecution {
+    /// The job seed the plan's pass seeds derive from (see [`ResolvedDenoisePlan::job_seed`]).
+    pub job_seed: u64,
+    /// Per-pass execution records, in execution order.
+    pub passes: Vec<DenoisePassExecutionRecord>,
+    /// The chain's total effective model evaluations — the progress denominator.
+    pub total_model_evals: usize,
+}
+
+impl DenoisePlanExecution {
+    /// Attach the original requested passes (index-aligned) so the record carries requested AND
+    /// resolved values. `None` marks the implicit one-pass plan of a request with no
+    /// `denoisePasses`.
+    #[must_use]
+    pub fn with_requested(mut self, requested: Option<&[DenoisePass]>) -> Self {
+        if let Some(requested) = requested {
+            for (record, pass) in self.passes.iter_mut().zip(requested) {
+                record.requested = Some(pass.clone());
+            }
+        }
+        self
+    }
+
+    /// Encode the execution record as JSON (camelCase; seeds as decimal **strings**, exactly like
+    /// [`ResolvedDenoisePlan::to_json`] and for the same JavaScript-truncation reason).
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        let passes: Vec<Value> = self
+            .passes
+            .iter()
+            .map(|record| {
+                let mut object = Map::new();
+                if let Some(requested) = &record.requested {
+                    object.insert("requested".to_string(), pass_to_json(requested));
+                }
+                let mut resolved = Map::new();
+                resolved.insert("index".to_string(), Value::from(record.resolved.index));
+                resolved.insert("steps".to_string(), Value::from(record.resolved.steps));
+                resolved.insert(
+                    "sampler".to_string(),
+                    Value::from(record.resolved.sampler.as_str()),
+                );
+                resolved.insert(
+                    "scheduler".to_string(),
+                    Value::from(record.resolved.scheduler.as_str()),
+                );
+                resolved.insert("denoise".to_string(), json_f32(record.resolved.denoise));
+                if let Some(guidance) = record.resolved.guidance {
+                    resolved.insert("guidance".to_string(), json_f32(guidance));
+                }
+                resolved.insert("seed".to_string(), json_seed(record.resolved.seed));
+                resolved.insert(
+                    "adapters".to_string(),
+                    Value::Array(record.resolved.adapters.iter().map(adapter_to_json).collect()),
+                );
+                object.insert("resolved".to_string(), Value::Object(resolved));
+                object.insert(
+                    "scheduleSteps".to_string(),
+                    Value::from(record.schedule_steps),
+                );
+                object.insert("scheduleLen".to_string(), Value::from(record.schedule_len));
+                object.insert(
+                    "effectiveSteps".to_string(),
+                    Value::from(record.effective_steps),
+                );
+                object.insert("modelEvals".to_string(), Value::from(record.model_evals));
+                object.insert("renoised".to_string(), Value::from(record.renoised));
+                Value::Object(object)
+            })
+            .collect();
+        let mut root = Map::new();
+        root.insert(
+            "contractVersion".to_string(),
+            Value::from(DENOISE_PASS_CONTRACT_VERSION),
+        );
+        root.insert("jobSeed".to_string(), json_seed(self.job_seed));
+        root.insert(
+            "totalModelEvals".to_string(),
+            Value::from(self.total_model_evals),
+        );
+        root.insert("passes".to_string(), Value::Array(passes));
+        Value::Object(root)
+    }
+}
+
 /// Compare two JSON values, allowing numbers to differ by at most `tolerance`.
 ///
 /// Exists because the contract's floats are `f32` and a fixture is authored in decimal: an exact

@@ -33,6 +33,7 @@
 pub mod cfgpp;
 pub mod latent_ops;
 pub mod model_sampling;
+pub mod pass_executor;
 pub mod schedulers;
 pub mod solvers;
 pub mod unified;
@@ -54,6 +55,11 @@ pub use schedulers::{
 pub use solvers::{
     sampler_by_name, Abnorsett4m, AbnorsettState, Ddim, Dpmpp2m, Dpmpp2mSde, DpmppSde, ErSde,
     EulerAncestral, Heun, Lcm, Rk67s, Solver, UniPc, ABNORSETT_ORDER,
+};
+pub use pass_executor::{
+    denoise_pass_renoise_seed, denoise_pass_schedule_steps, execute_denoise_plan,
+    terminal_pass_segment, DenoisePassHost, ExecutedDenoisePlan, PassObservation,
+    DENOISE_PASS_RENOISE_SALT,
 };
 pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
 
