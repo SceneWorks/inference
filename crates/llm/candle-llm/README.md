@@ -83,12 +83,41 @@ parity tests:
 | `CANDLE_LLM_QWEN35_MODEL` | a Qwen3.6 (`qwen3_5` / Qwen3-Next) snapshot dir (27B dense or 35B-A3B MoE) | `qwen35` — resolve/dispatch, coherent text, think/no-think, Q8, conformance; **tool calling** (`qwen35_tools` — the model emits a `<tool_call>` that the provider parses into `out.tool_calls`) |
 | `CANDLE_LLM_GGUF` | a single `*.gguf` file | conformance + GGUF parity vs the HF load, **snapshot prepare** (GGUF → snapshot, dense + Q8) |
 | `CANDLE_LLM_{PHI3,QWEN2MOE,GEMMA2,GLM4,DEEPSEEK}_MODEL` | a snapshot for that architecture family | `breadth` — coherent-text streaming per family |
+| `CANDLE_LLM_GEMMA4_MODEL` | a Gemma 4 unified snapshot dir (e.g. `google/gemma-4-12B-it`) | `breadth` — coherent-text streaming; `gemma4_decoder` — the real-weight per-layer-type forward (hidden-state stack + soft-capped logits) |
 | `CANDLE_LLM_VLM_MODEL` | a SigLIP-based `LlavaForConditionalGeneration` snapshot dir (small: `llava-hf/llava-interleave-qwen-0.5b-hf`; faithful: JoyCaption) | `vlm` — image captioning + the multimodal conformance check |
 
 The `breadth` test streams a prompt through each non-Llama architecture: **Phi-3** (packed qkv/gate_up),
 **Qwen2-MoE** (router + experts + shared, q/k/v bias), **Gemma-2** (sandwich norms + soft-caps + GeGLU),
-**GLM-4** (sandwich + partial/interleaved RoPE), and **DeepSeek-V2** (Multi-head Latent Attention +
-fine-grained MoE; verified on `deepseek-ai/DeepSeek-V2-Lite-Chat`, which fits in 96GB).
+**GLM-4** (sandwich + partial/interleaved RoPE), **DeepSeek-V2** (Multi-head Latent Attention +
+fine-grained MoE; verified on `deepseek-ai/DeepSeek-V2-Lite-Chat`, which fits in 96GB), and
+**Gemma 4 unified** (the per-layer-type decoder — see below).
+
+**Gemma 4** is the first architecture whose layers are *not* uniform: `layer_types` alternates 40
+`sliding_attention` layers (head_dim 256, θ=10 000, 1024-key window, 8 KV heads) with 8
+`full_attention` ones (head_dim 512, `proportional` θ=1 000 000 with `partial_rotary_factor` 0.25, 1
+KV head, and `attention_k_eq_v` — one shared key/value projection, so those layers carry no `v_proj`
+at all). The decoder therefore reads `ModelConfig::layer_attention` per layer and carries one RoPE
+per layer *type* (`RopeTables`); norms are plain `weight` (not Gemma-2's `1 + weight`), the attention
+scale is `1.0`, the value heads take a scale-free per-head RMSNorm, and every block's output is
+multiplied by a learned per-layer `layer_scalar` after both residual adds.
+
+Two further Gemma 4 knobs are implemented even though the shipped LTX-2.5 encoder leaves them off:
+`num_kv_shared_layers` (the trailing layers project no K/V at all and attend the last earlier layer
+of their **own** type) and `use_double_wide_mlp` (those same layers get a 2x inner width). Their
+donor keys/values are published per forward rather than carried in the cache, so a *continued*
+generation on such a model is refused by name — a single forward from an empty cache, which is what
+a text encoder runs, is exact.
+
+Because the two layer types disagree on `(n_kv_heads, head_dim)`, the single-shape **paged** pool
+cannot serve the stack — use the contiguous cache and the `Exact` continuous mode; both refuse
+Gemma 4 by name rather than attending the wrong shape.
+
+`tests/gemma4_decoder.rs` pins the numbers against
+`crates/llm/testdata/gemma4/gemma4_decoder_goldens.json` — a backend-neutral fixture owned by
+sc-18760 that `mlx-llm` asserts against too, so a divergence between the two ports fails on one of
+them rather than going unnoticed. It ships mutation oracles (a skipped `layer_scalar`, V read off
+the normed key, a dropped window, a leading-slice partial RoPE) which the suite requires to differ
+from the truth.
 
 The `prefix` test covers **shared-prefix KV reuse** (`generate_cached` over a `PrefixCache`): a request
 sharing a leading run of tokens with a stored one (a system prompt, a few-shot preamble, a growing
