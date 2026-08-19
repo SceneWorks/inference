@@ -23,8 +23,8 @@
 //! |---|---|---|---|
 //! | DiT attention + FFN Linears (1344) | **yes** | 37.04 GB | [`crate::transformer::Linear`] (`.scales` predicate) |
 //! | the two embeddings connectors' attention + FFN Linears (96) | **yes** | 4.02 GB | [`crate::connector::Connector`] (sc-18775) |
-//! | Gemma 4 attention + MLP projections (328) | **yes** | 21.85 GB | `mlx_llm::primitives::projection::Projection` (`config.quantization`) |
 //! | the two `text_embedding_projection.*_aggregate_embed` Linears | **yes** | 2.31 GB | [`crate::text_encoder::LtxTextEncoder`] (sc-18775) |
+//! | Gemma 4 attention + MLP projections (328) | **yes** | 21.85 GB | `mlx_llm::primitives::projection::Projection` (`config.quantization`) |
 //! | `model.embed_tokens` | no | 2.01 GB | an embedding **lookup**, not a matmul — mlx-llm has no quantized-embedding read path, and the weight is tied to an LM head LTX never runs |
 //! | the Gemma vision tower / audio + multimodal projectors | no | 0.08 GB | not on the LTX text path at all; carried verbatim so the pack stays self-contained |
 //! | conv video VAE, audio VAE, vocoder, both latent upsamplers | no | 3.07 GB | **zero** rank-2 Linear weights between them — every weight is a Conv1d/2d/3d kernel, a norm, or a per-channel statistic, and MLX has no quantized convolution |
@@ -39,7 +39,15 @@
 //!
 //! Each tier directory is a SceneWorks split bundle in the shape [`crate::model::load`] already
 //! consumes — the same per-component `.safetensors` + `embedded_config.json` + `split_model.json`
-//! the 2.3 converter emits — with two 2.5-specific additions:
+//! the 2.3 converter emits.
+//!
+//! One component boundary is deliberately **not** upstream's: the LTX-2.5 text-encoder file carries
+//! `text_embedding_projection.*`, and the tier moves it into `connector.safetensors`. That is where
+//! LTX-2.3 keeps it and where [`crate::text_encoder::LtxTextEncoder`]'s feature heads read it from,
+//! so the tier stays a drop-in for the shipped ports instead of requiring a loader signature change
+//! for a weight that is a text-stage weight either way.
+//!
+//! Two 2.5-specific additions on top of the 2.3 shape:
 //!
 //! * every component file **keeps its own `__metadata__`** (the upstream `config` slice,
 //!   `model_version`, the transformer's `gemma_source_checkpoint`, the text encoder's `gemma_config`,
@@ -51,6 +59,9 @@
 //!
 //! # Traps this module is written around
 //!
+//! * **This conversion runs on MLX's CPU stream** ([`CpuConversion`]). It is bandwidth-bound work
+//!   with no kernel worth dispatching, and on the GPU stream the multi-GB materializations trip
+//!   Metal's command-buffer watchdog — measured, twice, on the 26.3 GB text encoder.
 //! * **`save_file` metadata order is not stable.** Two byte-identical conversions can produce
 //!   different files, so nothing here — and nothing downstream — may verify a tier by hashing it.
 //!   Verification is by *content measurement* (per-tensor dtype, quant geometry, key sets).
@@ -69,7 +80,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Device, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent, LtxResolvedComponent};
 use mlx_gen::weights::Weights;
@@ -216,13 +227,10 @@ const GEMMA_QUANT_SUFFIXES: &[&str] = &[
     ".mlp.down_proj",
 ];
 
-/// The LTX text-embedding projection Linears that ride inside the 2.5 text-encoder file (LTX-2.3
-/// kept them in `connector.safetensors`). Each is a `[out, 188160]` matmul — 2.31 GB of the two
-/// together — consumed by [`crate::text_encoder::LtxTextEncoder`]'s feature heads.
-const TEXT_PROJECTION_QUANT_SUFFIXES: &[&str] = &[
-    "text_embedding_projection.video_aggregate_embed",
-    "text_embedding_projection.audio_aggregate_embed",
-];
+/// Key prefix of the LTX text-embedding projection. It rides inside the LTX-2.5 **text-encoder**
+/// file; the tier moves it into `connector.safetensors`, where LTX-2.3 keeps it and where
+/// [`crate::text_encoder::LtxTextEncoder`]'s feature heads read it from.
+pub const TEXT_PROJECTION_PREFIX: &str = "text_embedding_projection.";
 
 /// Whether `key` names a weight this component quantizes at a quantized tier.
 ///
@@ -233,15 +241,17 @@ fn matches_quant_suffix(key: &str, suffixes: &[&str]) -> bool {
         .is_some_and(|base| suffixes.iter().any(|s| base.ends_with(s)))
 }
 
-/// The text encoder's quantized set: the Gemma decoder projections plus the two LTX aggregate
-/// embeds. Never the packed HF asset tensors (`tokenizer_json`, `hf_asset__*`), which are `U8`
-/// payloads, nor `model.embed_tokens.weight`.
+/// The text encoder's quantized set: the Gemma decoder projections, and nothing else.
+///
+/// Never the packed HF asset tensors (`tokenizer_json`, `hf_asset__*`) — they are `U8` payloads and
+/// quantizing one would corrupt the tokenizer — and never `model.embed_tokens.weight`, which is an
+/// embedding **lookup**. The two `text_embedding_projection` aggregate embeds are quantized too, but
+/// under [`CONNECTOR_QUANT_SUFFIXES`]: the tier moves them into the connector component.
 fn is_text_encoder_quantizable(key: &str) -> bool {
     if mlx_gen::gen_core::gemma_assets::is_gemma_asset_key(key) {
         return false;
     }
     matches_quant_suffix(key, GEMMA_QUANT_SUFFIXES)
-        || matches_quant_suffix(key, TEXT_PROJECTION_QUANT_SUFFIXES)
 }
 
 // =================================================================================================
@@ -337,6 +347,10 @@ impl LtxTierReport {
             "quantization_group_size": self.group_size,
             "components": self.components.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
             "component_detail": components,
+            // Weights only. The sidecars are written after this value is computed — a manifest
+            // whose own size fed back into a total it declares could never be self-consistent — so
+            // `LtxTierReport::bytes` (which adds them) is deliberately the larger number, and it is
+            // the one sc-18781's `footprint.diskSizeBytes` should carry.
             "total_bytes": self.bytes,
             "source": serde_json::Value::Object(sources),
         })
@@ -413,6 +427,73 @@ fn rank2_float_weights(map: &HashMap<String, Array>) -> usize {
         .count()
 }
 
+/// Byte budget for one `eval` submission (measured against the arrays' logical size).
+///
+/// MLX is lazy, so a single `eval` over a whole component's tensor map materializes that component's
+/// entire graph in one shot — 4349 tensors and 1344 `quantize` ops for the transformer, 26.3 GB of
+/// Gemma weights for the text encoder. Batching bounds the transient working set to something that
+/// leaves room for the source mapping and the write buffer, instead of asking the allocator for the
+/// whole component at once.
+const EVAL_BATCH_BYTES: usize = 512 * 1024 * 1024;
+
+/// `eval` a component's tensors in bounded batches. See [`EVAL_BATCH_BYTES`].
+///
+/// Iteration order is the map's, which is arbitrary but irrelevant: every tensor is an independent
+/// leaf of the write, so any partition into batches produces identical bytes.
+fn eval_in_batches<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<()> {
+    let mut batch: Vec<&Array> = Vec::new();
+    let mut bytes = 0usize;
+    for array in arrays {
+        bytes = bytes.saturating_add(array.nbytes());
+        batch.push(array);
+        if bytes >= EVAL_BATCH_BYTES {
+            eval(batch.iter().copied())?;
+            batch.clear();
+            bytes = 0;
+        }
+    }
+    if !batch.is_empty() {
+        eval(batch.iter().copied())?;
+    }
+    Ok(())
+}
+
+/// Runs a tier conversion on MLX's **CPU** stream, restoring the previous default device on drop.
+///
+/// A weight conversion has no business on the Metal command queue. It is an offline,
+/// bandwidth-bound job — read a tensor, quantize or cast it, write it — with no kernel worth
+/// dispatching and nothing to gain from the GPU, and putting it there costs two things that both
+/// bit during this story:
+///
+/// 1. **The watchdog.** Metal kills a command buffer that runs too long. Materializing the 26.3 GB
+///    text encoder came back as `kIOGPUCommandBufferCallbackErrorTimeout` — and once one buffer
+///    fails, every later submission in the process returns
+///    `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`, so the failure is not even local to the
+///    component that caused it. Both were measured on this conversion, twice.
+/// 2. **The device.** This machine's GPU is also what renders; a multi-minute conversion holding the
+///    queue is a conversion that cannot run beside anything else.
+///
+/// Setting the default device is global to the process, so this is an RAII guard rather than a
+/// one-way switch: a caller that converts and then runs a forward (every real-weights test here
+/// does) gets its GPU back, panic or not.
+struct CpuConversion {
+    previous: Device,
+}
+
+impl CpuConversion {
+    fn enter() -> Result<Self> {
+        let previous = Device::try_default()?;
+        Device::set_default(&Device::cpu());
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for CpuConversion {
+    fn drop(&mut self) {
+        Device::set_default(&self.previous);
+    }
+}
+
 /// Materialize and write one component, then measure the file that landed.
 ///
 /// Deliberately measures **after** the write: the report is a statement about bytes on disk, which
@@ -426,8 +507,7 @@ fn write_component(
     dense_reason: Option<DenseReason>,
 ) -> Result<LtxTierComponentReport> {
     let file = dir.join(format!("{}.safetensors", emit.name));
-    let arrays: Vec<&Array> = emit.weights.values().collect();
-    eval(arrays)?;
+    eval_in_batches(emit.weights.values())?;
     let metadata: HashMap<String, String> = emit
         .metadata
         .iter()
@@ -539,14 +619,16 @@ fn component_metadata(resolved: &LtxResolvedComponent, tier: LtxTier) -> BTreeMa
     metadata
 }
 
-/// Metadata derived from another component's, for the pieces a 2.5 component file is split into
-/// (the connector out of the transformer, the two VAE halves out of one VAE file).
+/// Metadata for the **secondary** half of a source file the tier splits in two — the connector out
+/// of the transformer, the encoder out of each video VAE, the vocoder out of the audio VAE.
 ///
-/// The `config` key is **dropped** rather than copied: a `vae_encoder.safetensors` carrying
-/// `config.vae` would classify as a second `conv_video_vae` and make the directory scan ambiguous,
-/// and a `connector.safetensors` carrying `config.transformer` would classify as a second
-/// transformer. Their configs are not lost — they ride on the component the split came from and in
-/// the tier's merged `embedded_config.json`, which is what the shipped ports read.
+/// The `config` key is **dropped** rather than copied, so that exactly one emitted file declares
+/// each [`LtxComponent`] slot. A `vae_encoder.safetensors` carrying `config.vae` would classify as a
+/// second `conv_video_vae` and make [`mlx_gen::gen_core::ltx_checkpoint::discover_split_bundle`]
+/// refuse the whole tree as ambiguous; a `connector.safetensors` carrying `config.transformer`
+/// would do the same to the transformer slot. The configs are not lost — the primary half of the
+/// same split keeps the whole slice ([`component_metadata`]), and the tier's merged
+/// `embedded_config.json` carries every section, which is what the shipped ports read.
 fn derived_metadata(
     resolved: &LtxResolvedComponent,
     tier: LtxTier,
@@ -636,10 +718,16 @@ pub fn convert_2_5_tier(
             "ltx tiers: group size must be positive, got {group_size}"
         )));
     }
+    // Everything below runs on the CPU stream and the caller's device is restored on the way out.
+    let _cpu = CpuConversion::enter()?;
 
     let mut components: Vec<LtxTierComponentReport> = Vec::new();
     let mut embedded = serde_json::Map::new();
     let mut sources: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // Assembled from two source files (the connector towers from the transformer, the text-embedding
+    // projection from the text encoder) and written once both are in hand.
+    let mut connector: HashMap<String, Array>;
+    let connector_meta: BTreeMap<String, String>;
 
     // ---- transformer + the two embeddings connectors -------------------------------------------
     {
@@ -663,12 +751,15 @@ pub fn convert_2_5_tier(
             group_size,
             |key| matches_quant_suffix(key, TRANSFORMER_QUANT_SUFFIXES),
         )?);
-        mlx_rs::memory::clear_cache();
-
-        // The connector is emitted as its own file, exactly as the 2.3 bundle does: the text-encoder
-        // stage runs it long before the DiT is resident, and folding 4 GB of connector into an 11 GB
-        // (q4) transformer file would force the whole DiT in to produce text embeddings.
-        let connector = build_connector_component(&raw);
+        // The two embeddings connectors are lifted out of the transformer file and emitted as their
+        // own component, exactly as the 2.3 bundle does: the text-encoder stage runs them long
+        // before the DiT is resident, and folding 4 GB of connector into an 11 GB (q4) transformer
+        // file would force the whole DiT in just to produce text embeddings.
+        //
+        // Held (not yet written) because the LTX text-embedding projection belongs in the same file
+        // and lives in a different source — see the text-encoder step below. These are unevaluated
+        // memory-mapped views until then, so holding them costs page cache, not resident RAM.
+        connector = build_connector_component(&raw);
         if connector.is_empty() {
             return Err(Error::Msg(format!(
                 "ltx tiers: {} carries no `*_embeddings_connector.*` tensors — an LTX-2.5 \
@@ -676,23 +767,20 @@ pub fn convert_2_5_tier(
                 resolved.path().display()
             )));
         }
-        components.push(emit_component(
-            out,
-            Emit {
-                name: "connector",
-                weights: connector,
-                metadata: derived_metadata(resolved, tier, "transformer"),
-                exempt: None,
-            },
-            tier,
-            group_size,
-            |key| matches_quant_suffix(key, CONNECTOR_QUANT_SUFFIXES),
-        )?);
+        connector_meta = derived_metadata(resolved, tier, "transformer");
         drop(raw);
         mlx_rs::memory::clear_cache();
     }
 
-    // ---- text encoder ---------------------------------------------------------------------------
+    // ---- text encoder + the text-embedding projection --------------------------------------------
+    //
+    // LTX-2.3 kept `text_embedding_projection.*` in `connector.safetensors`; LTX-2.5 ships it inside
+    // the text-encoder file. The **tier puts it back with the connectors**, because that is the file
+    // [`crate::text_encoder::LtxTextEncoder`] reads both from — its `video_head`/`audio_head` take
+    // one `connector_w` carrying the `aggregate_embed` Linear *and* the connector tower. Leaving the
+    // projection in the text-encoder file would make an otherwise drop-in tier need a signature
+    // change in whatever loads it (sc-18778), for no benefit: the two aggregate embeds are a
+    // text-stage weight either way, and this keeps every LTX bundle, 2.3 and 2.5, one shape.
     {
         let resolved = bundle.require(LtxComponent::TextEncoder)?;
         sources.insert("text_encoder".into(), resolved.path().to_path_buf());
@@ -704,13 +792,31 @@ pub fn convert_2_5_tier(
             )));
         }
         let raw = Weights::from_file(resolved.path())?;
+        let mut encoder = passthrough_map(&raw);
+        let projection: Vec<String> = encoder
+            .keys()
+            .filter(|k| k.starts_with(TEXT_PROJECTION_PREFIX))
+            .cloned()
+            .collect();
+        if projection.is_empty() {
+            return Err(Error::Msg(format!(
+                "ltx tiers: {} carries no `{TEXT_PROJECTION_PREFIX}*` tensors — the LTX-2.5 text \
+                 encoder ships the video/audio aggregate embeds the feature heads project through",
+                resolved.path().display()
+            )));
+        }
+        for key in projection {
+            let value = encoder.remove(&key).expect("key from keys()");
+            connector.insert(key, value);
+        }
+
         let mut metadata = component_metadata(resolved, tier);
         stamp_gemma_quantization(&mut metadata, tier, group_size, resolved.path())?;
         components.push(emit_component(
             out,
             Emit {
                 name: "text_encoder",
-                weights: passthrough_map(&raw),
+                weights: encoder,
                 metadata,
                 exempt: None,
             },
@@ -721,6 +827,21 @@ pub fn convert_2_5_tier(
         drop(raw);
         mlx_rs::memory::clear_cache();
     }
+
+    // ---- connector (both towers + the text-embedding projection) ----------------------------------
+    components.push(emit_component(
+        out,
+        Emit {
+            name: "connector",
+            weights: connector,
+            metadata: connector_meta,
+            exempt: None,
+        },
+        tier,
+        group_size,
+        |key| matches_quant_suffix(key, CONNECTOR_QUANT_SUFFIXES),
+    )?);
+    mlx_rs::memory::clear_cache();
 
     // ---- conv video VAE (encoder + decoder) -----------------------------------------------------
     {
@@ -733,9 +854,22 @@ pub fn convert_2_5_tier(
         let _ = crate::config::LtxVaeConfig::from_embedded_vae(&vae_block)?;
         embedded.insert("vae".into(), vae_block);
 
-        for (name, weights) in [
-            ("vae_decoder", sanitize_vae_decoder_component(&raw)?),
-            ("vae_encoder", sanitize_vae_encoder_component(&raw)?),
+        // The **decoder** carries the `config.vae` slice and so is the file that classifies as
+        // `conv_video_vae`; the encoder half carries none. Exactly one file per component slot may
+        // declare itself, or a directory scan over the tier tree is ambiguous — and the decoder is
+        // the right one to be it, because a "video VAE" that cannot decode is not the component a
+        // caller resolving `conv_video_vae` is asking for.
+        for (name, weights, metadata) in [
+            (
+                "vae_decoder",
+                sanitize_vae_decoder_component(&raw)?,
+                component_metadata(resolved, tier),
+            ),
+            (
+                "vae_encoder",
+                sanitize_vae_encoder_component(&raw)?,
+                derived_metadata(resolved, tier, "conv_video_vae"),
+            ),
         ] {
             if weights.is_empty() {
                 return Err(Error::Msg(format!(
@@ -748,7 +882,7 @@ pub fn convert_2_5_tier(
                 Emit {
                     name,
                     weights,
-                    metadata: derived_metadata(resolved, tier, "conv_video_vae"),
+                    metadata,
                     exempt: Some(DenseReason::NoLinearWeights),
                 },
                 tier,
@@ -789,6 +923,10 @@ pub fn convert_2_5_tier(
             |_| false,
         )?);
 
+        // As with the conv VAE, the decoder is the file that carries `config.vae` — here declaring
+        // `CausalDiffusionVAE`, so it is the one that classifies as `diffusion_video_vae`. A DiffVAE
+        // file carrying no diffusion decoder is not a DiffVAE, and leaving the slot unclaimed in
+        // that case is the honest outcome rather than pointing it at a conv encoder.
         let decoder = sanitize_vae_decoder_component(&raw)?;
         let has_stages = decoder.keys().any(|k| k.starts_with("det_stages."));
         let has_blocks = decoder.keys().any(|k| k.starts_with("diff_blocks."));
@@ -798,7 +936,7 @@ pub fn convert_2_5_tier(
                 Emit {
                     name: "vae_diffusion_decoder",
                     weights: decoder,
-                    metadata: derived_metadata(resolved, tier, "diffusion_video_vae"),
+                    metadata: component_metadata(resolved, tier),
                     exempt: Some(DenseReason::NoMlxPort("sc-18766")),
                 },
                 tier,
@@ -817,9 +955,21 @@ pub fn convert_2_5_tier(
         for section in ["audio_vae", "vocoder"] {
             embedded.insert(section.into(), resolved.config_section(section)?.clone());
         }
-        for (name, weights) in [
-            ("audio_vae", sanitize_audio_vae_component(&raw)?),
-            ("vocoder", sanitize_vocoder_component(&raw)?),
+        // Upstream packs the audio VAE and the vocoder in one file carrying both config sections;
+        // the tier splits the weights but keeps the whole config on `audio_vae.safetensors`, which
+        // is therefore the file that classifies as the `audio_vae` component. `vocoder` is not an
+        // `LtxComponent` slot at all, so its file declaring nothing is correct rather than a loss.
+        for (name, weights, metadata) in [
+            (
+                "audio_vae",
+                sanitize_audio_vae_component(&raw)?,
+                component_metadata(resolved, tier),
+            ),
+            (
+                "vocoder",
+                sanitize_vocoder_component(&raw)?,
+                derived_metadata(resolved, tier, "audio_vae"),
+            ),
         ] {
             if weights.is_empty() {
                 return Err(Error::Msg(format!(
@@ -832,7 +982,7 @@ pub fn convert_2_5_tier(
                 Emit {
                     name,
                     weights,
-                    metadata: derived_metadata(resolved, tier, "audio_vae"),
+                    metadata,
                     exempt: Some(DenseReason::NoLinearWeights),
                 },
                 tier,

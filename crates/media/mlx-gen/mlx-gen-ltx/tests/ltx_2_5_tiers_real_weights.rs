@@ -17,15 +17,22 @@
 //! # Running
 //!
 //! ```text
-//! LTX25_BUNDLE_DIR=/path/to/Lightricks--LTX-2.5/snapshots/<rev> \
+//! LTX25_BUNDLE_DIR=/path/to/a/curated/ltx-2.5-distilled-bf16 \
 //! LTX25_TIER_DIR=/path/to/scratch/ltx25-tiers \
 //!   cargo test -p mlx-gen-ltx --release --test ltx_2_5_tiers_real_weights -- --ignored --nocapture
 //! ```
 //!
-//! `LTX25_BUNDLE_DIR` is the upstream snapshot root (scanned recursively and classified by each
-//! file's own metadata — never by name). `LTX25_TIER_DIR` is where the tiers are written and is
-//! **required**: three tiers are ~135 GB and must not land in a temp dir by accident. Paths are
-//! supplied by the caller; this crate never names a model cache or derives one.
+//! `LTX25_BUNDLE_DIR` holds **exactly one file per component** and is scanned recursively, each file
+//! classified by its own metadata — never by name. It is deliberately *not* the raw upstream
+//! snapshot root: that ships five transformers (distilled/dev × bf16/int8/nvfp4) and two text
+//! encoders, and [`discover_split_bundle`] refuses an ambiguous component rather than guessing which
+//! variant a tier should be built from. Point this at a directory of symlinks selecting the
+//! **distilled bf16** variant (the epic's tier source — the 42 GB dev variant is open decision #5 and
+//! is deliberately not converted here, though nothing in the converter precludes it).
+//!
+//! `LTX25_TIER_DIR` is where the tiers are written and is **required**: three tiers are ~50 GB and
+//! must not land in a temp dir by accident. Paths are supplied by the caller; this crate never names
+//! a model cache or derives one.
 //!
 //! # Cost
 //!
@@ -240,40 +247,15 @@ fn manifest(root: &Path, tier: LtxTier) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
 }
 
-/// Reload a tier directory as a bundle through the split resolver, with the SceneWorks component
-/// names mapped onto their [`LtxComponent`] slots.
+/// Reload a tier directory as a bundle **through the directory scan** — the same route
+/// `crate::bundle::resolve_split_bundle` takes when no component is staged explicitly.
 ///
-/// The tier tree splits the upstream conv-VAE file into two halves and lifts the connector out of
-/// the transformer, so the slots that carry one file each are provisioned explicitly; the rest of
-/// the tree's classification is exercised by [`discover_split_bundle`] in
-/// `a_tier_tree_resolves_through_the_split_resolver`.
+/// Deliberately not a hand-provisioned builder: a tier tree that only resolves when the caller
+/// already knows which file is which is not a drop-in for the shipped loader, and the whole point of
+/// the metadata the converter preserves is that the scan can answer that question itself.
 fn tier_bundle(root: &Path, tier: LtxTier) -> LtxBundle {
-    let dir = root.join(tier.id());
-    let mut builder = mlx_gen::gen_core::ltx_checkpoint::LtxBundleBuilder::new()
-        .with_component(
-            LtxComponent::Transformer,
-            dir.join("transformer.safetensors"),
-        )
-        .with_component(
-            LtxComponent::TextEncoder,
-            dir.join("text_encoder.safetensors"),
-        )
-        .with_component(
-            LtxComponent::ConvVideoVae,
-            dir.join("vae_decoder.safetensors"),
-        )
-        .with_component(LtxComponent::AudioVae, dir.join("audio_vae.safetensors"));
-    for (component, name) in [
-        (LtxComponent::SpatialUpsampler, "spatial_upsampler"),
-        (LtxComponent::TemporalUpsampler, "temporal_upsampler"),
-        (LtxComponent::DurationHead, "duration_head"),
-    ] {
-        let path = dir.join(format!("{name}.safetensors"));
-        if path.is_file() {
-            builder = builder.with_component(component, path);
-        }
-    }
-    builder.build().expect("the tier tree must resolve")
+    discover_split_bundle(root.join(tier.id()))
+        .unwrap_or_else(|e| panic!("{tier}: the tier tree must resolve through the scan: {e}"))
 }
 
 // =================================================================================================
@@ -297,7 +279,9 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
     // Counts derived from the checkpoint's own declared geometry, never pinned literals.
     let cfg = LtxConfig::from_model_dir(&root.join(LtxTier::Bf16.id())).expect("tier config");
     let dit_linears = (cfg.num_layers as usize) * (6 * 4 + 4);
-    let connector_linears = (cfg.connector_num_layers as usize) * 6 * 2;
+    // Six Linears per connector block across the video and audio towers, plus the two
+    // `text_embedding_projection` aggregate embeds the tier moves into this component.
+    let connector_linears = (cfg.connector_num_layers as usize) * 6 * 2 + 2;
 
     let mut totals: Vec<(LtxTier, u64)> = Vec::new();
     for tier in LtxTier::ALL {
@@ -395,8 +379,7 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
                 "down_proj",
             ]
             .iter()
-            .any(|p| key.ends_with(&format!(".{p}.weight")))
-                || key.ends_with("_aggregate_embed.weight");
+            .any(|p| key.ends_with(&format!(".{p}.weight")));
             if !is_proj {
                 continue;
             }
@@ -408,15 +391,37 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
                 "{tier}/text_encoder/{key}: packed state must follow the tier"
             );
         }
-        assert!(
-            projections > 300,
-            "{tier}: the real Gemma 4 encoder has 328 decoder projections plus the two aggregate \
-             embeds; found {projections}"
+        assert_eq!(
+            projections, 328,
+            "{tier}: the real Gemma 4 encoder has 48x(q,k,o,gate,up,down) + 40 v_proj = 328 \
+             decoder projections"
         );
         assert_eq!(
             te.tensors["model.embed_tokens.weight"].dtype, "BF16",
             "{tier}: the embedding table is an exempt lookup"
         );
+        // The text-embedding projection has moved to the connector component (where LTX-2.3 keeps
+        // it and where the feature heads read it from) — so it must be absent here and present,
+        // packed, there.
+        assert!(
+            !te.tensors
+                .keys()
+                .any(|k| k.starts_with("text_embedding_projection.")),
+            "{tier}: the tier moves the text-embedding projection into the connector component"
+        );
+        let conn = component_header(&root, *tier, "connector");
+        for head in ["video", "audio"] {
+            let base = format!("text_embedding_projection.{head}_aggregate_embed");
+            assert!(
+                conn.tensors.contains_key(&format!("{base}.bias")),
+                "{tier}: the connector must carry {base}.bias"
+            );
+            assert_eq!(
+                conn.tensors.contains_key(&format!("{base}.scales")),
+                tier.bits().is_some(),
+                "{tier}: {base} packed state must follow the tier"
+            );
+        }
 
         totals.push((*tier, tier_bytes));
         eprintln!(
@@ -454,16 +459,33 @@ fn a_tier_tree_resolves_through_the_split_resolver() {
         // deliberately carry no config section of their own.
         let scanned = discover_split_bundle(&dir)
             .unwrap_or_else(|e| panic!("{tier}: the tier tree must resolve unambiguously: {e}"));
-        for component in [
-            LtxComponent::Transformer,
-            LtxComponent::TextEncoder,
-            LtxComponent::AudioVae,
-            LtxComponent::DurationHead,
+        for (component, file) in [
+            (LtxComponent::Transformer, "transformer.safetensors"),
+            (LtxComponent::TextEncoder, "text_encoder.safetensors"),
+            (LtxComponent::ConvVideoVae, "vae_decoder.safetensors"),
+            (
+                LtxComponent::DiffusionVideoVae,
+                "vae_diffusion_decoder.safetensors",
+            ),
+            (LtxComponent::AudioVae, "audio_vae.safetensors"),
+            (
+                LtxComponent::SpatialUpsampler,
+                "spatial_upsampler.safetensors",
+            ),
+            (
+                LtxComponent::TemporalUpsampler,
+                "temporal_upsampler.safetensors",
+            ),
+            (LtxComponent::DurationHead, "duration_head.safetensors"),
         ] {
+            let resolved = scanned.require(component).unwrap_or_else(|e| {
+                panic!("{tier}: {} must resolve from the scan: {e}", component.id())
+            });
             assert!(
-                scanned.require(component).is_ok(),
-                "{tier}: {} must resolve from the scan",
-                component.id()
+                resolved.path().ends_with(file),
+                "{tier}: {} resolved to {}, expected {file}",
+                component.id(),
+                resolved.path().display()
             );
         }
 
@@ -698,28 +720,55 @@ fn every_component_loads_and_forwards_at_every_tier() {
         }
 
         // ---- latent upsamplers --------------------------------------------------------------------
-        for name in ["spatial_upsampler", "temporal_upsampler"] {
-            let path = dir.join(format!("{name}.safetensors"));
-            if !path.is_file() {
-                continue;
-            }
-            let w = Weights::from_file(&path).unwrap();
+        //
+        // Only the **spatial** one is driven. Both files carry the same key families, but the
+        // temporal upsampler's `upsampler.0.weight` is a rank-5 Conv3d where the spatial one's is a
+        // rank-4 Conv2d, and this crate's `LatentUpsampler` implements the spatial resampler only —
+        // its temporal twin is a later story in this epic. Running it here would measure that gap
+        // rather than the tier. The temporal component is still asserted structurally, which is the
+        // part a tier conversion can actually break.
+        {
+            let w = Weights::from_file(dir.join("spatial_upsampler.safetensors")).unwrap();
             let up = LatentUpsampler::from_weights(&w)
-                .unwrap_or_else(|e| panic!("{tier}: build {name}: {e}"));
+                .unwrap_or_else(|e| panic!("{tier}: build the spatial upsampler: {e}"));
             drop(w);
             clear_cache();
             let latent = Array::ones::<f32>(&[1, 128, 2, 8, 8]).unwrap();
             let out = up
                 .forward(&latent)
-                .unwrap_or_else(|e| panic!("{tier}: {name} forward: {e}"));
+                .unwrap_or_else(|e| panic!("{tier}: spatial upsampler forward: {e}"));
             out.eval().unwrap();
-            eprintln!("[{tier}] {name}: {:?} -> {:?}", latent.shape(), out.shape());
+            eprintln!(
+                "[{tier}] spatial upsampler: {:?} -> {:?}",
+                latent.shape(),
+                out.shape()
+            );
+            assert_eq!(
+                out.shape(),
+                &[1, 128, 2, 16, 16],
+                "{tier}: the spatial upsampler must double H and W and leave F alone"
+            );
             assert!(
                 max_abs(&out).is_finite(),
-                "{tier}: {name} produced non-finite latents"
+                "{tier}: the spatial upsampler produced non-finite latents"
             );
             drop(up);
             clear_cache();
+        }
+        {
+            let header = component_header(&root, *tier, "temporal_upsampler");
+            // Raw PyTorch layout, exactly as it ships: `LatentUpsampler`'s loader does the
+            // channels-last transpose itself, so a converter that pre-transposed here would break
+            // the port that eventually consumes it.
+            assert_eq!(
+                header.tensors["initial_conv.weight"].shape,
+                vec![512, 128, 3, 3, 3],
+                "{tier}: the temporal upsampler's conv weights must stay in PyTorch layout"
+            );
+            assert_eq!(header.tensors["upsampler.0.weight"].shape.len(), 5);
+            for (key, h) in &header.tensors {
+                assert_eq!(h.dtype, "BF16", "{tier}: temporal_upsampler/{key}");
+            }
         }
     }
 }
@@ -875,14 +924,17 @@ fn the_gemma_4_checkpoint_shapes_survive_at_every_tier() {
             32_169_626,
             "{tier}: the packed tokenizer.json must survive byte-for-byte"
         );
-        // ...and it still builds a working tokenizer.
-        let tok = mlx_gen::gen_core::gemma_assets::LtxGemmaTokenizer::from_assets(&assets)
-            .unwrap_or_else(|e| panic!("{tier}: build the tokenizer from the tier: {e}"));
-        let out = tok
+        // ...and the shipped 2.5 tokenizer (sc-18762) builds straight off the tier's packed encoder
+        // with no other file — the property that makes a tier self-contained.
+        let tok = mlx_gen_ltx::Ltx25Tokenizer::from_packed_te_file(
+            &root.join(tier.id()).join("text_encoder.safetensors"),
+        )
+        .unwrap_or_else(|e| panic!("{tier}: build Ltx25Tokenizer from the tier: {e}"));
+        let (ids, mask) = tok
             .encode("a cinematic shot of a harbour at dusk", 128)
-            .unwrap();
-        assert_eq!(out.ids.len(), 128);
-        assert!(out.mask.iter().any(|m| *m == 1));
+            .unwrap_or_else(|e| panic!("{tier}: encode through the tier's tokenizer: {e}"));
+        assert_eq!(ids.shape(), &[1, 128]);
+        assert_eq!(mask.shape(), &[1, 128]);
 
         // The `quantization` block that binds the packed projections is present iff the tier packs.
         let gemma: serde_json::Value = serde_json::from_str(&te.metadata["gemma_config"]).unwrap();

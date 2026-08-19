@@ -79,6 +79,10 @@ pub(crate) const TRANSFORMER_QUANT_SUFFIXES: &[&str] = &[
 /// 4 MB across both connectors, and quantizing a multiplicative gate buys nothing measurable while
 /// perturbing every attention output. Norms, biases and the learnable registers are excluded for the
 /// same reason the DiT excludes them — they are not matmul weights.
+/// The two `text_embedding_projection.*_aggregate_embed` Linears are included: they live in the
+/// LTX-2.5 text-encoder file but the tier moves them into this component (where LTX-2.3 keeps them
+/// and where [`crate::text_encoder::LtxTextEncoder`]'s feature heads read them from), and at
+/// `[4096, 188160]` and `[2048, 188160]` they are 2.31 GB of the two together.
 pub(crate) const CONNECTOR_QUANT_SUFFIXES: &[&str] = &[
     ".attn1.to_q",
     ".attn1.to_k",
@@ -86,6 +90,8 @@ pub(crate) const CONNECTOR_QUANT_SUFFIXES: &[&str] = &[
     ".attn1.to_out.0",
     ".ff.net.0.proj",
     ".ff.net.2",
+    "text_embedding_projection.video_aggregate_embed",
+    "text_embedding_projection.audio_aggregate_embed",
 ];
 
 /// The LTX-2.3 latent-upsampler component specs (component prefix → source filename in the base

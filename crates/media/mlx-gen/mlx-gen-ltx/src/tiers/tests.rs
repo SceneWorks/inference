@@ -563,8 +563,10 @@ fn every_quantizable_segment_lands_at_the_tier_precision() {
     // Gemma's 3-or-4 attention projections + 3 MLP projections per layer, plus the two LTX
     // aggregate embeds.
     let dit = BLOCKS * (6 * 4 + 4);
-    let connector = CONNECTOR_BLOCKS * 6 * 2;
-    let gemma = GEMMA_LAYERS * 6 + (GEMMA_LAYERS - GEMMA_FULL_LAYERS.len()) + 2;
+    // Both connector towers, plus the two `text_embedding_projection` aggregate embeds the tier
+    // moves here out of the text-encoder file.
+    let connector = CONNECTOR_BLOCKS * 6 * 2 + 2;
+    let gemma = GEMMA_LAYERS * 6 + (GEMMA_LAYERS - GEMMA_FULL_LAYERS.len());
 
     for report in &reports {
         let quantized = report.bits.is_some();
@@ -959,13 +961,55 @@ fn a_tier_directory_resolves_and_its_sidecars_parse() {
     assert_eq!(vae.latent_channels, 128);
     assert_eq!(vae.patch_size, 4);
 
-    // Re-resolving the produced tree through the scan must not be ambiguous: the split halves and
-    // the connector deliberately carry no config section of their own.
+    // **Every component slot the source bundle carried must resolve from a scan of the tier tree**,
+    // and no slot may be ambiguous. This is the property that makes a tier a drop-in for
+    // `resolve_split_bundle`, and it is exactly what breaks if a split half keeps a config section
+    // it should have dropped (two files claiming one slot) or drops one it should have kept (no
+    // file claiming it).
     let scanned = mlx_gen::gen_core::ltx_checkpoint::discover_split_bundle(&out)
         .expect("a tier tree must resolve without an ambiguous component");
-    assert!(scanned.require(LtxComponent::Transformer).is_ok());
-    assert!(scanned.require(LtxComponent::TextEncoder).is_ok());
-    assert!(scanned.require(LtxComponent::DurationHead).is_ok());
+    for component in [
+        LtxComponent::Transformer,
+        LtxComponent::TextEncoder,
+        LtxComponent::ConvVideoVae,
+        LtxComponent::AudioVae,
+        LtxComponent::SpatialUpsampler,
+        LtxComponent::TemporalUpsampler,
+        LtxComponent::DurationHead,
+    ] {
+        let resolved = scanned
+            .require(component)
+            .unwrap_or_else(|e| panic!("{} must resolve from the tier tree: {e}", component.id()));
+        // ...and it must resolve to the file that actually holds that component's weights.
+        let expected = match component {
+            LtxComponent::ConvVideoVae => "vae_decoder.safetensors",
+            LtxComponent::TextEncoder => "text_encoder.safetensors",
+            LtxComponent::Transformer => "transformer.safetensors",
+            LtxComponent::AudioVae => "audio_vae.safetensors",
+            LtxComponent::SpatialUpsampler => "spatial_upsampler.safetensors",
+            LtxComponent::TemporalUpsampler => "temporal_upsampler.safetensors",
+            LtxComponent::DurationHead => "duration_head.safetensors",
+            other => panic!("unexpected component {}", other.id()),
+        };
+        assert!(
+            resolved.path().ends_with(expected),
+            "{} resolved to {}, expected {expected}",
+            component.id(),
+            resolved.path().display()
+        );
+    }
+    // The secondary halves declare nothing, so they are searched-but-unclaimed rather than rival
+    // candidates for a slot.
+    for name in ["connector", "vae_encoder", "vocoder"] {
+        let path = out.join(format!("{name}.safetensors"));
+        let meta = mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata::from_file(&path)
+            .unwrap_or_else(|e| panic!("read {name} metadata: {e}"));
+        assert_eq!(
+            meta.classify(),
+            None,
+            "{name} must not claim a component slot"
+        );
+    }
 }
 
 /// Two conversions of the same input agree on **content** even though their bytes may differ.
@@ -1038,10 +1082,24 @@ fn the_text_encoder_predicate_covers_the_projections_and_nothing_else() {
         "model.layers.11.self_attn.o_proj.weight",
         "model.layers.0.mlp.down_proj.weight",
         "model.language_model.layers.0.mlp.up_proj.weight",
+    ] {
+        assert!(is_text_encoder_quantizable(key), "should quantize: {key}");
+    }
+    // The aggregate embeds ARE quantized — but under the connector's predicate, because the tier
+    // moves them into that component. Asserting both halves here keeps the split honest: a future
+    // change that stopped moving them would leave them matched by neither list and silently dense.
+    for key in [
         "text_embedding_projection.video_aggregate_embed.weight",
         "text_embedding_projection.audio_aggregate_embed.weight",
     ] {
-        assert!(is_text_encoder_quantizable(key), "should quantize: {key}");
+        assert!(
+            !is_text_encoder_quantizable(key),
+            "the text encoder no longer owns: {key}"
+        );
+        assert!(
+            matches_quant_suffix(key, CONNECTOR_QUANT_SUFFIXES),
+            "the connector must own: {key}"
+        );
     }
     for key in [
         "model.embed_tokens.weight",
