@@ -131,12 +131,22 @@ pub fn check_schedule_goldens(resolve: &ScheduleResolver<'_>) -> Result<(), Stri
     }
 }
 
+/// Whether a golden for `scheduler` must be exactly `steps + 1` long. The advanced pair and most
+/// curated builders preserve the requested length; ComfyUI's `ddim_uniform` re-strides and the two
+/// beta variants dedup consecutive table indices, so their recorded lengths are whatever the
+/// builder produced (still pinned byte-for-byte by [`check_schedule_goldens`]).
+fn golden_length_is_exact(scheduler: &str) -> bool {
+    !matches!(scheduler, "ddim_uniform" | "beta" | "beta57")
+}
+
 /// The golden table's own coverage contract: representative short and production-length schedules,
-/// including the epic-20414 KreaMania 10-step and 4-step passes, for both advanced schedulers.
+/// including the epic-20414 KreaMania 10-step and 4-step passes, for **every** scheduler id — the
+/// advanced pair (sc-20416) and the curated eight (byte-pinned in sc-20418).
 pub fn check_schedule_golden_coverage() -> Result<(), String> {
+    use gen_core::sampling::Scheduler;
     let goldens = schedule_goldens();
     let mut failures: Vec<String> = Vec::new();
-    for scheduler in ["linear_quadratic", "bong_tangent"] {
+    for scheduler in Scheduler::EVERY.iter().map(|s| s.name()) {
         let steps: Vec<usize> = goldens
             .iter()
             .filter(|c| c.scheduler == scheduler)
@@ -151,13 +161,21 @@ pub fn check_schedule_golden_coverage() -> Result<(), String> {
         }
     }
     for case in &goldens {
-        if case.sigmas.len() != case.steps + 1 {
+        if golden_length_is_exact(&case.scheduler) && case.sigmas.len() != case.steps + 1 {
             failures.push(format!(
                 "schedule goldens: {} @ {} steps has {} sigmas, expected {}",
                 case.scheduler,
                 case.steps,
                 case.sigmas.len(),
                 case.steps + 1
+            ));
+        }
+        if case.sigmas.len() < 2 {
+            failures.push(format!(
+                "schedule goldens: {} @ {} steps is degenerate ({} node(s))",
+                case.scheduler,
+                case.steps,
+                case.sigmas.len()
             ));
         }
         if case.sigmas.last() != Some(&0.0) {
@@ -215,16 +233,24 @@ mod tests {
         });
     }
 
-    /// Only the gated advanced ids appear in the table — the curated menu's output is pinned by
-    /// gen-core's own regression guard, not here.
+    /// The table covers exactly the known scheduler vocabulary — the advanced pair AND (since
+    /// sc-20418) the curated eight, whose builder math previously had no external byte-pin (its
+    /// only guard recomputed both sides from the same Rust builders). No unknown id may appear.
     #[test]
-    fn goldens_cover_only_the_advanced_pass_schedulers() {
-        let advanced: Vec<&str> = Scheduler::ADVANCED_PASS.iter().map(|s| s.name()).collect();
-        for case in schedule_goldens() {
+    fn goldens_cover_every_scheduler_and_nothing_else() {
+        let known: Vec<&str> = Scheduler::EVERY.iter().map(|s| s.name()).collect();
+        let goldens = schedule_goldens();
+        for case in &goldens {
             assert!(
-                advanced.contains(&case.scheduler.as_str()),
+                known.contains(&case.scheduler.as_str()),
                 "unexpected golden scheduler {:?}",
                 case.scheduler
+            );
+        }
+        for id in known {
+            assert!(
+                goldens.iter().any(|c| c.scheduler == id),
+                "scheduler {id:?} has no golden cases"
             );
         }
     }

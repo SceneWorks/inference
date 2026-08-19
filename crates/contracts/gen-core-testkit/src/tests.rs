@@ -367,6 +367,92 @@ fn dishonest_validate_fails_validate_check() {
     assert!(check_validate_honesty(&g, &cheap()).is_err());
 }
 
+/// A generator whose `validate` rejects one id its descriptor still advertises — the menu-honesty
+/// mutation the positive sampler/scheduler loops in [`check_validate_honesty`] exist to catch.
+/// (The shared `Capabilities::validate_request` floor can never produce this shape — only a
+/// bespoke provider `validate` layered on top can — which is exactly why the loops probe the
+/// provider rather than the floor.)
+struct MenuDishonest {
+    desc: ModelDescriptor,
+    reject_sampler: Option<&'static str>,
+    reject_scheduler: Option<&'static str>,
+}
+
+impl MenuDishonest {
+    fn new(
+        reject_sampler: Option<&'static str>,
+        reject_scheduler: Option<&'static str>,
+    ) -> Self {
+        let mut desc = stub_desc(STUB_ID);
+        desc.capabilities.samplers = vec!["euler", "heun"];
+        desc.capabilities.schedulers = vec!["normal", "linear_quadratic"];
+        Self {
+            desc,
+            reject_sampler,
+            reject_scheduler,
+        }
+    }
+}
+
+impl Generator for MenuDishonest {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.desc
+    }
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.desc.capabilities.validate_request(STUB_ID, req)?;
+        if let (Some(rejected), Some(requested)) = (self.reject_sampler, req.sampler.as_deref()) {
+            if requested == rejected {
+                return Err(Error::Msg(format!("{STUB_ID}: sampler {rejected} refused")));
+            }
+        }
+        if let (Some(rejected), Some(requested)) =
+            (self.reject_scheduler, req.scheduler.as_deref())
+        {
+            if requested == rejected {
+                return Err(Error::Msg(format!(
+                    "{STUB_ID}: scheduler {rejected} refused"
+                )));
+            }
+        }
+        Ok(())
+    }
+    fn generate(
+        &self,
+        _req: &GenerationRequest,
+        _on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        panic!("check_validate_honesty never calls generate()");
+    }
+}
+
+/// sc-20418 (adjacent fix): the SCHEDULER honesty loop added by sc-20416 has a working negative —
+/// a provider advertising a scheduler its `validate` rejects fails `check_validate_honesty`, and
+/// the failure names the loop. Without this, the loop could rot into never-fires.
+#[test]
+fn dishonest_scheduler_menu_fails_validate_check() {
+    let g = MenuDishonest::new(None, Some("linear_quadratic"));
+    let err = check_validate_honesty(&g, &cheap()).expect_err("dishonest scheduler must fail");
+    assert!(err.contains("advertised scheduler"), "got: {err}");
+    assert!(err.contains("linear_quadratic"), "got: {err}");
+}
+
+/// The sampler twin: the pre-existing sampler loop also has a live negative.
+#[test]
+fn dishonest_sampler_menu_fails_validate_check() {
+    let g = MenuDishonest::new(Some("heun"), None);
+    let err = check_validate_honesty(&g, &cheap()).expect_err("dishonest sampler must fail");
+    assert!(err.contains("advertised sampler"), "got: {err}");
+    assert!(err.contains("heun"), "got: {err}");
+}
+
+/// Positive control: the same descriptor with an honest `validate` passes — proving the two
+/// negatives above fail on the dishonesty, not on the menus being present at all.
+#[test]
+fn honest_menus_pass_validate_check() {
+    let g = MenuDishonest::new(None, None);
+    check_validate_honesty(&g, &cheap()).unwrap();
+}
+
 #[test]
 fn audio_provider_size_exemption_passes_validate_honesty() {
     // sc-13705: an audio-lane provider (Modality::Audio) validates through the size-skipping floor

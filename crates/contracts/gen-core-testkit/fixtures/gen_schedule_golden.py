@@ -78,6 +78,24 @@ Both schedules over a sigma_max = 1.0 model (gen-core's `FlowModelSampling`), wh
 shape of the schedule; the Rust suite separately proves that a model with sigma_max != 1 yields the
 same shape scaled by sigma_max. Step counts cover degenerate (1, 2), the epic 20414 KreaMania
 recipe (10-step pass 1, 4-step pass 2), and production lengths (20, 30, 50).
+
+
+CURATED SCHEDULES (sc-20418 adjacent fix)
+-----------------------------------------
+The curated eight (`normal` / `simple` / `karras` / `exponential` / `sgm_uniform` / `beta` /
+`ddim_uniform` / `beta57`) are ALSO pinned here over the same flow model. Before sc-20418 their
+only regression guard recomputed both sides from the same Rust builders (gen-core's
+`curated_scheduler_ids_and_output_are_unchanged`), which pins the dispatcher wiring but is blind to
+a builder-body edit. These entries are the durable byte-pin: transcriptions of the published closed
+forms (Karras et al. 2022 eq. 5; geometric/log-linear spacing; ComfyUI's normal / sgm_uniform /
+simple / ddim / beta samplings over the model sigma table; the Beta-CDF timestep draw, with the
+same Lanczos-lnGamma + Numerical-Recipes-betacf + bisection inverse the Rust port derives from)
+in plain f64 Python.
+
+The flow model's discrete sigma table (used by simple / ddim_uniform / beta / beta57) is gen-core's
+default `ModelSampling::sigma_table`: 1000 nodes, linear in sigma from sigma_min = 1/1000 to
+sigma_max = 1.0. Its Rust form interpolates in f32; the committed f64 numbers differ by < 1e-7,
+inside the fixture's 1e-6 tolerance.
 """
 import json
 import math
@@ -147,6 +165,211 @@ def bong_tangent(n, slope=None, pivot=None, start=1.0, end=0.0):
     return sigmas
 
 
+# --- Curated schedules (sc-20418): the flow model surface the Rust builders read -----------------
+
+FLOW_NUM_TIMESTEPS = 1000
+FLOW_SIGMA_MIN = 1.0 / FLOW_NUM_TIMESTEPS
+FLOW_SIGMA_MAX = 1.0
+
+
+def flow_sigma_table():
+    """gen-core `ModelSampling::sigma_table` default over the unshifted flow model: 1000 nodes,
+    ascending, linear from sigma_min to sigma_max (timestep(s) = s, sigma(t) = t at mu = 0)."""
+    n = FLOW_NUM_TIMESTEPS
+    lo, hi = FLOW_SIGMA_MIN, FLOW_SIGMA_MAX
+    return [lo + (hi - lo) * (i / (n - 1)) for i in range(n)]
+
+
+def karras(n, sigma_min=FLOW_SIGMA_MIN, sigma_max=FLOW_SIGMA_MAX, rho=7.0):
+    """Karras et al. (2022) eq. 5, trailing 0. Length n + 1."""
+    min_inv = sigma_min ** (1.0 / rho)
+    max_inv = sigma_max ** (1.0 / rho)
+    out = []
+    for i in range(n):
+        ramp = 0.0 if n == 1 else i / (n - 1)
+        out.append((max_inv + ramp * (min_inv - max_inv)) ** rho)
+    out.append(0.0)
+    return out
+
+
+def exponential(n, sigma_min=FLOW_SIGMA_MIN, sigma_max=FLOW_SIGMA_MAX):
+    """Geometric (log-linear) spacing, trailing 0. Length n + 1."""
+    lmin, lmax = math.log(sigma_min), math.log(sigma_max)
+    out = []
+    for i in range(n):
+        f = 0.0 if n == 1 else i / (n - 1)
+        out.append(math.exp(lmax + (lmin - lmax) * f))
+    out.append(0.0)
+    return out
+
+
+def normal(n, sgm=False):
+    """ComfyUI normal / sgm_uniform over the flow model: timesteps lerped from timestep(sigma_max)
+    to timestep(sigma_min) (identity maps at mu = 0), trailing 0. Length n + 1."""
+    start, end = FLOW_SIGMA_MAX, FLOW_SIGMA_MIN
+    out = []
+    for i in range(n):
+        if sgm:
+            f = i / n
+        else:
+            f = 0.0 if n == 1 else i / (n - 1)
+        out.append(start + (end - start) * f)
+    out.append(0.0)
+    return out
+
+
+def simple(n):
+    """ComfyUI simple_scheduler: the sigma table sub-sampled by a fixed stride from the noisy end,
+    trailing 0. Length n + 1."""
+    table = flow_sigma_table()
+    ss = len(table) / n
+    out = []
+    for x in range(n):
+        from_end = 1 + int(x * ss)
+        idx = max(len(table) - from_end, 0)
+        out.append(table[min(idx, len(table) - 1)])
+    out.append(0.0)
+    return out
+
+
+def ddim_uniform(n):
+    """ComfyUI ddim_scheduler: a uniform stride through the table from index 1 upward, reversed,
+    trailing 0. Length is stride-dependent (~n + 1)."""
+    table = flow_sigma_table()
+    steps = n
+    if abs(table[1]) < 1e-5:
+        steps += 1
+    ss = max(len(table) // steps, 1)
+    out = []
+    x = 1
+    while x < len(table):
+        out.append(table[x])
+        x += ss
+    out.reverse()
+    out.append(0.0)
+    return out
+
+
+# Inverse Beta CDF: the same Lanczos-lnGamma + Numerical-Recipes betacf + bisection construction
+# the Rust port uses, in plain f64, so both sides compute the identical table index.
+_LANCZOS_C = [
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+]
+
+
+def ln_gamma(x):
+    if x < 0.5:
+        return math.log(math.pi) - math.log(abs(math.sin(math.pi * x))) - ln_gamma(1.0 - x)
+    x -= 1.0
+    t = x + 7.0 + 0.5
+    a = _LANCZOS_C[0]
+    for i in range(1, 9):
+        a += _LANCZOS_C[i] / (x + i)
+    return 0.5 * math.log(2.0 * math.pi) + (x + 0.5) * math.log(t) - t + math.log(a)
+
+
+def betacf(a, b, x):
+    fpmin = 1e-30
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, 300):
+        m2 = 2.0 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        del_ = d * c
+        h *= del_
+        if abs(del_ - 1.0) < 1e-13:
+            break
+    return h
+
+
+def reg_inc_beta(a, b, x):
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(
+        ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * math.log(x) + b * math.log(1.0 - x)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * betacf(a, b, x) / a
+    return 1.0 - bt * betacf(b, a, 1.0 - x) / b
+
+
+def beta_ppf(p, a, b):
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if reg_inc_beta(a, b, mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def beta_schedule(n, alpha, beta):
+    """ComfyUI beta_scheduler: inverse-Beta-CDF timesteps mapped to table indices with
+    consecutive-duplicate removal, trailing 0. Length <= n + 1."""
+    table = flow_sigma_table()
+    total = len(table) - 1
+    out = []
+    last_t = -1
+    for i in range(n):
+        ts = 1.0 - i / n
+        # Rust f64 `.round()` is half-away-from-zero; the argument is non-negative here.
+        t = int(beta_ppf(ts, alpha, beta) * total + 0.5)
+        if t != last_t:
+            out.append(table[min(max(t, 0), len(table) - 1)])
+        last_t = t
+    out.append(0.0)
+    return out
+
+
+# Every curated id, with its builder and whether its output length is exactly steps + 1.
+CURATED = [
+    ("normal", lambda n: normal(n, sgm=False), True),
+    ("simple", simple, True),
+    ("karras", karras, True),
+    ("exponential", exponential, True),
+    ("sgm_uniform", lambda n: normal(n, sgm=True), True),
+    ("beta", lambda n: beta_schedule(n, 0.6, 0.6), False),
+    ("ddim_uniform", ddim_uniform, False),
+    ("beta57", lambda n: beta_schedule(n, 0.5, 0.7), False),
+]
+
+
 def main():
     cases = []
     for n in STEP_COUNTS:
@@ -176,18 +399,37 @@ def main():
             }
         )
 
+    exact_length = {"linear_quadratic", "bong_tangent"}
+    for name, build, length_preserving in CURATED:
+        if length_preserving:
+            exact_length.add(name)
+        for n in STEP_COUNTS:
+            cases.append(
+                {
+                    "scheduler": name,
+                    "model": "flow",
+                    "steps": n,
+                    "note": "curated byte-pin (sc-20418)",
+                    "sigmas": build(n),
+                }
+            )
+
     for case in cases:
         sig = case["sigmas"]
-        assert len(sig) == case["steps"] + 1
-        assert sig[0] == 1.0 and sig[-1] == 0.0
-        assert all(math.isfinite(s) for s in sig)
-        assert all(sig[i] > sig[i + 1] for i in range(len(sig) - 1))
+        if case["scheduler"] in exact_length:
+            assert len(sig) == case["steps"] + 1, case
+        assert len(sig) >= 2, case
+        assert sig[-1] == 0.0, case
+        assert sig[0] > 0.0, case
+        assert all(math.isfinite(s) for s in sig), case
+        assert all(sig[i] > sig[i + 1] for i in range(len(sig) - 1)), case
 
     doc = {
         "meta": {
             "purpose": (
-                "Independent golden sigma schedules for the gen-core linear_quadratic and "
-                "bong_tangent schedulers (epic 20414, sc-20416)."
+                "Independent golden sigma schedules for the gen-core schedulers: the advanced "
+                "linear_quadratic + bong_tangent pair (epic 20414, sc-20416) and the curated "
+                "eight (byte-pinned in sc-20418)."
             ),
             "generator": "crates/contracts/gen-core-testkit/fixtures/gen_schedule_golden.py",
             "model": (

@@ -45,6 +45,7 @@ pub mod audio_embedder;
 pub mod audio_generator;
 pub mod audio_transform;
 pub mod captioner;
+pub mod denoise_passes;
 pub mod memory_strategy;
 pub mod schedules;
 pub mod trainer;
