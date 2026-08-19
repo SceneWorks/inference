@@ -346,6 +346,163 @@ pub struct ControlPlan {
     ctrl_tokens: Array,
 }
 
+/// Count-invariant chained denoise-pass render state (epic 20414, sc-20418), built once per request
+/// by [`KreaHeavy::prepare_denoise_passes`] and reused across the seed/count loop.
+///
+/// `Shared` — no pass overrides adapter weights: every pass runs the provider's own DiT with one
+/// step-invariant prep (zero clones, load-time stack untouched). `PerPass` — at least one override:
+/// one job-local DiT clone per pass (adapter stack = the load-time specs re-scaled by that pass's
+/// overrides) plus that clone's own prep, indexed by pass position.
+pub enum DenoisePassPlans {
+    Shared(T2iPlan),
+    PerPass(Vec<(Krea2Transformer, T2iPlan)>),
+}
+
+/// Chain-global denoise-pass preview (sc-20418): frames are numbered by the executor's
+/// `chain_step` (0-based outer step across the WHOLE chain), so a multi-pass job reads as one
+/// continuous `1..=total` trajectory instead of restarting per pass. There is no single σ array to
+/// key the shared sigma-position counter on (each pass owns a fresh schedule), so this dedups on
+/// the step index directly — the multi-eval solvers repeat a `chain_step`; only its first
+/// evaluation emits. One per image. Projection failures are swallowed (previews are decorative).
+struct PassPreview<'a> {
+    sink: &'a PreviewSink,
+    emitted: std::cell::Cell<u32>,
+}
+
+impl<'a> PassPreview<'a> {
+    fn new(sink: &'a PreviewSink) -> Self {
+        Self {
+            sink,
+            emitted: std::cell::Cell::new(0),
+        }
+    }
+
+    fn emit(&self, chain_step: usize, chain_total_steps: usize, latents: &Array) {
+        if !self.sink.is_active() {
+            return;
+        }
+        let total = chain_total_steps.max(1) as u32;
+        let candidate = (chain_step as u32 + 1).min(total);
+        if candidate <= self.emitted.get() {
+            return;
+        }
+        // Consume the position before projecting (the shared emit_preview contract): a failed
+        // projection loses only this decorative frame and is never retried as a duplicate.
+        self.emitted.set(candidate);
+        if let Ok(image) = mlx_gen_qwen_image::preview::project_spatial_latents(latents) {
+            self.sink.emit(mlx_gen::gen_core::PreviewFrame {
+                current: candidate,
+                total,
+                image,
+            });
+        }
+    }
+}
+
+/// The MLX Krea [`gen_core::sampling::DenoisePassHost`]: the family schedule builders, the per-pass
+/// forward (per-pass CFG combined inside via the shared [`KreaHeavy::prepared_cfg_velocity`], the
+/// MLX per-evaluation `eval` compute boundary included), and the chain-global preview.
+struct KreaPassHost<'a> {
+    heavy: &'a KreaHeavy,
+    plans: &'a DenoisePassPlans,
+    is_raw: bool,
+    width: u32,
+    height: u32,
+    attention: mlx_gen::attention::AttentionPlan<'a>,
+    preview: PassPreview<'a>,
+}
+
+impl KreaPassHost<'_> {
+    fn pass_state(
+        &self,
+        pass: &mlx_gen::gen_core::ResolvedDenoisePass,
+    ) -> mlx_gen::gen_core::Result<(&Krea2Transformer, &T2iPlan)> {
+        match self.plans {
+            DenoisePassPlans::Shared(plan) => Ok((&self.heavy.dit, plan)),
+            DenoisePassPlans::PerPass(per_pass) => per_pass
+                .get(pass.index)
+                .map(|(dit, plan)| (dit, plan))
+                .ok_or_else(|| {
+                    mlx_gen::gen_core::Error::Msg(format!(
+                        "krea_2 denoise passes: no prepared plan for pass {}",
+                        pass.index
+                    ))
+                }),
+        }
+    }
+}
+
+impl mlx_gen::gen_core::sampling::DenoisePassHost<mlx_gen::MlxLatentOps> for KreaPassHost<'_> {
+    fn build_schedule(
+        &mut self,
+        pass: &mlx_gen::gen_core::ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> mlx_gen::gen_core::Result<Vec<f32>> {
+        // The pass's resolved scheduler id goes through the family's ordinary resolver: a curated
+        // or gated-advanced id builds via `schedule_sigmas` over the family mu; the advertised
+        // native alias (`flow_match`) falls back to the byte-exact native schedule.
+        Ok(if self.is_raw {
+            base_schedule(
+                schedule_steps,
+                self.width,
+                self.height,
+                Some(pass.scheduler.as_str()),
+            )
+        } else {
+            turbo_schedule(schedule_steps, Some(pass.scheduler.as_str()))
+        })
+    }
+
+    fn predict(
+        &mut self,
+        pass: &mlx_gen::gen_core::ResolvedDenoisePass,
+        x: &Array,
+        timestep: f32,
+    ) -> mlx_gen::gen_core::Result<Array> {
+        let (dit, plan) = self.pass_state(pass)?;
+        let run = || -> Result<Array> {
+            // Per-eval compute boundary (the `run_curated_sampler` contract): force the prior
+            // step's lazy graph so the chain stays cancellable per evaluation instead of becoming
+            // one un-cancellable graph that only runs at decode.
+            mlx_rs::transforms::eval([x])?;
+            let t = Array::from_slice(&[timestep], &[1]);
+            let guidance = if self.is_raw {
+                pass.guidance.unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let negative = if guidance > 0.0 {
+                Some(plan.prep_neg.as_ref().ok_or_else(|| {
+                    Error::Msg(
+                        "krea_2 denoise passes: a CFG pass (guidance > 0) requires the \
+                         unconditional prep, but the plan was built without one"
+                            .into(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            let v = KreaHeavy::prepared_cfg_velocity(
+                dit,
+                x,
+                &t,
+                &plan.prep_pos,
+                negative,
+                guidance,
+                None,
+                self.attention,
+            )?;
+            Ok(v.as_dtype(Dtype::Float32)?)
+        };
+        run().map_err(Into::into)
+    }
+
+    fn observe(&mut self, obs: mlx_gen::gen_core::sampling::PassObservation<'_, Array>) {
+        self.preview
+            .emit(obs.chain_step, obs.chain_total_steps, obs.latent);
+    }
+}
+
 impl KreaHeavy {
     #[allow(clippy::too_many_arguments)]
     fn prepared_cfg_velocity(
@@ -1209,6 +1366,120 @@ impl KreaHeavy {
         }
         on_progress(Progress::Decoding);
         self.decode_latents(&latent, decoder, opts, cancel)
+    }
+
+    /// Build the **count-invariant** per-pass render state for a chained denoise-pass job (epic
+    /// 20414, sc-20418) — the MLX adoption seam of the SHARED gen-core pass executor
+    /// (`gen_core::sampling::pass_executor`, which owns the runtime invariant: fresh schedule +
+    /// solver state per pass, deterministic boundary re-noise on the pass seed, chain-wide
+    /// effective-model-eval progress, cancellation at every evaluation/pass boundary).
+    ///
+    /// A chain with **no** adapter weight override runs every pass on the provider's own DiT with
+    /// ONE shared step-invariant [`T2iPlan`] — zero clones, the load-time stack untouched
+    /// (`DenoisePassPlans::Shared`). Any override builds one **job-local clone per pass**
+    /// ([`Krea2Transformer::clone_for_multiphase`], the multiphase concurrency pattern — the shared
+    /// resident is never mutated) whose adapter stack is `gen_core::pass_adapter_specs` — every
+    /// load-time spec with the pass's weight overrides folded in by index — plus that clone's own
+    /// prep (`DenoisePassPlans::PerPass`). Either way the model weights are loaded once per job:
+    /// clones are shallow, refcounted, and share the resident tensors.
+    ///
+    /// `ctx_neg` must be `Some` whenever any pass uses CFG (the caller encodes it under exactly
+    /// that condition — the multiphase precedent); a CFG pass with no negative prep is a loud error
+    /// at prepare time, never a silent single-forward render.
+    pub fn prepare_denoise_passes(
+        &self,
+        resolved: &[mlx_gen::gen_core::ResolvedDenoisePass],
+        all_specs: &[AdapterSpec],
+        is_raw: bool,
+        ctx_pos: &Array,
+        ctx_neg: Option<&Array>,
+        width: u32,
+        height: u32,
+    ) -> Result<DenoisePassPlans> {
+        validate_multiple_of(width, height, crate::RES_MULTIPLE, "krea_2")?;
+        let geom = Self::geom_latent(width, height)?;
+        let pass_uses_cfg =
+            |pass: &mlx_gen::gen_core::ResolvedDenoisePass| is_raw && pass.guidance.unwrap_or(0.0) > 0.0;
+        let neg_prep = |dit: &Krea2Transformer, needed: bool| -> Result<Option<JointPrep>> {
+            if !needed {
+                return Ok(None);
+            }
+            let neg = ctx_neg.ok_or_else(|| {
+                Error::Msg(
+                    "krea_2 denoise passes: a CFG pass (guidance > 0) needs a negative context, \
+                     but none was encoded"
+                        .into(),
+                )
+            })?;
+            Ok(Some(dit.prepare(neg, None, &geom)?))
+        };
+        if !mlx_gen::gen_core::any_pass_overrides_adapters(resolved) {
+            let prep_pos = self.dit.prepare(ctx_pos, None, &geom)?;
+            let prep_neg = neg_prep(&self.dit, resolved.iter().any(pass_uses_cfg))?;
+            return Ok(DenoisePassPlans::Shared(T2iPlan { prep_pos, prep_neg }));
+        }
+        let mut per_pass = Vec::with_capacity(resolved.len());
+        for pass in resolved {
+            // The pass's executable adapter stack: EVERY load-time spec, re-scaled by this pass's
+            // overrides (`None` entries pin the load-time scale) — the OVERRIDE semantics, not the
+            // multiphase subset SELECTION.
+            let specs = mlx_gen::gen_core::pass_adapter_specs(&pass.adapters, all_specs);
+            let dit = self.dit.clone_for_multiphase(&specs)?;
+            // Prep from THIS pass's clone (an adapter may steer the text-fusion aggregator).
+            let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
+            let prep_neg = neg_prep(&dit, pass_uses_cfg(pass))?;
+            per_pass.push((dit, T2iPlan { prep_pos, prep_neg }));
+        }
+        Ok(DenoisePassPlans::PerPass(per_pass))
+    }
+
+    /// **Chained denoise-pass render** (epic 20414, sc-20418) — one image at `opts.seed`: drive the
+    /// resolved plan through the shared gen-core executor over [`MlxLatentOps`], then decode ONCE.
+    /// The latent stays in latent space across every pass boundary (the executor re-noises in
+    /// latent space; no VAE round trip), previews are numbered by the executor's chain-global outer
+    /// step so a multi-pass job reads as one continuous trajectory, and the returned
+    /// [`DenoisePlanExecution`](mlx_gen::gen_core::DenoisePlanExecution) carries the per-pass
+    /// execution record for upstream metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_denoise_passes(
+        &self,
+        plans: &DenoisePassPlans,
+        plan: &mlx_gen::gen_core::ResolvedDenoisePlan,
+        is_raw: bool,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        preview: &PreviewSink,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Image, mlx_gen::gen_core::DenoisePlanExecution)> {
+        use mlx_gen::gen_core::sampling::{
+            execute_denoise_plan, FlowModelSampling, TimestepConvention,
+        };
+        let initial = init_noise(opts.height, opts.width, opts.seed)?;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let mut host = KreaPassHost {
+            heavy: self,
+            plans,
+            is_raw,
+            width: opts.width,
+            height: opts.height,
+            attention: opts.attention_plan(cancel),
+            preview: PassPreview::new(preview),
+        };
+        let run = execute_denoise_plan(
+            &mlx_gen::MlxLatentOps,
+            &ms,
+            plan,
+            initial,
+            &mut host,
+            cancel,
+            on_progress,
+        )?;
+        // Force the final step's lazy graph before decode (the run_curated_sampler tail contract).
+        mlx_rs::transforms::eval([&run.latent])?;
+        on_progress(Progress::Decoding);
+        let image = self.decode_latents(&run.latent, decoder, opts, cancel)?;
+        Ok((image, run.execution))
     }
 
     /// **img2img latent-init Raw true-CFG render** (`krea_2_raw`, epic 8588 slice A / sc-10224) — the
@@ -2623,6 +2894,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, 4), (2, 4), (3, 4), (4, 4)]
         );
+    }
+
+    /// sc-20418: the chained denoise-pass preview numbers frames by the executor's chain-global
+    /// outer step — one continuous `1..=total` run across pass boundaries — and dedups the
+    /// multi-eval solver repeats of a step, exactly like the σ-keyed counters do per schedule.
+    #[test]
+    fn pass_preview_numbers_chain_steps_once_across_passes() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let pv = PassPreview::new(&sink);
+        let latent = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+        // Pass 1 (2 steps): step 0 evaluated twice (a heun-style repeat), then step 1.
+        pv.emit(0, 4, &latent);
+        pv.emit(0, 4, &latent);
+        pv.emit(1, 4, &latent);
+        // Pass 2 (2 steps): the chain steps continue, never restarting at 1.
+        pv.emit(2, 4, &latent);
+        pv.emit(3, 4, &latent);
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.current, frame.total))
+                .collect::<Vec<_>>(),
+            [(1, 4), (2, 4), (3, 4), (4, 4)]
+        );
+        // An inert sink does no work and emits nothing.
+        let inert = PreviewSink::default();
+        let pv = PassPreview::new(&inert);
+        pv.emit(0, 4, &latent);
     }
 
     #[test]
