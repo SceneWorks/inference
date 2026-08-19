@@ -1979,6 +1979,285 @@ pub(crate) fn render_multiphase(
     )
 }
 
+// ---- Chained denoise passes (epic 20414, sc-20418) -----------------------------------------------
+//
+// The Krea adoption of the SHARED gen-core pass executor (`gen_core::sampling::pass_executor`): the
+// executor owns the runtime invariant (fresh schedule + solver state per pass, deterministic
+// boundary re-noise on the pass seed, chain-wide effective-model-eval progress, cancellation and
+// override-revert at safe boundaries); this file supplies only the Krea host — schedule builders
+// (`base_schedule` / `turbo_schedule` over the pass's resolved scheduler), the DiT forward with the
+// per-pass CFG combine, the pass-local adapter-weight materialization, and the preview projection.
+//
+// **Model residency.** A chain with NO adapter-weight override runs entirely on the provider's
+// already-loaded DiT (`PassDit::Shared`) — zero extra loads, the load-time stack untouched. Any
+// override forces ONE job-local base DiT (`PassDit::JobLocal`, the multiphase concurrency pattern:
+// the shared resident is never mutated) that is re-materialized per pass via the same safe additive
+// adapter path multiphase uses, and explicitly cleared at chain end. Either way the model is loaded
+// at most once per job, the latent stays in latent space across every boundary (no VAE round trip),
+// and decode runs exactly once per image after the chain.
+
+/// The job-constant inputs of one chained denoise-pass render.
+pub(crate) struct DenoisePassJob<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) native_dit: Option<&'a gen_core::PinnedWeightsFile>,
+    pub(crate) quant: Option<gen_core::Quant>,
+    pub(crate) device: &'a Device,
+    /// Raw (two-forward CFG available per pass) vs Turbo (CFG-free single forward).
+    pub(crate) raw: bool,
+    /// The load-time adapter stack (`LoadSpec::adapters`) pass overrides re-scale by index.
+    pub(crate) all_specs: &'a [AdapterSpec],
+    /// The request's resolved job seed (drawn once — F-089); image `n` re-resolves at `seed + n`.
+    pub(crate) base_seed: u64,
+    /// Resolve the plan for one image's job seed (the provider's `resolve_denoise_plan` closure).
+    pub(crate) resolve: &'a dyn Fn(u64) -> gen_core::Result<gen_core::ResolvedDenoisePlan>,
+}
+
+/// The chain's DiT: the provider's loaded model when no pass overrides adapter weights, else ONE
+/// job-local re-adaptable base (never the shared resident — the multiphase concurrency invariant).
+enum PassDit<'a> {
+    Shared(&'a Krea2Transformer),
+    JobLocal(Krea2Transformer),
+}
+
+impl PassDit<'_> {
+    fn forward(&self, x: &Tensor, t: &Tensor, context: &Tensor) -> Result<Tensor> {
+        match self {
+            PassDit::Shared(dit) => Ok(dit.forward(x, t, context)?),
+            PassDit::JobLocal(dit) => Ok(dit.forward(x, t, context)?),
+        }
+    }
+}
+
+/// The Krea [`gen_core::sampling::DenoisePassHost`]: schedule builders, the per-pass forward (CFG
+/// combined inside, exactly like the single-pass drivers), pass-local adapter materialization, and
+/// the chain-global preview counter.
+struct KreaPassHost<'h, 's, 'a> {
+    dit: &'h mut PassDit<'s>,
+    raw: bool,
+    width: u32,
+    height: u32,
+    device: &'a Device,
+    context: &'a Tensor,
+    neg_context: Option<&'a Tensor>,
+    all_specs: &'a [AdapterSpec],
+    hook: crate::preview::PassPreview<'a>,
+}
+
+impl gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> for KreaPassHost<'_, '_, '_> {
+    fn build_schedule(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> gen_core::Result<Vec<f32>> {
+        // The pass's resolved scheduler id goes through the family's ordinary resolver: a curated
+        // or gated-advanced id builds via `schedule_sigmas` over the family mu; the advertised
+        // native alias (`flow_match`) falls back to the byte-exact native schedule.
+        Ok(if self.raw {
+            base_schedule(
+                schedule_steps,
+                self.width,
+                self.height,
+                Some(pass.scheduler.as_str()),
+            )
+        } else {
+            turbo_schedule(schedule_steps, Some(pass.scheduler.as_str()))
+        })
+    }
+
+    fn begin_pass(&mut self, pass: &gen_core::ResolvedDenoisePass) -> gen_core::Result<()> {
+        if let PassDit::JobLocal(dit) = &mut *self.dit {
+            // The pass's executable adapter stack: EVERY load-time spec, with this pass's weight
+            // overrides folded in by index (`None` entries pin the load-time scale). Materialized
+            // through the same clear+install seam multiphase uses, on the job-local DiT only.
+            let specs = gen_core::pass_adapter_specs(&pass.adapters, self.all_specs);
+            materialize_multiphase_adapter_set(dit, &specs).map_err(gen_core::Error::from)?;
+        }
+        Ok(())
+    }
+
+    fn predict(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        x: &Tensor,
+        timestep: f32,
+    ) -> gen_core::Result<Tensor> {
+        let run = || -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep], (1,), self.device)?;
+            let cond = self.dit.forward(x, &t, self.context)?;
+            let guidance = pass.guidance.unwrap_or(0.0);
+            // Per-pass CFG on Raw (two forwards through the reference combine); Turbo is CFG-free
+            // (validation rejects a guidance-bearing pass there).
+            let v = if self.raw && guidance > 0.0 {
+                let nc = self.neg_context.ok_or_else(|| {
+                    CandleError::Msg(
+                        "krea_2 denoise passes: a CFG pass (guidance > 0) requires the \
+                         unconditional context, but none was encoded"
+                            .into(),
+                    )
+                })?;
+                let uncond = self.dit.forward(x, &t, nc)?;
+                krea_cfg_combine(&cond, &uncond, guidance)?
+            } else {
+                cond
+            };
+            Ok(v.to_dtype(DType::F32)?)
+        };
+        run().map_err(gen_core::Error::from)
+    }
+
+    fn observe(&mut self, obs: gen_core::sampling::PassObservation<'_, Tensor>) {
+        self.hook
+            .emit(obs.chain_step, obs.chain_total_steps, obs.latent);
+    }
+}
+
+/// The chained-pass render driver: resolve → (at most one) DiT residency decision → per-image
+/// executor run → ONE decode per image. Test-instrumentable exactly like
+/// [`render_multiphase_driver`]: `on_dit_load` fires once per job-local base load (never per pass),
+/// and `decode` observes the single post-chain latent per image.
+#[allow(clippy::too_many_arguments)]
+fn render_denoise_passes_driver<T>(
+    provider_dit: &Krea2Transformer,
+    job: &DenoisePassJob<'_>,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    dit_dtype: DType,
+    on_dit_load: &mut dyn FnMut(),
+    decode: &mut dyn FnMut(&Tensor) -> Result<T>,
+) -> Result<(Vec<T>, Option<gen_core::DenoisePlanExecution>)> {
+    let base_plan = (job.resolve)(job.base_seed).map_err(CandleError::from)?;
+    // ONE residency decision for the whole job: any pass-local weight override forces a single
+    // job-local re-adaptable base (the shared resident DiT is never mutated); otherwise the chain
+    // runs on the provider's already-loaded DiT with zero extra loads.
+    let mut pass_dit = if gen_core::any_pass_overrides_adapters(&base_plan.passes) {
+        on_dit_load();
+        PassDit::JobLocal(load_dit_base_at_dtype(
+            job.root,
+            job.native_dit,
+            job.device,
+            job.quant,
+            dit_dtype,
+        )?)
+    } else {
+        PassDit::Shared(provider_dit)
+    };
+    let ms = gen_core::sampling::FlowModelSampling::new(TimestepConvention::Sigma);
+    let mut execution: Option<gen_core::DenoisePlanExecution> = None;
+    let result = candle_gen::for_each_image_seed(job.base_seed, req.count, |seed| {
+        let plan = if seed == job.base_seed {
+            base_plan.clone()
+        } else {
+            (job.resolve)(seed).map_err(CandleError::from)?
+        };
+        let initial = init_noise(req.height, req.width, seed, job.device)?;
+        let mut host = KreaPassHost {
+            dit: &mut pass_dit,
+            raw: job.raw,
+            width: req.width,
+            height: req.height,
+            device: job.device,
+            context,
+            neg_context,
+            all_specs: job.all_specs,
+            hook: crate::preview::pass_hook(&req.preview),
+        };
+        let run = gen_core::sampling::execute_denoise_plan(
+            &candle_gen::CandleLatentOps,
+            &ms,
+            &plan,
+            initial,
+            &mut host,
+            &req.cancel,
+            on_progress,
+        )
+        .map_err(CandleError::from)?;
+        if execution.is_none() {
+            execution = Some(run.execution);
+        }
+        on_progress(Progress::Decoding);
+        decode(&run.latent)
+    });
+    // Release any job-local pass residuals on EVERY exit path (the multiphase precedent): repeated
+    // requests must never inherit the last pass's overrides, and an errored chain must not leave a
+    // poisoned adapter stack behind. The run error, when present, stays primary.
+    if let PassDit::JobLocal(dit) = &mut pass_dit {
+        let cleared = dit.clear_adapters();
+        let outputs = result?;
+        cleared?;
+        return Ok((outputs, execution));
+    }
+    Ok((result?, execution))
+}
+
+fn render_denoise_passes_with(
+    heavy: &KreaHeavy,
+    job: &DenoisePassJob<'_>,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+    let mut noop_load = || {};
+    let mut decode = |latent: &Tensor| {
+        // Denoise passes render t2i through the native Qwen VAE only (PiD is rejected up front),
+        // exactly once per image, after the whole chain.
+        let decoded = decode_via_seam(heavy.vae.as_ref(), None, latent, None, Some(&req.cancel))?;
+        to_image(&decoded)
+    };
+    render_denoise_passes_driver(
+        &heavy.dit,
+        job,
+        context,
+        neg_context,
+        req,
+        on_progress,
+        DIT_DTYPE,
+        &mut noop_load,
+        &mut decode,
+    )
+}
+
+/// Chained denoise passes on the `Resident` path (warm [`Components`]).
+pub(crate) fn render_denoise_passes_resident(
+    comps: &Components,
+    job: &DenoisePassJob<'_>,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+    render_denoise_passes_with(&comps.heavy, job, context, neg_context, req, on_progress)
+}
+
+/// Chained denoise passes on the `Sequential` path (per-request [`ResidencyHeavy`]).
+pub(crate) fn render_denoise_passes_sequential(
+    heavy: &ResidencyHeavy,
+    job: &DenoisePassJob<'_>,
+    context: &Tensor,
+    neg_context: Option<&Tensor>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+    render_denoise_passes_with(&heavy.heavy, job, context, neg_context, req, on_progress)
+}
+
+/// Encode the denoise-pass contexts from one text phase: Raw shares the multiphase encode (the
+/// negative context iff any pass uses CFG); Turbo encodes the single CFG-free context.
+pub(crate) fn encode_denoise_pass_contexts(
+    text: &KreaText,
+    req: &GenerationRequest,
+    raw: bool,
+    need_neg: bool,
+) -> Result<(Tensor, Option<Tensor>)> {
+    if raw {
+        encode_multiphase_contexts(text, req, need_neg)
+    } else {
+        Ok((encode_prompt_context(text, req)?, None))
+    }
+}
+
 /// Render the **Raw img2img** (reference-guided latent-init under full classifier-free guidance) path
 /// (sc-10226, epic 8588) — the img2img sibling of [`render_base`] seeded from a VAE-encoded reference
 /// instead of pure noise, and the full-CFG sibling of the CFG-free Turbo [`render_img2img`]. The
@@ -3152,6 +3431,290 @@ mod tests {
             assert!(after_owner_drop.contains(&"drop-text"));
             assert!(after_owner_drop.contains(&"drop-heavy"));
         }
+    }
+
+    // ---- Chained denoise passes (epic 20414, sc-20418) -------------------------------------------
+
+    fn dp_pass(
+        steps: u32,
+        sampler: &str,
+        denoise: f32,
+        adapters: Vec<candle_gen::gen_core::PhaseAdapter>,
+    ) -> gen_core::DenoisePass {
+        gen_core::DenoisePass {
+            steps: Some(steps),
+            sampler: Some(sampler.to_owned()),
+            scheduler: Some("flow_match".to_owned()),
+            denoise: Some(denoise),
+            adapters,
+            ..Default::default()
+        }
+    }
+
+    fn dp_request(seed: u64, count: u32, passes: Vec<gen_core::DenoisePass>) -> GenerationRequest {
+        GenerationRequest {
+            width: 32,
+            height: 32,
+            count,
+            seed: Some(seed),
+            denoise_passes: Some(passes),
+            ..Default::default()
+        }
+    }
+
+    /// Drive the production denoise-pass driver at F32 with an identity decode, counting DiT loads
+    /// and decode calls — the instrumentation ACs 1/2/3/5 read.
+    #[allow(clippy::type_complexity)]
+    fn dp_run(
+        provider_dit: &Krea2Transformer,
+        root: &Path,
+        native: Option<&gen_core::PinnedWeightsFile>,
+        all_specs: &[AdapterSpec],
+        context: &Tensor,
+        req: &GenerationRequest,
+    ) -> Result<(
+        Vec<Tensor>,
+        Option<gen_core::DenoisePlanExecution>,
+        usize,
+        usize,
+    )> {
+        let desc = crate::descriptor();
+        let defaults = crate::krea_denoise_defaults(false);
+        let ctx = desc
+            .capabilities
+            .denoise_pass_context(Some(all_specs.len()));
+        let base_seed = req.seed.expect("dp tests always pin the seed");
+        let resolve = |seed: u64| -> gen_core::Result<gen_core::ResolvedDenoisePlan> {
+            req.resolve_denoise_plan(seed, &defaults, &ctx)
+                .map_err(gen_core::Error::from)
+        };
+        let job = DenoisePassJob {
+            root,
+            native_dit: native,
+            quant: None,
+            device: &Device::Cpu,
+            raw: false,
+            all_specs,
+            base_seed,
+            resolve: &resolve,
+        };
+        let mut loads = 0usize;
+        let mut decodes = 0usize;
+        let mut on_load = || loads += 1;
+        let mut decode = |latent: &Tensor| {
+            decodes += 1;
+            assert_eq!(
+                latent.dims(),
+                &[1, LATENT_CHANNELS, 4, 4],
+                "the chain must hand decode ONE latent-space tensor (no pixel round trip)"
+            );
+            Ok(latent.clone())
+        };
+        let (outputs, execution) = render_denoise_passes_driver(
+            provider_dit,
+            &job,
+            context,
+            None,
+            req,
+            &mut |_| {},
+            DType::F32,
+            &mut on_load,
+            &mut decode,
+        )?;
+        Ok((outputs, execution, loads, decodes))
+    }
+
+    fn dp_write_lora(tmp: &tempfile::TempDir, file: &str, cfg: &Krea2Config) -> PathBuf {
+        use std::collections::HashMap;
+        let path = tmp.path().join(file);
+        let down = Tensor::from_vec(vec![0.05f32; 32], (1, 32), &Device::Cpu).unwrap();
+        let up =
+            Tensor::from_vec(vec![0.05f32; cfg.q_dim()], (cfg.q_dim(), 1), &Device::Cpu).unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([
+                (
+                    "transformer_blocks.0.attn.to_q.lora_A.weight".to_string(),
+                    down,
+                ),
+                ("transformer_blocks.0.attn.to_q.lora_B.weight".to_string(), up),
+            ]),
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    /// AC1 + AC3 (native route) + AC5: a ONE-pass chain over the provider's already-loaded DiT is
+    /// bit-identical to the legacy single-pass flow driver over the same schedule/seed, loads NO
+    /// extra model, and decodes exactly once.
+    #[test]
+    fn denoise_pass_one_pass_chain_matches_the_single_pass_driver_native_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, imported, cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        let dit =
+            load_dit_base_at_dtype(&root, Some(&pinned), &Device::Cpu, None, DType::F32).unwrap();
+        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+        let context = context.unsqueeze(0).unwrap();
+
+        let req = dp_request(0x5eed, 1, vec![dp_pass(2, "euler", 1.0, vec![])]);
+        let (outputs, execution, loads, decodes) =
+            dp_run(&dit, &root, Some(&pinned), &[], &context, &req).unwrap();
+        assert_eq!(loads, 0, "a no-override chain must reuse the loaded DiT");
+        assert_eq!(decodes, 1, "one decode per image, after the whole chain");
+
+        // The legacy single-pass shape: the same solver over the same native schedule and seed.
+        let sigmas = turbo_schedule(2, None);
+        let noise = init_noise(32, 32, 0x5eed, &Device::Cpu).unwrap();
+        let legacy = candle_gen::run_flow_sampler(
+            Some("euler"),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            0x5eed,
+            &gen_core::CancelFlag::new(),
+            &mut |_| {},
+            None,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), &Device::Cpu)?;
+                Ok(dit.forward(x, &t, &context)?.to_dtype(DType::F32)?)
+            },
+        )
+        .unwrap();
+        let got = outputs[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want = legacy.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, want, "one-pass chain must equal the single-pass driver");
+        let execution = execution.expect("first image records the execution");
+        assert_eq!(execution.passes.len(), 1);
+        assert!(!execution.passes[0].renoised);
+        assert_eq!(execution.total_model_evals, 2);
+    }
+
+    /// AC2 + AC5: per-pass adapter-weight overrides run through ONE job-local base (exactly one
+    /// load regardless of pass count, the shared resident untouched), a zero-weight pass equals the
+    /// bare base, and different per-pass weights produce genuinely different chains. The execution
+    /// record pins the seeds, re-noise flags and effective evaluations.
+    #[test]
+    fn denoise_pass_overrides_isolate_per_pass_with_one_job_local_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, imported, cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        let dit =
+            load_dit_base_at_dtype(&root, Some(&pinned), &Device::Cpu, None, DType::F32).unwrap();
+        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+        let context = context.unsqueeze(0).unwrap();
+        let lora = AdapterSpec::new(
+            dp_write_lora(&tmp, "dp-lora.safetensors", &cfg),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        );
+        let specs = vec![lora];
+        let ov = |w: f32| {
+            vec![candle_gen::gen_core::PhaseAdapter {
+                adapter: 0,
+                weight: Some(w),
+            }]
+        };
+
+        // Pass 2 refines at denoise 0.5: its boundary re-noise BLENDS pass 1's latent (a pass-2
+        // denoise of 1.0 would re-noise at σ = 1, where the flow convex blend deliberately
+        // discards the incoming latent — a complete re-run). The blend is what lets the assertions
+        // below see pass 1's weight through the final output.
+        let run = |p0: Vec<candle_gen::gen_core::PhaseAdapter>,
+                   p1: Vec<candle_gen::gen_core::PhaseAdapter>| {
+            let req = dp_request(
+                7,
+                1,
+                vec![dp_pass(1, "euler", 1.0, p0), dp_pass(1, "euler", 0.5, p1)],
+            );
+            dp_run(&dit, &root, Some(&pinned), &specs, &context, &req).unwrap()
+        };
+
+        // No overrides at all: the SHARED path (zero loads), load-time stack untouched — with a
+        // bare provider DiT this is the bare-base chain.
+        let (bare, _, bare_loads, _) = run(vec![], vec![]);
+        assert_eq!(bare_loads, 0);
+
+        // Zero-weight overrides: ONE job-local load (never one per pass), and the zero-scaled
+        // residual is numerically the bare base.
+        let (zero, execution, zero_loads, zero_decodes) = run(ov(0.0), ov(0.0));
+        assert_eq!(zero_loads, 1, "one job-local load per job, not per pass");
+        assert_eq!(zero_decodes, 1, "no VAE round trip between passes");
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(v(&zero[0]), v(&bare[0]));
+
+        // Full-weight and mixed chains genuinely differ — the override reaches the forward, and
+        // per-pass isolation is real (pass 1's weight is visible through pass 2's blend, and pass
+        // 2's weight does not bleed into pass 1 or vice versa).
+        let (full, _, full_loads, _) = run(ov(1.0), ov(1.0));
+        assert_eq!(full_loads, 1);
+        let (mixed, _, _, _) = run(ov(0.0), ov(1.0));
+        assert_ne!(v(&full[0]), v(&zero[0]));
+        assert_ne!(v(&mixed[0]), v(&zero[0]));
+        assert_ne!(v(&mixed[0]), v(&full[0]));
+
+        // AC2 bookkeeping: pass seeds are domain-separated from the job seed and recorded.
+        let execution = execution.expect("execution recorded");
+        assert_eq!(execution.job_seed, 7);
+        assert_eq!(execution.passes[0].resolved.seed, 7);
+        assert_eq!(
+            execution.passes[1].resolved.seed,
+            gen_core::denoise_pass_seed(7, 1)
+        );
+        assert!(execution.passes[1].renoised && !execution.passes[0].renoised);
+        assert_eq!(execution.total_model_evals, 2);
+    }
+
+    /// AC3 (built-in snapshot route): the same driver over a diffusers `transformer/` snapshot —
+    /// shared reuse without overrides, exactly one job-local load with them, and a batched request
+    /// decodes once per image with per-seed outputs.
+    #[test]
+    fn denoise_pass_snapshot_route_serves_shared_and_job_local_chains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, cfg) = crate::testfix::tiny_snapshot_transformer_fixture(&tmp);
+        let dit = load_dit_base_at_dtype(&root, None, &Device::Cpu, None, DType::F32).unwrap();
+        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+        let context = context.unsqueeze(0).unwrap();
+
+        // Shared, batched: one decode per image, images differ by seed.
+        let req = dp_request(
+            11,
+            2,
+            vec![
+                dp_pass(1, "euler", 1.0, vec![]),
+                dp_pass(1, "euler", 0.5, vec![]),
+            ],
+        );
+        let (outputs, _, loads, decodes) =
+            dp_run(&dit, &root, None, &[], &context, &req).unwrap();
+        assert_eq!(loads, 0);
+        assert_eq!(decodes, 2);
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_ne!(v(&outputs[0]), v(&outputs[1]), "images must differ by seed");
+
+        // Job-local from the SNAPSHOT source (native_dit = None): the built-in override route.
+        let lora = AdapterSpec::new(
+            dp_write_lora(&tmp, "dp-snap-lora.safetensors", &cfg),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        );
+        let req = dp_request(
+            11,
+            1,
+            vec![dp_pass(
+                1,
+                "euler",
+                1.0,
+                vec![candle_gen::gen_core::PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(1.0),
+                }],
+            )],
+        );
+        let (_, _, loads, decodes) =
+            dp_run(&dit, &root, None, &[lora], &context, &req).unwrap();
+        assert_eq!(loads, 1);
+        assert_eq!(decodes, 1);
     }
 
     #[test]
