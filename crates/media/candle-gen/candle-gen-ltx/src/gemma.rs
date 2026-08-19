@@ -264,3 +264,278 @@ impl GemmaEncoder {
         Ok(hiddens)
     }
 }
+
+/// sc-18763: pin exactly which Gemma hidden states [`GemmaEncoder::forward`] returns — the count
+/// and which slot carries the final norm. The LTX caption feature extractor concatenates ALL
+/// returned states (`flat_dim = hidden_size * (num_layers+1)`, `text_encoder.rs`'s
+/// `normed_hidden`); an off-by-one here changes every downstream number by a small amount a smoke
+/// render would not catch. Synthetic tiny weights only — no real Gemma checkpoint needed. Port of
+/// the equivalent mlx-gen-ltx `gemma.rs` test module.
+///
+/// Requires an accelerator: [`GemmaEncoder`] runs bf16 unconditionally (matching the reference),
+/// and candle's plain CPU backend has no bf16 matmul (`gemm-bf16` is not part of this candle
+/// fork's CPU gemm surface) — the same reason `tests/conformance.rs` is `cuda`-only. `device()`
+/// below prefers `cuda`, else `metal` (both support bf16 matmul; this Mac exercises the `metal`
+/// arm). Neither feature is in this crate's `default` set, so `cargo test` with no `--features`
+/// compiles this module out entirely rather than failing on an unsupported dtype.
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+mod hidden_state_pinning_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn device() -> Device {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).expect("cuda device")
+        }
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            Device::new_metal(0).expect("metal device")
+        }
+    }
+
+    fn tiny_cfg(num_layers: usize) -> GemmaConfig {
+        GemmaConfig {
+            num_layers,
+            hidden_size: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            intermediate_size: 8,
+            rms_eps: 1e-6,
+            rope_theta_global: 1_000_000.0,
+            rope_theta_local: 10_000.0,
+            sliding_window_pattern: 6,
+            query_pre_attn_scalar: 4.0,
+            vocab_size: 6,
+        }
+    }
+
+    /// Deterministic, non-degenerate (non-zero, non-uniform) fill so RMSNorm/attention behave
+    /// generically rather than hitting a zero-weight special case.
+    fn fill(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.037).sin() * 0.1)
+            .collect()
+    }
+
+    fn put(
+        m: &mut HashMap<String, Tensor>,
+        dev: &Device,
+        key: &str,
+        shape: (usize, usize),
+        seed: f32,
+    ) {
+        let n = shape.0 * shape.1;
+        let t = Tensor::from_vec(fill(n, seed), shape, dev).unwrap();
+        m.insert(key.to_string(), t);
+    }
+
+    fn put1(m: &mut HashMap<String, Tensor>, dev: &Device, key: &str, n: usize, seed: f32) {
+        let t = Tensor::from_vec(fill(n, seed), n, dev).unwrap();
+        m.insert(key.to_string(), t);
+    }
+
+    /// A tiny, fully-synthetic Gemma weight set covering every tensor `GemmaEncoder::new` requires.
+    fn tiny_vb(cfg: &GemmaConfig, seed: f32, dev: &Device) -> VarBuilder<'static> {
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        put(
+            &mut m,
+            dev,
+            "embed_tokens.weight",
+            (cfg.vocab_size, cfg.hidden_size),
+            seed,
+        );
+        for i in 0..cfg.num_layers {
+            let b = format!("layers.{i}.");
+            let s = seed + i as f32;
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}input_layernorm.weight"),
+                cfg.hidden_size,
+                s + 1.0,
+            );
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}post_attention_layernorm.weight"),
+                cfg.hidden_size,
+                s + 2.0,
+            );
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}pre_feedforward_layernorm.weight"),
+                cfg.hidden_size,
+                s + 3.0,
+            );
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}post_feedforward_layernorm.weight"),
+                cfg.hidden_size,
+                s + 4.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.q_proj.weight"),
+                (cfg.num_heads * cfg.head_dim, cfg.hidden_size),
+                s + 5.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.k_proj.weight"),
+                (cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
+                s + 6.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.v_proj.weight"),
+                (cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
+                s + 7.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.o_proj.weight"),
+                (cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+                s + 8.0,
+            );
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.q_norm.weight"),
+                cfg.head_dim,
+                s + 9.0,
+            );
+            put1(
+                &mut m,
+                dev,
+                &format!("{b}self_attn.k_norm.weight"),
+                cfg.head_dim,
+                s + 10.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}mlp.gate_proj.weight"),
+                (cfg.intermediate_size, cfg.hidden_size),
+                s + 11.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}mlp.up_proj.weight"),
+                (cfg.intermediate_size, cfg.hidden_size),
+                s + 12.0,
+            );
+            put(
+                &mut m,
+                dev,
+                &format!("{b}mlp.down_proj.weight"),
+                (cfg.hidden_size, cfg.intermediate_size),
+                s + 13.0,
+            );
+        }
+        put1(&mut m, dev, "norm.weight", cfg.hidden_size, seed + 100.0);
+        // BF16, matching production (the Gemma dense arm always casts to `vb.dtype()` = bf16); the
+        // rest of `GemmaEncoder` hardcodes bf16 for the embedding/embed_scale/norm regardless.
+        VarBuilder::from_tensors(m, DType::BF16, dev)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.to_dtype(DType::F32).unwrap();
+        let b = b.to_dtype(DType::F32).unwrap();
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
+        let dev = device();
+        for num_layers in [1usize, 2, 3, 5] {
+            let cfg = tiny_cfg(num_layers);
+            let vb = tiny_vb(&cfg, 0.0, &dev);
+            let model = GemmaEncoder::new(vb, &cfg).unwrap();
+            let ids = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &dev).unwrap();
+            let hiddens = model.forward(&ids, &[1, 1, 1]).unwrap();
+            assert_eq!(
+                hiddens.len(),
+                num_layers + 1,
+                "num_layers={num_layers}: the LTX feature extractor concatenates ALL returned \
+                 hidden states (flat_dim = hidden_size · (num_layers+1)); an off-by-one here \
+                 silently drops or duplicates a layer's contribution with no visible failure in a \
+                 smoke render"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_state_zero_is_exactly_the_scaled_embedding_lookup() {
+        let dev = device();
+        let cfg = tiny_cfg(2);
+        let vb = tiny_vb(&cfg, 0.0, &dev);
+        let model = GemmaEncoder::new(vb, &cfg).unwrap();
+        let ids = Tensor::from_vec(vec![3u32, 1], (1, 2), &dev).unwrap();
+        let hiddens = model.forward(&ids, &[1, 1]).unwrap();
+
+        let want_ids = Tensor::from_vec(vec![3u32, 1], (2,), &dev).unwrap();
+        let embed_rows = model.embed.index_select(&want_ids, 0).unwrap();
+        let want = embed_rows
+            .broadcast_mul(&model.embed_scale)
+            .unwrap()
+            .reshape((1, 2, cfg.hidden_size))
+            .unwrap();
+        assert!(
+            max_abs_diff(&hiddens[0], &want) < 5e-3,
+            "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
+        );
+    }
+
+    #[test]
+    fn only_the_last_hidden_state_carries_the_final_norm() {
+        // Two models identical except `norm.weight` (the FINAL norm, applied once after the last
+        // layer). If it's wired to exactly one slot (the last), perturbing it must change
+        // `hiddens.last()` and MUST NOT change any earlier slot.
+        let dev = device();
+        let cfg = tiny_cfg(2);
+        let ids = Tensor::from_vec(vec![0u32, 1], (1, 2), &dev).unwrap();
+
+        let vb_a = tiny_vb(&cfg, 0.0, &dev);
+        let model_a = GemmaEncoder::new(vb_a, &cfg).unwrap();
+        let hiddens_a = model_a.forward(&ids, &[1, 1]).unwrap();
+
+        // Rebuild with the SAME seed, then hand-perturb only `norm.weight` on the resulting model
+        // (bypassing the loader so nothing else can change).
+        let vb_b = tiny_vb(&cfg, 0.0, &dev);
+        let mut model_b = GemmaEncoder::new(vb_b, &cfg).unwrap();
+        model_b.norm = Tensor::from_vec(vec![9.0f32; cfg.hidden_size], cfg.hidden_size, &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let hiddens_b = model_b.forward(&ids, &[1, 1]).unwrap();
+
+        assert_eq!(hiddens_a.len(), hiddens_b.len());
+        let last = hiddens_a.len() - 1;
+        for i in 0..last {
+            assert!(
+                max_abs_diff(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
+                "perturbing the FINAL norm changed hidden_states[{i}], which is not the final index"
+            );
+        }
+        assert!(
+            max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
+            "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
+        );
+    }
+}

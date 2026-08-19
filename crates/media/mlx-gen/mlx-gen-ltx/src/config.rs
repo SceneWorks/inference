@@ -200,7 +200,11 @@ impl LtxConfig {
     }
 
     /// Build the config from the `transformer` block of a parsed `embedded_config.json`,
-    /// reproducing `generate_av.py`'s field resolution exactly.
+    /// reproducing `generate_av.py`'s field resolution exactly. Infallible — the caption
+    /// feature-extractor selection (config-driven, sc-18763/sc-18757) is a separate fallible step,
+    /// `validated` (private to this module), because it is keyed on **key presence** in `t`, which
+    /// this dimension-parametric mapper does not otherwise need to distinguish from "absent ⇒
+    /// default".
     pub fn from_embedded_transformer(t: &Value) -> Self {
         let mut cfg = Self::video_only_defaults();
 
@@ -1049,7 +1053,16 @@ fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
 mod tests {
     use super::*;
 
-    /// An LTX-2.3 `transformer` block of `embedded_config.json`.
+    /// An LTX-2.3 `transformer` block of `embedded_config.json`, reproducing the **already-hosted**
+    /// `SceneWorks/ltx-2.3-mlx` tier's actual shape — measured directly against every cached
+    /// snapshot/quant variant on this machine (sc-18763 coordinator review, 2026-08-18; corrects an
+    /// earlier version of this fixture that instead measured the upstream *dense*
+    /// `ltx-2.3-22b-dev.safetensors` checkpoint's `__metadata__`, which is NOT what
+    /// `LtxConfig::from_model_dir` reads in production — the crate reads the split MLX tier's
+    /// `embedded_config.json`, a different, older converter artifact). Only
+    /// `caption_projection_first_linear`/`caption_projection_second_linear` are present (both
+    /// `false`); `caption_proj_before_connector`/`caption_proj_input_norm` are absent — the legacy
+    /// 2-key shape `CAPTION_V2_LEGACY_KEYS` (gen-core's `ltx_checkpoint` module) carves out.
     fn ltx23_transformer() -> Value {
         serde_json::json!({
             "_class_name": "AVTransformer3DModel",
@@ -1090,7 +1103,10 @@ mod tests {
 
     #[test]
     fn ltx23_config_matches_reference_build_logic() {
-        let cfg = LtxConfig::from_embedded_transformer(&ltx23_transformer());
+        let t = ltx23_transformer();
+        let cfg = LtxConfig::from_embedded_transformer(&t)
+            .validated(&t)
+            .unwrap();
         // Gated family → adaLN coeff 9.
         assert!(cfg.apply_gated_attention);
         assert_eq!(cfg.adaln_embedding_coefficient, 9);
@@ -1100,6 +1116,12 @@ mod tests {
         assert!(!cfg.caption_projection_second_linear);
         assert_eq!(cfg.caption_channels, 4096);
         assert_eq!(cfg.audio_caption_channels, 32 * 64);
+        // sc-18763 (coordinator review, detector-collapse round): the REAL shipped tier only
+        // carries the legacy 2-key shape (verified against every cached SceneWorks/ltx-2.3-mlx
+        // snapshot on this machine) — it resolves to V2 via gen-core's `caption_feature_version`
+        // legacy carve-out, not the strict 4-key match. This is the single shared detector both
+        // backends now fold onto (sc-18757); mlx-gen-ltx no longer duplicates the detection logic.
+        assert_eq!(cfg.caption_feature_version, CaptionFeatureVersion::V2);
         // Audio stack dims (sc-2684).
         assert_eq!(cfg.audio_inner_dim(), 2048);
         assert_eq!(cfg.audio_connector_num_attention_heads, 32);
@@ -1201,6 +1223,14 @@ mod tests {
         assert_eq!(cfg.audio_out_channels, 257);
         assert_eq!(cfg.audio_positional_embedding_max_pos, 42);
         assert_eq!(cfg.av_ca_timestep_scale_multiplier, 2000);
+        // No V2 keys present in `t` at all ⇒ V1 (not an error — a fully-absent config is a clean
+        // detection, distinct from a *partial* or *mismatched* one; see the
+        // "caption feature-extractor version selection" tests below, which exercise the shared
+        // detector directly rather than through this infallible field-mapper).
+        assert_eq!(
+            caption_feature_version(&t).unwrap(),
+            CaptionFeatureVersion::V1
+        );
         // The float-typed integer is read via the same getter for the non-audio multiplier too.
         let t2 = serde_json::json!({ "timestep_scale_multiplier": 3000.0 });
         assert_eq!(
@@ -1216,6 +1246,136 @@ mod tests {
         assert!(!cfg.apply_gated_attention);
         assert_eq!(cfg.caption_channels, 3840);
         assert!(cfg.caption_projection_first_linear);
+    }
+
+    // --- sc-18763: caption feature-extractor version selection ------------------------------------
+    //
+    // Detector collapse (sc-18757/#688, 2026-08-19 coordinator review): `mlx-gen-ltx` no longer
+    // duplicates upstream's V1/V2 detection logic — `gen_core::ltx_checkpoint::caption_feature_
+    // version` is the single shared detector both backends fold onto. These tests are KEPT (per
+    // the coordinator's explicit instruction) but now call that shared function directly instead
+    // of a local `detect_text_encoder_feature_version` twin, so this crate still pins its own
+    // regression coverage of the cases its `LtxConfig`/fixtures care about, without a second copy
+    // of the classification rule. `gen_core::ltx_checkpoint`'s own test module covers the same 8
+    // cases exhaustively (verified to agree with these before the collapse).
+
+    /// The 2.5 transformer config's V2-detection keys, measured directly off the real
+    /// `ltx-2.5-22b-distilled-transformer-bf16.safetensors` header
+    /// (`docs/reference/sc-18756-headers/diffusion_models/…-bf16.safetensors.json`, captured
+    /// 2026-08-18, sc-18756).
+    fn ltx25_v2_keys() -> Value {
+        serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        })
+    }
+
+    #[test]
+    fn ltx25_config_selects_v2() {
+        // Acceptance (sc-18763): a test asserts the extractor version chosen for a 2.5 config is V2.
+        assert_eq!(
+            caption_feature_version(&ltx25_v2_keys()).unwrap(),
+            CaptionFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn no_v2_keys_present_selects_v1_not_an_error() {
+        assert_eq!(
+            caption_feature_version(&serde_json::json!({})).unwrap(),
+            CaptionFeatureVersion::V1
+        );
+    }
+
+    #[test]
+    fn partial_v2_key_set_errors_loudly_instead_of_falling_back_to_v1() {
+        // A DIFFERENT 2-of-4 pair than the legacy shape (`caption_proj_before_connector` +
+        // `caption_projection_first_linear`, not `caption_projection_{first,second}_linear`) — the
+        // legacy carve-out must not widen to accept it. Config drift, not a clean V1 or V2 config;
+        // must error, not silently resolve to V1 (the story's explicit "verify, do not assume" /
+        // no-silent-fallback requirement).
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+        });
+        let err = caption_feature_version(&corrupted).expect_err("partial V2 key set must error");
+        let msg = err.to_string();
+        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_input_norm"));
+        assert!(msg.contains("caption_projection_second_linear"));
+    }
+
+    #[test]
+    fn all_four_keys_present_but_wrong_value_errors_loudly() {
+        // All 4 keys present (so it's not "partial"), but one value disagrees with
+        // `CAPTION_V2_EXPECTED_CONFIG` — config drift the reference itself raises
+        // `NotImplementedError` on.
+        let mut corrupted = ltx25_v2_keys();
+        corrupted["caption_proj_before_connector"] = serde_json::json!(false);
+        let err =
+            caption_feature_version(&corrupted).expect_err("mismatched V2 key value must error");
+        let msg = err.to_string();
+        assert!(msg.contains("caption_proj_before_connector"), "{msg}");
+    }
+
+    #[test]
+    fn present_non_bool_value_errors_as_unknown_config_not_silent_v1() {
+        // sc-18763 coordinator review point 3: a key present with a non-bool JSON value must count
+        // as PRESENT (matching upstream's `dict.keys()` semantics) and then fail the value
+        // comparison — landing in an error, never silently treated as absent/V1.
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": "yes", // non-bool — must not read as absent
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("a present non-bool value must error, not resolve V1");
+        assert!(err.to_string().contains("caption_proj_before_connector"));
+    }
+
+    #[test]
+    fn present_non_bool_value_in_a_partial_set_still_counts_as_present() {
+        // A non-bool value at a legacy-shape key position means this is NOT the legacy shape (the
+        // carve-out requires an exact boolean `false`), and the non-bool key still counts toward
+        // "declared" (not toward "missing") — so with only 2 of 4 keys declared here, this is
+        // "partial", not "unknown value on all 4".
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": "false", // non-bool, string not JSON bool
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("must error, not silently resolve to the legacy V2 shape");
+        assert!(err.to_string().contains("partial"));
+    }
+
+    #[test]
+    fn legacy_two_key_shape_with_a_true_value_is_not_the_carve_out() {
+        // Same two key NAMES as the shipped legacy shape, but a `true` instead of `false` — the
+        // carve-out is exact-match, not name-only.
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": true,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("a wrong-valued near-miss of the legacy shape must not resolve V2");
+        assert!(err.to_string().contains("partial"));
+    }
+
+    #[test]
+    fn the_shipped_legacy_shape_selects_v2() {
+        // The exact legacy 2-key shape shipped tiers carry (sc-18763 coordinator review) — pinned
+        // directly here in addition to `ltx23_config_matches_reference_build_logic`'s full fixture.
+        let legacy = serde_json::json!({
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+        });
+        assert_eq!(
+            caption_feature_version(&legacy).unwrap(),
+            CaptionFeatureVersion::V2
+        );
     }
 
     #[test]

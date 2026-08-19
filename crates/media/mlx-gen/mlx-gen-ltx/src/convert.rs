@@ -468,6 +468,14 @@ fn build_embedded_config() -> serde_json::Value {
             "connector_apply_gated_attention": true,
             "caption_projection_first_linear": false,
             "caption_projection_second_linear": false,
+            // sc-18763: this is the legacy 2-of-4 V2-detection key shape — the SAME shape measured
+            // directly off the already-hosted `SceneWorks/ltx-2.3-mlx` tier's real
+            // `embedded_config.json` (every cached snapshot/quant variant, coordinator review
+            // 2026-08-18). `caption_proj_before_connector`/`caption_proj_input_norm` are genuinely
+            // absent on the real shipped tiers, not merely omitted here — do NOT "complete" this to
+            // all 4 keys; `LtxConfig`'s detection carves this exact shape out as V2 explicitly
+            // (`is_legacy_two_key_v2_shape` in config.rs), so a converted directory with just these
+            // two keys loads correctly, matching production.
             "audio_connector_attention_head_dim": 64,
             "audio_connector_num_attention_heads": 32,
             "cross_attention_adaln": true,
