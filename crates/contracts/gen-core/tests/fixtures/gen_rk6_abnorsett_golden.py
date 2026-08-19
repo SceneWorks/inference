@@ -312,7 +312,7 @@ def main():
         ),
         **cases,
     }
-    OUT.write_text(json.dumps(payload, indent=1) + "\n")
+    OUT.write_text(json.dumps(payload, indent=1) + "\n", newline="\n")
     print(f"wrote {OUT}")
 
 
