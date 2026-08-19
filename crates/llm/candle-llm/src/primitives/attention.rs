@@ -141,6 +141,60 @@ pub fn sliding_causal_mask(
 #[cfg(test)]
 static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The one memoized **sliding-window** causal mask — sc-12458's memo, keyed to include the window.
+///
+/// A Gemma 4 stack has 40 `sliding_attention` layers that all ask for the identical
+/// `(q_len, k_len, window)` mask within one forward, so without a memo the host-side fill + upload
+/// in [`sliding_causal_mask`] runs 40 times per prefill. It is a **separate** entry from
+/// [`CAUSAL_MASK_CACHE`] on purpose: that key has no window field, so sharing one slot would let a
+/// `full_attention` layer collect a sliding mask (and vice versa) at the same `(q_len, k_len)` —
+/// the exact aliasing [`sliding_causal_mask`]'s doc warns about. Two slots also mean the alternating
+/// stack never thrashes a single one.
+struct SlidingMaskEntry {
+    q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: Device,
+    mask: Tensor,
+}
+
+static SLIDING_MASK_CACHE: Mutex<Option<SlidingMaskEntry>> = Mutex::new(None);
+
+/// [`sliding_causal_mask`] behind its own single-entry memo: bit-identical values (same builder),
+/// built once per distinct `(q_len, k_len, window, dtype, device)`.
+fn cached_sliding_causal_mask(
+    q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut guard = SLIDING_MASK_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = guard.as_ref() {
+        if e.q_len == q_len
+            && e.k_len == k_len
+            && e.window == window
+            && e.dtype == dtype
+            && e.device.same_device(device)
+        {
+            return Ok(e.mask.clone());
+        }
+    }
+    let mask = sliding_causal_mask(q_len, k_len, window, dtype, device)?;
+    *guard = Some(SlidingMaskEntry {
+        q_len,
+        k_len,
+        window,
+        dtype,
+        device: device.clone(),
+        mask: mask.clone(),
+    });
+    Ok(mask)
+}
+
 /// The one memoized causal mask (sc-12458). Every decoder layer of a forward asks [`sdpa_eager`] for
 /// the identical `AttnMask::Causal` mask, so without memoization the host-side vec fill + upload in
 /// [`causal_mask`] ran once **per layer** per forward. A single entry suffices: within one forward
@@ -233,7 +287,8 @@ fn sdpa_eager(
         }
         AttnMask::Additive(a) => scores.broadcast_add(a)?,
         AttnMask::SlidingCausal { window } => {
-            let m = sliding_causal_mask(q_len, k_len, window, scores.dtype(), scores.device())?;
+            let m =
+                cached_sliding_causal_mask(q_len, k_len, window, scores.dtype(), scores.device())?;
             scores.broadcast_add(&m)?
         }
     };
