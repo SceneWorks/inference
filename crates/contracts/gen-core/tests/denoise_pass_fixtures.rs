@@ -160,8 +160,12 @@ fn request_of(fixture: &Value) -> Result<GenerationRequest, DenoisePassError> {
         .and_then(Value::as_array)
         .map(|phases| vec![GenerationPhase::default(); phases.len()]);
     // Only `denoisePasses` participates in the strict decode; `advanced` legitimately carries other
-    // keys (`strength`, …) that flatten onto other request fields.
-    let denoise_passes = {
+    // keys (`strength`, …) that flatten onto other request fields. A *null* `advanced` is passed
+    // through verbatim rather than isolated into an empty object, so a fixture declaring that shape
+    // genuinely exercises the null-block branch on both sides of the contract.
+    let denoise_passes = if advanced.is_null() {
+        denoise_passes_from_advanced_json(&advanced)?
+    } else {
         let mut isolated = serde_json::Map::new();
         if let Some(passes) = advanced.get("denoisePasses") {
             isolated.insert("denoisePasses".to_string(), passes.clone());

@@ -72,6 +72,13 @@
 //! carries no `serde` derive. Decoding is **strict**: an unknown key is an error, which is what makes
 //! the round-trip provably lossless rather than silently lossy. Cross-language fixtures live at
 //! `crates/contracts/gen-core/tests/fixtures/denoise_passes/` and are consumed by both repositories.
+//!
+//! One deliberate deviation from "natural JSON types": in a **resolved plan**, `jobSeed` and every
+//! per-pass `seed` are decimal **strings**. Seeds are full-range `u64` — [`denoise_pass_seed`]
+//! finishes with splitmix64, so a derived pass seed is above 2^53 in ~99.9% of cases — and the other
+//! side of this contract is JavaScript, whose `JSON.parse` silently rounds such a number to the
+//! nearest `f64`. A truncated seed raises no error and replays as a *different image*, so the plan
+//! moves seeds as text and [`ResolvedDenoisePlan::from_json`] refuses a bare number outright.
 
 use std::fmt;
 
@@ -765,7 +772,9 @@ pub struct ResolvedDenoisePass {
     /// Guidance for this pass. Still `Option` after resolution because a model with no guidance axis
     /// genuinely has none — `None` means "this model's implicit no-guidance path", not "look it up".
     pub guidance: Option<f32>,
-    /// The deterministic per-pass seed ([`denoise_pass_seed`]), recorded for exact replay.
+    /// The deterministic per-pass seed ([`denoise_pass_seed`]), recorded for exact replay. Written to
+    /// JSON as a decimal **string** — it is full-range `u64` and a bare number would be truncated by
+    /// any JavaScript reader.
     pub seed: u64,
     /// Pass-local adapter weight overrides, verbatim from the request (an empty list leaves the
     /// load-time stack at its load-time scales — see [`DenoisePass::adapters`]).
@@ -778,7 +787,8 @@ pub struct ResolvedDenoisePlan {
     /// The passes, in execution order. Never empty.
     pub passes: Vec<ResolvedDenoisePass>,
     /// The job seed every pass seed was derived from — recorded so a plan is self-describing for
-    /// replay without also carrying the originating request.
+    /// replay without also carrying the originating request. Written to JSON as a decimal **string**,
+    /// like every seed in the plan.
     pub job_seed: u64,
 }
 
@@ -896,12 +906,61 @@ fn json_f32(value: f32) -> Value {
     serde_json::from_str::<Value>(&format!("{value:?}")).unwrap_or(Value::Null)
 }
 
+/// A seed as a **decimal string** — the resolved plan's wire form for `seed` and `jobSeed`.
+///
+/// Seeds are full-range `u64`. [`default_seed`](crate::default_seed) is nanoseconds since the epoch
+/// (~1.7e18 today) and [`denoise_pass_seed`] finishes with splitmix64, so a derived pass seed is
+/// uniform over the whole `u64` range and exceeds 2^53 in ~99.9% of cases. A bare JSON number above
+/// 2^53 does not survive a JavaScript `JSON.parse`: it is rounded to the nearest `f64` **silently**,
+/// which replays as a *different image* with no error anywhere. The plan is a cross-language
+/// artifact, so its seeds are written as strings, where every reader is exact.
+fn json_seed(value: u64) -> Value {
+    Value::String(value.to_string())
+}
+
+/// Read a plan seed written by [`json_seed`].
+///
+/// Deliberately **string-only**: a bare JSON number here is exactly the shape a JavaScript producer
+/// emits after `JSON.parse` has already truncated it, so accepting it would turn a corrupted seed
+/// into a plausible-looking plan. Refusing it is the same policy `contractVersion` enforces — fail
+/// loudly rather than replay a different image.
+fn seed_from_json(index: Option<usize>, key: &str, value: &Value) -> DenoisePassResult<u64> {
+    let Some(text) = value.as_str() else {
+        return Err(malformed(
+            index,
+            DenoisePassField::DenoisePasses,
+            format!(
+                "`{key}` must be a u64 written as a decimal STRING (got {}) — a bare JSON number \
+                 loses seeds above 2^53 in every JavaScript reader",
+                json_type_name(value)
+            ),
+        ));
+    };
+    text.parse::<u64>().map_err(|err| {
+        malformed(
+            index,
+            DenoisePassField::DenoisePasses,
+            format!("`{key}` string {text:?} is not a decimal u64: {err}"),
+        )
+    })
+}
+
 /// Read `advanced.denoisePasses` out of an `advanced` object.
 ///
 /// A missing key, or an explicit `null`, is `Ok(None)` — the ordinary request with no chained passes.
+///
+/// A **null `advanced` block itself** is `Ok(None)` for the same reason: `advanced` is optional on
+/// the request, and a producer that serializes an absent optional as `"advanced": null` (rather than
+/// omitting the key) is describing the same request as one that omits it. Rejecting that shape would
+/// make this contract retroactively invalidate payloads written before it existed. Any other
+/// non-object — an array, a number, a string — is still malformed: those are structurally wrong,
+/// not merely absent.
 pub fn denoise_passes_from_advanced_json(
     advanced: &Value,
 ) -> DenoisePassResult<Option<Vec<DenoisePass>>> {
+    if advanced.is_null() {
+        return Ok(None);
+    }
     let Some(object) = advanced.as_object() else {
         return Err(malformed(
             None,
@@ -1175,6 +1234,13 @@ fn adapter_to_json(adapter: &PhaseAdapter) -> Value {
 
 impl ResolvedDenoisePlan {
     /// Encode the plan as JSON — the replay/metadata form SceneWorks persists.
+    ///
+    /// `jobSeed` and each pass's `seed` are written as decimal **strings**, not JSON numbers. Seeds
+    /// are full-range `u64` (`denoise_pass_seed` finishes with splitmix64, so a derived pass seed
+    /// exceeds 2^53 in ~99.9% of cases) and a bare JSON number above 2^53 is silently rounded by
+    /// JavaScript's `JSON.parse` — which replays as a *different image* with no error raised
+    /// anywhere. [`from_json`](Self::from_json) is string-only on the way back for the same reason.
+    /// Every other field is its natural JSON type.
     #[must_use]
     pub fn to_json(&self) -> Value {
         let passes: Vec<Value> = self
@@ -1193,7 +1259,7 @@ impl ResolvedDenoisePlan {
                 if let Some(guidance) = pass.guidance {
                     object.insert("guidance".to_string(), json_f32(guidance));
                 }
-                object.insert("seed".to_string(), Value::from(pass.seed));
+                object.insert("seed".to_string(), json_seed(pass.seed));
                 object.insert(
                     "adapters".to_string(),
                     Value::Array(pass.adapters.iter().map(adapter_to_json).collect()),
@@ -1206,7 +1272,7 @@ impl ResolvedDenoisePlan {
             "contractVersion".to_string(),
             Value::from(DENOISE_PASS_CONTRACT_VERSION),
         );
-        root.insert("jobSeed".to_string(), Value::from(self.job_seed));
+        root.insert("jobSeed".to_string(), json_seed(self.job_seed));
         root.insert("passes".to_string(), Value::Array(passes));
         Value::Object(root)
     }
@@ -1245,16 +1311,17 @@ impl ResolvedDenoisePlan {
                 ),
             ));
         }
-        let job_seed = object
-            .get("jobSeed")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
+        let job_seed = seed_from_json(
+            None,
+            "jobSeed",
+            object.get("jobSeed").ok_or_else(|| {
                 malformed(
                     None,
                     DenoisePassField::DenoisePasses,
-                    "a plan must carry a non-negative integer `jobSeed`".to_string(),
+                    "a plan must carry a `jobSeed`".to_string(),
                 )
-            })?;
+            })?,
+        )?;
         let Some(array) = object.get("passes").and_then(Value::as_array) else {
             return Err(malformed(
                 None,
@@ -1294,13 +1361,7 @@ impl ResolvedDenoisePlan {
                         .expect("a present `scheduler` decodes to Some");
                 let denoise = opt_f32(index, DenoisePassField::Denoise, Some(need("denoise")?))?
                     .expect("a present `denoise` decodes to Some");
-                let seed = need("seed")?.as_u64().ok_or_else(|| {
-                    malformed(
-                        Some(index),
-                        DenoisePassField::DenoisePasses,
-                        "`seed` must be a non-negative integer".to_string(),
-                    )
-                })?;
+                let seed = seed_from_json(Some(index), "seed", need("seed")?)?;
                 Ok(ResolvedDenoisePass {
                     index,
                     steps,
@@ -1957,6 +2018,30 @@ mod tests {
         assert!(denoise_passes_from_advanced_json(&serde_json::json!([])).is_err());
     }
 
+    /// A null `advanced` block is the same request as an omitted one. A legacy producer that
+    /// serializes its absent optional as `"advanced": null` predates this contract, so treating it as
+    /// malformed would retroactively break payloads that were valid when they were written.
+    /// Structurally wrong shapes stay rejected — the tolerance is for *absence*, not for anything
+    /// that merely fails to be an object.
+    #[test]
+    fn a_null_advanced_block_is_the_absent_state_not_a_malformed_one() {
+        assert_eq!(
+            denoise_passes_from_advanced_json(&Value::Null).expect("a null `advanced` decodes"),
+            None
+        );
+        for wrong in [
+            serde_json::json!([]),
+            serde_json::json!(0),
+            serde_json::json!("advanced"),
+            serde_json::json!(true),
+        ] {
+            let err = denoise_passes_from_advanced_json(&wrong)
+                .expect_err("a non-null non-object `advanced` is malformed");
+            assert_eq!(err.pass_index(), None, "for {wrong}");
+            assert_eq!(err.field(), DenoisePassField::DenoisePasses, "for {wrong}");
+        }
+    }
+
     #[test]
     fn resolved_plans_round_trip_through_json() {
         let req = GenerationRequest {
@@ -2029,6 +2114,78 @@ mod tests {
             .expect("object")
             .remove("contractVersion");
         assert!(ResolvedDenoisePlan::from_json(&json).is_err());
+    }
+
+    /// Plan seeds cross the language boundary as decimal **strings**.
+    ///
+    /// The other end of this contract is JavaScript, where `JSON.parse` silently rounds an integer
+    /// above 2^53 to the nearest `f64`. A per-pass seed is a splitmix64 output, so it is above 2^53
+    /// essentially always — the checked-in reference recipe already carries `5145724004617983535`,
+    /// which a bare-number reader would hand back as `5145724004617983000` and replay as a different
+    /// image with no error raised. So: emit strings, and refuse a bare number on read rather than
+    /// accept the exact shape a truncating producer emits.
+    #[test]
+    fn plan_seeds_are_json_strings_so_they_survive_a_javascript_reader() {
+        // The real pass-1 seed of the reference recipe — comfortably past 2^53.
+        let derived = denoise_pass_seed(1_234_567_890, 1);
+        assert!(
+            derived > (1_u64 << 53),
+            "the fixture premise: derived seeds exceed JavaScript's exact-integer range ({derived})"
+        );
+        let plan = ResolvedDenoisePlan {
+            job_seed: u64::MAX,
+            passes: vec![ResolvedDenoisePass {
+                index: 0,
+                steps: 10,
+                sampler: "euler".to_string(),
+                scheduler: "normal".to_string(),
+                denoise: 1.0,
+                guidance: None,
+                seed: derived,
+                adapters: Vec::new(),
+            }],
+        };
+        let json = plan.to_json();
+        assert_eq!(
+            json.get("jobSeed").and_then(Value::as_str),
+            Some(u64::MAX.to_string().as_str()),
+            "jobSeed is a decimal string"
+        );
+        assert_eq!(
+            json["passes"][0].get("seed").and_then(Value::as_str),
+            Some(derived.to_string().as_str()),
+            "a pass seed is a decimal string"
+        );
+        // Full-range round-trip: the exact bits come back, which is the whole point.
+        let decoded = ResolvedDenoisePlan::from_json(&json).expect("decodes");
+        assert_eq!(decoded, plan);
+        assert_eq!(decoded.job_seed, u64::MAX);
+        assert_eq!(decoded.passes[0].seed, derived);
+
+        // A bare JSON number is refused on both keys — it is exactly what a truncating reader
+        // re-emits, so accepting it would launder a corrupted seed into a plausible plan.
+        for key in ["jobSeed", "seed"] {
+            let mut broken = json.clone();
+            let slot = if key == "jobSeed" {
+                &mut broken["jobSeed"]
+            } else {
+                &mut broken["passes"][0]["seed"]
+            };
+            *slot = Value::from(42_u64);
+            let err = ResolvedDenoisePlan::from_json(&broken)
+                .expect_err("a numeric seed must be refused");
+            assert!(err.to_string().contains("decimal STRING"), "{key}: {err}");
+        }
+
+        // A string that is not a decimal u64 is refused too, rather than silently becoming 0.
+        for bad in ["", "-1", "18446744073709551616", "0x10", "1e9", " 7"] {
+            let mut broken = json.clone();
+            broken["jobSeed"] = Value::from(bad);
+            assert!(
+                ResolvedDenoisePlan::from_json(&broken).is_err(),
+                "{bad:?} must not decode"
+            );
+        }
     }
 
     #[test]

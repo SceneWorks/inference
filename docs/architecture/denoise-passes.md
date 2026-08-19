@@ -67,6 +67,21 @@ to the legacy single-trajectory render, and every already-persisted replay paylo
 seed. Later passes mix a golden-ratio salt in at the pass index and run a splitmix64 finalizer, so
 adjacent passes are not merely offset seeds.
 
+### Plan seeds are JSON strings
+
+Because the finalizer is splitmix64, a derived pass seed is uniform over the whole `u64` range and
+sits above 2^53 in ~99.9% of cases (`default_seed()` — nanoseconds since the epoch — already does).
+The other end of this contract is JavaScript, where `JSON.parse` rounds such a number to the nearest
+`f64` **without raising anything**: `5145724004617983535` reads back as `5145724004617983000`, and the
+replay silently produces a different image. So in a resolved plan, `jobSeed` and every per-pass `seed`
+are written as **decimal strings**, and `ResolvedDenoisePlan::from_json` refuses a bare JSON number
+rather than accepting the exact shape a truncating producer emits. Consumers parse them with a
+full-width integer type (`BigInt`, `u64`).
+
+The request's own top-level `seed` keeps its pre-existing bare-number form — that wire format predates
+this contract and is not this contract's to change. The asymmetry is documented in the fixture
+README, which is what the SceneWorks-side implementation reads.
+
 ## Denoise passes are not Krea RAW multi-phase denoise
 
 `advanced.phases` (epic 13879, sc-13884) predates this and is a different mechanism. **The two are
@@ -126,8 +141,8 @@ A **resolved plan** is a persisted replay artifact, so its JSON is stamped with
 does not implement rather than interpreting unfamiliar fields as familiar ones — the failure mode
 that stamp exists to prevent is a silently *different* replayed image, not a parse error. Bump the
 version when a change would make an older build mis-read a newer plan: a new seed derivation, a new
-meaning for `denoise`, a changed resolution ladder. A new *optional* per-pass field that older
-builds may ignore is not such a change.
+meaning for `denoise`, a changed resolution ladder, a changed JSON type for an existing field. A new
+*optional* per-pass field that older builds may ignore is not such a change.
 
 The **request** side carries no version, deliberately. `advanced.denoisePasses` is a bare array with
 nowhere natural to put one, its decoding is strict (an unknown key is an error, not a silent drop),

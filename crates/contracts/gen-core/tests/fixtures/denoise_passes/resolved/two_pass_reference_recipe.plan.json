@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "jobSeed": 1234567890,
+  "jobSeed": "1234567890",
   "passes": [
     {
       "index": 0,
@@ -9,7 +9,7 @@
       "scheduler": "normal",
       "denoise": 1.0,
       "guidance": 3.5,
-      "seed": 1234567890,
+      "seed": "1234567890",
       "adapters": []
     },
     {
@@ -19,7 +19,7 @@
       "scheduler": "karras",
       "denoise": 0.2,
       "guidance": 2.0,
-      "seed": 5145724004617983535,
+      "seed": "5145724004617983535",
       "adapters": []
     }
   ]

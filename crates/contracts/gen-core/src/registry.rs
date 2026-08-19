@@ -4375,6 +4375,95 @@ mod tests {
         assert!(model_descriptor_errors(&wired).is_empty());
     }
 
+    /// The chained-denoise cross-check (sc-20415): `supports_denoise_passes` set on a descriptor that
+    /// advertises no sampler or no scheduler menu is flagged. Every pass names its *own* sampler and
+    /// scheduler and the shared floor validates those ids against the advertised menus, so a
+    /// flag-on/menu-empty descriptor would pass the capability gate and then have nothing
+    /// authoritative to check the ids against — the same "flag on, surface missing" footgun the
+    /// conversation-history cross-check above closes. Each menu is asserted independently so an
+    /// inverted or dropped condition cannot hide behind the other one firing.
+    #[test]
+    fn model_descriptor_errors_flags_denoise_passes_without_menus() {
+        // `Modality::Audio` keeps the size-bounds floor out of the way (see the sweep below), so the
+        // conformant cases can assert an *empty* error list rather than a filtered one.
+        let descriptor =
+            |flag: bool, samplers: Vec<&'static str>, schedulers: Vec<&'static str>| {
+                ModelDescriptor {
+                    encoder_contract: None,
+                    denoiser_output_latent_space: None,
+                    control_kinds: None,
+                    required_components: &[],
+                    id: "chained",
+                    family: "test",
+                    backend: "candle",
+                    modality: Modality::Audio,
+                    capabilities: Capabilities {
+                        max_count: 1,
+                        supports_denoise_passes: flag,
+                        samplers,
+                        schedulers,
+                        ..Default::default()
+                    },
+                }
+            };
+        let errors_of = |flag, samplers, schedulers| {
+            model_descriptor_errors(&descriptor(flag, samplers, schedulers))
+        };
+        let has = |errs: &[String], needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        // Flag on, both menus empty: both halves fire.
+        let errs = errors_of(true, vec![], vec![]);
+        assert!(
+            has(
+                &errs,
+                "supports_denoise_passes is set but `samplers` is empty"
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            has(
+                &errs,
+                "supports_denoise_passes is set but `schedulers` is empty"
+            ),
+            "{errs:?}"
+        );
+
+        // Only the sampler menu wired: the scheduler half must still fire on its own.
+        let errs = errors_of(true, vec!["euler"], vec![]);
+        assert!(
+            !has(&errs, "`samplers` is empty"),
+            "a wired sampler menu must not be flagged: {errs:?}"
+        );
+        assert!(
+            has(
+                &errs,
+                "supports_denoise_passes is set but `schedulers` is empty"
+            ),
+            "{errs:?}"
+        );
+
+        // Only the scheduler menu wired: the sampler half must still fire on its own.
+        let errs = errors_of(true, vec![], vec!["normal"]);
+        assert!(
+            has(
+                &errs,
+                "supports_denoise_passes is set but `samplers` is empty"
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            !has(&errs, "`schedulers` is empty"),
+            "a wired scheduler menu must not be flagged: {errs:?}"
+        );
+
+        // Both menus wired is conformant.
+        assert!(errors_of(true, vec!["euler"], vec!["normal"]).is_empty());
+
+        // The cross-check is scoped to the opt-in: a descriptor that leaves the flag false keeps the
+        // menus optional, which is what every descriptor shipping today relies on.
+        assert!(errors_of(false, vec![], vec![]).is_empty());
+    }
+
     /// The size-bounds floor is exempt for `Modality::Audio` (sc-13314): a pure-audio generator has
     /// no width/height, so `min_size`/`max_size` left at the unused `Default` 0 must NOT be flagged —
     /// mirroring the size-skipping `validate_request_audio` floor. The exemption is scoped to the

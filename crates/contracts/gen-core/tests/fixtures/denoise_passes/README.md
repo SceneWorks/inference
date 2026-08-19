@@ -16,12 +16,12 @@ repositories read the *same* files:
 |---|---|
 | `valid/*.json` | Requests that must be accepted, with the model context needed to resolve them. |
 | `resolved/<name>.plan.json` | The exact `ResolvedDenoisePlan` each `valid/<name>.json` must resolve to, per-pass seeds included. |
+| `invalid/*.json` | Requests that must be rejected, each naming the pass index, field and issue code. |
 
 Each `resolved/` file opens with `"contractVersion": 1`. A plan is a persisted replay artifact, so it
 carries the contract version it was written under, and a reader refuses a version it does not
 implement rather than mis-reading it. The request side carries no version — an absent
 `denoisePasses` is the single-pass render for every build there has ever been.
-| `invalid/*.json` | Requests that must be rejected, each naming the pass index, field and issue code. |
 
 ## Envelope
 
@@ -33,7 +33,8 @@ Every fixture is an object:
   "story": "sc-20415",
   "description": "prose, for the human reading a failure",
   "request": {                              // the SceneWorks request, camelCase
-    "seed": 1234567890,                     // the RESOLVED job seed
+    "seed": 1234567890,                     // the RESOLVED job seed; a NUMBER on the request side,
+                                            // but a STRING in resolved/ — see "Seeds are strings"
     "steps": 20, "sampler": "euler", "scheduler": "normal", "guidance": 3.5,
     "advanced": { "denoisePasses": [ /* ... */ ] }
   },
@@ -80,6 +81,46 @@ recipe *shape* (10 steps at denoise 1.0, then 4 steps at denoise 0.2, each with 
 sampler+scheduler) is what `two_pass_reference_recipe.json` pins, and the ids can be swapped in
 once they land without touching the harness. `invalid/unknown_sampler.json` deliberately uses an id
 no registry will ever contain, so it stays a genuine negative regardless of what the siblings add.
+
+## Seeds are **strings** in a resolved plan — read this before writing the consumer
+
+In `resolved/*.plan.json`, `jobSeed` and every per-pass `seed` are decimal **strings**, not JSON
+numbers:
+
+```json
+"jobSeed": "1234567890",
+"seed": "5145724004617983535"
+```
+
+This is not cosmetic and it is not optional. A seed is a full-range `u64`:
+`gen_core::default_seed()` is nanoseconds since the epoch (~1.7e18 today) and
+`denoise_pass_seed` finishes with a splitmix64 mixer, so a **derived pass seed is above 2^53 in
+~99.9% of cases** — `two_pass_reference_recipe` already carries `5145724004617983535`, and
+`pass_local_adapter_overrides` carries `13679457532755275413`, which does not even fit an `i64`.
+JavaScript's `JSON.parse` maps a bare number that large onto the nearest `f64` **silently**:
+`5145724004617983535` comes back as `5145724004617983000`. Nothing errors; the render just replays as
+a different image. Encoding the seed as text is what makes every reader exact, whatever its native
+integer width.
+
+The consumer contract, in both directions:
+
+- **Reading a plan:** take `jobSeed` / `seed` as a string and parse it with a full-width integer type
+  (`BigInt` in JS/TS, `u64` in Rust). Never `Number(...)` it, never let it reach `JSON.parse` as a
+  number.
+- **Writing a plan:** emit the decimal digits as a string. `gen_core::ResolvedDenoisePlan::from_json`
+  is deliberately **string-only** — it rejects a bare JSON number rather than accepting it, because a
+  bare number is precisely the shape a truncating producer emits, and laundering that into a
+  plausible-looking plan is the failure this rule exists to prevent.
+
+The **request** side (`request.seed` in a fixture envelope) is still a bare JSON number: it is the
+pre-existing request wire format and changing it is not this story's to make. The fixture request
+seeds are therefore deliberately kept below 2^53 so they stay exact in every reader. If a fixture ever
+needs a full-range job seed on the request side, that is a request-contract change, not a fixture
+edit.
+
+One useful side effect: because the comparison helper gives numeric slack (see `PLAN_TOLERANCE`) but
+compares strings exactly, string seeds are asserted **bit-for-bit**, which a large JSON number never
+was.
 
 ## Regenerating `resolved/`
 
