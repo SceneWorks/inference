@@ -1,0 +1,40 @@
+{
+  "fixture": "duplicate_adapter_override",
+  "story": "sc-20415",
+  "description": "Two overrides for the same load-time adapter inside one pass. Resolving that by last-write-wins would make the render depend on list order for no stated reason, so contradictory overrides are rejected instead.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        {
+          "steps": 10,
+          "denoise": 1.0,
+          "adapters": [
+            { "adapter": 1, "weight": 1.0 },
+            { "adapter": 1, "weight": 0.25 }
+          ]
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 2
+  },
+  "expectedError": {
+    "passIndex": 0,
+    "field": "adapters",
+    "issue": "duplicateAdapter"
+  }
+}

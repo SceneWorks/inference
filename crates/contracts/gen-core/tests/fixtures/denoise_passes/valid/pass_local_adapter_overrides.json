@@ -1,0 +1,50 @@
+{
+  "fixture": "pass_local_adapter_overrides",
+  "story": "sc-20415",
+  "description": "Pass-local LoRA weight overrides against the load-time adapter stack, by index. Pass 1 pins adapter 0 at its load-time scale (weight absent) and mutes adapter 1; pass 2 ramps adapter 1 in; pass 3 names no adapters at all, which means the load-time stack at its load-time scales -- the OPPOSITE of a Krea RAW phase's empty list.",
+  "request": {
+    "seed": 42,
+    "steps": 24,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 4.0,
+    "advanced": {
+      "denoisePasses": [
+        {
+          "steps": 16,
+          "denoise": 1.0,
+          "adapters": [
+            { "adapter": 0 },
+            { "adapter": 1, "weight": 0.0 }
+          ]
+        },
+        {
+          "steps": 6,
+          "sampler": "ddim",
+          "scheduler": "simple",
+          "denoise": 0.35,
+          "guidance": 1.0,
+          "adapters": [
+            { "adapter": 1, "weight": 0.9 }
+          ]
+        },
+        {
+          "steps": 2,
+          "denoise": 0.1
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 2
+  }
+}

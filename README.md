@@ -50,6 +50,9 @@ Start in [`docs/`](docs/README.md). The essentials:
 - **[Architecture Rationale](docs/architecture/inference-rearchitecture.md)** — why the
   repositories were consolidated, why provider discovery is explicit, the alternatives
   considered, and the tradeoffs accepted.
+- **[Chained Denoise Passes](docs/architecture/denoise-passes.md)** — the
+  `advanced.denoisePasses` contract, its resolution ladder and runtime invariant, and how it
+  differs from Krea RAW multi-phase denoise.
 
 See [`docs/migration/PHASE_2_CHECKPOINT.md`](docs/migration/PHASE_2_CHECKPOINT.md)
 for normalization invariants and

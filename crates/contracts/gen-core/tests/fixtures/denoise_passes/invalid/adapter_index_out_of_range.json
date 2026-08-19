@@ -1,0 +1,42 @@
+{
+  "fixture": "adapter_index_out_of_range",
+  "story": "sc-20415",
+  "description": "A pass-local weight override naming an adapter the load spec never provisioned. Adapters are referenced by their load-time index, so an out-of-range index is an incompatible adapter reference and is rejected before execution.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "denoise": 1.0 },
+        {
+          "steps": 4,
+          "denoise": 0.2,
+          "adapters": [
+            { "adapter": 0, "weight": 1.0 },
+            { "adapter": 3, "weight": 0.5 }
+          ]
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 2
+  },
+  "expectedError": {
+    "passIndex": 1,
+    "field": "adapters.adapter",
+    "issue": "adapterIndexOutOfRange",
+    "checkedBy": "model"
+  }
+}

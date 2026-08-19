@@ -1,0 +1,31 @@
+{
+  "fixture": "empty_pass_array",
+  "story": "sc-20415",
+  "description": "`denoisePasses: []` is rejected rather than treated as 'no passes'. Omitting the key is how a caller asks for the ordinary single-pass render; an empty array is a UI that lost its rows.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": []
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": null,
+    "field": "denoisePasses",
+    "issue": "empty"
+  }
+}

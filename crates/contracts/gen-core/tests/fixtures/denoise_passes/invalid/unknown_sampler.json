@@ -1,0 +1,34 @@
+{
+  "fixture": "unknown_sampler",
+  "story": "sc-20415",
+  "description": "A sampler id no registry will ever contain, so this stays a genuine negative regardless of which algorithms the sibling stories add. An unknown id is a CAPABILITY gap (typed Error::Unsupported), not a range error.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "sampler": "euler", "denoise": 1.0 },
+        { "steps": 4, "sampler": "definitely_not_a_sampler", "denoise": 0.2 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": 1,
+    "field": "sampler",
+    "issue": "unknownId"
+  }
+}

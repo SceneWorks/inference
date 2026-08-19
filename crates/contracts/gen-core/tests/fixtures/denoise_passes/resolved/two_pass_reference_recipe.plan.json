@@ -1,0 +1,26 @@
+{
+  "contractVersion": 1,
+  "jobSeed": "1234567890",
+  "passes": [
+    {
+      "index": 0,
+      "steps": 10,
+      "sampler": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "guidance": 3.5,
+      "seed": "1234567890",
+      "adapters": []
+    },
+    {
+      "index": 1,
+      "steps": 4,
+      "sampler": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 0.2,
+      "guidance": 2.0,
+      "seed": "5145724004617983535",
+      "adapters": []
+    }
+  ]
+}

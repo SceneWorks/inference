@@ -1593,6 +1593,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_multi_speaker: false,
             supports_conversation_history: false,
             supports_conversation_session: false,
+            // Chained denoise passes are not wired for this provider (sc-20415).
+            supports_denoise_passes: false,
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],

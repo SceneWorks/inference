@@ -1,0 +1,34 @@
+{
+  "fixture": "guidance_overflows_f32",
+  "story": "sc-20415",
+  "description": "JSON has no NaN or Infinity literal, but it has plenty of finite f64 values that become +Inf the moment they are narrowed to the contract's f32 -- 1e39 is one. Narrowing silently and letting the Inf reach the guidance math is the classic garbage-as-success poisoning the finiteness floor exists to stop, so the pass-indexed validator must reject it.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "denoise": 1.0 },
+        { "steps": 4, "denoise": 0.2, "guidance": 1e39 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": 1,
+    "field": "guidance",
+    "issue": "notFinite"
+  }
+}

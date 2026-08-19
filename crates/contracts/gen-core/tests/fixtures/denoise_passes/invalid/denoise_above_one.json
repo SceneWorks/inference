@@ -1,0 +1,33 @@
+{
+  "fixture": "denoise_above_one",
+  "story": "sc-20415",
+  "description": "`denoise` above 1.0 has no meaning against a schedule normalized to its own top -- it is a percentage-vs-fraction unit slip (120 -> 1.2) that would otherwise index past the schedule.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "denoise": 1.2 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": 0,
+    "field": "denoise",
+    "issue": "outOfRange"
+  }
+}

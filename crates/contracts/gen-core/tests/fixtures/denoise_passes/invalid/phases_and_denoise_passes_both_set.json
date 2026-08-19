@@ -1,0 +1,38 @@
+{
+  "fixture": "phases_and_denoise_passes_both_set",
+  "story": "sc-20415",
+  "description": "The Krea RAW multi-phase denoise and chained denoise passes are different mechanisms over the same denoise (one global schedule sliced, vs. a fresh schedule per pass). There is no defined composition, so a request that sets both is rejected before execution rather than silently resolved in favour of one.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "phases": [
+        { "steps": 12 },
+        { "steps": 8, "guidance": 0.0 }
+      ],
+      "denoisePasses": [
+        { "steps": 10, "denoise": 1.0 },
+        { "steps": 4, "denoise": 0.2 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": null,
+    "field": "denoisePasses",
+    "issue": "mutuallyExclusiveWithPhases"
+  }
+}

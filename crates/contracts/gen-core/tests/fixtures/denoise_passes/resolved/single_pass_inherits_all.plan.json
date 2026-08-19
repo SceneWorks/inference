@@ -1,0 +1,16 @@
+{
+  "contractVersion": 1,
+  "jobSeed": "1234567890",
+  "passes": [
+    {
+      "index": 0,
+      "steps": 20,
+      "sampler": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "guidance": 3.5,
+      "seed": "1234567890",
+      "adapters": []
+    }
+  ]
+}

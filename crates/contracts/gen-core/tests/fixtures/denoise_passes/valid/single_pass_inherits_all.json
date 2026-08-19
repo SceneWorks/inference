@@ -1,0 +1,29 @@
+{
+  "fixture": "single_pass_inherits_all",
+  "story": "sc-20415",
+  "description": "A one-pass chain that names nothing. Every field inherits from the top-level request, so the plan is identical to the legacy single-trajectory render of the same request (AC 3), and pass 0's seed is the job seed verbatim.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 3.5,
+    "advanced": {
+      "denoisePasses": [
+        {}
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  }
+}
