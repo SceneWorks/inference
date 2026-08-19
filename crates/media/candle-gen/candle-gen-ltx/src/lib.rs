@@ -38,6 +38,7 @@ pub mod config;
 pub mod connector;
 pub mod conv3d;
 pub mod dit_train;
+pub mod duration_head;
 pub mod gemma;
 pub mod image_crf;
 pub mod params;

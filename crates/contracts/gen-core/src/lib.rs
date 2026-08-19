@@ -18,6 +18,7 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod control;
+pub mod duration_head;
 pub mod encoder_contract;
 pub mod error;
 pub mod execution_domains;
