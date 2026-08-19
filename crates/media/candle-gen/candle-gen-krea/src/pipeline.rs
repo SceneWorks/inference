@@ -2014,9 +2014,10 @@ pub(crate) struct DenoisePassJob<'a> {
 
 /// The chain's DiT: the provider's loaded model when no pass overrides adapter weights, else ONE
 /// job-local re-adaptable base (never the shared resident — the multiphase concurrency invariant).
+/// Boxed so the enum stays reference-sized (the transformer aggregate is large).
 enum PassDit<'a> {
     Shared(&'a Krea2Transformer),
-    JobLocal(Krea2Transformer),
+    JobLocal(Box<Krea2Transformer>),
 }
 
 impl PassDit<'_> {
@@ -2133,13 +2134,13 @@ fn render_denoise_passes_driver<T>(
     // runs on the provider's already-loaded DiT with zero extra loads.
     let mut pass_dit = if gen_core::any_pass_overrides_adapters(&base_plan.passes) {
         on_dit_load();
-        PassDit::JobLocal(load_dit_base_at_dtype(
+        PassDit::JobLocal(Box::new(load_dit_base_at_dtype(
             job.root,
             job.native_dit,
             job.device,
             job.quant,
             dit_dtype,
-        )?)
+        )?))
     } else {
         PassDit::Shared(provider_dit)
     };

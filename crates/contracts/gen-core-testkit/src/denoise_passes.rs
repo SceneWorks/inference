@@ -289,7 +289,7 @@ pub fn check_boundary_renoise(builder: &PassScheduleBuilder<'_>) -> Result<(), S
     if out.latent == expected_entry {
         return Err("boundary re-noise: pass 2 never denoised its re-noised entry".to_owned());
     }
-    if !(out.execution.passes[1].renoised && !out.execution.passes[0].renoised) {
+    if !out.execution.passes[1].renoised || out.execution.passes[0].renoised {
         return Err("boundary re-noise: execution record mis-reports the renoise flags".to_owned());
     }
     Ok(())

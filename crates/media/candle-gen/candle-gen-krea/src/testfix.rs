@@ -291,10 +291,11 @@ pub(crate) fn tiny_native_transformer_fixture(
     (root, native_path, cfg)
 }
 
-/// Serialize the real tiny DiT as an ordinary **diffusers snapshot** (`transformer/model.safetensors`
-/// + `config.json`) — the BUILT-IN load route twin of [`tiny_native_transformer_fixture`], for tests
-/// that must prove the snapshot branch of a driver (sc-20418). Same production latent surface
-/// (`LATENT_CHANNELS == 16`, patch 2) so `init_noise` traverses the real path.
+/// Serialize the real tiny DiT as an ordinary **diffusers snapshot** (a `transformer/` dir carrying
+/// `model.safetensors` plus `config.json`) — the BUILT-IN load route twin of
+/// [`tiny_native_transformer_fixture`], for tests that must prove the snapshot branch of a driver
+/// (sc-20418). Same production latent surface (`LATENT_CHANNELS == 16`, patch 2) so `init_noise`
+/// traverses the real path.
 pub(crate) fn tiny_snapshot_transformer_fixture(tmp: &tempfile::TempDir) -> (PathBuf, Krea2Config) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let fixture = N.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +314,7 @@ pub(crate) fn tiny_snapshot_transformer_fixture(tmp: &tempfile::TempDir) -> (Pat
         rnd(&[cfg.in_channels, cfg.hidden_size]),
     );
     diffusers.insert("final_layer.linear.bias".into(), rnd(&[cfg.in_channels]));
-    candle_gen::candle_core::safetensors::save(&diffusers, &transformer.join("model.safetensors"))
+    candle_gen::candle_core::safetensors::save(&diffusers, transformer.join("model.safetensors"))
         .unwrap();
 
     let config = serde_json::json!({
