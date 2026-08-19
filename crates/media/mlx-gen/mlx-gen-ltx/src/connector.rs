@@ -17,7 +17,7 @@ use std::f64::consts::PI;
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, sum, tile};
+use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, sigmoid, sum, tile};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::linear;
@@ -29,7 +29,20 @@ use crate::rope::apply_split_rotary_emb;
 
 const CONNECTOR_EPS: f32 = 1e-6;
 
+/// `y = x·Wᵀ [+ b]` — the FF bias-optional twin of `mlx_gen::nn::linear` (sc-18758:
+/// `connector_ff_bias:false` leaves `blk.ff_{in,out}_b` `None`; every other connector Linear always
+/// carries a bias).
+fn linear_opt(x: &Array, w: &Array, b: Option<&Array>) -> Result<Array> {
+    match b {
+        Some(b) => linear(x, w, b),
+        None => Ok(matmul(x, w.t())?),
+    }
+}
+
 /// One connector transformer block (attn1 + gelu FF, both pre-normed with a unit-weight RMSNorm).
+/// `ff_in_b`/`ff_out_b` are `None` only when `connector_ff_bias:false` (sc-18758 — reference
+/// `Embeddings1DConnectorConfigurator`/`AudioEmbeddings1DConnectorConfigurator`, independent of the
+/// DiT's own `ff_bias`); neither shipped checkpoint sets it, so it is `Some` in practice today.
 struct ConnectorBlock {
     to_q_w: Array,
     to_q_b: Array,
@@ -44,9 +57,9 @@ struct ConnectorBlock {
     gate_w: Array,
     gate_b: Array,
     ff_in_w: Array,
-    ff_in_b: Array,
+    ff_in_b: Option<Array>,
     ff_out_w: Array,
-    ff_out_b: Array,
+    ff_out_b: Option<Array>,
 }
 
 /// The video text-feature connector.
@@ -74,6 +87,7 @@ impl Connector {
             cfg.connector_attention_head_dim,
             cfg.positional_embedding_theta,
             cfg.connector_positional_embedding_max_pos,
+            cfg.connector_ff_bias,
             dtype,
         )
     }
@@ -90,6 +104,7 @@ impl Connector {
         head_dim: i32,
         theta: f64,
         max_pos: i32,
+        ff_bias: bool,
         dtype: Dtype,
     ) -> Result<Self> {
         let n = num_layers as usize;
@@ -101,6 +116,9 @@ impl Connector {
                 .as_dtype(dtype)
                 .map_err(Error::from)
         };
+        // The `ff.proj_{in,out}.bias` tensors, absent when `connector_ff_bias:false` (sc-18758).
+        let w_at_dtype_opt =
+            |key: &str| -> Result<Option<Array>> { ff_bias.then(|| w_at_dtype(key)).transpose() };
         let mut blocks = Vec::with_capacity(n);
         for i in 0..n {
             let b = format!("{prefix}transformer_1d_blocks.{i}.");
@@ -118,9 +136,9 @@ impl Connector {
                 gate_w: w_at_dtype(&format!("{b}attn1.to_gate_logits.weight"))?,
                 gate_b: w_at_dtype(&format!("{b}attn1.to_gate_logits.bias"))?,
                 ff_in_w: w_at_dtype(&format!("{b}ff.net.0.proj.weight"))?,
-                ff_in_b: w_at_dtype(&format!("{b}ff.net.0.proj.bias"))?,
+                ff_in_b: w_at_dtype_opt(&format!("{b}ff.net.0.proj.bias"))?,
                 ff_out_w: w_at_dtype(&format!("{b}ff.net.2.weight"))?,
-                ff_out_b: w_at_dtype(&format!("{b}ff.net.2.bias"))?,
+                ff_out_b: w_at_dtype_opt(&format!("{b}ff.net.2.bias"))?,
             });
         }
         let registers = w_at_dtype(&format!("{prefix}learnable_registers"))?;
@@ -256,10 +274,10 @@ impl Connector {
         let n = rms_norm(x, &self.ones, CONNECTOR_EPS)?;
         let x = add(x, &self.attn(blk, &n, cos, sin)?)?;
         let n = rms_norm(&x, &self.ones, CONNECTOR_EPS)?;
-        let ff = linear(
-            &gelu(&linear(&n, &blk.ff_in_w, &blk.ff_in_b)?)?,
+        let ff = linear_opt(
+            &gelu(&linear_opt(&n, &blk.ff_in_w, blk.ff_in_b.as_ref())?)?,
             &blk.ff_out_w,
-            &blk.ff_out_b,
+            blk.ff_out_b.as_ref(),
         )?;
         Ok(add(&x, &ff)?)
     }

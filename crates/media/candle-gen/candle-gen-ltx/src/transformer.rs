@@ -34,6 +34,27 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
     x + out.broadcast_mul(gate)?
 }
 
+/// Add the learned keyframe absolute-position marker to single-pixel generated-keyframe tokens
+/// (sc-18758; reference `apply_keyframes_absolute_embedding`, ported from mlx-gen-ltx's twin). Applied
+/// to the patchified video hidden states immediately after `patchify_proj`. `embedding` is the
+/// stream's `(1, inner)` `keyframes_abs_pos_embedding` (`None` for a model built without
+/// `use_keyframes_abs_pos_embedding`, or for the audio stream, which never carries one);
+/// `keyframes_mask` is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either
+/// `None` makes this an exact no-op. The DFR keyframe-slot pipeline that would supply a real mask is a
+/// Phase 7 story (epic 18755); every current call site passes `None`.
+fn apply_keyframes_embedding(
+    x: &Tensor,
+    embedding: Option<&Tensor>,
+    keyframes_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let (Some(embedding), Some(mask)) = (embedding, keyframes_mask) else {
+        return Ok(x.clone());
+    };
+    let gate = mask.gt(0f32)?.to_dtype(x.dtype())?;
+    let marker = gate.broadcast_mul(&embedding.to_dtype(x.dtype())?)?;
+    x + marker
+}
+
 /// Weightless RMSNorm (unit weight) over the last axis, in f32.
 fn rms_noweight(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?.contiguous()?;
@@ -199,10 +220,16 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    /// `bias` is the caller's `AvConfig::video.ff_bias` / `audio_ff_bias` (sc-18758) — `true` keeps
+    /// both Linears biased (byte-identical to pre-sc-18758; this is 2.3 for both fields, and 2.5 for
+    /// `audio_ff_bias` — the real 2.5 header carries no `audio_ff_bias` key, so it stays the
+    /// reference absent-key default `True`). `false` (2.5's **video** `ff_bias` only) means neither
+    /// `net.0.proj` nor `net.2` carries a bias; reference `FeedForward.__init__` threads a single
+    /// `bias` flag to both.
+    fn load(vb: VarBuilder, bias: bool) -> Result<Self> {
         Ok(Self {
-            proj_in: linear(&vb.pp("net.0"), "proj")?,
-            proj_out: linear(&vb.pp("net"), "2")?,
+            proj_in: qlinear(&vb.pp("net.0"), "proj", bias)?,
+            proj_out: qlinear(&vb.pp("net"), "2", bias)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -296,6 +323,10 @@ struct AvStream {
     cross_gate_adaln: AdaLayerNormSingle,
     scale_shift_table: Tensor, // (2, inner) bf16
     proj_out: QLinear,
+    /// `(1, inner)` keyframe absolute-position marker (sc-18758) — the **video** stream only (the
+    /// reference `_init_video` never builds this for audio), `Some` only when
+    /// `cfg.use_keyframes_abs_pos_embedding`.
+    keyframes_embedding: Option<Tensor>,
     inner: usize,
     coeff: usize, // adaLN row count (9 gated)
     eps: f64,
@@ -315,7 +346,13 @@ impl AvStream {
         proj_out: &str,
         inner: usize,
         eps: f64,
+        keyframes_embedding_key: Option<&str>,
     ) -> Result<Self> {
+        // sc-18758: `require`d (not an existence probe) so a config that sets the flag but a
+        // checkpoint that omits the tensor is a load error, not a silent None.
+        let keyframes_embedding = keyframes_embedding_key
+            .map(|k| -> Result<Tensor> { vb.get_unchecked(k)?.to_dtype(vb.dtype()) })
+            .transpose()?;
         Ok(Self {
             patchify: linear(vb, patchify)?,
             adaln: AdaLayerNormSingle::load(vb.pp(adaln))?,
@@ -324,6 +361,7 @@ impl AvStream {
             cross_gate_adaln: AdaLayerNormSingle::load(vb.pp(cross_gate))?,
             scale_shift_table: vb.get_unchecked(sst)?.to_dtype(vb.dtype())?,
             proj_out: linear(vb, proj_out)?,
+            keyframes_embedding,
             inner,
             coeff: 9,
             eps,
@@ -451,6 +489,47 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn apply_keyframes_embedding_is_a_no_op_without_embedding_or_mask() -> Result<()> {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device)?;
+        let embedding = Tensor::from_vec(vec![10.0f32, 20.0], (1, 2), &device)?;
+        let mask = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2, 1), &device)?;
+
+        // No embedding configured (a pre-sc-18758 / 2.3 model, or the audio stream) → passthrough.
+        let got = apply_keyframes_embedding(&x, None, Some(&mask))?;
+        assert_eq!(
+            got.flatten_all()?.to_vec1::<f32>()?,
+            x.flatten_all()?.to_vec1::<f32>()?
+        );
+
+        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
+        // wiring is out of this story's scope) → passthrough.
+        let got2 = apply_keyframes_embedding(&x, Some(&embedding), None)?;
+        assert_eq!(
+            got2.flatten_all()?.to_vec1::<f32>()?,
+            x.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_keyframes_embedding_marks_only_gated_tokens() -> Result<()> {
+        let device = Device::Cpu;
+        // (1, 2, 2): token 0 marked (mask > 0), token 1 not.
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device)?;
+        let embedding = Tensor::from_vec(vec![10.0f32, 20.0], (1, 2), &device)?;
+        let mask = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2, 1), &device)?;
+
+        let got = apply_keyframes_embedding(&x, Some(&embedding), Some(&mask))?;
+        let out = got.flatten_all()?.to_vec1::<f32>()?;
+        assert!((out[0] - 11.0).abs() < 1e-6);
+        assert!((out[1] - 22.0).abs() < 1e-6);
+        assert!((out[2] - 3.0).abs() < 1e-6);
+        assert!((out[3] - 4.0).abs() < 1e-6);
+        Ok(())
+    }
 }
 
 /// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables → `(scale_a2v,
@@ -509,12 +588,12 @@ impl AvBlock {
         Ok(Self {
             attn1: Attention::load_with_dims(vb.pp("attn1"), vh, vdh, eps)?,
             attn2: Attention::load_with_dims(vb.pp("attn2"), vh, vdh, eps)?,
-            ff: FeedForward::load(vb.pp("ff"))?,
+            ff: FeedForward::load(vb.pp("ff"), cfg.video.ff_bias)?,
             v_sst: bf("scale_shift_table")?,
             v_pst: bf("prompt_scale_shift_table")?,
             a_attn1: Attention::load_with_dims(vb.pp("audio_attn1"), ah, adh, eps)?,
             a_attn2: Attention::load_with_dims(vb.pp("audio_attn2"), ah, adh, eps)?,
-            a_ff: FeedForward::load(vb.pp("audio_ff"))?,
+            a_ff: FeedForward::load(vb.pp("audio_ff"), cfg.audio_ff_bias)?,
             a_sst: bf("audio_scale_shift_table")?,
             a_pst: bf("audio_prompt_scale_shift_table")?,
             a2v: Attention::load_with_dims(vb.pp("audio_to_video_attn"), ah, adh, eps)?,
@@ -685,6 +764,9 @@ impl AvDiT {
             "proj_out",
             cfg.video.inner_dim(),
             cfg.video.norm_eps,
+            cfg.video
+                .use_keyframes_abs_pos_embedding
+                .then_some("keyframes_abs_pos_embedding"),
         )?;
         let audio = AvStream::load(
             &vb,
@@ -697,6 +779,8 @@ impl AvDiT {
             "audio_proj_out",
             cfg.audio_inner(),
             cfg.video.norm_eps,
+            // The reference never builds a keyframe marker for the audio stream (`_init_video` only).
+            None,
         )?;
         let mut blocks = Vec::with_capacity(cfg.video.num_layers);
         for i in 0..cfg.video.num_layers {
@@ -909,6 +993,9 @@ impl AvDiT {
             .video
             .patchify
             .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+        // sc-18758: the DFR keyframe-slot marker (video stream only). No call site threads a real
+        // mask yet (Phase 7), so this is presently an exact no-op — see `apply_keyframes_embedding`.
+        vx = apply_keyframes_embedding(&vx, self.video.keyframes_embedding.as_ref(), None)?;
         let mut ax = self
             .audio
             .patchify
@@ -979,6 +1066,7 @@ impl AvDiT {
             .video
             .patchify
             .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+        vx = apply_keyframes_embedding(&vx, self.video.keyframes_embedding.as_ref(), None)?;
         let v_ctx = video_context.to_dtype(self.video.dtype)?;
         // The video-only path never consumes the cross-modal fields. Reuse the self-RoPE/timestep
         // tensors to keep this borrowed argument bundle allocation-free.

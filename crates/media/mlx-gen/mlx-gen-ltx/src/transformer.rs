@@ -220,6 +220,32 @@ fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
     to_dtype(w.require(key)?, prec.dtype())
 }
 
+/// Add the learned keyframe absolute-position marker to single-pixel generated-keyframe tokens
+/// (sc-18758; reference `apply_keyframes_absolute_embedding`). Applied to the patchified video
+/// hidden states, immediately after `patchify_proj`. `embedding` is the model's `(1, inner_dim)`
+/// `keyframes_abs_pos_embedding` parameter (`None` for a model built without
+/// `use_keyframes_abs_pos_embedding`, matching `LTXModel._keyframes_embedding()`); `keyframes_mask`
+/// is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either `None` makes this
+/// an exact no-op — as does an embedding that is still zero-initialized (the loaded-but-untrained
+/// state). The DFR keyframe-slot conditioning pipeline that would supply a real, non-`None` mask is a
+/// Phase 7 story (epic 18755); every current call site passes `None`, so this is presently inert in
+/// the full generate path — the parameter load + apply mechanism is landed here because the flag is
+/// `true` and the weight ships in the real LTX-2.5 checkpoint.
+fn apply_keyframes_embedding(
+    x: &Array,
+    embedding: Option<&Array>,
+    keyframes_mask: Option<&Array>,
+) -> Result<Array> {
+    let (Some(embedding), Some(mask)) = (embedding, keyframes_mask) else {
+        return Ok(x.clone());
+    };
+    let gate = mask
+        .gt(scalar(0.0f32).as_dtype(mask.dtype())?)?
+        .as_dtype(x.dtype())?;
+    let marker = multiply(&gate, &embedding.as_dtype(x.dtype())?)?;
+    Ok(add(x, &marker)?)
+}
+
 /// `x · (1 + scale) + shift` (adaLN modulation), broadcasting `scale`/`shift` `(B, S', dim)` over the
 /// token axis. One fused kernel when the sc-2963 glue toggle is on (the `1` is cast to `scale`'s dtype
 /// inside, as before — bit-identical and dtype-preserving).
@@ -286,18 +312,21 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
     }
 }
 
-/// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load.
+/// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load. `b` is `None`
+/// only for the LTX-2.5 `ff_bias:false` FFN Linears (sc-18758) — every other Linear in the checkpoint
+/// (attention, patchify/proj_out, adaLN) always carries a bias in both 2.3 and 2.5 (the reference
+/// `attention_bias` check is hardcoded `True`), so `None` never appears there.
 #[derive(Clone)]
 enum LinearKind {
     Dense {
-        w: Array, // [out, in]
-        b: Array, // [out]
+        w: Array,         // [out, in]
+        b: Option<Array>, // [out]
     },
     Quant {
         q: Array,      // [out, in_packed] U32
         scales: Array, // [out, in/group]
         biases: Array,
-        b: Array,
+        b: Option<Array>,
         group: i32,
         bits: i32,
     },
@@ -306,7 +335,8 @@ enum LinearKind {
 impl LinearKind {
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
-            LinearKind::Dense { w, b } => linear(x, w, b),
+            LinearKind::Dense { w, b: Some(b) } => linear(x, w, b),
+            LinearKind::Dense { w, b: None } => Ok(matmul(x, w.t())?),
             LinearKind::Quant {
                 q,
                 scales,
@@ -314,7 +344,7 @@ impl LinearKind {
                 b,
                 group,
                 bits,
-            } => quantized_matmul_with_bias(x, q, scales, biases, Some(b), *group, *bits),
+            } => quantized_matmul_with_bias(x, q, scales, biases, b.as_ref(), *group, *bits),
         }
     }
 
@@ -348,14 +378,18 @@ impl LinearKind {
         match self {
             LinearKind::Dense { w, b } => {
                 *w = to_dtype(w, dtype)?;
-                *b = to_dtype(b, dtype)?;
+                if let Some(b) = b {
+                    *b = to_dtype(b, dtype)?;
+                }
             }
             LinearKind::Quant {
                 scales, biases, b, ..
             } => {
                 *scales = to_dtype(scales, dtype)?;
                 *biases = to_dtype(biases, dtype)?;
-                *b = to_dtype(b, dtype)?;
+                if let Some(b) = b {
+                    *b = to_dtype(b, dtype)?;
+                }
             }
         }
         Ok(())
@@ -427,9 +461,22 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// Every Linear except the LTX-2.5 `ff_bias:false` FFN Linears carries a bias — see
+    /// [`load_with_bias`](Self::load_with_bias).
     fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+        Self::load_with_bias(w, prefix, prec, true)
+    }
+
+    /// Load with the bias tensor optionally absent (sc-18758: LTX-2.5's `ff_bias:false` FFN Linears
+    /// carry no `{prefix}.bias`). `has_bias:false` must not `require` a bias key that legitimately
+    /// doesn't exist in the checkpoint — and must not silently zero-fill a *missing* bias it should
+    /// have found, so this only ever skips the read when the caller (the FFN construction, gated on
+    /// `LtxConfig::ff_bias`/`audio_ff_bias`/`connector_ff_bias`) says the tensor was never shipped.
+    fn load_with_bias(w: &Weights, prefix: &str, prec: Precision, has_bias: bool) -> Result<Self> {
         let dt = prec.dtype();
-        let b = to_dtype(w.require(&format!("{prefix}.bias"))?, dt)?;
+        let b = has_bias
+            .then(|| to_dtype(w.require(&format!("{prefix}.bias"))?, dt))
+            .transpose()?;
         let kind = match w.get(&format!("{prefix}.scales")) {
             Some(scales) => {
                 let q = w.require(&format!("{prefix}.weight"))?;
@@ -865,10 +912,16 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+    /// `bias` is the caller's [`LtxConfig::ff_bias`]/`audio_ff_bias`/`connector_ff_bias` — `true`
+    /// keeps both Linears biased (byte-identical to pre-sc-18758; this is 2.3 for all three, and 2.5
+    /// for `audio_ff_bias`/`connector_ff_bias` — the real 2.5 header carries no `audio_ff_bias` key,
+    /// so it stays the reference absent-key default `True`). `false` (2.5's **video** `ff_bias` only)
+    /// means neither `proj_in` nor `proj_out` carries a bias; see reference `FeedForward.__init__`,
+    /// which threads a single `bias` flag to both `net.0.proj` and `net.2`.
+    fn load(w: &Weights, prefix: &str, prec: Precision, bias: bool) -> Result<Self> {
         Ok(Self {
-            proj_in: Linear::load(w, &format!("{prefix}.proj_in"), prec)?,
-            proj_out: Linear::load(w, &format!("{prefix}.proj_out"), prec)?,
+            proj_in: Linear::load_with_bias(w, &format!("{prefix}.proj_in"), prec, bias)?,
+            proj_out: Linear::load_with_bias(w, &format!("{prefix}.proj_out"), prec, bias)?,
         })
     }
 
@@ -946,7 +999,7 @@ impl VideoBlock {
         Ok(Self {
             attn1: Attention::load(w, &format!("{prefix}.attn1"), h, dh, eps, prec)?,
             attn2: Attention::load(w, &format!("{prefix}.attn2"), h, dh, eps, prec)?,
-            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec, cfg.ff_bias)?,
             scale_shift_table: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
             prompt_scale_shift_table: param(
                 w,
@@ -1189,6 +1242,9 @@ pub struct LtxDiT {
     blocks: Vec<VideoBlock>,
     scale_shift_table: Array, // (2, inner)
     proj_out: Linear,
+    /// `(1, inner_dim)` keyframe absolute-position marker (sc-18758), `Some` only when
+    /// `cfg.use_keyframes_abs_pos_embedding` — the checkpoint carries no such tensor otherwise.
+    keyframes_embedding: Option<Array>,
     cfg: LtxConfig,
     prec: Precision,
     /// Per-stage SPLIT-RoPE table cache (F-048): the tables are constant across denoise steps.
@@ -1213,6 +1269,13 @@ impl LtxDiT {
             blocks,
             scale_shift_table: param(w, "scale_shift_table", prec)?,
             proj_out: Linear::load(w, "proj_out", prec)?,
+            // sc-18758: the checkpoint carries `keyframes_abs_pos_embedding` (1, inner_dim) iff the
+            // config flag is set — `require`, not `get`, so a config that says `true` but a checkpoint
+            // that omits the tensor is a load error, not a silent None.
+            keyframes_embedding: cfg
+                .use_keyframes_abs_pos_embedding
+                .then(|| param(w, "keyframes_abs_pos_embedding", prec))
+                .transpose()?,
             cfg: cfg.clone(),
             prec,
             rope_memo: RopeMemo::default(),
@@ -1294,6 +1357,9 @@ impl LtxDiT {
             b.cast_weights(dtype)?;
         }
         self.scale_shift_table = to_dtype(&self.scale_shift_table, dtype)?;
+        if let Some(kf) = &self.keyframes_embedding {
+            self.keyframes_embedding = Some(to_dtype(kf, dtype)?);
+        }
         self.prec = self.prec.with_compute_dtype(dtype);
         Ok(())
     }
@@ -1322,6 +1388,10 @@ impl LtxDiT {
         let coeff = self.cfg.adaln_embedding_coefficient;
 
         let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
+        // sc-18758: the DFR keyframe-slot marker (a Phase 7 pipeline story supplies the real mask; no
+        // call site threads one yet, so this is presently an exact no-op — see
+        // `apply_keyframes_embedding`).
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
 
         // adaLN-single timestep projection. The `× timestep_scale_multiplier` runs in the **input
         // dtype** (matching `denoise_av`, which feeds a latent-dtype timestep): the adaLN sinusoid
@@ -1611,6 +1681,10 @@ struct Stream {
     cross_gate_adaln: AdaLayerNormSingle,
     scale_shift_table: Array, // (2, inner) output head
     proj_out: Linear,
+    /// `(1, inner)` keyframe absolute-position marker (sc-18758) — the **video** stream only
+    /// (`_init_video`; the reference never builds this for the audio stream), `Some` only when
+    /// `cfg.use_keyframes_abs_pos_embedding`.
+    keyframes_embedding: Option<Array>,
     inner: i32,
     heads: i32,
     coeff: i32, // adaLN row count (9 gated)
@@ -1689,6 +1763,10 @@ impl Stream {
         let (inner, coeff) = (self.inner, self.coeff);
 
         let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
+        // sc-18758: the DFR keyframe-slot marker (video stream only; `self.keyframes_embedding` is
+        // always `None` for the audio stream). No call site threads a real mask yet (Phase 7), so
+        // this is presently an exact no-op — see `apply_keyframes_embedding`.
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
 
         // adaLN-single timestep projection (the `× ts_mult` runs in the input dtype; see the
         // video-only path's note — bf16 must round `bf16(σ·1000)` first).
@@ -1852,12 +1930,12 @@ impl AvBlock {
         Ok(Self {
             attn1: Attention::load(w, &format!("{prefix}.attn1"), vh, vdh, eps, prec)?,
             attn2: Attention::load(w, &format!("{prefix}.attn2"), vh, vdh, eps, prec)?,
-            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec)?,
+            ff: FeedForward::load(w, &format!("{prefix}.ff"), prec, cfg.ff_bias)?,
             v_sst: param(w, &format!("{prefix}.scale_shift_table"), prec)?,
             v_pst: param(w, &format!("{prefix}.prompt_scale_shift_table"), prec)?,
             a_attn1: Attention::load(w, &format!("{prefix}.audio_attn1"), ah, adh, eps, prec)?,
             a_attn2: Attention::load(w, &format!("{prefix}.audio_attn2"), ah, adh, eps, prec)?,
-            a_ff: FeedForward::load(w, &format!("{prefix}.audio_ff"), prec)?,
+            a_ff: FeedForward::load(w, &format!("{prefix}.audio_ff"), prec, cfg.audio_ff_bias)?,
             a_sst: param(w, &format!("{prefix}.audio_scale_shift_table"), prec)?,
             a_pst: param(w, &format!("{prefix}.audio_prompt_scale_shift_table"), prec)?,
             // Cross-modal attns run at the audio inner dim (heads 32 × head_dim 64 = 2048).
@@ -2047,6 +2125,12 @@ impl AvDiT {
             cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_a2v_gate_adaln_single", prec)?,
             scale_shift_table: param(w, "scale_shift_table", prec)?,
             proj_out: Linear::load(w, "proj_out", prec)?,
+            // sc-18758: video-stream-only marker; `require`d (not `get`) so a config that sets the
+            // flag but a checkpoint that omits the tensor is a load error, not a silent None.
+            keyframes_embedding: cfg
+                .use_keyframes_abs_pos_embedding
+                .then(|| param(w, "keyframes_abs_pos_embedding", prec))
+                .transpose()?,
             inner: cfg.inner_dim(),
             heads: cfg.num_attention_heads,
             coeff: cfg.adaln_embedding_coefficient,
@@ -2073,6 +2157,8 @@ impl AvDiT {
             cross_gate_adaln: AdaLayerNormSingle::load(w, "av_ca_v2a_gate_adaln_single", prec)?,
             scale_shift_table: param(w, "audio_scale_shift_table", prec)?,
             proj_out: Linear::load(w, "audio_proj_out", prec)?,
+            // The reference never builds a keyframe marker for the audio stream (`_init_video` only).
+            keyframes_embedding: None,
             inner: cfg.audio_inner_dim(),
             heads: cfg.audio_num_attention_heads,
             coeff: cfg.adaln_embedding_coefficient,
@@ -2454,7 +2540,7 @@ mod tests {
         let dt = w.dtype();
         Linear {
             kind: LinearKind::Dense {
-                b: Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap(),
+                b: Some(Array::zeros::<f32>(&[out]).unwrap().as_dtype(dt).unwrap()),
                 w,
             },
             lora: None,
@@ -2726,5 +2812,136 @@ mod tests {
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    // --- sc-18758: ff_bias / audio_ff_bias / connector_ff_bias, keyframes_abs_pos_embedding ---------
+
+    /// A minimal 2-linear FeedForward-shaped weights map: `proj_in`/`proj_out`, each `[4,4]` weight +
+    /// `[4]` bias — `with_bias:false` also skips inserting the bias tensors, matching a real LTX-2.5
+    /// checkpoint (the tensor is genuinely absent, not merely unread).
+    fn ff_weights(with_bias: bool) -> Weights {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ff.proj_in.weight".to_string(),
+            Array::from_slice(
+                &[
+                    0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
+                    1.6,
+                ],
+                &[4, 4],
+            ),
+        );
+        m.insert(
+            "ff.proj_out.weight".to_string(),
+            Array::from_slice(
+                &[
+                    0.2f32, -0.1, 0.05, 0.15, -0.2, 0.3, 0.1, -0.05, 0.25, -0.15, 0.2, -0.1, 0.05,
+                    0.1, -0.2, 0.15,
+                ],
+                &[4, 4],
+            ),
+        );
+        if with_bias {
+            m.insert(
+                "ff.proj_in.bias".to_string(),
+                Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]),
+            );
+            m.insert(
+                "ff.proj_out.bias".to_string(),
+                Array::from_slice(&[0.5f32, -0.5, 0.25, -0.25], &[4]),
+            );
+        }
+        Weights::from_map(m)
+    }
+
+    /// Mutation test (sc-18758): flipping `ff_bias` genuinely changes the constructed parameter set —
+    /// not merely a defaulted-past flag. With a checkpoint that carries bias tensors, `bias:true` reads
+    /// and applies them (the forward differs from the bias-free result); `bias:false` never reads
+    /// `.bias` at all, so its `LinearKind` structurally omits the bias term (`Dense { b: None, .. }`)
+    /// even though the tensor was present in the source map — proving the flag, not the checkpoint
+    /// content, decides whether the bias parameter exists in the built module.
+    #[test]
+    fn ff_bias_flag_changes_constructed_params_and_forward() {
+        let prec = Precision::dense_f32(4, 64);
+        let w = ff_weights(true);
+        let x = Array::from_slice(&[1.0f32, -1.0, 0.5, 2.0], &[1, 4]);
+
+        let ff_biased = FeedForward::load(&w, "ff", prec, true).expect("bias:true loads");
+        let ff_unbiased = FeedForward::load(&w, "ff", prec, false).expect("bias:false loads");
+
+        // Structural: bias:false never installs a bias term, regardless of the source map.
+        assert!(matches!(
+            &ff_unbiased.proj_in.kind,
+            LinearKind::Dense { b: None, .. }
+        ));
+        assert!(matches!(
+            &ff_biased.proj_in.kind,
+            LinearKind::Dense { b: Some(_), .. }
+        ));
+
+        // Forward: the two constructions produce numerically different output on the same input —
+        // the flag is exercised, not defaulted past.
+        let out_biased = ff_biased.forward(&x).unwrap();
+        let out_unbiased = ff_unbiased.forward(&x).unwrap();
+        mlx_rs::transforms::eval([&out_biased, &out_unbiased]).unwrap();
+        assert!(
+            !array_eq(&out_biased, &out_unbiased, None)
+                .unwrap()
+                .item::<bool>(),
+            "ff_bias:true vs false must produce different output on a checkpoint with real bias values"
+        );
+    }
+
+    /// The other half of the mutation proof: `bias:false` on a checkpoint that genuinely carries no
+    /// `.bias` tensor (the real LTX-2.5 shape) must NOT `require` it — and `bias:true` on that same
+    /// checkpoint must error, proving the strict-loader contract (never silently zero-fill a bias that
+    /// was never shipped, never silently skip one the config says must be there).
+    #[test]
+    fn ff_bias_false_never_requires_an_absent_bias_tensor() {
+        let prec = Precision::dense_f32(4, 64);
+        let w = ff_weights(false);
+
+        FeedForward::load(&w, "ff", prec, false).expect("bias:false must not require the tensor");
+        let err = FeedForward::load(&w, "ff", prec, true);
+        assert!(
+            err.is_err(),
+            "bias:true against a checkpoint with no `.bias` tensor must error, not silently proceed"
+        );
+    }
+
+    #[test]
+    fn apply_keyframes_embedding_is_a_no_op_without_embedding_or_mask() {
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let embedding = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[1.0f32, 0.0], &[1, 2, 1]);
+
+        // No embedding configured (a pre-sc-18758 / 2.3 model) → exact passthrough.
+        let got = apply_keyframes_embedding(&x, None, Some(&mask)).unwrap();
+        mlx_rs::transforms::eval([&got, &x]).unwrap();
+        assert!(array_eq(&got, &x, None).unwrap().item::<bool>());
+
+        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
+        // wiring is out of this story's scope) → exact passthrough.
+        let got2 = apply_keyframes_embedding(&x, Some(&embedding), None).unwrap();
+        mlx_rs::transforms::eval([&got2]).unwrap();
+        assert!(array_eq(&got2, &x, None).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn apply_keyframes_embedding_marks_only_gated_tokens() {
+        // (1, 2, 2): token 0 marked (mask>0), token 1 not.
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let embedding = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[1.0f32, 0.0], &[1, 2, 1]);
+
+        let got = apply_keyframes_embedding(&x, Some(&embedding), Some(&mask)).unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        let out = got.as_slice::<f32>();
+        // Token 0 gets `x + embedding`.
+        assert!((out[0] - 11.0).abs() < 1e-6);
+        assert!((out[1] - 22.0).abs() < 1e-6);
+        // Token 1 (mask == 0) is untouched.
+        assert!((out[2] - 3.0).abs() < 1e-6);
+        assert!((out[3] - 4.0).abs() < 1e-6);
     }
 }
