@@ -18,7 +18,7 @@ use crate::error::Result;
 use crate::primitives::kv_cache::KvCache;
 
 pub use deepstack::MropePositions;
-pub use llama::{shard_plan, CausalLm};
+pub use llama::{shard_plan, CausalLm, RopeTables};
 pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
 pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput};
 pub use siglip::{

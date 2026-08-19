@@ -231,6 +231,7 @@ fn tiny_config() -> ModelConfig {
         mla: None,
         yarn: None,
         mrope_section: None,
+        gemma4: None,
     }
 }
 

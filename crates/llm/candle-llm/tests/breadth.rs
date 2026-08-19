@@ -104,3 +104,18 @@ fn glm4_streams_coherent_text() {
 fn deepseek_v2_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_DEEPSEEK_MODEL", "deepseek_v2");
 }
+
+/// Gemma 4 unified (sc-18761): the **per-layer-type** decoder — 40 `sliding_attention` layers
+/// (head_dim 256, θ=10 000, window 1024, 8 KV heads) interleaved with 8 `full_attention` ones
+/// (head_dim 512, proportional θ=1 000 000, 1 KV head, shared K/V), plain-`weight` norms, unit
+/// attention scale, a scale-free value norm, and final-logit soft-capping at 30.
+///
+/// Point at a `google/gemma-4-12B-it` snapshot. `tests/gemma4_decoder.rs` carries the numeric
+/// pinning on the deterministic CPU path; this is the real-weight coherence check the CUDA lane
+/// runs — the shapes are large enough (48 layers, hidden 3840, vocab 262 144) that a per-layer table
+/// wired wrong produces word salad rather than a shape error.
+#[test]
+#[ignore = "needs a Gemma 4 unified snapshot via CANDLE_LLM_GEMMA4_MODEL"]
+fn gemma4_unified_streams_coherent_text() {
+    assert_streams_coherent("CANDLE_LLM_GEMMA4_MODEL", "gemma4_unified");
+}

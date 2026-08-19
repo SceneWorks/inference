@@ -1,5 +1,5 @@
 //! Generic Llama-family causal decoder, config-dispatched across architectures (Llama / Mistral,
-//! Qwen3, Phi-3, Qwen2-MoE, Gemma-2, GLM-4, DeepSeek-V2).
+//! Qwen3, Phi-3, Qwen2-MoE, Gemma-2, GLM-4, DeepSeek-V2, Gemma 4).
 //!
 //! The Candle port of `mlx-llm`'s `CausalLm`, modelled alongside `candle-gen-sensenova`'s
 //! hand-rolled Qwen3 stack. One block shape covers the family: self-attention is either grouped-query
@@ -12,18 +12,33 @@
 //! Shapes are batch-capable (`[batch, seq, …]`). `head_dim` is taken from config and may differ from
 //! `hidden_size / num_heads` (e.g. Qwen3-0.6B: hidden 1024, 16 heads, head_dim 128). Compute runs in
 //! the device's [`compute_dtype`] (bf16 on GPU, f32 on CPU).
+//!
+//! # Per-layer-type attention (Gemma 4)
+//!
+//! Every architecture before Gemma 4 is *uniform*: one head dim, one KV-head count, one RoPE
+//! schedule, one mask, for the whole stack. Gemma 4 is not — its `layer_types` alternates
+//! `sliding_attention` and `full_attention` layers that disagree on all four (sc-18761). The block
+//! therefore reads [`ModelConfig::layer_attention`] **per layer** rather than the scalar
+//! `head_dim` / `num_kv_heads` / `rope_theta` triple, and the model carries one RoPE per layer
+//! *type* ([`RopeTables`]). A uniform architecture resolves every layer to the same descriptor built
+//! from exactly the scalars it read before, so nothing about its forward changes.
+//!
+//! The Gemma 4 deltas the block itself implements: the sliding-window mask on `sliding_attention`
+//! layers, the `attention_k_eq_v` shared key/value projection ([`KvProjection`]) on
+//! `full_attention` layers, and the **scale-free** per-head value norm applied to the raw
+//! projection output on every layer.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module};
 
-use crate::config::{Architecture, ModelConfig};
+use crate::config::{Architecture, LayerAttentionType, ModelConfig};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
-use crate::primitives::attention::{sdpa, AttnMask};
+use crate::primitives::attention::{sdpa, sliding_causal_mask, AttnMask};
 use crate::primitives::kv_cache::KvCache;
-use crate::primitives::nn::{embed, gelu, rms_norm, silu, soft_cap};
-use crate::primitives::projection::{Projection, QuantSpec};
+use crate::primitives::nn::{embed, gelu, rms_norm, rms_norm_unscaled, silu, soft_cap};
+use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
 
@@ -33,7 +48,11 @@ pub struct CausalLm {
     layers: Vec<LlamaLayer>,
     norm: Tensor,
     lm_head: Linear,
+    /// The RoPE every layer uses on a uniform model — and Gemma 4's `sliding_attention` schedule.
     rope: Rope,
+    /// Gemma 4's `full_attention` RoPE (`proportional`, its own theta and head dim); `None` for
+    /// every uniform architecture, whose layers all share [`CausalLm::rope`].
+    rope_full: Option<Rope>,
     cfg: ModelConfig,
     dtype: DType,
     device: Device,
@@ -47,6 +66,9 @@ pub struct CausalLm {
     embed_scale: Option<f64>,
     /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
     final_softcap: Option<f32>,
+    /// Whether any layer reads its keys/values from an earlier one (Gemma 4 `num_kv_shared_layers`).
+    /// Those are published per forward, so a continued (cached) generation is refused.
+    kv_sharing: bool,
 }
 
 impl CausalLm {
@@ -83,7 +105,15 @@ impl CausalLm {
         // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
         // `*ForCausalLM` keeps the historical `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight`
         // layout. `decoder_root` carries the right stem so the per-key suffixes below are uniform.
-        let vlm_nested = cfg.architecture.is_qwen3_vl();
+        //
+        // Gemma 4 unified ships **both** ways — `Gemma4UnifiedForConditionalGeneration` nests the
+        // text decoder under `model.language_model.*`, while a text-only export (and the LTX-2.5
+        // packed encoder, whose weights are re-rooted on unpack) keeps the plain `model.*` layout.
+        // Probe rather than guess: the nesting is a checkpoint fact, not a config one, and picking
+        // the wrong stem fails on the very first weight lookup with a key the caller never wrote.
+        let vlm_nested = cfg.architecture.is_qwen3_vl()
+            || (cfg.architecture.is_gemma4()
+                && w.contains("model.language_model.embed_tokens.weight"));
         let decoder_root = if vlm_nested {
             "model.language_model".to_string()
         } else {
@@ -104,12 +134,18 @@ impl CausalLm {
             };
             Projection::load_with_bias(req(wkey)?, bias, quant)
         };
-        // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
-        // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim.)
-        let gemma = cfg.architecture.is_gemma2();
+        // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
+        // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim — and so are
+        // **Gemma 4's**: `Gemma4UnifiedRMSNorm` multiplies by the stored weight, whose initializer
+        // is ones, so folding +1 in would corrupt every norm. Hence `norm_unit_offset` rather than
+        // the broader `is_gemma`.)
+        let norm_offset = cfg.architecture.norm_unit_offset();
+        // The two things every Gemma generation shares: the sqrt(hidden) embedding scale and the
+        // GeGLU (`gelu_pytorch_tanh`) MLP.
+        let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Tensor> {
             let t = req(key)?;
-            if gemma {
+            if norm_offset {
                 Ok(t.affine(1.0, 1.0)?)
             } else {
                 Ok(t)
@@ -130,61 +166,99 @@ impl CausalLm {
         };
 
         let qk_norm = cfg.has_qk_norm();
-        let groups = cfg.groups() as usize;
         let num_heads = cfg.num_heads as usize;
-        let num_kv_heads = cfg.num_kv_heads as usize;
-        let head_dim = cfg.head_dim as usize;
         let scale = cfg.attn_scale();
         let eps = cfg.rms_norm_eps as f64;
-        // Phi-3 fuses q‖k‖v into one `qkv_proj` and gate‖up into one `gate_up_proj`; the row spans the
-        // split slices below carve out (each `[out, hidden]`, so the split is along axis 0).
-        let qd = num_heads * head_dim;
-        let kvd = num_kv_heads * head_dim;
         let inter = cfg.intermediate_size as usize;
+        // Gemma 4's scale-free per-head value norm, applied to the **raw** value projection output
+        // on every layer (shared with K or not). Off for every other architecture.
+        let v_norm = cfg.architecture.has_v_norm();
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
+
+            // **Per layer**, not per model: Gemma 4's two layer types disagree on head dim, KV-head
+            // count, GQA group count, RoPE schedule, mask and whether K/V share a projection. Every
+            // uniform architecture resolves each layer to the same descriptor built from the scalar
+            // `head_dim` / `num_kv_heads` it always read, so its projections are unchanged.
+            let la = cfg.layer_attention(i);
+            let head_dim = la.head_dim as usize;
+            let num_kv_heads = la.num_kv_heads as usize;
+            let groups = la.groups(cfg.num_heads) as usize;
+            // Phi-3 fuses q‖k‖v into one `qkv_proj` and gate‖up into one `gate_up_proj`; the row
+            // spans the split slices below carve out (each `[out, hidden]`, so the split is along
+            // axis 0).
+            let qd = num_heads * head_dim;
+            let kvd = num_kv_heads * head_dim;
+            // Gemma 4's `num_kv_shared_layers` tail: these layers carry **no** `k_proj` / `v_proj` /
+            // `k_norm` at all and attend the keys/values published by `kv_donor` — the last earlier
+            // layer of their own type (never the other type's: the head dims do not even match).
+            let kv_share = cfg.gemma4.as_deref().and_then(|g| {
+                g.kv_donor(i).map(|donor| KvShare {
+                    donor_kind: g.layer_type(donor),
+                })
+            });
+            let stores_shared_kv = cfg.gemma4.as_deref().is_some_and(|g| g.stores_shared_kv(i));
 
             // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention. MLA's
             // low-rank q/kv projections are wholly distinct from GQA's q/k/v, so it is its own path.
             let attn = if cfg.architecture.is_mla() {
                 Attention::Mla(MlaAttention::load(w, lp, &cfg, dtype, quant)?)
             } else {
-                let (q_norm, k_norm) = if qk_norm {
-                    (
-                        Some(req(lp("self_attn.q_norm.weight"))?),
-                        Some(req(lp("self_attn.k_norm.weight"))?),
-                    )
-                } else {
-                    (None, None)
-                };
+                let q_norm = qk_norm
+                    .then(|| req(lp("self_attn.q_norm.weight")))
+                    .transpose()?;
+                // A KV-sharing layer normalizes nothing on the key path — it has no key to project.
+                let k_norm = (qk_norm && kv_share.is_none())
+                    .then(|| req(lp("self_attn.k_norm.weight")))
+                    .transpose()?;
                 // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v, else the separate
                 // `q_proj`/`k_proj`/`v_proj` are loaded directly (with q/k/v bias for Qwen2).
-                let (q, k, v) = {
+                // Gemma 4's `attention_k_eq_v` layers have **no** `v_proj` in the checkpoint at all:
+                // the key projection feeds both, so it is loaded once and shared (see
+                // [`KvProjection`] — running one weight through two projections would give the same
+                // numbers at twice the matmul and twice the quantized footprint).
+                let (q, kv) = {
                     let packed = lp("self_attn.qkv_proj.weight");
                     if w.contains(&packed) {
                         let qkv = req(packed)?; // [qd + 2*kvd, hidden]
                         (
                             Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
-                            Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
-                            Projection::load(qkv.narrow(0, qd + kvd, kvd)?.contiguous()?, quant)?,
+                            Some(KvProjection::separate(
+                                Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
+                                Projection::load(
+                                    qkv.narrow(0, qd + kvd, kvd)?.contiguous()?,
+                                    quant,
+                                )?,
+                            )),
                         )
                     } else {
-                        (
-                            proj_b(lp("self_attn.q_proj.weight"))?,
-                            proj_b(lp("self_attn.k_proj.weight"))?,
-                            proj_b(lp("self_attn.v_proj.weight"))?,
-                        )
+                        let q = proj_b(lp("self_attn.q_proj.weight"))?;
+                        let kv = match kv_share.is_some() {
+                            true => None,
+                            false => {
+                                let k = proj_b(lp("self_attn.k_proj.weight"))?;
+                                Some(if la.k_eq_v {
+                                    KvProjection::shared(k)
+                                } else {
+                                    KvProjection::separate(
+                                        k,
+                                        proj_b(lp("self_attn.v_proj.weight"))?,
+                                    )
+                                })
+                            }
+                        };
+                        (q, kv)
                     }
                 };
                 Attention::Gqa(LlamaAttention {
                     q,
-                    k,
-                    v,
+                    kv,
                     o: proj_b(lp("self_attn.o_proj.weight"))?,
                     q_norm,
                     k_norm,
+                    v_norm,
                     num_heads,
                     num_kv_heads,
                     head_dim,
@@ -193,6 +267,10 @@ impl CausalLm {
                     eps,
                     softcap: cfg.attn_logit_softcap,
                     rope_interleaved: cfg.architecture.rope_interleaved(),
+                    sliding_window: la.sliding_window,
+                    kv_share,
+                    stores_shared_kv,
+                    layer_kind: cfg.layer_type(i),
                 })
             };
 
@@ -239,6 +317,13 @@ impl CausalLm {
                 })
             } else {
                 // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
+                // `use_double_wide_mlp` doubles this layer's inner width on Gemma 4's KV-sharing
+                // tail (the layers that saved a K/V projection spend it on a wider MLP instead);
+                // every other layer, and every other architecture, keeps `intermediate_size`.
+                let inter = match cfg.gemma4.as_deref() {
+                    Some(g) => g.layer_intermediate_size(i, cfg.intermediate_size) as usize,
+                    None => inter,
+                };
                 let (gate, up) = {
                     let packed = lp("mlp.gate_up_proj.weight");
                     if w.contains(&packed) {
@@ -286,6 +371,16 @@ impl CausalLm {
                 (None, None)
             };
 
+            // Gemma 4's `layer_scalar`: a learned per-layer scalar that multiplies the block's
+            // whole output — residual stream included — after both residual adds. Its initializer
+            // is ones, which is exactly why a port that never reads it looks correct against any
+            // fixture that left it at the initializer; the shared goldens set it to 0.9/1.1/... so
+            // skipping it cannot pass. Only Gemma 4 has it.
+            let layer_scalar = cfg
+                .is_gemma4()
+                .then(|| req(lp("layer_scalar")))
+                .transpose()?;
+
             layers.push(LlamaLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
@@ -294,10 +389,22 @@ impl CausalLm {
                 attn,
                 ffn,
                 eps,
+                layer_scalar,
             });
         }
 
-        let rope = cfg.build_rope();
+        // One RoPE per layer *type*. A uniform model has a single type, so `rope` is exactly
+        // `cfg.build_rope()` as before and `rope_full` is `None`; Gemma 4 gets its `default`
+        // (sliding, θ=10 000, head_dim 256) and `proportional` (full, θ=1 000 000,
+        // partial_rotary_factor 0.25, head_dim 512) schedules, whose tables are not even the same
+        // width.
+        let (rope, rope_full) = match cfg.gemma4.as_deref() {
+            Some(g) => (
+                g.for_type(LayerAttentionType::Sliding).build_rope(),
+                Some(g.for_type(LayerAttentionType::Full).build_rope()),
+            ),
+            None => (cfg.build_rope(), None),
+        };
         // The per-layer device is wherever that layer's weights landed — equal to `device` for a
         // normal load, distinct blocks when the `Weights` were placed by a sharded loader.
         let layer_devices: Vec<Device> =
@@ -308,12 +415,17 @@ impl CausalLm {
             norm,
             lm_head,
             rope,
+            rope_full,
             dtype,
             device,
             layer_devices,
             quantized: quant.is_some(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f64).sqrt()),
             final_softcap: cfg.final_logit_softcap,
+            kv_sharing: cfg
+                .gemma4
+                .as_deref()
+                .is_some_and(|g| g.first_kv_shared_layer().is_some()),
             cfg,
         })
     }
@@ -381,17 +493,37 @@ impl CausalLm {
         self.dtype
     }
 
-    /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
-    /// (row-major flat `positions`, length `rows * cols`) — the **per-sequence** position tables the
-    /// batched decode (story 7255) feeds [`CausalLm::decode_logits_masked`]. Each is
+    /// Build per-row RoPE tables for a `[rows, cols]` grid of absolute positions (row-major flat
+    /// `positions`, length `rows * cols`) — the **per-sequence** position tables the batched decode
+    /// (story 7255) feeds [`CausalLm::decode_logits_masked`]. Each `(cos, sin)` is
     /// `[rows, cols, head_dim]` in the compute dtype.
-    pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Tensor, Tensor)> {
-        let (cos, sin) = self.rope.cos_sin_at(positions, self.dtype, &self.device)?; // [1, rows*cols, hd]
-        let hd = self.rope.dim();
-        Ok((
-            cos.reshape((rows as usize, cols as usize, hd))?,
-            sin.reshape((rows as usize, cols as usize, hd))?,
-        ))
+    ///
+    /// Returns a [`RopeTables`] rather than one pair because a Gemma 4 stack needs **two** — its
+    /// layer types have different head dims, so their tables are different widths. A uniform model's
+    /// `RopeTables` holds exactly the single pair this returned before.
+    pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<RopeTables> {
+        let grid = |rope: &Rope| -> Result<(Tensor, Tensor)> {
+            let (cos, sin) = rope.cos_sin_at(positions, self.dtype, &self.device)?; // [1, rows*cols, hd]
+            let hd = rope.dim();
+            Ok((
+                cos.reshape((rows as usize, cols as usize, hd))?,
+                sin.reshape((rows as usize, cols as usize, hd))?,
+            ))
+        };
+        Ok(RopeTables {
+            primary: grid(&self.rope)?,
+            full: self.rope_full.as_ref().map(grid).transpose()?,
+        })
+    }
+
+    /// The RoPE tables for `seq_len` contiguous positions starting at `offset` — the single-sequence
+    /// forward's tables, one pair per layer type.
+    fn rope_tables_seq(&self, seq_len: i32, offset: i32) -> Result<RopeTables> {
+        let at = |rope: &Rope| rope.cos_sin(seq_len, offset, self.dtype, &self.device);
+        Ok(RopeTables {
+            primary: at(&self.rope)?,
+            full: self.rope_full.as_ref().map(at).transpose()?,
+        })
     }
 
     /// Embed token ids `[batch, seq]` (u32) → `[batch, seq, hidden]`. Gemma scales the embeddings by
@@ -428,8 +560,57 @@ impl CausalLm {
         let s = input_embeds.dim(1)? as i32;
         // Single-sequence / uniform batch: positions [offset, offset+s) shared across the batch, with
         // an implicit bottom-right causal mask; cos/sin `[1, s, head_dim]` broadcast over the batch.
-        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
-        self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
+        let tables = self.rope_tables_seq(s, offset)?;
+        self.forward_to_last_logits(input_embeds, cache, &tables, AttnMask::Causal)
+    }
+
+    /// Run a forward step over token ids and return **every layer's** hidden states rather than
+    /// logits — the `output_hidden_states=True` stack a *text encoder* consumes (LTX-2.5 stacks all
+    /// of them into its feature extractor; only a language-model head wants logits).
+    ///
+    /// See [`CausalLm::hidden_states_from_embeds`] for the returned layout.
+    pub fn hidden_states(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Tensor>> {
+        let embeds = self.embed(input_ids)?;
+        self.hidden_states_from_embeds(&embeds, cache, offset)
+    }
+
+    /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
+    ///
+    /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's
+    /// `output_hidden_states` layout:
+    ///
+    /// * `[0]` — the input embeddings (post embedding-scale), i.e. the first layer's input.
+    /// * `[i]` for `1 <= i < num_layers` — the output of decoder layer `i - 1`.
+    /// * `[num_layers]` — the **final-normed** output of the last layer (HF ties the last entry to
+    ///   `last_hidden_state`, which is post-`model.norm`), *not* the raw layer output.
+    ///
+    /// Getting that last entry wrong is invisible in a decode smoke test — logits go through the
+    /// same norm either way — but silently shifts every feature an encoder consumer builds.
+    pub fn hidden_states_from_embeds(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Tensor>> {
+        let s = input_embeds.dim(1)? as i32;
+        let tables = self.rope_tables_seq(s, offset)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            &tables,
+            AttnMask::Causal,
+            Some(&mut out),
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        }
+        Ok(out)
     }
 
     /// Embed token ids `[1, S]` → `[1, S, hidden]` in the compute dtype — the Qwen3-VL multimodal
@@ -507,6 +688,16 @@ impl CausalLm {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        // Interleaved M-RoPE is Qwen3-VL's whole-model schedule; a per-layer-type table (Gemma 4)
+        // has no M-RoPE form, and running the sliding schedule on every layer would be silently
+        // wrong rather than an error.
+        if self.rope_full.is_some() {
+            return Err(Error::Unsupported(
+                "interleaved multimodal RoPE is a whole-model schedule; this decoder has one RoPE \
+                 per layer type (Gemma 4), which M-RoPE does not describe"
+                    .to_string(),
+            ));
+        }
         let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
             positions,
             self.cfg.mrope_section_resolved(),
@@ -520,6 +711,8 @@ impl CausalLm {
         let mut cur = h0.device().clone();
         let mut cos_d = cos.clone();
         let mut sin_d = sin.clone();
+        // Qwen3-VL only (Gemma 4 is refused above), so no layer ever reads or writes this.
+        let mut shared_kv = SharedKv::default();
         let h = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -535,7 +728,12 @@ impl CausalLm {
                     cur = dev.clone();
                     h.to_device(dev)?
                 };
-                self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, cache, i)
+                let mut state = LayerState {
+                    cache: &mut *cache,
+                    layer_idx: i,
+                    shared_kv: &mut shared_kv,
+                };
+                self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
         )?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
@@ -547,21 +745,23 @@ impl CausalLm {
     /// and an explicit additive attention mask — the decode primitive the dynamic-batch scheduler
     /// (story 7255) runs each step.
     ///
-    /// `input_ids` is `[batch, seq]` (u32); `cos`/`sin` are `[batch, seq, head_dim]` (per-row
-    /// positions, e.g. from [`CausalLm::rope_tables`]); `mask` is an additive
+    /// `input_ids` is `[batch, seq]` (u32); `tables` holds the `[batch, seq, head_dim]` per-row
+    /// position tables (from [`CausalLm::rope_tables`]); `mask` is an additive
     /// `[batch, 1, seq, k_total]` score mask (`0` keep, large-negative block) covering left-padding +
     /// causality. Returns logits for the **last column** `[batch, vocab]` — left-padding right-aligns
     /// every row's last real token to that column, so one slice serves the whole batch.
+    ///
+    /// A Gemma 4 stack's `sliding_attention` layers narrow this mask further, adding their window
+    /// band to whatever the caller supplied — so left-padding and the window both hold.
     pub fn decode_logits_masked(
         &self,
         input_ids: &Tensor,
         cache: &mut dyn KvCache,
-        cos: &Tensor,
-        sin: &Tensor,
+        tables: &RopeTables,
         mask: &Tensor,
     ) -> Result<Tensor> {
         let embeds = self.embed(input_ids)?;
-        self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
+        self.forward_to_last_logits(&embeds, cache, tables, AttnMask::Additive(mask))
     }
 
     /// **Per-sequence** batched decode step for iteration-level continuous batching (story 7347,
@@ -577,12 +777,25 @@ impl CausalLm {
     /// is not M-invariant on a GPU, so a row *tracks* its batch-1 run only to sub-ULP (the documented
     /// Throughput tradeoff that buys the weight-read amortization). The bit-exact continuous path runs
     /// each sequence through [`CausalLm::decode_logits`] on its own cache instead.
+    ///
+    /// **Not available for Gemma 4.** The shared block pool is sized once from a single
+    /// `(n_kv_heads, head_dim)`, and Gemma 4's layer types disagree on both (8×256 vs 1×512), so one
+    /// pool cannot hold the stack. Refused by name for the same reason MLA is — the bit-exact
+    /// `Exact` continuous mode serves it instead.
     pub fn decode_logits_per_seq(
         &self,
         input_ids: &Tensor,
         caches: &mut [&mut PagedKvCache],
         positions: &[i32],
     ) -> Result<Tensor> {
+        if self.cfg.is_gemma4() {
+            return Err(Error::Unsupported(
+                "continuous-batching Throughput mode is not supported for Gemma 4: its layer types \
+                 have different KV-head counts and head dims, which the single-shape paged block \
+                 pool cannot hold. Use the Exact mode."
+                    .to_string(),
+            ));
+        }
         let (b, s) = input_ids.dims2()?;
         if caches.len() != b {
             return Err(crate::error::Error::Msg(format!(
@@ -620,10 +833,11 @@ impl CausalLm {
             self.cfg.head_dim as usize,
             &self.device,
         )?;
-        let (cos, sin) = self.rope_tables(positions, b as i32, s as i32)?;
+        let tables = self.rope_tables(positions, b as i32, s as i32)?;
+        let (cos, sin) = tables.uniform();
         let mut h = self.embed(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward_per_seq(&h, &cos, &sin, caches, &plan, i)?;
+            h = layer.forward_per_seq(&h, cos, sin, caches, &plan, i)?;
         }
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
         let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
@@ -643,24 +857,23 @@ impl CausalLm {
     ) -> Result<Tensor> {
         let embeds = self.embed(input_ids)?;
         let s = embeds.dim(1)? as i32;
-        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
-        let h = self.run_decoder_stack(&embeds, cache, &cos, &sin, AttnMask::Causal)?;
+        let tables = self.rope_tables_seq(s, offset)?;
+        let h = self.run_decoder_stack(&embeds, cache, &tables, AttnMask::Causal)?;
         self.project_logits(&h) // [b, s, vocab]
     }
 
     /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
     /// project the **last column** to logits `[batch, vocab]`. The shared core of the single and
-    /// batched forwards: they differ only in how `cos`/`sin` and `mask` are built.
+    /// batched forwards: they differ only in how the tables and `mask` are built.
     fn forward_to_last_logits(
         &self,
         input_embeds: &Tensor,
         cache: &mut dyn KvCache,
-        cos: &Tensor,
-        sin: &Tensor,
+        tables: &RopeTables,
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
         let (b, s, _) = input_embeds.dims3()?;
-        let h = self.run_decoder_stack(input_embeds, cache, cos, sin, mask)?;
+        let h = self.run_decoder_stack(input_embeds, cache, tables, mask)?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
         let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
         Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
@@ -672,17 +885,49 @@ impl CausalLm {
         &self,
         input_embeds: &Tensor,
         cache: &mut dyn KvCache,
-        cos: &Tensor,
-        sin: &Tensor,
+        tables: &RopeTables,
         mask: AttnMask<'_>,
     ) -> Result<Tensor> {
+        self.run_decoder_stack_collecting(input_embeds, cache, tables, mask, None)
+    }
+
+    /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — the one
+    /// loop, so the hidden-state-stack forward cannot drift from the logits forward (device hops,
+    /// mask carrying, and RoPE-table placement included).
+    fn run_decoder_stack_collecting(
+        &self,
+        input_embeds: &Tensor,
+        cache: &mut dyn KvCache,
+        tables: &RopeTables,
+        mask: AttnMask<'_>,
+        mut collect: Option<&mut Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
+        // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
+        // keys); this decoder does not carry them in the cache, so a continued generation would
+        // hand the tail only the current step's keys — a different model, silently. A single
+        // forward from an empty cache, which is what a text encoder runs, is exact.
+        if self.kv_sharing && cache.offset() > 0 {
+            return Err(Error::Unsupported(format!(
+                "num_kv_shared_layers needs the donor layers' full-length keys, which this decoder \
+                 publishes per forward rather than storing across steps; continuing from a cache \
+                 of {} positions would attend only this step's keys. Run the sequence as one \
+                 forward from an empty cache.",
+                cache.offset()
+            )));
+        }
         let mut h = input_embeds.clone();
+        if let Some(sink) = collect.as_deref_mut() {
+            sink.push(h.clone());
+        }
         // The hidden state and the RoPE tables follow each layer onto its device; an explicit additive
         // mask (batched decode) is carried across too. All `to_device`s are no-op clones for a model
         // whose layers share one device, so the common path pays nothing.
         let mut cur = h.device().clone();
-        let mut cos_d = cos.clone();
-        let mut sin_d = sin.clone();
+        let mut tables_d = tables.clone();
+        // Gemma 4's KV-sharing tail reads the keys/values published earlier in **this** forward.
+        // Untouched (and never allocated into) by every model without a sharing tail.
+        let mut shared_kv = SharedKv::default();
         let mut mask_d: Option<Tensor> = match mask {
             AttnMask::Additive(m) => Some(m.clone()),
             _ => None,
@@ -691,8 +936,7 @@ impl CausalLm {
             let dev = &self.layer_devices[i];
             if !cur.same_device(dev) {
                 h = h.to_device(dev)?;
-                cos_d = cos.to_device(dev)?;
-                sin_d = sin.to_device(dev)?;
+                tables_d = tables.to_device(dev)?;
                 if let Some(m) = &mask_d {
                     mask_d = Some(m.to_device(dev)?);
                 }
@@ -702,8 +946,22 @@ impl CausalLm {
                 AttnMask::Causal => AttnMask::Causal,
                 AttnMask::None => AttnMask::None,
                 AttnMask::Additive(_) => AttnMask::Additive(mask_d.as_ref().unwrap()),
+                // Rebuilt per layer from `(q_len, k_len)` on whichever device the layer sits on,
+                // so there is nothing to carry across the device hop.
+                AttnMask::SlidingCausal { window } => AttnMask::SlidingCausal { window },
             };
-            h = layer.forward(&h, &cos_d, &sin_d, layer_mask, cache, i)?;
+            // The layer's *type* picks its RoPE table: a uniform model has one, Gemma 4 has one per
+            // type. The window that narrows the mask lives on the attention itself.
+            let (cos_d, sin_d) = tables_d.for_type(self.cfg.layer_type(i));
+            let mut state = LayerState {
+                cache: &mut *cache,
+                layer_idx: i,
+                shared_kv: &mut shared_kv,
+            };
+            h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
+            if let Some(sink) = collect.as_deref_mut() {
+                sink.push(h.clone());
+            }
         }
         Ok(h)
     }
@@ -722,6 +980,59 @@ impl CausalLm {
             Some(c) => Ok(soft_cap(&logits, c)?),
             None => Ok(logits),
         }
+    }
+}
+
+/// The RoPE `(cos, sin)` tables one forward feeds its decoder layers.
+///
+/// A uniform architecture has exactly one pair, shared by every layer — which is what this held
+/// implicitly before Gemma 4. Gemma 4 needs one per layer *type*: its `sliding_attention` layers
+/// rotate a 256-wide head on the `default` θ=10 000 schedule and its `full_attention` layers a
+/// 512-wide head on the `proportional` θ=1 000 000 one, so the two tables are not even the same
+/// shape and cannot be reduced to one.
+///
+/// Built by [`CausalLm::rope_tables`] (per-row positions) or the single-sequence forwards.
+#[derive(Clone, Debug)]
+pub struct RopeTables {
+    /// Every layer's table on a uniform model; the `sliding_attention` table on Gemma 4.
+    primary: (Tensor, Tensor),
+    /// Gemma 4's `full_attention` table; `None` ⇒ uniform, everything uses `primary`.
+    full: Option<(Tensor, Tensor)>,
+}
+
+impl RopeTables {
+    /// The tables for a layer of the given type.
+    fn for_type(&self, kind: LayerAttentionType) -> (&Tensor, &Tensor) {
+        let (cos, sin) = match (kind, &self.full) {
+            (LayerAttentionType::Full, Some(t)) => t,
+            _ => &self.primary,
+        };
+        (cos, sin)
+    }
+
+    /// The single `(cos, sin)` pair of a **uniform** model — every layer's table.
+    ///
+    /// Public so callers that build their own position grids (the batched decode's tests and
+    /// benches) can still reach the tensors. On a Gemma 4 model this is the `sliding_attention`
+    /// pair, which is why the paths that use it refuse Gemma 4 by name rather than reading it.
+    pub fn uniform(&self) -> (&Tensor, &Tensor) {
+        (&self.primary.0, &self.primary.1)
+    }
+
+    /// Whether this carries a second, `full_attention` table (i.e. the model is Gemma 4).
+    pub fn is_per_layer_type(&self) -> bool {
+        self.full.is_some()
+    }
+
+    /// Move every table onto `device` (a no-op clone when they are already there).
+    fn to_device(&self, device: &Device) -> Result<Self> {
+        let mv = |(cos, sin): &(Tensor, Tensor)| -> Result<(Tensor, Tensor)> {
+            Ok((cos.to_device(device)?, sin.to_device(device)?))
+        };
+        Ok(Self {
+            primary: mv(&self.primary)?,
+            full: self.full.as_ref().map(mv).transpose()?,
+        })
     }
 }
 
@@ -907,6 +1218,56 @@ struct LlamaLayer {
     attn: Attention,
     ffn: Ffn,
     eps: f64,
+    /// Gemma 4's `layer_scalar` (`[1]`): multiplies the block's whole output, residual stream
+    /// included, after both residual adds. `None` for every other architecture.
+    layer_scalar: Option<Tensor>,
+}
+
+/// The keys/values a Gemma 4 forward publishes for its `num_kv_shared_layers` tail.
+///
+/// The tail layers project no K/V of their own; each attends the K/V of the last earlier layer of
+/// its **own type** (`Gemma4Config::kv_donor`), which is why this is keyed by layer type rather
+/// than by layer index. Empty — and never touched — for every model without a sharing tail.
+///
+/// Deliberately *not* the [`KvCache`]: the reference reads its stored `shared_kv_states` even when
+/// a cache exists, because a sliding donor's cache may no longer hold the full-length keys.
+#[derive(Default)]
+struct SharedKv {
+    sliding: Option<(Tensor, Tensor)>,
+    full: Option<(Tensor, Tensor)>,
+}
+
+impl SharedKv {
+    fn get(&self, kind: LayerAttentionType) -> Option<&(Tensor, Tensor)> {
+        match kind {
+            LayerAttentionType::Sliding => self.sliding.as_ref(),
+            LayerAttentionType::Full => self.full.as_ref(),
+        }
+    }
+
+    fn put(&mut self, kind: LayerAttentionType, kv: (Tensor, Tensor)) {
+        match kind {
+            LayerAttentionType::Sliding => self.sliding = Some(kv),
+            LayerAttentionType::Full => self.full = Some(kv),
+        }
+    }
+}
+
+/// A layer that reuses another layer's published keys/values (Gemma 4 `num_kv_shared_layers`).
+#[derive(Clone, Copy)]
+struct KvShare {
+    /// The donor's layer type — the [`SharedKv`] slot to read.
+    donor_kind: LayerAttentionType,
+}
+
+/// The mutable per-forward state a decoder layer threads through: the KV cache, which layer it is,
+/// and the keys/values Gemma 4's sharing tail reads. Bundled rather than passed as three more
+/// parameters — they always travel together, and the layer/attention forwards were at the argument
+/// limit already.
+struct LayerState<'a> {
+    cache: &'a mut dyn KvCache,
+    layer_idx: usize,
+    shared_kv: &'a mut SharedKv,
 }
 
 impl LlamaLayer {
@@ -916,16 +1277,14 @@ impl LlamaLayer {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
         let attn = self.attn.forward(
             &rms_norm(x, &self.input_ln, self.eps)?,
             cos,
             sin,
             mask,
-            cache,
-            layer_idx,
+            state,
         )?;
         self.combine_ffn(x, &attn)
     }
@@ -956,21 +1315,27 @@ impl LlamaLayer {
     /// The residual + MLP half shared by both forwards: the Llama pre-norm, or the Gemma-2 4-norm
     /// sandwich when `pre_ff_ln`/`post_ff_ln` are set. `x` is the block input, `attn` the attention out.
     fn combine_ffn(&self, x: &Tensor, attn: &Tensor) -> Result<Tensor> {
-        match (&self.pre_ff_ln, &self.post_ff_ln) {
+        let h = match (&self.pre_ff_ln, &self.post_ff_ln) {
             // Gemma-2 sandwich: post-norm the attention output and the MLP output before each add.
             (Some(pre_ff), Some(post_ff)) => {
                 let attn = rms_norm(attn, &self.post_ln, self.eps)?;
                 let h = x.broadcast_add(&attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, pre_ff, self.eps)?)?;
                 let ffn = rms_norm(&ffn, post_ff, self.eps)?;
-                Ok(h.broadcast_add(&ffn)?)
+                h.broadcast_add(&ffn)?
             }
             // Llama pre-norm: `post_ln` is the MLP pre-norm.
             _ => {
                 let h = x.broadcast_add(attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
-                Ok(h.broadcast_add(&ffn)?)
+                h.broadcast_add(&ffn)?
             }
+        };
+        // Gemma 4: `hidden_states *= self.layer_scalar`, after **both** residual adds — it scales
+        // the block's whole contribution, residual stream included, not just the MLP branch.
+        match &self.layer_scalar {
+            Some(s) => Ok(h.broadcast_mul(&s.to_dtype(h.dtype())?)?),
+            None => Ok(h),
         }
     }
 }
@@ -1005,12 +1370,11 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
         match self {
-            Attention::Gqa(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
-            Attention::Mla(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
+            Attention::Gqa(a) => a.forward(x, cos, sin, mask, state),
+            Attention::Mla(a) => a.forward(x, cos, sin, mask, &mut *state.cache, state.layer_idx),
         }
     }
 
@@ -1028,6 +1392,14 @@ impl Attention {
         layer_idx: usize,
     ) -> Result<Tensor> {
         match self {
+            // A windowed layer's per-sequence attention would need the window band folded into the
+            // ragged varlen/eager path, and the pool cannot hold its head shape anyway — refused up
+            // front in `decode_logits_per_seq`; this arm is the belt to that braces.
+            Attention::Gqa(a) if a.sliding_window.is_some() => Err(crate::error::Error::Msg(
+                "continuous-batching Throughput mode is not supported for sliding-window layers \
+                 (Gemma 4); use the Exact mode"
+                    .into(),
+            )),
             Attention::Gqa(a) => a.forward_per_seq(x, cos, sin, caches, gather, layer_idx),
             Attention::Mla(_) => Err(crate::error::Error::Msg(
                 "continuous-batching Throughput mode is not supported for MLA (DeepSeek-V2); use the \
@@ -1038,14 +1410,22 @@ impl Attention {
     }
 }
 
-/// Grouped-query attention with RoPE and optional per-head q/k RMSNorm (Qwen3).
+/// Grouped-query attention with RoPE and optional per-head q/k RMSNorm (Qwen3, Gemma 4).
+///
+/// `num_kv_heads` / `head_dim` / `groups` / `sliding_window` are this **layer's** — equal across the
+/// stack for every uniform architecture, and different per layer type on Gemma 4.
 struct LlamaAttention {
     q: Projection,
-    k: Projection,
-    v: Projection,
+    /// The key and value projections, which are **one shared weight** on a Gemma 4
+    /// `attention_k_eq_v` layer (there is no `v_proj` in the checkpoint at all) and **absent**
+    /// entirely on a `num_kv_shared_layers` tail layer, which projects no K/V of its own.
+    kv: Option<KvProjection>,
     o: Projection,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    /// Gemma 4's **scale-free** per-head value RMSNorm (`with_scale=False`), applied to the raw
+    /// value projection output — shared with the key's or not. `false` for every other architecture.
+    v_norm: bool,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -1056,6 +1436,17 @@ struct LlamaAttention {
     softcap: Option<f32>,
     /// Whether RoPE uses the interleaved (GPT-J) pairing (GLM-4).
     rope_interleaved: bool,
+    /// `Some(w)` ⇒ this layer attends only the `w` most recent keys (Gemma 4 `sliding_attention`);
+    /// `None` ⇒ the full causal prefix, which is every pre-Gemma-4 layer.
+    sliding_window: Option<i32>,
+    /// `Some` ⇒ this layer reads its keys/values from [`SharedKv`] instead of projecting them
+    /// (Gemma 4's `num_kv_shared_layers` tail).
+    kv_share: Option<KvShare>,
+    /// Whether this layer must **publish** its keys/values for the sharing tail
+    /// (`store_full_length_kv`: the last layer of each type before the tail).
+    stores_shared_kv: bool,
+    /// This layer's type — the [`SharedKv`] slot it publishes into.
+    layer_kind: LayerAttentionType,
 }
 
 impl LlamaAttention {
@@ -1067,18 +1458,32 @@ impl LlamaAttention {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
 
-        // Project, then split into heads in [b, s, heads, head_dim] layout.
+        // Project, then split into heads in [b, s, heads, head_dim] layout. On a shared-projection
+        // layer (`attention_k_eq_v`) the key matmul runs **once** and the value path takes its raw
+        // output — K and V still end up different tensors, because only K takes `k_norm` + RoPE and
+        // only V takes the scale-free `v_norm`.
         let mut q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let mut k = self.k.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v.forward(x)?.reshape((b, s, nkv, hd))?;
+        let kv = self.kv.as_ref().ok_or_else(|| {
+            Error::Msg("attention layer has no key/value projection to run".into())
+        })?;
+        let (raw_k, raw_v) = kv.forward(x)?;
+        let mut k = raw_k.reshape((b, s, nkv, hd))?;
+        let v = raw_v.reshape((b, s, nkv, hd))?;
 
-        // Qwen3 per-head q/k RMSNorm over the head_dim axis, before RoPE.
+        // Qwen3 / Gemma 4 per-head q/k RMSNorm over the head_dim axis, before RoPE.
         if let Some(qn) = &self.q_norm {
             q = rms_norm(&q, qn, self.eps)?;
         }
         if let Some(kn) = &self.k_norm {
             k = rms_norm(&k, kn, self.eps)?;
         }
+        // Gemma 4's `v_norm`: parameterless, and on the **raw** projection output — never on the
+        // k_norm'd or RoPE'd key, even when the projection is shared.
+        let v = if self.v_norm {
+            rms_norm_unscaled(&v, self.eps)?
+        } else {
+            v
+        };
 
         // RoPE on q,k (cos/sin broadcast over the head axis), then -> [b, heads, s, head_dim].
         let q = apply_rope(&q, cos, sin, self.rope_interleaved)?
@@ -1089,6 +1494,63 @@ impl LlamaAttention {
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
         Ok((q, k, v))
+    }
+
+    /// Project and rotate **only** the queries — the half a KV-sharing layer still computes for
+    /// itself. Returns `[b, heads, s, head_dim]`.
+    fn project_queries(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = x.dims3()?;
+        let mut q = self
+            .q
+            .forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?;
+        if let Some(qn) = &self.q_norm {
+            q = rms_norm(&q, qn, self.eps)?;
+        }
+        Ok(apply_rope(&q, cos, sin, self.rope_interleaved)?
+            .transpose(1, 2)?
+            .contiguous()?)
+    }
+
+    /// The window band this layer adds to an **explicit additive** mask, or `None` when the layer is
+    /// not windowed / the mask is not additive.
+    ///
+    /// A `sliding_attention` layer under a batched decode has to honour *both* the caller's
+    /// left-padding + causality mask and its own window, so the two additive masks are summed (both
+    /// use the same large-finite-negative block fill, and a doubled block is still `-inf` to the
+    /// softmax while staying finite).
+    fn combined_sliding_mask(
+        &self,
+        mask: AttnMask<'_>,
+        q_len: usize,
+        k_len: usize,
+    ) -> Result<Option<Tensor>> {
+        match (self.sliding_window, mask) {
+            (Some(window), AttnMask::Additive(m)) => {
+                let band = sliding_causal_mask(q_len, k_len, window, m.dtype(), m.device())?;
+                Ok(Some(m.broadcast_add(&band)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The mask this layer actually attends under: the forward's mask, narrowed by the layer's
+    /// sliding window when it has one.
+    fn layer_mask<'m>(&self, mask: AttnMask<'m>, combined: &'m Option<Tensor>) -> AttnMask<'m> {
+        let Some(window) = self.sliding_window else {
+            return mask;
+        };
+        match (combined, mask) {
+            (Some(c), _) => AttnMask::Additive(c),
+            (None, AttnMask::Causal) => AttnMask::SlidingCausal { window },
+            // Already windowed by the caller: take the tighter of the two.
+            (None, AttnMask::SlidingCausal { window: w }) => AttnMask::SlidingCausal {
+                window: w.min(window),
+            },
+            // A deliberately unmasked (bidirectional) forward is not a causal one — a window would
+            // be a different model, not a narrowing, so it is left alone.
+            (None, m) => m,
+        }
     }
 
     /// Project the attended output `[b, heads, s, head_dim]` back to `[b, s, hidden]` through `o`. The
@@ -1108,13 +1570,46 @@ impl LlamaAttention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
-        let (q, k, v) = self.project(x, cos, sin)?;
-        let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+        // A `num_kv_shared_layers` tail layer projects only its queries; K/V come from the donor
+        // layer's published tensors, whole and already normed/rotated. The reference reads
+        // `shared_kv_states` rather than the cache precisely because a sliding donor's cache may no
+        // longer hold the full-length keys, so this bypasses `cache.update` entirely — the tail
+        // layer contributes nothing to the cache and reads nothing from it.
+        let (q, k_all, v_all) = match self.kv_share {
+            Some(share) => {
+                let q = self.project_queries(x, cos, sin)?;
+                let (k, v) = state
+                    .shared_kv
+                    .get(share.donor_kind)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "layer {} shares keys/values with an earlier {} layer that has not \
+                         published them; a KV-sharing forward must run the whole stack in order",
+                            state.layer_idx,
+                            share.donor_kind.as_str()
+                        ))
+                    })?;
+                (q, k, v)
+            }
+            None => {
+                let (q, k, v) = self.project(x, cos, sin)?;
+                if self.stores_shared_kv {
+                    // Publish **this forward's** full-length K/V for the sharing tail, before the
+                    // GQA expansion (the tail layer expands with its own group count).
+                    state.shared_kv.put(self.layer_kind, (k.clone(), v.clone()));
+                }
+                let (k_all, v_all) = state.cache.update(state.layer_idx, &k, &v)?;
+                (q, k_all, v_all)
+            }
+        };
+        let (q_len, k_len) = (q.dim(2)?, k_all.dim(2)?);
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
+        let combined = self.combined_sliding_mask(mask, q_len, k_len)?;
+        let mask = self.layer_mask(mask, &combined);
         let out = sdpa(&q, &k_all, &v_all, self.scale, self.softcap, mask)?; // [b, heads, s, head_dim]
         self.output(&out)
     }
@@ -1665,7 +2160,8 @@ mod tests {
                     let mut h = model.embed(&ids).unwrap();
                     sync();
                     let t_e = Instant::now();
-                    let (cos, sin) = model.rope_tables(&positions, N as i32, 1).unwrap();
+                    let tables = model.rope_tables(&positions, N as i32, 1).unwrap();
+                    let (cos, sin) = tables.uniform();
                     sync();
                     let t_r = Instant::now();
 
@@ -1706,7 +2202,7 @@ mod tests {
                         let xn = rms_norm(&h, &layer.input_ln, layer.eps).unwrap();
                         sync();
                         let l1 = Instant::now();
-                        let (q, k, v) = a.project(&xn, &cos, &sin).unwrap();
+                        let (q, k, v) = a.project(&xn, cos, sin).unwrap();
                         sync();
                         let l2 = Instant::now();
                         let k_tm = k
@@ -1837,7 +2333,8 @@ mod tests {
                 let mut h = model.embed(&ids).unwrap();
                 sync();
                 let t_e = Instant::now();
-                let (cos, sin) = model.rope_tables(&positions, N as i32, 1).unwrap();
+                let tables = model.rope_tables(&positions, N as i32, 1).unwrap();
+                let (cos, sin) = tables.uniform();
                 sync();
                 let t_r = Instant::now();
                 // build: the [N,1,1,L+1] additive decode mask (host loop + H2D + dtype cast),
@@ -1870,7 +2367,7 @@ mod tests {
                     let xn = rms_norm(&h, &layer.input_ln, layer.eps).unwrap();
                     sync();
                     let l1 = Instant::now();
-                    let (q, k, v) = a.project(&xn, &cos, &sin).unwrap();
+                    let (q, k, v) = a.project(&xn, cos, sin).unwrap();
                     sync();
                     let l2 = Instant::now();
                     let k_all = Tensor::cat(&[&k_cached, &k], 2).unwrap();

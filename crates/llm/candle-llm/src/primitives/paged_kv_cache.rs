@@ -170,6 +170,12 @@ impl BlockPool {
         Ok(())
     }
 
+    /// The `(n_kv_heads, head_dim)` the pooled tensors were sized for, or `None` before first use.
+    /// One shape serves the whole stack — see the check in [`PagedKvCache::update`].
+    pub(crate) fn head_shape(&self) -> Option<(usize, usize)> {
+        self.store.as_ref().map(|s| (s.n_kv_heads, s.head_dim))
+    }
+
     /// Grow the pooled tensors so they cover at least `blocks` blocks (doubling past the request), in
     /// place-preserving the existing rows. A no-op when already large enough.
     fn ensure_capacity(&mut self, blocks: usize) -> Result<()> {
@@ -555,10 +561,10 @@ impl KvCache for PagedKvCache {
             )));
         }
         let step = keys.dims()[SEQ_AXIS];
+        let (kvh, hd) = (keys.dims()[1], keys.dims()[3]);
         // The block layout advances once per step, at the first layer (every layer adds the same
         // tokens at the same positions in lockstep), so a block carries all layers consistently.
         if layer == 0 {
-            let (kvh, hd) = (keys.dims()[1], keys.dims()[3]);
             self.pool.borrow_mut().ensure_store(
                 self.num_layers,
                 kvh,
@@ -567,6 +573,20 @@ impl KvCache for PagedKvCache {
                 keys.device(),
             )?;
             self.advance(step)?;
+        }
+        // The pool is **one** `[rows, n_kv_heads, head_dim]` tensor per layer, sized once from layer
+        // 0. A model whose layers disagree on that shape (Gemma 4: 8×256 on its `sliding_attention`
+        // layers, 1×512 on its `full_attention` ones) cannot be served by it. Say so here rather
+        // than letting the write fail on a raw shape mismatch two layers in — the callers that can
+        // hit this (`CausalLm::new_paged_cache` + a decode) have no other signal.
+        if let Some((want_kvh, want_hd)) = self.pool.borrow().head_shape() {
+            if (kvh, hd) != (want_kvh, want_hd) {
+                return Err(Error::Msg(format!(
+                    "PagedKvCache pool holds one head shape per layer ({want_kvh}x{want_hd}, from \
+                     layer 0), but layer {layer} projects {kvh}x{hd}. A model with per-layer-type \
+                     attention (Gemma 4) needs the contiguous cache instead."
+                )));
+            }
         }
         self.write_step(layer, keys, values)?;
         self.gather_head_major(layer)
