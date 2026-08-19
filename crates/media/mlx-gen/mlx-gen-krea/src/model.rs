@@ -11,10 +11,11 @@
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::media::Image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
-    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
+    advanced_pass_scheduler_names, curated_sampler_names, curated_scheduler_names, default_seed,
+    AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
+    Progress, Quant, Residency, Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -248,7 +249,14 @@ pub fn descriptor() -> ModelDescriptor {
             // the Boogu Turbo precedent); the scaffold advertises the full curated menu as a starting
             // point. The native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: curated_sampler_names(),
-            schedulers: curated_scheduler_names(),
+            // Krea 2 is epic 20414's first acceptance target, so it is the one family validated for
+            // the GATED advanced multi-pass schedules (`linear_quadratic` / `bong_tangent`,
+            // sc-20416) on top of the curated eight — the candle twin advertises the same pair.
+            // Every route here resolves its schedule through `mlx_gen::resolve_flow_schedule` ->
+            // `gen_core::sampling::schedule_sigmas`, so the advertisement and the honoring are the
+            // same code path. Families that have NOT been validated keep the bare
+            // `curated_scheduler_names()` menu — that is the gate.
+            schedulers: [curated_scheduler_names(), advanced_pass_scheduler_names()].concat(),
             supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,

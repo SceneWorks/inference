@@ -1372,6 +1372,52 @@ mod tests {
         }
     }
 
+    /// Epic 20414 / sc-20416 gating — the MLX twin of the candle catalog's test. The two advanced
+    /// multi-pass schedules are implemented in shared gen-core for every backend, but they are
+    /// advertised ONLY by the model families explicitly validated for them. Krea 2 is the epic's
+    /// first acceptance target and is currently the whole allow-list; every other registered family
+    /// must still show exactly the menu it showed before. Widening this set is a deliberate edit
+    /// here plus the family's own validation — never a side effect of touching the shared vocabulary.
+    #[test]
+    fn advanced_pass_schedulers_are_gated_to_validated_families_only() {
+        const VALIDATED_FAMILIES: [&str; 1] = ["krea_2"];
+        let advanced = mlx_gen::advanced_pass_scheduler_names();
+        assert_eq!(advanced, vec!["linear_quadratic", "bong_tangent"]);
+
+        let registry = super::provider_registry().unwrap();
+        let mut saw_a_validated_route = false;
+        for registration in registry.generators() {
+            let descriptor = (registration.descriptor)();
+            let advertised = &descriptor.capabilities.schedulers;
+            let validated = VALIDATED_FAMILIES.contains(&descriptor.family);
+            for gated in &advanced {
+                assert_eq!(
+                    advertised.contains(gated),
+                    validated,
+                    "{} (family {}) advertises {gated:?}: {advertised:?}",
+                    descriptor.id,
+                    descriptor.family
+                );
+            }
+            if validated {
+                saw_a_validated_route = true;
+                // A validated family advertises the curated menu PLUS the gated pair — opting in
+                // adds choices, it never removes any.
+                for curated in mlx_gen::curated_scheduler_names() {
+                    assert!(
+                        advertised.contains(&curated),
+                        "{} dropped the curated scheduler {curated:?}",
+                        descriptor.id
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_a_validated_route,
+            "no {VALIDATED_FAMILIES:?} route is registered — the gating test proves nothing"
+        );
+    }
+
     #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();

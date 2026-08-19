@@ -46,6 +46,7 @@ pub mod audio_generator;
 pub mod audio_transform;
 pub mod captioner;
 pub mod memory_strategy;
+pub mod schedules;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;
@@ -718,6 +719,20 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         if let Err(e) = g.validate(&r) {
             return Err(format!(
                 "validate-honesty[{id}]: advertised sampler {s:?} was rejected by validate(): {e}"
+            ));
+        }
+    }
+
+    // Positive: every advertised SCHEDULER must be accepted too — the twin of the sampler loop
+    // above, which had no scheduler counterpart. It is the gate epic 20414 leans on: a family that
+    // advertises the gated `linear_quadratic`/`bong_tangent` ids must actually honor them, and a
+    // family that has not been validated for them must not list them.
+    for &s in &caps.schedulers {
+        let mut r = base_request(profile);
+        r.scheduler = Some(s.to_owned());
+        if let Err(e) = g.validate(&r) {
+            return Err(format!(
+                "validate-honesty[{id}]: advertised scheduler {s:?} was rejected by validate(): {e}"
             ));
         }
     }

@@ -146,3 +146,7 @@ memmap2 = "0.9"
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
+# The shared σ-schedule golden table (epic 20414, sc-20416): `sampler::schedule_seam_tests` replays
+# the SAME fixture the candle-gen twin replays, which is how "both backends receive identical
+# coefficients" is enforced in CI. Test-only — it never compiles into a production build.
+sceneworks-gen-core-testkit = { workspace = true }
