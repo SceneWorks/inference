@@ -529,7 +529,7 @@ fn slice_c(x: &Array, start: i32, end: i32) -> Result<Array> {
 // ---------------------------------------------------------------------------------------------
 
 /// `(B, C, F, H, W) -> (B, C·p², F, H/p, W/p)` (reference `ops.patchify`, `patch_size_t=1`).
-fn patchify(x: &Array, p: i32) -> Result<Array> {
+pub(crate) fn patchify(x: &Array, p: i32) -> Result<Array> {
     let sh = x.shape();
     let (b, c, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
     let (nh, nw) = (h / p, w / p);
@@ -540,7 +540,7 @@ fn patchify(x: &Array, p: i32) -> Result<Array> {
 }
 
 /// `(B, C·p², F, H, W) -> (B, C, F, H·p, W·p)` (reference `ops.unpatchify`, `patch_size_t=1`).
-fn unpatchify(x: &Array, p: i32) -> Result<Array> {
+pub(crate) fn unpatchify(x: &Array, p: i32) -> Result<Array> {
     let sh = x.shape();
     let (b, c_packed, f, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
     let c = c_packed / (p * p);

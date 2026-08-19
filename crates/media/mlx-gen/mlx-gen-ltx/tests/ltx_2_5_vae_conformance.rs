@@ -387,14 +387,24 @@ fn diffvae_encoder_is_the_conv_encoder_with_only_the_logvar_mode_changed() {
     let fx = fixture();
     let conv = tensors(&fx, "ltx_2_5_video_vae_conv");
     let diff = tensors(&fx, "ltx_2_5_video_vae_diffusion");
-    let conv_enc: BTreeMap<_, _> = conv
-        .iter()
-        .filter(|(k, _)| k.starts_with("encoder.") || k.starts_with("per_channel_statistics."))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let encoder_half = |m: &BTreeMap<String, Vec<i32>>| -> BTreeMap<String, Vec<i32>> {
+        m.iter()
+            .filter(|(k, _)| k.starts_with("encoder.") || k.starts_with("per_channel_statistics."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let conv_enc = encoder_half(&conv);
     assert_eq!(
-        conv_enc, diff,
+        conv_enc,
+        encoder_half(&diff),
         "the DiffVAE's encoder is no longer tensor-identical to the conv VAE's"
+    );
+    // The rest of the DiffVAE file is the `NADiffusionDecoder` (sc-18766), which has no counterpart
+    // in the conv file at all — so the two files agree on the encoder and on nothing else.
+    assert!(
+        diff.keys().any(|k| k.starts_with("decoder.det_stages."))
+            && !conv.keys().any(|k| k.starts_with("decoder.det_stages.")),
+        "only the DiffVAE file carries neighborhood-attention decoder stages"
     );
     assert_eq!(
         conv_enc["encoder.conv_out.conv.weight"],
@@ -552,11 +562,12 @@ fn convert_vae_components_emits_the_2_3_component_key_sets_from_2_5_inputs() {
     assert_eq!(av, mlx_gen_ltx::config::AudioVaeConfig::defaults());
 }
 
-/// The DiffVAE file shares the conv encoder, so the converter emits that encoder — and **refuses to
-/// emit a `vae_decoder`**, because its decoder is an `NADiffusionDecoder`. Without this branch the
-/// output dir would load through `LtxVideoVae` and render garbage.
+/// The DiffVAE file shares the conv encoder, so the converter emits that encoder plus the
+/// `NADiffusionDecoder` under its own component name (sc-18766) — and **never a `vae_decoder`**,
+/// because it has no conv decoder. Were the two to share a name, the output dir would load through
+/// `LtxVideoVae` and render garbage.
 #[test]
-fn convert_vae_components_takes_only_the_encoder_from_a_diffvae_file() {
+fn convert_vae_components_emits_the_encoder_and_the_diffusion_decoder_from_a_diffvae_file() {
     let fx = fixture();
     let tmp = tempfile::tempdir().unwrap();
     let video = synthetic_component(
@@ -568,11 +579,20 @@ fn convert_vae_components_takes_only_the_encoder_from_a_diffvae_file() {
     let out = tmp.path().join("split");
     let components =
         convert_vae_components(&video, None::<&std::path::Path>, &out).expect("convert diffvae");
-    assert_eq!(components, vec!["vae_encoder"]);
+    assert_eq!(components, vec!["vae_encoder", "vae_diffusion_decoder"]);
     assert!(
         !out.join("vae_decoder.safetensors").exists(),
         "a conv `vae_decoder` must never be emitted from a CausalDiffusionVAE checkpoint"
     );
+    // The decoder half is readable as an `NADiffusionDecoder`: same tensors, its own config.
+    let diffusion = keys_of(&out.join("vae_diffusion_decoder.safetensors"));
+    assert!(
+        diffusion.keys().any(|k| k.starts_with("det_stages."))
+            && diffusion.keys().any(|k| k.starts_with("diff_blocks.")),
+        "the emitted diffusion decoder must carry both stage families"
+    );
+    mlx_gen_ltx::diff_vae::NaDiffusionDecoderConfig::from_model_dir(&out)
+        .expect("the emitted embedded_config.json must describe the NA diffusion decoder");
     let got = keys_of(&out.join("vae_encoder.safetensors"));
     let want = tensors(&fx, "ltx_2_3_mlx_vae_encoder");
     assert_eq!(
@@ -581,6 +601,98 @@ fn convert_vae_components_takes_only_the_encoder_from_a_diffvae_file() {
     );
     let cfg = LtxVaeConfig::from_model_dir(&out).expect("emitted embedded_config.json");
     assert_eq!(cfg.latent_log_var, LatentLogVar::Constant);
+}
+
+/// The recorded `NADiffusionDecoder` key set is **exactly** what the MLX port reads (sc-18766).
+///
+/// No weights, no GPU: the fixture carries the released file's key/shape lists, so a checkpoint
+/// that grew or renamed a tensor is caught here rather than as a missing-key error mid-render — or,
+/// worse, as a tensor the port silently never loads.
+#[test]
+fn diffusion_decoder_component_carries_exactly_the_keys_the_port_reads() {
+    let fx = fixture();
+    let diff = tensors(&fx, "ltx_2_5_video_vae_diffusion");
+    let cfg = mlx_gen_ltx::diff_vae::NaDiffusionDecoderConfig::from_embedded_vae(
+        config_of(&fx, "ltx_2_5_video_vae_diffusion")
+            .get("vae")
+            .expect("config.vae"),
+    )
+    .expect("the released decoder config must parse");
+
+    // The converter strips the `decoder.` namespace and remaps the two stats, so compare against
+    // the post-sanitize names the port asks for.
+    let mut recorded: Vec<String> = diff
+        .keys()
+        .filter_map(|k| {
+            if let Some(rest) = k.strip_prefix("decoder.") {
+                Some(rest.to_string())
+            } else {
+                match k.as_str() {
+                    "per_channel_statistics.mean-of-means" => {
+                        Some("per_channel_statistics.mean".to_string())
+                    }
+                    "per_channel_statistics.std-of-means" => {
+                        Some("per_channel_statistics.std".to_string())
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .collect();
+    recorded.sort();
+
+    let expected = mlx_gen_ltx::diff_vae::expected_weight_keys(&cfg);
+    let unread: Vec<&String> = recorded.iter().filter(|k| !expected.contains(k)).collect();
+    assert_eq!(
+        unread,
+        mlx_gen_ltx::diff_vae::UNUSED_DECODER_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .iter()
+            .collect::<Vec<_>>(),
+        "the checkpoint carries tensors the port never reads"
+    );
+    let absent: Vec<&String> = expected.iter().filter(|k| !recorded.contains(k)).collect();
+    assert!(
+        absent.is_empty(),
+        "the port reads tensors the checkpoint lacks: {absent:?}"
+    );
+
+    // Shapes the port derives from the config must agree with the recorded ones.
+    assert_eq!(
+        diff["decoder.conv_in.weight"],
+        vec![cfg.stage_channels[0], cfg.in_channels]
+    );
+    assert_eq!(
+        diff["decoder.conv_out.weight"],
+        vec![
+            cfg.out_channels * cfg.patch_size * cfg.patch_size,
+            cfg.stage5_width()
+        ]
+    );
+    assert_eq!(
+        diff["decoder.shared_adaln.proj.weight"],
+        vec![7 * cfg.stage5_width(), cfg.t_emb_dim]
+    );
+    assert_eq!(
+        diff["decoder.diff_blocks.0.scale_shift_table"],
+        vec![7, cfg.stage5_width()]
+    );
+    for (stage, &channels) in cfg
+        .stage_channels
+        .iter()
+        .take(cfg.upsamples.len())
+        .enumerate()
+    {
+        let (stride, reduction) = cfg.upsamples[stage];
+        let out = stride[0] * stride[1] * stride[2] * channels / reduction;
+        assert_eq!(
+            diff[&format!("decoder.upsamples.{stage}.proj.weight")],
+            vec![out, channels],
+            "upsample {stage} width"
+        );
+    }
 }
 
 /// An unknown VAE class is refused rather than converted on the assumption it is conv-shaped.

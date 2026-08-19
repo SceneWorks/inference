@@ -316,10 +316,16 @@ fn diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_
     let out = tmp.path().join("diffvae");
     let components =
         convert_vae_components(&diff, None::<&Path>, &out).expect("convert the DiffVAE encoder");
+    // sc-18766 added the NA diffusion decoder this file's decoder half becomes. What must NOT
+    // appear is a `vae_decoder`: that component name is the conv stack's, and this file has none.
     assert_eq!(
         components,
-        vec!["vae_encoder"],
-        "only the conv encoder is portable from a CausalDiffusionVAE"
+        vec!["vae_encoder", "vae_diffusion_decoder"],
+        "a CausalDiffusionVAE yields the conv encoder plus the NA diffusion decoder"
+    );
+    assert!(
+        !out.join("vae_decoder.safetensors").exists(),
+        "a CausalDiffusionVAE has no conv decoder to emit"
     );
 
     let cfg = LtxVaeConfig::from_model_dir(&out).expect("embedded_config.json");

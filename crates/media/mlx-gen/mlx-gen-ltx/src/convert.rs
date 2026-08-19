@@ -730,11 +730,12 @@ fn component_config(w: &Weights, what: &str) -> Result<serde_json::Value> {
 /// (`audio_vae.decoder.*`, `vocoder.vocoder.*`, `vocoder.bwe_generator.*`, `vocoder.mel_stft.*`).
 ///
 /// `video_vae` may be either LTX-2.5 video VAE:
-///  - `CausalVideoAutoencoder` (the conv VAE) — encoder **and** decoder are emitted;
-///  - `CausalDiffusionVAE` (the DiffVAE) — only the **encoder** is emitted, because its encoder is
-///    the same conv module (differing solely in the declared `latent_log_var`) while its decoder is
-///    an `NADiffusionDecoder` that this crate does not implement. Emitting a `vae_decoder` from it
-///    would produce a directory that loads and renders garbage.
+///  - `CausalVideoAutoencoder` (the conv VAE) — encoder **and** a `vae_decoder` are emitted;
+///  - `CausalDiffusionVAE` (the DiffVAE) — the same conv encoder (differing solely in the declared
+///    `latent_log_var`) plus a **`vae_diffusion_decoder`** (sc-18766). The two decoders never share
+///    a component name: `vae_decoder` is the conv stack [`crate::vae::LtxVideoVae`] builds, and a
+///    directory where the two were interchangeable is one where a mis-selected file renders
+///    garbage rather than failing to load.
 ///
 /// Selecting *which* component files make up a bundle is the loader's job (sc-18757); this function
 /// takes the paths it is given.
@@ -793,7 +794,32 @@ pub fn convert_vae_components(
             components.push("vae_decoder".into());
         }
         "CausalDiffusionVAE" => {
-            // Encoder-only, deliberately: see the doc comment.
+            // The decoder is an `NADiffusionDecoder` (sc-18766), emitted under its own component
+            // name. `sanitize_vae_decoder` needs no special case: its tensors are all rank-2
+            // Linears, so the conv channels-last transpose is inert on them, and the
+            // `per_channel_statistics` remap is the same one the conv decoder wants.
+            let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
+            // `sanitize_vae_decoder` also sweeps in the two `per_channel_statistics` tensors, so
+            // "not empty" is not the same as "has a decoder": check for both stage families.
+            let has_stages = vae_decoder.keys().any(|k| k.starts_with("det_stages."));
+            let has_blocks = vae_decoder.keys().any(|k| k.starts_with("diff_blocks."));
+            if !(has_stages && has_blocks) {
+                return Err(Error::Msg(format!(
+                    "ltx: {} declares {class} but carries no `decoder.det_stages.*` / \
+                     `decoder.diff_blocks.*` tensors",
+                    video_path.display()
+                )));
+            }
+            // Parse before writing: an unreadable `vae.decoder` block would otherwise produce a
+            // component file no loader can build a decoder from.
+            let _ = crate::diff_vae::NaDiffusionDecoderConfig::from_embedded_vae(&vae_block)?;
+            cast_floats_bf16(&mut vae_decoder)?;
+            save_component(
+                out,
+                crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
+                &vae_decoder,
+            )?;
+            components.push(crate::diff_vae::DIFFUSION_DECODER_COMPONENT.into());
         }
         other => {
             return Err(Error::Msg(format!(
