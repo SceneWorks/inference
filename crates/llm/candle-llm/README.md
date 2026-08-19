@@ -98,12 +98,26 @@ fine-grained MoE; verified on `deepseek-ai/DeepSeek-V2-Lite-Chat`, which fits in
 KV head, and `attention_k_eq_v` — one shared key/value projection, so those layers carry no `v_proj`
 at all). The decoder therefore reads `ModelConfig::layer_attention` per layer and carries one RoPE
 per layer *type* (`RopeTables`); norms are plain `weight` (not Gemma-2's `1 + weight`), the attention
-scale is `1.0`, and the value heads take a scale-free per-head RMSNorm. Because the two types
-disagree on `(n_kv_heads, head_dim)`, the single-shape **paged** pool cannot serve the stack — use
-the contiguous cache and the `Exact` continuous mode; both refuse Gemma 4 by name rather than
-attending the wrong shape. `tests/gemma4_decoder.rs` pins the numbers against
-`crates/llm/testdata/gemma4/gemma4_decoder_goldens.json`, a backend-neutral fixture `mlx-llm`
-asserts against too.
+scale is `1.0`, the value heads take a scale-free per-head RMSNorm, and every block's output is
+multiplied by a learned per-layer `layer_scalar` after both residual adds.
+
+Two further Gemma 4 knobs are implemented even though the shipped LTX-2.5 encoder leaves them off:
+`num_kv_shared_layers` (the trailing layers project no K/V at all and attend the last earlier layer
+of their **own** type) and `use_double_wide_mlp` (those same layers get a 2x inner width). Their
+donor keys/values are published per forward rather than carried in the cache, so a *continued*
+generation on such a model is refused by name — a single forward from an empty cache, which is what
+a text encoder runs, is exact.
+
+Because the two layer types disagree on `(n_kv_heads, head_dim)`, the single-shape **paged** pool
+cannot serve the stack — use the contiguous cache and the `Exact` continuous mode; both refuse
+Gemma 4 by name rather than attending the wrong shape.
+
+`tests/gemma4_decoder.rs` pins the numbers against
+`crates/llm/testdata/gemma4/gemma4_decoder_goldens.json` — a backend-neutral fixture owned by
+sc-18760 that `mlx-llm` asserts against too, so a divergence between the two ports fails on one of
+them rather than going unnoticed. It ships mutation oracles (a skipped `layer_scalar`, V read off
+the normed key, a dropped window, a leading-slice partial RoPE) which the suite requires to differ
+from the truth.
 
 The `prefix` test covers **shared-prefix KV reuse** (`generate_cached` over a `PrefixCache`): a request
 sharing a leading run of tokens with a stored one (a system prompt, a few-shot preamble, a growing

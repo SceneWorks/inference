@@ -66,6 +66,9 @@ pub struct CausalLm {
     embed_scale: Option<f64>,
     /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
     final_softcap: Option<f32>,
+    /// Whether any layer reads its keys/values from an earlier one (Gemma 4 `num_kv_shared_layers`).
+    /// Those are published per forward, so a continued (cached) generation is refused.
+    kv_sharing: bool,
 }
 
 impl CausalLm {
@@ -98,30 +101,6 @@ impl CausalLm {
         dtype: DType,
     ) -> Result<Self> {
         let device = w.device().clone();
-        // Gemma 4 config knobs this decoder does not implement. Both are `0` / `false` in every
-        // shipped Gemma 4 config (the LTX-2.5 packed text encoder included), so nothing real is
-        // turned away — but a config that did set one describes a *different* stack, and silently
-        // ignoring the key would produce plausible, wrong numbers rather than an error. Same
-        // reasoning as the config layer's refusal of a `factor` on a `default` RoPE schedule.
-        if let Some(g) = cfg.gemma4.as_deref() {
-            if g.num_kv_shared_layers > 0 {
-                return Err(Error::Unsupported(format!(
-                    "num_kv_shared_layers = {} asks the trailing layers to reuse an earlier \
-                     layer's cached K/V of their own layer type; this decoder projects K/V in \
-                     every layer. Every shipped Gemma 4 config carries 0.",
-                    g.num_kv_shared_layers
-                )));
-            }
-            if g.use_double_wide_mlp {
-                return Err(Error::Unsupported(
-                    "use_double_wide_mlp doubles `intermediate_size` on the KV-sharing tail \
-                     layers, which this decoder does not build (see `num_kv_shared_layers`). \
-                     Every shipped Gemma 4 config carries false."
-                        .to_string(),
-                ));
-            }
-        }
-
         // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
         // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
         // `*ForCausalLM` keeps the historical `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight`
@@ -212,20 +191,28 @@ impl CausalLm {
             // axis 0).
             let qd = num_heads * head_dim;
             let kvd = num_kv_heads * head_dim;
+            // Gemma 4's `num_kv_shared_layers` tail: these layers carry **no** `k_proj` / `v_proj` /
+            // `k_norm` at all and attend the keys/values published by `kv_donor` — the last earlier
+            // layer of their own type (never the other type's: the head dims do not even match).
+            let kv_share = cfg.gemma4.as_deref().and_then(|g| {
+                g.kv_donor(i).map(|donor| KvShare {
+                    donor_kind: g.layer_type(donor),
+                })
+            });
+            let stores_shared_kv = cfg.gemma4.as_deref().is_some_and(|g| g.stores_shared_kv(i));
 
             // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention. MLA's
             // low-rank q/kv projections are wholly distinct from GQA's q/k/v, so it is its own path.
             let attn = if cfg.architecture.is_mla() {
                 Attention::Mla(MlaAttention::load(w, lp, &cfg, dtype, quant)?)
             } else {
-                let (q_norm, k_norm) = if qk_norm {
-                    (
-                        Some(req(lp("self_attn.q_norm.weight"))?),
-                        Some(req(lp("self_attn.k_norm.weight"))?),
-                    )
-                } else {
-                    (None, None)
-                };
+                let q_norm = qk_norm
+                    .then(|| req(lp("self_attn.q_norm.weight")))
+                    .transpose()?;
+                // A KV-sharing layer normalizes nothing on the key path — it has no key to project.
+                let k_norm = (qk_norm && kv_share.is_none())
+                    .then(|| req(lp("self_attn.k_norm.weight")))
+                    .transpose()?;
                 // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v, else the separate
                 // `q_proj`/`k_proj`/`v_proj` are loaded directly (with q/k/v bias for Qwen2).
                 // Gemma 4's `attention_k_eq_v` layers have **no** `v_proj` in the checkpoint at all:
@@ -238,21 +225,29 @@ impl CausalLm {
                         let qkv = req(packed)?; // [qd + 2*kvd, hidden]
                         (
                             Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
-                            KvProjection::separate(
+                            Some(KvProjection::separate(
                                 Projection::load(qkv.narrow(0, qd, kvd)?.contiguous()?, quant)?,
                                 Projection::load(
                                     qkv.narrow(0, qd + kvd, kvd)?.contiguous()?,
                                     quant,
                                 )?,
-                            ),
+                            )),
                         )
                     } else {
                         let q = proj_b(lp("self_attn.q_proj.weight"))?;
-                        let k = proj_b(lp("self_attn.k_proj.weight"))?;
-                        let kv = if la.k_eq_v {
-                            KvProjection::shared(k)
-                        } else {
-                            KvProjection::separate(k, proj_b(lp("self_attn.v_proj.weight"))?)
+                        let kv = match kv_share.is_some() {
+                            true => None,
+                            false => {
+                                let k = proj_b(lp("self_attn.k_proj.weight"))?;
+                                Some(if la.k_eq_v {
+                                    KvProjection::shared(k)
+                                } else {
+                                    KvProjection::separate(
+                                        k,
+                                        proj_b(lp("self_attn.v_proj.weight"))?,
+                                    )
+                                })
+                            }
                         };
                         (q, kv)
                     }
@@ -273,6 +268,9 @@ impl CausalLm {
                     softcap: cfg.attn_logit_softcap,
                     rope_interleaved: cfg.architecture.rope_interleaved(),
                     sliding_window: la.sliding_window,
+                    kv_share,
+                    stores_shared_kv,
+                    layer_kind: cfg.layer_type(i),
                 })
             };
 
@@ -319,6 +317,13 @@ impl CausalLm {
                 })
             } else {
                 // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
+                // `use_double_wide_mlp` doubles this layer's inner width on Gemma 4's KV-sharing
+                // tail (the layers that saved a K/V projection spend it on a wider MLP instead);
+                // every other layer, and every other architecture, keeps `intermediate_size`.
+                let inter = match cfg.gemma4.as_deref() {
+                    Some(g) => g.layer_intermediate_size(i, cfg.intermediate_size) as usize,
+                    None => inter,
+                };
                 let (gate, up) = {
                     let packed = lp("mlp.gate_up_proj.weight");
                     if w.contains(&packed) {
@@ -366,6 +371,16 @@ impl CausalLm {
                 (None, None)
             };
 
+            // Gemma 4's `layer_scalar`: a learned per-layer scalar that multiplies the block's
+            // whole output — residual stream included — after both residual adds. Its initializer
+            // is ones, which is exactly why a port that never reads it looks correct against any
+            // fixture that left it at the initializer; the shared goldens set it to 0.9/1.1/... so
+            // skipping it cannot pass. Only Gemma 4 has it.
+            let layer_scalar = cfg
+                .is_gemma4()
+                .then(|| req(lp("layer_scalar")))
+                .transpose()?;
+
             layers.push(LlamaLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
@@ -374,6 +389,7 @@ impl CausalLm {
                 attn,
                 ffn,
                 eps,
+                layer_scalar,
             });
         }
 
@@ -406,6 +422,10 @@ impl CausalLm {
             quantized: quant.is_some(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f64).sqrt()),
             final_softcap: cfg.final_logit_softcap,
+            kv_sharing: cfg
+                .gemma4
+                .as_deref()
+                .is_some_and(|g| g.first_kv_shared_layer().is_some()),
             cfg,
         })
     }
@@ -691,6 +711,8 @@ impl CausalLm {
         let mut cur = h0.device().clone();
         let mut cos_d = cos.clone();
         let mut sin_d = sin.clone();
+        // Qwen3-VL only (Gemma 4 is refused above), so no layer ever reads or writes this.
+        let mut shared_kv = SharedKv::default();
         let h = deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
@@ -706,7 +728,12 @@ impl CausalLm {
                     cur = dev.clone();
                     h.to_device(dev)?
                 };
-                self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, cache, i)
+                let mut state = LayerState {
+                    cache: &mut *cache,
+                    layer_idx: i,
+                    shared_kv: &mut shared_kv,
+                };
+                self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
         )?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
@@ -875,6 +902,20 @@ impl CausalLm {
         mask: AttnMask<'_>,
         mut collect: Option<&mut Vec<Tensor>>,
     ) -> Result<Tensor> {
+        // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
+        // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
+        // keys); this decoder does not carry them in the cache, so a continued generation would
+        // hand the tail only the current step's keys — a different model, silently. A single
+        // forward from an empty cache, which is what a text encoder runs, is exact.
+        if self.kv_sharing && cache.offset() > 0 {
+            return Err(Error::Unsupported(format!(
+                "num_kv_shared_layers needs the donor layers' full-length keys, which this decoder \
+                 publishes per forward rather than storing across steps; continuing from a cache \
+                 of {} positions would attend only this step's keys. Run the sequence as one \
+                 forward from an empty cache.",
+                cache.offset()
+            )));
+        }
         let mut h = input_embeds.clone();
         if let Some(sink) = collect.as_deref_mut() {
             sink.push(h.clone());
@@ -884,6 +925,9 @@ impl CausalLm {
         // whose layers share one device, so the common path pays nothing.
         let mut cur = h.device().clone();
         let mut tables_d = tables.clone();
+        // Gemma 4's KV-sharing tail reads the keys/values published earlier in **this** forward.
+        // Untouched (and never allocated into) by every model without a sharing tail.
+        let mut shared_kv = SharedKv::default();
         let mut mask_d: Option<Tensor> = match mask {
             AttnMask::Additive(m) => Some(m.clone()),
             _ => None,
@@ -909,7 +953,12 @@ impl CausalLm {
             // The layer's *type* picks its RoPE table: a uniform model has one, Gemma 4 has one per
             // type. The window that narrows the mask lives on the attention itself.
             let (cos_d, sin_d) = tables_d.for_type(self.cfg.layer_type(i));
-            h = layer.forward(&h, cos_d, sin_d, layer_mask, cache, i)?;
+            let mut state = LayerState {
+                cache: &mut *cache,
+                layer_idx: i,
+                shared_kv: &mut shared_kv,
+            };
+            h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
             if let Some(sink) = collect.as_deref_mut() {
                 sink.push(h.clone());
             }
@@ -1169,6 +1218,56 @@ struct LlamaLayer {
     attn: Attention,
     ffn: Ffn,
     eps: f64,
+    /// Gemma 4's `layer_scalar` (`[1]`): multiplies the block's whole output, residual stream
+    /// included, after both residual adds. `None` for every other architecture.
+    layer_scalar: Option<Tensor>,
+}
+
+/// The keys/values a Gemma 4 forward publishes for its `num_kv_shared_layers` tail.
+///
+/// The tail layers project no K/V of their own; each attends the K/V of the last earlier layer of
+/// its **own type** (`Gemma4Config::kv_donor`), which is why this is keyed by layer type rather
+/// than by layer index. Empty — and never touched — for every model without a sharing tail.
+///
+/// Deliberately *not* the [`KvCache`]: the reference reads its stored `shared_kv_states` even when
+/// a cache exists, because a sliding donor's cache may no longer hold the full-length keys.
+#[derive(Default)]
+struct SharedKv {
+    sliding: Option<(Tensor, Tensor)>,
+    full: Option<(Tensor, Tensor)>,
+}
+
+impl SharedKv {
+    fn get(&self, kind: LayerAttentionType) -> Option<&(Tensor, Tensor)> {
+        match kind {
+            LayerAttentionType::Sliding => self.sliding.as_ref(),
+            LayerAttentionType::Full => self.full.as_ref(),
+        }
+    }
+
+    fn put(&mut self, kind: LayerAttentionType, kv: (Tensor, Tensor)) {
+        match kind {
+            LayerAttentionType::Sliding => self.sliding = Some(kv),
+            LayerAttentionType::Full => self.full = Some(kv),
+        }
+    }
+}
+
+/// A layer that reuses another layer's published keys/values (Gemma 4 `num_kv_shared_layers`).
+#[derive(Clone, Copy)]
+struct KvShare {
+    /// The donor's layer type — the [`SharedKv`] slot to read.
+    donor_kind: LayerAttentionType,
+}
+
+/// The mutable per-forward state a decoder layer threads through: the KV cache, which layer it is,
+/// and the keys/values Gemma 4's sharing tail reads. Bundled rather than passed as three more
+/// parameters — they always travel together, and the layer/attention forwards were at the argument
+/// limit already.
+struct LayerState<'a> {
+    cache: &'a mut dyn KvCache,
+    layer_idx: usize,
+    shared_kv: &'a mut SharedKv,
 }
 
 impl LlamaLayer {
@@ -1178,16 +1277,14 @@ impl LlamaLayer {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
         let attn = self.attn.forward(
             &rms_norm(x, &self.input_ln, self.eps)?,
             cos,
             sin,
             mask,
-            cache,
-            layer_idx,
+            state,
         )?;
         self.combine_ffn(x, &attn)
     }
@@ -1218,21 +1315,27 @@ impl LlamaLayer {
     /// The residual + MLP half shared by both forwards: the Llama pre-norm, or the Gemma-2 4-norm
     /// sandwich when `pre_ff_ln`/`post_ff_ln` are set. `x` is the block input, `attn` the attention out.
     fn combine_ffn(&self, x: &Tensor, attn: &Tensor) -> Result<Tensor> {
-        match (&self.pre_ff_ln, &self.post_ff_ln) {
+        let h = match (&self.pre_ff_ln, &self.post_ff_ln) {
             // Gemma-2 sandwich: post-norm the attention output and the MLP output before each add.
             (Some(pre_ff), Some(post_ff)) => {
                 let attn = rms_norm(attn, &self.post_ln, self.eps)?;
                 let h = x.broadcast_add(&attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, pre_ff, self.eps)?)?;
                 let ffn = rms_norm(&ffn, post_ff, self.eps)?;
-                Ok(h.broadcast_add(&ffn)?)
+                h.broadcast_add(&ffn)?
             }
             // Llama pre-norm: `post_ln` is the MLP pre-norm.
             _ => {
                 let h = x.broadcast_add(attn)?;
                 let ffn = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
-                Ok(h.broadcast_add(&ffn)?)
+                h.broadcast_add(&ffn)?
             }
+        };
+        // Gemma 4: `hidden_states *= self.layer_scalar`, after **both** residual adds — it scales
+        // the block's whole contribution, residual stream included, not just the MLP branch.
+        match &self.layer_scalar {
+            Some(s) => Ok(h.broadcast_mul(&s.to_dtype(h.dtype())?)?),
+            None => Ok(h),
         }
     }
 }
@@ -1267,12 +1370,11 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
         match self {
-            Attention::Gqa(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
-            Attention::Mla(a) => a.forward(x, cos, sin, mask, cache, layer_idx),
+            Attention::Gqa(a) => a.forward(x, cos, sin, mask, state),
+            Attention::Mla(a) => a.forward(x, cos, sin, mask, &mut *state.cache, state.layer_idx),
         }
     }
 
@@ -1315,8 +1417,9 @@ impl Attention {
 struct LlamaAttention {
     q: Projection,
     /// The key and value projections, which are **one shared weight** on a Gemma 4
-    /// `attention_k_eq_v` layer (there is no `v_proj` in the checkpoint at all).
-    kv: KvProjection,
+    /// `attention_k_eq_v` layer (there is no `v_proj` in the checkpoint at all) and **absent**
+    /// entirely on a `num_kv_shared_layers` tail layer, which projects no K/V of its own.
+    kv: Option<KvProjection>,
     o: Projection,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
@@ -1336,6 +1439,14 @@ struct LlamaAttention {
     /// `Some(w)` ⇒ this layer attends only the `w` most recent keys (Gemma 4 `sliding_attention`);
     /// `None` ⇒ the full causal prefix, which is every pre-Gemma-4 layer.
     sliding_window: Option<i32>,
+    /// `Some` ⇒ this layer reads its keys/values from [`SharedKv`] instead of projecting them
+    /// (Gemma 4's `num_kv_shared_layers` tail).
+    kv_share: Option<KvShare>,
+    /// Whether this layer must **publish** its keys/values for the sharing tail
+    /// (`store_full_length_kv`: the last layer of each type before the tail).
+    stores_shared_kv: bool,
+    /// This layer's type — the [`SharedKv`] slot it publishes into.
+    layer_kind: LayerAttentionType,
 }
 
 impl LlamaAttention {
@@ -1352,7 +1463,10 @@ impl LlamaAttention {
         // output — K and V still end up different tensors, because only K takes `k_norm` + RoPE and
         // only V takes the scale-free `v_norm`.
         let mut q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let (raw_k, raw_v) = self.kv.forward(x)?;
+        let kv = self.kv.as_ref().ok_or_else(|| {
+            Error::Msg("attention layer has no key/value projection to run".into())
+        })?;
+        let (raw_k, raw_v) = kv.forward(x)?;
         let mut k = raw_k.reshape((b, s, nkv, hd))?;
         let v = raw_v.reshape((b, s, nkv, hd))?;
 
@@ -1380,6 +1494,22 @@ impl LlamaAttention {
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
         Ok((q, k, v))
+    }
+
+    /// Project and rotate **only** the queries — the half a KV-sharing layer still computes for
+    /// itself. Returns `[b, heads, s, head_dim]`.
+    fn project_queries(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = x.dims3()?;
+        let mut q = self
+            .q
+            .forward(x)?
+            .reshape((b, s, self.num_heads, self.head_dim))?;
+        if let Some(qn) = &self.q_norm {
+            q = rms_norm(&q, qn, self.eps)?;
+        }
+        Ok(apply_rope(&q, cos, sin, self.rope_interleaved)?
+            .transpose(1, 2)?
+            .contiguous()?)
     }
 
     /// The window band this layer adds to an **explicit additive** mask, or `None` when the layer is
@@ -1440,11 +1570,41 @@ impl LlamaAttention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
-        let (q, k, v) = self.project(x, cos, sin)?;
-        let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+        // A `num_kv_shared_layers` tail layer projects only its queries; K/V come from the donor
+        // layer's published tensors, whole and already normed/rotated. The reference reads
+        // `shared_kv_states` rather than the cache precisely because a sliding donor's cache may no
+        // longer hold the full-length keys, so this bypasses `cache.update` entirely — the tail
+        // layer contributes nothing to the cache and reads nothing from it.
+        let (q, k_all, v_all) = match self.kv_share {
+            Some(share) => {
+                let q = self.project_queries(x, cos, sin)?;
+                let (k, v) = state
+                    .shared_kv
+                    .get(share.donor_kind)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Msg(format!(
+                            "layer {} shares keys/values with an earlier {} layer that has not \
+                         published them; a KV-sharing forward must run the whole stack in order",
+                            state.layer_idx,
+                            share.donor_kind.as_str()
+                        ))
+                    })?;
+                (q, k, v)
+            }
+            None => {
+                let (q, k, v) = self.project(x, cos, sin)?;
+                if self.stores_shared_kv {
+                    // Publish **this forward's** full-length K/V for the sharing tail, before the
+                    // GQA expansion (the tail layer expands with its own group count).
+                    state.shared_kv.put(self.layer_kind, (k.clone(), v.clone()));
+                }
+                let (k_all, v_all) = state.cache.update(state.layer_idx, &k, &v)?;
+                (q, k_all, v_all)
+            }
+        };
         let (q_len, k_len) = (q.dim(2)?, k_all.dim(2)?);
         let k_all = repeat_kv(&k_all, self.groups)?;
         let v_all = repeat_kv(&v_all, self.groups)?;
