@@ -62,6 +62,28 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        // sc-18769 makes a Gemma 4 `config.json` **parse** — that is this story's whole point, and
+        // `ModelConfig::layer_attention` now resolves the per-layer table the decoder needs. The
+        // decoder itself is sc-18760 (MLX) / sc-18761 (candle): this block still reads one uniform
+        // `head_dim` per model, projects a `v_proj` every layer, and masks every layer causally, so
+        // handing it a Gemma 4 snapshot would half-build a model and then die on a missing
+        // `self_attn.v_proj.weight` (the `full_attention` layers share their key projection).
+        //
+        // Refuse by name instead. Before this story the loader refused a Gemma 4 config outright as
+        // an unknown architecture; now that it is a known one, that refusal has to be restated here
+        // or it degrades into a cryptic weight-lookup failure. Delete this guard when the per-layer
+        // attention block lands.
+        if cfg.architecture.is_gemma4() {
+            return Err(Error::Unsupported(
+                "Gemma 4 needs per-layer-type attention (two head dims, two RoPE schedules, \
+                 sliding-window layers, `attention_k_eq_v`, and a scale-free value norm); the \
+                 generic decoder is still uniform. The config layer and primitives are in place \
+                 (see `ModelConfig::layer_attention`) — sc-18760 / sc-18761 build the decoder on \
+                 them."
+                    .to_string(),
+            ));
+        }
+
         // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
         // norm, and `layers.{i}.*`) — there is no second `model.` segment — while `lm_head.weight`
         // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
@@ -120,14 +142,20 @@ impl CausalLm {
             };
             load_proj(&wkey, bias)
         };
-        // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
+        // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
         // `rms_norm` applies it. (Llama / Qwen3 / Qwen3-VL / GLM-4 norm weights are standard RMSNorm
         // — used verbatim, including Qwen3-VL's `Qwen3VLTextRMSNorm`, which is plain `weight · x`;
-        // its small early-layer block-norm weights are genuine, verified by real-weights coherence.)
-        let gemma = cfg.architecture.is_gemma2();
+        // its small early-layer block-norm weights are genuine, verified by real-weights coherence.
+        // **Gemma 4** is also verbatim: `Gemma4UnifiedRMSNorm` multiplies by the stored weight, whose
+        // initializer is ones, so folding +1 in would corrupt every norm — hence `norm_unit_offset`
+        // rather than the broader `is_gemma`.)
+        let norm_offset = cfg.architecture.norm_unit_offset();
+        // The two things every Gemma generation shares: the √hidden embedding scale and the GeGLU
+        // (`gelu_pytorch_tanh`) MLP.
+        let gemma = cfg.architecture.is_gemma();
         let norm_w = |key: String| -> Result<Array> {
             let t = req_bf16(key)?;
-            if gemma {
+            if norm_offset {
                 Ok(add(&t, &Array::from_f32(1.0).as_dtype(t.dtype())?)?)
             } else {
                 Ok(t)
@@ -579,6 +607,56 @@ impl CausalLm {
         Ok(logits.reshape(&[b, self.cfg.vocab_size])?)
     }
 
+    /// Run a forward step over token ids and return **every layer's** hidden states rather than
+    /// logits — the `output_hidden_states=True` stack a *text encoder* consumes (LTX-2.5 stacks all
+    /// of them into its feature extractor; only a language-model head wants logits).
+    ///
+    /// See [`CausalLm::hidden_states_from_embeds`] for the returned layout.
+    pub fn hidden_states(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Array>> {
+        let embeds = self.embed(input_ids)?;
+        self.hidden_states_from_embeds(&embeds, cache, offset)
+    }
+
+    /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
+    ///
+    /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's
+    /// `output_hidden_states` layout:
+    ///
+    /// * `[0]` — the input embeddings (post embedding-scale), i.e. the first layer's input.
+    /// * `[i]` for `1 <= i < num_layers` — the output of decoder layer `i - 1`.
+    /// * `[num_layers]` — the **final-normed** output of the last layer (HF ties the last entry to
+    ///   `last_hidden_state`, which is post-`model.norm`), *not* the raw layer output.
+    ///
+    /// Getting that last entry wrong is invisible in a decode smoke test — logits go through the
+    /// same norm either way — but silently shifts every feature an encoder consumer builds.
+    pub fn hidden_states_from_embeds(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Vec<Array>> {
+        let s = input_embeds.shape()[1];
+        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            input_embeds,
+            cache,
+            &cos,
+            &sin,
+            AttnMask::Causal,
+            Some(&mut out),
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
+        }
+        Ok(out)
+    }
+
     /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
     /// project the **last column** to logits `[batch, vocab]`.
     fn forward_to_last_logits(
@@ -606,9 +684,31 @@ impl CausalLm {
         sin: &Array,
         mask: AttnMask<'_>,
     ) -> Result<Array> {
+        self.run_decoder_stack_collecting(input_embeds, cache, cos, sin, mask, None)
+    }
+
+    /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — one
+    /// loop, so the hidden-state-stack forward cannot drift from the logits forward. sc-18760
+    /// rewrites this loop for Gemma 4's per-layer attention and must not have to keep two copies of
+    /// it in step. Mirrors candle-llm's `run_decoder_stack_collecting`.
+    fn run_decoder_stack_collecting(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        cos: &Array,
+        sin: &Array,
+        mask: AttnMask<'_>,
+        mut collect: Option<&mut Vec<Array>>,
+    ) -> Result<Array> {
         let mut h = input_embeds.clone();
+        if let Some(sink) = collect.as_deref_mut() {
+            sink.push(h.clone());
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, cos, sin, mask, cache, i)?;
+            if let Some(sink) = collect.as_deref_mut() {
+                sink.push(h.clone());
+            }
         }
         Ok(h)
     }

@@ -60,6 +60,57 @@ impl Rope {
         }
     }
 
+    /// **Proportional** RoPE (`rope_type: "proportional"`, new in Gemma 4's `full_attention`
+    /// layers), over the **full** `head_dim`.
+    ///
+    /// The leading `rope_angles = floor(partial_rotary_factor * head_dim / 2)` frequency channels
+    /// carry the ordinary `theta^(-2i / head_dim)` — note the exponent denominator is the **full**
+    /// `head_dim`, not the rotated span — and the remaining `head_dim/2 - rope_angles` channels are
+    /// **exactly zero**, so their cos/sin are `1`/`0` and the rotation is an identity there.
+    ///
+    /// This is *not* [`Rope::partial`] with a narrower dim. Both leave part of the head unrotated,
+    /// but they disagree on two things that change every rotated value:
+    ///
+    /// * **The pairing.** `partial` rotates a leading slice, pairing channel `i` with `i + rd/2`
+    ///   *inside* that slice; proportional keeps the NeoX pairing across the whole head, `i` with
+    ///   `i + head_dim/2`. A rotated channel's partner is a different channel under the two.
+    /// * **The frequencies.** `partial` re-bases the exponent on the rotated span (`2i/rd`);
+    ///   proportional keeps `2i/head_dim`, so the same channel index gets a *higher* frequency.
+    ///
+    /// `factor` is the reference's trailing `inv_freq /= factor` (its `rope_parameters.factor`), a
+    /// linear frequency divisor; every shipped Gemma 4 config carries `1.0`, which is a no-op.
+    ///
+    /// With `partial_rotary_factor >= 1.0` and `factor == 1.0` this is exactly [`Rope::standard`].
+    pub fn proportional(
+        head_dim: i32,
+        theta: f32,
+        partial_rotary_factor: f32,
+        factor: f32,
+    ) -> Self {
+        let dim = head_dim.max(0) as usize;
+        let half = dim / 2;
+        // `int(partial_rotary_factor * head_dim // 2)` in the reference.
+        let rope_angles = ((partial_rotary_factor * head_dim as f32) / 2.0)
+            .floor()
+            .clamp(0.0, half as f32) as usize;
+        let inv_freq = (0..half)
+            .map(|i| {
+                if i < rope_angles {
+                    // `inv_freq /= factor` is applied to the rotated channels; the zero tail stays
+                    // zero either way (0 / factor == 0), matching the reference's whole-vector divide.
+                    1.0 / theta.powf((2 * i) as f32 / dim as f32) / factor
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        Self {
+            inv_freq,
+            dim,
+            interleaved: false,
+        }
+    }
+
     /// YaRN-scaled RoPE (DeepSeek-V2's `rope_scaling` "yarn" schedule), over `rope_dim` dimensions.
     ///
     /// Each inverse frequency is a wavelength-ramped blend of the **extrapolated** frequency (the

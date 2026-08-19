@@ -49,6 +49,350 @@ pub enum Architecture {
     /// [`CausalLm`](crate::models::CausalLm); the text path is plain 1-D RoPE (interleaved M-RoPE with
     /// equal t/h/w rows is bit-identical), the image path uses the interleaved-M-RoPE cos/sin table.
     Qwen3Vl,
+    /// Gemma 4 **unified** (`model_type` `gemma4_unified` / `gemma4_unified_text`): the
+    /// encode-capable multimodal Gemma 4, whose text decoder is the LTX-2.5 text encoder. Structurally
+    /// a Gemma-2 sandwich block, but with a **per-layer-type** attention table
+    /// ([`Gemma4Config`]) rather than one uniform shape: `layer_types` alternates
+    /// `sliding_attention` / `full_attention`, and the two types differ in head dim, KV-head count,
+    /// RoPE schedule (`default` vs `proportional`), masking (sliding window vs full causal), and
+    /// whether K and V share a projection (`attention_k_eq_v`). Norms are plain-`weight` RMSNorm —
+    /// **not** Gemma-2's `(1 + weight)` fold — and the attention scale is `1.0` (the per-head q/k
+    /// RMSNorms take its place).
+    Gemma4Unified,
+    /// Gemma 4 **dense** (`model_type` `gemma4` / `gemma4_text`): the text-only Gemma 4 upstream
+    /// distinguishes from the unified variant. Same decoder shape and per-layer-type attention
+    /// table as [`Architecture::Gemma4Unified`]; LTX-2.5 uses it only as a prompt *enhancer*, never
+    /// as the encoder (the packed TE always carries the unified config).
+    Gemma4,
+}
+
+/// Which attention flavour a decoder layer runs — Gemma 4's `layer_types` entries.
+///
+/// Every architecture before Gemma 4 is uniform (one shape for all layers), which is
+/// [`LayerAttentionType::Full`] for the whole stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerAttentionType {
+    /// `sliding_attention`: the layer only attends the `sliding_window` most recent keys.
+    Sliding,
+    /// `full_attention`: the layer attends the whole (causal) prefix.
+    Full,
+}
+
+impl LayerAttentionType {
+    /// The `config.json` spelling (`"sliding_attention"` / `"full_attention"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayerAttentionType::Sliding => "sliding_attention",
+            LayerAttentionType::Full => "full_attention",
+        }
+    }
+
+    /// Parse a `layer_types` entry; unrecognized spellings are `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sliding_attention" => Some(LayerAttentionType::Sliding),
+            "full_attention" => Some(LayerAttentionType::Full),
+            _ => None,
+        }
+    }
+}
+
+/// How a layer builds its RoPE inverse frequencies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeType {
+    /// `rope_type: "default"` — `inv_freq[i] = theta^(-2i / head_dim)` over the full head.
+    Default,
+    /// `rope_type: "proportional"` — the leading `int(partial_rotary_factor · head_dim / 2)`
+    /// channels carry `theta^(-2i / head_dim)` (denominator the **full** head dim) and the rest are
+    /// exactly zero, so the table stays `head_dim` wide and the un-rotated channels are an identity
+    /// rotation. Distinct from a leading-slice partial RoPE (GLM-4), which narrows both the
+    /// denominator and the rotated span. New in Gemma 4.
+    Proportional,
+}
+
+/// One layer type's attention descriptor — the per-layer replacement for the scalar `head_dim` /
+/// `num_kv_heads` / `rope_theta` triple.
+///
+/// Uniform architectures resolve every layer to the same descriptor (see
+/// [`ModelConfig::layer_attention`]); Gemma 4 resolves `sliding_attention` and `full_attention`
+/// layers to two different ones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerAttention {
+    /// Per-head dimension for this layer type (Gemma 4: 256 sliding, `global_head_dim` 512 full).
+    pub head_dim: i32,
+    /// Key/value head count for this layer type (Gemma 4: `num_key_value_heads` sliding,
+    /// `num_global_key_value_heads` full).
+    pub num_kv_heads: i32,
+    /// The RoPE frequency schedule.
+    pub rope_type: RopeType,
+    /// RoPE base frequency (Gemma 4: 10 000 sliding, 1 000 000 full).
+    pub rope_theta: f32,
+    /// Fraction of `head_dim` that carries a rotation; `1.0` ⇒ every channel.
+    pub partial_rotary_factor: f32,
+    /// `rope_parameters.<type>.factor` — the linear divisor applied to the inverse frequencies
+    /// (`inv_freq /= factor`) at the end of the reference's proportional schedule. `1.0` ⇒ no
+    /// scaling, which is what every shipped Gemma 4 config carries.
+    pub rope_factor: f32,
+    /// `Some(w)` ⇒ the layer attends only the `w` most recent keys (inclusive of the query's own
+    /// position); `None` ⇒ the full causal prefix.
+    pub sliding_window: Option<i32>,
+    /// `attention_k_eq_v`: K and V come from **one** shared projection (the value path takes the raw
+    /// projection output and its own scale-free norm, so K and V are still different tensors).
+    pub k_eq_v: bool,
+}
+
+impl LayerAttention {
+    /// GQA group count for this layer (`num_heads / num_kv_heads`).
+    pub fn groups(&self, num_heads: i32) -> i32 {
+        num_heads / self.num_kv_heads.max(1)
+    }
+
+    /// Build this layer type's RoPE. Only the schedules a per-layer-type table can express
+    /// ([`RopeType`]) are built here; the whole-model schedules (llama3 / YaRN / interleaved) stay
+    /// on [`ModelConfig::build_rope`], which [`ModelConfig::layer_rope`] dispatches to for every
+    /// architecture that predates Gemma 4.
+    pub fn build_rope(&self) -> Rope {
+        match self.rope_type {
+            RopeType::Default => Rope::standard(self.head_dim, self.rope_theta),
+            RopeType::Proportional => Rope::proportional(
+                self.head_dim,
+                self.rope_theta,
+                self.partial_rotary_factor,
+                self.rope_factor,
+            ),
+        }
+    }
+}
+
+/// `use_bidirectional_attention`: which token spans attend bidirectionally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BidirectionalAttention {
+    /// `"vision"` — vision tokens are bidirectional, text stays causal (the Gemma 4 default, and the
+    /// only mode a text-only encoder ever sees).
+    Vision,
+    /// `"all"` — every token attends bidirectionally. Upstream also halves the configured
+    /// `sliding_window` to `w / 2 + 1` when this is set (exclusive bounds), which
+    /// [`Gemma4Config`] parsing reproduces.
+    All,
+}
+
+/// Gemma 4's per-layer-type attention table.
+///
+/// `layer_types` has one entry per decoder layer; each entry selects [`Gemma4Config::sliding`] or
+/// [`Gemma4Config::full`]. This is the block that makes a single `ModelConfig` able to describe a
+/// model whose layers do not share a head dim, a KV-head count, a RoPE schedule, or a mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gemma4Config {
+    /// One entry per decoder layer (length `num_layers`).
+    pub layer_types: Vec<LayerAttentionType>,
+    /// The `sliding_attention` layers' descriptor.
+    pub sliding: LayerAttention,
+    /// The `full_attention` layers' descriptor.
+    pub full: LayerAttention,
+    /// `use_bidirectional_attention`; `None` when the config disables it outright.
+    pub bidirectional: Option<BidirectionalAttention>,
+    /// `num_kv_shared_layers`: how many trailing layers reuse the last non-sharing layer's K/V of
+    /// their own layer type instead of projecting their own. `0` ⇒ no sharing.
+    pub num_kv_shared_layers: usize,
+    /// `use_double_wide_mlp`: the KV-sharing tail layers double `intermediate_size`.
+    pub use_double_wide_mlp: bool,
+}
+
+/// Upstream's default sliding/full schedule period: every `6`th layer is full attention (5:1).
+const GEMMA4_SLIDING_WINDOW_PATTERN: usize = 6;
+
+impl Gemma4Config {
+    /// The layer type of decoder layer `i` (out-of-range indices clamp to the last entry, matching
+    /// how the decoder only ever asks about layers it built).
+    pub fn layer_type(&self, layer_idx: usize) -> LayerAttentionType {
+        self.layer_types
+            .get(layer_idx)
+            .copied()
+            .or_else(|| self.layer_types.last().copied())
+            .unwrap_or(LayerAttentionType::Full)
+    }
+
+    /// The attention descriptor of decoder layer `i`.
+    pub fn layer(&self, layer_idx: usize) -> LayerAttention {
+        match self.layer_type(layer_idx) {
+            LayerAttentionType::Sliding => self.sliding,
+            LayerAttentionType::Full => self.full,
+        }
+    }
+
+    /// The descriptor for a layer *type*.
+    pub fn for_type(&self, kind: LayerAttentionType) -> LayerAttention {
+        match kind {
+            LayerAttentionType::Sliding => self.sliding,
+            LayerAttentionType::Full => self.full,
+        }
+    }
+
+    /// Resolve `layer_types`: the explicit `config.json` array when present, else upstream's default
+    /// 5:1 schedule (`sliding_attention` unless `(i + 1) % 6 == 0`). Either way the **last** layer is
+    /// forced to `full_attention`, as upstream does.
+    pub fn resolve_layer_types(
+        num_layers: usize,
+        explicit: Option<&Value>,
+    ) -> Vec<LayerAttentionType> {
+        let mut types: Vec<LayerAttentionType> = match explicit.and_then(|v| v.as_array()) {
+            Some(a) if a.len() >= num_layers => a
+                .iter()
+                .take(num_layers)
+                .map(|e| {
+                    e.as_str()
+                        .and_then(LayerAttentionType::parse)
+                        .unwrap_or(LayerAttentionType::Full)
+                })
+                .collect(),
+            _ => (0..num_layers)
+                .map(|i| {
+                    if (i + 1) % GEMMA4_SLIDING_WINDOW_PATTERN == 0 {
+                        LayerAttentionType::Full
+                    } else {
+                        LayerAttentionType::Sliding
+                    }
+                })
+                .collect(),
+        };
+        if let Some(last) = types.last_mut() {
+            *last = LayerAttentionType::Full;
+        }
+        types
+    }
+
+    /// Parse the Gemma 4 block out of an (already `text_config`-descended) config value.
+    /// `num_layers` / `num_kv_heads` / `head_dim` are the scalars [`ModelConfig::from_json`] has
+    /// already read, which double as the `sliding_attention` defaults.
+    fn from_json(v: &Value, num_layers: usize, num_kv_heads: i32, head_dim: i32) -> Result<Self> {
+        let int =
+            |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
+        let bidirectional = match v
+            .get("use_bidirectional_attention")
+            .and_then(|x| x.as_str())
+        {
+            Some("all") => Some(BidirectionalAttention::All),
+            Some("vision") => Some(BidirectionalAttention::Vision),
+            // A JSON `null` / absent key defaults to upstream's `"vision"`; any other spelling is
+            // treated as "not bidirectional" rather than guessed at.
+            None if v.get("use_bidirectional_attention").is_none() => {
+                Some(BidirectionalAttention::Vision)
+            }
+            _ => None,
+        };
+        // Upstream halves the stored window (`w / 2 + 1`, exclusive bounds) when every token is
+        // bidirectional. Serialization undoes it, so the stored value is always the un-halved one.
+        let raw_window = int("sliding_window").unwrap_or(1024);
+        let sliding_window = if bidirectional == Some(BidirectionalAttention::All) {
+            raw_window / 2 + 1
+        } else {
+            raw_window
+        };
+        let k_eq_v = v
+            .get("attention_k_eq_v")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+
+        // `rope_parameters` is keyed by layer type; both entries default to upstream's table.
+        // Fallible: an unsupported `factor` combination is refused rather than dropped.
+        let rope_for = |kind: LayerAttentionType,
+                        default_theta: f32,
+                        default_type: RopeType,
+                        default_partial: f32| {
+            let block = v
+                .get("rope_parameters")
+                .and_then(|rp| rp.get(kind.as_str()));
+            let rope_type = match block
+                .and_then(|b| b.get("rope_type"))
+                .and_then(|x| x.as_str())
+            {
+                Some("proportional") => RopeType::Proportional,
+                Some(_) => RopeType::Default,
+                None => default_type,
+            };
+            let theta = block
+                .and_then(|b| b.get("rope_theta"))
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(default_theta);
+            let partial = block
+                .and_then(|b| b.get("partial_rotary_factor"))
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(default_partial);
+            // `factor` divides the inverse frequencies at the end of the *proportional* schedule
+            // only. Gemma 4's own `compute_default_rope_parameters` has no factor term, so a
+            // `default` layer type carrying one would mean a schedule this crate does not
+            // implement — refuse it rather than silently ignoring the key.
+            let factor = block
+                .and_then(|b| b.get("factor"))
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(1.0);
+            if rope_type == RopeType::Default && factor != 1.0 {
+                return Err(Error::Unsupported(format!(
+                    "rope_parameters.{}.factor = {factor} on a `default` rope_type: the reference \
+                     applies `factor` only to the `proportional` schedule, so this config asks for \
+                     a frequency scaling this decoder does not implement",
+                    kind.as_str()
+                )));
+            }
+            Ok((rope_type, theta, partial, factor))
+        };
+        let (sliding_rope, sliding_theta, sliding_partial, sliding_factor) = rope_for(
+            LayerAttentionType::Sliding,
+            10_000.0,
+            RopeType::Default,
+            1.0,
+        )?;
+        let (full_rope, full_theta, full_partial, full_factor) = rope_for(
+            LayerAttentionType::Full,
+            1_000_000.0,
+            RopeType::Proportional,
+            0.25,
+        )?;
+
+        // The `full_attention` layers' overrides (`per_layer_config` upstream): a wider head, and —
+        // only when `attention_k_eq_v` is set — a different KV-head count.
+        let global_head_dim = int("global_head_dim").unwrap_or(512);
+        let global_kv_heads = if k_eq_v {
+            int("num_global_key_value_heads").unwrap_or(num_kv_heads)
+        } else {
+            num_kv_heads
+        };
+
+        Ok(Self {
+            layer_types: Self::resolve_layer_types(num_layers, v.get("layer_types")),
+            sliding: LayerAttention {
+                head_dim,
+                num_kv_heads,
+                rope_type: sliding_rope,
+                rope_theta: sliding_theta,
+                partial_rotary_factor: sliding_partial,
+                rope_factor: sliding_factor,
+                sliding_window: Some(sliding_window),
+                // `attention_k_eq_v` gates only the non-sliding layers upstream
+                // (`use_alternative_attention = attention_k_eq_v and not is_sliding`).
+                k_eq_v: false,
+            },
+            full: LayerAttention {
+                head_dim: global_head_dim,
+                num_kv_heads: global_kv_heads,
+                rope_type: full_rope,
+                rope_theta: full_theta,
+                partial_rotary_factor: full_partial,
+                rope_factor: full_factor,
+                sliding_window: None,
+                k_eq_v,
+            },
+            bidirectional,
+            num_kv_shared_layers: int("num_kv_shared_layers").unwrap_or(0).max(0) as usize,
+            use_double_wide_mlp: v
+                .get("use_double_wide_mlp")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+        })
+    }
 }
 
 impl Architecture {
@@ -79,6 +423,11 @@ impl Architecture {
             Ok(Architecture::Qwen3)
         } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
             Ok(Architecture::Qwen2Moe)
+        } else if hay.contains("gemma4_unified") || hay.contains("gemma4unified") {
+            // `gemma4_unified` must be tested before the bare `gemma4` (a substring of it).
+            Ok(Architecture::Gemma4Unified)
+        } else if hay.contains("gemma4") {
+            Ok(Architecture::Gemma4)
         } else if hay.contains("gemma2") {
             Ok(Architecture::Gemma2)
         } else if hay.contains("glm4") {
@@ -115,6 +464,8 @@ impl Architecture {
             Architecture::DeepseekV2 => "deepseek_v2",
             Architecture::Qwen35 => "qwen3_5",
             Architecture::Qwen3Vl => "qwen3_vl",
+            Architecture::Gemma4Unified => "gemma4_unified",
+            Architecture::Gemma4 => "gemma4",
         }
     }
 
@@ -130,10 +481,52 @@ impl Architecture {
         matches!(self, Architecture::Gemma2)
     }
 
-    /// Whether the block uses the 4-norm "sandwich" residual (Gemma-2, GLM-4) rather than the plain
-    /// Llama pre-norm.
+    /// Whether this is a Gemma 4 decoder — unified (encode-capable) or dense (enhance-only). Drives
+    /// the per-layer-type attention table ([`Gemma4Config`]), the `text_config` descent, the
+    /// unit attention scale, and the scale-free value norm.
+    pub fn is_gemma4(self) -> bool {
+        matches!(self, Architecture::Gemma4Unified | Architecture::Gemma4)
+    }
+
+    /// Whether this is any Gemma decoder. Drives the two behaviours **all** Gemma generations share:
+    /// the `√hidden` embedding scale and the GeGLU (`gelu_pytorch_tanh`) MLP, plus the implicit
+    /// `tie_word_embeddings` default. Deliberately distinct from [`Architecture::norm_unit_offset`]
+    /// — Gemma 4 shares the scale and the activation but **not** the `(1 + weight)` norm fold.
+    pub fn is_gemma(self) -> bool {
+        self.is_gemma2() || self.is_gemma4()
+    }
+
+    /// Whether RMSNorm weights are stored offset by one, so the norm is `(1 + weight) · x̂`.
+    ///
+    /// **Gemma-2 only.** Gemma 4's `Gemma4UnifiedRMSNorm` multiplies by the stored `weight`
+    /// directly (its weights initialize to ones, not zeros), so folding `+1` into a Gemma 4
+    /// checkpoint would corrupt every norm in the model.
+    pub fn norm_unit_offset(self) -> bool {
+        matches!(self, Architecture::Gemma2)
+    }
+
+    /// Whether attention applies a **scale-free** per-head RMSNorm to the value heads (Gemma 4's
+    /// `v_norm`, `with_scale=False`). Gemma 4 only.
+    pub fn has_v_norm(self) -> bool {
+        self.is_gemma4()
+    }
+
+    /// Whether the decoder fields live under a `text_config` VLM wrapper rather than at the top
+    /// level (Qwen3-VL, and both Gemma 4 variants).
+    pub fn nests_text_config(self) -> bool {
+        self.is_qwen3_vl() || self.is_gemma4()
+    }
+
+    /// Whether the block uses the 4-norm "sandwich" residual (Gemma-2, Gemma 4, GLM-4) rather than
+    /// the plain Llama pre-norm.
     pub fn is_sandwich(self) -> bool {
-        matches!(self, Architecture::Gemma2 | Architecture::Glm4)
+        matches!(
+            self,
+            Architecture::Gemma2
+                | Architecture::Glm4
+                | Architecture::Gemma4Unified
+                | Architecture::Gemma4
+        )
     }
 
     /// Whether RoPE uses the interleaved (GPT-J-style) pairing rather than NeoX half-split (GLM-4,
@@ -148,9 +541,15 @@ impl Architecture {
         matches!(self, Architecture::DeepseekV2)
     }
 
-    /// Whether attention applies per-head q/k RMSNorm (Qwen3 / Qwen3-VL).
+    /// Whether attention applies per-head q/k RMSNorm (Qwen3 / Qwen3-VL / Gemma 4).
     pub fn has_qk_norm(self) -> bool {
-        matches!(self, Architecture::Qwen3 | Architecture::Qwen3Vl)
+        matches!(
+            self,
+            Architecture::Qwen3
+                | Architecture::Qwen3Vl
+                | Architecture::Gemma4Unified
+                | Architecture::Gemma4
+        )
     }
 }
 
@@ -296,16 +695,27 @@ pub struct ModelConfig {
     /// to `rotary_dim/2`); `None` ⇒ no M-RoPE / the even split from [`Self::mrope_section_resolved`].
     /// Drives the image (3-D) RoPE channel-axis assignment; the text path (equal rows) is unaffected.
     pub mrope_section: Option<[i32; 3]>,
+    /// Gemma 4's **per-layer-type** attention table, present only for a Gemma 4 decoder; `None` ⇒ a
+    /// uniform model, where every layer resolves to the scalar `head_dim` / `num_kv_heads` /
+    /// `rope_theta` above (see [`ModelConfig::layer_attention`]). Adding this block is what lets one
+    /// `ModelConfig` describe a stack whose layers disagree on head dim, KV-head count, RoPE
+    /// schedule, and mask — without moving any scalar an existing architecture reads.
+    ///
+    /// **Boxed on purpose.** `ModelConfig` is cloned into every loaded decoder, and the table is
+    /// over a hundred bytes of `Vec` + two descriptors that no pre-Gemma-4 model has any use for;
+    /// inlining it inflated the provider's decoder enum enough to trip `clippy::large_enum_variant`.
+    /// One pointer keeps the common config exactly as cheap as it was.
+    pub gemma4: Option<Box<Gemma4Config>>,
 }
 
 impl ModelConfig {
     /// Parse from an already-decoded `config.json` value.
     pub fn from_json(top: &Value) -> Result<Self> {
         let architecture = Architecture::from_config(top)?;
-        // Qwen3-VL nests the decoder fields under `text_config` (the VLM wrapper); read decoder
-        // numerics / RoPE from there, but `tie_word_embeddings` and the `quantization` block stay at
-        // the top level. All other architectures read everything from the top.
-        let v = if architecture.is_qwen3_vl() {
+        // Qwen3-VL and Gemma 4 nest the decoder fields under `text_config` (the VLM wrapper); read
+        // decoder numerics / RoPE from there, but `tie_word_embeddings` and the `quantization` block
+        // stay at the top level. All other architectures read everything from the top.
+        let v = if architecture.nests_text_config() {
             top.get("text_config").unwrap_or(top)
         } else {
             top
@@ -350,7 +760,7 @@ impl ModelConfig {
             .get("tie_word_embeddings")
             .and_then(|x| x.as_bool())
             // Gemma always ties its (huge) embedding to the LM head; the config often omits the key.
-            .unwrap_or(architecture.is_gemma2());
+            .unwrap_or(architecture.is_gemma());
         let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
 
         let f32_opt =
@@ -456,6 +866,32 @@ impl ModelConfig {
                 [g(0), g(1), g(2)]
             });
 
+        // Gemma 4's per-layer-type attention table. Parsed **last** so it can seed its
+        // `sliding_attention` descriptor from the scalars above, then reflect its own
+        // `sliding_attention` values back into them: the scalar `head_dim` / `num_kv_heads` /
+        // `rope_theta` / `partial_rotary_factor` stay the "layer 0" view of the model, so anything
+        // that reads them (memory estimates, cache sizing, diagnostics) sees a coherent shape rather
+        // than a `rope_theta` default the config never carried. Every other architecture leaves this
+        // `None` and every scalar untouched — the byte-identical-parse invariant.
+        let gemma4 = match architecture.is_gemma4() {
+            true => Some(Box::new(Gemma4Config::from_json(
+                v,
+                num_layers,
+                num_kv_heads,
+                head_dim,
+            )?)),
+            false => None,
+        };
+        let (head_dim, num_kv_heads, rope_theta, partial_rotary_factor) = match &gemma4 {
+            Some(g) => (
+                g.sliding.head_dim,
+                g.sliding.num_kv_heads,
+                g.sliding.rope_theta,
+                g.sliding.partial_rotary_factor,
+            ),
+            None => (head_dim, num_kv_heads, rope_theta, partial_rotary_factor),
+        };
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -479,6 +915,7 @@ impl ModelConfig {
             mla,
             yarn,
             mrope_section,
+            gemma4,
         })
     }
 
@@ -508,6 +945,72 @@ impl ModelConfig {
     /// Whether the decoder uses a Mixture-of-Experts FFN (Qwen2-MoE).
     pub fn is_moe(&self) -> bool {
         self.moe.is_some()
+    }
+
+    /// Whether this is a Gemma 4 decoder (and therefore carries a [`Gemma4Config`] table).
+    pub fn is_gemma4(&self) -> bool {
+        self.architecture.is_gemma4()
+    }
+
+    /// The attention descriptor for decoder layer `i`.
+    ///
+    /// Gemma 4 resolves through its [`Gemma4Config`] table (`sliding_attention` vs
+    /// `full_attention`); **every** other architecture resolves every layer to the same descriptor
+    /// built from the scalar `head_dim` / `num_kv_heads` / `rope_theta` / `partial_rotary_factor` —
+    /// so a uniform model reads exactly the values it read before this table existed.
+    pub fn layer_attention(&self, layer_idx: usize) -> LayerAttention {
+        match &self.gemma4 {
+            Some(g) => g.layer(layer_idx),
+            None => LayerAttention {
+                head_dim: self.head_dim,
+                num_kv_heads: self.num_kv_heads,
+                rope_type: RopeType::Default,
+                rope_theta: self.rope_theta,
+                partial_rotary_factor: self.partial_rotary_factor,
+                rope_factor: 1.0,
+                sliding_window: None,
+                k_eq_v: false,
+            },
+        }
+    }
+
+    /// The layer type of decoder layer `i` — [`LayerAttentionType::Full`] for every uniform
+    /// (pre-Gemma-4) architecture.
+    pub fn layer_type(&self, layer_idx: usize) -> LayerAttentionType {
+        match &self.gemma4 {
+            Some(g) => g.layer_type(layer_idx),
+            None => LayerAttentionType::Full,
+        }
+    }
+
+    /// GQA group count for decoder layer `i` (`num_heads / layer num_kv_heads`). Equals
+    /// [`ModelConfig::groups`] for every uniform architecture; Gemma 4's `full_attention` layers
+    /// have a different (much larger) group count than its `sliding_attention` layers.
+    pub fn layer_groups(&self, layer_idx: usize) -> i32 {
+        self.layer_attention(layer_idx).groups(self.num_heads)
+    }
+
+    /// Per-head dimension for decoder layer `i`.
+    pub fn layer_head_dim(&self, layer_idx: usize) -> i32 {
+        self.layer_attention(layer_idx).head_dim
+    }
+
+    /// `Some(window)` when decoder layer `i` attends only the `window` most recent keys; `None` for
+    /// a full causal layer (and for every uniform architecture).
+    pub fn layer_sliding_window(&self, layer_idx: usize) -> Option<i32> {
+        self.layer_attention(layer_idx).sliding_window
+    }
+
+    /// The RoPE for decoder layer `i`.
+    ///
+    /// Gemma 4 builds the layer type's schedule (`default` / `proportional`); every other
+    /// architecture returns [`ModelConfig::build_rope`] unchanged — including the whole-model
+    /// llama3 / YaRN / partial-interleaved schedules, which have no per-layer-type form.
+    pub fn layer_rope(&self, layer_idx: usize) -> Rope {
+        match &self.gemma4 {
+            Some(g) => g.layer(layer_idx).build_rope(),
+            None => self.build_rope(),
+        }
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -580,8 +1083,14 @@ impl ModelConfig {
 
     /// Attention scale. MLA (DeepSeek-V2) scales by `q_head_dim^(-0.5)` multiplied by the YaRN
     /// magnitude `mscale²`; Gemma-2 scales by `query_pre_attn_scalar^(-0.5)` (a denominator that may
-    /// differ from `head_dim`); otherwise the usual `head_dim^(-0.5)`.
+    /// differ from `head_dim`); **Gemma 4 scales by `1.0`** — upstream's
+    /// `Gemma4UnifiedTextAttention` sets `self.scaling = 1.0`, because the per-head q/k RMSNorms
+    /// already fix the score magnitude; dividing by the root of `head_dim` on top would shrink every
+    /// logit. Otherwise the usual `head_dim^(-0.5)`.
     pub fn attn_scale(&self) -> f32 {
+        if self.architecture.is_gemma4() {
+            return 1.0;
+        }
         if let Some(mla) = self.mla {
             let base = (mla.q_head_dim() as f32).powf(-0.5);
             let mscale = self.yarn.map_or(1.0, |y| y.softmax_mscale());
@@ -959,5 +1468,95 @@ mod tests {
         assert_eq!(cfg.head_dim, 128); // explicit, != 1024/16
         assert_eq!(cfg.max_position_embeddings, 40960);
         assert!(cfg.rope_scaling.is_none());
+    }
+
+    #[test]
+    fn gemma4_dispatch_orders_unified_before_the_bare_family() {
+        // `gemma4` is a substring of `gemma4_unified`, so the unified check must come first or every
+        // unified checkpoint silently loads as the dense enhance-only variant. Both spellings the
+        // checkpoints use — top-level `gemma4_unified` and the nested `gemma4_unified_text` — must
+        // land on the same variant.
+        let unified = json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "model_type": "gemma4_unified",
+            "text_config": { "model_type": "gemma4_unified_text" }
+        });
+        let a = Architecture::from_config(&unified).unwrap();
+        assert_eq!(a, Architecture::Gemma4Unified);
+        assert_eq!(a.family(), "gemma4_unified");
+
+        let dense = json!({ "architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4" });
+        let d = Architecture::from_config(&dense).unwrap();
+        assert_eq!(d, Architecture::Gemma4);
+        assert_eq!(d.family(), "gemma4");
+
+        // Gemma-2 must still dispatch to Gemma-2 (and keep its `(1 + weight)` norm fold).
+        let g2 = json!({ "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2" });
+        let g2 = Architecture::from_config(&g2).unwrap();
+        assert_eq!(g2, Architecture::Gemma2);
+        assert!(g2.norm_unit_offset());
+
+        for g4 in [a, d] {
+            assert!(g4.is_gemma4());
+            assert!(g4.is_gemma());
+            assert!(
+                !g4.is_gemma2(),
+                "Gemma 4 must not answer to the Gemma-2 flag"
+            );
+            assert!(
+                !g4.norm_unit_offset(),
+                "Gemma 4 norms use the stored weight verbatim"
+            );
+            assert!(g4.is_sandwich());
+            assert!(g4.has_qk_norm());
+            assert!(g4.has_v_norm());
+            assert!(g4.nests_text_config());
+            assert!(!g4.rope_interleaved());
+            assert!(!g4.is_mla());
+        }
+    }
+
+    #[test]
+    fn gemma4_minimal_config_defaults_match_upstream() {
+        // A Gemma 4 text config carrying none of the optional keys must still land on upstream's
+        // defaults rather than this crate's generic ones — in particular `rope_theta`, whose generic
+        // default (500 000) belongs to no Gemma model, and the 512-wide `global_head_dim`.
+        let v = json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 12,
+                "num_attention_heads": 4, "vocab_size": 256
+            }
+        });
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        let g = cfg.gemma4.as_ref().expect("gemma 4 table");
+        assert_eq!(g.sliding.rope_theta, 10_000.0);
+        assert_eq!(
+            g.sliding.head_dim, 16,
+            "hidden/heads when head_dim is absent"
+        );
+        assert_eq!(g.full.rope_theta, 1_000_000.0);
+        assert_eq!(g.full.rope_type, RopeType::Proportional);
+        assert_eq!(g.full.partial_rotary_factor, 0.25);
+        assert_eq!(g.full.head_dim, 512, "global_head_dim defaults to 512");
+        assert_eq!(g.sliding.sliding_window, Some(1024));
+        assert!(!g.full.k_eq_v, "attention_k_eq_v defaults to false");
+        assert_eq!(g.num_kv_shared_layers, 0);
+        assert_eq!(g.bidirectional, Some(BidirectionalAttention::Vision));
+        // With `attention_k_eq_v` off, the full layers keep the ordinary KV-head count — the
+        // `num_global_key_value_heads` override is gated on the flag upstream.
+        assert_eq!(g.full.num_kv_heads, g.sliding.num_kv_heads);
+        // The scalar view is the sliding (layer-0) one, and Gemma always ties its embeddings.
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        assert_eq!(cfg.head_dim, 16);
+        assert!(cfg.tie_word_embeddings);
+        assert_eq!(cfg.attn_scale(), 1.0);
+        // 12 layers: full at indices 5 and 11 (the last is forced full either way).
+        let full: Vec<usize> = (0..12)
+            .filter(|&i| cfg.layer_type(i) == LayerAttentionType::Full)
+            .collect();
+        assert_eq!(full, vec![5, 11]);
     }
 }

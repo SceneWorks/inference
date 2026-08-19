@@ -11,7 +11,7 @@ use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis};
 use mlx_rs::{Array, Dtype};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::primitives::nn::soft_cap;
 
 /// Disallowed-attention fill for the eager additive mask: a large finite negative (matching the
@@ -36,6 +36,18 @@ pub enum AttnMask<'a> {
     Causal,
     /// An explicit additive mask broadcast over the score tensor (`0` keep, `-inf` block).
     Additive(&'a Array),
+    /// **Sliding-window** causal mask (Gemma 4's `sliding_attention` layers): causal *and* limited to
+    /// the `window` most recent keys, so query `q` sees key `j` iff `0 <= q − j < window` (the
+    /// query's own position counts toward the window). Queries are bottom-right aligned over the
+    /// cached keys like [`AttnMask::Causal`], so a cached decode step attends the tail of its cache.
+    ///
+    /// MLX's fused kernel has no sliding mode, so [`sdpa`] / [`sdpa_capped`] materialize this into an
+    /// additive mask ([`sliding_causal_mask`]) before dispatching.
+    SlidingCausal {
+        /// Number of most-recent keys a query may attend, inclusive of its own position. A window
+        /// `>= k_len` is exactly [`AttnMask::Causal`].
+        window: i32,
+    },
 }
 
 /// Expand grouped-query KV heads to the full query head count.
@@ -72,6 +84,12 @@ pub fn sdpa(
     scale: f32,
     mask: AttnMask<'_>,
 ) -> Result<Array> {
+    // MLX has no fused sliding-window mode; materialize the window into an additive mask and run the
+    // ordinary explicit-mask path (which the chunked-prefill mitigation already slices correctly).
+    if let AttnMask::SlidingCausal { window } = mask {
+        let m = sliding_causal_mask(queries.shape()[2], keys.shape()[2], window)?;
+        return sdpa(queries, keys, values, scale, AttnMask::Additive(&m));
+    }
     let (heads, q_len, head_dim) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
     let hits_broken_kernel = q_len > SDPA_MAX_FUSED_QLEN
         && heads >= 2
@@ -95,10 +113,22 @@ fn sdpa_fused(
         AttnMask::None => None,
         AttnMask::Causal => Some(ScaledDotProductAttentionMask::Causal),
         AttnMask::Additive(a) => Some(ScaledDotProductAttentionMask::Array(a)),
+        // `sdpa` materializes the window before dispatching; nothing else reaches the fused kernel.
+        AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
     };
     Ok(scaled_dot_product_attention(
         queries, keys, values, scale, m, None,
     )?)
+}
+
+/// The internal invariant [`sdpa`] upholds: it converts [`AttnMask::SlidingCausal`] into an explicit
+/// additive mask before dispatching, so neither the fused kernel nor the chunked-prefill path ever
+/// sees the variant. Reaching either with it is a bug in this module, not bad input.
+fn sliding_mask_not_materialized() -> Error {
+    Error::Msg(
+        "sliding-window masks must be materialized by `sdpa` before dispatch (internal invariant)"
+            .into(),
+    )
 }
 
 /// A contiguous `[start, end)` index vector for [`Array::take_axis`].
@@ -163,6 +193,8 @@ fn sdpa_chunked_prefill(
                     sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(a))?
                 }
             }
+            // `sdpa` materializes the window into `Additive` before it ever reaches here.
+            AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
         };
         outs.push(out); // stay lazy: the caller's single forward `eval` streams + frees each chunk's
                         // K/V prefix slice, so peak transient is one chunk (sc-7469 — no per-chunk sync)
@@ -237,6 +269,9 @@ fn sdpa_eager(
         AttnMask::None => scores,
         AttnMask::Causal => add(&scores, &causal_mask(q_len, k_len)?)?,
         AttnMask::Additive(a) => add(&scores, &a.as_dtype(Dtype::Float32)?)?,
+        AttnMask::SlidingCausal { window } => {
+            add(&scores, &sliding_causal_mask(q_len, k_len, window)?)?
+        }
     };
     let last_axis = scores.ndim() as i32 - 1;
     let weights = softmax_axis(&scores, last_axis, None)?;
@@ -267,6 +302,34 @@ fn causal_mask(q_len: i32, k_len: i32) -> Result<Array> {
     for r in 0..q_len {
         for j in 0..k_len {
             if j > offset + r {
+                data[(r * k_len + j) as usize] = MASK_NEG;
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[1, 1, q_len, k_len]))
+}
+
+/// The additive **sliding-window** causal mask `[1, 1, q_len, k_len]` (`0` keep / a large finite
+/// negative to block) — Gemma 4's `sliding_attention` layers.
+///
+/// Queries are bottom-right aligned over the keys (`offset = k_len − q_len` cached positions come
+/// first), so query row `r` sits at absolute position `offset + r` and may attend key `j` iff
+/// `0 <= (offset + r) − j < window`: causal, *and* no further back than `window − 1` positions. A
+/// `window >= k_len` degenerates to the plain causal mask; a `window <= 0` is rejected rather than
+/// silently producing an all-blocked row (whose softmax is a uniform distribution over garbage).
+pub fn sliding_causal_mask(q_len: i32, k_len: i32, window: i32) -> Result<Array> {
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "sliding_causal_mask: window must be positive, got {window}"
+        )));
+    }
+    let offset = k_len - q_len;
+    let mut data = vec![0f32; (q_len * k_len) as usize];
+    for r in 0..q_len {
+        let pos = offset + r;
+        for j in 0..k_len {
+            let delta = pos - j;
+            if !(0..window).contains(&delta) {
                 data[(r * k_len + j) as usize] = MASK_NEG;
             }
         }
