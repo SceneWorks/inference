@@ -6,14 +6,38 @@
 //! and every loaded overlay remain `Missing` until their additional paths have independent coverage.
 //! Production calibration is limited to the exact measured FLUX.1-dev Q4 deferred artifact and
 //! request geometry; weights-free registry conformance receives an isolated synthetic identity.
+//!
+//! ## Envelope vs. structure in the request route gate (sc-20569 twin)
+//!
+//! The route gate carries two kinds of clause and they must not be confused — the same distinction
+//! SC-20569 established for mlx-gen-sensenova. A **structural** clause (loaded mode/overlay/reference
+//! match, PiD requested without a loaded overlay, request phases, decode-tile geometry, transformer
+//! streaming eligibility) states what THIS loaded route can do at all — no authority changes that —
+//! and stays fail-closed unconditionally. The **envelope** clause (the calibrated-geometry block)
+//! states what the `2026-08-03` FLUX.1-dev Q4 campaign MEASURED: clean text-to-image at 1024x1024,
+//! batch 1, one frame, zero references. That is a statement about which evidence exists, not about
+//! what the engine can render — the shipped `flux_dev` manifest advertises 768x768, 1280x720, and
+//! 720x1280 alongside 1024x1024, and counts 1/2/4, and this clause fired on ANY optimized-rung
+//! selection regardless of authority, so a legacy/estimated admission at any of those off-cell
+//! combinations was refused. Only a context that also claims measured evidence
+//! (`optimization_authority == Calibrated`) is held to the measured cell; an `Estimated` claim —
+//! exactly what `AdmissionPath::Legacy` in the SceneWorks fit gate carries for an out-of-envelope
+//! request — must degrade to the caller's legacy/estimated admission instead of refusing.
+//!
+//! Every clause inside `route_gate` therefore builds a `CoreError::Msg`, not `CoreError::Unsupported`.
+//! `standard_memory_strategy_safety_check` stringifies a route-gate error into
+//! `MemorySafetyDecision::Reject` immediately (`error.to_string()`), so nothing downstream can read
+//! the type, while `begin_request_with_cleanup` types the surviving string as `Unsupported` once at
+//! the request boundary. Building `Unsupported` inside the closure too doubled the prefix into
+//! `unsupported: unsupported: …` — the same secondary defect SC-20569 fixed in mlx-gen-sensenova.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryOptimizationAuthority, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadSpec, OffloadPolicy};
@@ -470,28 +494,36 @@ pub(crate) fn safety_check(
             || context.geometry.reference_count != expected_references
             || context.overlay != route_overlay(&contract.provider_id, spec)
         {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Msg(format!(
                 "{}: memory route does not match the loaded mode/overlay",
                 contract.provider_id
             )));
         }
         if context.use_pid && spec.pid.is_none() {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Msg(format!(
                 "{}: PiD was requested without a loaded PiD overlay",
                 contract.provider_id
             )));
         }
         if context.has_phases {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Msg(format!(
                 "{}: FLUX.1 memory routes are single-phase",
                 contract.provider_id
             )));
         }
+        // sc-20569 twin: `claims_measured_evidence` is the same envelope/structure discriminator the
+        // SenseNova route gate uses. An optimized rung admitted behind a legacy/estimated authority
+        // has NOT claimed to be graded against the measured cell, so it must degrade to admission
+        // instead of refusing; only a `Calibrated` claim off the measured cell fails closed, because
+        // admitting THAT would grade a request against evidence captured at a different geometry.
+        let claims_measured_evidence =
+            context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
         if contract
             .calibration
             .as_ref()
             .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
             && context.selection.strategy.is_optimized()
+            && claims_measured_evidence
             && (context.mode != MemoryMode::TextToImage
                 || context.geometry.reference_count != 0
                 || context.geometry.width != 1024
@@ -501,7 +533,7 @@ pub(crate) fn safety_check(
                 || context.use_pid
                 || context.overlay.is_some())
         {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Msg(format!(
                 "{}: calibrated memory geometry is exactly clean text-to-image 1024x1024, batch 1, one frame, and zero references",
                 contract.provider_id
             )));
@@ -514,14 +546,14 @@ pub(crate) fn safety_check(
                     context.selection.parameters.decode_tile_edge,
                     context.selection.parameters.decode_overlap,
                 )
-                .map_err(CoreError::Unsupported)?;
+                .map_err(CoreError::Msg)?;
         }
         if contract.engages(
             context.selection.strategy,
             MemoryStrategy::BoundedTransformerResidency,
         ) && !contract.lifecycle.transformer_window_materialization
         {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Msg(format!(
                 "{}: transformer streaming requires the verified Sequential + DeferredMaterialization route",
                 contract.provider_id
             )));
@@ -634,6 +666,9 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    // The one place a refused route becomes a TYPED error. `MemorySafetyDecision::Reject` carries an
+    // already-rendered string, so the route gate deliberately hands back plain reasons (see
+    // `safety_check`) and the `unsupported: ` prefix is applied exactly once, here.
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
@@ -1050,6 +1085,218 @@ mod tests {
             registered_safety_check(&spec, &contract, &resident),
             MemorySafetyDecision::Accept,
             "the optimized exact-geometry calibration must not constrain Resident requests"
+        );
+    }
+
+    /// The exact geometries `config/manifests/builtin.models.jsonc` advertises for `flux_dev`
+    /// (`limits.resolutions`). Only `1024x1024` is the measured cell; the other three are shipped,
+    /// product-legal geometries the calibrated-geometry envelope clause used to refuse outright.
+    const MANIFEST_RESOLUTIONS: [(u32, u32); 4] =
+        [(768, 768), (1024, 1024), (1280, 720), (720, 1280)];
+
+    /// `flux_dev`'s manifest `limits.count`. SceneWorks pins the provider-facing `batch` to one
+    /// forward pass today, but the gate is a provider-owned seam and any caller may set it, so the
+    /// degrade is proven across the full advertised count axis rather than at the worker's current
+    /// pin.
+    const MANIFEST_COUNTS: [u32; 3] = [1, 2, 4];
+
+    fn calibrated_q4_contract(spec: &LoadSpec) -> MemoryProviderContract {
+        let mut contract =
+            weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, spec).unwrap();
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        ));
+        contract
+    }
+
+    fn t2i_route() -> mlx_gen::gen_core::MemoryBehaviorRoute {
+        mlx_gen::gen_core::MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        }
+    }
+
+    fn route_context(
+        contract: &MemoryProviderContract,
+        strategy: MemoryStrategy,
+        tier: MemoryNumericTier,
+    ) -> MemoryRunContext {
+        mlx_gen::gen_core::standard_memory_behavior_context(contract, strategy, tier, t2i_route())
+            .unwrap()
+    }
+
+    /// sc-20569 twin (mlx-gen-flux): every geometry/count `flux_dev` advertises off the measured
+    /// 1024x1024/batch-1/frame-1 cell used to be refused unconditionally by the calibrated-geometry
+    /// envelope clause whenever an optimized rung was selected, regardless of authority. A context
+    /// that does NOT claim measured evidence — `AdmissionPath::Legacy` in the SceneWorks fit gate,
+    /// whether it synthesized an estimate ladder or froze to the resident baseline — must be
+    /// ADMITTED at every manifest-declared geometry and count, and must be able to open a request
+    /// scope.
+    #[test]
+    fn every_manifest_geometry_and_count_degrades_to_legacy_admission() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let contract = calibrated_q4_contract(&spec);
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        };
+
+        let mut admitted = 0;
+        for (width, height) in MANIFEST_RESOLUTIONS {
+            for batch in MANIFEST_COUNTS {
+                for (authority, strategy) in [
+                    (
+                        MemoryOptimizationAuthority::Estimated,
+                        MemoryStrategy::BoundedAttention,
+                    ),
+                    (
+                        MemoryOptimizationAuthority::Estimated,
+                        MemoryStrategy::BoundedTransformerResidency,
+                    ),
+                    (
+                        MemoryOptimizationAuthority::Resident,
+                        MemoryStrategy::Resident,
+                    ),
+                ] {
+                    let label =
+                        format!("{width}x{height} batch {batch} {authority:?}/{strategy:?}");
+                    let mut context = route_context(&contract, strategy, tier);
+                    context.optimization_authority = authority;
+                    context.geometry.width = width;
+                    context.geometry.height = height;
+                    context.geometry.batch = batch;
+                    assert_eq!(
+                        registered_safety_check(&spec, &contract, &context),
+                        MemorySafetyDecision::Accept,
+                        "{label}"
+                    );
+                    assert!(
+                        begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &context)
+                            .unwrap_or_else(|error| panic!("{label}: {error}"))
+                            .is_some(),
+                        "{label}"
+                    );
+                    admitted += 1;
+                }
+            }
+        }
+        assert_eq!(
+            admitted,
+            MANIFEST_RESOLUTIONS.len() * MANIFEST_COUNTS.len() * 3,
+            "four manifest resolutions x three counts x three legacy dispositions"
+        );
+    }
+
+    /// The degrade must not weaken the STRUCTURAL refusals. No amount of estimate authority makes a
+    /// clean `flux_dev` load answer a mismatched mode, admit PiD it never loaded, or run a
+    /// multi-phase trajectory. Each axis is mutated on its own so every guard is asked its own
+    /// question.
+    #[test]
+    fn structural_refusals_are_not_weakened_by_the_legacy_degrade() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let contract = calibrated_q4_contract(&spec);
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        };
+        let mut legacy = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
+        legacy.optimization_authority = MemoryOptimizationAuthority::Estimated;
+        // The unmutated legacy context is admitted, so each rejection below is attributable to the
+        // one axis it mutates.
+        assert_eq!(
+            registered_safety_check(&spec, &contract, &legacy),
+            MemorySafetyDecision::Accept
+        );
+
+        let mut wrong_mode = legacy.clone();
+        wrong_mode.mode = MemoryMode::Edit;
+        let mut wrong_reference = legacy.clone();
+        wrong_reference.geometry.reference_count = 1;
+        wrong_reference.has_reference = true;
+        let mut use_pid = legacy.clone();
+        use_pid.use_pid = true;
+        let mut has_phases = legacy.clone();
+        has_phases.has_phases = true;
+        for (label, context, needle) in [
+            (
+                "wrong_mode",
+                wrong_mode,
+                "does not match the loaded mode/overlay",
+            ),
+            (
+                "wrong_reference",
+                wrong_reference,
+                "does not match the loaded mode/overlay",
+            ),
+            (
+                "use_pid",
+                use_pid,
+                "PiD was requested without a loaded PiD overlay",
+            ),
+            (
+                "has_phases",
+                has_phases,
+                "FLUX.1 memory routes are single-phase",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    registered_safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Reject { reason } if reason.contains(needle)
+                ),
+                "{label}: structural refusal must survive the legacy degrade"
+            );
+            assert!(
+                begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &context).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    /// sc-20569 twin secondary: `begin_request` used to double-stringify a route-gate refusal —
+    /// `standard_memory_strategy_safety_check` renders the route gate's error into
+    /// `MemorySafetyDecision::Reject` once (`error.to_string()`), and `begin_request_with_cleanup`
+    /// typed that already-rendered string as `Unsupported` again, printing
+    /// `unsupported: unsupported: flux1_dev: …`. Exactly one prefix must reach the caller.
+    #[test]
+    fn a_route_refusal_surfaces_the_unsupported_prefix_exactly_once() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
+            .with_quant(mlx_gen::Quant::Q4);
+        let contract = calibrated_q4_contract(&spec);
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        };
+        let mut context = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
+        context.geometry.width = 768;
+        context.geometry.height = 768;
+        let error = match begin_request(crate::FLUX1_DEV_ID, &spec, &contract, &context) {
+            Ok(_) => panic!("a measured claim off the campaign cell must still refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            error.matches("unsupported: ").count(),
+            1,
+            "the rendered refusal must carry one `unsupported: ` prefix: {error}"
+        );
+        assert!(
+            error.starts_with(&format!("unsupported: {}: ", crate::FLUX1_DEV_ID)),
+            "{error}"
         );
     }
 
