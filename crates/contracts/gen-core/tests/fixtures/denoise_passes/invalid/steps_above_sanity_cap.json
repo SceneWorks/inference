@@ -1,0 +1,33 @@
+{
+  "fixture": "steps_above_sanity_cap",
+  "story": "sc-20415",
+  "description": "A per-pass step count above the shared MAX_STEPS sanity cap. Without a per-pass cap a chained request routes around the flat one, launching an effectively unbounded, cancel-only-recoverable run.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 100001, "denoise": 1.0 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": 0,
+    "field": "steps",
+    "issue": "aboveMax"
+  }
+}

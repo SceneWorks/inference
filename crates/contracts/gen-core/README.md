@@ -21,6 +21,10 @@ contract is backend-independent.
 - **Request / output types** — `GenerationRequest`, `GenerationOutput`, `Conditioning`,
   `Capabilities`, `ModelDescriptor`, `Progress`, `CancelFlag`, and the training/caption
   analogues.
+- **The chained denoise-pass contract** — `DenoisePass` / `ResolvedDenoisePlan` and the
+  `advanced.denoisePasses` wire format, its pre-execution validation (errors name the pass
+  index and field) and its `pass → request → model` resolution ladder. See
+  [`docs/architecture/denoise-passes.md`](../../../docs/architecture/denoise-passes.md).
 - **Load types** — `LoadSpec`, `WeightsSource`, `Quant`, `Precision`, `OffloadPolicy`,
   `AdapterSpec`, and the ControlNet / IP-Adapter / PiD / identity / external-text-encoder
   overlays layered onto a base model at load time.

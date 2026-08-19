@@ -156,6 +156,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_multi_speaker: true,
             supports_conversation_history: false,
             supports_conversation_session: false,
+            // Chained denoise passes are not wired for this provider (sc-20415).
+            supports_denoise_passes: false,
             max_speakers: Some(MAX_SPEAKERS),
             size_floor: SizeFloor::RangeChecked,
             execution: Default::default(),

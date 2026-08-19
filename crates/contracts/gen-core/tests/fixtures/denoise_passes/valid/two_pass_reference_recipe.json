@@ -1,0 +1,41 @@
+{
+  "fixture": "two_pass_reference_recipe",
+  "story": "sc-20415",
+  "description": "Epic 20414's reference recipe shape: pass 1 runs the full trajectory, pass 2 re-enters a freshly built schedule at denoise 0.2 with its own sampler, scheduler and guidance. Algorithm ids are ones the registry already has; see the README on the new-id siblings.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 3.5,
+    "advanced": {
+      "denoisePasses": [
+        {
+          "steps": 10,
+          "sampler": "euler",
+          "scheduler": "normal",
+          "denoise": 1.0
+        },
+        {
+          "steps": 4,
+          "sampler": "dpmpp_2m",
+          "scheduler": "karras",
+          "denoise": 0.2,
+          "guidance": 2.0
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  }
+}

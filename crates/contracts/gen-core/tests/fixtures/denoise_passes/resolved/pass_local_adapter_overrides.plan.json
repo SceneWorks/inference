@@ -1,0 +1,41 @@
+{
+  "contractVersion": 1,
+  "jobSeed": 42,
+  "passes": [
+    {
+      "index": 0,
+      "steps": 16,
+      "sampler": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "guidance": 4.0,
+      "seed": 42,
+      "adapters": [
+        { "adapter": 0 },
+        { "adapter": 1, "weight": 0.0 }
+      ]
+    },
+    {
+      "index": 1,
+      "steps": 6,
+      "sampler": "ddim",
+      "scheduler": "simple",
+      "denoise": 0.35,
+      "guidance": 1.0,
+      "seed": 13679457532755275413,
+      "adapters": [
+        { "adapter": 1, "weight": 0.9 }
+      ]
+    },
+    {
+      "index": 2,
+      "steps": 2,
+      "sampler": "euler",
+      "scheduler": "normal",
+      "denoise": 0.1,
+      "guidance": 4.0,
+      "seed": 2949826092126892291,
+      "adapters": []
+    }
+  ]
+}

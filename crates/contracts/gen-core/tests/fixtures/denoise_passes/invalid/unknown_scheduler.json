@@ -1,0 +1,33 @@
+{
+  "fixture": "unknown_scheduler",
+  "story": "sc-20415",
+  "description": "The scheduler counterpart of `unknown_sampler`. Also pins that the model's advertised menu is authoritative: `karras` is a real registry id but is absent from THIS model's menu, and an off-menu id must be rejected exactly like an invented one.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "scheduler": "karras", "denoise": 1.0 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler"],
+    "schedulers": ["normal", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": 0,
+    "field": "scheduler",
+    "issue": "unknownId"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "fixture": "nulls_normalize_to_absent",
+  "story": "sc-20415",
+  "description": "A producer that writes explicit nulls for unset optionals. Nulls decode as absent and re-encode omitted -- the one deliberate normalization the format performs, pinned here so both sides agree on the canonical form. The model has no default guidance, so the resolved passes carry none.",
+  "request": {
+    "seed": 7,
+    "steps": 12,
+    "sampler": "ddim",
+    "scheduler": "simple",
+    "advanced": {
+      "denoisePasses": [
+        {
+          "steps": 8,
+          "sampler": null,
+          "scheduler": null,
+          "denoise": null,
+          "guidance": null,
+          "adapters": null
+        },
+        {
+          "steps": null,
+          "denoise": 0.4
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
+    "guidance": null
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "canonicalDenoisePasses": [
+    { "steps": 8 },
+    { "denoise": 0.4 }
+  ]
+}

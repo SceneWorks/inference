@@ -1,0 +1,24 @@
+{
+  "contractVersion": 1,
+  "jobSeed": 7,
+  "passes": [
+    {
+      "index": 0,
+      "steps": 8,
+      "sampler": "ddim",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "seed": 7,
+      "adapters": []
+    },
+    {
+      "index": 1,
+      "steps": 12,
+      "sampler": "ddim",
+      "scheduler": "simple",
+      "denoise": 0.4,
+      "seed": 7191089600892374487,
+      "adapters": []
+    }
+  ]
+}

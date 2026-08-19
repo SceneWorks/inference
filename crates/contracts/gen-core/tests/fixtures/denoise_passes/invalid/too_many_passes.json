@@ -1,0 +1,37 @@
+{
+  "fixture": "too_many_passes",
+  "story": "sc-20415",
+  "description": "Seventeen passes, one past MAX_DENOISE_PASSES. Each pass is a complete denoise run, so an unbounded list is an unbounded, cancel-only-recoverable job -- the same footgun class the flat step cap closes.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 1 }, { "steps": 1 }, { "steps": 1 }, { "steps": 1 },
+        { "steps": 1 }, { "steps": 1 }, { "steps": 1 }, { "steps": 1 },
+        { "steps": 1 }, { "steps": 1 }, { "steps": 1 }, { "steps": 1 },
+        { "steps": 1 }, { "steps": 1 }, { "steps": 1 }, { "steps": 1 },
+        { "steps": 1 }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  },
+  "expectedError": {
+    "passIndex": null,
+    "field": "denoisePasses",
+    "issue": "tooMany"
+  }
+}

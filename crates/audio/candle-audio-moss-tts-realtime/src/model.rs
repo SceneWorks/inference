@@ -152,6 +152,8 @@ pub fn descriptor() -> ModelDescriptor {
             // history-in-request path (A) and the stateful warm-KV session (B).
             supports_conversation_history: true,
             supports_conversation_session: true,
+            // Chained denoise passes are not wired for this provider (sc-20415).
+            supports_denoise_passes: false,
             max_speakers: None,
             size_floor: SizeFloor::RangeChecked,
             execution: Default::default(),

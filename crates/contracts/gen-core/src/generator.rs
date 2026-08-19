@@ -7,6 +7,10 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
+use crate::denoise_passes::{
+    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassContext, DenoisePassResult,
+    ResolvedDenoisePlan,
+};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
@@ -476,6 +480,27 @@ pub struct GenerationRequest {
     /// *scheduler* selection is a deliberate follow-on — every phase shares the one global schedule.
     pub phases: Option<Vec<GenerationPhase>>,
 
+    // --- Chained denoise passes (epic 20414, sc-20415) ---
+    /// An ordered list of **chained denoise passes** — the typed carrier for the SceneWorks
+    /// `advanced.denoisePasses` block (sc-20415). Unlike [`phases`](Self::phases), each
+    /// [`DenoisePass`] is a *complete denoise run of its own*: its own step count, sampler,
+    /// scheduler, `denoise` entry fraction, guidance and pass-local adapter weight overrides, over a
+    /// **freshly built** schedule with reset solver history, starting from the latent the previous
+    /// pass produced (no VAE round trip at the boundary). Model-agnostic, unlike the Krea-RAW-only
+    /// `phases`.
+    ///
+    /// **Mutually exclusive with [`phases`](Self::phases)**: they are different mechanisms over the
+    /// same denoise and there is no defined composition, so the shared floor rejects a request that
+    /// sets both. See [`crate::denoise_passes`] for the full comparison table and the runtime
+    /// invariant, and [`resolve_denoise_plan`](Self::resolve_denoise_plan) for turning a request into
+    /// the explicit plan execution and metadata consume.
+    ///
+    /// **Additive.** `None` (the default) is the ordinary single-pass render, byte-for-byte
+    /// unaffected — a request serialized before sc-20415 deserializes with this absent and behaves
+    /// exactly as it did. Gated per model by
+    /// [`Capabilities::supports_denoise_passes`](Capabilities::supports_denoise_passes).
+    pub denoise_passes: Option<Vec<DenoisePass>>,
+
     // --- Control ---
     pub cancel: CancelFlag,
     /// Per-step latent-preview sink: a supporting engine emits a small linear latent→RGB
@@ -825,6 +850,7 @@ impl Default for GenerationRequest {
             approximation: None,
             audio: None,
             phases: None,
+            denoise_passes: None,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
         }
@@ -1000,6 +1026,10 @@ impl GenerationRequest {
             // below the flat knobs (sc-13884). Named (no `..`) so a future float-bearing per-phase
             // control fails to compile here until it is classified into the floor.
             phases,
+            // The chained-denoise list carries per-pass floats (`denoise`, guidance, adapter
+            // weights), checked below the flat knobs (sc-20415). Named (no `..`) for the same
+            // reason as `phases`.
+            denoise_passes,
             // Every `Option<f32>` knob the floor owns.
             guidance,
             true_cfg,
@@ -1171,6 +1201,32 @@ impl GenerationRequest {
                 }
             }
         }
+        // Chained denoise-pass floats (sc-20415): the same reasoning as `phases` above — each pass's
+        // `denoise` fraction, guidance and adapter weights feed the schedule / guidance / adapter-
+        // scale math. This is the index-free backstop; the floor's indexed pass
+        // (`validate_denoise_passes`, which names the offending pass and field) runs first inside
+        // `validate_request_inner`, exactly as the multi-region conditioning guard does.
+        if let Some(passes) = denoise_passes {
+            for pass in passes {
+                if let Some(d) = pass.denoise {
+                    if !d.is_finite() {
+                        return Some(("denoisePasses.denoise", d));
+                    }
+                }
+                if let Some(g) = pass.guidance {
+                    if !g.is_finite() {
+                        return Some(("denoisePasses.guidance", g));
+                    }
+                }
+                for pa in &pass.adapters {
+                    if let Some(w) = pa.weight {
+                        if !w.is_finite() {
+                            return Some(("denoisePasses.adapter.weight", w));
+                        }
+                    }
+                }
+            }
+        }
         None
     }
 
@@ -1183,6 +1239,24 @@ impl GenerationRequest {
             return Err(Error::Msg(format!("{field} must be finite (got {value})")));
         }
         Ok(())
+    }
+
+    /// Resolve this request into an explicit [`ResolvedDenoisePlan`] (sc-20415).
+    ///
+    /// Delegates to [`crate::resolve_denoise_plan`]; see it for the resolution ladder and the
+    /// one-pass equivalence guarantee. `job_seed` must be the request's already-resolved seed
+    /// (`req.seed.unwrap_or_else(gen_core::default_seed)`, evaluated **once** — F-089).
+    ///
+    /// A request with no [`denoise_passes`](Self::denoise_passes) resolves to a one-pass plan
+    /// carrying this request's own top-level values, so a provider can adopt the plan for every
+    /// request rather than branching on whether the field is present.
+    pub fn resolve_denoise_plan(
+        &self,
+        job_seed: u64,
+        defaults: &DenoiseDefaults,
+        ctx: &DenoisePassContext<'_>,
+    ) -> DenoisePassResult<ResolvedDenoisePlan> {
+        crate::denoise_passes::resolve_denoise_plan(self, job_seed, defaults, ctx)
     }
 
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
@@ -1975,6 +2049,21 @@ pub struct Capabilities {
     /// conversation+seed; the `gen-core-testkit` `check_multi_turn` check enforces it. A model may
     /// advertise either path independently.
     pub supports_conversation_session: bool,
+    /// Whether this model honors **chained denoise passes**
+    /// ([`GenerationRequest::denoise_passes`], epic 20414 / sc-20415) — the opt-in signal for the
+    /// per-pass sampler/scheduler/`denoise`/guidance/adapter-weight contract, mirroring
+    /// [`supports_conversation_history`](Self::supports_conversation_history). `Default` is `false`:
+    /// every existing model leaves it unset and the shared floor rejects a request carrying
+    /// `denoisePasses` as the typed [`Error::Unsupported`], so a model that has not wired the chained
+    /// execution can never silently run only the first pass. A provider sets it `true` only once its
+    /// denoise loop genuinely rebuilds the schedule and resets solver history per pass (see
+    /// [`crate::denoise_passes`] for the invariant). A model that advertises it must also advertise a
+    /// non-empty [`samplers`](Self::samplers) and [`schedulers`](Self::schedulers) menu, since a pass
+    /// names both explicitly — the descriptor conformance sweep cross-checks that.
+    ///
+    /// Orthogonal to the Krea-RAW-only [`GenerationRequest::phases`]: the two request fields are
+    /// mutually exclusive, and a model may support either, both, or neither.
+    pub supports_denoise_passes: bool,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -2054,7 +2143,7 @@ pub struct Capabilities {
 /// train-timestep count); these sit ABOVE any real model bound so they only reject a pathological
 /// value (`u32::MAX` steps/frames) that would otherwise launch an effectively-unbounded, cancel-only
 /// run — never preempting a model's own check.
-const MAX_STEPS: u32 = 100_000;
+pub(crate) const MAX_STEPS: u32 = 100_000;
 const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
@@ -2199,6 +2288,29 @@ impl Capabilities {
         req: &GenerationRequest,
     ) -> Result<ApproximationPlan> {
         self.approximation.resolve(id, req.approximation.as_ref())
+    }
+
+    /// The denoise-pass validation context these capabilities imply (sc-20415).
+    ///
+    /// `loaded_adapters` is how many adapters the load spec provisioned, when the caller knows —
+    /// `None` leaves the per-pass adapter index bound to the model, which is the only party that can
+    /// see the real stack. The advertised [`samplers`](Self::samplers) / [`schedulers`](Self::schedulers)
+    /// menus are passed through as authoritative when non-empty (a family legitimately advertises
+    /// native ids beyond the curated registry); an empty menu falls back to the curated
+    /// [`Solver`](crate::sampling::Solver) / [`Scheduler`](crate::sampling::Scheduler) registries
+    /// rather than rejecting every id.
+    ///
+    /// This is the same call the shared floor makes, exposed so a provider validates and resolves
+    /// against exactly what the floor already checked instead of re-deriving it.
+    #[must_use]
+    pub fn denoise_pass_context(&self, loaded_adapters: Option<usize>) -> DenoisePassContext<'_> {
+        DenoisePassContext {
+            supports_denoise_passes: self.supports_denoise_passes,
+            samplers: (!self.samplers.is_empty()).then_some(self.samplers.as_slice()),
+            schedulers: (!self.schedulers.is_empty()).then_some(self.schedulers.as_slice()),
+            loaded_adapters,
+            max_steps: MAX_STEPS,
+        }
     }
 
     /// Shared implementation of the floor. `check_size` gates only the size-range check so the
@@ -2514,6 +2626,24 @@ impl Capabilities {
                     }
                 }
             }
+        }
+        // Chained denoise passes (sc-20415). Runs **before** `ensure_finite_floats` for the same
+        // reason the multi-region loop above does: the finiteness floor returns a `&'static str` key
+        // and cannot say *which* pass, and a caller editing a three-pass recipe needs the index to
+        // act on the message. `validate_denoise_passes` names the pass index and the field for every
+        // rejection it makes — including the non-finite ones — and `ensure_finite_floats` stays
+        // intact below as the backstop for providers with a bespoke `validate`.
+        //
+        // Mutual exclusion with `phases` is checked here too: the two are different mechanisms over
+        // the same denoise (fresh-schedule-per-pass vs. slices of one global schedule), so a request
+        // that sets both is rejected rather than silently resolved in favor of one.
+        if let Some(passes) = &req.denoise_passes {
+            validate_denoise_passes(
+                passes,
+                req.phases.is_some(),
+                &self.denoise_pass_context(None),
+            )
+            .map_err(|err| err.into_gen_error(id))?;
         }
         req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {

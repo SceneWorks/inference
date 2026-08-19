@@ -1660,6 +1660,25 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
              is not in `conditioning` — path-A requests would be rejected by the allowlist"
         ));
     }
+    // Chained-denoise consistency (sc-20415): every pass names its own sampler and scheduler, and the
+    // shared floor validates those against the advertised menus. A descriptor that sets
+    // `supports_denoise_passes` with an empty menu would therefore admit the request at the
+    // capability gate and then have nothing authoritative to validate the ids against — the same
+    // "flag on, surface missing" footgun the conversation-history cross-check closes.
+    if caps.supports_denoise_passes {
+        if caps.samplers.is_empty() {
+            errs.push(format!(
+                "{ctx}: supports_denoise_passes is set but `samplers` is empty — a pass names its \
+                 own sampler, so the advertised menu must exist"
+            ));
+        }
+        if caps.schedulers.is_empty() {
+            errs.push(format!(
+                "{ctx}: supports_denoise_passes is set but `schedulers` is empty — a pass names its \
+                 own scheduler, so the advertised menu must exist"
+            ));
+        }
+    }
     if let Some(space) = d.denoiser_output_latent_space {
         let validation = space.validation();
         if validation.zero_channels {

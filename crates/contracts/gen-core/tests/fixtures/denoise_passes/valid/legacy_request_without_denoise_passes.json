@@ -1,0 +1,27 @@
+{
+  "fixture": "legacy_request_without_denoise_passes",
+  "story": "sc-20415",
+  "description": "A request serialized before sc-20415: `advanced` carries no `denoisePasses` key at all. It must decode to the absent state and resolve to the same one-pass plan as `single_pass_inherits_all` (AC 1 / AC 2).",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 3.5,
+    "advanced": {
+      "strength": 0.65
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "dpmpp_2m",
+    "scheduler": "karras",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "loadedAdapters": 0
+  }
+}
