@@ -59,7 +59,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, reject_unknown_components, Capabilities, Conditioning, ConditioningKind,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Progress, Quant, SizeFloor, WeightsSource,
+    Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -126,7 +126,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
             // `guidance` is text CFG; `true_cfg` is the image-guidance scale on it2i.
             supports_true_cfg: true,
@@ -134,8 +133,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
             ],
-            supports_lora: false,
-            supports_lokr: false,
             // Bespoke-by-architecture (epic 7114 P4, sc-7123 — mirrors the mlx-gen SenseNova won't-do):
             // SenseNova-U1 is an AUTOREGRESSIVE backbone whose `predict_v` mutates a per-step `KvCache`
             // (`cache.len()` feeds the RoPE/position build) shared across the cond/uncond passes. The
@@ -144,43 +141,23 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // corrupt output. The native shifted-Euler (single eval/step, `req.scheduler_shift`) is the
             // only valid integrator, so no curated sampler/scheduler menu is advertised (N3: empty list).
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            mac_only: false,
             // The SceneWorks turnkey's pre-quantized q4/q8 tiers load natively (sc-14249): every
             // backbone projection packed-detects its MLX triple, so a Q4/Q8 here is a turnkey tier
             // SELECT (which subdir the caller resolved), not an on-the-fly quantize. bf16 resolves
             // to `None` and loads dense. Same contract as flux1/qwen/kolors.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // The backbone uses a KV cache for the AR prefix + denoise.
             supports_kv_cache: true,
             // Flow-match schedule uses a timestep shift (mapped from scheduler_shift).
             requires_sigma_shift: true,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16960). Both ids reach the one bespoke
             // flow-match denoise loop in `t2i.rs`, which emits directly through
             // `PreviewHook::emit_step`; `preview` owns the fit and the pool to the token grid.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

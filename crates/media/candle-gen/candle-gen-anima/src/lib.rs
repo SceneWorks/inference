@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
@@ -91,8 +91,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: cfg_capable,
             supports_guidance: cfg_capable,
-            supports_true_cfg: false,
-            conditioning: vec![],
             // LoRA/LoKr injection is wired (the candle counterpart of MLX sc-10521): every trained
             // adapter's 448 DiT + 60 conditioner targets fold at load, stacked + mixed, strict routing
             // (`adapters::apply_anima_adapters`). Weight-level fold, validated bit-exact on CPU.
@@ -102,41 +100,20 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // (req.sampler == None) is the recommended er_sde solver; the full curated menu is advertised.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // The whole point of the candle port: Anima is no longer Mac-only.
-            mac_only: false,
             // Q4 + Q8 (the candle counterpart of MLX sc-10517): the DiT packed-detects and runs the
             // dequant-dense forward (CPU-capable — NOT the CUDA-only int8 fast GEMM); conditioner /
             // Qwen3 TE / VAE stay dense bf16. A pre-packed tier is a real, loadable snapshot.
             supported_quants: ANIMA_QUANTS,
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             requires_sigma_shift: true,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews: wired by sc-16953 for all three variants at once — they share
             // one render lane and differ only in the DiT weights file — and advertised behind the
             // source-verified bidirectional guard in `candle-gen-catalog` (sc-16951), which derives
             // from this crate's shipped sources whether it actually emits.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

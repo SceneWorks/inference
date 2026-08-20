@@ -31,7 +31,7 @@ use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, SizeFloor, WeightsSource,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::NeoChatConfig;
@@ -87,7 +87,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // `guidance` → text cfg_scale; `true_cfg` → image cfg (it2i edit≈1.0 / character≈1.5).
             supports_guidance: true,
             supports_true_cfg: true,
@@ -96,10 +95,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
             ],
-            supports_lora: false,
-            supports_lokr: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Bespoke-by-architecture (epic 7114, sc-7120, task 7185): SenseNova-U1 is NOT routed through
             // the unified curated-sampler framework. Its denoise threads each step through an
             // autoregressive backbone with a per-step-mutated `KvCache` (`predict_v` appends to the cache;
@@ -109,8 +105,6 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // output. It is also x0-prediction over a clean-fraction timestep grid (not noise-fraction σ).
             // Its native shifted-Euler loop is its only valid sampler. See `t2i::denoise`/`it2i_denoise`.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -121,23 +115,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             requires_sigma_shift: true,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

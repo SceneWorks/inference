@@ -23,7 +23,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Result, SizeFloor, WeightsSource,
+    Precision, Progress, Result, StepSupport, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -77,48 +77,30 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // SVD uses a frame-wise guidance ramp (min→max); `req.guidance` overrides the ceiling.
             supports_guidance: true,
-            supports_true_cfg: false,
             // image→video is a single `Reference` image.
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Curated unified solvers (epic 7114, sc-7122): SVD exposes the SAMPLER axis but NO scheduler
             // (matching ComfyUI) — it keeps its native Karras EDM σ schedule and only swaps the
             // integrator (over `EdmModelSampling`, v-prediction). An unset sampler → the native EDM Euler
             // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,
+            // SVD-XT's engine bound, advertised rather than hidden (sc-19559). It lived only in
+            // `validate_output_params` below, so a consumer could not learn the ceiling without
+            // dispatching a job; the shared floor now enforces the same number from the same
+            // constant. `candle-gen-svd` declares the identical range from its own `MAX_STEPS`.
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -637,6 +619,53 @@ mod tests {
         assert!(validate_output_params(&req(512, 512, Some(0), None)).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(MAX_STEPS + 1))).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(0))).is_err());
+    }
+
+    /// sc-19559 — the step ceiling this model has always had is now on the advertised surface, so
+    /// a consumer can read it without loading a single weight, and the SHARED floor refuses an
+    /// over-ceiling count rather than only `validate_output_params` doing so privately.
+    ///
+    /// Both halves matter. Reading `ceiling()` alone would pass against a descriptor nothing
+    /// enforces (the declared-but-unread defect this epic keeps hitting); asserting only the
+    /// refusal would pass against a bound that stays undiscoverable, which is the state this
+    /// story found.
+    #[test]
+    fn the_step_ceiling_is_advertised_and_enforced_by_the_shared_floor() {
+        let caps = descriptor().capabilities;
+        assert_eq!(
+            caps.supported_steps.ceiling(),
+            Some(MAX_STEPS),
+            "the descriptor must advertise the engine's own ceiling, weights-free"
+        );
+        assert_eq!(caps.supported_steps.floor(), Some(1));
+
+        let at = |steps: u32| {
+            caps.validate_request(
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    steps: Some(steps),
+                    conditioning: vec![Conditioning::Reference {
+                        image: img(512, 512, 512 * 512 * 3),
+                        strength: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            at(MAX_STEPS).is_ok(),
+            "the advertised ceiling itself must be renderable"
+        );
+        let err = at(MAX_STEPS + 1)
+            .expect_err("the shared floor must refuse an over-ceiling count")
+            .to_string();
+        assert!(
+            err.contains(MODEL_ID) && err.contains(&format!("1..={MAX_STEPS}")),
+            "the refusal must name the model and the advertised range: {err}"
+        );
     }
 
     #[test]

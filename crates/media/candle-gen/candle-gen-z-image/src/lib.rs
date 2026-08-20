@@ -211,8 +211,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -595,8 +595,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             // Turbo is guidance-distilled: no CFG, no negative prompt.
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // img2img reference-guided latent-init (sc-11783): a single `Conditioning::Reference` seeds
             // the CFG-free denoise from the VAE-encoded reference (`render` + `encode_reference`, the
             // Turbo mirror of the base `z_image` img2img sc-8646). The strict-pose ControlNet + the
@@ -613,38 +611,16 @@ pub fn descriptor() -> ModelDescriptor {
             // flow-match schedule) is the byte-faithful N1 no-op.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16957). Every Turbo render lane emits: the
             // resident and staged txt2img/img2img routes hand `run_flow_sampler` a projector hook, and
             // the name-driven control + edit providers' bespoke Euler loops emit directly. The
             // projection reuses the epic-16624 Z-Image 16-channel fit — see [`crate::preview`].
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

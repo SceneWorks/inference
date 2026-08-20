@@ -12,11 +12,11 @@ use mlx_gen::asset_facts::{
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::gen_core::{
     Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Result as CoreResult,
-    TransformerComponent,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
@@ -269,6 +269,7 @@ fn memory_strategy_contract_with_asset_facts(
                 kind: MemoryComponentKind::ControlBranch,
                 resident_bytes: overlay_bytes,
                 bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
             }],
         }
     } else {

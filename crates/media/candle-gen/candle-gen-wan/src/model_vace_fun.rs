@@ -10,7 +10,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, PerComponentBytes, Progress, Quant, SizeFloor, WeightsSource,
+    OffloadPolicy, PerComponentBytes, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -25,7 +25,7 @@ use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
     build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
-    WanVaceTransformer,
+    vace_control_scales, WanVaceTransformer,
 };
 use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
@@ -71,10 +71,6 @@ fn expert_schedule_crossing(steps: usize, sampler: Sampler, shift: f64) -> gen_c
         )));
     }
     Ok(crossing)
-}
-
-fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
-    control_scale.unwrap_or(1.0) * masking_strength
 }
 
 #[derive(Clone)]
@@ -269,11 +265,10 @@ impl Pipeline {
             control,
             // VACE exposes one conditioning scale for the whole hint stack. Multiplying it by the
             // requested masking strength weights the mask/video control without thresholding a soft
-            // mask away in `prepare_video_latents`.
-            scales: vec![
-                weighted_control_scale(req.control_scale, clip.masking_strength);
-                self.vace_cfg.vace_layers.len()
-            ],
+            // mask away in `prepare_video_latents`. Resolved by the shared `vace.rs` seam so this
+            // route and the single-expert one cannot drift; pinned by
+            // `render_binds_scales_to_the_shared_resolver`.
+            scales: vace_control_scales(req, self.vace_cfg.vace_layers.len()),
             pos,
             neg,
             cos,
@@ -638,38 +633,16 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -725,6 +698,7 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
 

@@ -269,6 +269,15 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "ltx_2_3_distilled",
         components: &["ltx_2_3", "gemma_3_12b_it"],
     },
+    // --- minimax-h3 -------------------------------------------------------------------------
+    // One repository, two licences: the DiT / VAEs / tokenizer are the territorially-exclusive
+    // MiniMax H3 Community License, while the bundled `text_encoder/` is byte-identical upstream
+    // Qwen3-VL-32B-Instruct under Apache-2.0. Both are rowed, because both are loaded. Identical to
+    // the MLX sibling's row: these are facts about the checkpoint, not about a backend.
+    ProviderComponents {
+        provider_id: "minimax_h3",
+        components: &["minimax_h3", "qwen3_vl_32b_instruct"],
+    },
     // --- mochi ------------------------------------------------------------------------------
     // The AsymmVAE ships inside the Mochi snapshot and rides its row; the T5-XXL encoder is the
     // same `google/t5-v1_1-xxl` FLUX and Chroma condition on, which is what the crate names
@@ -531,7 +540,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 49);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 50);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -563,8 +572,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            58,
-            "58 distinct Candle provider ids: 53 generators + 7 trainers (5 of them also generator \
+            59,
+            "59 distinct Candle provider ids: 54 generators + 7 trainers (5 of them also generator \
              ids) + 1 captioner + 2 embedders"
         );
 
@@ -718,6 +727,7 @@ mod tests {
                 "chroma1_hd",
                 "ltx_2_3",
                 "ltx_2_3_distilled",
+                "minimax_h3",
                 "mochi_1",
                 "sana_1600m",
                 "sana_sprint_1600m",

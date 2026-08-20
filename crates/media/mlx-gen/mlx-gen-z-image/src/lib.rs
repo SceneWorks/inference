@@ -108,7 +108,7 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         hidden_activation: "silu",
         attention_dropout: mlx_gen::gen_core::EncoderConfigFloat::new(0.0),
         rms_norm_eps: mlx_gen::gen_core::EncoderConfigFloat::new(1e-6),
-        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-5)),
+        qk_norm_eps: Some(mlx_gen::gen_core::EncoderConfigFloat::new(1e-6)),
         rope_theta: mlx_gen::gen_core::EncoderConfigFloat::new(1_000_000.0),
         max_position_embeddings: 40_960,
         attention_bias: mlx_gen::gen_core::EncoderConfigBool::Required(false),

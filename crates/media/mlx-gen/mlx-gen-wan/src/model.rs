@@ -24,7 +24,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterSpec, CancelFlag, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Precision, Progress, Quant, Result, SizeFloor, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
@@ -37,11 +37,11 @@ use crate::config::{WanModelConfig, WanQuant, MIN_SIZE};
 use crate::feature_cache::TrunkCache;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
-    build_ti2v_multi_mask, crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx,
-    denoise_curated, denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range,
-    denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
-    preprocess_ti2v_image, refuse_unwired_approximation, reject_off_grid, reject_over_area,
-    resolve_sampler_knobs, seq_len, staged_expert_swap, ti2v_blend_init, Expert,
+    crossing_index, decode_to_frames, decode_to_frames_22, denoise_approx, denoise_curated,
+    denoise_moe, denoise_moe_curated, denoise_moe_curated_swapped, denoise_range, denoise_ti2v,
+    frames_to_images, latent_shape, preflight_denoise_memory_guard, preprocess_ti2v_image,
+    refuse_unwired_approximation, reject_off_grid, reject_over_area, resolve_sampler_knobs,
+    seq_len, staged_expert_swap, ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
 use crate::text_encoder::encode_text_staged_for_tier;
@@ -154,7 +154,6 @@ pub fn descriptor() -> ModelDescriptor {
             // mask-blend, pinning the listed latent frames instead of only frame 0.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // Q4/Q8 (sc-2682) loads via `spec.quantize` (transformer-only); LoRA/LoKr merge onto the
             // single dense model at generate time (the reference `_loras_single` path — shared
@@ -162,7 +161,6 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32 (`reject_off_grid`); floor each side at MIN_SIZE = 480
             // (= 15·32 — the z48 vae22 renders garbage below a 15×15 latent grid, sc-10306/sc-12636),
             // matching candle; cap the long edge at 1280 (max_area 704×1280).
@@ -187,21 +185,6 @@ pub fn descriptor() -> ModelDescriptor {
             // TE → DiT → z48 VAE is phase-staged on every request; Sequential additionally flushes
             // dead allocator cache between those already-staged phases.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
             // The sc-18322 denoise feature cache, declared on the dense 5B alone: it is the one Wan
             // provider with a single transformer for the whole trajectory (no MoE expert swap to
             // invalidate a retained residual across) and a native one-forward-per-step loop with a step
@@ -212,6 +195,7 @@ pub fn descriptor() -> ModelDescriptor {
             // declaration is what makes the mechanism discoverable and what the terminal measurement
             // campaign narrows from these candidate intervals to the ones it can vouch for.
             approximation: approximation_surface(),
+            ..Default::default()
         },
     }
 }
@@ -574,6 +558,10 @@ impl Wan {
         let (dw, dh) = grid(&self.config, Ti2vProviderVae::VAE_TILING);
         reject_off_grid(MODEL_ID, req, dw, dh)?;
         reject_over_area(MODEL_ID, req, dw, dh, self.config.max_area)?;
+        // sc-19571: the conditioning strengths now reach the mask builder, so their range is load
+        // bearing — reject out-of-range/non-finite here rather than letting `1 − strength` become a
+        // negative mask deep in the denoise.
+        reject_out_of_range_strengths(MODEL_ID, req)?;
         // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
         // Keyframe conditioning OR a Reference image — the contract checks below must cover both.
         let image_conditioned = !req.keyframes().is_empty() || i2v_reference(req).is_some();
@@ -749,51 +737,40 @@ impl Wan {
         };
         let (t_lat, h_lat, w_lat) = (lat[1] as usize, lat[2] as usize, lat[3] as usize);
         let keyframes = req.keyframes();
-        let (latents_init, ti2v) = if !keyframes.is_empty() {
-            // Wan-native first_last_frame / multi-keyframe (sc-3357): pin each Keyframe's latent frame
-            // via the mask-blend (frame_idx is a latent index, negative-from-end → `-1` = last frame).
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = Ti2vProviderVae::from_weights(&w)?;
-            let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
-            let mut indices: Vec<usize> = Vec::with_capacity(keyframes.len());
-            for kf in &keyframes {
-                let idx = if kf.frame_idx < 0 {
-                    t_lat as i32 + kf.frame_idx
+        // **The seam** (sc-19571). Every conditioning strength the request carries is resolved into
+        // `(latent_frame, strength)` pins HERE, once, and the mask builder below is driven by these
+        // and by nothing else — so a strength cannot be "accepted at the boundary and defaulted on
+        // the way in" the way it was when the builder took bare indices. `resolve_ti2v_pins` is pure
+        // and unit-tested against non-default strengths (`ti2v_pins_carry_*`).
+        let pins = resolve_ti2v_pins(req, t_lat)?;
+        let (latents_init, ti2v) = if pins.is_empty() {
+            (init_noise.clone(), None)
+        } else {
+            // Wan-native first_last_frame / multi-keyframe (sc-3357) or a single `Reference` image:
+            // encode the conditioning frame(s), scatter them into the clean latent, then mask-blend.
+            // The VAE encoder is scoped to this block so it drops before the mask build (sc-12796).
+            let z = {
+                let w = Weights::from_file(self.root.join("vae.safetensors"))?;
+                let vae = Ti2vProviderVae::from_weights(&w)?;
+                if keyframes.is_empty() {
+                    // `[z,1,h,w]` — broadcasts over T_lat in the blend (the pin is frame 0).
+                    let (image, _) = i2v_reference(req).expect("pins are non-empty");
+                    encode_kf(&vae, image)?
                 } else {
-                    kf.frame_idx
-                };
-                if idx < 0 || idx as usize >= t_lat {
-                    return Err(Error::Msg(format!(
-                        "wan2_2_ti2v_5b: keyframe latent frame index {} out of bounds for {t_lat} \
-                         latent frames",
-                        kf.frame_idx
-                    )));
+                    // Positional with `pins`: `resolve_ti2v_pins` walks `req.keyframes()` in the same
+                    // request order, so `pins[i]` is this keyframe's resolved latent frame.
+                    let mut frames: Vec<(Array, usize)> = Vec::with_capacity(keyframes.len());
+                    for (kf, &(idx, _)) in keyframes.iter().zip(pins.iter()) {
+                        frames.push((encode_kf(&vae, kf.image)?, idx));
+                    }
+                    build_ti2v_keyframe_z(&frames, cfg.vae_z_dim, t_lat, h_lat, w_lat)?
                 }
-                frames.push((encode_kf(&vae, kf.image)?, idx as usize));
-                indices.push(idx as usize);
-            }
-            let z = build_ti2v_keyframe_z(&frames, cfg.vae_z_dim, t_lat, h_lat, w_lat)?;
+            };
             let (mask, mask_tokens) =
-                build_ti2v_multi_mask(&indices, cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
+                build_ti2v_mask(&pins, cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
             let latents = ti2v_blend_init(&z, &mask, &init_noise)?;
             mlx_rs::transforms::eval([&latents, &z])?;
             (latents, Some((z, mask, mask_tokens)))
-        } else {
-            match i2v_reference(req) {
-                Some(image) => {
-                    let z_img = {
-                        let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-                        let vae = Ti2vProviderVae::from_weights(&w)?;
-                        encode_kf(&vae, image)?
-                    };
-                    let (mask, mask_tokens) =
-                        build_ti2v_mask(cfg.vae_z_dim, t_lat, h_lat, w_lat, cfg.patch_size);
-                    let latents = ti2v_blend_init(&z_img, &mask, &init_noise)?;
-                    mlx_rs::transforms::eval([&latents, &z_img])?;
-                    (latents, Some((z_img, mask, mask_tokens)))
-                }
-                None => (init_noise.clone(), None),
-            }
         };
         // sc-12796: the TI2V/keyframe path above loads the z48 VAE **encoder** to encode the reference
         // image(s), then drops it at the brace (`latents_init`/`z` are eval'd and independent of it).
@@ -1013,14 +990,11 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // prompt. Pure text→video: no image conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            conditioning: Vec::new(),
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
             // MoE high/low); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot.
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
@@ -1028,10 +1002,8 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
@@ -1040,22 +1012,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -1456,9 +1413,24 @@ impl Wan14b {
         // does not support `trim_first_frames` (the reference builds `y` from `num_frames`, so an
         // extended noise length would mismatch the conditioning's temporal dim).
         if self.config.is_i2v_concat() {
-            if i2v_reference(req).is_none() {
+            let Some((_, strength)) = i2v_reference(req) else {
                 return Err(Error::Msg(format!(
                     "{id}: image-to-video requires a Reference conditioning image"
+                )));
+            };
+            // sc-19571 — **refuse, do not ignore.** The A14B I2V conditions by CHANNEL-CONCAT: the
+            // reference is VAE-encoded into `y` and concatenated onto every forward's latent, with
+            // no denoise mask anywhere in the path. There is therefore nothing for a conditioning
+            // strength to weight, and the 5B's `1 − strength` mask-blend cannot be extended here
+            // (sc-19504). Accepting the knob and quietly rendering a full pin is the exact failure
+            // this story exists to close, so a request that asks for anything other than a full pin
+            // gets a typed error naming the mechanism.
+            if strength != 1.0 {
+                return Err(Error::Msg(format!(
+                    "{id}: conditioning strength is not supported for A14B image-to-video (got \
+                     {strength}) — the reference is channel-concatenated, not mask-blended, so \
+                     there is no denoise mask to weight; use strength 1.0, or wan2_2_ti2v_5b, \
+                     whose mask-blend honors it"
                 )));
             }
             if req.trim_first_frames.unwrap_or(0) > 0 {
@@ -1601,7 +1573,10 @@ impl Wan14b {
         // `[20, T_lat, h_lat, w_lat]` (f32), concatenated onto each forward's noise latent in
         // `denoise_moe`. `frames` (not `gen_frames`) — validate() rejected `trim` for I2V.
         let y = if cfg.is_i2v_concat() {
-            let image = i2v_reference(req).ok_or_else(|| {
+            // sc-19571: the strength is deliberately NOT read here — the A14B I2V is channel-concat,
+            // which has no denoise mask to weight, so `validate_impl` refuses a non-default strength
+            // outright rather than accepting it and dropping it silently.
+            let (image, _) = i2v_reference(req).ok_or_else(|| {
                 Error::Msg(format!(
                     "{}: image-to-video requires a Reference conditioning image",
                     self.descriptor.id
@@ -1938,12 +1913,91 @@ fn wan14b_adapter_bytes_per_expert(
         })
 }
 
-/// The single conditioning reference image for I2V (the first video frame), if present.
-fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
+/// The single conditioning reference image for I2V (the first video frame) **and its resolved
+/// conditioning strength**, if present.
+///
+/// sc-19571: this used to return the image alone, which is how the TI2V mask-blend came to build a
+/// hard 0/1 pin no matter what the caller asked for. The per-`Reference` `strength` wins over the
+/// request-level img2img `strength`, falling back to `1.0` (a full pin) — the identical resolution
+/// candle's `candle_gen_wan` TI2V path performs, so the two lanes read one number the same way.
+fn i2v_reference(req: &GenerationRequest) -> Option<(&Image, f32)> {
     req.conditioning.iter().find_map(|c| match c {
-        Conditioning::Reference { image, .. } => Some(image),
+        Conditioning::Reference { image, strength } => {
+            Some((image, strength.or(req.strength).unwrap_or(1.0)))
+        }
         _ => None,
     })
+}
+
+/// **The TI2V mask-blend seam** (sc-19571): resolve the request's image conditioning into the
+/// `(latent_frame, strength)` pins that drive [`build_ti2v_mask`], and nothing else.
+///
+/// * `Keyframe`s (first_last_frame / multi-keyframe) → one pin each, **in request order**, so the
+///   caller can zip the pins against `req.keyframes()` to pair each resolved index with its image.
+///   `frame_idx` is a latent index with negative-from-end resolution (`-1` = last latent frame).
+/// * otherwise a single `Reference` image → one pin at latent frame 0 with the strength
+///   [`i2v_reference`] resolves.
+/// * no image conditioning → no pins, i.e. pure-noise T2V.
+///
+/// Pure and total (no GPU, no weights), because the whole defect this closes was a strength that
+/// was carried as far as the provider and then dropped on the way into the mask — which is exactly
+/// the hop a unit test can only pin if it is expressible without a render.
+fn resolve_ti2v_pins(req: &GenerationRequest, t_lat: usize) -> Result<Vec<(usize, f32)>> {
+    let keyframes = req.keyframes();
+    if keyframes.is_empty() {
+        return Ok(i2v_reference(req)
+            .map(|(_, strength)| vec![(0usize, strength)])
+            .unwrap_or_default());
+    }
+    let mut pins = Vec::with_capacity(keyframes.len());
+    for kf in &keyframes {
+        let idx = if kf.frame_idx < 0 {
+            t_lat as i32 + kf.frame_idx
+        } else {
+            kf.frame_idx
+        };
+        if idx < 0 || idx as usize >= t_lat {
+            return Err(Error::Msg(format!(
+                "wan2_2_ti2v_5b: keyframe latent frame index {} out of bounds for {t_lat} latent \
+                 frames",
+                kf.frame_idx
+            )));
+        }
+        pins.push((idx as usize, kf.strength));
+    }
+    Ok(pins)
+}
+
+/// Range-gate every conditioning strength a Wan request can carry (sc-19571, mirroring candle's
+/// `check_strength` and mlx-gen-ltx's F-054 gate).
+///
+/// `strength > 1` yields a **negative** denoise mask (`1 − strength`) → negative per-token timesteps
+/// and extrapolating blends: silent garbage rather than a louder pin. `strength < 0` over-weights
+/// the noise the same way. Now that the number actually reaches the mask, the range has to be a
+/// request-boundary rejection instead of a value nobody read.
+fn reject_out_of_range_strengths(id: &str, req: &GenerationRequest) -> Result<()> {
+    let check = |label: &str, strength: f32| -> Result<()> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(Error::Msg(format!(
+                "{id}: {label} strength must be finite and in [0, 1] (got {strength})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(strength) = req.strength {
+        check("img2img", strength)?;
+    }
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference {
+                strength: Some(strength),
+                ..
+            } => check("Reference", *strength)?,
+            Conditioning::Keyframe { strength, .. } => check("Keyframe", *strength)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the output `(width, height)` for a **dense** Wan path (5B TI2V, A14B): round the requested
@@ -1994,7 +2048,6 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // A single image is channel-concatenated as the first-frame conditioning (in_dim 36).
             conditioning: vec![ConditioningKind::Reference],
             // LoRA + LoKr merge per-expert at generate time (sc-2683 / sc-2393, PEFT/kohya + LoKr,
@@ -2002,7 +2055,6 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: wan_samplers(),
-            schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
             supported_guidance_methods: vec![],
             min_size: 16,
@@ -2010,9 +2062,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12736): the staged expert swap
             // holds only the ACTIVE MoE expert resident (never both) and frees the UMT5 TE / VAE
             // off-GPU during denoise, dropping the unified-memory peak to ~one expert. Advertised so
@@ -2021,22 +2071,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             // TE/VAE and the active expert are phase-staged even under Resident; Sequential adds the
             // stronger cache-flush/expert-residency controls described above.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -2105,6 +2140,195 @@ mod tests {
             height,
             ..Default::default()
         }
+    }
+
+    /// A tiny solid-color RGB conditioning frame.
+    fn dummy_image() -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![128u8; 64 * 64 * 3],
+        }
+    }
+
+    fn keyframe(frame_idx: i32, strength: f32) -> Conditioning {
+        Conditioning::Keyframe {
+            image: dummy_image(),
+            frame_idx,
+            strength,
+        }
+    }
+
+    /// **The seam assertion** (sc-19571). `resolve_ti2v_pins` is the single hop between the request
+    /// and [`build_ti2v_mask`], so this pins what the mask builder is actually handed — with
+    /// **non-default** strengths on both ends of a first_last_frame pair, because the defect it
+    /// replaces produced a full 1.0 pin for every keyframe and would satisfy any assertion written
+    /// against the default.
+    ///
+    /// Mutation guard: change the `pins.push((idx as usize, kf.strength))` in `resolve_ti2v_pins` to
+    /// `(idx as usize, 1.0)` — i.e. re-introduce the exact defect — and the strength asserts below
+    /// go red while every index assert still passes. That asymmetry is the point: indices were never
+    /// the broken half.
+    #[test]
+    fn ti2v_pins_carry_each_keyframes_own_strength_to_the_mask_builder() {
+        // t_lat = 4 latent frames. first_last_frame with two DIFFERENT, non-default strengths, and
+        // the last frame addressed negative-from-end (the shape SceneWorks actually sends).
+        let mut r = req(704, 480);
+        // 0.25 / 0.75 are exactly representable in f32, so `1 − strength` is exact and the mask
+        // assertion below can be `==` rather than an epsilon that could hide a wrong-but-close pin.
+        r.conditioning = vec![keyframe(0, 0.25), keyframe(-1, 0.75)];
+        let pins = resolve_ti2v_pins(&r, 4).expect("pins");
+        assert_eq!(
+            pins,
+            vec![(0usize, 0.25f32), (3usize, 0.75f32)],
+            "each keyframe's own strength must reach the mask builder, in request order"
+        );
+
+        // …and the mask the builder derives from them carries `1 − strength` at each pinned frame.
+        // z=1, t_lat=4, h=w=1, patch (1,1,1) → one token per latent frame.
+        let (mask, tokens) = build_ti2v_mask(&pins, 1, 4, 1, 1, (1, 1, 1));
+        assert_eq!(mask.as_slice::<f32>(), &[0.75, 1.0, 1.0, 0.25]);
+        assert_eq!(tokens.as_slice::<f32>(), &[0.75, 1.0, 1.0, 0.25]);
+    }
+
+    /// The `Reference` half of the same seam: a single conditioning image pins latent frame 0 at the
+    /// strength the request resolves — the per-`Reference` value first, then the request-level
+    /// img2img `strength`, then a full pin. Non-default at every rung.
+    #[test]
+    fn ti2v_pins_resolve_the_reference_strength_precedence() {
+        let mut r = req(704, 480);
+        // Per-reference strength wins.
+        r.conditioning = vec![Conditioning::Reference {
+            image: dummy_image(),
+            strength: Some(0.4),
+        }];
+        r.strength = Some(0.9);
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 0.4f32)]);
+        // No per-reference strength → the request-level img2img strength.
+        r.conditioning = vec![Conditioning::Reference {
+            image: dummy_image(),
+            strength: None,
+        }];
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 0.9f32)]);
+        // Neither → a full pin (the historical hard mask).
+        r.strength = None;
+        assert_eq!(resolve_ti2v_pins(&r, 4).unwrap(), vec![(0usize, 1.0f32)]);
+        // No image conditioning at all → no pins, i.e. pure-noise T2V.
+        r.conditioning = vec![];
+        assert!(resolve_ti2v_pins(&r, 4).unwrap().is_empty());
+    }
+
+    /// Out-of-bounds latent indices still reject (this moved into `resolve_ti2v_pins` with the
+    /// strengths — the guard must not have been lost in the move).
+    #[test]
+    fn ti2v_pins_reject_out_of_bounds_latent_indices() {
+        let mut r = req(704, 480);
+        r.conditioning = vec![keyframe(4, 1.0)];
+        let err = resolve_ti2v_pins(&r, 4).unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unexpected: {err}");
+        r.conditioning = vec![keyframe(-5, 1.0)];
+        assert!(resolve_ti2v_pins(&r, 4).is_err());
+    }
+
+    /// sc-19571 — the strengths now reach `1 − strength`, so a value outside `[0,1]` would build a
+    /// NEGATIVE mask: negative per-token timesteps and an extrapolating blend, i.e. silent garbage.
+    /// Mirrors candle's `validate_rejects_non_finite_or_out_of_range_ti2v_strengths`.
+    ///
+    /// Two gates, deliberately asserted apart: **non-finite** is the shared gen-core floor
+    /// (`ensure_finite_floats`, which sc-19571 also taught about `Keyframe.strength`), **finite but
+    /// out of range** is this provider's own gate. Mutation guard: delete the
+    /// `reject_out_of_range_strengths` call in `validate_impl` and the `[0, 1]` asserts go red while
+    /// the finiteness ones still pass — which is how you can tell the two gates are distinct and
+    /// neither is carrying the other.
+    #[test]
+    fn validate_rejects_out_of_range_conditioning_strengths_5b() {
+        let wan = wan_5b();
+        for bad in [1.5f32, -0.1] {
+            let mut r = req(704, 480);
+            r.conditioning = vec![keyframe(0, bad)];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("Keyframe strength must be finite and in [0, 1]"),
+                "keyframe {bad}: {err}"
+            );
+
+            let mut r = req(704, 480);
+            r.conditioning = vec![Conditioning::Reference {
+                image: dummy_image(),
+                strength: Some(bad),
+            }];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("Reference strength must be finite and in [0, 1]"),
+                "reference {bad}: {err}"
+            );
+
+            let mut r = req(704, 480);
+            r.strength = Some(bad);
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("img2img strength must be finite and in [0, 1]"),
+                "img2img {bad}: {err}"
+            );
+        }
+        // Non-finite is caught one layer up, by the shared finiteness floor.
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut r = req(704, 480);
+            r.conditioning = vec![keyframe(0, bad)];
+            let err = wan.validate_impl(&r).unwrap_err().to_string();
+            assert!(
+                err.contains("conditioning.keyframe.strength") && err.contains("must be finite"),
+                "keyframe {bad}: {err}"
+            );
+        }
+        // The in-range partial pins this story exists to enable still validate.
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![keyframe(0, 0.35), keyframe(-1, 0.0)];
+        assert!(wan.validate_impl(&ok).is_ok());
+    }
+
+    /// sc-19571 — **refuse, do not ignore.** The A14B I2V is channel-concat and has no denoise mask,
+    /// so a conditioning strength cannot be honored there; it must be rejected with a message naming
+    /// the mechanism rather than accepted and dropped. Mutation guard: delete the `strength != 1.0`
+    /// branch in `Wan14b::validate_impl` and the `unwrap_err`s below panic.
+    #[test]
+    fn validate_refuses_conditioning_strength_on_a14b_i2v() {
+        let wan = Wan14b {
+            descriptor: descriptor_i2v_14b(),
+            config: WanModelConfig::wan22_i2v_14b(),
+            root: PathBuf::new(),
+            adapters: vec![],
+            quant: None,
+            offload_policy: OffloadPolicy::Resident,
+        };
+        let reference = |strength: Option<f32>| Conditioning::Reference {
+            image: dummy_image(),
+            strength,
+        };
+        // A full pin — the only thing channel-concat can express — validates.
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![reference(Some(1.0))];
+        assert!(wan.validate_impl(&ok).is_ok(), "strength 1.0 must validate");
+        let mut ok = req(704, 480);
+        ok.conditioning = vec![reference(None)];
+        assert!(wan.validate_impl(&ok).is_ok(), "unset must validate");
+
+        // Anything else is refused, on either carrier.
+        let mut bad = req(704, 480);
+        bad.conditioning = vec![reference(Some(0.5))];
+        let err = wan.validate_impl(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("conditioning strength is not supported")
+                && err.contains("channel-concatenated"),
+            "unexpected: {err}"
+        );
+        let mut bad = req(704, 480);
+        bad.conditioning = vec![reference(None)];
+        bad.strength = Some(0.5);
+        assert!(
+            wan.validate_impl(&bad).is_err(),
+            "the request-level img2img strength resolves into the same pin and must be refused too"
+        );
     }
 
     #[test]

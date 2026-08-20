@@ -24,12 +24,12 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     self, AdapterKind, AdapterResidencyMode, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport, Quant,
-    ResidentRequestMemory, WeightsSource,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, Quant, ResidentRequestMemory, WeightsSource,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, Result};
@@ -190,6 +190,7 @@ fn production_asset_declaration(
             kind: MemoryComponentKind::AdapterStack,
             resident_bytes: overlay_bytes,
             bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
         })
         .into_iter()
         .collect();

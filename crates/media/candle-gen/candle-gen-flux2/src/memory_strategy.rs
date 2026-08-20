@@ -9,13 +9,14 @@ use crate::config::{Flux2Variant, FLUX2_DEV_ID, FLUX2_KLEIN_9B_ID};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
-    PerComponentBytes, Precision, Quant, TransformerComponent, WeightsSource,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWindowMaterialization, PerComponentBytes, Precision, Quant, TransformerComponent,
+    WeightsSource,
 };
 use std::sync::{Arc, Mutex};
 
@@ -317,6 +318,7 @@ fn resident_components(
                     // SC-15833 windows the 56-block base. The four overlay blocks remain resident and
                     // are therefore charged explicitly rather than hidden inside the base estimate.
                     bounded_by: None,
+                    residency: MemoryComponentResidency::WholeRender,
                 });
             }
         }

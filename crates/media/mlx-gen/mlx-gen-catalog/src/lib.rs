@@ -37,6 +37,7 @@ pub mod providers {
     pub use mlx_gen_lens as lens;
     pub use mlx_gen_ltx as ltx;
     pub use mlx_gen_mage as mage;
+    pub use mlx_gen_minimax_h3 as minimax_h3;
     pub use mlx_gen_mochi as mochi;
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
@@ -96,6 +97,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_lens::register_providers(registry);
     let registry = mlx_gen_ltx::register_providers(registry);
     let registry = mlx_gen_mage::register_providers(registry);
+    let registry = mlx_gen_minimax_h3::register_providers(registry);
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
@@ -523,6 +525,12 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
+                // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
+                // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
+                // external decoder can consume it, so the descriptor deliberately advertises
+                // nothing and fails closed against every decoder swap.
+                "minimax_h3" => None,
                 family => panic!(
                     "{} has unclassified latent lineage for registered family {family}",
                     descriptor.id
@@ -665,20 +673,22 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 49);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 48);
+        assert_eq!(registry.memory_strategy_registrations().len(), 50);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 49);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["flux2_dev_control"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // 46 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface. The two video
-        // providers publish narrower, truthful inventories instead: LTX has no deferred/block-window
-        // loader, so it witnesses the eager half; TI2V-5B admits only a BF16 Resident/Eager load, so
-        // it witnesses one selector per tier. Spelling the sum out this way keeps a future provider's
-        // narrowing visible in the diff rather than folded into a single total.
-        assert_eq!(surfaces.len(), 46 * 12 + 6 + 3);
+        // 47 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
+        // joined them in the sc-17137 sync: it ships all three tiers and both materialization
+        // shapes). Two video providers publish narrower, truthful inventories instead: LTX has no
+        // deferred/block-window loader, so it witnesses the eager half; TI2V-5B admits only a BF16
+        // Resident/Eager load, so it witnesses one selector per tier. Spelling the sum out this way
+        // keeps a future provider's narrowing visible in the diff rather than folded into a single
+        // total.
+        assert_eq!(surfaces.len(), 47 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -1448,6 +1458,7 @@ mod tests {
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
+                "minimax_h3",
                 "mochi_1",
                 "pulid_flux",
                 "qwen_image",
@@ -1518,8 +1529,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 68);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 59);
+        assert_eq!(distinct.len(), 69);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 60);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

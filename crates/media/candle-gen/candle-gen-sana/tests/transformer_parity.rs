@@ -31,6 +31,10 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::Weights;
 use candle_gen_sana::{SanaTransformer, SanaTransformerConfig};
 
+mod common;
+
+use common::{tiny_config, tiny_sprint_config};
+
 fn mean_rel(got: &Tensor, want: &Tensor) -> f32 {
     let num = (got - want)
         .unwrap()
@@ -85,29 +89,6 @@ fn split_golden(golden: &Weights) -> (Weights, Tensor, Tensor, Tensor, Tensor) {
     (Weights::from_map(map), latent, caption, timestep, want)
 }
 
-/// Tiny config matching `dump_sana_transformer_golden.py`'s tiny instance.
-fn tiny_config() -> SanaTransformerConfig {
-    SanaTransformerConfig {
-        in_channels: 4,
-        out_channels: 4,
-        num_attention_heads: 2,
-        attention_head_dim: 8, // inner = 16
-        num_layers: 2,
-        num_cross_attention_heads: 2,
-        cross_attention_head_dim: 8,
-        caption_channels: 24,
-        mlp_ratio: 2.5,
-        patch_size: 1,
-        norm_eps: 1e-6,
-        caption_norm_eps: 1e-5,
-        attn_qk_norm_eps: 1e-5,
-        attn_eps: 1e-15,
-        guidance_embeds: false,
-        guidance_embeds_scale: 0.1,
-        qk_norm: false,
-    }
-}
-
 #[test]
 fn trunk_matches_diffusers_tiny() {
     let golden_path = concat!(
@@ -135,16 +116,6 @@ fn trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — that IS a port bug, not rounding"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
-}
-
-/// Tiny SANA-**Sprint** config (guidance embedder + qk-norm ON), matching `dump_sana_sprint_golden.py`.
-fn tiny_sprint_config() -> SanaTransformerConfig {
-    SanaTransformerConfig {
-        guidance_embeds: true,
-        guidance_embeds_scale: 0.1,
-        qk_norm: true,
-        ..tiny_config()
-    }
 }
 
 #[test]

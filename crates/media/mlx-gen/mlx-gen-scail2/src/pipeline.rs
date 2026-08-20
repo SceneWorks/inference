@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use mlx_gen::{
     default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Progress, Quant, Result, SizeFloor, WeightsSource,
+    Progress, Quant, ReplacementMode, Result, SizeFloor, WeightsSource,
 };
 use mlx_gen_wan::config::MAX_AREA_14B;
 use mlx_gen_wan::pipeline::reject_over_area_dims;
@@ -61,7 +61,6 @@ pub fn descriptor() -> ModelDescriptor {
             },
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
             // characters (MultiReference, experimental); the driving video + its per-frame color masks
             // map to ControlClip.
@@ -78,38 +77,21 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: vec!["unipc", "dpm++"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // The root-only provider always stages UMT5 + CLIP ahead of the DiT and has no
             // request-selectable Resident mode. This is physical staging, not a shared control.
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
             // sc-18317: the graph-evaluation cadence + FFN chunk this provider's shared Wan
             // `DitMemoryConfig` consumes. `generate` threads the request through
             // `DitMemoryConfig::with_request` on top of `SCAIL2_MEM_DEFAULT`.
             execution: crate::generate::EXECUTION_SURFACE,
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -164,6 +146,10 @@ mlx_gen::impl_generator!(Scail2 {
         s.descriptor
             .capabilities
             .validate_request(s.descriptor.id, req)?;
+        // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
+        // silently dropping them. Runs on BOTH seams (`impl_generator!`'s `generate` does not call
+        // `validate`), same as the geometry gate below.
+        reject_unimplemented_control_clip_knobs(req)?;
         // The RESOLVED geometry, which the shared floor above cannot see (sc-16167). Only the `0x0`
         // sentinel needs the driving clip to resolve; an EXPLICIT size is checkable with no clip at
         // all, and must be — candle's `validate` area-checks `req` unconditionally, so gating the
@@ -207,6 +193,59 @@ fn resolve_pre_flight_size(req: &GenerationRequest) -> Option<(u32, u32)> {
     req.control_clip()
         .and_then(|c| c.frames.first())
         .map(|first| resolve_target_size(req, first))
+}
+
+/// Refuse the [`Conditioning::ControlClip`] knobs SCAIL-2 does not implement (sc-20262).
+///
+/// SCAIL-2 consumes the ControlClip as a **driving video + per-frame color masks** — `run` reads
+/// `frames` and `mask` and nothing else. The other three fields belong to the LTX / Wan-VACE
+/// replace_person mask-injection mechanism, which this pipeline does not have:
+///
+/// * `masking_strength` weights a mask-injection step count (`ceil(steps · masking_strength)`) —
+///   SCAIL-2 has no mask-injection stage to weight; the driving masks are consumed as color-coded
+///   region labels, not as a blend.
+/// * `start_frame` aligns the clip to an output latent frame — SCAIL-2's segmented driving loop
+///   starts at frame 0 by construction (`SEGMENT_LEN` / `SEGMENT_OVERLAP`).
+/// * `mode` is the replacement granularity — SCAIL-2 re-renders the whole tracked person, so there
+///   is no face-only vs full-person branch here to select.
+///
+/// Until sc-20262 these were silently dropped: a caller who set one got a render that ignored it
+/// with no diagnostic. The sc-19571 rule is that a control either works or is refused with a clear
+/// error, so this is the refusal. It fires **only on a non-default value** — a request carrying the
+/// contract defaults (`1.0` / `0` / [`ReplacementMode::default`]) passes through unchanged, which is
+/// every request SceneWorks builds today.
+///
+/// Typed [`Error::Unsupported`], not [`Error::Msg`]: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
+fn reject_unimplemented_control_clip_knobs(req: &GenerationRequest) -> Result<()> {
+    let Some(clip) = req.control_clip() else {
+        return Ok(());
+    };
+    if clip.masking_strength != 1.0 {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} does not implement masking_strength (got {}); remove it or leave it at the \
+             default 1.0 — SCAIL-2 consumes the ControlClip masks as color-coded region labels and \
+             has no mask-injection stage to weight",
+            clip.masking_strength
+        )));
+    }
+    if clip.start_frame != 0 {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} does not implement start_frame (got {}); remove it or leave it at the \
+             default 0 — SCAIL-2's segmented driving loop starts at frame 0 by construction",
+            clip.start_frame
+        )));
+    }
+    if clip.mode != ReplacementMode::default() {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} does not implement mode (got {:?}); remove it or leave it at the default \
+             {:?} — SCAIL-2 re-renders the whole tracked person, so there is no replacement \
+             granularity to select",
+            clip.mode,
+            ReplacementMode::default()
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a geometry SCAIL-2 does not advertise, **before** the render — the second half of the
@@ -436,6 +475,10 @@ impl Scail2 {
                     .into(),
             )
         })?;
+        // sc-20262 — the same refusal `validate` runs, re-checked here because `impl_generator!`'s
+        // `generate` does not call `validate` (F-158, the reason the shared floor is re-checked at
+        // the top of this function too).
+        reject_unimplemented_control_clip_knobs(req)?;
 
         // Explicit geometry is already on the advertised 32-pixel grid. A `0x0` sentinel first
         // resolves to the driving frame's native size, then is aligned below while that source-media
@@ -1151,5 +1194,106 @@ mod tests {
                  accepted={generate_ok}",
             );
         }
+    }
+
+    /// A 640x480 request whose driving ControlClip carries one non-default sc-20262 knob.
+    fn with_clip_knobs(
+        masking_strength: f32,
+        start_frame: i32,
+        mode: ReplacementMode,
+    ) -> GenerationRequest {
+        let mut req = GenerationRequest {
+            width: 640,
+            height: 480,
+            count: 1,
+            conditioning: conditioning(640, 480),
+            ..Default::default()
+        };
+        if let Some(Conditioning::ControlClip {
+            masking_strength: ms,
+            start_frame: sf,
+            mode: m,
+            ..
+        }) = req
+            .conditioning
+            .iter_mut()
+            .find(|c| matches!(c, Conditioning::ControlClip { .. }))
+        {
+            *ms = masking_strength;
+            *sf = start_frame;
+            *m = mode;
+        }
+        req
+    }
+
+    /// sc-20262 — `masking_strength` / `start_frame` / `mode` were silently dropped. Each is now a
+    /// typed [`Error::Unsupported`] naming the field and the model, on **both** seams
+    /// (`impl_generator!`'s `generate` does not call `validate`).
+    ///
+    /// Every case uses a genuinely NON-default value: at the contract defaults the refusal must not
+    /// fire at all, which the companion test pins.
+    #[test]
+    fn non_default_control_clip_knobs_are_refused_by_name_on_both_seams() {
+        let m = unloaded();
+        let mut noop = |_: Progress| {};
+
+        for (req, field) in [
+            (
+                with_clip_knobs(0.5, 0, ReplacementMode::default()),
+                "masking_strength",
+            ),
+            (
+                with_clip_knobs(1.0, 3, ReplacementMode::default()),
+                "start_frame",
+            ),
+            (
+                with_clip_knobs(1.0, 0, ReplacementMode::FullPersonReplaceOutfit),
+                "mode",
+            ),
+        ] {
+            // `Generator::validate` is the backend-neutral seam, so the refusal must arrive as the
+            // typed `gen_core::Error::Unsupported` — the variant the worker classifies as a
+            // user-facing invalid payload rather than an opaque engine failure.
+            let err =
+                Generator::validate(&m, &req).expect_err("a non-default knob must be refused");
+            assert!(
+                matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                "{field}: typed Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field}: names the field: {msg}");
+            assert!(msg.contains(MODEL_ID), "{field}: names the model: {msg}");
+
+            // The `generate` seam refuses it too, rather than only the pre-flight.
+            let msg = m
+                .run(&req, &mut noop)
+                .expect_err("no request renders without weights")
+                .to_string();
+            assert!(
+                msg.contains(field) && msg.contains(MODEL_ID),
+                "{field}: generate must refuse it too, got: {msg}"
+            );
+        }
+    }
+
+    /// sc-20262 — the refusal fires **only** on a value a caller actually set. A request carrying
+    /// the contract defaults (`1.0` / `0` / [`ReplacementMode::default`]) — which is every request
+    /// SceneWorks builds today — validates, and inside `generate` reaches the pixel decode, proving
+    /// it cleared the new gate rather than dying earlier.
+    #[test]
+    fn default_control_clip_knobs_still_pass_unchanged() {
+        let m = unloaded();
+        let mut noop = |_: Progress| {};
+        let req = with_clip_knobs(1.0, 0, ReplacementMode::default());
+
+        Generator::validate(&m, &req).expect("a default-valued ControlClip must still validate");
+        let msg = m
+            .run(&req, &mut noop)
+            .expect_err("no request renders without weights")
+            .to_string();
+        assert!(
+            msg.contains(CLEARED_THE_GEOMETRY_GATE),
+            "a default request must reach the pixel decode, got: {msg}"
+        );
     }
 }

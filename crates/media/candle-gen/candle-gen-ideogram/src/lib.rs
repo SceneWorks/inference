@@ -37,7 +37,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
-    SizeFloor, WeightsSource,
+    WeightsSource,
 };
 
 pub use adapters::TurboLoraReport;
@@ -160,51 +160,27 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // Edit (sc-6303/6330 → candle sc-6598): one img2img/inpaint source Reference + optional
             // inpaint Mask. No control/pose/multi-reference. Works in both quality and turbo.
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec![],
             schedulers: vec!["flow_match_euler"],
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: 8,
-            mac_only: false,
             // sc-9607: advertise the packed tiers so the worker's `resolve_quant` / A-B quant toggle
             // engages off-Mac (the resolved q4/q8 turnkey subdir self-describes; `build` no-ops the
             // requested quant — see below). Both quality + turbo share this via `descriptor_turbo`.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16955). Ideogram drives no shared sampler, so
             // its bespoke flow-match loop emits directly (`crate::preview`); the VAE it loads is the
             // FLUX.2 one tensor-for-tensor, so it reuses that fit rather than introducing one.
             // `candle-gen-catalog`'s guard derives this flag from the sources — including from a
             // bespoke crate's direct emission call — so it cannot run ahead of or behind the wiring.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

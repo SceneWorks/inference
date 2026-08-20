@@ -189,6 +189,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
+      # sc-19556. A RATCHET against scripts/clock_assertions_baseline.txt, not a zero-gate: the
+      # residual clock-bound assertions are real and tracked, and a gate demanding zero would be
+      # switched off within a week. This reds only when a file's count RISES or a newly flagged
+      # file appears — i.e. when a PR adds an assertion whose truth depends on how busy the runner
+      # was. `workspace` is the right lane because select_lanes.py never skips it, so the ratchet
+      # sees every PR regardless of which crates it touched.
+      - name: Ratchet wall-clock-dependent assertions
+        run: python3 scripts/check_clock_assertions.py --check-baseline .
       # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
       # MMAudio parity fixtures' deterministic inputs (a 28 MP synthetic clip) and compares digests,
       # which needs numpy. Leaving this after the discover step would turn that gate into an import
@@ -409,6 +417,52 @@ jobs:
           sw_vers
           xcodebuild -version
           cmake --version
+      # sc-19556 CI-disk mitigation. On 2026-08-19 this lane hit the runner's disk wall three
+      # attempts running: attempt 1 died with `ar: libmlx.a: No space left on device` inside the
+      # MLX native build during "Test LLM+audio macOS bundle", and attempts 2-3 killed the runner
+      # outright (it could no longer write its own `_diag` log). Two things stack up:
+      #   * the hosted `macos-15-arm64` image ships NINE Xcode installs (16.0 through 26.3) plus the
+      #     Android SDK. This lane uses exactly one Xcode and no Android at all, so that payload is
+      #     pure dead weight sitting on the same volume as `target/`.
+      #   * this lane runs four cargo invocations with four different feature sets, and on any branch
+      #     whose manifest set differs from `main` the rust-cache restore is a prefix match
+      #     ("full match: false" — the failing run restored `...-c5bb8f3b` under key `...-e634915e`),
+      #     so the restored ~1.2 GB target/ is kept AND a second generation of artifacts is built on
+      #     top of it. Branches whose manifests match `main` get "full match: true" and never build
+      #     that second generation, which is why they passed the same day on the same image.
+      # We cannot shrink the second generation without a full rebuild, so reclaim the image payload
+      # instead. This step is diagnostics + deletion only: it never fails the job.
+      - name: Reclaim runner disk
+        run: |
+          set +e
+          echo "--- disk before reclaim ---"
+          df -h /
+          resolve() { ( cd "$1" >/dev/null 2>&1 && pwd -P ); }
+          keep="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer.*##')"
+          case "$keep" in
+            /Applications/Xcode*.app)
+              keep_real="$(resolve "$keep")"
+              echo "active Xcode: $keep_real"
+              for app in /Applications/Xcode*.app; do
+                [ -e "$app" ] || continue
+                if [ "$(resolve "$app")" = "$keep_real" ]; then
+                  echo "keep  $app"
+                  continue
+                fi
+                echo "prune $app"
+                sudo rm -rf "$app"
+              done
+              ;;
+            *)
+              # DEVELOPER_DIR is CommandLineTools or unset — we cannot tell which Xcode the later
+              # steps will select, so prune nothing rather than guess.
+              echo "active developer dir is '${keep:-<none>}', not an Xcode bundle; skipping Xcode prune"
+              ;;
+          esac
+          sudo rm -rf "$HOME/Library/Android" "$HOME/.android"
+          echo "--- disk after reclaim ---"
+          df -h /
+          exit 0
       - name: Ensure Metal compiler
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then
@@ -442,6 +496,18 @@ jobs:
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos
+      # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
+      # else in this job, so it is free to drop before the four cargo invocations start stacking
+      # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
+      # the 2026-08-19 disk failures had no data for. Diagnostics only; never fails the job.
+      - name: Disk after rustdoc
+        if: always()
+        run: |
+          set +e
+          rm -rf target/doc
+          df -h /
+          du -sh target 2>/dev/null
+          exit 0
       - name: Reclaim Clippy and rustdoc artifacts before linking MLX tests
         # The complete all-target Clippy graph plus rustdoc output exhausted the hosted macOS disk
         # while the broad test graph was linking. Both gates have already succeeded, so rebuild the
@@ -465,6 +531,15 @@ jobs:
         run: >-
           cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after MLX package tests
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       - name: Reclaim broad MLX test artifacts before bundle profiles
         # The complete MLX test graph has already passed. Its linked test artifacts do not fit on
         # the hosted macOS image alongside the separately compiled runtime bundle profiles and the
@@ -473,11 +548,31 @@ jobs:
         run: cargo clean
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after LLM-only bundle
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
       # profile — and this is the one platform where that combination is cross-backend.
       - name: Test LLM+audio macOS bundle
         run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
+      # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
+      # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
+      # only; never fails the job.
+      - name: Disk after LLM+audio bundle
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
       # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
       # (no lane passes --features metal to Clippy), and without --all-targets it did not even
@@ -572,6 +667,36 @@ jobs:
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
+      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
+      #
+      # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
+      # Ampere, the box is Blackwell" therefore reads as an obvious bug, and is not one.
+      # `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture ladder, never the hardware. It
+      # seeds one cudaforge `-gencode`; `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and
+      # `compute_120` PTX on top (sc-7544), so the shipped `libmoe.a` is a fatbin that runs Ampere
+      # -> Ada -> Hopper -> Blackwell from one binary. Set this to 120 and the bottom rung
+      # disappears: quantized models stop working on every pre-Blackwell customer GPU, and the
+      # dense PTX floor rises to `compute_120` so even dense models stop loading there.
+      #
+      # The hazard the number LOOKS like -- quantized matmuls silently returning zeros -- is real,
+      # was sc-7544, and is fixed. What must actually hold is that the runner's arch is served by
+      # SOME rung, which is a different claim from "the cap matches the GPU". Concretely, the
+      # ladder is sm_80 (this value) + sm_90 + sm_120 SASS + `compute_120` PTX, so this pool's
+      # cards are covered natively.
+      #
+      # KNOWN GAP, recorded so it is not rediscovered: **datacenter Blackwell sm_100 (B100/B200) is
+      # NOT covered** on the quant path. Major 10 is served neither by the sm_9x/sm_12x cubins
+      # (SASS is compatible only upward WITHIN one major) nor by the `compute_120` PTX floor (120 >
+      # 100). build.rs states this is deliberate. If such a card ever joins this pool, quantized
+      # matmuls return zeros silently -- add `code=sm_100` to build.rs, do NOT touch this value.
+      #
+      # sm_120 for the current cards is a SPEC fact, not a CI measurement: no lane has ever queried
+      # `compute_cap`, and nothing in this repository does. `nvidia-smi` here reports only the
+      # truncated model name and memory.
+      #
+      # NOTHING ENFORCES ANY OF THIS. sc-19545 verified it by hand and wrote it down; a drift guard
+      # was explicitly scoped out. If someone edits this value, the first symptom is black
+      # renders on customer GPUs, not a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"

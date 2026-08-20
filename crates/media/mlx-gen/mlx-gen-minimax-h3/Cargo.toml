@@ -1,0 +1,50 @@
+[package]
+name = "mlx-gen-minimax-h3"
+version = "0.0.0"
+edition = "2021"
+description = "MiniMax-H3 (Hailuo 3.0) provider crate for mlx-gen: video VAE decoding (3D-CNN encoder / 36-layer ViT decoder), audio VAE decoding (DAC lineage / BigVGAN, 32 kHz stereo) and Qwen3-VL-32B context extraction."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "minimax-h3", "video", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# The Qwen3-VL vision tower is genuinely shared, not forked: H3's `vision_config` is identical to
+# boogu's in every field but `out_hidden_size` (5120 vs 4096), so the parity-critical tower is
+# consumed rather than duplicated — the same call boogu, krea, mage and bernini already make.
+mlx-gen-boogu = { path = "../mlx-gen-boogu" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# `RgbImage` for the vision-reference hand-off to `boogu::vision::preprocess::preprocess_image`.
+image = { workspace = true }
+# The condition tokenizer loads `tokenizer.json` DIRECTLY rather than through
+# `mlx_gen::tokenizer::TextTokenizer`, because H3 needs `add_special_tokens` and that wrapper
+# exposes no way to register added tokens. MiniMax's seven extra specials (`<d>`, `</d>`,
+# `<|cutoff|>`, the lyrics/caption pairs) exist ONLY in `tokenizer_config.json`; without
+# registering them `<d>` BPE-splits to `[90707, 29]` instead of the single id 151669 that
+# `transformers` produces. See `text_encoder::tokenizer`.
+tokenizers = { workspace = true }
+# Parse the diffusers `vae/config.json` (per-channel latents_mean/std, decoder geometry, the
+# clip_length / token_drop temporal-chunk knobs) and the audio VAE's `config.json` +
+# `metadata.json`. The audio VAE's third document, `config.yaml`, is four flat `key: integer`
+# pairs; `audio_config` reads it directly rather than taking a YAML dependency for that.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# `_mlx_array_is_available` — mlx-c's accessor for `mlx::core::array::is_available()`, which
+# `tests/pipeline.rs` reads to observe DIRECTLY that the render's compute landed inside the
+# cancel-checked region, replacing a wall-clock ratio that moved with host load (sc-19452).
+# mlx-rs exposes no safe wrapper for it. Pinned to the same git rev as mlx-rs's own path dep (an
+# invariant `scripts/check-workspace.py` asserts), so cargo unifies on one copy and
+# `mlx_rs::Array::as_ptr` hands back exactly this crate's `mlx_array` handle.
+mlx-sys = { workspace = true }
+# RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
+# `Drop` — including out of a panicking test, which is the only path the old
+# `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
+tempfile = { workspace = true }
+# The real-weight smoke reads the shard index to prove the loader's key set is exhaustive against
+# the published checkpoint, not just against the committed fixture.
+serde_json = { workspace = true }
+# The shared weights-free memory-contract and registry conformance checks (sc-18659).
+sceneworks-gen-core-testkit = { workspace = true }

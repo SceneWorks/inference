@@ -90,7 +90,7 @@ pub use voice_embedder::{
 
 use gen_core::{
     Capabilities, Conditioning, EncoderContract, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, Modality, Progress, VisionEncoderContract,
+    Generator, Image, Modality, Progress, StepSupport, VisionEncoderContract,
 };
 
 /// Write a sparse, validation-complete text-encoder fixture for provider load-gate tests.
@@ -722,6 +722,57 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
         }
     }
 
+    // Positive + negative: the advertised step surface must be honest — an exact menu (sc-19502) or
+    // an inclusive range (sc-19559). Every ADMITTED count must validate, and a count outside must be
+    // refused; the pair is the point, because each half alone is satisfiable by a broken provider: a
+    // lane that ignores `req.steps` entirely (which `mlx-gen-ltx` did) passes the positive half
+    // trivially, and a lane that rejects everything passes the negative half trivially.
+    //
+    // Skipped entirely for the unconstrained majority, so this adds no requirement to a model that
+    // never opted in.
+    if !caps.supported_steps.is_unconstrained() {
+        // Probe the ENDPOINTS, not the whole interval: SVD's range is 1..=200 and Kolors' is
+        // 1..=1100, so enumerating every admitted count would run 1100 validate() calls for no
+        // extra signal. An exact menu is small, so it is probed in full.
+        let admitted: Vec<u32> = match &caps.supported_steps {
+            StepSupport::Unconstrained => Vec::new(),
+            StepSupport::Exact(counts) => counts.clone(),
+            StepSupport::Range { min, max } => {
+                if min == max {
+                    vec![*min]
+                } else {
+                    vec![*min, *max]
+                }
+            }
+        };
+        for steps in admitted {
+            let mut r = base_request(profile);
+            r.steps = Some(steps);
+            if let Err(e) = g.validate(&r) {
+                return Err(format!(
+                    "validate-honesty[{id}]: advertised step count {steps} was rejected by validate(): {e}"
+                ));
+            }
+        }
+        // The smallest positive count the model does NOT admit. Searching for a GAP rather than
+        // always probing `ceiling + 1` keeps this meaningful for a model with a discontinuous menu
+        // (a range check would admit the gap but still refuse `ceiling + 1`). The search bound is
+        // `ceiling + 1`, which no constrained surface admits, so it always finds something.
+        let ceiling = caps.supported_steps.ceiling().unwrap_or(0) + 1;
+        if let Some(off) = (1..=ceiling).find(|s| !caps.supported_steps.admits(*s)) {
+            let mut r = base_request(profile);
+            r.steps = Some(off);
+            if g.validate(&r).is_ok() {
+                return Err(format!(
+                    "validate-honesty[{id}]: step count {off} is outside the advertised surface \
+                     {:?} but was accepted by validate() — an advertised step constraint that \
+                     admits other counts silently ignores the caller's `steps`",
+                    caps.supported_steps
+                ));
+            }
+        }
+    }
+
     // Negative: a size above max_size must be rejected — but only for providers whose contract
     // includes a size axis. Audio-lane providers (Modality::Audio) legitimately do NOT range-check
     // width/height: those fields are meaningless for audio, so a conformant audio model validates
@@ -926,7 +977,22 @@ pub fn check_progress_contract_with(
 /// steps (≤ 2), and produces no partial output.
 pub fn check_cancellation(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
     let mut req = base_request(profile);
-    req.steps = Some(profile.cancel_steps);
+    // `cancel_steps` is headroom, not a knob every model has (sc-19502). A model advertising a fixed
+    // schedule (`Capabilities::supported_steps`) refuses any other count, so handing it the profile's
+    // headroom value would fail `validate` and report a CANCELLATION defect for a step-count
+    // rejection. Fall back to the largest advertised count — it is the most headroom the model can
+    // legally be given, and for the distilled LTX schedule that is 8, well past the ≥ 3 this needs.
+    let caps = &g.descriptor().capabilities;
+    req.steps = Some(if caps.supported_steps.admits(profile.cancel_steps) {
+        profile.cancel_steps
+    } else {
+        // The most headroom the model can legally be given. For the distilled LTX schedule that is
+        // 8, well past the ≥ 3 this needs; for a ranged model the profile value is admitted, so
+        // this arm is only reached by an exact menu.
+        caps.supported_steps
+            .ceiling()
+            .unwrap_or(profile.cancel_steps)
+    });
     check_cancellation_with(g, &req)
 }
 

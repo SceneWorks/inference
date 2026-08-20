@@ -14,7 +14,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, AdapterSpec, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
+    Result, WeightsSource, BASE_SNAPSHOT_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -78,12 +78,21 @@ pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
             },
         ],
     };
+/// The declared prompt executions — field for field identical to candle-gen-krea's
+/// `PROMPT_EXECUTIONS`, the sc-9047 fail-loud admission posture on both lanes.
+///
+/// The two `length` caps are spelled as literals rather than as
+/// [`crate::text_encoder::tokenizer::MAX_TEXT_TOKENS`] / `MAX_EDIT_TOKENS` because the cross-backend
+/// contract gate compares these declarations as source text and does not resolve an identifier
+/// through another module, so naming the constant here reads as a divergence from candle's literal.
+/// The literals cannot drift from what the tokenizer enforces:
+/// `tokenizer::tests::declared_length_policy_matches_the_enforced_caps` asserts they are equal.
 pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
     mlx_gen::gen_core::EncoderPromptExecutionContract {
         purpose: "krea_t2i",
         template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3Vl,
         add_special_tokens: false,
-        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 1024 },
         padding: mlx_gen::gen_core::EncoderPromptPadding::None,
         prefix_trim: 34,
     },
@@ -91,7 +100,7 @@ pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract
         purpose: "krea_edit",
         template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
         add_special_tokens: false,
-        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 8192 },
         padding: mlx_gen::gen_core::EncoderPromptPadding::None,
         prefix_trim: 34,
     },
@@ -228,10 +237,8 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
-            supports_true_cfg: false,
             // Reference-image conditioning = img2img latent-init (epic 8588 slice A, sc-10135): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (see [`generate_impl`] → `generate_turbo_img2img_with_progress`). Turbo only; the
@@ -249,7 +256,6 @@ pub fn descriptor() -> ModelDescriptor {
             // point. The native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -257,28 +263,10 @@ pub fn descriptor() -> ModelDescriptor {
             // The turnkey ships pre-packed Q8/Q4 ([`crate::convert::assemble_quantized_snapshot`]);
             // load-time quantize over a dense bf16 build is a no-op on an already-packed snapshot.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

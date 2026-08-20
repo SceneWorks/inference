@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -79,7 +79,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
@@ -90,34 +89,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -437,6 +413,9 @@ impl Generator for BerniniRenderer {
         }
         // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095.
         validate_bernini_geometry(id, req)?;
+        // sc-20264 — the same per-clip knob refusal the `bernini` id runs; both providers take the
+        // same conditioning through the same encode path, so they must give the same answer.
+        crate::bernini::reject_unimplemented_video_clip_knobs(id, req)?;
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode with no source silently renders text-only; a text-only mode with a source drops it.
         let has_video = req

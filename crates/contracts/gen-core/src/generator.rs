@@ -1071,45 +1071,74 @@ impl GenerationRequest {
                 }
             }
         }
-        // Conditioning-carried floats the floor also owns (F-001): the Control-branch scale and the
-        // per-Reference img2img strength both flow into the same denoise/scheduler math.
+        // Conditioning-carried floats the floor also owns (F-001): every numeric a `Conditioning`
+        // variant carries flows into the same denoise / scheduler / mask math as the flat knobs.
+        //
+        // **This match is deliberately wildcard-free and guard-free** (sc-19571). It used to end in
+        // `_ => {}`, and that one arm is the whole reason the floor lagged the request surface: the
+        // exhaustive `Self { .. }` destructure above makes a new *field* break the build, but a new
+        // float-bearing `Conditioning` **variant** compiled clean and slipped straight past. Four
+        // did — `Keyframe.strength`, `VideoClip.strength`, `ControlClip.masking_strength` and every
+        // `ReduxRefs` per-ref strength — each of them a `1 − strength` denoise mask or a blend
+        // weight, i.e. exactly the math this method exists to protect. Guards are avoided for the
+        // same reason: `match` exhaustiveness ignores them, so a guarded arm re-opens the hole.
+        // Adding a variant now fails to compile here until its numerics are classified.
         for c in conditioning {
             match c {
-                Conditioning::Control { scale: Some(s), .. } if !s.is_finite() => {
-                    return Some(("conditioning.control.scale", *s));
+                Conditioning::Control { scale, .. } => {
+                    if let Some(s) = scale {
+                        if !s.is_finite() {
+                            return Some(("conditioning.control.scale", *s));
+                        }
+                    }
                 }
-                Conditioning::Reference {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.reference.strength", *s));
+                Conditioning::Reference { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference.strength", *s));
+                        }
+                    }
                 }
-                Conditioning::ReferenceAudio {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.reference_audio.strength", *s));
+                Conditioning::ReferenceAudio { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference_audio.strength", *s));
+                        }
+                    }
+                }
+                // A reference clip's declared rate (sc-17149). Not a cosmetic label: it is the
+                // divisor of the resample stride that picks which frames the model actually reads,
+                // so a NaN propagates into a frame-index computation rather than into denoise math
+                // — the same class of silent poisoning, one step earlier.
+                Conditioning::ReferenceVideo { fps, .. } => {
+                    if !fps.is_finite() {
+                        return Some(("conditioning.reference_video.fps", *fps));
+                    }
                 }
                 // The audio-edit strength and its region bounds all flow into the edit-window /
                 // blend math; a NaN would silently poison the region conversion or the strength
                 // gate (sc-12847).
                 Conditioning::AudioEdit {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.audio_edit.strength", *s));
-                }
-                Conditioning::AudioEdit {
-                    region: Some(r), ..
-                } if !r.start_secs.is_finite() => {
-                    return Some(("conditioning.audio_edit.region.start_secs", r.start_secs));
-                }
-                Conditioning::AudioEdit {
-                    region:
-                        Some(TimeRegion {
-                            end_secs: Some(end),
-                            ..
-                        }),
-                    ..
-                } if !end.is_finite() => {
-                    return Some(("conditioning.audio_edit.region.end_secs", *end));
+                    strength, region, ..
+                } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.audio_edit.strength", *s));
+                        }
+                    }
+                    if let Some(r) = region {
+                        if !r.start_secs.is_finite() {
+                            return Some((
+                                "conditioning.audio_edit.region.start_secs",
+                                r.start_secs,
+                            ));
+                        }
+                        if let Some(end) = r.end_secs {
+                            if !end.is_finite() {
+                                return Some(("conditioning.audio_edit.region.end_secs", end));
+                            }
+                        }
+                    }
                 }
                 // The multi-region carrier (sc-14549). Written as a **loop over every** region
                 // rather than as more `if`-guarded arms, and that difference is the whole point:
@@ -1144,12 +1173,61 @@ impl GenerationRequest {
                         }
                     }
                 }
-                Conditioning::VoiceEmbedding {
-                    strength: Some(s), ..
-                } if !s.is_finite() => {
-                    return Some(("conditioning.voice_embedding.strength", *s));
+                Conditioning::VoiceEmbedding { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.voice_embedding.strength", *s));
+                        }
+                    }
                 }
-                _ => {}
+                // sc-19571 — the four that the old `_ => {}` swallowed.
+                //
+                // A keyframe's `strength` is a `1 − strength` denoise mask on the pinned latent
+                // frame AND the per-token diffusion timestep for that frame's tokens (Wan TI2V,
+                // LTX). A NaN there does not merely mis-weight a pin: it makes the whole masked
+                // frame's timestep NaN, which the denoise then multiplies into every step.
+                Conditioning::Keyframe { strength, .. } => {
+                    if !strength.is_finite() {
+                        return Some(("conditioning.keyframe.strength", *strength));
+                    }
+                }
+                // An in-context clip's `strength` is the same `1 − strength` mask on appended
+                // conditioning tokens (LTX IC-LoRA, krea-realtime v2v).
+                Conditioning::VideoClip { strength, .. } => {
+                    if !strength.is_finite() {
+                        return Some(("conditioning.video_clip.strength", *strength));
+                    }
+                }
+                // `masking_strength` gates BOTH the pixel-space neutralization of the person region
+                // and the mask-injection step count (`ceil(steps · masking_strength)`), so a NaN
+                // reaches an integer step count as well as a blend weight.
+                Conditioning::ControlClip {
+                    masking_strength, ..
+                } => {
+                    if !masking_strength.is_finite() {
+                        return Some((
+                            "conditioning.control_clip.masking_strength",
+                            *masking_strength,
+                        ));
+                    }
+                }
+                // Per-reference Redux weights. A **loop**, for the `AudioEditRegions` reason above:
+                // checking only `refs[0]` would compile and pass, and a NaN in ref two would flow
+                // into the conditioning blend unseen.
+                Conditioning::ReduxRefs { refs } => {
+                    for (_, strength) in refs {
+                        if !strength.is_finite() {
+                            return Some(("conditioning.redux_refs.strength", *strength));
+                        }
+                    }
+                }
+                // Float-free carriers: media and opaque labels only. Named rather than swallowed by
+                // a wildcard so that adding a numeric to any of them breaks this match.
+                Conditioning::MultiReference { images: _ } => {}
+                Conditioning::Depth { image: _ } => {}
+                Conditioning::Mask { image: _ } => {}
+                Conditioning::VideoSync { frames: _ } => {}
+                Conditioning::ConversationHistory { turns: _ } => {}
             }
         }
         // Multi-phase denoise floats (sc-13884): each phase's guidance and each phase-adapter weight
@@ -1314,6 +1392,10 @@ pub fn default_seed() -> u64 {
 /// [`VideoClip`](Conditioning::VideoClip) / [`ControlClip`](Conditioning::ControlClip) is
 /// **keyframe-append** (append the clip's VAE latents as extra in-context tokens — extend_clip /
 /// video_bridge / replace_person, the IC-LoRA path).
+///
+/// [`Conditioning::ReferenceVideo`] (sc-17149) is a **third** video mechanism and not part of that
+/// pair: both epic-3040 mechanisms place their clip at an index in the generated timeline, and a
+/// reference has no such index at all — it conditions the render without appearing in it.
 #[derive(Clone, Debug)]
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
@@ -1326,6 +1408,66 @@ pub enum Conditioning {
     ReferenceAudio {
         audio: AudioTrack,
         strength: Option<f32>,
+    },
+    /// A reference **video** clip — the video analogue of [`Conditioning::Reference`] /
+    /// [`Conditioning::ReferenceAudio`], completing the reference triple (sc-17149). A motion and
+    /// camera reference the model conditions on, optionally carrying **its own soundtrack**.
+    ///
+    /// A reference has **no position in the generated timeline** — that is what separates it from
+    /// every other video-frame variant. It is not spliced into the output at an index, it does not
+    /// bind the output geometry, and it is not softened by a caller-supplied denoise mask; it is
+    /// encoded at its own resolution and packed as extra fully-pinned rows the denoise loop never
+    /// writes. Its placement comes from its **ordinal in the request's `conditioning` list**, which
+    /// is why that list is an ordered `Vec` and why reordering references is a different request.
+    ///
+    /// This is a **distinct variant**, deliberately not an overload of the two existing carriers:
+    ///
+    /// - It is **not** [`Conditioning::VideoClip`]. That is the LTX in-context *latent-append* path,
+    ///   whose whole contract is the two fields a reference cannot use: `frame_idx` (a position in
+    ///   the generated timeline) and `strength` (a `1 − strength` denoise mask). A reference has
+    ///   neither, so riding `VideoClip` means shipping a vocabulary in which two of three fields are
+    ///   constants a provider must reject — and it still cannot carry the two things a reference
+    ///   genuinely needs, `fps` and `audio`.
+    /// - It is **not** [`Conditioning::VideoSync`]. That is the Foley condition (sc-13436): frames
+    ///   an audio decoder attends to in order to score a *supplied silent clip*, explicitly "not
+    ///   spliced into a video latent". A reference video *is* VAE-encoded into latent rows and
+    ///   conditions a *generated* clip. Advertising `VideoSync` would advertise a Foley capability,
+    ///   and the kind is what routing reads.
+    ///
+    /// # `fps` is required data, not a hint
+    ///
+    /// A model resamples a reference onto its own frame rate by dropping and duplicating whole
+    /// frames, so a clip whose real rate was lost is conditioned on **at the wrong speed with
+    /// nothing to raise about it**. That is why the rate is a bare `f32` here rather than an
+    /// `Option` with a plausible default.
+    ///
+    /// This does **not** contradict the single-source-of-truth argument [`Conditioning::VideoSync`]
+    /// makes for reading the request-level [`GenerationRequest::fps`]: that field is the rate of the
+    /// *generated output*, whereas this one is the rate of *supplied input media*. For a variant
+    /// whose defining property is that it does not bind the output timeline, the two are genuinely
+    /// different quantities and a model may legally reject an output rate it happily accepts as an
+    /// input rate. Reusing `req.fps` for both would pin every reference to the output rate.
+    ///
+    /// # `audio` is the reference's own soundtrack
+    ///
+    /// `Some(track)` conditions on the clip's own soundtrack, aligned with its video rows and
+    /// sharing their origin on the model's rotary clock. This is **not** the same request as sending
+    /// the same waveform as a separate [`Conditioning::ReferenceAudio`], which is a *standalone*
+    /// reference occupying its own slot — a distinction models with per-modality reference caps also
+    /// count differently. `None` conditions on motion alone.
+    ///
+    /// A model opts in by advertising [`ConditioningKind::ReferenceVideo`] in
+    /// [`Capabilities::conditioning`]; the shared floor rejects the variant on a non-advertising
+    /// model as the typed [`Error::Unsupported`] (F-008), an empty `frames` as [`Error::Msg`], and a
+    /// non-finite `fps` through the same finiteness floor that owns every other conditioning float.
+    /// Per-model rate, resolution and cap bounds are layered by the provider's own `validate`.
+    ReferenceVideo {
+        frames: Vec<Image>,
+        /// **The rate `frames` actually carry** — see the variant docs.
+        fps: f32,
+        /// This clip's own soundtrack, conditioned on as the reference's own rather than as a
+        /// reference of its own. `None` conditions on motion alone.
+        audio: Option<AudioTrack>,
     },
     /// **Prompted source-audio editing** (sc-12847) — the audio analogue of the image lane's masked
     /// edit / inpaint conditioning ([`Conditioning::Mask`] and the region-carrying
@@ -1520,6 +1662,7 @@ impl Conditioning {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
+            Conditioning::ReferenceVideo { .. } => ConditioningKind::ReferenceVideo,
             Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
             Conditioning::AudioEditRegions { .. } => ConditioningKind::AudioEditRegions,
             Conditioning::VoiceEmbedding { .. } => ConditioningKind::VoiceEmbedding,
@@ -1564,6 +1707,12 @@ pub enum ConditioningKind {
     Reference,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
+    /// Motion/camera reference video, optionally with its own soundtrack
+    /// ([`Conditioning::ReferenceVideo`], sc-17149). A **distinct** kind from
+    /// [`VideoClip`](Self::VideoClip): a reference has no position in the generated timeline and no
+    /// denoise mask, so the two carry disjoint payloads and default-deny keeps every existing
+    /// in-context-clip provider from being handed a reference it would splice into the output.
+    ReferenceVideo,
     /// Prompted source-audio editing ([`Conditioning::AudioEdit`]).
     AudioEdit,
     /// **Multi-region** prompted source-audio editing ([`Conditioning::AudioEditRegions`],
@@ -1842,9 +1991,138 @@ pub enum StagedResidencyAvailability {
     UnconditionallyEngaged,
 }
 
-/// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
-/// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
-/// ..Default::default() }`).
+/// The denoise step counts a model can render — the ONE representation for every step-count
+/// shape the catalog has needed (sc-19559).
+///
+/// Three shapes accreted before this type existed: a **minimum** (SceneWorks'
+/// `limits.hardMinSteps`, sc-19426), an **exact set** (`supported_steps: Vec<u32>`, sc-19502),
+/// and a **ceiling**, which nothing could express at all — SVD's `MAX_STEPS = 200` lived only
+/// inside `mlx-gen-svd`'s and `candle-gen-svd`'s `validate`, so a consumer could not learn the
+/// bound without dispatching a job. Rather than adding a fourth key, the shapes collapse here:
+/// a model is unconstrained, pinned to an exact menu, or bounded by an inclusive range.
+///
+/// **Rejected alternatives.** A separate `max_steps: Option<u32>` beside the existing `Vec<u32>`
+/// was cheaper but lets a descriptor declare `supported_steps: [8]` *and* `max_steps: 4` — a
+/// contradiction only a cross-check could catch, and it leaves the minimum still unexpressible,
+/// so the next model needing a floor adds a fourth key. Extending `Vec<u32>` to enumerate
+/// `1..=200` as 200 elements is a set pretending to be a range: it makes the ceiling
+/// undiscoverable as a *bound*, and Kolors' `1..=1100` would be an 1100-element vector in every
+/// descriptor snapshot.
+///
+/// **Polarity.** [`Unconstrained`](Self::Unconstrained) is the `Default` and means **no
+/// constraint** — deliberately the opposite of [`Capabilities::samplers`], where empty means
+/// "reject any explicit value". A model opts *in* to being constrained. Inverting it would make
+/// a bare `Default::default()` refuse every step count in the repo.
+///
+/// Only an EXPLICIT `req.steps` is judged; `None` means "the model picks its baked default" and
+/// always passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StepSupport {
+    /// No advertised constraint: any count the shared sanity caps admit.
+    #[default]
+    Unconstrained,
+    /// The **only** legal counts. A distilled model bakes its σ waypoints into training, so the
+    /// step count is not a knob at all — LTX-2.3 runs a fixed 8-step stage-1 schedule
+    /// (`STAGE1_SIGMAS`, 9 waypoints) and cannot honor any other count without going
+    /// out-of-distribution.
+    ///
+    /// An empty set would refuse every count including the model's own default, which no model
+    /// wants; [`model_descriptor_errors`](crate::registry::model_descriptor_errors) rejects it as
+    /// a descriptor mistake.
+    Exact(Vec<u32>),
+    /// Any count in `min..=max`, inclusive on both ends. This is the shape a model with a real
+    /// engine bound has: SVD-XT's 200-step ceiling, ACE-Step's 200, MMAudio's 500, Kolors'
+    /// 1100 train timesteps.
+    ///
+    /// `min > max` is an unsatisfiable declaration and is rejected by
+    /// [`model_descriptor_errors`](crate::registry::model_descriptor_errors).
+    Range { min: u32, max: u32 },
+}
+
+impl StepSupport {
+    /// Whether this model can render exactly `steps` denoise steps.
+    pub fn admits(&self, steps: u32) -> bool {
+        match self {
+            Self::Unconstrained => true,
+            Self::Exact(counts) => counts.contains(&steps),
+            Self::Range { min, max } => (*min..=*max).contains(&steps),
+        }
+    }
+
+    /// The largest step count this model renders, or `None` when it advertises no ceiling.
+    ///
+    /// This is the weights-free ceiling read: a consumer sizing a Steps control asks the
+    /// descriptor rather than dispatching a job and reading the failure. An
+    /// [`Exact`](Self::Exact) menu's ceiling is its largest member; an empty menu has none.
+    pub fn ceiling(&self) -> Option<u32> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Exact(counts) => counts.iter().copied().max(),
+            Self::Range { max, .. } => Some(*max),
+        }
+    }
+
+    /// The smallest step count this model renders, or `None` when it advertises no floor.
+    ///
+    /// ⚠️ This is a **bound, not a default**. A consumer must not seed a Steps control with it:
+    /// omitting `steps` selects the model's own baked default, which is generally not the floor.
+    pub fn floor(&self) -> Option<u32> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Exact(counts) => counts.iter().copied().min(),
+            Self::Range { min, .. } => Some(*min),
+        }
+    }
+
+    /// Whether this advertises no step constraint at all (the `Default`).
+    pub fn is_unconstrained(&self) -> bool {
+        matches!(self, Self::Unconstrained)
+    }
+}
+
+/// What a model supports — drives `validate()` and consumer UI.
+///
+/// `Default` is "supports nothing"; a model **turns on only what it offers** and defers every
+/// other field, which is what makes adding a capability additive instead of a repo-wide compile
+/// break (sc-19561):
+///
+/// ```
+/// # use gen_core::Capabilities;
+/// Capabilities {
+///     supports_guidance: true,
+///     max_count: 1,
+///     ..Default::default()
+/// }
+/// # ;
+/// ```
+///
+/// This is not a style preference. Every descriptor in the workspace constructs `Capabilities`
+/// from another crate, so a new field lands in ~70 files at once unless each construction ends in
+/// `..Default::default()` (or another base). `#[non_exhaustive]` cannot enforce it — that
+/// attribute makes cross-crate construction impossible outright (E0639), and so does a private
+/// field (E0451) — so the invariant is enforced by the
+/// `capabilities_are_constructed_additively` integration test instead, which reads every `.rs`
+/// file in the workspace and fails on any `Capabilities { .. }` literal with no base expression.
+///
+/// # Measured cost of adding a field (sc-19561 AC1)
+///
+/// Demonstrated rather than asserted, on 2026-08-15: a scratch `pub scratch_ac1_demonstration:
+/// bool` was added here, both macOS lane sets were run, and it was removed again.
+///
+/// | | files touched | lines |
+/// |---|---|---|
+/// | at this revision | **1** (this one) | **1** |
+/// | at the pre-conversion parent `2225b5026` | 70 + this one | ≥ 75 |
+///
+/// `cargo check --locked --all-targets -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+/// -p mlx-gen -p 'mlx-gen-*'` and `cargo check --locked --all-targets --features metal
+/// -p 'candle-gen*' -p 'candle-audio*'` both exited **0 with zero errors and zero warnings** —
+/// nothing outside this file needed to change. The parent row is the counterfactual: a
+/// brace-matching parse of `2225b5026` finds **126 `Capabilities` literals, 74 of them
+/// exhaustive, across 70 files**, and each would have raised its own `E0063`.
+///
+/// Reproduce the parent count with the same parser the guard uses — it is the guard, run over a
+/// different revision.
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub supports_negative_prompt: bool,
@@ -1862,6 +2140,48 @@ pub struct Capabilities {
     pub min_size: u32,
     pub max_size: u32,
     pub max_count: u32,
+    /// The denoise step counts this model can render (sc-19502 for the exact menu, sc-19559 for
+    /// the range) — see [`StepSupport`] for the representation and the rejected alternatives.
+    ///
+    /// [`StepSupport::Unconstrained`] (the `Default`) means **no constraint**, deliberately the
+    /// opposite polarity to [`samplers`](Self::samplers) / [`audio_voices`](Self::audio_voices),
+    /// where empty means "no selectable surface, reject any explicit value". A model opts *in* to
+    /// being constrained.
+    ///
+    /// Constrained ⇒ an explicit `req.steps` outside the menu/range is rejected by the shared
+    /// floor. `None` on the request always passes: that is "use the model's baked default", not a
+    /// step count anyone chose. A declared bound is therefore **never a default** — read
+    /// [`StepSupport::floor`] as a bound only.
+    ///
+    /// # Why this is on `Capabilities` rather than in each provider's `validate`
+    ///
+    /// Distilled models bake their σ waypoints into training, so the step count is not a knob at
+    /// all — LTX-2.3 runs a fixed 8-step stage-1 schedule (`STAGE1_SIGMAS`, 9 waypoints) and
+    /// cannot honor any other count without going out-of-distribution. That constraint was
+    /// previously written as an ad-hoc `if` inside ONE lane's `validate`, which produced the exact
+    /// failure this field exists to prevent: `candle-gen-ltx` rejected `steps: 30` while
+    /// `mlx-gen-ltx` never read `req.steps` at all and silently rendered its baked 8-step schedule
+    /// anyway. Same model, same manifest entry, two behaviours, and the silent lane is the worse
+    /// one — a user-facing control that quietly does nothing (the sc-11993 silent-coercion class).
+    ///
+    /// Hanging it on the advertised surface fixes both halves at once: the two lanes now share ONE
+    /// enforcement site instead of two hand-maintained copies that already drifted, and a
+    /// weights-free consumer holding a `Capabilities` can finally discover the constraint by
+    /// inspection rather than by dispatching a job and reading the failure — the same
+    /// discoverability argument [`size_floor`](Self::size_floor) makes for the size axis.
+    ///
+    /// The same argument carries the ceiling (sc-19559): SVD-XT refuses `steps > 200` in both
+    /// lanes' `validate`, but nothing said so on the advertised surface, so the only way to learn
+    /// the bound was to dispatch a job. A [`StepSupport::Range`] declaration makes the shared
+    /// floor the enforcing site and the descriptor the discoverable one.
+    ///
+    /// # Conformance coupling
+    ///
+    /// `gen-core-testkit`'s `check_validate_honesty` validates at `profile.steps`, so a model
+    /// declaring a constraint must align its conformance `Profile` — LTX pins 8. A declaration
+    /// whose model default falls outside its own menu is a descriptor mistake
+    /// caught by [`model_descriptor_errors`](crate::registry::model_descriptor_errors).
+    pub supported_steps: StepSupport,
     pub mac_only: bool,
     /// How this model's size range is enforced — and therefore whether
     /// `min_size`/`max_size` are a bound a caller may rely on, plus any explicit-size grid the
@@ -2285,6 +2605,58 @@ impl Capabilities {
                 )));
             }
         }
+        // The advertised step surface — an exact menu (sc-19502) or an inclusive range (sc-19559).
+        // Distinct from the sanity cap above: that one is a footgun guard every model shares, this
+        // one is the model's own declaration, either that the step count is not a knob at all or
+        // that its engine bound is `min..=max`. `Unconstrained` is the `Default`, so this is inert
+        // for every model that does not opt in (see `Capabilities::supported_steps` for why the
+        // polarity is inverted relative to `samplers`).
+        //
+        // **Reject, never snap to the nearest legal count.** Quietly rewriting `steps: 30` to 8
+        // would deliver a render the caller did not ask for with no error and no signal — the
+        // silent-coercion class — and it is the precise defect this replaces: `mlx-gen-ltx` used to
+        // ignore `req.steps` outright and render its baked schedule regardless.
+        //
+        // Only an EXPLICIT count is judged. `None` means "the model picks", so there is nothing to
+        // refuse; that is what keeps the common path (omit `steps`, get the baked schedule) working
+        // and is why a distilled model is still usable without the caller knowing its magic number.
+        if let Some(steps) = req.steps {
+            if !self.supported_steps.admits(steps) {
+                return Err(Error::Msg(match &self.supported_steps {
+                    // Unreachable: `admits` is always true here, but spelling the arm keeps the
+                    // match exhaustive without an `unreachable!` on a request path.
+                    StepSupport::Unconstrained => format!("{id}: steps {steps} is not supported"),
+                    // Singular reads as the original per-provider message it replaces ("a fixed
+                    // 8-step schedule"), because one legal count is the case that actually ships;
+                    // the plural arm keeps the set readable rather than emitting "count(s)".
+                    StepSupport::Exact(counts) => {
+                        let schedule = match counts.as_slice() {
+                            [only] => format!("a fixed {only}-step schedule"),
+                            many => format!(
+                                "a fixed schedule ({} steps only)",
+                                many.iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" or ")
+                            ),
+                        };
+                        format!(
+                            "{id}: this distilled model runs {schedule} and cannot honor \
+                             steps={steps}; omit `steps` to use the baked schedule."
+                        )
+                    }
+                    // The advertised RANGE (sc-19559). Distinct from the shared sanity cap above:
+                    // that one is a footgun guard every model shares, this is the model's own
+                    // engine bound — SVD-XT's 200, Kolors' 1100 train timesteps — which used to
+                    // live only inside a provider `validate` and so was undiscoverable
+                    // weights-free.
+                    StepSupport::Range { min, max } => format!(
+                        "{id}: steps {steps} is outside this model's supported range \
+                         {min}..={max}; omit `steps` to use the model's default."
+                    ),
+                }));
+            }
+        }
         if let Some(frames) = req.frames {
             if frames > MAX_FRAMES {
                 return Err(Error::Msg(format!(
@@ -2648,6 +3020,30 @@ impl Capabilities {
                     return Err(Error::Msg(format!(
                         "{id}: VideoSync conditioning carries no frames — a video→audio clip must \
                          have at least one frame"
+                    )));
+                }
+            }
+        }
+        // A reference clip (sc-17149) must carry frames, and must carry the rate they were shot at.
+        // The rate is checked for **positivity** here and not only finiteness, unlike every other
+        // conditioning float the floor owns: those feed denoise math where 0.0 is a meaningful
+        // (inert) value, whereas a rate of 0 or below has no reading at all — it makes the resample
+        // stride undefined or negative, and the frames a model would then read are arbitrary rather
+        // than merely unweighted. Per-model rate *bounds* stay with the provider, which knows what
+        // it resamples onto.
+        for c in &req.conditioning {
+            if let Conditioning::ReferenceVideo { frames, fps, .. } = c {
+                if frames.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "{id}: ReferenceVideo conditioning carries no frames — a reference clip \
+                         must have at least one frame"
+                    )));
+                }
+                if !fps.is_finite() || *fps <= 0.0 {
+                    return Err(Error::Msg(format!(
+                        "{id}: ReferenceVideo conditioning declares a frame rate of {fps} — a \
+                         reference clip is resampled from the rate it carries, so the rate must be \
+                         a positive finite number"
                     )));
                 }
             }
@@ -3671,6 +4067,185 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    /// sc-19502 — the exact-step surface refuses an off-schedule count, admits every count it
+    /// advertises, and admits `None`.
+    ///
+    /// The `None` half is the load-bearing one: it is what keeps "omit `steps`, get the baked
+    /// schedule" working, and inverting it would break every caller of a distilled model who does
+    /// not know its magic number.
+    #[test]
+    fn advertised_supported_steps_reject_every_off_schedule_count() {
+        let distilled = Capabilities {
+            supported_steps: StepSupport::Exact(vec![8]),
+            ..caps()
+        };
+        let at = |steps: Option<u32>| {
+            distilled.validate_request(
+                "ltx_2_3",
+                &GenerationRequest {
+                    steps,
+                    ..base_req()
+                },
+            )
+        };
+
+        // Admitted: the advertised count, and "the model picks".
+        assert!(at(Some(8)).is_ok(), "the advertised count must be admitted");
+        assert!(
+            at(None).is_ok(),
+            "an omitted count must use the baked schedule, not be refused"
+        );
+
+        // Refused on BOTH sides of the advertised value — a floor-shaped guard would let 30 through,
+        // which is the precise half `limits.hardMinSteps` could not express (sc-19426).
+        for steps in [1, 4, 7, 9, 30] {
+            let err = at(Some(steps)).unwrap_err().to_string();
+            assert!(
+                err.contains("ltx_2_3")
+                    && err.contains(&format!("steps={steps}"))
+                    && err.contains("8"),
+                "the refusal must name the model, the request and the legal value: {err}"
+            );
+        }
+    }
+
+    /// sc-19502 — the polarity guard. Empty `supported_steps` is NO constraint, so every descriptor
+    /// that never opts in is byte-identical to before the field existed.
+    ///
+    /// Deliberately its own test rather than an assertion inside the one above: this is the
+    /// property that makes the field safe to add to a 128-descriptor repo, and if it regressed, a
+    /// bare `Default::default()` would refuse every step count in the workspace.
+    #[test]
+    fn an_unconstrained_model_admits_every_step_count_the_sanity_caps_admit() {
+        let c = caps();
+        assert!(
+            c.supported_steps.is_unconstrained(),
+            "the default must be unconstrained"
+        );
+        for steps in [1, 2, 8, 30, MAX_STEPS] {
+            assert!(
+                c.validate_request(
+                    "m",
+                    &GenerationRequest {
+                        steps: Some(steps),
+                        ..base_req()
+                    }
+                )
+                .is_ok(),
+                "an undeclared model must still admit {steps} steps"
+            );
+        }
+    }
+
+    /// sc-19502 — a multi-value schedule is a SET, not a range: the gap between two advertised
+    /// counts is refused.
+    ///
+    /// Pins the shape choice. A future distilled model with two baked schedules can declare both
+    /// without the guard degrading into "anything between the smallest and largest".
+    #[test]
+    fn supported_steps_is_a_set_not_a_range() {
+        let two_schedules = Capabilities {
+            supported_steps: StepSupport::Exact(vec![4, 8]),
+            ..caps()
+        };
+        let at = |steps: u32| {
+            two_schedules.validate_request(
+                "m",
+                &GenerationRequest {
+                    steps: Some(steps),
+                    ..base_req()
+                },
+            )
+        };
+        assert!(at(4).is_ok());
+        assert!(at(8).is_ok());
+        let gap = at(6)
+            .expect_err("6 sits between the two schedules and belongs to neither")
+            .to_string();
+        // The plural arm names every legal count, so the caller can pick one rather than guess.
+        assert!(
+            gap.contains("4 or 8") && gap.contains("steps=6"),
+            "the multi-schedule refusal must list the legal counts: {gap}"
+        );
+    }
+
+    /// sc-19559 — the ceiling. SVD-XT's `MAX_STEPS = 200` used to live only inside the two SVD
+    /// providers' `validate`; the shared floor now enforces the advertised range, and refuses on
+    /// BOTH ends of it.
+    ///
+    /// The `200` boundary pair is the load-bearing part: an off-by-one that made the range
+    /// exclusive would refuse the model's own top count, and one that never fired would admit
+    /// `201` — asserting only the far-outside `10_000` would catch neither.
+    #[test]
+    fn an_advertised_step_range_refuses_both_ends_and_admits_the_interior() {
+        let bounded = Capabilities {
+            supported_steps: StepSupport::Range { min: 2, max: 200 },
+            ..caps()
+        };
+        let at = |steps: Option<u32>| {
+            bounded.validate_request(
+                "svd_xt",
+                &GenerationRequest {
+                    steps,
+                    ..base_req()
+                },
+            )
+        };
+
+        for ok in [2, 3, 25, 199, 200] {
+            assert!(at(Some(ok)).is_ok(), "{ok} is inside 2..=200 and must pass");
+        }
+        assert!(
+            at(None).is_ok(),
+            "an omitted count must use the model's default, not be refused"
+        );
+
+        for bad in [1, 201, 10_000] {
+            let err = at(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("svd_xt") && err.contains(&bad.to_string()) && err.contains("2..=200"),
+                "the refusal must name the model, the request and the legal range: {err}"
+            );
+        }
+    }
+
+    /// sc-19559 — the ceiling is readable from the descriptor, which is the whole point: a
+    /// consumer must not have to dispatch a job to learn the bound.
+    ///
+    /// Also pins that a bound is NOT a default: `floor()` is the smallest legal count, and the
+    /// step count a request omitting `steps` actually gets is the model's own baked default,
+    /// which the capability surface deliberately does not carry.
+    #[test]
+    fn a_declared_bound_is_readable_and_is_not_a_default() {
+        assert_eq!(StepSupport::Unconstrained.ceiling(), None);
+        assert_eq!(StepSupport::Unconstrained.floor(), None);
+
+        let range = StepSupport::Range { min: 2, max: 200 };
+        assert_eq!(range.ceiling(), Some(200));
+        assert_eq!(range.floor(), Some(2));
+
+        // An exact menu's ceiling is its largest member, not its declaration order.
+        let menu = StepSupport::Exact(vec![8, 4]);
+        assert_eq!(menu.ceiling(), Some(8));
+        assert_eq!(menu.floor(), Some(4));
+
+        // A model that declares a bound still renders its own default when `steps` is omitted —
+        // the floor never substitutes the bound for the missing value.
+        let bounded = Capabilities {
+            supported_steps: range,
+            ..caps()
+        };
+        let req = GenerationRequest {
+            steps: None,
+            ..base_req()
+        };
+        assert!(bounded.validate_request("m", &req).is_ok());
+        assert_eq!(
+            req.steps, None,
+            "validation must not seed `steps` from a bound"
+        );
     }
 
     #[test]
@@ -5053,6 +5628,238 @@ mod tests {
             "empty VideoSync frames → Msg, got {err:?}"
         );
         assert!(err.to_string().contains("carries no frames"));
+    }
+
+    // ---- Reference video conditioning (sc-17149) -------------------------------------------
+
+    /// A video model that admits the `ReferenceVideo` kind.
+    fn ref_video_caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::ReferenceVideo],
+            max_count: 1,
+            min_size: 8,
+            max_size: 2048,
+            ..Default::default()
+        }
+    }
+
+    /// A reference-video request. `fps` is on the **variant** (the clip's own rate), and the
+    /// request's own `fps` is deliberately left unset — the two are different quantities.
+    fn ref_video_req(frame_count: usize, fps: f32, audio: Option<AudioTrack>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "the same subject, new scene".into(),
+            width: 64,
+            height: 64,
+            conditioning: vec![Conditioning::ReferenceVideo {
+                frames: (0..frame_count).map(|_| img(8, 8)).collect(),
+                fps,
+                audio,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reference_video_maps_to_its_own_kind() {
+        // Distinct from every other video-frame carrier. If this ever collapsed onto VideoClip, an
+        // in-context-clip provider would start receiving references it would splice into the output.
+        let req = ref_video_req(3, 30.0, None);
+        assert_eq!(req.conditioning[0].kind(), ConditioningKind::ReferenceVideo);
+        // And it is not collected by the epic-3040 in-context accessors: a reference has no position
+        // in the generated timeline, so it is not an extend_clip / keyframe / replace_person input.
+        assert!(req.video_clips().is_empty());
+        assert!(req.control_clip().is_none());
+        assert!(req.keyframes().is_empty());
+    }
+
+    #[test]
+    fn reference_video_accepted_when_advertised() {
+        let c = ref_video_caps();
+        c.validate_request("refvid", &ref_video_req(4, 30.0, None))
+            .expect("an advertised reference clip is legal");
+        // Carrying its own soundtrack changes nothing at the floor — the pairing rules that do
+        // exist are per-model and layered by the provider's own validate.
+        c.validate_request("refvid", &ref_video_req(4, 24.0, Some(track())))
+            .expect("a reference clip with its own soundtrack is legal");
+    }
+
+    #[test]
+    fn reference_video_unsupported_on_a_non_advertising_model() {
+        // F-008: default-deny. A provider that advertises the in-context clip kind but not the
+        // reference kind must still reject a reference — this is the arm that makes the two kinds
+        // worth separating in the first place.
+        let c = Capabilities {
+            conditioning: vec![ConditioningKind::VideoClip],
+            max_count: 1,
+            min_size: 8,
+            max_size: 2048,
+            ..Default::default()
+        };
+        let err = c
+            .validate_request("ltx", &ref_video_req(2, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "un-advertised ReferenceVideo → typed Unsupported, got {err:?}"
+        );
+        // The capability verdict outranks a payload-*shape* problem: an empty reference on a model
+        // that does not admit the kind is still `Unsupported`, because the caller's first problem is
+        // that this model cannot do this at all.
+        let err = c
+            .validate_request("ltx", &ref_video_req(0, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "capability gap outranks payload shape, got {err:?}"
+        );
+        // The finiteness floor is the one exception, and it is deliberate and pre-existing: it runs
+        // ahead of the conditioning allowlist for *every* float in the request, so a NaN rate is
+        // reported as the non-finite float it is even on a model that would have refused the kind.
+        // Pinned here so a future reordering of the floor is a visible decision rather than a
+        // silent change of which error a caller sees.
+        let err = c
+            .validate_request("ltx", &ref_video_req(2, f32::NAN, None))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Msg(m) if m.contains("conditioning.reference_video.fps")),
+            "the finiteness floor precedes the allowlist, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reference_video_empty_frames_is_a_msg_range_error() {
+        let c = ref_video_caps();
+        let err = c
+            .validate_request("refvid", &ref_video_req(0, 24.0, None))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "empty ReferenceVideo frames → Msg, got {err:?}"
+        );
+        assert!(err.to_string().contains("carries no frames"));
+    }
+
+    #[test]
+    fn reference_video_rejects_a_rate_that_has_no_reading() {
+        // Zero and negative are refused as well as non-finite, and that is deliberate: a rate is the
+        // divisor of a resample stride, so unlike every other conditioning float 0.0 is not a
+        // meaningful inert value here — it makes the set of frames the model reads arbitrary.
+        let c = ref_video_caps();
+        for bad in [0.0f32, -24.0, f32::NAN, f32::INFINITY] {
+            let err = c
+                .validate_request("refvid", &ref_video_req(2, bad, None))
+                .unwrap_err();
+            assert!(matches!(err, Error::Msg(_)), "fps {bad} → Msg, got {err:?}");
+        }
+        // A legal rate on the same shape passes, so the loop above is not passing because the
+        // request is malformed for some unrelated reason.
+        c.validate_request("refvid", &ref_video_req(2, 30.0, None))
+            .expect("30 fps is a legal rate");
+    }
+
+    #[test]
+    fn reference_video_rate_joins_the_finiteness_floor() {
+        // The floor is a separate mechanism from validate()'s range check above, and it names the
+        // offending field. Both must cover the rate: the floor is what providers reading the
+        // conditioning directly rely on.
+        let (field, value) = ref_video_req(2, f32::NAN, None)
+            .first_nonfinite_float()
+            .expect("NaN fps must be caught");
+        assert_eq!(field, "conditioning.reference_video.fps");
+        assert!(value.is_nan());
+        assert!(ref_video_req(2, 30.0, None)
+            .first_nonfinite_float()
+            .is_none());
+    }
+
+    /// sc-19571 — the four conditioning floats the old `_ => {}` arm swallowed.
+    ///
+    /// Each of these is a `1 − strength` denoise mask or a blend weight, i.e. the same math the
+    /// floor already protected on `Reference` — they were missed only because the conditioning
+    /// `match` ended in a wildcard, so a new float-bearing variant compiled clean. The wildcard is
+    /// gone; this test is what proves the four arms that replaced it actually fire.
+    ///
+    /// Mutation guard: delete any ONE of the four arms and exactly one sub-assertion below goes
+    /// red — they are checked individually, not as a batch.
+    #[test]
+    fn keyframe_video_clip_control_clip_and_redux_floats_join_the_finiteness_floor() {
+        let with = |c: Conditioning| GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+
+        let (field, value) = with(Conditioning::Keyframe {
+            image: img(8, 8),
+            frame_idx: 0,
+            strength: f32::NAN,
+        })
+        .first_nonfinite_float()
+        .expect("NaN keyframe strength must be caught");
+        assert_eq!(field, "conditioning.keyframe.strength");
+        assert!(value.is_nan());
+
+        let (field, value) = with(Conditioning::VideoClip {
+            frames: vec![img(8, 8)],
+            frame_idx: 0,
+            strength: f32::INFINITY,
+        })
+        .first_nonfinite_float()
+        .expect("infinite clip strength must be caught");
+        assert_eq!(field, "conditioning.video_clip.strength");
+        assert!(value.is_infinite());
+
+        let (field, value) = with(Conditioning::ControlClip {
+            frames: vec![img(8, 8)],
+            mask: vec![img(8, 8)],
+            masking_strength: f32::NAN,
+            start_frame: 0,
+            mode: ReplacementMode::FaceOnly,
+        })
+        .first_nonfinite_float()
+        .expect("NaN masking_strength must be caught");
+        assert_eq!(field, "conditioning.control_clip.masking_strength");
+        assert!(value.is_nan());
+
+        // The bad value sits in ref **two** — a guard that only reached `refs[0]` would compile and
+        // pass every other assertion here (the `AudioEditRegions` lesson, applied).
+        let (field, value) = with(Conditioning::ReduxRefs {
+            refs: vec![(img(8, 8), 0.5), (img(8, 8), f32::NAN)],
+        })
+        .first_nonfinite_float()
+        .expect("NaN in the SECOND redux ref must be caught");
+        assert_eq!(field, "conditioning.redux_refs.strength");
+        assert!(value.is_nan());
+
+        // Finite values on all four pass cleanly — the floor rejects non-finiteness, not the knob.
+        let clean = GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: img(8, 8),
+                    frame_idx: -1,
+                    strength: 0.25,
+                },
+                Conditioning::VideoClip {
+                    frames: vec![img(8, 8)],
+                    frame_idx: 0,
+                    strength: 0.75,
+                },
+                Conditioning::ControlClip {
+                    frames: vec![img(8, 8)],
+                    mask: vec![img(8, 8)],
+                    masking_strength: 0.5,
+                    start_frame: 0,
+                    mode: ReplacementMode::FaceOnly,
+                },
+                Conditioning::ReduxRefs {
+                    refs: vec![(img(8, 8), 0.5), (img(8, 8), 0.25)],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(clean.first_nonfinite_float().is_none());
+        assert!(clean.ensure_finite_floats().is_ok());
     }
 
     /// sc-13884: the default request carries no phases (single-phase, byte-for-byte the pre-13884

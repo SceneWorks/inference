@@ -515,6 +515,7 @@ dependencies = [
  "candle-gen-lens",
  "candle-gen-ltx",
  "candle-gen-mage",
+ "candle-gen-minimax-h3",
  "candle-gen-mochi",
  "candle-gen-pid",
  "candle-gen-pulid",
@@ -744,6 +745,22 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-minimax-h3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-boogu",
+ "half",
+ "image",
+ "rand",
+ "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -2217,6 +2234,7 @@ dependencies = [
  "mlx-gen-lens",
  "mlx-gen-ltx",
  "mlx-gen-mage",
+ "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
  "mlx-gen-pid",
  "mlx-gen-pulid",
@@ -2422,6 +2440,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-minimax-h3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-boogu",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]

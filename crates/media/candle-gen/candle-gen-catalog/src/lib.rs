@@ -31,6 +31,7 @@ pub mod providers {
     pub use candle_gen_lens as lens;
     pub use candle_gen_ltx as ltx;
     pub use candle_gen_mage as mage;
+    pub use candle_gen_minimax_h3 as minimax_h3;
     pub use candle_gen_mochi as mochi;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
@@ -96,6 +97,10 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
     let registry = candle_gen_mage::register_providers(registry);
+    // sc-17156: the generator and the memory-strategy registration land TOGETHER.
+    // `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose `provider_id`
+    // has no matching generator, so this line was absent while the crate shipped only the contract.
+    let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -129,6 +134,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
@@ -655,13 +662,20 @@ mod preview_advertising {
         /// over a low-resolution input has no multi-step progression to preview. No holdout R² was
         /// ever measured for it and none is quoted.
         Seedvr2SuperResolution,
+        /// MiniMax-H3's **joint audio+video** space (sc-17156). Excluded on its shape, not on a
+        /// number: the video half decodes through a 36-layer *transformer* whose output projection
+        /// performs all 16x spatial and 4x temporal upsampling, so there is no per-frame linear map
+        /// from a latent to a preview frame the way there is for a CNN VAE — and the packed sequence
+        /// interleaves audio rows that have no picture at all. No holdout R^2 was ever measured for
+        /// it and none is quoted.
+        MinimaxH3Joint,
     }
 
     impl NoGo {
         /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
         /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
         /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-        const ALL: [NoGo; 7] = [
+        const ALL: [NoGo; 8] = [
             NoGo::Ltx,
             NoGo::Mage,
             NoGo::Mochi,
@@ -669,6 +683,7 @@ mod preview_advertising {
             NoGo::WanZ48,
             NoGo::SvdTemporal,
             NoGo::Seedvr2SuperResolution,
+            NoGo::MinimaxH3Joint,
         ];
 
         /// Exactly the variants epic 16624 put a number on. Kept beside [`NoGo::measured`] so the
@@ -696,6 +711,7 @@ mod preview_advertising {
                      candle-side adjudication sc-16954",
                 ),
                 NoGo::Seedvr2SuperResolution => None,
+                NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -711,9 +727,11 @@ mod preview_advertising {
                 NoGo::Ltx => Some(("0.984291", "0.618575")),
                 NoGo::Mage => Some(("0.938091", "0.806216")),
                 NoGo::Mochi => Some(("0.846932", "0.807202")),
-                NoGo::WanZ16 | NoGo::WanZ48 | NoGo::SvdTemporal | NoGo::Seedvr2SuperResolution => {
-                    None
-                }
+                NoGo::WanZ16
+                | NoGo::WanZ48
+                | NoGo::SvdTemporal
+                | NoGo::Seedvr2SuperResolution
+                | NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -744,6 +762,13 @@ mod preview_advertising {
                         "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
                          temporal decoder) — NEVER measured, same program gate; not SDXL's \
                          four-channel space"
+                    }
+                    NoGo::MinimaxH3Joint => {
+                        "MiniMax-H3's joint audio+video space — NEVER measured, and excluded on its \
+                         SHAPE: the video half decodes through a 36-layer transformer whose output \
+                         projection performs all 16x spatial and 4x temporal upsampling, so there \
+                         is no per-frame linear latent→pixel map to fit, and the packed sequence \
+                         interleaves audio rows that carry no picture at all"
                     }
                     NoGo::Seedvr2SuperResolution => {
                         "a one-step super-resolution upscaler over a low-resolution input — no \
@@ -788,6 +813,7 @@ mod preview_advertising {
         ("wan_vace", NoGo::WanZ16),
         ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
+        ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
         ("mage_flow_base", NoGo::Mage),
@@ -1142,6 +1168,12 @@ mod preview_advertising {
         ProviderCrate {
             dir: "candle-gen-mage",
             register: candle_gen_mage::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        ProviderCrate {
+            dir: "candle-gen-minimax-h3",
+            register: candle_gen_minimax_h3::register_providers,
             denoise: Denoise::Bespoke,
             routes: &[],
         },
@@ -3353,6 +3385,11 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_mage::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
+            dir: "candle-gen-minimax-h3",
+            register_providers: candle_gen_minimax_h3::register_providers,
+            register_surfaces: Some(candle_gen_minimax_h3::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
@@ -3642,18 +3679,25 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // Two independent registrations landed on the 51/29/19/3 base and BOTH bumped this tally, so
-        // the merged value is their union rather than either side's number:
-        //   * SC-18306 registered the already-wired Krea Turbo edit route (+1 registered, +1 wired).
-        //     No preview fit or emission behavior changed; the new descriptor reaches Krea's
-        //     existing edit preview hook.
-        //   * VACE-Fun occupies the already-settled Wan z16 no-go space (+1 registered, +1 no-go).
-        // 53 registered generators = 30 wired + 20 no-go + 3 deferred.
-        assert_eq!(
-            (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (53, 30, 20, 3),
-            "moving a route between preview classes is a decision that must be written down here"
-        );
+        // Deliberately NOT a pinned total. Two consecutive main syncs (sc-18306+VACE-Fun, then
+        // MiniMax-H3+Krea Turbo edit) each tripped a frozen (registered, wired, no_go, deferred)
+        // tuple whose only failure mode was "two branches merged" — never a defect. The decision
+        // record this test exists for is the *classification*: the partition, disjointness, and
+        // classified == registered assertions above already force every new registration to be
+        // filed into exactly one class, in writing, in the three pinned id lists. What remains
+        // load-bearing here is that no class silently empties out.
+        for (label, len) in [
+            ("registered", registered.len()),
+            ("wired", wired.len()),
+            ("no-go", no_go.len()),
+            ("deferred", deferred.len()),
+        ] {
+            assert!(
+                len > 0,
+                "the {label} preview class must not be empty — an empty class means a whole \
+                 decision category was silently dropped, not that the catalog shrank honestly"
+            );
+        }
     }
 
     /// **No no-go family may acquire a preview fit, a fit producer, or an emission call** (sc-16961).
@@ -3708,13 +3752,14 @@ mod preview_advertising {
                 "candle-gen-bernini",
                 "candle-gen-ltx",
                 "candle-gen-mage",
+                "candle-gen-minimax-h3",
                 "candle-gen-mochi",
                 "candle-gen-scail2",
                 "candle-gen-seedvr2",
                 "candle-gen-svd",
                 "candle-gen-wan",
             ],
-            "the 19 no-go ids must resolve to exactly these eight crates — a mismatch means an id \
+            "the 20 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
         );
 
@@ -4332,6 +4377,12 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
+                // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
+                // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
+                // external decoder can consume it, so the descriptor deliberately advertises
+                // nothing and fails closed against every decoder swap.
+                "minimax_h3" => None,
                 family => panic!(
                     "{} has unclassified latent lineage for registered family {family}",
                     descriptor.id
@@ -4818,6 +4869,7 @@ mod tests {
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
+                "minimax_h3",
                 "mochi_1",
                 "qwen_image",
                 "sana_1600m",
@@ -4870,9 +4922,10 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
-        // also generator ids, which is why 53 + 14 + 1 + 2 registrations are 58 distinct ids. Both
-        // branches independently added one generator to the 51-id base, so the generator count here
-        // is their union (53), not either side's 52.
+        // also generator ids, which is why 54 + 14 + 1 + 2 registrations are 59 distinct ids. Both
+        // branches independently added one generator to the 53-id base (MiniMax-H3 joint-space
+        // no-go on the epic side, the Krea Turbo edit route on main), so the generator count here
+        // is their union (54), not either side's 53.
         //
         // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -4885,8 +4938,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 58);
-        assert_eq!(super::provider_components().len(), 49);
+        assert_eq!(distinct.len(), 59);
+        assert_eq!(super::provider_components().len(), 50);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

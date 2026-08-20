@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -251,7 +251,6 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // (no CFG, no negative branch).
             supports_negative_prompt: cfg,
             supports_guidance: cfg,
-            supports_true_cfg: false,
             // img2img reference-guided latent-init (sc-11784): a single `Conditioning::Reference` seeds
             // the denoise from the VAE-encoded reference (`render` + `encode_reference`) — real CFG
             // (Large/Medium) or the distilled loop (Turbo) over the reduced `start_step..` σ tail. NOT
@@ -263,40 +262,20 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            mac_only: false,
             // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
             // VAE stay dense. All three variants share the quant path.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
             // pipeline, so it does not require the loader to pre-shift.
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
             // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
             // for the lane enumeration and the reused epic-16624 16-channel fit.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

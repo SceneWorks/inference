@@ -638,15 +638,18 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 33 since sc-18325 added the three correctness-only decode-quality jobs;
+        # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
+        # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
-        # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job
-        # (28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
+        # 29 since sc-18249 added the `mlx-sana-drift-ceiling` job;
+        # 28 since sc-15520 added the `mlx-chroma-memory-ladder` job;
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 33,
-        WINDOWS_HUB_LOCK: 10,
+        MACOS_HUB_LOCK: 34,
+        # 11 since sc-18932 added the `candle-minimax-h3` job.
+        WINDOWS_HUB_LOCK: 11,
+        # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
@@ -897,8 +900,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 33)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 10)
+        # 34 / 11 after the sc-17137 main sync: sc-18932 added `mlx-minimax-h3` and
+        # `candle-minimax-h3` (one materialize step each) on top of main's decode-quality and Krea
+        # license lanes. These counts are the anti-drift half of the policy above: the shape checks
+        # pass on a job that installs nothing, so only a count notices a lane that quietly stopped
+        # materializing its snapshot. Bump them when you add or remove a lane.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 34)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 11)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -2603,8 +2611,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         hours.
         """
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        start = workflow.index("  mlx-krea-realtime-s18-sweep:")
-        job = workflow[start : workflow.index("\n  candle-audio-kokoro:", start)]
+        # Bounded by the job map, not by the NAME OF THE NEXT JOB. The hard-coded
+        # `candle-audio-kokoro` anchor this used to carry silently swallowed any job inserted
+        # between the two, which is exactly what happened when sc-18932 added `mlx-minimax-h3`
+        # there: the sweep's body then contained a scheduled lane's `if:` and the
+        # dispatch-only assertion below failed against a job it was never describing.
+        job = "\n".join(workflow_job_bodies(workflow)["mlx-krea-realtime-s18-sweep"])
 
         self.assertIn("krea-s18-sweep", workflow.split("jobs:", 1)[0])
         self.assertIn(
@@ -3145,6 +3157,283 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("github.event_name == 'schedule'", producers)
         self.assertIn("actions/upload-artifact", producers)
         self.assertIn("if-no-files-found: error", producers)
+
+    def test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count(self) -> None:
+        """sc-18932: the MiniMax-H3 lanes must select tests that EXIST and are still `#[ignore]`d.
+
+        The defect this closes was not a vacuous green -- `MINIMAX_H3_SNAPSHOT` was read by ~30
+        `#[ignore]`d tests across both backends and referenced by no workflow, so they simply ran
+        nowhere. Wiring a lane is only half the fix, because a lane can go on naming a test that no
+        longer exists: with `--exact` after the `--` a rename yields `0 passed; N filtered out` and
+        cargo EXITS 0, and the run-count assertion in the step catches that only when the weekly
+        schedule fires. This binds the two sides on every PR instead.
+
+        Three properties, each of which would otherwise fail silently or late:
+
+        1. every name the workflow selects is a `fn` in that crate's `tests/real_weights.rs` -- a
+           rename on either side is a red here, not a quiet loss of coverage next Monday;
+        2. every selected test is still `#[ignore]`d, because one that stops being ignored would be
+           filtered OUT by the `--ignored` flag the step passes and report `0 passed`;
+        3. `--exact` after the `--`, one `set -o pipefail` per cargo step, and one run-count
+           assertion per selection -- the sc-17250 false-green shape.
+        """
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        repository = REAL_WEIGHTS_WORKFLOW.parents[2]
+        # job -> the (source file, selected names) pairs it draws from. A job may select out of more
+        # than ONE test binary: sc-17156 added the VRAM probe, which lives in its own `vram_probe.rs`
+        # rather than in `real_weights.rs`, and binding it here is what stops that selection from
+        # silently rotting the way the sc-18932 orphans did.
+        selected = {
+            "mlx-minimax-h3": (
+                (
+                    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/real_weights.rs",
+                    (
+                        # Header/config only -- no weight I/O, no Metal.
+                        "declared_tensor_names_match_the_published_checkpoint",
+                        # sc-19445. The key-set proof above cannot see a tensor read at the wrong
+                        # LEVEL; this derives all 118 encode shapes from the config and judges them
+                        # against the published headers. The committed fixture cannot: it is a
+                        # four-level 32-channel toy whose spatial and temporal downsample factor
+                        # lists are the SAME list, so a level predicate that reads the wrong one of
+                        # them is the identity there and mis-strides the shipped six-level stack.
+                        "declared_encoder_shapes_match_the_published_checkpoint",
+                        "declared_audio_tensor_names_match_the_published_checkpoint",
+                        "published_audio_configs_reproduce_the_declared_geometry",
+                        "te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable",
+                        "real_tokenizer_resolves_the_minimax_special_tokens",
+                        # Decodes: ~10 GB and ~0.6 GB resident on MLX.
+                        "real_weight_decode_produces_a_plausible_video",
+                        "real_weight_multi_chunk_decode_blends_the_seam",
+                        "real_weight_audio_decode_produces_a_plausible_stereo_track",
+                        # The sc-18740 layout gate -- the ONLY test in either backend that compares
+                        # against an independent implementation on the published bytes.
+                        "real_weight_decode_matches_the_official_diffusers_vae",
+                        # sc-19445 / sc-19438 -- the other two comparisons against an independent
+                        # implementation, each behind its own fail-closed operator-artifact check.
+                        # The ENCODE half had no real-weight gate at all between sc-17148 and
+                        # sc-19445. The conditioner's gate existed but asserted on an artifact that
+                        # had never been produced, so this lane could not run it: absent variable
+                        # meant hard failure and set variable meant nothing to point it at.
+                        "real_weight_encode_matches_the_official_diffusers_vae",
+                        "real_weight_te_context_matches_the_official_conditioner",
+                    ),
+                ),
+                (
+                    # sc-17151's staged-residency tripwire, which lives in its own test binary
+                    # rather than in `real_weights.rs` -- binding it here is what stops the
+                    # selection from rotting the way the sc-18932 orphans did.
+                    #
+                    # ONLY these two of the file's arms are selected, and the omission is a DISK
+                    # fact rather than an oversight: every other arm opens `transformer/` or
+                    # `text_encoder/` through `Weights::from_dir`, and this row's `download_files`
+                    # carries no shards of either (the TE index only). These two run on `vae/` and
+                    # `audio_vae/`, which the slice carries whole.
+                    "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/staged_residency.rs",
+                    (
+                        "the_video_decoder_hands_off_cleanly",
+                        "a_held_decoder_trips_both_handoff_gates",
+                    ),
+                ),
+            ),
+            "candle-minimax-h3": (
+                (
+                    "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+                    (
+                        "declared_tensor_names_match_the_published_checkpoint",
+                        # Header-only and device-free like its neighbours; added by sc-19008 and
+                        # wired by sc-19414, which found it selected by no lane at all.
+                        "declared_encoder_shapes_match_the_published_checkpoint",
+                        "declared_audio_tensor_names_match_the_published_checkpoint",
+                        "published_audio_configs_reproduce_the_declared_geometry",
+                        "stored_kaiser_filters_match_the_derivation_on_real_weights",
+                        # Header-only and device-free, wired by sc-19558. These two were listed as
+                        # NOT COVERED for exactly one reason -- `transformer/` was in no manifest
+                        # row, so `ensure_model_snapshot.py` could not materialize what they read.
+                        # The `minimax-h3-dit` key supplies it without widening the 11.640 GB slice
+                        # every other H3 lane fetches.
+                        "declared_dit_tensor_names_match_the_published_checkpoint",
+                        "the_adaln_projections_are_the_documented_twenty_six_gigabytes",
+                        # Decodes, landing on GPU 0 under `--features cuda`. Wired by sc-19414
+                        # against a MEASURED 97887 MiB card rather than against `CUDA_COMPUTE_CAP`,
+                        # which names an architecture and never a capacity. BOTH sides of that
+                        # comparison are measured: `vae/` and `audio_vae/` ship entirely F32, so the
+                        # f32 loads are no-op casts, and the decode halves are 9.03 GiB and
+                        # 0.242 GiB -- not the ~19.4 GB / ~1.2 GB the pre-sc-19414 comments claimed.
+                        "real_weight_decode_produces_a_plausible_video",
+                        "real_weight_multi_chunk_decode_blends_the_seam",
+                        "real_weight_audio_decode_produces_a_plausible_stereo_track",
+                    ),
+                ),
+                (
+                    # sc-17156 -- the measured `vramGbByTier` datum. Operator-dispatched behind the
+                    # `minimax_h3_vram_probe` input (it renders for hours on a card both listeners
+                    # share), but the SELECTION still has to name a test that exists and is still
+                    # `#[ignore]`d, which is exactly what this binding checks.
+                    "crates/media/candle-gen/candle-gen-minimax-h3/tests/vram_probe.rs",
+                    ("minimax_h3_vram_bf16",),
+                ),
+            ),
+        }
+
+        bodies = workflow_job_bodies(workflow)
+        for job, sources in selected.items():
+            self.assertIn(job, bodies, f"{job} was renamed or removed")
+            body = "\n".join(bodies[job])
+            for source, names in sources:
+                text = (repository / source).read_text(encoding="utf-8")
+                for name in names:
+                    with self.subTest(job=job, test=name):
+                        # `run_one <name>` in the bash lane, `call :run_one <name> || exit /b 1` in
+                        # the cmd one, `name=<name>` in the single-selection step. The trailing
+                        # negative class is load-bearing: without it a longer test name that merely
+                        # STARTS with this one would satisfy the check for both.
+                        self.assertRegex(
+                            body,
+                            rf"(?:run_one |name=){re.escape(name)}(?![A-Za-z0-9_])",
+                            f"{job}: {name} is no longer selected by name",
+                        )
+                        # `\bfn <name>(` -- the definition, not a `--skip` or doc-comment mention.
+                        definition = re.search(
+                            rf"(?m)^(?P<attributes>(?:#\[[^\n]*\]\n)*)fn {re.escape(name)}\(",
+                            text,
+                        )
+                        self.assertIsNotNone(
+                            definition,
+                            f"{job} selects {name}, which no longer exists in {source}",
+                        )
+                        self.assertIn(
+                            "#[ignore",
+                            definition.group("attributes"),
+                            f"{name} is no longer #[ignore]d, so `--ignored` filters it OUT and "
+                            f"the {job} step would report `0 passed`",
+                        )
+            # Join `\`-continued shell lines first: the macOS invocations span several, and a
+            # per-LINE check cannot see that `--exact` moved from after the `--` to before it —
+            # the whole trap this is here to catch would be invisible.
+            joined, buffer = [], ""
+            for line in body.splitlines():
+                stripped = line.strip()
+                buffer += " " + stripped.removesuffix("\\")
+                if not stripped.endswith("\\"):
+                    joined.append(buffer)
+                    buffer = ""
+            invocations = [command for command in joined if "cargo test " in command]
+            self.assertTrue(invocations, f"{job}: no cargo test invocation")
+            for command in invocations:
+                cargo_arguments, separator, libtest = command.partition(" -- ")
+                self.assertTrue(separator, f"{job}: cargo test invocation has no `--`: {command}")
+                # cargo REJECTS `--exact` in its own argument position and reports the rejection as
+                # exit 0, so the step would never run at all while looking like it passed.
+                self.assertNotIn("--exact", cargo_arguments, f"{job}: --exact must follow the `--`")
+                self.assertIn("--exact", libtest, f"{job}: selection is not `--exact`")
+                self.assertIn("--ignored", libtest, f"{job}: selection does not pass --ignored")
+            # One run-count assertion per cargo INVOCATION, in whichever shell the lane speaks.
+            # Both lanes route their selections through a `run_one` helper, so the invocation is the
+            # scope the guard has to sit in: a step that added a second bare `cargo test` beside the
+            # helper would run unguarded, which is the shape that makes a rename exit 0 and green.
+            guards = body.count('grep -qE "test result: ok\\. 1 passed"') + body.count(
+                'findstr /C:"test result: ok. 1 passed"'
+            )
+            self.assertEqual(
+                guards,
+                len(invocations),
+                f"{job}: every cargo test invocation needs its own run-count assertion",
+            )
+
+        # bash-only: the Windows lane is `cmd`, where the equivalent is `|| exit /b 1` per call.
+        #
+        # The predicate is the step's SCRIPT, not its NAME. This counted steps named `- name: Run `
+        # as a proxy for "steps that run cargo", and the proxy left a hole of exactly the class the
+        # guard exists to close: a cargo step named anything else, added with a run-count assertion
+        # but no `set -o pipefail`, moved NEITHER side of that equality and shipped green. Without
+        # `pipefail` a piped cargo's exit status is `tee`'s rather than cargo's, which is how a lane
+        # reports ok having tested nothing.
+        #
+        # The population is selected from the parsed steps by the same predicate the assertion
+        # checks, so there is no literal to drift when a step is added, renamed or removed -- and
+        # the emptiness check is what keeps a predicate that stops matching from passing vacuously.
+        mlx = "\n".join(bodies["mlx-minimax-h3"])
+        mlx_cargo_steps = [
+            step
+            for step in yaml.safe_load(workflow)["jobs"]["mlx-minimax-h3"]["steps"]
+            if "cargo test " in (step.get("run") or "")
+        ]
+        self.assertTrue(
+            mlx_cargo_steps,
+            "mlx-minimax-h3: no step runs `cargo test`, so this guard is asserting nothing",
+        )
+        for step in mlx_cargo_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertIn(
+                    "set -o pipefail",
+                    step["run"],
+                    f"mlx-minimax-h3: step {step.get('name')!r} runs cargo test without its own "
+                    "`set -o pipefail`, so `| tee /dev/stderr` swallows cargo's exit status",
+                )
+        # The three operator-artifact gates run LAST and each sits behind its OWN fail-closed
+        # check, so an operator who has staged none of them still gets every self-healing verdict
+        # first, and one missing artifact does not hide the other two.
+        #
+        # This ordering is not cosmetic. The Windows lane's `Require operator-provided MiniMax-H3
+        # snapshot` sits before `Record the CUDA device inventory` with a hard `exit /b 1`, which
+        # is exactly why that inventory has never once fired. Every reporting step in this job --
+        # disk headroom and the macOS device inventory -- therefore precedes all three checks
+        # below, and this asserts it rather than trusting the file to stay in order.
+        for artifact, gate in (
+            (
+                "Require the operator-provisioned diffusers VAE reference",
+                "real_weight_decode_matches_the_official_diffusers_vae",
+            ),
+            (
+                "Require the operator-provisioned diffusers VAE ENCODE reference",
+                "real_weight_encode_matches_the_official_diffusers_vae",
+            ),
+            (
+                "Require the operator-provisioned conditioner reference",
+                "real_weight_te_context_matches_the_official_conditioner",
+            ),
+        ):
+            with self.subTest(artifact=artifact):
+                self.assertIn(artifact, mlx, f"{artifact} was renamed or removed")
+                # `name=<gate>` is the selection; the require step must precede it.
+                self.assertLess(
+                    mlx.index(artifact),
+                    mlx.index(f"name={gate}"),
+                    f"{gate} runs before the step that fails closed on its artifact",
+                )
+                # …and every report-only step must precede the hard check.
+                for report in ("Report runner disk headroom", "Record the macOS device inventory"):
+                    self.assertLess(
+                        mlx.index(report),
+                        mlx.index(artifact),
+                        f"{artifact} can exit non-zero before {report!r} has run, which is the "
+                        "shape that has kept the Windows lane's device inventory from ever firing",
+                    )
+        # The self-healing verdicts all land before the first artifact check.
+        self.assertLess(
+            mlx.index("run_one real_weight_audio_decode_produces_a_plausible_stereo_track"),
+            mlx.index("Require the operator-provisioned diffusers VAE reference"),
+        )
+        # Both manifest rows are materialized, and the text-encoder one only here: the shared
+        # `minimax-h3` row is `media-cuda` too, and 58.6 GB of text encoder on the Windows box
+        # would buy that lane nothing.
+        self.assertIn(
+            "ensure_model_snapshot.py --model minimax-h3-text-encoder",
+            mlx,
+            "mlx-minimax-h3 does not materialize the text-encoder shards its conditioner gate maps",
+        )
+        self.assertNotIn(
+            "minimax-h3-text-encoder",
+            "\n".join(bodies["candle-minimax-h3"]),
+            "the Windows CUDA lane must not fetch 58.6 GB of text encoder it never reads",
+        )
+        # Both lanes materialize from the manifest row rather than assuming a hand-placed tree.
+        for job in selected:
+            self.assertIn(
+                "ensure_model_snapshot.py --model minimax-h3",
+                "\n".join(bodies[job]),
+                f"{job} does not materialize and verify the pinned snapshot",
+            )
 
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

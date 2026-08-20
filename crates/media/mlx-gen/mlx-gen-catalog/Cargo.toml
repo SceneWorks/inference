@@ -27,6 +27,7 @@ mlx-gen-ltx = { path = "../mlx-gen-ltx" }
 # Scaffold only (sc-14037): compiled as part of the platform package, but deliberately NOT yet
 # composed into `register_providers`. See `PENDING_REGISTRATION_CRATES` in src/lib.rs.
 mlx-gen-mage = { path = "../mlx-gen-mage" }
+mlx-gen-minimax-h3 = { path = "../mlx-gen-minimax-h3" }
 mlx-gen-mochi = { path = "../mlx-gen-mochi" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-gen-pulid = { path = "../mlx-gen-pulid" }

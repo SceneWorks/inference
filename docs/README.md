@@ -11,6 +11,9 @@ Documentation for the SceneWorks inference workspace.
   platform, with the MLX/Candle deltas. Built from the committed exact-surface tests.
 - **[Mochi 1 tier strategy](reference/mochi-1-tier-strategy.md)** — the accepted quantization
   packaging decision for the native Mochi 1 port (pre-quantized per-tier artifacts, default q4).
+- **[MiniMax-H3 withheld upstream components](reference/minimax-h3-withheld-upstream-components.md)**
+  — what `H3-Context-IR`, `H3-Regenerate-2K`, sparse-attention inference and the `<d>` dialogue
+  markers cost this port, what the crates do instead, and what would change if upstream publishes.
 
 ## Architecture
 

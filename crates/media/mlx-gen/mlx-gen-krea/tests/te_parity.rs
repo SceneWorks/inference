@@ -7,9 +7,13 @@
 //! Tolerance 1e-2 (Metal fp32 matmul).
 
 use mlx_gen::weights::Weights;
-use mlx_gen_krea::{KreaTeConfig, KreaTextEncoder};
+use mlx_gen_krea::KreaTextEncoder;
 use mlx_rs::ops::{all_close, multiply, sqrt, sum};
 use mlx_rs::{Array, Dtype};
+
+mod common;
+
+use common::tiny_te_config;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,25 +27,6 @@ fn cosine(a: &Array, b: &Array) -> f32 {
     let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
     let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
     (dot / (na * nb)).item::<f32>()
-}
-
-/// Tiny config matching `tools/dump_krea_te_golden.py`.
-fn tiny_te_config() -> KreaTeConfig {
-    KreaTeConfig {
-        hidden_size: 64,
-        num_layers: 6,
-        num_heads: 4,
-        num_kv_heads: 2,
-        head_dim: 32,
-        intermediate_size: 128,
-        rms_norm_eps: 1e-6,
-        rope_theta: 5_000_000.0,
-        select_hidden: vec![2, 4],
-        prefix_tokens: 3,
-        image_token_id: 151655,
-        // Text-only parity: MRoPE reduces to 1-D, so the whole head_dim/2 (=16 here) sits on the T axis.
-        mrope_section: [16, 0, 0],
-    }
 }
 
 #[test]

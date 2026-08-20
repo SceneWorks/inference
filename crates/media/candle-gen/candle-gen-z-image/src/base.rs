@@ -29,8 +29,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, SizeFloor,
-    WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
@@ -270,40 +269,19 @@ pub fn descriptor() -> ModelDescriptor {
             // byte-exact shift=6.0 σ table.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
             // On-the-fly Q4/Q8 not wired on the candle base path yet (rejected at load, not dropped).
             supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16957). Both base render lanes — the resident
             // `render_base` and the staged `render_base_sequential` — hand `run_flow_sampler` a
             // projector hook, as does the base half of the name-driven Fun-ControlNet provider. The
             // CFG blend happens inside the predict closure, so the previewed latent is always the
             // single conditional trajectory. Reuses the epic-16624 Z-Image fit ([`crate::preview`]).
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

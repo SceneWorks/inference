@@ -7,13 +7,14 @@
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
-    PerComponentBytes, Precision, Quant, TransformerComponent, WeightsSource,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWindowMaterialization, PerComponentBytes, Precision, Quant, TransformerComponent,
+    WeightsSource,
 };
 
 pub const DECODE_TILE_EDGE: u32 = 512;
@@ -66,6 +67,7 @@ fn overlay_components(spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
             kind,
             resident_bytes,
             bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
         })
     })
     .collect::<Vec<_>>();
@@ -80,6 +82,7 @@ fn overlay_components(spec: &LoadSpec) -> Vec<MemoryResidentComponent> {
                 kind: MemoryComponentKind::IpAdapter,
                 resident_bytes,
                 bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
             });
         }
     }

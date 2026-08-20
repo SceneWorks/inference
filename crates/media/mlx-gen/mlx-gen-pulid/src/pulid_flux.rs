@@ -26,7 +26,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, SizeFloor, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -68,7 +68,6 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true, // >1 enables real-CFG pos/neg identity branches (sc-3075)
             conditioning: vec![ConditioningKind::Reference], // the reference face
             supports_lora: false,
-            supports_lokr: false,
             // Epic 7114 (sc-7297): PuLID delegates its denoise to the FLUX.1-dev backbone
             // (`generate_with_injector_cfg` → `run_denoise` → `run_flow_sampler`), which already
             // honors the full curated integrator menu over the flow-match σ schedule AND the curated
@@ -89,33 +88,15 @@ pub fn descriptor() -> ModelDescriptor {
                 s.push("linear");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
             requires_sigma_shift: true, // dev
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
