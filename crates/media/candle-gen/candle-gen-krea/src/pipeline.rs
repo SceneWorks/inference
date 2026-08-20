@@ -3487,14 +3487,18 @@ mod tests {
     }
 
     /// Drive the production denoise-pass driver at F32 with an identity decode, counting DiT loads
-    /// and decode calls — the instrumentation ACs 1/2/3/5 read.
-    #[allow(clippy::type_complexity)]
+    /// and decode calls — the instrumentation ACs 1/2/3/5 read. `raw` selects the full-CFG Raw host
+    /// (per-pass guidance + `neg_context`, the resolution-dynamic schedule branch) vs the CFG-free
+    /// Turbo one, with the matching descriptor menus and model defaults.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn dp_run(
         provider_dit: &Krea2Transformer,
         root: &Path,
         native: Option<&gen_core::PinnedWeightsFile>,
         all_specs: &[AdapterSpec],
+        raw: bool,
         context: &Tensor,
+        neg_context: Option<&Tensor>,
         req: &GenerationRequest,
     ) -> Result<(
         Vec<Tensor>,
@@ -3502,8 +3506,12 @@ mod tests {
         usize,
         usize,
     )> {
-        let desc = crate::descriptor();
-        let defaults = crate::krea_denoise_defaults(false);
+        let desc = if raw {
+            crate::raw_descriptor()
+        } else {
+            crate::descriptor()
+        };
+        let defaults = crate::krea_denoise_defaults(raw);
         let ctx = desc
             .capabilities
             .denoise_pass_context(Some(all_specs.len()));
@@ -3517,7 +3525,7 @@ mod tests {
             native_dit: native,
             quant: None,
             device: &Device::Cpu,
-            raw: false,
+            raw,
             all_specs,
             base_seed,
             resolve: &resolve,
@@ -3538,7 +3546,7 @@ mod tests {
             provider_dit,
             &job,
             context,
-            None,
+            neg_context,
             req,
             &mut |_| {},
             DType::F32,
@@ -3586,7 +3594,7 @@ mod tests {
 
         let req = dp_request(0x5eed, 1, vec![dp_pass(2, "euler", 1.0, vec![])]);
         let (outputs, execution, loads, decodes) =
-            dp_run(&dit, &root, Some(&pinned), &[], &context, &req).unwrap();
+            dp_run(&dit, &root, Some(&pinned), &[], false, &context, None, &req).unwrap();
         assert_eq!(loads, 0, "a no-override chain must reuse the loaded DiT");
         assert_eq!(decodes, 1, "one decode per image, after the whole chain");
 
@@ -3662,7 +3670,17 @@ mod tests {
                 1,
                 vec![dp_pass(1, "euler", 1.0, p0), dp_pass(1, "euler", 0.5, p1)],
             );
-            dp_run(&dit, &root, Some(&pinned), &specs, &context, &req).unwrap()
+            dp_run(
+                &dit,
+                &root,
+                Some(&pinned),
+                &specs,
+                false,
+                &context,
+                None,
+                &req,
+            )
+            .unwrap()
         };
 
         // No overrides at all: the SHARED path (zero loads), load-time stack untouched — with a
@@ -3720,7 +3738,8 @@ mod tests {
                 dp_pass(1, "euler", 0.5, vec![]),
             ],
         );
-        let (outputs, _, loads, decodes) = dp_run(&dit, &root, None, &[], &context, &req).unwrap();
+        let (outputs, _, loads, decodes) =
+            dp_run(&dit, &root, None, &[], false, &context, None, &req).unwrap();
         assert_eq!(loads, 0);
         assert_eq!(decodes, 2);
         let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -3745,9 +3764,80 @@ mod tests {
                 }],
             )],
         );
-        let (_, _, loads, decodes) = dp_run(&dit, &root, None, &[lora], &context, &req).unwrap();
+        let (_, _, loads, decodes) =
+            dp_run(&dit, &root, None, &[lora], false, &context, None, &req).unwrap();
         assert_eq!(loads, 1);
         assert_eq!(decodes, 1);
+    }
+
+    /// AC2 (guidance isolation) on the RAW host: per-pass guidance actually reaches the forward
+    /// (a guided chain differs from a CFG-off one), does not bleed between passes (which pass
+    /// carries the guidance matters), consults the encoded negative context exactly when guidance
+    /// is on (a different negative changes a guided chain and cannot change a CFG-off one), and a
+    /// CFG pass with no negative context is a loud typed error — the missing Raw-path coverage
+    /// flagged in review. Pass 2 refines at denoise 0.5 so pass 1's behaviour stays visible
+    /// through the boundary blend, and the effective-evaluation accounting is unchanged by CFG
+    /// (two forwards inside ONE evaluation).
+    #[test]
+    fn denoise_pass_raw_chain_isolates_per_pass_guidance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, imported, cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&imported).unwrap();
+        let dit =
+            load_dit_base_at_dtype(&root, Some(&pinned), &Device::Cpu, None, DType::F32).unwrap();
+        let (_, context, _) = crate::testfix::tiny_batch(&cfg);
+        let context = context.unsqueeze(0).unwrap();
+        // Two DISTINCT negative contexts (unseeded fixture draws differ), so "the negative context
+        // is consulted" is observable as an output change.
+        let (_, neg_x, _) = crate::testfix::tiny_batch(&cfg);
+        let neg_x = neg_x.unsqueeze(0).unwrap();
+        let (_, neg_y, _) = crate::testfix::tiny_batch(&cfg);
+        let neg_y = neg_y.unsqueeze(0).unwrap();
+
+        let gpass = |denoise: f32, guidance: f32| gen_core::DenoisePass {
+            guidance: Some(guidance),
+            ..dp_pass(1, "euler", denoise, vec![])
+        };
+        let run = |g0: f32, g1: f32, neg: Option<&Tensor>| {
+            let req = dp_request(7, 1, vec![gpass(1.0, g0), gpass(0.5, g1)]);
+            dp_run(&dit, &root, Some(&pinned), &[], true, &context, neg, &req)
+        };
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let (a, execution, _, _) = run(0.0, 0.0, Some(&neg_x)).unwrap();
+        let (b, _, _, _) = run(0.0, 2.5, Some(&neg_x)).unwrap();
+        let (c, _, _, _) = run(2.5, 0.0, Some(&neg_x)).unwrap();
+        // Guidance reaches each pass's forward...
+        assert_ne!(v(&a[0]), v(&b[0]), "pass-2 guidance must change the chain");
+        assert_ne!(v(&a[0]), v(&c[0]), "pass-1 guidance must change the chain");
+        // ... and stays pass-local: WHICH pass carries it is observable.
+        assert_ne!(v(&b[0]), v(&c[0]), "guidance must not bleed between passes");
+
+        // The negative context is consulted exactly when a pass runs CFG.
+        let (a2, _, _, _) = run(0.0, 0.0, Some(&neg_y)).unwrap();
+        assert_eq!(
+            v(&a[0]),
+            v(&a2[0]),
+            "a CFG-off chain must never consult the negative context"
+        );
+        let (b2, _, _, _) = run(0.0, 2.5, Some(&neg_y)).unwrap();
+        assert_ne!(
+            v(&b[0]),
+            v(&b2[0]),
+            "a CFG pass must actually consume the encoded negative context"
+        );
+
+        // A CFG pass with no negative context is a loud typed error, not a silent single-forward.
+        let err = run(0.0, 2.5, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unconditional context"),
+            "got: {err}"
+        );
+
+        // CFG costs a second forward INSIDE one evaluation — the effective accounting is unchanged.
+        let execution = execution.expect("execution recorded");
+        assert_eq!(execution.total_model_evals, 2);
+        assert_eq!(execution.passes[1].resolved.guidance, Some(0.0));
     }
 
     #[test]
