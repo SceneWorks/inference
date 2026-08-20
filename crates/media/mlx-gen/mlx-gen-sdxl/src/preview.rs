@@ -4,8 +4,10 @@
 //! convention and calls the narrow [`emit_nhwc_preview`] seam; schedule ownership remains with the
 //! route that is actually denoising.
 
+use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
+use mlx_gen::array::scalar;
 use mlx_gen::PreviewSink;
 
 /// Ordinary-least-squares map from SDXL-family VAE latents to latent-resolution RGB. Fit on four
@@ -47,16 +49,52 @@ pub fn emit_nhwc_preview(
     if !sink.is_active() {
         return;
     }
-    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
-        let shape = latents.shape();
-        if shape.len() != 4 || shape[0] != 1 || shape[3] != 4 {
-            return Err(mlx_gen::Error::Msg(format!(
-                "SDXL preview latent must have shape [1, h, w, 4], got {shape:?}"
-            )));
-        }
-        let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
-        mlx_gen::preview::project_latents(&nchw, &RGB_FACTORS, RGB_BIAS)
+    mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || project_nhwc(latents));
+}
+
+/// Project and emit one raw k-diffusion VE-space SDXL-family latent.
+///
+/// The fitted projection was measured on the renormalized latent seen by the U-Net. Curated SDXL
+/// and Kolors samplers carry `x0 + noise * sigma`, so this path applies their
+/// `1 / sqrt(sigma^2 + 1)` input scale before projection. A missing sigma is an error and therefore
+/// loses only the decorative frame instead of recreating the saturated-preview defect.
+pub fn emit_nhwc_ve_preview(
+    sink: &PreviewSink,
+    counter: &mlx_gen::preview::PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    latents: &Array,
+) {
+    if !sink.is_active() {
+        return;
+    }
+    mlx_gen::preview::emit_preview_with_sigma(sink, counter, sigmas, sigma, |sigma| {
+        project_ve_latents(latents, sigma)
     });
+}
+
+/// Project a raw VE-space NHWC latent after applying the SDXL-family input scaling.
+pub fn project_ve_latents(latents: &Array, sigma: Option<f32>) -> mlx_gen::Result<mlx_gen::Image> {
+    let Some(sigma) = sigma else {
+        return Err(mlx_gen::Error::Msg(
+            "sdxl preview: a VE-space latent needs the schedule sigma to renormalize with, but the \
+             driver supplied none"
+                .into(),
+        ));
+    };
+    let scale = 1.0 / (sigma * sigma + 1.0).sqrt();
+    project_nhwc(&multiply(latents, scalar(scale))?)
+}
+
+fn project_nhwc(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
+    let shape = latents.shape();
+    if shape.len() != 4 || shape[0] != 1 || shape[3] != 4 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "SDXL preview latent must have shape [1, h, w, 4], got {shape:?}"
+        )));
+    }
+    let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
+    mlx_gen::preview::project_latents(&nchw, &RGB_FACTORS, RGB_BIAS)
 }
 
 #[cfg(test)]
@@ -81,6 +119,63 @@ mod tests {
         assert_eq!((frames[0].current, frames[0].total), (1, 1));
         assert_eq!((frames[0].image.width, frames[0].image.height), (3, 2));
         assert_eq!(frames[0].image.pixels, [142, 130, 126].repeat(6));
+    }
+
+    #[test]
+    fn ve_correction_removes_early_frame_saturation() {
+        let latents = Array::from_slice(
+            &(0..4 * 4 * 4)
+                .map(|i| ((((i * 37) % 101) as f32 / 50.0) - 1.0) * 14.6)
+                .collect::<Vec<_>>(),
+            &[1, 4, 4, 4],
+        )
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+
+        let raw = project_nhwc(&latents).unwrap();
+        let early = project_ve_latents(&latents, Some(14.6)).unwrap();
+        let late = project_ve_latents(&latents, Some(0.0292)).unwrap();
+        let rail_fraction = |pixels: &[u8]| {
+            pixels.iter().filter(|&&v| v == 0 || v == 255).count() as f32 / pixels.len() as f32
+        };
+
+        assert!(rail_fraction(&raw.pixels) > 0.50);
+        assert!(rail_fraction(&early.pixels) < 0.10);
+        assert_ne!(raw.pixels, early.pixels);
+        assert_eq!(raw.pixels, late.pixels);
+    }
+
+    #[test]
+    fn ve_emitter_uses_the_sigma_aware_projection() {
+        let latents = Array::from_slice(
+            &(0..4 * 4 * 4)
+                .map(|i| ((((i * 37) % 101) as f32 / 50.0) - 1.0) * 14.6)
+                .collect::<Vec<_>>(),
+            &[1, 4, 4, 4],
+        )
+        .transpose_axes(&[0, 2, 3, 1])
+        .unwrap();
+        let sigmas = [14.6, 0.0];
+        let counter = mlx_gen::preview::PreviewCounter::new(&sigmas);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+
+        emit_nhwc_ve_preview(&sink, &counter, &sigmas, sigmas[0], &latents);
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        let pixels = &frames[0].image.pixels;
+        let rail_fraction =
+            pixels.iter().filter(|&&v| v == 0 || v == 255).count() as f32 / pixels.len() as f32;
+        assert!(rail_fraction < 0.10, "rail fraction {rail_fraction}");
+    }
+
+    #[test]
+    fn ve_projection_rejects_a_missing_sigma() {
+        let latents = Array::zeros::<f32>(&[1, 2, 3, 4]).unwrap();
+        let error = project_ve_latents(&latents, None).unwrap_err().to_string();
+        assert!(error.contains("needs the schedule sigma"), "{error}");
     }
 
     #[test]
