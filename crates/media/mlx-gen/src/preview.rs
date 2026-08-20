@@ -68,13 +68,32 @@ pub fn emit_preview<F>(
 ) where
     F: FnOnce() -> Result<Image>,
 {
+    emit_preview_with_sigma(sink, counter, sigmas, sigma, |_| project());
+}
+
+/// Run a provider-owned projection that also receives the schedule sigma for this frame.
+///
+/// This is additive to [`emit_preview`]: existing providers keep their zero-argument projection
+/// closure and therefore cannot accidentally change behaviour. Discrete epsilon-prediction families
+/// whose running latent is in raw VE sigma-space use this seam to apply the same input scaling as
+/// their denoiser before projecting. The optional argument lets those projectors fail closed if a
+/// sigma-less provider calls them directly; this schedule-keyed emitter always supplies `Some`.
+pub fn emit_preview_with_sigma<F>(
+    sink: &PreviewSink,
+    counter: &PreviewCounter,
+    sigmas: &[f32],
+    sigma: f32,
+    project: F,
+) where
+    F: FnOnce(Option<f32>) -> Result<Image>,
+{
     if !sink.is_active() {
         return;
     }
     let Some(current) = counter.next(sigmas, sigma) else {
         return;
     };
-    if let Ok(image) = project() {
+    if let Ok(image) = project(Some(sigma)) {
         sink.emit(PreviewFrame {
             current,
             total: counter.total(),
@@ -227,6 +246,24 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].current, 2);
         assert_eq!(frames[0].total, 8);
+    }
+
+    #[test]
+    fn sigma_aware_emission_forwards_the_schedule_sigma() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let counter = PreviewCounter::new(&SIGMAS);
+        let observed = Cell::new(None);
+        let latents = Array::zeros::<f32>(&[1, 4, 2, 3]).unwrap();
+
+        emit_preview_with_sigma(&sink, &counter, &SIGMAS, SIGMAS[2], |sigma| {
+            observed.set(sigma);
+            project_latents(&latents, &[[0.0; 3]; 4], [0.0; 3])
+        });
+
+        assert_eq!(observed.get(), Some(SIGMAS[2]));
+        assert_eq!(frames.lock().unwrap().len(), 1);
     }
 
     #[test]
