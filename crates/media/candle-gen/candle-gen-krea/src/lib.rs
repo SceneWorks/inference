@@ -2096,10 +2096,7 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
         return Ok(companion_quant);
     }
 
-    let requested = match spec.quantize {
-        Some(quant @ (Quant::Q4 | Quant::Q8 | Quant::Nvfp4)) => Some(quant),
-        None => None,
-    };
+    let requested = spec.quantize;
     match (companion_quant, requested) {
         (Some(companion), Some(requested)) if companion == requested => Ok(Some(requested)),
         (Some(companion), Some(requested)) => Err(gen_core::Error::Unsupported(format!(
