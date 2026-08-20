@@ -217,10 +217,22 @@ fn per_tile_normalization_is_observably_wrong() {
 }
 
 /// An edge wide enough to hold the whole output takes the single-tile fall-through inside every
-/// layer, so it is the dense computation up to floating-point reassociation — [`GlobalGroupNorm`]
-/// computes `x·(1/σ)` where candle's `GroupNorm` computes `x/σ`. This is the control that separates
-/// "bounded and correct" from "never actually bounded": it must land orders of magnitude tighter
-/// than a genuinely tiled decode.
+/// layer, so every convolution sees the identical input the dense decode gives it and every
+/// `GroupNorm` reduces the identical activation. This is the control that separates "bounded and
+/// correct" from "never actually bounded".
+///
+/// The two routes reach their `GroupNorm`s through different code — `decode` through candle's
+/// `GroupNorm` module, `decode_tiled` through `GlobalGroupNorm` — so this is also the end-to-end
+/// pin that those two agree. It asserts **bit-equality**, not a tolerance (sc-19447).
+///
+/// It was `< 1e-6`, which was a machine-calibrated number rather than a real invariant: at the time
+/// `GlobalGroupNorm` multiplied by a stored `1/σ` where candle divides by `σ`, so the fall-through
+/// was the dense computation only up to a spare rounding per normalized element. That is ~1 ULP at
+/// one layer, but it compounds through the decoder, and where it lands is a property of the target:
+/// this decode measured `9.537e-7` on `aarch64` macOS and `1.073e-6` on `x86_64` Linux — the same
+/// divergence, passing a 1e-6 bound on one host and failing it on the other. Widening the bound
+/// would have re-buried a genuine dense/bounded divergence, so `GlobalGroupNorm` now divides and
+/// the honest invariant is exact equality.
 #[test]
 fn a_wide_edge_falls_through_to_the_dense_computation() {
     let device = Device::Cpu;
@@ -237,8 +249,9 @@ fn a_wide_edge_falls_through_to_the_dense_computation() {
     let bounded = native.decode_tiled(&z, 4096, None).unwrap();
     let delta = max_abs(&bounded, &dense);
     assert!(
-        delta < 1e-6,
-        "the single-tile fall-through must be the dense computation: max|delta|={delta:.3e}"
+        delta == 0.0,
+        "the single-tile fall-through must BE the dense computation, not merely approximate it: \
+         max|delta|={delta:.3e}"
     );
 }
 
