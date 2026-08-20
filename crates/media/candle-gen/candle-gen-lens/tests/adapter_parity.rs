@@ -90,6 +90,7 @@ fn build_dit(map: HashMap<String, Tensor>, device: &Device) -> Result<LensTransf
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo transformer snapshot (LENS_DIT_DIR) + adapter goldens (LENS_ADAPTER_DIR)"]
 fn lens_adapters_match_reference() -> Result<()> {
     let dit_dir = match std::env::var("LENS_DIT_DIR") {
         Ok(d) => d,
