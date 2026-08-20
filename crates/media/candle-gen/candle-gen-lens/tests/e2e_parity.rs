@@ -64,6 +64,7 @@ fn std_of(t: &Tensor) -> Result<f32, AnyErr> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo snapshot root (LENS_SNAPSHOT_DIR) + goldens (LENS_E2E_GOLDENS)"]
 fn lens_e2e_matches_reference() -> Result<(), AnyErr> {
     let root = match std::env::var("LENS_SNAPSHOT_DIR") {
         Ok(d) => d,
