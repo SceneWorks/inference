@@ -124,6 +124,7 @@ fn relative_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 /// With the multi-arch fatbin (native sm_120 cubin) it passes. The comparison is a relative
 /// max-abs-diff, not cosine; see `relative_max_abs_diff` for why that distinction matters.
 #[test]
+#[ignore = "needs a CUDA device: default_device() must resolve to CUDA (build --features cuda on a GPU host)"]
 fn cuda_qmatmul_matches_cpu() {
     let device = default_device().expect("default device");
     if !device.is_cuda() {
