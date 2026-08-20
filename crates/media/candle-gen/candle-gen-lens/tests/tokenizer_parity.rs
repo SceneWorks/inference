@@ -27,6 +27,7 @@ fn ids_u32(t: &Tensor) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
 }
 
 #[test]
+#[ignore = "needs the Lens tokenizer.json (LENS_TOKENIZER_JSON) + goldens (LENS_TOK_GOLDENS)"]
 fn lens_tokenizer_matches_hf_reference() -> R {
     let Ok(tok_json) = std::env::var("LENS_TOKENIZER_JSON") else {
         eprintln!("SKIP: set LENS_TOKENIZER_JSON to the Lens tokenizer/tokenizer.json");
