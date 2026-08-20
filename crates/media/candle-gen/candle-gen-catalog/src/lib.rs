@@ -368,8 +368,9 @@ pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
 ///   fit is a property of the VAE latent space, not of the backend, so a linear approximation that
 ///   misses the holdout bar on MLX misses it on candle too. **Do not re-run these fits**; the
 ///   `NoGo` basis on each row says whether it rides a measurement or a deliberate non-measurement.
-/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Boogu's latent space already has a
-///   committed fit clearing the bar (sc-17218 is the wiring).
+/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Empty after sc-17218 wired the last
+///   deferred family, but retained as an explicit class so a future measured-but-unwired route cannot
+///   be mistaken for a no-go.
 ///
 /// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` makes those three total over the
 /// registered surface, so a newly registered route must be classified rather than defaulting into
@@ -428,12 +429,12 @@ mod preview_advertising {
     /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
     /// through a hooked call site. That is the case the direct-emission scanner was hardened for.
     ///
-    /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
-    /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
-    /// `AutoencoderKL` (the FLUX.1 / Z-Image lineage, `z_image::vae::AutoEncoderKL`, SHA-256
-    /// `8c717328…4c94`) with no `bn.*` stats at all, so the 32-channel fit does not describe its latent
-    /// space and sc-16955's own acceptance criterion is that it emits only if its VAE is proven to be
-    /// FLUX.2's. It is not. See `docs/migration/evidence/sc-16955-flux2-candle-preview.md`.
+    /// `candle-gen-boogu` was deliberately absent from sc-16955 because it loads a plain 244-tensor
+    /// **16-channel** `AutoencoderKL`, not FLUX.2's 32-channel space. sc-16956 then proved the positive
+    /// relationship: Boogu's f32 tensors round exactly onto FLUX.1's bf16 bits, key for key. sc-17218
+    /// wires that reused raw-latent projector across all three registered ids. Base and Edit have one
+    /// hooked shared-driver site each; Turbo has a hooked curated lane plus a direct emission in its
+    /// default native DMD loop, always observing the running latent entering the outer step.
     ///
     /// The FLUX.1 family (sc-16956) is the first to make the descriptor-less half of the platform
     /// *visible* rather than merely absent. It contributes seven rows — `flux1_schnell` / `flux1_dev`
@@ -573,6 +574,9 @@ mod preview_advertising {
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
+        "boogu_image",
+        "boogu_image_turbo",
+        "boogu_image_edit",
         "sdxl",
         "kolors",
         "flux2_klein_9b",
@@ -836,21 +840,10 @@ mod preview_advertising {
 
     /// The third class: registered routes that neither emit previews **nor** are no-gos.
     ///
-    /// Without this list "preview-inert" and "rejected" would collapse into each other, and the no-go
-    /// set would silently absorb every family that simply has not been wired yet. Boogu is exactly
-    /// that case and it is the opposite of a rejection: sc-16956 proved its VAE **is** FLUX.1's — a
-    /// different f32 container whose 244 tensors round exactly onto FLUX.1's bf16 bits — so its latent
-    /// space already has a committed fit that clears the bar. It is unwired only because the wiring has
-    /// not been done, tracked as **sc-17218**.
-    ///
-    /// Keeping it named here is what lets
-    /// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` be a **total** partition, which
-    /// is the assertion that stops the no-go set going stale as the catalog grows.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[
-        ("boogu_image", "sc-17218"),
-        ("boogu_image_turbo", "sc-17218"),
-        ("boogu_image_edit", "sc-17218"),
-    ];
+    /// The class is empty after sc-17218 wired Boogu, but keeping it explicit prevents a future
+    /// viable-but-unwired route from being silently absorbed into the no-go set. The total-partition
+    /// assertion below keeps all three classes honest as the registry grows.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -947,7 +940,16 @@ mod preview_advertising {
             dir: "candle-gen-boogu",
             register: candle_gen_boogu::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-17218's inventory. Base, Turbo's curated/img2img lane, and Edit each drive one
+            // hooked flow-sampler site. Turbo's default route owns a four-step DMD loop and emits
+            // directly at the top of each iteration, before prediction and re-noise. No dark site:
+            // every user-reachable denoise lane now has a live sink seam.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 3,
+                direct: 1,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-chroma",
@@ -3685,12 +3687,14 @@ mod preview_advertising {
         // record this test exists for is the *classification*: the partition, disjointness, and
         // classified == registered assertions above already force every new registration to be
         // filed into exactly one class, in writing, in the three pinned id lists. What remains
-        // load-bearing here is that no class silently empties out.
+        // load-bearing here is that the catalog, wired set, and permanent no-go set do not silently
+        // empty out. The deferred class is intentionally allowed to reach zero: sc-17218 wired its
+        // final member. The class and its provenance validation remain above so the next viable but
+        // unwired route must still be recorded explicitly.
         for (label, len) in [
             ("registered", registered.len()),
             ("wired", wired.len()),
             ("no-go", no_go.len()),
-            ("deferred", deferred.len()),
         ] {
             assert!(
                 len > 0,
