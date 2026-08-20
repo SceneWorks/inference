@@ -696,17 +696,18 @@ fn denoise_core(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // Scale the latents into the model's input space: identity for the ancestral sampler (which
+        // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
+        // for Lightning and Kolors Euler. Preview the same tensor the U-Net sees: this preserves the
+        // ancestral path byte-for-byte while keeping every discrete sampler in the fit's domain.
+        let x_in = d.sampler.scale_model_input(&latents, i)?;
         crate::preview::emit_nhwc_preview(
             preview,
             &preview_counter,
             &preview_sigmas,
             preview_sigmas[i],
-            &latents,
+            &x_in,
         );
-        // Scale the latents into the model's input space: identity for the ancestral sampler (which
-        // folds the renormalization into its step → bit-identical to the pre-trait loop), `x/√(σ²+1)`
-        // for the Lightning Euler sampler. Acceleration samplers also cast to the U-Net compute dtype.
-        let x_in = d.sampler.scale_model_input(&latents, i)?;
         let x_unet = if cfg_on {
             concatenate_axis(&[&x_in, &x_in], 0)?
         } else {
@@ -852,7 +853,7 @@ pub fn denoise_curated_with_preview(
         cancel,
         on_progress,
         |latents, sigma| {
-            crate::preview::emit_nhwc_preview(preview, &preview_counter, sigmas, sigma, latents);
+            crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
         },
         |x_in, timestep| {
             // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
@@ -973,7 +974,7 @@ pub fn denoise_cfgpp_with_preview(
         cancel,
         on_progress,
         |latents, sigma| {
-            crate::preview::emit_nhwc_preview(preview, &preview_counter, sigmas, sigma, latents);
+            crate::preview::emit_nhwc_ve_preview(preview, &preview_counter, sigmas, sigma, latents);
         },
         |x_in, timestep| {
             // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
