@@ -271,6 +271,20 @@ pub struct MiniMaxH3 {
     /// rung 4 is `Implemented` on a [`LoadShape::DeferredMaterialization`] spec and `Missing` on a
     /// resident one, and a request the contract refuses must be refused here too (sc-18662).
     load_shape: mlx_gen::gen_core::LoadShape,
+    /// The provider's memory-strategy contract, resolved at load and **published through
+    /// [`Generator::memory_strategy_contract`]** (sc-18650).
+    ///
+    /// Not an `Option`, unlike the ltx/wan twins: [`crate::memory_strategy::contract_for`] is total
+    /// — every load surface this loader admits has a contract — so there is no "loaded route with no
+    /// calibrated contract" arm to model, and an `Option` here could only ever express a bug.
+    ///
+    /// Resolved at [`Self::load_shape`] by construction (`contract_for` reads `spec.load_shape`, the
+    /// same field `load` copies into `load_shape`), so the declaration and the runtime admission in
+    /// [`Self::requested_transformer_window`] cannot disagree about whether rung 4 exists.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// The numeric tier this route loaded at, for the safety check's tier axis. See
+    /// [`crate::memory_strategy::numeric_tier`].
+    memory_tier: mlx_gen::gen_core::MemoryNumericTier,
 }
 
 /// The staged-component id for the **tiered** DiT directory (sc-17150).
@@ -802,6 +816,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         Precision::Fp32 => Dtype::Float32,
         _ => Dtype::Bfloat16,
     };
+    // sc-18650. Resolved here, at the one point that holds the spec, and carried on the generator so
+    // `Generator::memory_strategy_contract` has something to publish. `contract_for` only stats the
+    // component directories it has already probed above — no weight file is opened.
+    let memory_strategy = crate::memory_strategy::contract_for(spec).map_err(Error::from)?;
+    let memory_tier = crate::memory_strategy::numeric_tier(spec);
     Ok(Box::new(MiniMaxH3 {
         descriptor: descriptor(),
         root,
@@ -810,6 +829,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         dtype,
         adapters: spec.adapters.clone(),
         load_shape: spec.load_shape,
+        memory_strategy,
+        memory_tier,
     }))
 }
 
@@ -1733,10 +1754,77 @@ const _: () = {
     assert!(MIN_DURATION_SECONDS < MAX_DURATION_SECONDS);
 };
 
-mlx_gen::impl_generator!(MiniMaxH3 {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+/// Hand-written rather than `mlx_gen::impl_generator!`, for the three memory-strategy methods the
+/// macro cannot emit (sc-18650) — the ltx/wan shape.
+///
+/// The macro emits **only** `descriptor` / `validate` / `generate`, so while this provider used it
+/// the other three slots held their trait defaults: `memory_strategy_contract` answered `None`, and
+/// downstream that is the "has not adopted the shared contract" state — SceneWorks' video admission
+/// reads exactly this seam and skips the request-geometry gate entirely when it is `None`. A 33B
+/// joint-AV model was therefore rendering ungated while `crate::memory_strategy` built a complete,
+/// calibrated contract that nothing ever asked for.
+///
+/// The first three bodies below are the same delegation the macro emitted, verbatim.
+///
+/// # Why all three overrides land together
+///
+/// They are not independent. The defaults are mutually consistent only for a provider publishing
+/// **no** contract:
+///
+/// * `memory_strategy_safety_check`'s default rejects every non-`Resident` selection outright;
+/// * `begin_memory_strategy_request`'s default hard-errors ("advertises an implemented optimized
+///   memory strategy but does not open a request scope") for any contract declaring an implemented
+///   optimized rung — and this one declares two, `StagedResidency` and `BoundedDecode`, plus
+///   `BoundedTransformerResidency` on a deferred load.
+///
+/// So publishing the contract alone would turn today's working-but-ungated renders into hard
+/// errors. The rung semantics are not restated here: all three bodies delegate to
+/// [`crate::memory_strategy`], whose `strategies()` is the single declaration and whose
+/// `route_gate` is the single geometry predicate.
+impl Generator for MiniMaxH3 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    /// Defense in depth over the shared worker's selection. Delegates to the provider's own
+    /// admission, which is `standard_memory_strategy_safety_check` (the capability table, the owned
+    /// parameter domains and the numeric tier) **plus** this family's `route_gate` — the lattice,
+    /// stride, canvas, batch and `use_pid` predicates the render itself enforces. A selection this
+    /// accepts is one `generate` can actually run.
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.memory_strategy, self.memory_tier, context)
+    }
+
+    /// Open the request scope the accepted selection needs, re-running the safety check first so a
+    /// caller that skipped it cannot open a scope over a refused selection. The production entry
+    /// point, so its terminal cleanup drains the MLX allocator cache.
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy::begin_request(&self.memory_strategy, self.memory_tier, context)
+    }
+}
 
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
@@ -1758,7 +1846,14 @@ mod tests {
         }
     }
 
-    fn generator_at(dit_dir: &str) -> MiniMaxH3 {
+    /// A generator over a snapshot that does not exist, at an explicit load shape.
+    ///
+    /// The contract is resolved from a spec carrying **that same shape** rather than being pinned
+    /// here, because `load` resolves the two from one `LoadSpec` and a fixture that let them
+    /// disagree would be testing a state the loader cannot produce (sc-18650).
+    fn generator_with(dit_dir: &str, load_shape: mlx_gen::gen_core::LoadShape) -> MiniMaxH3 {
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap"))).with_load_shape(load_shape);
         MiniMaxH3 {
             descriptor: descriptor(),
             root: PathBuf::from("/snap"),
@@ -1766,11 +1861,249 @@ mod tests {
             text_encoder_dir: PathBuf::from("/snap/text_encoder"),
             dtype: Dtype::Bfloat16,
             adapters: Vec::new(),
-            // The shape rung 4 is `Implemented` at. NOT `LoadSpec::new`'s default — that is
-            // `EagerMaterialization`; a caller must ask for the deferred shape, and the
-            // resident-load refusal below constructs the eager twin explicitly.
-            load_shape: mlx_gen::gen_core::LoadShape::DeferredMaterialization,
+            load_shape,
+            memory_strategy: crate::memory_strategy::contract_for(&spec).expect("contract"),
+            memory_tier: crate::memory_strategy::numeric_tier(&spec),
         }
+    }
+
+    /// The shape rung 4 is `Implemented` at. NOT `LoadSpec::new`'s default — that is
+    /// `EagerMaterialization`; a caller must ask for the deferred shape, and the resident-load
+    /// refusal below constructs the eager twin explicitly.
+    fn generator_at(dit_dir: &str) -> MiniMaxH3 {
+        generator_with(
+            dit_dir,
+            mlx_gen::gen_core::LoadShape::DeferredMaterialization,
+        )
+    }
+
+    /// Write the structurally complete **weights-free** snapshot [`load`] probes for.
+    ///
+    /// Every path here is stat'd or parsed as JSON by the loader; not one tensor is read. The
+    /// shards are **sparse** files of the measured component sizes — `safetensors_path_bytes`
+    /// stats rather than parses — so the contract resolved off this tree carries the family's real
+    /// asset facts at no disk cost. That is what lets the assertions below distinguish the
+    /// production contract from the zero-footprint weights-free one.
+    fn weightless_snapshot(root: &Path) {
+        for (dir, probe) in [
+            (BASE_DIT_PARTITION, "config.json"),
+            (REFERENCE_DIT_PARTITION, "config.json"),
+            ("text_encoder", "config.json"),
+            ("vae", "config.json"),
+            ("audio_vae", "config.json"),
+            ("tokenizer", "tokenizer.json"),
+            ("FL2VA/audio_vae", "config.json"),
+            ("FL2VA/audio_vae", "config.yaml"),
+            ("FL2VA/audio_vae", "metadata.json"),
+        ] {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).expect("component dir");
+            std::fs::write(dir.join(probe), b"{}").expect("probe document");
+        }
+        for (component, bytes) in [
+            (BASE_DIT_PARTITION, crate::memory_strategy::DIT_BF16_BYTES),
+            ("text_encoder", crate::memory_strategy::TEXT_ENCODER_BYTES),
+            ("vae", crate::memory_strategy::VIDEO_VAE_BYTES),
+            ("audio_vae", crate::memory_strategy::AUDIO_VAE_BYTES),
+        ] {
+            let shard = std::fs::File::create(root.join(component).join("model.safetensors"))
+                .expect("shard");
+            shard.set_len(bytes).expect("sparse shard");
+        }
+    }
+
+    /// **The loaded generator publishes the provider's memory-strategy contract** (sc-18650).
+    ///
+    /// This is the seam SceneWorks admission reads: `Generator::memory_strategy_contract` on the
+    /// boxed generator `load` hands back. `mlx_gen::impl_generator!` emits only `descriptor` /
+    /// `validate` / `generate`, so before this story the vtable slot resolved to the trait default
+    /// `None` and every MiniMax-H3 render skipped request-geometry admission entirely — while
+    /// `memory_strategy::contract_for` built a full contract that nothing ever asked for.
+    ///
+    /// Asserted through `dyn Generator` rather than on the concrete struct, because the default is
+    /// what a `Box<dyn Generator>` would dispatch to.
+    ///
+    /// Both load shapes are driven, because rung 4's support is the one entry that varies with the
+    /// shape — a single-shape test would pass against a contract pinned to either constant.
+    #[test]
+    fn a_loaded_generator_publishes_the_providers_memory_strategy_contract() {
+        use mlx_gen::gen_core::{LoadShape, MemoryStrategy, MemoryStrategySupport};
+        let root = tempfile::tempdir().expect("fixture root");
+        weightless_snapshot(root.path());
+
+        for (load_shape, rung4) in [
+            (
+                LoadShape::DeferredMaterialization,
+                MemoryStrategySupport::Implemented,
+            ),
+            (
+                LoadShape::EagerMaterialization,
+                MemoryStrategySupport::Missing,
+            ),
+        ] {
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()))
+                .with_load_shape(load_shape);
+            let generator = load(&spec).expect("weights-free load");
+            let published = generator
+                .memory_strategy_contract()
+                .expect("a loaded generator must publish its memory-strategy contract");
+
+            // It is the provider's own contract for THIS spec — not some other shape's, and not the
+            // resident-only compatibility default the trait falls back to.
+            assert_eq!(
+                published,
+                &crate::memory_strategy::contract_for(&spec).expect("contract")
+            );
+            assert_eq!(published.load_shape, load_shape);
+            // ...and the PRODUCTION one. The weights-free fixture contract differs from it only in
+            // asset facts, so every assertion below would hold against it too; this is the one that
+            // proves `load` resolved the snapshot it had just probed.
+            assert_ne!(
+                published,
+                &crate::memory_strategy::weights_free_contract(&spec).expect("fixture contract"),
+                "the published contract must carry the resolved snapshot's asset facts"
+            );
+            assert_eq!(
+                published.asset_facts.transformer_bytes,
+                crate::memory_strategy::DIT_BF16_BYTES
+            );
+
+            // The rungs it advertises are `memory_strategy::strategies()`'s, for this load shape.
+            let support = |strategy: MemoryStrategy| {
+                published
+                    .capability(strategy)
+                    .unwrap_or_else(|| panic!("{strategy:?} must appear in the strategy table"))
+                    .support
+                    .clone()
+            };
+            for implemented in [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+            ] {
+                assert_eq!(
+                    support(implemented),
+                    MemoryStrategySupport::Implemented,
+                    "{implemented:?}"
+                );
+            }
+            // Rung 3 is measured inapplicable on MLX for this family, at every shape.
+            assert!(
+                matches!(
+                    support(MemoryStrategy::BoundedAttention),
+                    MemoryStrategySupport::StructurallyNotApplicable { .. }
+                ),
+                "rung 3 must stay structurally inapplicable, got {:?}",
+                support(MemoryStrategy::BoundedAttention)
+            );
+            // Rung 4 exists only where its shared prerequisite — the deferred shape — does.
+            assert_eq!(
+                support(MemoryStrategy::BoundedTransformerResidency),
+                rung4,
+                "{load_shape:?}"
+            );
+        }
+    }
+
+    /// **The published safety check and request scope refuse what this provider cannot run**
+    /// (sc-18650).
+    ///
+    /// Publishing a contract without these two is worse than publishing nothing: the trait's own
+    /// `memory_strategy_safety_check` default would accept any selection the capability table
+    /// allows **without** this family's `route_gate`, and its `begin_memory_strategy_request`
+    /// default hard-errors for a contract declaring implemented optimized rungs. So each arm here
+    /// is a live guard, not a restatement of `memory_strategy`'s own tests:
+    ///
+    /// * the accepted arm dies if `begin_memory_strategy_request` is dropped (the default errors);
+    /// * the geometry arms die if `memory_strategy_safety_check` is dropped (the default runs no
+    ///   route gate and admits both);
+    /// * the rung-4 arm is the same context judged by two generators, so it cannot pass by
+    ///   accident: it fails if the shape stops reaching the declaration.
+    #[test]
+    fn the_published_admission_refuses_selections_this_provider_cannot_serve() {
+        use mlx_gen::gen_core::{LoadShape, MemorySafetyDecision, MemoryStrategy};
+        let root = tempfile::tempdir().expect("fixture root");
+        weightless_snapshot(root.path());
+        let spec_at = |load_shape| {
+            LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf())).with_load_shape(load_shape)
+        };
+        let deferred_spec = spec_at(LoadShape::DeferredMaterialization);
+        let deferred = load(&deferred_spec).expect("weights-free load");
+        let contract = deferred.memory_strategy_contract().expect("contract");
+
+        // The provider's own fixture builder supplies the contexts, so every parameter is one this
+        // contract published — a hand-rolled context would risk testing the parameter validator
+        // instead of the rung.
+        let fixture_for = |strategy| {
+            crate::memory_strategy::registered_fixture(&deferred_spec, contract, strategy)
+                .expect("fixtures")
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{strategy:?} must publish at least one route fixture"))
+        };
+
+        // --- accepted: the legal rung-2 selection admits, and opens a real scope ----------------
+        let admitted = fixture_for(MemoryStrategy::BoundedDecode).context;
+        assert_eq!(
+            deferred.memory_strategy_safety_check(&admitted),
+            MemorySafetyDecision::Accept
+        );
+        assert!(
+            deferred
+                .begin_memory_strategy_request(&admitted)
+                .expect("an admitted selection must open a scope, not error")
+                .is_some(),
+            "an implemented optimized rung must hand back a live request scope"
+        );
+
+        // --- refused: a rung this LOADED route does not have ------------------------------------
+        // The identical context, judged by the eager twin whose contract declares rung 4 `Missing`.
+        let streamed = fixture_for(MemoryStrategy::BoundedTransformerResidency).context;
+        assert_eq!(
+            deferred.memory_strategy_safety_check(&streamed),
+            MemorySafetyDecision::Accept,
+            "the deferred load implements rung 4"
+        );
+        let eager = load(&spec_at(LoadShape::EagerMaterialization)).expect("weights-free load");
+        assert!(
+            matches!(
+                eager.memory_strategy_safety_check(&streamed),
+                MemorySafetyDecision::Reject { .. }
+            ),
+            "a resident load must refuse block streaming, not silently accept it"
+        );
+        assert!(
+            eager.begin_memory_strategy_request(&streamed).is_err(),
+            "a refused selection must not open a scope"
+        );
+
+        // --- refused: a geometry the render itself would reject ---------------------------------
+        // Off the `17n + 5` lattice. Only `route_gate` knows this, and only the override runs it.
+        let mut off_lattice = admitted.clone();
+        off_lattice.geometry.frames += 1;
+        let MemorySafetyDecision::Reject { reason } =
+            deferred.memory_strategy_safety_check(&off_lattice)
+        else {
+            panic!("an off-lattice frame count must be refused");
+        };
+        assert!(reason.contains("17n+5"), "{reason}");
+        assert!(
+            deferred
+                .begin_memory_strategy_request(&off_lattice)
+                .is_err(),
+            "a refused geometry must not open a scope"
+        );
+
+        // --- refused: a decode geometry outside the singleton domain -----------------------------
+        let mut retiled = admitted;
+        retiled.selection.parameters.decode_tile_edge =
+            Some(crate::memory_strategy::DECODE_TILE_EDGE + SPATIAL_STRIDE);
+        let MemorySafetyDecision::Reject { reason } =
+            deferred.memory_strategy_safety_check(&retiled)
+        else {
+            panic!("an out-of-domain decode tile must be refused");
+        };
+        assert!(!reason.is_empty(), "a refusal must name its reason");
     }
 
     /// **The rung-4 admission mirrors the contract in both directions** (sc-18662).
@@ -1823,10 +2156,7 @@ mod tests {
         );
 
         // A resident load genuinely does not have the rung (its contract declares `Missing`).
-        let resident = MiniMaxH3 {
-            load_shape: LoadShape::EagerMaterialization,
-            ..generator_at("/snap/transformer")
-        };
+        let resident = generator_with("/snap/transformer", LoadShape::EagerMaterialization);
         let refusal = resident
             .requested_transformer_window(&streamed(stream_request))
             .expect_err("a resident load must refuse streaming, not downgrade it")

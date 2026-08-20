@@ -1079,22 +1079,48 @@ fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Result<()> {
     Ok(())
 }
 
+/// The numeric tier a spec loads at — the one immutable axis of a selection this provider varies.
+///
+/// The floor list is empty because every component is packed at the DiT's own tier: the packed text
+/// encoder tracks whatever `{base}.scales` it ships with rather than a declared per-component floor
+/// (see [`crate::model::TEXT_ENCODER_COMPONENT`]), and the two VAEs are dense on every tier.
+///
+/// Resolved in one place so the loaded route (`crate::model::load`, which captures this on the
+/// generator) and the registry's weights-free probe cannot end up grading against different tiers.
+pub fn numeric_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    }
+}
+
 /// The provider's real admission check, callable before any weight file is opened.
+///
+/// Takes the resolved tier rather than the spec (the wan/ltx idiom) because the **loaded**
+/// generator is the primary caller: `Generator::memory_strategy_safety_check` holds a contract and
+/// a tier resolved once at load, not the `LoadSpec` that produced them.
 pub fn safety_check(
-    spec: &LoadSpec,
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(tier),
         Some(&|| route_gate(context)),
     )
+}
+
+/// The [`MEMORY_REGISTRATION`] adapter: the registry probes weights-free from a spec, so it resolves
+/// the tier here rather than holding one.
+fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check(contract, numeric_tier(spec), context)
 }
 
 /// Weights-free executable fixtures for one implemented optimized rung — one per render route.
@@ -1110,11 +1136,7 @@ pub fn registered_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = numeric_tier(spec);
     routes()
         .into_iter()
         .map(|(mode, reference_count)| {
@@ -1149,12 +1171,12 @@ pub fn registered_fixture(
 }
 
 fn begin_request_with_cleanup(
-    spec: &LoadSpec,
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
+    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
@@ -1196,22 +1218,26 @@ pub fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
-        spec,
         contract,
+        numeric_tier(spec),
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
 /// Production entry point: terminal cleanup drains the MLX allocator cache.
+///
+/// This is what `Generator::begin_memory_strategy_request` calls on the loaded generator (sc-18650).
+/// Until that override existed the function was reachable from nothing: the macro-emitted
+/// `impl Generator` left the trait default in the vtable slot, so a shipped render opened no scope.
 pub fn begin_request(
-    spec: &LoadSpec,
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
-        spec,
         contract,
+        tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
@@ -1222,7 +1248,7 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
         contract: contract_for,
-        safety_check,
+        safety_check: registered_safety_check,
     };
 
 /// The weights-free contract fixture catalog conformance resolves instead of [`contract_for`].
@@ -1382,7 +1408,7 @@ mod tests {
             .register_memory_strategy(mlx_gen::gen_core::MemoryRegistration {
                 provider_id: "minimax_h4",
                 contract: contract_for,
-                safety_check,
+                safety_check: registered_safety_check,
             })
             .build();
         assert!(
@@ -1470,7 +1496,7 @@ mod tests {
                 reference_count: 0,
             };
             assert_eq!(
-                safety_check(&spec, &contract, &context),
+                safety_check(&contract, numeric_tier(&spec), &context),
                 MemorySafetyDecision::Accept,
                 "{strategy:?} must admit its own legal geometry"
             );
@@ -1548,7 +1574,7 @@ mod tests {
             "the representative rung-2 selection must carry the published domain"
         );
         assert_eq!(
-            safety_check(&spec, &contract, &context),
+            safety_check(&contract, numeric_tier(&spec), &context),
             MemorySafetyDecision::Accept,
             "rung 2 must admit its own published geometry"
         );
@@ -1810,7 +1836,7 @@ mod tests {
         };
 
         assert_eq!(
-            safety_check(&spec, &contract, &context(legal, false)),
+            safety_check(&contract, numeric_tier(&spec), &context(legal, false)),
             MemorySafetyDecision::Accept,
             "the control arm must be admitted, or every rejection below is vacuous"
         );
@@ -1854,7 +1880,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    safety_check(&spec, &contract, &context(geometry, use_pid)),
+                    safety_check(&contract, numeric_tier(&spec), &context(geometry, use_pid)),
                     MemorySafetyDecision::Reject { .. }
                 ),
                 "{name} must be refused"
@@ -3040,12 +3066,12 @@ mod tests {
             reference_count: 0,
         };
         assert_eq!(
-            safety_check(&spec, &contract, &context),
+            safety_check(&contract, numeric_tier(&spec), &context),
             MemorySafetyDecision::Accept
         );
         context.selection.tier.precision = Precision::Fp32;
         assert!(matches!(
-            safety_check(&spec, &contract, &context),
+            safety_check(&contract, numeric_tier(&spec), &context),
             MemorySafetyDecision::Reject { .. }
         ));
     }
