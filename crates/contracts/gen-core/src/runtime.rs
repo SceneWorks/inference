@@ -2011,38 +2011,41 @@ mod tests {
         let writer = std::thread::spawn(move || {
             writer_entered.wait();
             let replacement = writer_file.with_extension("replacement");
-            std::fs::write(&replacement, vec![0xa5; 128 * 1024])
-                .expect("write replacement beside source");
-            #[cfg(unix)]
-            std::fs::rename(replacement, writer_file).expect("atomically replace during read");
-            #[cfg(not(unix))]
-            {
-                let bytes = std::fs::read(replacement).expect("read replacement fixture");
-                std::fs::write(writer_file, bytes).expect("overwrite source during read");
-            }
+            // A replacing rename on every platform, so the reader below keeps consuming the original
+            // object everywhere: an in-place overwrite would feed it the replacement's bytes off
+            // Unix, and could not run at all against a source the caller had mapped.
+            let swapped = std::fs::write(&replacement, vec![0xa5; 128 * 1024])
+                .and_then(|()| std::fs::rename(replacement, writer_file));
+            // Release the reader whatever the swap did: returning ahead of this barrier strands it
+            // there and hangs the test binary. The outcome is asserted on `join` instead.
             writer_done.wait();
+            swapped
         });
 
-        let error = pinned
-            .read_unchanged::<_, crate::Error>(|path| {
-                // Open and consume part of the original payload before allowing replacement. The
-                // remainder is then read from the already-open original inode, proving the post-read
-                // check—not a pre-open race—is what rejects the mixed-provenance operation.
-                let mut source = std::fs::File::open(path)?;
-                let mut bytes = vec![0; 4096];
-                source.read_exact(&mut bytes)?;
-                assert!(bytes.iter().all(|byte| *byte == 0x5a));
-                consumed_first_chunk.wait();
-                replacement_done.wait();
-                source.read_to_end(&mut bytes)?;
-                assert_eq!(bytes.len(), original.len());
-                #[cfg(unix)]
-                assert!(bytes.iter().all(|byte| *byte == 0x5a));
-                Ok(bytes)
-            })
+        let outcome = pinned.read_unchanged::<_, crate::Error>(|path| {
+            // Open and consume part of the original payload before allowing replacement. The
+            // remainder is then read from the already-open original file object — which the
+            // replacing rename unlinks but does not disturb — proving the post-read check, not a
+            // pre-open race, is what rejects the mixed-provenance operation.
+            let mut source = std::fs::File::open(path)?;
+            let mut bytes = vec![0; 4096];
+            source.read_exact(&mut bytes)?;
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            consumed_first_chunk.wait();
+            replacement_done.wait();
+            source.read_to_end(&mut bytes)?;
+            assert_eq!(bytes.len(), original.len());
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            Ok(bytes)
+        });
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("replace the pinned source mid-read");
+
+        let error = outcome
             .expect_err("a replacement between the two checks must fail")
             .to_string();
-        writer.join().expect("writer thread");
         assert!(error.contains("changed after load"), "got: {error}");
     }
 
