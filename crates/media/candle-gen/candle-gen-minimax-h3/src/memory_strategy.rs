@@ -75,15 +75,17 @@
 //! the shared `adapter_stack_resident_bytes` at [`AdapterResidencyMode::Additive`] — see
 //! [`adapter_overlay_bytes`], which is also where the probe that makes the bytes *knowable* lives.
 //!
-//! **That probe is a fourth genuine divergence from MLX**, and it is forced by the two lanes' `load`
-//! boundaries rather than chosen. MLX's `load` refuses a nonexistent adapter outright, so it can
-//! size with a flat `ok_or_else(Err)`; this one never has, and two shipped guards
-//! (`crate::model::tests::a_staged_lora_survives_load_rather_than_being_dropped` and its knob-refusal
-//! sibling) drive a path that does not exist because what they assert is retention and refusal, not
-//! sizing. So the absent case is charged an **exact** 0 — nothing can become resident from a file
-//! `read_adapter` cannot even `stat` — while a file that *is* there and cannot be sized fails closed.
-//! The declaration and the variable are both conditional on a non-zero overlay, so a render with no
-//! adapter publishes byte-for-byte the contract this provider always has.
+//! **The probe fails closed on every configured adapter**, matching the MLX sibling: an adapter that
+//! is not on disk is refused at `load` rather than charged 0, and so is one that *is* there and
+//! cannot be sized. Charging an absent path 0 would have been exact only at the **probe instant** —
+//! the contract is computed once in `crate::model::MiniMaxH3::load` and cached, while the factors are
+//! installed per render in `crate::model::MiniMaxH3::load_task_dit`, so a path that appears between
+//! the two would put ~636 MB of resident factors behind a published `overlay_bytes: 0`. That is the
+//! defect this story exists to close, and refusing at `load` costs nothing a caller could have used:
+//! `read_adapter` stats the path first, so an adapter absent at load can never reach a *successful*
+//! render on this lane in any case. The declaration and the variable are both conditional on a
+//! non-zero overlay, so a render with **no** adapter configured publishes byte-for-byte the contract
+//! this provider always has.
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -222,10 +224,18 @@ pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
 pub const ADALN_COMPONENT_ID: &str = "dit_adaln_proj_stack";
 
 /// Contract-stable identity of the configured LoRA stack (sc-18650), declared only when one is
-/// configured. Deliberately **not** `pub`: it is the MLX sibling's literal spelling, and publishing
-/// it would put a second copy of the same string under `scripts/check-workspace.py`'s cross-backend
-/// `pub const` comparison for no consumer that needs the name.
-const ADAPTER_STACK_COMPONENT_ID: &str = "adapter_stack";
+/// configured. Published for the same reason [`ADALN_COMPONENT_ID`] is: a consumer finds the
+/// declaration by name rather than by matching on bytes.
+///
+/// **`pub` does not make it gate-protected, and the test is what pins the spelling.**
+/// `scripts/check-workspace.py`'s `RUST_PUB_CONST` sweep compares only names declared on *both*
+/// backends, and the MLX sibling inlines this literal at its component site rather than naming a
+/// constant — so this name is currently unpaired and the gate compares it against nothing.
+/// `the_configured_lora_stack_is_charged_as_a_typed_additive_overlay` therefore asserts the bare
+/// `"adapter_stack"` literal: asserting it against this constant would be tautological, since both
+/// sides of that comparison come from this declaration. Should the MLX lane ever declare the same
+/// name, the cross-backend gate picks the pair up with no further change here.
+pub const ADAPTER_STACK_COMPONENT_ID: &str = "adapter_stack";
 
 /// The load shape this loader actually has, pinned rather than mirrored from the spec.
 ///
@@ -354,45 +364,43 @@ impl ComponentBytes {
 /// the last denoise step. `Folded` would declare zero and re-open the same under-declaration under a
 /// typed name.
 ///
-/// # Why an ABSENT file is charged 0 while a PRESENT one must be sizable
+/// # Why an unsizable adapter is REFUSED rather than charged 0 — absent ones included
 ///
-/// The shared helper returns `None` for both, and a flat `ok_or_else(Err)` — the MLX shape — is
-/// wrong here, because the two lanes' `load` boundaries genuinely differ. MLX's refuses a
-/// nonexistent adapter outright (`!adapter.path.is_file()`); this one never has, and two shipped
-/// tests depend on that — `crate::model::tests::a_staged_lora_survives_load_rather_than_being_dropped`
-/// and `…::lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually` both drive a
-/// `/turbo.safetensors` that does not exist, because what they assert is **retention** and **knob
-/// refusal**, neither of which needs a real file. Turning their scenario into a load error would
-/// delete two correct guards to satisfy a sizing concern that does not apply to them.
+/// The shared helper returns `None` whenever any configured adapter sizes to zero, and this takes
+/// the flat `ok_or_else(Err)` — the MLX shape — for both of the ways that happens.
 ///
-/// It does not apply because an absent path can put **no bytes anywhere**: `read_adapter`'s first
-/// act is `std::fs::metadata`, so [`crate::adapters::apply_minimax_h3_adapters`] refuses the render
-/// before a single factor is materialized. `0` there is *exact*, not a guess.
+/// **An absent file.** Charging it 0 is exact only at the **probe instant**, and the probe instant is
+/// not the render. [`crate::model::MiniMaxH3::load`] computes this contract once and caches it;
+/// [`crate::model::MiniMaxH3::load_task_dit`] installs the factors per render, later. A path that is
+/// absent at load and present by the time a render maps its DiT installs the full stack behind a
+/// published `overlay_bytes: 0` — the exact under-declaration this story closes, and one no probe
+/// placed at load can *measure* its way out of. It can only refuse. That costs no working scenario:
+/// `candle_gen::train::merge::read_adapter` stats the path before it allocates, so an adapter absent
+/// at load has no successful render to protect — [`crate::adapters::apply_minimax_h3_adapters`] would
+/// have failed the render anyway, 20 minutes later and after the DiT was mapped. The MLX sibling
+/// refuses the same case in its own `load`, so this closes the lanes' one remaining divergence rather
+/// than opening one.
 ///
-/// A **present** file is the opposite, and it is the case that makes this a fail-closed check rather
-/// than a formality. `read_adapter` is extension-blind — it reads the bytes and parses safetensors
-/// out of the buffer — while `safetensors_path_bytes` gates on the `.safetensors` extension and skips
-/// dotfiles. So a perfectly loadable adapter named `turbo.bin`, `turbo.st` or `.turbo.safetensors`
-/// installs 312 modules' worth of factors and sizes to **zero**: a live under-declaration in the OOM
-/// direction, reachable with no malformed input at all. That is refused here rather than charged 0,
-/// which is also what the MLX lane does with the same file.
+/// **A file that IS there and cannot be sized**, which needs no malformed input at all.
+/// `read_adapter` is extension-blind — it reads the bytes and parses safetensors out of the buffer —
+/// while `safetensors_path_bytes` gates on the `.safetensors` extension and skips dotfiles. So a
+/// perfectly loadable adapter named `turbo.bin`, `turbo.st` or `.turbo.safetensors` installs 312
+/// modules' worth of factors and sizes to **zero**: a live under-declaration in the OOM direction.
+///
+/// What remains, and is not closed here, is the narrower window in which a *sized* file is swapped
+/// for a larger one between load and render. No load-time probe can see that; it is the ordinary
+/// time-of-check/time-of-use residual every path that sizes a file before reading it carries.
 pub fn adapter_overlay_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
-    // `try_exists` rather than `exists`: the skip is taken only when the filesystem says the path is
-    // definitely not there. An I/O error means we could not tell, which falls through to the sizing
-    // helper and fails closed — `exists()` would have folded that into "absent" and charged 0.
-    let present: Vec<_> = spec
-        .adapters
-        .iter()
-        .filter(|adapter| !adapter.path.try_exists().is_ok_and(|there| !there))
-        .cloned()
-        .collect();
-    adapter_stack_resident_bytes(&present, AdapterResidencyMode::Additive).ok_or_else(|| {
+    adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(|| {
         CoreError::Unsupported(format!(
-            "{MODEL_ID}: every adapter present on disk must have a non-zero load-exact safetensors \
-             size before the memory contract can declare its resident overlay — {} sized to 0. The \
-             render seam parses safetensors out of the file's bytes whatever it is named, but the \
-             shared sizer counts only non-hidden `.safetensors`, so an adapter named otherwise would \
-             load and be charged nothing. Rename it to `<name>.safetensors`.",
+            "{MODEL_ID}: every configured adapter must be on disk with a non-zero load-exact \
+             safetensors size before the memory contract can declare its resident overlay — {} \
+             sized to 0. An absent path is refused rather than charged 0 because the contract is \
+             built once at load while the factors are installed per render, so a file that appears \
+             in between would be resident against a zero declaration. A present one is refused \
+             because the render seam parses safetensors out of the file's bytes whatever it is \
+             named, while the shared sizer counts only non-hidden `.safetensors` — so an adapter \
+             named otherwise would load and be charged nothing. Stage it as `<name>.safetensors`.",
             spec.adapters
                 .iter()
                 .map(|adapter| adapter.path.display().to_string())
@@ -2294,7 +2302,13 @@ mod tests {
             .iter()
             .find(|component| component.kind == MemoryComponentKind::AdapterStack)
             .expect("the LoRA stack must be declared as a TYPED auxiliary component");
-        assert_eq!(stack.id, ADAPTER_STACK_COMPONENT_ID);
+        // The bare LITERAL, not [`ADAPTER_STACK_COMPONENT_ID`]. Asserting it against the constant
+        // would put this declaration on both sides of the comparison and pin nothing, and the
+        // cross-backend `pub const` gate cannot stand in for it: it compares only names declared on
+        // both backends, and the MLX sibling inlines this string. This is the only thing holding the
+        // two lanes to the same spelling.
+        assert_eq!(stack.id, "adapter_stack");
+        assert_eq!(ADAPTER_STACK_COMPONENT_ID, "adapter_stack");
         assert_eq!(stack.resident_bytes, TURBO_LORA_BYTES);
         assert_eq!(
             stack.residency,
@@ -2321,33 +2335,39 @@ mod tests {
         );
     }
 
-    /// **An adapter that is not on disk leaves the contract byte-identical** (sc-18650) — the leg
-    /// that lets the sizing fail closed without inventing a load error.
+    /// **An adapter that is not on disk is REFUSED, not charged an exact 0** (sc-18650).
     ///
-    /// The MLX sibling refuses a nonexistent adapter in `load` outright, so it can size with a flat
-    /// `ok_or_else(Err)`. This lane never has, and two shipped guards depend on that:
-    /// `crate::model::tests::a_staged_lora_survives_load_rather_than_being_dropped` and
-    /// `…::lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually` both stage a
-    /// `/turbo.safetensors` that does not exist, because they are about **retention** and **knob
-    /// refusal**. `0` is exact for them rather than a guess: `read_adapter` stats the path first, so
-    /// [`crate::adapters::apply_minimax_h3_adapters`] refuses before a factor is materialized.
+    /// `0` for an absent path is exact only at the **probe instant**. The contract is computed once
+    /// in [`crate::model::MiniMaxH3::load`] and cached; the factors are installed per render, later,
+    /// in [`crate::model::MiniMaxH3::load_task_dit`] — so a path that is absent at load and present
+    /// by render time puts the whole stack resident behind a published `overlay_bytes: 0`, which is
+    /// the defect this story exists to close. It costs no working scenario: `read_adapter` stats
+    /// before it allocates, so an adapter absent at load has no successful render to protect.
     ///
-    /// Pinned here so the absent leg is a decision rather than an accident — a later "tidy-up" that
-    /// makes it an error deletes those two guards.
+    /// The no-adapter control is what keeps this attributable — an empty `spec.adapters` is a
+    /// different thing from a configured-but-absent one, and it must still publish the unmoved
+    /// contract.
     #[test]
-    fn an_adapter_that_is_not_on_disk_leaves_the_contract_byte_identical() {
+    fn an_adapter_that_is_not_on_disk_is_refused_rather_than_charged_zero() {
         let root = tempfile::tempdir().expect("tempdir");
         full_snapshot(root.path());
+        // Control: NO adapter configured is not the same case, and still publishes cleanly.
         let bare =
             contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
-        let absent = contract_for(
+        assert_eq!(bare.asset_facts.overlay_bytes, 0);
+
+        let err = contract_for(
             &LoadSpec::new(WeightsSource::Dir(root.path().into()))
                 .with_adapters(vec![lora_at(PathBuf::from("/turbo.safetensors"))]),
         )
-        .expect("an absent adapter must not become a contract error");
-        assert_eq!(
-            absent, bare,
-            "an adapter that can put no bytes anywhere must publish the no-adapter contract"
+        .expect_err("an adapter configured but absent must be refused, not charged 0");
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("/turbo.safetensors"),
+            "the refusal must name the adapter it could not size: {err}"
         );
     }
 
@@ -2378,13 +2398,23 @@ mod tests {
             "the refusal must name the file it could not size: {err}"
         );
 
-        // ...and a hidden `.safetensors` is the same hole with a different spelling.
+        // ...and a hidden `.safetensors` is the same hole with a different spelling, held to the
+        // same two assertions: a bare `is_err()` would stay green if this leg regressed to an opaque
+        // `Msg`, or to a message that never named the file the caller has to go rename.
         let hidden = sparse_file(&root.path().join(".turbo.safetensors"), TURBO_LORA_BYTES);
-        assert!(contract_for(
+        let err = contract_for(
             &LoadSpec::new(WeightsSource::Dir(root.path().into()))
                 .with_adapters(vec![lora_at(hidden)]),
         )
-        .is_err());
+        .expect_err("a hidden `.safetensors` loads and sizes to 0, so it must be refused too");
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(".turbo.safetensors"),
+            "the refusal must name the file it could not size: {err}"
+        );
     }
 
     /// [`ADALN_MODULATION_TABLE_MAX_BYTES`] is read off a **real** worst-case schedule rather than
