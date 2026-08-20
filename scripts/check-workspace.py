@@ -495,27 +495,13 @@ CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS: dict[tuple[str, str], dict[str, str]] =
             "`language_model.layers.0.input_layernorm.weight` to classify dense storage, mlx's "
             "packed loader needs no probe."
         ),
-        ".prompt_executions[krea_t2i].length": (
-            "admission posture, not geometry — see `PROMPT_EXECUTIONS`, which this contract embeds."
-        ),
-        ".prompt_executions[krea_edit].length": (
-            "admission posture, not geometry — see `PROMPT_EXECUTIONS`, which this contract embeds."
-        ),
     },
-    ("krea", "PROMPT_EXECUTIONS"): {
-        "[krea_t2i].length": (
-            "the length policy differs by lane: candle rejects prompts above 1024 tokens at "
-            "admission, mlx leaves the length unbounded. A per-backend admission posture from the "
-            "sc-18306 sweep, recorded here rather than settled by copying either side. Every other "
-            "field of the execution — template, special tokens, padding, prefix trim — agrees."
-        ),
-        "[krea_edit].length": (
-            "as `krea_t2i`, at the edit execution's own bound: candle rejects above 8192 tokens, "
-            "mlx is unbounded. Listed separately because it is a separate declaration — the "
-            "whole-constant exemption this replaced named only `krea_t2i` and silently covered "
-            "this one too."
-        ),
-    },
+    # The krea prompt-execution `length` exemptions (`[krea_t2i]` / `[krea_edit]`, on both this
+    # constant and `PROMPT_EXECUTIONS`) are gone: mlx used to leave both executions unbounded while
+    # candle rejected above 1024 / 8192, and the sc-17137 sync settled it by giving mlx the same
+    # fail-loud admission the repo chose in sc-9047 — `MAX_TEXT_TOKENS` / `MAX_EDIT_TOKENS` in
+    # `mlx-gen-krea/src/text_encoder/tokenizer.rs`, enforced by `check_len` and named directly by
+    # `PROMPT_EXECUTIONS`. The two lanes now agree, so an exemption here would itself red the gate.
     ("qwen-image", "ENCODER_CONTRACT"): {
         ".tokenizer.artifact_candidates[1]": (
             "the encoder contract embeds the tokenizer contract, so the loader search path "
@@ -541,8 +527,18 @@ CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS: dict[tuple[str, str], dict[str, str]] =
     ("z-image", "PROMPT_EXECUTIONS"): {
         "[z_image_prompt].padding": (
             "the `z_image_prompt` execution pads differently by lane: candle applies no padding, "
-            "mlx right-pads to the 512-token max with the qwen pad token. A per-backend batching "
-            "posture, not geometry. The `z_image_empty_negative` execution agrees field for field."
+            "mlx right-pads to the 512-token max with the qwen pad token. Verified functionally "
+            "equivalent against the diffusers reference (sc-17137 sync review), not an open "
+            "question: `pipeline_z_image.py:229-249` pads to 512 purely so a batch can be one "
+            "tensor, then strips each sample back to its valid length with the attention mask "
+            "before the DiT ever sees it. mlx mirrors that mechanically — pad, then `slice_valid` "
+            "back to `num_valid` (`mlx-gen-z-image/src/pipeline.rs:600-615`); candle reaches the "
+            "same place by skipping the pad round-trip entirely. Both feed the DiT identical "
+            "valid-token conditioning, and both truncate identically above 512 through the shared "
+            "`gen-core/src/tokenizer.rs:196-202`. The exemption stays because the declared "
+            "constants still differ — a batching posture, not geometry — but the question of "
+            "whether that difference changes conditioning is settled: it does not. The "
+            "`z_image_empty_negative` execution agrees field for field."
         ),
     },
 }

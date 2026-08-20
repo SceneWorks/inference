@@ -78,12 +78,21 @@ pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
             },
         ],
     };
+/// The declared prompt executions — field for field identical to candle-gen-krea's
+/// `PROMPT_EXECUTIONS`, the sc-9047 fail-loud admission posture on both lanes.
+///
+/// The two `length` caps are spelled as literals rather than as
+/// [`crate::text_encoder::tokenizer::MAX_TEXT_TOKENS`] / `MAX_EDIT_TOKENS` because the cross-backend
+/// contract gate compares these declarations as source text and does not resolve an identifier
+/// through another module, so naming the constant here reads as a divergence from candle's literal.
+/// The literals cannot drift from what the tokenizer enforces:
+/// `tokenizer::tests::declared_length_policy_matches_the_enforced_caps` asserts they are equal.
 pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract] = &[
     mlx_gen::gen_core::EncoderPromptExecutionContract {
         purpose: "krea_t2i",
         template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3Vl,
         add_special_tokens: false,
-        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 1024 },
         padding: mlx_gen::gen_core::EncoderPromptPadding::None,
         prefix_trim: 34,
     },
@@ -91,7 +100,7 @@ pub const PROMPT_EXECUTIONS: &[mlx_gen::gen_core::EncoderPromptExecutionContract
         purpose: "krea_edit",
         template: mlx_gen::gen_core::EncoderPromptTemplate::KreaQwen3VlEdit,
         add_special_tokens: false,
-        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::Unbounded,
+        length: mlx_gen::gen_core::EncoderPromptLengthPolicy::RejectAbove { max_tokens: 8192 },
         padding: mlx_gen::gen_core::EncoderPromptPadding::None,
         prefix_trim: 34,
     },
