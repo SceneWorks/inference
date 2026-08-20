@@ -55,7 +55,7 @@ pub(crate) const DEFAULT_TURBO_SIGMA: f32 = 0.001;
 
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count.
 const SPATIAL_SCALE: u32 = 8;
-const LATENT_CHANNELS: usize = 16;
+pub(crate) const LATENT_CHANNELS: usize = 16;
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Boogu prompts are short).
 /// Enforced up front by [`crate::tokenizer::BooguTokenizer`] so an over-length prompt returns a clear
@@ -231,6 +231,7 @@ pub(crate) fn render_base(
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
         let x_t = blend_reference(clean, noise, sigmas[start])?;
+        let preview_hook = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
@@ -239,7 +240,7 @@ pub(crate) fn render_base(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview_hook),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward(x, &t, &cond)?;
@@ -325,6 +326,7 @@ pub(crate) fn render_turbo(
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
             let x_t = blend_reference(clean, noise, sigmas[start])?;
+            let preview_hook = crate::preview::hook(&req.preview);
             let lat = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -333,7 +335,7 @@ pub(crate) fn render_turbo(
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview_hook),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let v = comps.dit.forward(x, &t, &cond)?;
@@ -349,10 +351,16 @@ pub(crate) fn render_turbo(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
+        let preview_counter = crate::preview::native_counter(steps);
         for i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            // Match the shared sampler contract: preview the running state entering this outer step.
+            // For i > 0 this is the previous clean estimate after DMD re-noise, which is also the
+            // tensor the DiT consumes below. The transient x0 estimate is never previewed twice.
+            preview_hook.emit_step(&preview_counter, i, &lat);
             let sigma = sigmas[i];
             let t = Tensor::from_vec(vec![sigma], (1,), device)?;
             let pred = comps.dit.forward(&lat, &t, &cond)?;
@@ -492,6 +500,7 @@ pub(crate) fn render_edit(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
@@ -500,7 +509,7 @@ pub(crate) fn render_edit(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview_hook),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
