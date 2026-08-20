@@ -459,6 +459,10 @@ impl Pipeline {
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        // Every render begins at the first distilled stage. The adapter overlay retains its complete
+        // per-pass vector, so a two-stage caller switches this selector before its stage-two denoise
+        // instead of collapsing Eros's `[1.0, 0.4]` at load time.
+        comps.avdit.set_adapter_pass(0);
 
         // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
