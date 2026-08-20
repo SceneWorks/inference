@@ -132,6 +132,10 @@ pub trait DenoisePassHost<L: LatentOps> {
 
     /// Apply this pass's pass-local state (guidance selection, adapter weight overrides). Called
     /// after the boundary re-noise and before the first evaluation of the pass.
+    ///
+    /// If this returns `Err`, [`end_pass`](Self::end_pass) is **still invoked** before the executor
+    /// returns — a host may have partially applied pass-local state before failing, so the revert
+    /// hook must be able to clean it up. The begin error stays the primary error.
     fn begin_pass(&mut self, _pass: &ResolvedDenoisePass) -> Result<()> {
         Ok(())
     }
@@ -271,7 +275,14 @@ pub fn execute_denoise_plan<L: LatentOps + 'static>(
             latent = ops.axpy(k_x0, &latent, k_noise, &noise)?;
         }
 
-        host.begin_pass(pass)?;
+        if let Err(error) = host.begin_pass(pass) {
+            // The revert hook still runs on a FAILED begin (the trait's every-exit-path contract):
+            // a host may have partially applied pass-local state before erroring, and the
+            // executor's promise is that overrides never outlive their pass. The begin error stays
+            // primary; a secondary revert failure is subordinated, exactly as on the run path.
+            let _ = host.end_pass(pass);
+            return Err(error);
+        }
         let segment = prep.segment.as_slice();
         let seg_steps = segment.len().saturating_sub(1);
         let result = {
@@ -357,6 +368,7 @@ mod tests {
     struct StubHost {
         log: Vec<String>,
         fail_predict_at_eval: Option<usize>,
+        fail_begin_at_pass: Option<usize>,
         evals: usize,
         observed: Vec<(usize, usize, f32)>,
         first_latent_of_pass: Vec<Vec<f32>>,
@@ -368,6 +380,7 @@ mod tests {
             Self {
                 log: Vec::new(),
                 fail_predict_at_eval: None,
+                fail_begin_at_pass: None,
                 evals: 0,
                 observed: Vec::new(),
                 first_latent_of_pass: Vec::new(),
@@ -387,6 +400,9 @@ mod tests {
         }
         fn begin_pass(&mut self, pass: &ResolvedDenoisePass) -> Result<()> {
             self.log.push(format!("begin[{}]", pass.index));
+            if self.fail_begin_at_pass == Some(pass.index) {
+                return Err(Error::Msg("stub begin fault".to_owned()));
+            }
             Ok(())
         }
         fn predict(
@@ -747,6 +763,32 @@ mod tests {
             "no pass may begin after a pre-tripped cancel: {:?}",
             host.log
         );
+    }
+
+    /// The begin-failure contract: a failed `begin_pass` still gets its `end_pass` (a host may
+    /// have partially applied pass-local state before erroring), the begin error stays primary,
+    /// and no evaluation of that pass ever runs.
+    #[test]
+    fn a_failed_begin_still_gets_its_end_pass_and_is_primary() {
+        let plan = plan_for(vec![pass(2, "euler", 1.0), pass(2, "euler", 0.5)], 3);
+        let mut host = StubHost::new();
+        host.fail_begin_at_pass = Some(1);
+        let err = run(&plan, &mut host).expect_err("a failed begin surfaces");
+        assert!(err.to_string().contains("stub begin fault"), "{err}");
+        assert_eq!(
+            host.log,
+            vec![
+                "schedule[0]",
+                "schedule[1]",
+                "begin[0]",
+                "end[0]",
+                "begin[1]",
+                "end[1]",
+            ],
+            "the failed begin must still be reverted, and nothing may follow it"
+        );
+        // Pass 0 ran its 2 evaluations; pass 1 never evaluated.
+        assert_eq!(host.evals, 2);
     }
 
     #[test]
