@@ -399,8 +399,8 @@ impl<'a> PassPreview<'a> {
     }
 }
 
-/// The MLX Krea [`gen_core::sampling::DenoisePassHost`]: the family schedule builders, the per-pass
-/// forward (per-pass CFG combined inside via the shared [`KreaHeavy::prepared_cfg_velocity`], the
+/// The MLX Krea `gen_core::sampling::DenoisePassHost`: the family schedule builders, the per-pass
+/// forward (per-pass CFG combined inside via the shared `KreaHeavy::prepared_cfg_velocity`, the
 /// MLX per-evaluation `eval` compute boundary included), and the chain-global preview.
 struct KreaPassHost<'a> {
     heavy: &'a KreaHeavy,
@@ -1377,7 +1377,7 @@ impl KreaHeavy {
     /// A chain with **no** adapter weight override runs every pass on the provider's own DiT with
     /// ONE shared step-invariant [`T2iPlan`] — zero clones, the load-time stack untouched
     /// (`DenoisePassPlans::Shared`). Any override builds one **job-local clone per pass**
-    /// ([`Krea2Transformer::clone_for_multiphase`], the multiphase concurrency pattern — the shared
+    /// (`Krea2Transformer::clone_for_multiphase`, the multiphase concurrency pattern — the shared
     /// resident is never mutated) whose adapter stack is `gen_core::pass_adapter_specs` — every
     /// load-time spec with the pass's weight overrides folded in by index — plus that clone's own
     /// prep (`DenoisePassPlans::PerPass`). Either way the model weights are loaded once per job:
@@ -1436,11 +1436,11 @@ impl KreaHeavy {
     }
 
     /// **Chained denoise-pass render** (epic 20414, sc-20418) — one image at `opts.seed`: drive the
-    /// resolved plan through the shared gen-core executor over [`MlxLatentOps`], then decode ONCE.
+    /// resolved plan through the shared gen-core executor over `MlxLatentOps`, then decode ONCE.
     /// The latent stays in latent space across every pass boundary (the executor re-noises in
     /// latent space; no VAE round trip), previews are numbered by the executor's chain-global outer
     /// step so a multi-pass job reads as one continuous trajectory, and the returned
-    /// [`DenoisePlanExecution`](mlx_gen::gen_core::DenoisePlanExecution) carries the per-pass
+    /// `DenoisePlanExecution` (`mlx_gen::gen_core::DenoisePlanExecution`) carries the per-pass
     /// execution record for upstream metadata.
     #[allow(clippy::too_many_arguments)]
     pub fn render_denoise_passes(
