@@ -244,6 +244,10 @@ jobs:
   # steps, with the same commands and the same step names, and all four are gated on the same
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
   #
+  # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
+  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
+  # either; see the notes on those steps.)
+  #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
   # by their SUM — clippy 2.5m, rustdoc 2.3m, package tests 18.4m, conformance 7.4m, SA3 1.2m,
@@ -339,9 +343,57 @@ jobs:
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
         # crashes lld with SIGBUS. That was observed even with the Clippy tree already reclaimed, so
         # moving Clippy to its own runner does not lift it.
+        #
+        # `--lib` here is deliberate for these three groups and is NOT the sc-19447 defect:
+        #   * candle-llm's `conformance` target already executes in `candle-cpu-conformance`;
+        #   * `candle-audio*`'s integration targets are named one by one in that same job's SA3
+        #     step, a choice `scripts/tests/test_sa3_ci_target_coverage.py` polices — widening
+        #     them to `--tests` here would link SA3's real-weight-only binaries for zero cases and
+        #     silently make that guard redundant;
+        #   * runtime-cpu has no `tests/` directory at all.
+        # `candle-gen*` moved to its own invocation below because it was the group that had no
+        # `--tests` runner anywhere.
         run: >-
           cargo test --locked --lib -j 1
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p 'candle-audio*' -p runtime-cpu
+      # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
+      # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
+      # under all-target Clippy without running them, `windows-cuda-check` compiles them
+      # `--no-run`, `macos-metal` Clippies candle without testing it, and the only `--tests` runner
+      # for the family is the `workflow_dispatch`-only `windows-cuda` job. An entire epic's
+      # candle-side parity evidence therefore compiled green and was never evaluated.
+      #
+      # `--tests` over the whole `candle-gen*` glob rather than a curated `--test` list, which is
+      # the shape the sibling `macos-metal` job already uses for `mlx-gen*`. A curated list would
+      # need ~25 separate invocations and would rot the moment a target is added — the exact drift
+      # `test_sa3_ci_target_coverage.py` exists to catch on the audio side. The glob cannot drift,
+      # and `scripts/tests/test_candle_gen_ci_target_coverage.py` pins that it stays a glob that
+      # covers every crate carrying weight-free cases.
+      #
+      # Weight-bound cases are unaffected: they are `#[ignore]`d or sit behind a file-level
+      # `#![cfg(feature = "cuda")]`, so this lane reports them as skipped or compiles them to an
+      # empty binary. They stay reachable only from the manual `windows-cuda` dispatch and from
+      # `real-weights.yml`, which is the deliberate split — see sc-19447 for the per-target
+      # classification and for the real-weight targets no lane currently names.
+      #
+      # `-j 1` is carried over from the step above for the same lld/SIGBUS reason, and matters more
+      # here: this invocation links ~176 additional test binaries. `--lib` is redundant next to
+      # `--tests` (cargo's `--tests` already selects the lib's own test target — verified: both
+      # forms produce the same 210 binaries) and is kept only so this reads identically to the
+      # `macos-metal` invocation it is modelled on.
+      #
+      # MEASURED COST, so the widening is a deliberate choice rather than a silent one (sc-19447
+      # AC1). Locally at this lane's own settings (`-j 1`, `RUST_TEST_THREADS=1` from the root
+      # cargo config), with dependencies warm and only the `candle-gen*` crates rebuilt:
+      #   compile + link of the integration targets   +1m27s   (107 CPU-seconds)
+      #   execution of the 304 newly-running cases    +1m16s   (169 CPU-seconds)
+      # i.e. ~+2m43s of near-serial work on top of a 2m32s + 1m40s `--lib` baseline for the same
+      # crates. Hosted Linux cores are slower per-core, so budget more there; this is the first
+      # thing to re-measure if this job becomes the lane's binding constraint.
+      - name: Test Candle gen packages and integration targets
+        run: >-
+          cargo test --locked --lib --tests -j 1
+          -p 'candle-gen*'
 
   candle-cpu-conformance:
     name: Candle CPU conformance + SA3 gates (Linux)
