@@ -25,6 +25,7 @@
 pub mod config;
 pub mod loader;
 pub mod pipeline;
+pub mod preview;
 pub mod quant;
 pub mod text_encoder;
 pub mod tokenizer;
@@ -298,6 +299,9 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_guidance: true,
+            // All three registered routes emit one latent preview per outer denoise step. Base and
+            // Edit use the shared flow driver; Turbo additionally covers its default native DMD loop.
+            supports_preview: true,
             // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img latent-init
             // (sc-11786): VAE-encode the reference + noise-blend at a strength-derived start step. The
             // multi-image instruction-edit path is the Edit checkpoint's (`descriptor_edit`).
@@ -474,6 +478,7 @@ mod tests {
         let b = descriptor();
         assert!(b.capabilities.supports_guidance);
         assert!(!b.capabilities.supports_negative_prompt);
+        assert!(b.capabilities.supports_preview);
         // sc-11786: Base advertises a single-`Reference` img2img surface (no MultiReference).
         assert_eq!(
             b.capabilities.conditioning,
@@ -486,10 +491,12 @@ mod tests {
         assert!(!t.capabilities.supports_guidance);
         assert_eq!(t.capabilities.samplers, TURBO_SAMPLERS.to_vec());
         assert_eq!(t.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert!(t.capabilities.supports_preview);
         assert_eq!(
             descriptor_edit().capabilities.supported_quants,
             &[Quant::Q4, Quant::Q8]
         );
+        assert!(descriptor_edit().capabilities.supports_preview);
     }
 
     #[test]
