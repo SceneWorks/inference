@@ -1386,6 +1386,7 @@ impl KreaHeavy {
     /// `ctx_neg` must be `Some` whenever any pass uses CFG (the caller encodes it under exactly
     /// that condition — the multiphase precedent); a CFG pass with no negative prep is a loud error
     /// at prepare time, never a silent single-forward render.
+    #[allow(clippy::too_many_arguments)] // mirrors the sibling render/prepare entry points
     pub fn prepare_denoise_passes(
         &self,
         resolved: &[mlx_gen::gen_core::ResolvedDenoisePass],
