@@ -1854,6 +1854,15 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
     // `MiniMaxH3::load` because this is the boundary that carries the typed `Error::Unsupported`.
     requested_tier(spec)?;
     reject_unread_slots(spec)?;
+    // **The adapter-file probe** (sc-18650). `MiniMaxH3::load` runs it too, inside `contract_for` —
+    // this call is here for the same reason `requested_tier` is: that path returns `CandleError`,
+    // which has no `Unsupported` variant, so the refusal reaches a registry caller as an opaque
+    // `Msg` unless the typed check also runs at this boundary. It costs one `stat` per adapter.
+    //
+    // It is deliberately **after** the three knob refusals above: a LoKr staged at an unsizable path
+    // must still be named as LoKr, which is what
+    // `lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually` asserts.
+    crate::memory_strategy::adapter_overlay_bytes(spec)?;
     Ok(Box::new(MiniMaxH3::load(spec)?))
 }
 
@@ -2754,6 +2763,56 @@ mod tests {
                 "the refusal must name the knob it refused; wanted {needle:?}, got {msg}"
             );
         }
+    }
+
+    /// **The registry boundary carries the adapter-sizing refusal with its TYPED error** (sc-18650).
+    ///
+    /// `MiniMaxH3::load` runs the same probe inside `contract_for`, but that path returns
+    /// `CandleError`, which has no `Unsupported` variant — so without the call in [`load`] a registry
+    /// caller gets an opaque `Msg`. The same reason `requested_tier` is run at both boundaries.
+    ///
+    /// The control is the point, and it is the scenario the two adapter tests above rely on: the
+    /// **absent** `/turbo.safetensors` still loads, because an adapter that can put no bytes anywhere
+    /// is charged an exact 0 rather than refused. Only a file that is really there and cannot be
+    /// sized fails closed — `crate::adapters` reads safetensors out of a file's bytes whatever it is
+    /// named, so a `.bin` export would install and be charged nothing.
+    #[test]
+    fn an_unsizable_adapter_is_refused_at_the_registry_boundary_with_the_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+
+        // Control: absent path, unchanged behaviour.
+        load(
+            &LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![adapter_spec(
+                candle_gen::gen_core::AdapterKind::Lora,
+                None,
+                None,
+            )]),
+        )
+        .expect("an absent adapter must keep loading — the retention guards depend on it");
+
+        let misnamed = tmp.path().join("turbo.bin");
+        std::fs::File::create(&misnamed)
+            .unwrap()
+            .set_len(636_512_768)
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![AdapterSpec {
+            path: misnamed,
+            scale: 1.0,
+            kind: candle_gen::gen_core::AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }]);
+        // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
+        let err = match load(&spec) {
+            Ok(_) => panic!("an adapter that loads but cannot be sized must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(err.to_string().contains("turbo.bin"), "{err}");
     }
 
     /// A solid RGB image of the given extent, for the reference-request fixtures.
