@@ -910,14 +910,24 @@ impl MiniMaxH3 {
     /// when it arrives without going through a request scope, and a request the contract admits
     /// must not be silently downgraded to the resident path.
     ///
+    /// That mirror is a **standing obligation on two files**, and it was broken between sc-18662 and
+    /// sc-18650: the adapter guard below existed here with no counterpart in the declaration, so an
+    /// adapter-carrying deferred load advertised rung 4 `Implemented`, was admitted by the safety
+    /// check, opened a request scope, had `stream_transformer_blocks` set from that engagement by
+    /// `MemoryProviderContract::generation_memory` — and was then refused right here. Every guard
+    /// below now names the declaration clause it mirrors; adding a guard without one reopens that
+    /// loop.
+    ///
     /// * The generator must have been loaded at [`LoadShape::DeferredMaterialization`] — the rung's
-    ///   sole shared prerequisite, and the shape [`crate::memory_strategy::contract_for`] resolves
-    ///   `Implemented` at. On a resident load the rung is `Missing` and streaming is a typed
-    ///   refusal, not a fallback.
+    ///   first shared prerequisite, and half of what
+    ///   [`crate::memory_strategy::streamable`] resolves `Implemented` on. On a resident load the
+    ///   rung is `Missing` and streaming is a typed refusal, not a fallback.
     /// * Adapters are refused. A window rebuilds each block from the staged directory per step, so
-    ///   a LoRA folded into a resident stack (sc-18724) would be silently dropped from every
-    ///   windowed block — a plausible render the adapter barely touched, which is the exact failure
-    ///   `apply_minimax_h3_adapters`' strict matching exists to prevent.
+    ///   the forward-time residual factors sc-18724 installs would be dropped from every windowed
+    ///   block — a plausible render the adapter barely touched, which is the exact failure
+    ///   `apply_minimax_h3_adapters`' strict matching exists to prevent. Mirrored by the other half
+    ///   of [`crate::memory_strategy::streamable`], which must live in the declaration because
+    ///   `MemoryRunContext` has no adapter axis for a route gate to read.
     /// * The component scope must be [`TransformerComponent::Both`] — the only declared arm.
     ///   `None` defaults to `Dit` by the shared convention (SC-15794), and `Dit` is deliberately
     ///   outside this provider's published domain: declaring the DiT alone would leave the
@@ -1805,8 +1815,14 @@ impl Generator for MiniMaxH3 {
     /// Defense in depth over the shared worker's selection. Delegates to the provider's own
     /// admission, which is `standard_memory_strategy_safety_check` (the capability table, the owned
     /// parameter domains and the numeric tier) **plus** this family's `route_gate` — the lattice,
-    /// stride, canvas, batch and `use_pid` predicates the render itself enforces. A selection this
-    /// accepts is one `generate` can actually run.
+    /// stride, canvas, batch and `use_pid` predicates the render itself enforces.
+    ///
+    /// **Two axes, not one.** The route gate can only judge what a `MemoryRunContext` carries —
+    /// geometry, tier, parameters — so everything that is a property of the *load* rather than the
+    /// request is judged by the capability table instead, from a contract resolved at load time.
+    /// The deferred-shape and no-adapter prerequisites of rung 4 are both in that half
+    /// ([`crate::memory_strategy::streamable`]). A selection this accepts is one `generate` can run
+    /// only while both halves stay complete; sc-18650 fixed the case where the second was missing.
     fn memory_strategy_safety_check(
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,
@@ -2098,7 +2114,19 @@ mod tests {
             "a refused geometry must not open a scope"
         );
 
-        // --- refused: a decode geometry outside the singleton domain -----------------------------
+        // --- refused: a decode tile outside the PUBLISHED PARAMETER DOMAIN -----------------------
+        //
+        // Deliberately not titled "`validate_decode_geometry` runs": it does not, and cannot, from
+        // here. `contract.validate_selection` checks the owned parameter domains *before*
+        // `route_gate` is ever called, and rung 2's published domain is the same singleton
+        // `validate_decode_geometry` admits — so no value exists that clears one and trips the
+        // other, and every out-of-domain tile is refused by the domain check. That predicate's own
+        // seam is the request scope's `configure_decode`, which `memory_strategy`'s rung-2 chain
+        // test drives end to end. What this arm pins is the domain check itself, by its message.
+        //
+        // Only the edge is moved: the fixture selection already carries both published parameters,
+        // so this is a one-axis mutation of a complete, admitted selection rather than a selection
+        // with a hole in it — and the assertion names which axis was refused.
         let mut retiled = admitted;
         retiled.selection.parameters.decode_tile_edge =
             Some(crate::memory_strategy::DECODE_TILE_EDGE + SPATIAL_STRIDE);
@@ -2107,7 +2135,61 @@ mod tests {
         else {
             panic!("an out-of-domain decode tile must be refused");
         };
-        assert!(!reason.is_empty(), "a refusal must name its reason");
+        assert!(
+            reason.contains("outside the declared production candidates"),
+            "{reason}"
+        );
+
+        // --- refused: rung 4 on an ADAPTER-CARRYING deferred load (sc-18650) ----------------------
+        //
+        // The blocker this arm exists for. `requested_transformer_window` has always refused a
+        // windowed render with adapters, but until this story the contract did not know: `streamable`
+        // read the load shape alone, so this exact spec published rung 4 `Implemented`, accepted the
+        // selection, opened a scope, and only then hit a hard `Unsupported` inside `generate`.
+        //
+        // `MemoryRunContext` carries no adapter axis, so this cannot be a route-gate refusal — the
+        // declaration is the only seam that can see it, which is why the assertion is on `support`
+        // as well as on the two admission seams.
+        let lora = root.path().join("turbo.safetensors");
+        std::fs::write(&lora, b"\x00").expect("adapter file");
+        let adapted_spec =
+            spec_at(LoadShape::DeferredMaterialization).with_adapters(vec![AdapterSpec {
+                path: lora,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            }]);
+        let adapted = load(&adapted_spec).expect("weights-free load with an adapter");
+        let adapted_contract = adapted.memory_strategy_contract().expect("contract");
+        assert_eq!(
+            adapted_contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .expect("rung 4 must appear in the strategy table")
+                .support,
+            mlx_gen::gen_core::MemoryStrategySupport::Missing,
+            "an adapter load must declare rung 4 Missing — the window would drop the factors"
+        );
+        assert!(
+            matches!(
+                adapted.memory_strategy_safety_check(&streamed),
+                MemorySafetyDecision::Reject { .. }
+            ),
+            "an adapter load must refuse block streaming at the safety check"
+        );
+        assert!(
+            adapted.begin_memory_strategy_request(&streamed).is_err(),
+            "an adapter load must not open a streaming scope"
+        );
+        // ...and the adapter's resident bytes are charged rather than declared away (sc-18650).
+        assert_eq!(
+            adapted_contract.asset_facts.overlay_bytes, 1,
+            "the forward-time residual factors are resident for the whole render"
+        );
+        assert_eq!(
+            contract.asset_facts.overlay_bytes, 0,
+            "a render with no adapter has no overlay"
+        );
     }
 
     /// **The rung-4 admission mirrors the contract in both directions** (sc-18662).

@@ -158,7 +158,9 @@
 //!
 //! * **`TransformerSubStack`, not `Transformer`.** The projections are *inside*
 //!   `asset_facts.transformer_bytes`; declaring them as a whole transformer would charge 26 GB
-//!   twice. They are not auxiliary either, so `overlay_bytes` stays 0.
+//!   twice. They are not auxiliary either, so they contribute nothing to `overlay_bytes` — which
+//!   carries the configured LoRA stack and only that (sc-18650), and is 0 on a render with no
+//!   adapter.
 //! * **`residency`, not `default_engagement_exclusions`.** That list excludes a *rung* from
 //!   cost-order engagement; it cannot remove bytes from a formula, and there is no rung here to
 //!   exclude. `bounded_by` is `None` for the same reason — the drop is unconditional on the shipped
@@ -170,11 +172,11 @@
 
 use mlx_gen::gen_core::{
     safetensors_path_bytes, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
+    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
+    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, ResidentRequestMemory,
     TransformerComponent, WeightsSource,
@@ -560,10 +562,20 @@ struct ComponentBytes {
     adaln: u64,
     video_vae: u64,
     audio_vae: u64,
+    /// Load-exact bytes of the configured LoRA stack, held **resident for the whole render**
+    /// (sc-18650).
+    ///
+    /// [`crate::adapters`]'s declared strategy is a *forward-time residual* over
+    /// `mlx_gen::adapters::AdaptableLinear` — "never a merged weight", on **every** quant tier,
+    /// because a packed leaf cannot absorb a bf16 delta without dequantizing and quant tier is a
+    /// creative choice in this product. The factors are therefore still resident at the last denoise
+    /// step, which makes [`AdapterResidencyMode::Additive`] the honest mode: `Folded` would declare
+    /// zero and under-declare the floor, exactly the failure the text-encoder note below records.
+    overlay: u64,
 }
 
 impl ComponentBytes {
-    fn resolve(spec: &LoadSpec) -> Self {
+    fn resolve(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Self> {
         let root = match &spec.weights {
             WeightsSource::Dir(root) => root.clone(),
             WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
@@ -588,13 +600,26 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(TEXT_ENCODER_COMPONENT),
         };
-        Self {
+        // Fails closed rather than guessing: an additive stack whose file cannot be sized would
+        // otherwise be charged 0, and a zero overlay on a render that holds 300 MB of factors is an
+        // under-declaration in the OOM direction. The shared helper is the same one ltx uses.
+        let Some(overlay) = mlx_gen::gen_core::adapter_stack_resident_bytes(
+            &spec.adapters,
+            AdapterResidencyMode::Additive,
+        ) else {
+            return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID}: every configured adapter must have a non-zero load-exact safetensors \
+                 size before the memory contract can declare its resident overlay"
+            )));
+        };
+        Ok(Self {
             text_encoder: safetensors_path_bytes(text_encoder),
             dit: dit_bytes,
             adaln: resolved_adaln_bytes(&dit, dit_bytes),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
-        }
+            overlay,
+        })
     }
 
     /// The declaration-only footprint: no filesystem, no resolved tier, and therefore the
@@ -606,6 +631,7 @@ impl ComponentBytes {
             adaln: ADALN_EVICTED_BYTES,
             video_vae: 0,
             audio_vae: 0,
+            overlay: 0,
         }
     }
 
@@ -763,6 +789,11 @@ fn strategies(streamable: bool) -> Vec<MemoryStrategyCapability> {
                 // a resident load genuinely does not have it. Not `StructurallyNotApplicable`: a
                 // 50-block DiT and a 50-layer transformer encoder are exactly the components this
                 // rung optimizes, and both are measured to bound ~9x.
+                //
+                // sc-18650: `streamable` is **not** the load shape alone — a configured adapter
+                // makes it false too, because a windowed block is rebuilt from the staged tier and
+                // would drop the factors. See [`streamable`] for why that gate cannot live in
+                // `route_gate`.
                 MemoryStrategy::BoundedTransformerResidency if streamable => {
                     MemoryStrategySupport::Implemented
                 }
@@ -840,8 +871,33 @@ fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
     }
 }
 
-fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryProviderContract {
-    let streamable = load_shape == LoadShape::DeferredMaterialization;
+/// Rung 4's prerequisites, both of them, resolved from the spec.
+///
+/// **The deferred load shape is necessary but not sufficient** (sc-18650). A configured adapter is
+/// the second gate, and it belongs *here* rather than only in the render: `route_gate` cannot enforce
+/// it, because [`MemoryRunContext`] carries no adapter axis at all — a selection is geometry, tier
+/// and parameters, and the adapter list is a property of the *load*. So the only place the two can
+/// be made to agree is the declaration.
+///
+/// Without this clause the contract published rung 4 `Implemented` for an adapter-carrying deferred
+/// load, `validate_selection` admitted it, the request scope opened, and
+/// `MemoryProviderContract::generation_memory` set `stream_transformer_blocks` from that engagement —
+/// whereupon `crate::model::MiniMaxH3::requested_transformer_window` refused the very selection the
+/// contract had just promised. Declaring `Missing` closes the loop at its head instead.
+///
+/// The refusal it mirrors is not a caprice: a window rebuilds each block from the staged tier per
+/// step, so a forward-time residual adapter would be dropped from every windowed block. Both
+/// precedents this provider mirrors gate on the same thing — `mlx-gen-wan`'s adapter residency mode
+/// and `mlx-gen-ltx`'s overlay legs.
+pub fn streamable(spec: &LoadSpec) -> bool {
+    resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
+}
+
+fn build_contract(
+    components: &ComponentBytes,
+    load_shape: LoadShape,
+    streamable: bool,
+) -> MemoryProviderContract {
     MemoryProviderContract {
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -922,18 +978,46 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
         // an estimate built from it charges 26 GB the runtime does not hold.
         formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases: phases(),
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::FrameCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                // sc-18660. The decode phase's scratch is a function of the tile area, not the
-                // canvas area — one 256 px tile is decoded at a time regardless of canvas. The
-                // variable is declared because the phase expression needs it; its coefficient is
-                // calibration evidence and is NOT measured yet (see the sc-18660 notes).
-                MemoryFormulaVariable::DecodeTileArea,
-            ],
-            resident_components: vec![adaln_component(components.adaln)],
+            variables: {
+                let mut variables = vec![
+                    MemoryFormulaVariable::AssetBytes,
+                    MemoryFormulaVariable::PixelCount,
+                    MemoryFormulaVariable::FrameCount,
+                    MemoryFormulaVariable::ConditioningTokenCount,
+                    // sc-18660. The decode phase's scratch is a function of the tile area, not the
+                    // canvas area — one 256 px tile is decoded at a time regardless of canvas. The
+                    // variable is declared because the phase expression needs it; its coefficient is
+                    // calibration evidence and is NOT measured yet (see the sc-18660 notes).
+                    MemoryFormulaVariable::DecodeTileArea,
+                ];
+                // Declared **only when an adapter is configured** (sc-18650), so an ordinary load's
+                // formula is byte-for-byte the one this provider has always published and no
+                // existing calibration record is disturbed. `conformance_errors` requires this
+                // variable exactly when a typed auxiliary component is present, and the two are
+                // built from the same condition here so they cannot drift.
+                if components.overlay > 0 {
+                    variables.push(MemoryFormulaVariable::OverlayBytes);
+                }
+                variables
+            },
+            resident_components: {
+                let mut resident = vec![adaln_component(components.adaln)];
+                // The LoRA stack as a typed auxiliary component. `MemoryComponentKind::AdapterStack`
+                // is the ltx spelling for the same forward-time-residual install, and
+                // `WholeRender` is literal here: `crate::model::load_task_dit` installs the factors
+                // onto the task's DiT before the first step and nothing releases them until the DiT
+                // itself goes at the end of denoise.
+                if components.overlay > 0 {
+                    resident.push(MemoryResidentComponent {
+                        id: "adapter_stack".to_owned(),
+                        kind: MemoryComponentKind::AdapterStack,
+                        resident_bytes: components.overlay,
+                        bounded_by: None,
+                        residency: MemoryComponentResidency::WholeRender,
+                    });
+                }
+                resident
+            },
         },
         // The calibration identity carries the RESOLVED shape, not the resident default: a
         // deferred load's peaks are a different curve from a resident load's, and an evidence
@@ -947,9 +1031,21 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
             conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.decoder(),
-            // No auxiliary networks: MiniMax-H3 accepts no adapters, no ControlNet, no IP-adapter
-            // and no identity encoder (`reject_unknown_components` allows only `transformer`).
-            overlay_bytes: 0,
+            // **The configured LoRA stack, and nothing else** (sc-18650).
+            //
+            // This said "MiniMax-H3 accepts no adapters … `reject_unknown_components` allows only
+            // `transformer`" until this story. Both halves were false and had been since sc-18724
+            // landed adapter support on 2026-08-13: the descriptor declares `supports_lora: true`,
+            // `crate::model::load_task_dit` installs the published `lightx2v/Minimax-h3-Turbo`
+            // exports through `crate::adapters::apply_minimax_h3_adapters`, and
+            // `reject_unknown_components` is called with **two** components (`transformer` and
+            // `text_encoder`). The comment simply predated the feature, and while the contract went
+            // unpublished nothing read it.
+            //
+            // The rest of the sentence is still true and is what this field means: there is no
+            // ControlNet, no IP-adapter and no identity encoder on this family, so the LoRA stack is
+            // the only auxiliary residency there is.
+            overlay_bytes: components.overlay,
         },
         runtime: Default::default(),
     }
@@ -958,8 +1054,9 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
-        &ComponentBytes::resolve(spec),
+        &ComponentBytes::resolve(spec)?,
         resolved_load_shape(spec),
+        streamable(spec),
     ))
 }
 
@@ -971,6 +1068,7 @@ pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Memor
     Ok(build_contract(
         &ComponentBytes::weights_free(),
         resolved_load_shape(spec),
+        streamable(spec),
     ))
 }
 
