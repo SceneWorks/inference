@@ -595,13 +595,16 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(REGISTRATION)
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
+                backend: gen_core::CheckpointBackend::Candle,
+                source: gen_core::ImportedModelSource::FusedCheckpoint,
+                operation: gen_core::ImportedModelOperation::Generate,
+                provider_id: MODEL_ID,
+                required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+                inherit_adapters: true,
+            }],
+            ..gen_core::SDXL_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
 }

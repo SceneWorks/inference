@@ -151,13 +151,16 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_activation_memory(ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model::REGISTRATION_BASE)
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "mage-flow",
-            source: mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
-            provider_id: "mage_flow_base",
-            required_components: Some(model::REQUIRED_COMPONENTS),
-            inherit_adapters: false,
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                source: mlx_gen::gen_core::ImportedModelSource::TransformerDirectory,
+                operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                provider_id: "mage_flow_base",
+                required_components: Some(model::REQUIRED_COMPONENTS),
+                inherit_adapters: false,
+            }],
+            ..mlx_gen::gen_core::MAGE_FLOW_CHECKPOINT_ADAPTER
         })
         .register_generator(model::REGISTRATION_TURBO)
         .register_generator(model::REGISTRATION_EDIT)
