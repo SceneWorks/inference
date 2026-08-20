@@ -484,6 +484,7 @@ name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-flux",
  "candle-gen-pid",
  "candle-transformers",
  "image",
