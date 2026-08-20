@@ -989,12 +989,72 @@ pub fn walk_windowed_blocks(
     )
 }
 
+/// **Absolute per-constant bound on a declared peak (sc-17153, rider 1 of activity 20066).**
+///
+/// This replaces the `|measured/declared − 1| < 0.25` **ratio** bands that graded rung 4's
+/// constants until sc-17153's re-measurement pass. Two defects motivated the change, both recorded
+/// in the sc-18662 review:
+///
+/// 1. The ratio form was *multiplicatively asymmetric* — it admitted a declared constant up to
+///    `1/(1 − 0.25) ≈ 1.333x` the measured one while allowing measured only `1.25x` declared.
+/// 2. More seriously, a band on a **quotient** of two constants is blind to *pair-proportional*
+///    drift: `RUNG4_TE_RESIDENT_PEAK_BYTES` and `RUNG4_TE_WINDOWED_PEAK_BYTES` (or a
+///    `RUNG4_DIT_MEASURED_PEAKS` row's pair) moving by the same factor cancel exactly. The comments
+///    of the day claimed the absolute request-peak bound caught that class; it does not — it reads
+///    neither constant. So the class was caught by **nothing**.
+///
+/// Bounding each constant against its own measurement closes both: proportional drift moves each
+/// term and is caught on both, and the bound is symmetric in bytes.
+///
+/// **Tolerance** is the harness's own committed convention — the larger of 256 MiB absolute or 5 %
+/// relative (the `compare-reuse` tolerance in the **SceneWorks** repo's
+/// `docs/memory-calibration-harness.md`; this repo has no copy of that document) — reused here so
+/// this rung is graded the way every other cross-run memory comparison in the fleet is, rather than
+/// by a number invented for it. The absolute floor is what makes it usable on the small windowed
+/// constants, where 5 % of ~1.4 GB would be tighter than the counter's own resolution.
+///
+/// Measured spread this bound was sized against (sc-17153 terminal campaign, real weights, Metal):
+/// the q4 DiT windowed peak was **bit-identical** across two runs, its resident peak moved 0.36 %
+/// (~43 MB), and the q8 pair reproduced its declared constants to within 5 KB and 36 KB. The
+/// "~1 GB of run-to-run spread" the retired comments cited was not reproduced on either arm.
+///
+/// # Two limits of this bound, stated rather than discovered later
+///
+/// 1. **It is single-machine.** Every figure it grades was taken on one `rw-mage` host. The label
+///    `rw-mage` is on *both* Macs, so a scheduler that lands a real-weight arm on the other one is
+///    grading against numbers nobody has replicated there. Nothing here detects that; the failure
+///    mode is a red with a stale-constant message that names the wrong cause.
+/// 2. **On the tightest cell it is narrower than that cell's own recorded history.**
+///    `RUNG4_TE_WINDOWED_PEAK_BYTES` takes the 256 MiB floor, which is 5.96 % of the constant,
+///    while the sc-18662 comments record window-1 peaks of 5.30 GB and 6.24-6.34 GB for what was
+///    nominally the same cell — roughly ±9 %. That history is **not** evidence of counter noise at
+///    the current pin: it was taken on mlx-rs `932beb4e6`, and the pin has since moved to
+///    `7151a9b27` (see [`RUNG4_TE_WINDOWED_PEAK_BYTES`](mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES)).
+///    At `7151a9b27` the same cell reproduced across **eight** runs within ~500 KB (±0.01 %), which
+///    is why the shared tolerance is kept rather than widened to cover a spread from a different
+///    MLX build. A pin bump is the event that should be expected to move it again.
+pub fn assert_declared_peak_constant(what: &str, declared: u64, measured: u64) {
+    const ABSOLUTE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+    let tolerance = ABSOLUTE_FLOOR_BYTES.max((declared as f64 * 0.05) as u64);
+    let delta = declared.abs_diff(measured);
+    assert!(
+        delta <= tolerance,
+        "{what}: declared {declared} B against a measured {measured} B — off by {delta} B, over \
+         the {tolerance} B bound (larger of 256 MiB or 5 %). The constant is stale, and the \
+         contract's rung-4 declaration and the survey's requestPeak row are written from it. This \
+         is a per-constant bound precisely so that proportional drift of a resident/windowed pair \
+         cannot cancel out of a quotient."
+    );
+}
+
 /// Emit a rung-4 measurement receipt: to `MINIMAX_H3_EVIDENCE_OUT` when set, always to stderr.
 ///
 /// Same shape and the same sequencing caveat as [`write_bounded_attention_evidence`]: the measured
 /// half is emitted here in a versioned, self-describing form carrying every axis
 /// `MemoryEvidenceKey` needs, and sc-17153 pairs it with the fitted prediction that
 /// `MemoryRunOutcome` requires.
+///
+/// (see [`assert_declared_peak_constant`] for the per-constant bound these receipts are graded by)
 ///
 /// `cells` are `(window, peak_bytes, wall_seconds)`. **The wall figure is recorded but must not be
 /// asserted on**: this Mac is also the `nax-macos` runner and has been measured at load average

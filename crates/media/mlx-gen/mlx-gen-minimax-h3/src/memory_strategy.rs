@@ -123,24 +123,35 @@
 //!
 //! | arm | tier | resident | window 1 | ratio |
 //! | --- | --- | ---: | ---: | ---: |
-//! | text encoder | bf16 | 53.07 GB | 5.81 GB | **9.13x** |
+//! | text encoder | bf16 (dense) | 53.07 GB | 4.50 GB | **11.79x** |
+//! | text encoder | q8 | 26.98 GB | 1.43 GB | **18.88x** |
+//! | text encoder | q4 | 14.43 GB | 0.80 GB | **18.13x** |
 //! | DiT | bf16 | 39.58 GB | 1.90 GB | **20.82x** |
 //! | DiT | q8 | 21.64 GB | 1.58 GB | **13.73x** |
 //! | DiT | q4 | 12.00 GB | 1.36 GB | **8.85x** |
 //!
-//! Output was **bit-identical** at every window on every arm and tier, so nothing is traded. Both
-//! resident figures reproduce this module's own stage constants from a different harness —
-//! [`CONDITIONING_STAGE_PEAK_BYTES`] and [`DENOISE_RESIDENT_BF16_BYTES`] — which is what makes them
-//! attributable to a component rather than to a process-wide mark.
+//! Output is **bit-identical** (`0.000e0` relative max-abs) at every window on every arm and tier,
+//! so nothing is traded. Both resident figures reproduce this module's own stage constants from a
+//! different harness — [`CONDITIONING_STAGE_PEAK_BYTES`] and [`DENOISE_RESIDENT_BF16_BYTES`] —
+//! which is what makes them attributable to a component rather than to a process-wide mark.
+//!
+//! **What "bit-identical" now rests on, and what it used to rest on (sc-17153).** The claim was
+//! previously made from the dense arm alone, which is the one encoder no tiered render loads; the
+//! packed tiers' windowed output was compared against nothing. Both packed arms are now measured
+//! and both are bit-identical, so the claim is true of the encoders that ship — but it is a
+//! statement about *measured runs*, not a property the path guarantees: see
+//! [`TRANSFORMER_WINDOW_SIZE`]'s fault note for an observed all-zero windowed context that no
+//! memory assertion in this rung can see.
 //!
 //! Three things that declaration decides deliberately:
 //!
 //! * **[`TransformerComponent::Both`], not `Dit`.** The conditioning stage is still the taller of
 //!   the two at every tier even after sc-19120's packed encoder, and declaring the DiT alone would
-//!   leave it with no lever at all. The TE arm is the larger absolute saving — 47.26 GB against the
+//!   leave it with no lever at all. The TE arm is the larger absolute saving — 48.57 GB against the
 //!   DiT's 37.68 GB at bf16.
-//! * **A singleton window domain.** [`TRANSFORMER_WINDOW_SIZE`] is `1` because the parameter is
-//!   *measured inert* above it, not because 1 is a safe default. See that constant.
+//! * **A singleton window domain.** [`TRANSFORMER_WINDOW_SIZE`] is `1` because 1 is the *measured
+//!   residency floor* on every tier, not because the parameter is inert above it (it is not — the
+//!   packed tiers spread 2.17-3.12x) and not because 1 is a safe default. See that constant.
 //! * **Rung 4 does not depend on rung 3.** Its sole shared prerequisite is the load shape
 //!   (`BOUNDED_TRANSFORMER_RESIDENCY_REQUIRES`), not rung 1 and not rung 3 — so sc-18661's
 //!   `StructurallyNotApplicable` verdict, which satisfies prerequisite edges vacuously, introduces
@@ -461,32 +472,110 @@ fn resolved_load_shape(spec: &LoadSpec) -> LoadShape {
 /// The **only** transformer window size this provider admits: one block or layer at a time.
 ///
 /// **The singleton is the finding, not a placeholder** — the same shape rung 2's
-/// [`DECODE_TILE_EDGE`] has, for its own separate reason.
+/// [`DECODE_TILE_EDGE`] has, for its own separate reason. What makes it the right point is that
+/// **1 is the measured residency floor**, not that the parameter is inert.
 ///
-/// `mlx_gen::block_residency::run_windowed`'s `apply` releases each block as soon as it is consumed
-/// rather than at the end of the window, so even a 50-block all-covering plan holds one block at a
-/// time and the plan's window never sets the residency. Measured on the real encoder across
-/// `[1, 5, 10, 50]`: a **1.09x** spread across the whole range, against **9.13x below resident** —
-/// the run-to-run noise (~1 GB) is larger than the spread across window sizes.
+/// # The inertness claim was wrong, and it was wrong because it was measured on one tier (sc-17153)
 ///
-/// Publishing `[1, 5, 10, 50]` would advertise a lever whose other values do nothing, which is the
-/// inert-parameter defect this epic keeps refusing. SC-15448's rung-4 survey recorded the same
-/// window-inert-above-1 behaviour on another family; this reproduces it independently.
+/// This constant used to say the window parameter is *measured inert* above 1, citing a **1.09x**
+/// spread across `[1, 5, 10, 50]`. That spread was taken on the **dense** encoder, where a single
+/// Qwen3 layer's f32 upcast dominates the peak at every window size and flattens the curve
+/// (re-measured: 1.39x). It does not describe the encoder a shipped tiered render loads. Measured
+/// on the packed tiers, per window, on real weights:
+///
+/// | tier | resident | window 1 | window 5 | window 10 | window 50 | spread |
+/// | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+/// | `bf16` (dense) | 53.07 GB | **4.50 GB** | 6.24 GB | 6.24 GB | 6.24 GB | 1.39x |
+/// | `q8` | 26.98 GB | **1.43 GB** | 2.65 GB | 2.78 GB | 3.10 GB | 2.17x |
+/// | `q4` | 14.43 GB | **0.80 GB** | 1.78 GB | 1.95 GB | 1.87 GB | 2.45x |
+///
+/// The packed spread runs 2.17-3.12x across runs (sc-17153's terminal campaign independently
+/// measured 3.12x on `q4`), so the parameter is a **real lever** on every encoder a tiered render
+/// uses, and the retired `< 2.0` spread assertion in `tests/block_window_real.rs` was asserting
+/// something false about them.
+///
+/// What holds on **every encoder tier measured**, with a wide margin, is that window 1 is the
+/// minimum: 4.50 GB against 6.24 (dense), 1.43 against 2.65-3.10 (`q8`), 0.80 against 1.78-1.95
+/// (`q4`). The curve above 1 is not strictly monotonic — `q4` runs 1.78 -> 1.95 -> 1.87 across
+/// windows 5/10/50, so the ordering *among the larger windows* is counter noise — but the floor is
+/// separated from all of them by 1.9x or more. That is what justifies publishing the singleton:
+/// `[1]` is the cheapest point of a real curve, and the other values would advertise a lever that
+/// trades memory *away*.
+///
+/// `tests/block_window_real.rs::measure_te_arm` asserts the floor (with the harness's 256 MiB / 5 %
+/// margin, not as a strict ordering) and bounds the spread, on **both TE arms**. The DiT arm is
+/// deliberately not covered by that claim: it measures resident against window 1 only, so whether
+/// 1 is *its* floor is unmeasured — see [`RUNG4_DIT_MEASURED_PEAKS`].
+///
+/// # ⚠ The DENSE encoder has been observed returning an all-zero context — UNFIXED
+///
+/// Five sightings in ~32 real-weight forwards on this hardware (sc-17153): identical shapes, clean
+/// exit, no Metal diagnostic, `max = 0.0` where the correct answer is `1.55e4`. What the sightings
+/// have in common is now specific enough to be actionable:
+///
+/// * **Every sighting is the `bf16` dense encoder.** Zero sightings across ~14 `q4` / `q8` arms.
+/// * **It is NOT windowing.** Three sightings were *resident* forwards, two windowed — including
+///   two resident ones after this module's loader fix, on a path that never goes near
+///   `from_dir_deferred`. Rung 4 neither causes it nor is exposed to it more than the resident
+///   path is, and the loader fix neither introduced nor removed it.
+/// * **It is NOT the window size.** Reversing the order of `[1, 5, 10, 50]` moved the zero from
+///   window 1 to window 50.
+/// * **It IS the second multi-gigabyte encoder load in one process, reading cold.** Four of the
+///   five fit exactly that: two dense resident loads that followed the packed arm in the same test
+///   binary (167.2 s and 166.9 s cold — both zero), against two that were the *first* load in
+///   their process (156.0 s and 72.6 s cold — both correct), and twelve warm loads at any position
+///   (all correct). The two windowed sightings are the same shape: a window that followed a 53 GB
+///   resident load in the same process. The one outlier was a 2-layer probe taken while ~20
+///   compilers were running.
+///
+/// The mechanism is below this crate and is **unattributed**; nothing here claims to have removed
+/// it. Two things this crate does about it:
+///
+/// 1. `tests/block_window_real.rs` compares the context against a reference on every arm and
+///    refuses a degenerate reference — that assertion caught sightings four and five live. The peak
+///    counter reads *lower* when the work does not happen, so no memory assertion in this rung can
+///    see it, and neither can a norm, a cosine or a checksum.
+/// 2. That file now **requires** each arm to be its own process invocation, which is what its own
+///    module text had always claimed and what `--test-threads=1` does not provide.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 /// **The TE arm** (sc-18662, AC3), measured on the real Qwen3-VL-32B tap by
 /// `tests/block_window_real.rs`: resident bytes, and the window-1 floor.
 ///
-/// 53.07 GB -> 5.81 GB, a **9.13x** reduction and the single largest memory change this rung
+/// 53.07 GB -> 4.50 GB, an **11.79x** reduction and the single largest memory change this rung
 /// produces on this model. The resident figure independently reproduces
 /// [`CONDITIONING_STAGE_PEAK_BYTES`]'s 53.07 GB from a different harness, which is what makes it
 /// attributable to the encoder rather than to a process-wide mark.
 ///
 /// Output was **bit-identical** (`0.000e0` relative max-abs) at every window size, so nothing is
-/// traded for it.
+/// traded for it — but read the fault note on [`TRANSFORMER_WINDOW_SIZE`] before treating
+/// "bit-identical" as a property of the path rather than of the runs that were measured.
+///
+/// # The windowed figure moved with the mlx-rs pin (sc-17153): 5.81 GB -> 4.50 GB
+///
+/// `RUNG4_TE_WINDOWED_PEAK_BYTES` was declared at `5_814_845_376`. It does not reproduce: eight
+/// runs on real weights land at `4_501_440_448` B ± ~0.5 MB, 1.31 GB (22.6 %) below the declared
+/// value and far outside `common::assert_declared_peak_constant`'s bound — which is the
+/// per-constant absolute bound sc-17153 introduced precisely so a stale member of a pair could not
+/// hide inside a quotient. The resident member is unchanged and reproduces to 2.4 MB, so this was
+/// exactly the *single-member* drift a ratio band cancels.
+///
+/// **The cause is the MLX pin, not this crate.** `git diff` from the sc-18662 measurement
+/// (`19efeb265`) to the current tree over `src/text_encoder/`, `src/block_stream.rs` and the
+/// harness is doc- and comment-only — nothing in the crate accounts for a 22.6 % drop. What moved
+/// is `Cargo.toml`'s mlx-rs revision, `932beb4e6` -> **`7151a9b27`**, in `dfd76b5ae`
+/// ("fix(mlx): preserve global VAE normalization in tiled decode", sc-19753). So:
+///
+/// * this figure is **pinned to mlx-rs `7151a9b27`**, and an MLX pin bump is the event that should
+///   be expected to move it again — when it does, the assertion will red with a *stale constant*
+///   message, and the pin is the first thing to check rather than this crate's loaders;
+/// * it also independently rules out the alternative reading, that 4.50 GB is what a *degenerate*
+///   (all-zero) run happens to peak at. It is not: the zero-output runs peak lower still, and
+///   `tests/block_window_real.rs` compares output before it records a cell, so no run that
+///   produced zeros can contribute a peak to this constant.
 pub const RUNG4_TE_RESIDENT_PEAK_BYTES: u64 = 53_074_721_216;
 /// The TE arm at [`TRANSFORMER_WINDOW_SIZE`]. See [`RUNG4_TE_RESIDENT_PEAK_BYTES`].
-pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 5_814_845_376;
+pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 4_501_440_448;
 
 /// **The DiT arm**, per tier: `(tier, resident_peak_bytes, window_1_peak_bytes)`.
 ///
@@ -2988,7 +3077,7 @@ mod tests {
             .parameters;
         // **`Both`, not `Dit`.** Declaring the DiT alone would leave the conditioning phase — the
         // taller stage at every tier — with no lever, which is what AC3 refuses. The TE arm is
-        // measured separately: 53.07 -> 5.81 GB.
+        // measured separately: 53.07 -> 4.50 GB (dense).
         assert_eq!(
             ranges.transformer_window_components,
             vec![TransformerComponent::Both]

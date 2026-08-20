@@ -104,6 +104,28 @@ impl MiniMaxH3TextEncoder {
     /// The [`Weights`] map is dropped before returning: it is only lazily-mapped handles, but a
     /// retained one keeps every layer tensor reachable and makes the first window's release free
     /// nothing.
+    ///
+    /// # The token table is FORCED before that map is dropped (sc-17153)
+    ///
+    /// MLX maps per tensor and materializes on first read, so `embedding` alone hands back a lazy
+    /// handle: measured, `get_active_memory()` was **0 B** when this constructor returned while
+    /// [`Self::nbytes`] already claimed 1,555,824,640 B, and the table only became resident
+    /// (1,556,316,352 B active) part-way through the *first window*. Two things were wrong with
+    /// that:
+    ///
+    /// * the residency this constructor documents — "`embed_tokens` stays resident because it is
+    ///   consumed once, before the stack runs" — was not true at the point it is stated, and
+    ///   [`Self::nbytes`]'s own contract ("`get_active_memory` after a forced materialization must
+    ///   land within a small margin of it") had no forced materialization to be measured against;
+    /// * the 1.556 GB read landed *inside* a bounded window, so the window-1 peak this rung
+    ///   publishes ([`RUNG4_TE_WINDOWED_PEAK_BYTES`](crate::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES))
+    ///   was charged the token table's first materialization rather than the window's own
+    ///   residency, and the table's `Load` was still outstanding against a *dropped* map while the
+    ///   window held a second, independent map over the same 14 shard files.
+    ///
+    /// Forcing it here costs no extra bytes — the table has to be resident for the forward either
+    /// way — and is the idiom `mlx-gen-krea`'s encoder already uses
+    /// ([`TokenEmbedding::materialize_weights`]).
     pub fn from_dir_deferred(
         dir: impl AsRef<std::path::Path>,
         prefix: &str,
@@ -121,7 +143,10 @@ impl MiniMaxH3TextEncoder {
         let stream = crate::block_stream::TeBlockStream::new(dir, prefix, cfg.clone())?;
         let embed_tokens = {
             let w = Weights::from_dir(dir)?;
-            embedding(&w, &join_key(prefix, "embed_tokens"))?
+            let embed_tokens = embedding(&w, &join_key(prefix, "embed_tokens"))?;
+            // LOAD-BEARING, and it must happen before `w` goes out of scope — see the doc above.
+            embed_tokens.materialize_weights()?;
+            embed_tokens
         };
         Ok(Self {
             embed_tokens,
