@@ -73,6 +73,10 @@ pub use control::{
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
 };
 pub use denoise_passes::{
+    any_pass_overrides_adapters, pass_adapter_specs, DenoisePassExecutionRecord,
+    DenoisePlanExecution,
+};
+pub use denoise_passes::{
     curated_sampler_ids, curated_scheduler_ids, denoise_pass_seed,
     denoise_passes_from_advanced_json, denoise_passes_from_json, denoise_passes_to_json,
     json_equal_within, resolve_denoise_plan, validate_denoise_passes, DenoiseDefaults, DenoisePass,
@@ -158,12 +162,13 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
-    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
-    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, VAE_COMPONENT,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, DenoisePassReportSink,
+    FileStatFingerprint, IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult,
+    LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins,
+    PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

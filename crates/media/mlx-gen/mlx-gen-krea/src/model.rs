@@ -256,7 +256,17 @@ pub fn descriptor() -> ModelDescriptor {
             // `gen_core::sampling::schedule_sigmas`, so the advertisement and the honoring are the
             // same code path. Families that have NOT been validated keep the bare
             // `curated_scheduler_names()` menu — that is the gate.
-            schedulers: [curated_scheduler_names(), advanced_pass_scheduler_names()].concat(),
+            schedulers: [
+                curated_scheduler_names(),
+                advanced_pass_scheduler_names(),
+                // `flow_match` is the honored NATIVE alias (resolves to the byte-exact native
+                // exponential-mu schedule through the N3 fallback in `resolve_flow_schedule`).
+                // Advertised since sc-20418 because the chained denoise-pass resolution ladder
+                // needs an explicit, menu-valid id for "the model's default schedule" — a resolved
+                // plan naming it must replay through validation. The candle twin advertises it too.
+                vec!["flow_match"],
+            ]
+            .concat(),
             supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
@@ -277,8 +287,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_multi_speaker: false,
             supports_conversation_history: false,
             supports_conversation_session: false,
-            // Chained denoise passes are not wired for this provider (sc-20415).
-            supports_denoise_passes: false,
+            // Chained denoise passes (epic 20414, sc-20418): Krea 2 is the first wired family —
+            // Turbo here and Raw (which derives from this descriptor). The executor is the shared
+            // `gen_core::sampling::pass_executor`, driven by `KreaHeavy::render_denoise_passes`;
+            // the lockstep rule applies (never advertise ahead of the wiring), and the edit
+            // variants explicitly opt back OUT below (grounded edit conditioning is not in the
+            // t2i-from-noise v1 surface). The candle twin advertises identically.
+            supports_denoise_passes: true,
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
@@ -333,6 +348,10 @@ pub fn edit_descriptor() -> ModelDescriptor {
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
+    // Chained denoise passes are wired for the t2i-from-noise Turbo/Raw variants only (sc-20418):
+    // the grounded edit conditioning path is out of the v1 surface, so the derived edit descriptor
+    // must not inherit the advertisement.
+    d.capabilities.supports_denoise_passes = false;
     d
 }
 
@@ -353,6 +372,8 @@ pub fn turbo_edit_descriptor() -> ModelDescriptor {
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
+    // Chained denoise passes stay off the edit surfaces (sc-20418) — see `edit_descriptor`.
+    d.capabilities.supports_denoise_passes = false;
     d
 }
 
@@ -1117,6 +1138,10 @@ impl Generator for Krea {
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
         validate_request(&self.descriptor, req)?;
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        // Chained denoise passes (epic 20414, sc-20418): t2i-from-noise Turbo/Raw only. The shared
+        // floor above already gated capability, ids, ranges, and the phases mutual exclusion.
+        validate_denoise_pass_surface(self.descriptor.id, &self.descriptor.capabilities, req)?;
+        ensure_denoise_pass_adapters_allowed(self.descriptor.id, self.has_diff_patch, req)?;
         Ok(())
     }
 
@@ -1208,6 +1233,10 @@ impl Krea {
         // Loud-reject a multi-phase request on a diff-patch model (sc-13884): its baked `.diff` delta
         // can't be toggled off per phase, so it would silently corrupt "base-only" phases.
         ensure_multiphase_allowed_for(self.descriptor.id, self.has_diff_patch, req)?;
+        // Chained denoise passes (sc-20418): the same floor `validate` applies, re-checked here for
+        // callers that reach `generate` directly.
+        validate_denoise_pass_surface(self.descriptor.id, &self.descriptor.capabilities, req)?;
+        ensure_denoise_pass_adapters_allowed(self.descriptor.id, self.has_diff_patch, req)?;
         let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
@@ -1305,12 +1334,45 @@ impl Krea {
             let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
             base_schedule(total, req.width, req.height, req.scheduler.as_deref())
         });
+        // Chained denoise passes (epic 20414, sc-20418): resolve the EXPLICIT plan once up-front —
+        // adapter-index bounds against the real loaded count, the encode decision (whether any pass
+        // uses CFG), and the per-image render all drive from the same resolution. `None` ⇒ every
+        // existing path below is byte-untouched (including the RAW `phases` executor, with which
+        // this is mutually exclusive at the shared floor).
+        let dp_defaults = krea_denoise_defaults(is_raw);
+        let dp_ctx = self
+            .descriptor
+            .capabilities
+            .denoise_pass_context(Some(self.adapters.len()));
+        let dp_resolve = |seed: u64| -> Result<mlx_gen::gen_core::ResolvedDenoisePlan> {
+            req.resolve_denoise_plan(seed, &dp_defaults, &dp_ctx)
+                .map_err(mlx_gen::gen_core::Error::from)
+                .map_err(Error::from)
+        };
+        let dp_plan: Option<mlx_gen::gen_core::ResolvedDenoisePlan> = match &req.denoise_passes {
+            Some(_) => Some(dp_resolve(base_seed)?),
+            None => None,
+        };
+        let dp_need_neg = is_raw
+            && dp_plan
+                .as_ref()
+                .is_some_and(|plan| plan.passes.iter().any(|p| p.guidance.unwrap_or(0.0) > 0.0));
+
         // The text encode builds the unconditional context iff ANY phase runs CFG (guidance > 0). A
         // single positive value suffices for `encode_contexts`' neg-gate (it consults `guidance` only as
         // `guidance > 0`, never in the combine — the per-phase guidance drives the actual CFG combine).
+        // The chained denoise-pass plan gates the same way: the negative context is encoded iff any
+        // pass uses CFG.
         let encode_guidance = match &mp_resolved {
             Some(resolved) if multiphase::any_phase_uses_cfg(resolved) => 1.0,
             Some(_) => 0.0,
+            None if dp_plan.is_some() => {
+                if dp_need_neg {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             None => guidance,
         };
 
@@ -1366,6 +1428,74 @@ impl Krea {
                             .alternate_decoder
                             .map(|decoder| decoder as &dyn LatentDecoder)
                     });
+
+                // Chained denoise passes (epic 20414, sc-20418): drive the resolved plan through
+                // the SHARED gen-core pass executor (fresh schedule + solver state per pass,
+                // deterministic latent-space boundary re-noise on the pass seed, chain-wide
+                // effective-model-eval progress, per-eval cancellation) over per-pass prepared
+                // state — the provider's own DiT when no pass overrides adapter weights, else one
+                // job-local clone per pass. ONE decode per image, after the whole chain. Returns
+                // before the multi-phase and single-pass dispatches.
+                if let Some(base_plan) = dp_plan.as_ref() {
+                    let plans = self.file_pin_spec.read_files_unchanged(
+                        self.adapters.iter().map(|adapter| &adapter.path),
+                        || {
+                            heavy.heavy.prepare_denoise_passes(
+                                &base_plan.passes,
+                                &self.adapters,
+                                is_raw,
+                                &ctx.pos,
+                                ctx.neg.as_ref(),
+                                req.width,
+                                req.height,
+                            )
+                        },
+                    )?;
+                    let mut images = Vec::with_capacity(req.count as usize);
+                    let mut first_execution: Option<mlx_gen::gen_core::DenoisePlanExecution> = None;
+                    for n in 0..req.count {
+                        let seed = base_seed.wrapping_add(n as u64);
+                        // Image n re-resolves the plan at its own job seed (`seed + n`, the batch
+                        // convention), so its pass seeds are domain-separated per image exactly as
+                        // a standalone render at that seed would be.
+                        let plan = if n == 0 {
+                            base_plan.clone()
+                        } else {
+                            dp_resolve(seed)?
+                        };
+                        let opts = TurboOptions {
+                            width: req.width,
+                            height: req.height,
+                            steps,
+                            seed,
+                            sampler: req.sampler.clone(),
+                            scheduler: req.scheduler.clone(),
+                            transformer_window_size,
+                            memory: req.memory.unwrap_or_default(),
+                        };
+                        let (image, execution) = heavy.heavy.render_denoise_passes(
+                            &plans,
+                            &plan,
+                            is_raw,
+                            &opts,
+                            decoder,
+                            &req.cancel,
+                            &req.preview,
+                            on_progress,
+                        )?;
+                        if first_execution.is_none() {
+                            first_execution = Some(execution);
+                        }
+                        images.push(image);
+                    }
+                    // The execution record (requested + resolved per-pass values + effective
+                    // evaluation accounting), emitted exactly once per generation.
+                    if let Some(execution) = first_execution {
+                        req.denoise_pass_report
+                            .emit(execution.with_requested(req.denoise_passes.as_deref()));
+                    }
+                    return Ok(GenerationOutput::Images(images));
+                }
 
                 // Multi-phase render (epic 13879, sc-13884): drive the resolved phases over the ONE
                 // global schedule — per-phase guidance selecting the true-CFG (two-forward) or CFG-off
@@ -1687,6 +1817,101 @@ fn ensure_multiphase_allowed_for(
         )));
     }
     Ok(())
+}
+
+/// Chained denoise-pass request validation (epic 20414, sc-20418) — the Krea-specific floor on top
+/// of the shared `validate_denoise_passes` gate (which already checked capability, arity, ranges,
+/// sampler/scheduler ids against the advertised menus, and the `phases` mutual exclusion). The
+/// candle twin (`candle-gen-krea::validate_denoise_pass_surface`) applies the same rules.
+///
+/// Rejects, loudly:
+/// - passes combined with reference/edit conditioning or the PiD decoder (t2i-from-noise only in v1
+///   — the multiphase precedent);
+/// - a guidance-bearing pass on a CFG-free variant (Turbo has no guidance axis, so a per-pass
+///   guidance would be silently ignored — the class of silent-wrong this floor exists to close);
+/// - higher-rung per-generation memory adaptation (anything beyond `stage_residency`) — the chain
+///   host runs the unbounded attention/decode paths, so a selected lever must never be silently
+///   dropped (the candle twin rejects the same combination through its memory-rung branch).
+fn validate_denoise_pass_surface(
+    id: &str,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    let Some(passes) = req.denoise_passes.as_ref() else {
+        return Ok(());
+    };
+    if !req.conditioning.is_empty() {
+        return Err(Error::Msg(format!(
+            "{id}: chained denoise passes render from pure noise — reference/edit conditioning is \
+             not supported (sc-20418 v1)"
+        )));
+    }
+    if req.use_pid {
+        return Err(Error::Msg(format!(
+            "{id}: chained denoise passes do not support the PiD decoder yet (sc-20418 follow-on)"
+        )));
+    }
+    if !caps.supports_guidance {
+        if let Some(index) = passes.iter().position(|p| p.guidance.is_some()) {
+            return Err(Error::Msg(format!(
+                "{id}: pass {index} sets guidance, but this variant is CFG-free (no guidance \
+                 axis) — use {KREA_2_RAW_ID} for per-pass guidance"
+            )));
+        }
+    }
+    let has_higher_rung_controls = req.memory.is_some_and(|memory| {
+        mlx_gen::gen_core::GenerationMemory {
+            stage_residency: false,
+            ..memory
+        } != mlx_gen::gen_core::GenerationMemory::default()
+    });
+    if has_higher_rung_controls {
+        return Err(Error::Unsupported(format!(
+            "{id}: chained denoise passes do not support per-generation memory adaptation beyond \
+             staged residency (sc-20418 v1)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a chained denoise-pass request carrying **adapter weight overrides** on a model loaded
+/// with a diff-patch adapter (the sc-13884 rule, applied to the pass mechanism): the per-pass DiT
+/// clone clears the baked adapter stack and re-installs low-rank residuals, but a `.diff` fold
+/// lives in the shared dense base and cannot be re-scaled per pass — the override chain would
+/// silently keep it at full strength. Chains WITHOUT overrides are fine — they run on the
+/// provider's own (folded) DiT untouched.
+fn ensure_denoise_pass_adapters_allowed(
+    id: &str,
+    has_diff_patch: bool,
+    req: &GenerationRequest,
+) -> Result<()> {
+    let overrides = req.denoise_passes.as_ref().is_some_and(|passes| {
+        passes
+            .iter()
+            .any(|p| p.adapters.iter().any(|a| a.weight.is_some()))
+    });
+    if overrides && has_diff_patch {
+        return Err(Error::Msg(format!(
+            "{id}: per-pass adapter weight overrides are not supported on a model loaded with a \
+             diff-patch (.diff/.diff_b) adapter — the fold is irreversible, so a pass-local \
+             re-adaptation would silently drop it; run the chain without adapter overrides, or \
+             load low-rank LoRA/LoKr adapters"
+        )));
+    }
+    Ok(())
+}
+
+/// The Krea model defaults the chained denoise-pass resolution ladder bottoms out on (sc-20418):
+/// the byte-exact single-pass behaviour, expressed as explicit menu-valid ids. `euler` is the
+/// solver the drivers fall back to when no sampler is named; `flow_match` is the advertised native
+/// alias that resolves to the family's own schedule. Mirrors the candle twin exactly.
+fn krea_denoise_defaults(is_raw: bool) -> mlx_gen::gen_core::DenoiseDefaults {
+    if is_raw {
+        mlx_gen::gen_core::DenoiseDefaults::new(DEFAULT_RAW_STEPS, "euler", "flow_match")
+            .with_guidance(DEFAULT_RAW_GUIDANCE)
+    } else {
+        mlx_gen::gen_core::DenoiseDefaults::new(DEFAULT_STEPS, "euler", "flow_match")
+    }
 }
 
 /// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A), or
@@ -2778,6 +3003,135 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    // ---- Chained denoise passes (epic 20414, sc-20418) -------------------------------------------
+
+    /// The t2i variants advertise the capability and the native scheduler alias the resolution
+    /// ladder bottoms out on; the edit variants explicitly do NOT — mirroring the candle twin.
+    #[test]
+    fn denoise_pass_advertisement_covers_t2i_variants_only() {
+        assert!(descriptor().capabilities.supports_denoise_passes);
+        assert!(raw_descriptor().capabilities.supports_denoise_passes);
+        assert!(!edit_descriptor().capabilities.supports_denoise_passes);
+        assert!(!turbo_edit_descriptor().capabilities.supports_denoise_passes);
+        for d in [descriptor(), raw_descriptor()] {
+            assert!(d.capabilities.schedulers.contains(&"flow_match"));
+            assert!(d.capabilities.samplers.contains(&"euler"));
+        }
+        // The model defaults the ladder resolves to are menu-valid ids with the family's real
+        // default steps/guidance.
+        let raw = krea_denoise_defaults(true);
+        assert_eq!(
+            (raw.steps, raw.sampler.as_str(), raw.scheduler.as_str()),
+            (DEFAULT_RAW_STEPS, "euler", "flow_match")
+        );
+        assert_eq!(raw.guidance, Some(DEFAULT_RAW_GUIDANCE));
+        let turbo = krea_denoise_defaults(false);
+        assert_eq!(turbo.steps, DEFAULT_STEPS);
+        assert_eq!(turbo.guidance, None);
+    }
+
+    /// The Krea-specific denoise-pass floor: t2i only, no PiD, no guidance on the CFG-free Turbo,
+    /// no higher-rung memory adaptation — plus the shared floor's mutual exclusion with `phases`
+    /// and the diff-patch override reject. Weights-free (no loaded model).
+    #[test]
+    fn denoise_pass_surface_rejections_are_typed_and_specific() {
+        let pass = mlx_gen::gen_core::DenoisePass {
+            steps: Some(2),
+            ..Default::default()
+        };
+        let base = GenerationRequest {
+            denoise_passes: Some(vec![pass.clone()]),
+            ..req(512, 512)
+        };
+        let caps = descriptor().capabilities;
+
+        validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &base).unwrap();
+        validate_request(&descriptor(), &base).unwrap();
+
+        // Reference conditioning is out of the v1 surface.
+        let with_ref = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: tiny_image(),
+                strength: None,
+            }],
+            ..base.clone()
+        };
+        let err = validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &with_ref).unwrap_err();
+        assert!(err.to_string().contains("pure noise"), "{err}");
+
+        // PiD decode is a follow-on.
+        let with_pid = GenerationRequest {
+            use_pid: true,
+            ..base.clone()
+        };
+        let err = validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &with_pid).unwrap_err();
+        assert!(err.to_string().contains("PiD"), "{err}");
+
+        // A guidance-bearing pass on the CFG-free Turbo is a loud reject, not a silent ignore; the
+        // same pass is fine on Raw (which has the guidance axis).
+        let guided = GenerationRequest {
+            denoise_passes: Some(vec![mlx_gen::gen_core::DenoisePass {
+                guidance: Some(2.5),
+                ..pass.clone()
+            }]),
+            ..base.clone()
+        };
+        let err = validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &guided).unwrap_err();
+        assert!(err.to_string().contains("CFG-free"), "{err}");
+        validate_denoise_pass_surface(KREA_2_RAW_ID, &raw_descriptor().capabilities, &guided)
+            .unwrap();
+
+        // Higher-rung memory adaptation is rejected on the chain path (typed Unsupported).
+        let with_memory = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                chunk_attention: true,
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        let err = validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &with_memory).unwrap_err();
+        assert!(err.to_string().contains("memory adaptation"), "{err}");
+        // ... but staged residency alone is fine (the residency seam owns it).
+        let with_staged = GenerationRequest {
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..base.clone()
+        };
+        validate_denoise_pass_surface(KREA_2_TURBO_ID, &caps, &with_staged).unwrap();
+
+        // AC6 guard: `phases` and `denoisePasses` stay mutually exclusive at the shared floor, so
+        // a phases request can never reach the pass executor (and vice versa).
+        let both = GenerationRequest {
+            phases: Some(vec![mlx_gen::gen_core::GenerationPhase {
+                steps: 4,
+                guidance: None,
+                adapters: vec![],
+            }]),
+            ..base.clone()
+        };
+        let err = validate_request(&raw_descriptor(), &both).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+
+        // Diff-patch models reject pass-local weight OVERRIDES but accept override-free chains.
+        let with_override = GenerationRequest {
+            denoise_passes: Some(vec![mlx_gen::gen_core::DenoisePass {
+                adapters: vec![mlx_gen::gen_core::PhaseAdapter {
+                    adapter: 0,
+                    weight: Some(0.5),
+                }],
+                ..pass.clone()
+            }]),
+            ..base.clone()
+        };
+        let err = ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, true, &with_override)
+            .unwrap_err();
+        assert!(err.to_string().contains("diff-patch"), "{err}");
+        ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, true, &base).unwrap();
+        ensure_denoise_pass_adapters_allowed(KREA_2_TURBO_ID, false, &with_override).unwrap();
     }
 
     #[test]

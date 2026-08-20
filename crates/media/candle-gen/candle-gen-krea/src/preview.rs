@@ -74,6 +74,41 @@ pub(crate) fn multiphase_hook<'a>(
     PreviewHook::over_schedule(sink, counter, sigmas, project)
 }
 
+/// The chained denoise-pass preview (epic 20414, sc-20418): frames are numbered by the executor's
+/// **chain-global outer step** (`PassObservation::chain_step`), so a 3-pass chain reads as one
+/// continuous `1..=total` trajectory instead of restarting per pass. There is no single σ array to
+/// key on (each pass owns a fresh schedule), so the counter is step-indexed
+/// ([`PreviewCounter::with_steps`], the SCM precedent) and built lazily from the chain total the
+/// first observation carries. One per image — the executor runs once per image, and the driver
+/// builds a fresh one each time.
+pub(crate) struct PassPreview<'a> {
+    hook: PreviewHook<'a>,
+    counter: std::cell::RefCell<Option<PreviewCounter>>,
+}
+
+impl PassPreview<'_> {
+    /// Best-effort emit of the running latent at one chain-global outer step. Multi-eval solver
+    /// repeats dedup through the step-keyed counter; failures are swallowed (previews are
+    /// decorative and never fail a render).
+    pub(crate) fn emit(&self, chain_step: usize, chain_total_steps: usize, latents: &Tensor) {
+        if !self.hook.is_active() {
+            return;
+        }
+        let mut slot = self.counter.borrow_mut();
+        let counter =
+            slot.get_or_insert_with(|| PreviewCounter::with_steps(chain_total_steps.max(1)));
+        self.hook.emit_step(counter, chain_step, latents);
+    }
+}
+
+/// Build the per-image chained-pass preview over the request sink.
+pub(crate) fn pass_hook(sink: &PreviewSink) -> PassPreview<'_> {
+    PassPreview {
+        hook: PreviewHook::new(sink, project),
+        counter: std::cell::RefCell::new(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

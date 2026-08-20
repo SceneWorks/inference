@@ -172,7 +172,12 @@ pub fn emit_single_frame_preview(
     });
 }
 
-fn project_spatial_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
+/// Project a Qwen-family spatial latent `[1, 16, h, w]` with the fitted RGB coefficients, without
+/// emitting. `pub` since sc-20418: the Krea chained denoise-pass preview numbers frames by the
+/// executor's chain-global outer step (no single σ array exists across a pass chain), so it owns
+/// its own counter and needs the bare projection — the same reuse seam the candle twin
+/// (`candle_gen_qwen_image::preview::project_spatial_latents`) already exposes.
+pub fn project_spatial_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
     mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
 }
 

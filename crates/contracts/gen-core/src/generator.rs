@@ -13,7 +13,9 @@ use crate::denoise_passes::{
 };
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
+use crate::runtime::{
+    CancelFlag, DenoisePassReportSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
+};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
@@ -500,6 +502,13 @@ pub struct GenerationRequest {
     /// exactly as it did. Gated per model by
     /// [`Capabilities::supports_denoise_passes`](Capabilities::supports_denoise_passes).
     pub denoise_passes: Option<Vec<DenoisePass>>,
+    /// Optional consumer sink for the chained denoise-pass **execution record** (sc-20418): a
+    /// provider executing a `denoisePasses` chain emits exactly one
+    /// [`DenoisePlanExecution`](crate::denoise_passes::DenoisePlanExecution) — the requested AND
+    /// resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus the effective
+    /// evaluation accounting — before decoding. Requests with no `denoisePasses` never emit; the
+    /// inert default costs nothing (the [`PromptEnhancementSink`] pattern).
+    pub denoise_pass_report: DenoisePassReportSink,
 
     // --- Control ---
     pub cancel: CancelFlag,
@@ -851,6 +860,7 @@ impl Default for GenerationRequest {
             audio: None,
             phases: None,
             denoise_passes: None,
+            denoise_pass_report: DenoisePassReportSink::default(),
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
         }
@@ -1030,6 +1040,8 @@ impl GenerationRequest {
             // weights), checked below the flat knobs (sc-20415). Named (no `..`) for the same
             // reason as `phases`.
             denoise_passes,
+            // The execution-record sink (sc-20418) is float-free: it only carries a callback.
+            denoise_pass_report: _,
             // Every `Option<f32>` knob the floor owns.
             guidance,
             true_cfg,
