@@ -46,6 +46,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the FLUX.2 vae snapshot (FLUX2_VAE_DIR) + goldens (FLUX2_VAE_ENCODE_GOLDENS)"]
 fn flux2_vae_encode_matches_reference() -> Result<()> {
     let vae_dir = match std::env::var("FLUX2_VAE_DIR") {
         Ok(d) => d,
