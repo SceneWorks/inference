@@ -3436,6 +3436,29 @@ mod tests {
 
     // ---- Chained denoise passes (epic 20414, sc-20418) -------------------------------------------
 
+    /// AC4 adoption: the backend-neutral executor conformance suite
+    /// (`gen_core_testkit::denoise_passes`) runs over this family's REAL schedule seams — the Raw
+    /// resolution-dynamic schedule, the Turbo distilled schedule, and the advertised `flow_match`
+    /// native-alias fallback the resolution ladder's model default names. Weights-free, CPU-only:
+    /// the executor is driven over `CpuLatentOps` with a stub model, so what varies per family is
+    /// exactly the schedule math under test.
+    #[test]
+    fn shared_pass_executor_conformance_over_the_krea_schedule_seams() {
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "candle krea_2_raw",
+            &|pass, steps| base_schedule(steps, 1024, 1024, Some(pass.scheduler.as_str())),
+        );
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "candle krea_2_turbo",
+            &|pass, steps| turbo_schedule(steps, Some(pass.scheduler.as_str())),
+        );
+        // The native alias resolves through the N3 fallback to the byte-exact native schedule.
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "candle krea_2 flow_match alias",
+            &|_pass, steps| turbo_schedule(steps, Some("flow_match")),
+        );
+    }
+
     fn dp_pass(
         steps: u32,
         sampler: &str,

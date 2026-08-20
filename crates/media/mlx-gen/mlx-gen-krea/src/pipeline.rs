@@ -2898,6 +2898,30 @@ mod tests {
         );
     }
 
+    /// AC4 adoption (sc-20418): the backend-neutral executor conformance suite
+    /// (`gen_core_testkit::denoise_passes`) runs over this family's REAL schedule seams — the Raw
+    /// resolution-dynamic schedule, the Turbo distilled schedule, and the advertised `flow_match`
+    /// native-alias fallback the resolution ladder's model default names. Pure host math,
+    /// weights-free: the executor runs over `CpuLatentOps` with a stub model (no `Array`
+    /// anywhere), so what varies per family is exactly the schedule math under test — the same
+    /// invocation shape as the candle twin.
+    #[test]
+    fn shared_pass_executor_conformance_over_the_krea_schedule_seams() {
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "mlx krea_2_raw",
+            &|pass, steps| base_schedule(steps, 1024, 1024, Some(pass.scheduler.as_str())),
+        );
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "mlx krea_2_turbo",
+            &|pass, steps| turbo_schedule(steps, Some(pass.scheduler.as_str())),
+        );
+        // The native alias resolves through the N3 fallback to the byte-exact native schedule.
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "mlx krea_2 flow_match alias",
+            &|_pass, steps| turbo_schedule(steps, Some("flow_match")),
+        );
+    }
+
     /// sc-20418: the chained denoise-pass preview numbers frames by the executor's chain-global
     /// outer step — one continuous `1..=total` run across pass boundaries — and dedups the
     /// multi-eval solver repeats of a step, exactly like the σ-keyed counters do per schedule.
