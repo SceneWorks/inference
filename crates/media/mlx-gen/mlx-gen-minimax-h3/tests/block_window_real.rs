@@ -74,7 +74,8 @@ fn relative_max_abs(a: &Array, b: &Array) -> f32 {
     delta / scale
 }
 
-/// **The TE arm (AC3).** Peak of one conditioning forward, resident against each window size.
+/// One TE arm end to end: the resident baseline, then every window size in [`WINDOWS`], comparing
+/// **output** as well as peak. Returns `(tier_label, resident_peak, cells)`.
 ///
 /// A deliberately short prompt: the quantity under test is *weight residency*, and a long prompt
 /// would add activation the window does not bound and dilute the very ratio being measured. The
@@ -84,15 +85,20 @@ fn relative_max_abs(a: &Array, b: &Array) -> f32 {
 /// this arm the load *is* the residency: a resident `MiniMaxH3TextEncoder` maps its 50 tapped layers
 /// and holds them, and measuring only the forward would put both arms at the same near-zero mark
 /// (MLX mmaps lazily — a bare load leaves peak at ~33 KB, `memory_strategy`'s own note).
-#[test]
-#[ignore = "sc-18662: needs MINIMAX_H3_SNAPSHOT + Metal; the resident arm holds the 62 GB tapped encoder"]
-fn the_text_encoder_arm_is_measured_per_window() {
-    let root = common::snapshot();
-    let te_dir = root.join("text_encoder");
+///
+/// # Why this is a function and not one test (sc-17153)
+///
+/// Until sc-17153 the TE arm ran against **only** the dense upstream `text_encoder/` reachable from
+/// `MINIMAX_H3_SNAPSHOT`. A shipped `q4` render does not use that encoder — it uses the packed tier
+/// `MINIMAX_H3_TE` names ([`crate::convert::quantize_minimax_h3_text_encoder`]'s artifact, the one
+/// `tests/streamed_generate_real.rs` and `tests/te_tier_real_weights.rs` already take) — so the
+/// encoder a real windowed request actually conditions through had its windowed output compared
+/// against nothing at all. The two arms below are the same measurement over the two encoders.
+fn measure_te_arm(te_dir: &std::path::Path, arm: &str) -> (String, u64, Vec<(usize, u64, f64)>) {
     assert!(
         te_dir.join("config.json").is_file(),
-        "MINIMAX_H3_SNAPSHOT={} has no text_encoder/config.json",
-        root.display()
+        "{arm}: {} has no config.json",
+        te_dir.display()
     );
     let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
 
@@ -102,18 +108,25 @@ fn the_text_encoder_arm_is_measured_per_window() {
     let ids = Array::from_slice(&(1i32..=24).collect::<Vec<_>>(), &[1, 24]);
     let mask = Array::ones::<i32>(&[1, 24]).unwrap();
 
-    let ((resident_ctx, resident_wall), resident_peak) = peak_of(|| {
+    let ((resident_ctx, tier, resident_wall), resident_peak) = peak_of(|| {
         let started = Instant::now();
-        let w = Weights::from_dir(&te_dir).expect("te weights");
+        let w = Weights::from_dir(te_dir).expect("te weights");
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg).expect("resident te");
         assert_eq!(te.resident_layers(), te.num_loaded_layers());
         assert!(!te.is_deferred());
+        // The tier comes from the loaded projections rather than from the directory name, which a
+        // caller chooses freely — an unlabelled tier makes every measured cell unattributable.
+        let tier = match te.packed_bits().expect("uniform packed width") {
+            Some(bits) => format!("q{bits}"),
+            None => "bf16".to_owned(),
+        };
         let ctx = te.forward(&ids, &mask).expect("resident forward");
         mlx_rs::transforms::eval([&ctx]).unwrap();
-        (ctx, started.elapsed().as_secs_f64())
+        (ctx, tier, started.elapsed().as_secs_f64())
     });
     eprintln!(
-        "\n=== TE arm | tapped {} layers | {} tokens ===\n  resident            peak {:8.4} GB  {:7.1} s",
+        "\n=== TE arm ({arm}) | {tier} | tapped {} layers | {} tokens ===\n  resident            \
+         peak {:8.4} GB  {:7.1} s",
         cfg.select_hidden,
         ids.shape()[1],
         resident_peak as f64 / 1e9,
@@ -124,7 +137,7 @@ fn the_text_encoder_arm_is_measured_per_window() {
     for window in WINDOWS {
         let ((ctx, wall), peak) = peak_of(|| {
             let started = Instant::now();
-            let mut te = MiniMaxH3TextEncoder::from_dir_deferred(&te_dir, LM_PREFIX, &cfg)
+            let mut te = MiniMaxH3TextEncoder::from_dir_deferred(te_dir, LM_PREFIX, &cfg)
                 .expect("deferred te");
             assert_eq!(
                 te.resident_layers(),
@@ -148,12 +161,25 @@ fn the_text_encoder_arm_is_measured_per_window() {
             wall,
             resident_peak as f64 / peak.max(1) as f64
         );
-        // AC6: correctness alongside memory. The windowed walk runs the identical layer forwards in
-        // the identical order, so this is bit identity rather than a tolerance.
+        // **AC6, and the assertion that catches a silently-empty conditioning stage.** The windowed
+        // walk runs the identical layer forwards in the identical order, so this is bit identity
+        // rather than a tolerance — anything but `0.0` is a defect, not a numeric difference.
+        //
+        // It is stated in terms of `rel` rather than a norm, a cosine or a checksum deliberately:
+        // this model's defects have slipped past cosine 0.73–0.98 seven times. `relative_max_abs`
+        // additionally refuses a degenerate *reference*, so a run where the resident arm is the
+        // broken one cannot read as agreement either.
+        //
+        // A windowed forward returning an all-zero context was observed twice on this hardware
+        // (sc-17153, 2 of 25 windowed runs) — same shapes, clean run, no Metal diagnostic. Nothing
+        // but a value comparison sees it: the peak counter reads *lower* when the work does not
+        // happen, so every ratio in this file is happy. See `memory_strategy`'s rung-4 note.
         assert_eq!(
             rel, 0.0,
-            "window {window} changed the conditioning context by {rel:e} — the windowed walk runs \
-             the same arithmetic and differs only in when a layer's weights exist"
+            "{arm}/window {window} changed the conditioning context by {rel:e} — the windowed walk \
+             runs the same arithmetic and differs only in when a layer's weights exist. A context \
+             that differs at all (and `0.0` against a max|resident| of the right order is the only \
+             passing answer) means the streamed conditioning stage is not the resident one"
         );
         cells.push((window, peak, wall));
     }
@@ -163,49 +189,57 @@ fn the_text_encoder_arm_is_measured_per_window() {
     let (_, floor_peak, _) = cells[0];
     assert!(
         (floor_peak as f64) < resident_peak as f64 * 0.5,
-        "window 1 peaked at {floor_peak} B against a resident {resident_peak} B — the TE arm is \
-         not bounding the encoder, so `TransformerComponent::TextEncoder` must not be declared"
+        "{arm}: window 1 peaked at {floor_peak} B against a resident {resident_peak} B — the TE arm \
+         is not bounding the encoder, so `TransformerComponent::TextEncoder` must not be declared"
     );
-    // **The window parameter is INERT — this is the finding, and it is why the published domain is
-    // the singleton `[1]`.**
+
+    // **Window 1 is the measured FLOOR — that, not inertness, is why the published domain is the
+    // singleton `[1]` (sc-17153).**
     //
-    // `run_windowed`'s `apply` releases each layer as soon as it is consumed rather than at the end
-    // of the window, so even the 50-layer all-covering plan holds one layer at a time and the
-    // *plan's* window never sets the residency. Measured across two runs, every window size lands in
-    // one band — 6.24 to 6.34 GB on this run, and a 5.30 GB window-1 outlier on the previous one, so
-    // the run-to-run spread (~1 GB) is larger than the spread across window sizes.
+    // The retired claim here was that the parameter is *inert* above 1, bounded by a `< 2.0` spread
+    // across `[1 … 50]`. That was measured on the dense encoder alone, where the spread is small
+    // (1.41x on the re-measurement) because a single dense Qwen3 layer's f32 upcast dominates the
+    // peak at every window size. It does not hold for the encoder a shipped `q4` render actually
+    // uses: the packed tier spreads **2.80x** (0.7958 GB at window 1 against 2.2255 GB at window
+    // 50), and the campaign that found it independently measured 3.12x. The window parameter is a
+    // real lever on the packed encoder, and a `< 2.0` bound asserted over both arms is simply false.
     //
-    // So `transformer_window_sizes` publishes `[1]`, and that singleton is the finding rather than a
-    // placeholder — the same shape rung 2 already has on this provider, where `DECODE_TILE_EDGE` is a
-    // singleton for its own measured reason. Publishing `[1, 5, 10, 50]` would advertise a lever
-    // whose other values do nothing.
-    //
-    // Independently reproduced: SC-15448's rung-4 survey recorded the same window-inert-above-1
-    // behaviour on another family.
-    //
-    // The assertion is a **characterization, not an assumption**: if a window genuinely scaled
-    // residency the spread across `[1 … 50]` would be ~50x, and this would fire. It is the guard
-    // that would catch the residency silently becoming window-proportional — at which point the
-    // domain would have to be widened and re-measured.
-    //
-    // The bound is 2.0 rather than something tight because the discriminator is 50x against ~1x, so
-    // anything well under 50 separates them, while the peak counter carries ~1 GB of run-to-run
-    // spread on a ~6 GB figure. Measured spreads so far: 1.09x and 1.20x. A tighter bound would buy
-    // no discrimination and would go red on machine noise.
+    // What IS true on both, with a wide margin, is that **window 1 is the minimum**: every larger
+    // window holds more, monotonically on the packed tier and by 39 % on the dense one. That is the
+    // property the singleton domain rests on — `[1]` is the cheapest point, not an arbitrary one —
+    // and it is what this now asserts. The spread stays *reported*, because it is this arm's
+    // characterization output; it is simply no longer claimed to be ~1.
     let lo = cells.iter().map(|(_, p, _)| *p).min().unwrap();
     let hi = cells.iter().map(|(_, p, _)| *p).max().unwrap();
-    assert!(
-        (hi as f64) / (lo as f64) < 2.0,
-        "the window sizes {WINDOWS:?} spread {:.2}x ({lo} B to {hi} B) — the parameter is no longer \
-         inert, so the singleton `[1]` domain understates it and must be re-measured",
-        (hi as f64) / (lo as f64)
+    assert_eq!(
+        floor_peak, lo,
+        "{arm}: window 1 peaked at {floor_peak} B but some larger window reached only {lo} B — \
+         `TRANSFORMER_WINDOW_SIZE = 1` is published because 1 is the residency floor, so a larger \
+         window that costs less means the singleton domain is advertising the wrong point"
     );
     eprintln!(
-        "  window parameter is INERT: {:.2}x spread across {WINDOWS:?}, against {:.2}x below \
-         resident — a layer is released as it is consumed, not at the window boundary",
+        "  window 1 is the FLOOR: {:.2}x spread across {WINDOWS:?} ({lo} B to {hi} B), against \
+         {:.2}x below resident — larger windows hold more, they are not inert",
         (hi as f64) / (lo as f64),
         (resident_peak as f64) / (hi as f64)
     );
+    (tier, resident_peak, cells)
+}
+
+/// **The dense TE arm (AC3)** — the upstream 62 GB `text_encoder/` under `MINIMAX_H3_SNAPSHOT`.
+#[test]
+#[ignore = "sc-18662: needs MINIMAX_H3_SNAPSHOT + Metal; the resident arm holds the 62 GB tapped encoder"]
+fn the_text_encoder_arm_is_measured_per_window() {
+    let root = common::snapshot();
+    let te_dir = root.join("text_encoder");
+    let (tier, resident_peak, cells) = measure_te_arm(&te_dir, "dense");
+    assert_eq!(
+        tier, "bf16",
+        "MINIMAX_H3_SNAPSHOT's text_encoder/ must be the dense upstream component; a packed tier \
+         there would send packed peaks to RUNG4_TE_*_PEAK_BYTES, which were measured on the dense \
+         encoder"
+    );
+    let (_, floor_peak, _) = cells[0];
 
     // **Declared versus measured.** `memory_strategy`'s constants are what the contract's rung-4
     // declaration and its module docs are written from, so a drift between them and this harness
@@ -219,8 +253,8 @@ fn the_text_encoder_arm_is_measured_per_window() {
     // `tests/streamed_generate_real.rs` covered that class; it does not, it reads neither of these
     // constants, so the class was covered by nothing. See `common::assert_declared_peak_constant`.
     //
-    // The ratio is still *reported*, because window-inertness is the characterization this arm
-    // exists to publish — it is simply no longer the thing asserted.
+    // The ratio is still *reported*, because the window characterization is what this arm exists to
+    // publish — it is simply no longer the thing asserted.
     let declared_resident = mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_RESIDENT_PEAK_BYTES;
     let declared_windowed = mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES;
     let declared = declared_resident as f64 / declared_windowed as f64;
@@ -236,7 +270,44 @@ fn the_text_encoder_arm_is_measured_per_window() {
         declared_windowed,
         floor_peak,
     );
-    common::write_rung4_evidence("text_encoder", "bf16", &cells, resident_peak);
+    common::write_rung4_evidence("text_encoder", &tier, &cells, resident_peak);
+}
+
+/// **The packed TE arm (sc-17153)** — the tier `MINIMAX_H3_TE` names, which is the encoder a
+/// shipped `q4` / `q8` render actually conditions through.
+///
+/// This arm exists because the dense one above cannot stand in for it. `TransformerComponent::Both`
+/// windows the encoder on **every** tier, but until sc-17153 the only encoder whose windowed output
+/// was ever compared to anything was the 62 GB dense component — which no tiered render loads. The
+/// packed path differs from the dense one in the loader that reconstructs each windowed layer
+/// (`mlx_gen::quant::lin`'s packed triple against a dense `Dense` matmul) and in the token table's
+/// representation, so "the dense arm is bit-identical" was never evidence about it.
+///
+/// It publishes **no byte constants of its own**. The packed conditioning stage's resident peak is
+/// already declared, and independently reproduced, by
+/// [`CONDITIONING_STAGE_PEAK_Q4_BYTES`](mlx_gen_minimax_h3::memory_strategy::CONDITIONING_STAGE_PEAK_Q4_BYTES)
+/// through `tests/te_tier_real_weights.rs`; what was missing was the windowed-versus-resident
+/// **output** comparison and the window characterization, which are what this asserts.
+#[test]
+#[ignore = "sc-17153: needs MINIMAX_H3_TE (a packed text_encoder/) + Metal"]
+fn the_packed_text_encoder_arm_is_measured_per_window() {
+    let raw = std::env::var("MINIMAX_H3_TE").unwrap_or_default();
+    assert!(
+        !raw.trim().is_empty(),
+        "MINIMAX_H3_TE must point at a packed MiniMax-H3 `text_encoder/` (the same variable \
+         `tests/streamed_generate_real.rs` and `tests/te_tier_real_weights.rs` take). This test is \
+         #[ignore]d and asserts rather than skips so that a missing tier cannot be mistaken for a \
+         pass — which is exactly how the packed encoder went unmeasured under windowing."
+    );
+    let te_dir = PathBuf::from(raw.trim());
+    let (tier, resident_peak, cells) = measure_te_arm(&te_dir, "packed");
+    assert_ne!(
+        tier, "bf16",
+        "MINIMAX_H3_TE={} loaded DENSE projections — this arm exists to cover the packed tier, and \
+         pointing it at the dense component would silently re-run the arm above",
+        te_dir.display()
+    );
+    common::write_rung4_evidence("text_encoder", &tier, &cells, resident_peak);
 }
 
 /// **The DiT arm**, per window and per tier. `MINIMAX_H3_DIT` selects the tier.

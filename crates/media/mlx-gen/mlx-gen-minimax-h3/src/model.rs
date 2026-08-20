@@ -902,8 +902,11 @@ impl MiniMaxH3 {
     ///   outside this provider's published domain: declaring the DiT alone would leave the
     ///   conditioning phase, the taller stage at every tier, with no lever (AC3).
     /// * The window size must be inside the published singleton domain
-    ///   ([`crate::memory_strategy::TRANSFORMER_WINDOW_SIZE`]) — the parameter is measured inert
-    ///   above 1, so any other value would be an advertised lever that does nothing.
+    ///   ([`crate::memory_strategy::TRANSFORMER_WINDOW_SIZE`]) — 1 is the measured residency floor
+    ///   on every tier, so any other value would advertise a lever that only trades memory away.
+    ///   (Until sc-17153 this said the parameter was *inert* above 1. It is not: the packed
+    ///   encoders spread 2.17-3.12x across `[1, 5, 10, 50]`. The domain is unchanged, its reason is
+    ///   not — see that constant.)
     fn requested_transformer_window(&self, req: &GenerationRequest) -> Result<Option<u32>> {
         use mlx_gen::gen_core::LoadShape;
         let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
@@ -939,8 +942,8 @@ impl MiniMaxH3 {
         if size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE {
             return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: transformer window {size} is outside the published domain \
-                 [{}] — the parameter is measured inert above 1, so other values are not \
-                 advertised",
+                 [{}] — 1 is the measured residency floor on every tier, so larger windows only \
+                 raise the peak this rung exists to bound and are not advertised",
                 crate::memory_strategy::TRANSFORMER_WINDOW_SIZE
             )));
         }
