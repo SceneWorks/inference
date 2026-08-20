@@ -32,6 +32,13 @@ const PATH_PREFIXES: [&str; 6] = [
     "",
 ];
 
+/// `rerank_conditioning_safe=true` identifies the published cond_safe Eros adapter. Unlike a
+/// generic user adapter, this artifact has a fixed complete AudioVideo surface and must never load
+/// as a video-only subset.
+const COND_SAFE_METADATA_KEY: &str = "rerank_conditioning_safe";
+const COND_SAFE_TARGETS: usize = 1_660;
+const COND_SAFE_TENSORS: usize = 3_320;
+
 /// Result of installing one or more LTX LoRA/LoKr adapters.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct AdditiveReport {
@@ -182,13 +189,11 @@ fn effective_pass_scales(spec: &AdapterSpec) -> Result<Vec<f64>> {
     }
     let scales: Vec<f64> = match &spec.pass_scales {
         None => vec![spec.scale as f64],
-        Some(scales) if matches!(scales.len(), 1 | 2) => {
-            scales.iter().copied().map(f64::from).collect()
-        }
+        Some(scales) if scales.len() == 2 => scales.iter().copied().map(f64::from).collect(),
         Some(scales) => {
             return Err(CandleError::Msg(format!(
-            "ltx: adapter {} has {} pass_scales entries; LTX-2.3 accepts a uniform single scale \
-                 or its two-stage [stage1, stage2] shape",
+            "ltx: adapter {} has {} pass_scales entries; omit pass_scales for a uniform scalar \
+                 strength, or provide the exact two-stage [stage1, stage2] shape",
             spec.path.display(),
             scales.len()
         )))
@@ -201,6 +206,27 @@ fn effective_pass_scales(spec: &AdapterSpec) -> Result<Vec<f64>> {
         )));
     }
     Ok(scales)
+}
+
+fn is_cond_safe(file: &AdapterFile) -> bool {
+    file.meta
+        .get(COND_SAFE_METADATA_KEY)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn validate_cond_safe_completeness(
+    file: &AdapterFile,
+    lora_tensors: usize,
+    targets: usize,
+) -> Result<()> {
+    if is_cond_safe(file) && (lora_tensors != COND_SAFE_TENSORS || targets != COND_SAFE_TARGETS) {
+        return Err(CandleError::Msg(format!(
+            "ltx: cond_safe adapter declares {COND_SAFE_METADATA_KEY}=true but has {targets} LoRA \
+             targets / {lora_tensors} LoRA tensors; expected the complete {COND_SAFE_TARGETS} targets \
+             / {COND_SAFE_TENSORS} tensors (partial cond_safe adapters are unsafe)"
+        )));
+    }
+    Ok(())
 }
 
 /// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
@@ -281,21 +307,26 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
         }
 
         let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+        let mut lora_tensors = 0;
         for (key, tensor) in &file.tensors {
             match classify_lora_key(key) {
                 Some((path, Role::Down)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().down = Some(tensor.clone())
                 }
                 Some((path, Role::Up)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().up = Some(tensor.clone())
                 }
                 Some((path, Role::Alpha)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().alpha =
                         Some(read_scalar(key, "alpha", tensor)?)
                 }
                 None => report.skipped_keys += 1,
             }
         }
+        validate_cond_safe_completeness(&file, lora_tensors, triples.len())?;
         let metadata = LoraAdapterMeta::from_file_metadata(&file.meta);
         for (path, triple) in triples {
             let (down, up) = match (triple.down, triple.up) {
@@ -548,6 +579,20 @@ mod tests {
     }
 
     #[test]
+    fn cond_safe_partial_surface_is_rejected_before_provider_matching() {
+        let file = AdapterFile {
+            tensors: HashMap::new(),
+            meta: HashMap::from([(COND_SAFE_METADATA_KEY.into(), "true".into())]),
+        };
+        let error = validate_cond_safe_completeness(&file, 768, 384)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("384 LoRA targets / 768 LoRA tensors"));
+        assert!(error.contains("1660 targets / 3320 tensors"));
+        assert!(error.contains("partial cond_safe adapters are unsafe"));
+    }
+
+    #[test]
     fn eros_pass_scales_preserve_both_distilled_stages() {
         let mut spec = AdapterSpec::new("eros.safetensors".into(), 0.25, AdapterKind::Lora);
         spec.pass_scales = Some(vec![0.8, 0.2]);
@@ -557,7 +602,11 @@ mod tests {
         );
 
         spec.pass_scales = Some(vec![0.6]);
-        assert_eq!(effective_pass_scales(&spec).unwrap(), vec![0.6_f32 as f64]);
+        let error = effective_pass_scales(&spec).unwrap_err().to_string();
+        assert!(error.contains("1 pass_scales") && error.contains("omit pass_scales"));
+
+        spec.pass_scales = None;
+        assert_eq!(effective_pass_scales(&spec).unwrap(), vec![0.25]);
 
         spec.pass_scales = Some(vec![0.6, 0.4, 0.2]);
         let error = effective_pass_scales(&spec).unwrap_err().to_string();
