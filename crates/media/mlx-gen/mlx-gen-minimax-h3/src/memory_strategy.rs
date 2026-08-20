@@ -1095,12 +1095,13 @@ pub fn numeric_tier(spec: &LoadSpec) -> MemoryNumericTier {
     }
 }
 
-/// The provider's real admission check, callable before any weight file is opened.
+/// The provider's real admission check for a **loaded** route, callable before any weight file is
+/// opened.
 ///
-/// Takes the resolved tier rather than the spec (the wan/ltx idiom) because the **loaded**
-/// generator is the primary caller: `Generator::memory_strategy_safety_check` holds a contract and
-/// a tier resolved once at load, not the `LoadSpec` that produced them.
-pub fn safety_check(
+/// Takes the already-resolved tier rather than the spec because the loaded generator is the caller
+/// that matters: `Generator::memory_strategy_safety_check` holds a contract and a tier captured once
+/// at load (sc-18650), not the `LoadSpec` that produced them.
+pub fn safety_check_at_tier(
     contract: &MemoryProviderContract,
     tier: MemoryNumericTier,
     context: &MemoryRunContext,
@@ -1113,14 +1114,21 @@ pub fn safety_check(
     )
 }
 
-/// The [`MEMORY_REGISTRATION`] adapter: the registry probes weights-free from a spec, so it resolves
-/// the tier here rather than holding one.
-fn registered_safety_check(
+/// The spec-taking admission check — the [`MEMORY_REGISTRATION`] entry point, which probes
+/// weights-free from a spec and so resolves the tier here rather than holding one.
+///
+/// **The bare name is load-bearing across backends.** `scripts/check-workspace.py` compares the two
+/// backends' `pub const` declarations as canonicalized *source text*, so `MEMORY_REGISTRATION` must
+/// spell its `safety_check` field identically here and in `candle-gen-minimax-h3` — which registers
+/// the shorthand `safety_check,` against its own spec-taking function of that name. Renaming this to
+/// the wan-style `registered_safety_check` reds that gate even though nothing about the registration
+/// actually changed; the loaded variant is [`safety_check_at_tier`] for that reason.
+pub fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, numeric_tier(spec), context)
+    safety_check_at_tier(contract, numeric_tier(spec), context)
 }
 
 /// Weights-free executable fixtures for one implemented optimized rung — one per render route.
@@ -1176,7 +1184,7 @@ fn begin_request_with_cleanup(
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, tier, context) {
+    if let MemorySafetyDecision::Reject { reason } = safety_check_at_tier(contract, tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
@@ -1248,7 +1256,7 @@ pub const MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
         provider_id: MODEL_ID,
         contract: contract_for,
-        safety_check: registered_safety_check,
+        safety_check,
     };
 
 /// The weights-free contract fixture catalog conformance resolves instead of [`contract_for`].
@@ -1408,7 +1416,7 @@ mod tests {
             .register_memory_strategy(mlx_gen::gen_core::MemoryRegistration {
                 provider_id: "minimax_h4",
                 contract: contract_for,
-                safety_check: registered_safety_check,
+                safety_check,
             })
             .build();
         assert!(
@@ -1496,7 +1504,7 @@ mod tests {
                 reference_count: 0,
             };
             assert_eq!(
-                safety_check(&contract, numeric_tier(&spec), &context),
+                safety_check(&spec, &contract, &context),
                 MemorySafetyDecision::Accept,
                 "{strategy:?} must admit its own legal geometry"
             );
@@ -1574,7 +1582,7 @@ mod tests {
             "the representative rung-2 selection must carry the published domain"
         );
         assert_eq!(
-            safety_check(&contract, numeric_tier(&spec), &context),
+            safety_check(&spec, &contract, &context),
             MemorySafetyDecision::Accept,
             "rung 2 must admit its own published geometry"
         );
@@ -1836,7 +1844,7 @@ mod tests {
         };
 
         assert_eq!(
-            safety_check(&contract, numeric_tier(&spec), &context(legal, false)),
+            safety_check(&spec, &contract, &context(legal, false)),
             MemorySafetyDecision::Accept,
             "the control arm must be admitted, or every rejection below is vacuous"
         );
@@ -1880,7 +1888,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    safety_check(&contract, numeric_tier(&spec), &context(geometry, use_pid)),
+                    safety_check(&spec, &contract, &context(geometry, use_pid)),
                     MemorySafetyDecision::Reject { .. }
                 ),
                 "{name} must be refused"
@@ -3066,12 +3074,12 @@ mod tests {
             reference_count: 0,
         };
         assert_eq!(
-            safety_check(&contract, numeric_tier(&spec), &context),
+            safety_check(&spec, &contract, &context),
             MemorySafetyDecision::Accept
         );
         context.selection.tier.precision = Precision::Fp32;
         assert!(matches!(
-            safety_check(&contract, numeric_tier(&spec), &context),
+            safety_check(&spec, &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
     }

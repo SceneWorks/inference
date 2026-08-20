@@ -1811,7 +1811,11 @@ impl Generator for MiniMaxH3 {
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,
     ) -> mlx_gen::gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check(&self.memory_strategy, self.memory_tier, context)
+        crate::memory_strategy::safety_check_at_tier(
+            &self.memory_strategy,
+            self.memory_tier,
+            context,
+        )
     }
 
     /// Open the request scope the accepted selection needs, re-running the safety check first so a
