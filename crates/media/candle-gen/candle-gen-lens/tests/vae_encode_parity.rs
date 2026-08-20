@@ -47,6 +47,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the Lens vae snapshot (LENS_VAE_DIR) + goldens (LENS_VAE_ENCODE_GOLDENS)"]
 fn lens_vae_encode_matches_reference() -> Result<()> {
     let vae_dir = match std::env::var("LENS_VAE_DIR") {
         Ok(d) => d,
