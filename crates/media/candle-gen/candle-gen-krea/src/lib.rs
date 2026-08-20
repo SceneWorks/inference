@@ -23,7 +23,8 @@
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0; Krea 2 Community License (non-commercial use
 //! satisfies it). The packed q4/q8/bf16 turnkey loads per-tier via `loader::linear_detect` (sc-9411);
-//! the descriptor advertises `supported_quants: [Q4, Q8]` so the worker's A-B quant toggle engages
+//! the descriptor advertises `supported_quants: [Q4, Q8, Nvfp4]` so the worker can select both
+//! packed turnkey tiers and native NVIDIA Kitchen NVFP4 checkpoints
 //! (sc-9607). Packed loads retain file-backed converted sidecars: writable snapshots cache beside the
 //! component, while read-only snapshots use the configurable per-user external cache (sc-16587). A
 //! complete valid warm cache is read without taking its preparation lock; operators should budget
@@ -1120,10 +1121,10 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
-            // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
-            // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
-            supported_quants: &[Quant::Q4, Quant::Q8],
+            // Advertise packed turnkey tiers plus the native Kitchen NVFP4 file encoding. The
+            // resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
+            // sc-9411); imported native NVFP4 is selected explicitly by its stamped source format.
+            supported_quants: &[Quant::Q4, Quant::Q8, Quant::Nvfp4],
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
             // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
             // the worker's fit-gate reads. `raw_descriptor` inherits this for its CFG twin, and
@@ -2096,12 +2097,7 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
     }
 
     let requested = match spec.quantize {
-        Some(quant @ (Quant::Q4 | Quant::Q8)) => Some(quant),
-        Some(Quant::Nvfp4) => {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id}: imported native checkpoints support Q4/Q8 affine tiers, not NVFP4"
-            )))
-        }
+        Some(quant @ (Quant::Q4 | Quant::Q8 | Quant::Nvfp4)) => Some(quant),
         None => None,
     };
     match (companion_quant, requested) {
@@ -4053,7 +4049,10 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         // Shared surface stays in lockstep with Turbo (derived from `descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.samplers, descriptor().capabilities.samplers);
         assert!(!d.capabilities.mac_only);
         assert_eq!(pipeline::RAW_STEPS, 52);
@@ -4145,10 +4144,13 @@ mod tests {
             d.capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
-        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers advertised (sc-9607).
+        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers and native NVFP4 advertised.
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(TURBO_STEPS, 8);
     }
@@ -4414,7 +4416,10 @@ mod tests {
         );
         // Shared surface stays in lockstep with Raw/Turbo (derived from `raw_descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
     }
 
     #[test]
