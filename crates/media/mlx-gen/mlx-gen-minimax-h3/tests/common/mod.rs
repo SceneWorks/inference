@@ -989,19 +989,6 @@ pub fn walk_windowed_blocks(
     )
 }
 
-/// Emit a rung-4 measurement receipt: to `MINIMAX_H3_EVIDENCE_OUT` when set, always to stderr.
-///
-/// Same shape and the same sequencing caveat as [`write_bounded_attention_evidence`]: the measured
-/// half is emitted here in a versioned, self-describing form carrying every axis
-/// `MemoryEvidenceKey` needs, and sc-17153 pairs it with the fitted prediction that
-/// `MemoryRunOutcome` requires.
-///
-/// (see [`assert_declared_peak_constant`] for the per-constant bound these receipts are graded by)
-///
-/// `cells` are `(window, peak_bytes, wall_seconds)`. **The wall figure is recorded but must not be
-/// asserted on**: this Mac is also the `nax-macos` runner and has been measured at load average
-/// 80-109, so a duration taken here is a sample of the fleet's contention, not of the rung. The peak
-/// is a per-process allocator high-water mark and does not read machine load at all.
 /// **Absolute per-constant bound on a declared peak (sc-17153, rider 1 of activity 20066).**
 ///
 /// This replaces the `|measured/declared − 1| < 0.25` **ratio** bands that graded rung 4's
@@ -1020,7 +1007,8 @@ pub fn walk_windowed_blocks(
 /// term and is caught on both, and the bound is symmetric in bytes.
 ///
 /// **Tolerance** is the harness's own committed convention — the larger of 256 MiB absolute or 5 %
-/// relative (`docs/memory-calibration-harness.md`, the `compare-reuse` tolerance) — reused here so
+/// relative (the `compare-reuse` tolerance in the **SceneWorks** repo's
+/// `docs/memory-calibration-harness.md`; this repo has no copy of that document) — reused here so
 /// this rung is graded the way every other cross-run memory comparison in the fleet is, rather than
 /// by a number invented for it. The absolute floor is what makes it usable on the small windowed
 /// constants, where 5 % of ~1.4 GB would be tighter than the counter's own resolution.
@@ -1029,6 +1017,22 @@ pub fn walk_windowed_blocks(
 /// the q4 DiT windowed peak was **bit-identical** across two runs, its resident peak moved 0.36 %
 /// (~43 MB), and the q8 pair reproduced its declared constants to within 5 KB and 36 KB. The
 /// "~1 GB of run-to-run spread" the retired comments cited was not reproduced on either arm.
+///
+/// # Two limits of this bound, stated rather than discovered later
+///
+/// 1. **It is single-machine.** Every figure it grades was taken on one `rw-mage` host. The label
+///    `rw-mage` is on *both* Macs, so a scheduler that lands a real-weight arm on the other one is
+///    grading against numbers nobody has replicated there. Nothing here detects that; the failure
+///    mode is a red with a stale-constant message that names the wrong cause.
+/// 2. **On the tightest cell it is narrower than that cell's own recorded history.**
+///    `RUNG4_TE_WINDOWED_PEAK_BYTES` takes the 256 MiB floor, which is 5.96 % of the constant,
+///    while the sc-18662 comments record window-1 peaks of 5.30 GB and 6.24-6.34 GB for what was
+///    nominally the same cell — roughly ±9 %. That history is **not** evidence of counter noise at
+///    the current pin: it was taken on mlx-rs `932beb4e6`, and the pin has since moved to
+///    `7151a9b27` (see [`RUNG4_TE_WINDOWED_PEAK_BYTES`](mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES)).
+///    At `7151a9b27` the same cell reproduced across **eight** runs within ~500 KB (±0.01 %), which
+///    is why the shared tolerance is kept rather than widened to cover a spread from a different
+///    MLX build. A pin bump is the event that should be expected to move it again.
 pub fn assert_declared_peak_constant(what: &str, declared: u64, measured: u64) {
     const ABSOLUTE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
     let tolerance = ABSOLUTE_FLOOR_BYTES.max((declared as f64 * 0.05) as u64);
@@ -1043,6 +1047,19 @@ pub fn assert_declared_peak_constant(what: &str, declared: u64, measured: u64) {
     );
 }
 
+/// Emit a rung-4 measurement receipt: to `MINIMAX_H3_EVIDENCE_OUT` when set, always to stderr.
+///
+/// Same shape and the same sequencing caveat as [`write_bounded_attention_evidence`]: the measured
+/// half is emitted here in a versioned, self-describing form carrying every axis
+/// `MemoryEvidenceKey` needs, and sc-17153 pairs it with the fitted prediction that
+/// `MemoryRunOutcome` requires.
+///
+/// (see [`assert_declared_peak_constant`] for the per-constant bound these receipts are graded by)
+///
+/// `cells` are `(window, peak_bytes, wall_seconds)`. **The wall figure is recorded but must not be
+/// asserted on**: this Mac is also the `nax-macos` runner and has been measured at load average
+/// 80-109, so a duration taken here is a sample of the fleet's contention, not of the rung. The peak
+/// is a per-process allocator high-water mark and does not read machine load at all.
 pub fn write_rung4_evidence(
     component: &str,
     tier: &str,

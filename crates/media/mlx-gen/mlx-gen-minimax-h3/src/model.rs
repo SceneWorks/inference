@@ -903,7 +903,8 @@ impl MiniMaxH3 {
     ///   conditioning phase, the taller stage at every tier, with no lever (AC3).
     /// * The window size must be inside the published singleton domain
     ///   ([`crate::memory_strategy::TRANSFORMER_WINDOW_SIZE`]) — 1 is the measured residency floor
-    ///   on every tier, so any other value would advertise a lever that only trades memory away.
+    ///   on every text-encoder tier, so any other value would advertise a lever that only trades
+    ///   memory away.
     ///   (Until sc-17153 this said the parameter was *inert* above 1. It is not: the packed
     ///   encoders spread 2.17-3.12x across `[1, 5, 10, 50]`. The domain is unchanged, its reason is
     ///   not — see that constant.)
@@ -942,8 +943,8 @@ impl MiniMaxH3 {
         if size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE {
             return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: transformer window {size} is outside the published domain \
-                 [{}] — 1 is the measured residency floor on every tier, so larger windows only \
-                 raise the peak this rung exists to bound and are not advertised",
+                 [{}] — 1 is the measured residency floor on every text-encoder tier, so larger \
+                 windows only raise the peak this rung exists to bound and are not advertised",
                 crate::memory_strategy::TRANSFORMER_WINDOW_SIZE
             )));
         }

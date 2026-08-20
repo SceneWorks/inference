@@ -494,35 +494,49 @@ fn resolved_load_shape(spec: &LoadSpec) -> LoadShape {
 /// uses, and the retired `< 2.0` spread assertion in `tests/block_window_real.rs` was asserting
 /// something false about them.
 ///
-/// What holds on every tier, with a wide margin, is that **window 1 is the minimum** — every larger
-/// window holds strictly more. That is what justifies publishing the singleton: `[1]` is the
-/// cheapest point of a real curve, and the other values would advertise a lever that trades memory
-/// *away*. `tests/block_window_real.rs` asserts the floor and reports the spread.
+/// What holds on **every encoder tier measured**, with a wide margin, is that window 1 is the
+/// minimum: 4.50 GB against 6.24 (dense), 1.43 against 2.65-3.10 (`q8`), 0.80 against 1.78-1.95
+/// (`q4`). The curve above 1 is not strictly monotonic — `q4` runs 1.78 -> 1.95 -> 1.87 across
+/// windows 5/10/50, so the ordering *among the larger windows* is counter noise — but the floor is
+/// separated from all of them by 1.9x or more. That is what justifies publishing the singleton:
+/// `[1]` is the cheapest point of a real curve, and the other values would advertise a lever that
+/// trades memory *away*.
+///
+/// `tests/block_window_real.rs::measure_te_arm` asserts the floor (with the harness's 256 MiB / 5 %
+/// margin, not as a strict ordering) and bounds the spread, on **both TE arms**. The DiT arm is
+/// deliberately not covered by that claim: it measures resident against window 1 only, so whether
+/// 1 is *its* floor is unmeasured — see [`RUNG4_DIT_MEASURED_PEAKS`].
 ///
 /// # ⚠ The DENSE encoder has been observed returning an all-zero context — UNFIXED
 ///
-/// Four sightings in ~30 real-weight forwards on this hardware (sc-17153): identical shapes, clean
+/// Five sightings in ~32 real-weight forwards on this hardware (sc-17153): identical shapes, clean
 /// exit, no Metal diagnostic, `max = 0.0` where the correct answer is `1.55e4`. What the sightings
-/// do and do not have in common is the whole of what is known:
+/// have in common is now specific enough to be actionable:
 ///
-/// * **Every sighting is the `bf16` dense encoder.** Zero sightings across ~12 `q4` / `q8` arms.
-/// * **It is NOT windowing.** Two sightings were windowed forwards, two were *resident* ones —
-///   including one after this module's loader fix, on a path that does not go near
+/// * **Every sighting is the `bf16` dense encoder.** Zero sightings across ~14 `q4` / `q8` arms.
+/// * **It is NOT windowing.** Three sightings were *resident* forwards, two windowed — including
+///   two resident ones after this module's loader fix, on a path that never goes near
 ///   `from_dir_deferred`. Rung 4 neither causes it nor is exposed to it more than the resident
-///   path is.
+///   path is, and the loader fix neither introduced nor removed it.
 /// * **It is NOT the window size.** Reversing the order of `[1, 5, 10, 50]` moved the zero from
-///   window 1 to window 50: it follows whichever forward runs first after a 53 GB load, not the
-///   parameter.
-/// * It correlates with a *slow, cold* read of the 62 GB component (the failing forwards ran 3-10x
-///   longer than their warm twins) but did not reproduce in 16 warm runs, nor in a deliberately
-///   cold run with the page cache evicted to 60 MB of free pages.
+///   window 1 to window 50.
+/// * **It IS the second multi-gigabyte encoder load in one process, reading cold.** Four of the
+///   five fit exactly that: two dense resident loads that followed the packed arm in the same test
+///   binary (167.2 s and 166.9 s cold — both zero), against two that were the *first* load in
+///   their process (156.0 s and 72.6 s cold — both correct), and twelve warm loads at any position
+///   (all correct). The two windowed sightings are the same shape: a window that followed a 53 GB
+///   resident load in the same process. The one outlier was a 2-layer probe taken while ~20
+///   compilers were running.
 ///
 /// The mechanism is below this crate and is **unattributed**; nothing here claims to have removed
-/// it. What this crate does about it is compare the context against a reference on every arm and
-/// refuse a degenerate reference, which `tests/block_window_real.rs::measure_te_arm` does for the
-/// packed encoder as well as the dense one — that assertion caught sighting four live. Note that
-/// the peak counter reads *lower* when the work does not happen, so no memory assertion in this
-/// rung can see it, and neither can a norm, a cosine or a checksum.
+/// it. Two things this crate does about it:
+///
+/// 1. `tests/block_window_real.rs` compares the context against a reference on every arm and
+///    refuses a degenerate reference — that assertion caught sightings four and five live. The peak
+///    counter reads *lower* when the work does not happen, so no memory assertion in this rung can
+///    see it, and neither can a norm, a cosine or a checksum.
+/// 2. That file now **requires** each arm to be its own process invocation, which is what its own
+///    module text had always claimed and what `--test-threads=1` does not provide.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 /// **The TE arm** (sc-18662, AC3), measured on the real Qwen3-VL-32B tap by
@@ -537,7 +551,7 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// traded for it — but read the fault note on [`TRANSFORMER_WINDOW_SIZE`] before treating
 /// "bit-identical" as a property of the path rather than of the runs that were measured.
 ///
-/// # The windowed figure was re-measured (sc-17153): 5.81 GB -> 4.50 GB
+/// # The windowed figure moved with the mlx-rs pin (sc-17153): 5.81 GB -> 4.50 GB
 ///
 /// `RUNG4_TE_WINDOWED_PEAK_BYTES` was declared at `5_814_845_376`. It does not reproduce: eight
 /// runs on real weights land at `4_501_440_448` B ± ~0.5 MB, 1.31 GB (22.6 %) below the declared
@@ -545,6 +559,20 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// per-constant absolute bound sc-17153 introduced precisely so a stale member of a pair could not
 /// hide inside a quotient. The resident member is unchanged and reproduces to 2.4 MB, so this was
 /// exactly the *single-member* drift a ratio band cancels.
+///
+/// **The cause is the MLX pin, not this crate.** `git diff` from the sc-18662 measurement
+/// (`19efeb265`) to the current tree over `src/text_encoder/`, `src/block_stream.rs` and the
+/// harness is doc- and comment-only — nothing in the crate accounts for a 22.6 % drop. What moved
+/// is `Cargo.toml`'s mlx-rs revision, `932beb4e6` -> **`7151a9b27`**, in `dfd76b5ae`
+/// ("fix(mlx): preserve global VAE normalization in tiled decode", sc-19753). So:
+///
+/// * this figure is **pinned to mlx-rs `7151a9b27`**, and an MLX pin bump is the event that should
+///   be expected to move it again — when it does, the assertion will red with a *stale constant*
+///   message, and the pin is the first thing to check rather than this crate's loaders;
+/// * it also independently rules out the alternative reading, that 4.50 GB is what a *degenerate*
+///   (all-zero) run happens to peak at. It is not: the zero-output runs peak lower still, and
+///   `tests/block_window_real.rs` compares output before it records a cell, so no run that
+///   produced zeros can contribute a peak to this constant.
 pub const RUNG4_TE_RESIDENT_PEAK_BYTES: u64 = 53_074_721_216;
 /// The TE arm at [`TRANSFORMER_WINDOW_SIZE`]. See [`RUNG4_TE_RESIDENT_PEAK_BYTES`].
 pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 4_501_440_448;
@@ -3049,7 +3077,7 @@ mod tests {
             .parameters;
         // **`Both`, not `Dit`.** Declaring the DiT alone would leave the conditioning phase — the
         // taller stage at every tier — with no lever, which is what AC3 refuses. The TE arm is
-        // measured separately: 53.07 -> 5.81 GB.
+        // measured separately: 53.07 -> 4.50 GB (dense).
         assert_eq!(
             ranges.transformer_window_components,
             vec![TransformerComponent::Both]

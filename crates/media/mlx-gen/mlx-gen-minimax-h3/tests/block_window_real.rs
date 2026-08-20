@@ -3,10 +3,35 @@
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<upstream snapshot root> SCENEWORKS_GPU_ID=mlx \
 //!   cargo test -p mlx-gen-minimax-h3 --test block_window_real -- --ignored --nocapture \
-//!   --test-threads=1
+//!   --test-threads=1 --exact the_text_encoder_arm_is_measured_per_window
+//! # the packed arm takes a tier and is its OWN invocation — see below:
+//! MINIMAX_H3_TE=<tier>/text_encoder  …  --exact the_packed_text_encoder_arm_is_measured_per_window
 //! # the DiT arm additionally takes a staged tier:
 //! MINIMAX_H3_DIT=<tier>/transformer  …
 //! ```
+//!
+//! # ⚠ RUN EACH ARM IN ITS OWN PROCESS — `--test-threads=1` does NOT do this
+//!
+//! `--test-threads=1` serializes the arms inside **one** process; it does not isolate them. That
+//! distinction is load-bearing here, and it was found the hard way (sc-17153): the dense encoder
+//! returned an **all-zero context** on both occasions it was the *second* multi-gigabyte encoder
+//! load in a process and had to read cold from disk, and on neither occasion it was the first.
+//! Measured ledger, dense component, this hardware:
+//!
+//! | position in process | read | result |
+//! |---|---|---|
+//! | first big load | cold, 156.0 s | correct |
+//! | first big load | cold, 72.6 s (cache deliberately evicted) | correct |
+//! | **second** big load (packed arm ran first) | cold, 167.2 s | **all zeros** |
+//! | **second** big load (packed arm ran first) | cold, 166.9 s | **all zeros** |
+//! | any position | warm, 1.8-12.1 s | correct (x12) |
+//!
+//! The two windowed sightings have the same shape — a window that followed a 53 GB resident load in
+//! the same process. So the module text below, which has always said the arms are "measured in
+//! their own processes' own windows", was describing an invocation discipline the binary never
+//! enforced. It is now stated as a requirement rather than as a description. See
+//! [`TRANSFORMER_WINDOW_SIZE`](mlx_gen_minimax_h3::memory_strategy::TRANSFORMER_WINDOW_SIZE) for
+//! the fault itself, which is unattributed and unfixed.
 //!
 //! # Both arms, separately, because `TransformerComponent::Both` is two claims
 //!
@@ -177,9 +202,11 @@ fn measure_te_arm(te_dir: &std::path::Path, arm: &str) -> (String, u64, Vec<(usi
         assert_eq!(
             rel, 0.0,
             "{arm}/window {window} changed the conditioning context by {rel:e} — the windowed walk \
-             runs the same arithmetic and differs only in when a layer's weights exist. A context \
-             that differs at all (and `0.0` against a max|resident| of the right order is the only \
-             passing answer) means the streamed conditioning stage is not the resident one"
+             runs the same arithmetic and differs only in when a layer's weights exist, so a \
+             context that differs AT ALL means the streamed conditioning stage is not the resident \
+             one. NB the reference side is only checked for degeneracy (`scale > 1e-6` in \
+             `relative_max_abs`), not for magnitude: a resident arm that were wrong by an \
+             order of magnitude rather than zeroed would still be accepted as the reference"
         );
         cells.push((window, peak, wall));
     }
@@ -198,24 +225,59 @@ fn measure_te_arm(te_dir: &std::path::Path, arm: &str) -> (String, u64, Vec<(usi
     //
     // The retired claim here was that the parameter is *inert* above 1, bounded by a `< 2.0` spread
     // across `[1 … 50]`. That was measured on the dense encoder alone, where the spread is small
-    // (1.41x on the re-measurement) because a single dense Qwen3 layer's f32 upcast dominates the
-    // peak at every window size. It does not hold for the encoder a shipped `q4` render actually
-    // uses: the packed tier spreads **2.80x** (0.7958 GB at window 1 against 2.2255 GB at window
-    // 50), and the campaign that found it independently measured 3.12x. The window parameter is a
-    // real lever on the packed encoder, and a `< 2.0` bound asserted over both arms is simply false.
+    // because a single dense Qwen3 layer's f32 upcast dominates the peak at every window size. It
+    // does not hold for the encoder a shipped `q4` render actually uses.
     //
-    // What IS true on both, with a wide margin, is that **window 1 is the minimum**: every larger
-    // window holds more, monotonically on the packed tier and by 39 % on the dense one. That is the
-    // property the singleton domain rests on — `[1]` is the cheapest point, not an arbitrary one —
-    // and it is what this now asserts. The spread stays *reported*, because it is this arm's
-    // characterization output; it is simply no longer claimed to be ~1.
+    // **All figures below are ONE campaign** — sc-17153's post-fix measurement pass, mlx-rs
+    // `7151a9b27`, this Mac — quoted per tier as `w1 / w5 / w10 / w50` GB, so they can be compared
+    // against `memory_strategy`'s table cell for cell:
+    //
+    //   dense  4.50 / 6.24 / 6.24 / 6.24   spread 1.39x
+    //   q8     1.43 / 2.65 / 2.78 / 3.10   spread 2.17x
+    //   q4     0.80 / 1.78 / 1.95 / 1.87   spread 2.45x
+    //
+    // (Other numbers exist for these cells and are NOT mixed in here: the same arm run again gives
+    // dense 1.41x and q4 2.47x, and the campaign that first found the spread measured q4 at 3.12x.
+    // They agree on the finding and differ by run-to-run noise, which is why the bound below is
+    // loose rather than fitted to any one of them.)
+    //
+    // So a `< 2.0` bound asserted over both arms is simply false. What IS true on both, with a wide
+    // margin, is that **window 1 is the minimum** — by 1.9x or more. It is NOT true that the curve
+    // above 1 is monotonic: q4 runs 1.78 -> 1.95 -> 1.87, so the ordering among the larger windows
+    // is noise. Only the floor is asserted; the spread is bounded loosely and reported.
     let lo = cells.iter().map(|(_, p, _)| *p).min().unwrap();
     let hi = cells.iter().map(|(_, p, _)| *p).max().unwrap();
-    assert_eq!(
-        floor_peak, lo,
-        "{arm}: window 1 peaked at {floor_peak} B but some larger window reached only {lo} B — \
-         `TRANSFORMER_WINDOW_SIZE = 1` is published because 1 is the residency floor, so a larger \
-         window that costs less means the singleton domain is advertising the wrong point"
+
+    // The floor is asserted **with a margin**, not as a strict `floor_peak == lo` ordering. At the
+    // separations measured now (39 % dense, 2.2x q4, 1.9x q8) a strict ordering would hold, but it
+    // is one pin bump away from being a coin flip: the sc-18662 comments record a dense run where
+    // all four windows landed inside 1.6 % of each other (6.24-6.34 GB), and at that separation
+    // "which cell is smallest" is counter noise rather than a property. The margin is the harness's
+    // own 256 MiB / 5 % convention, reused so this is graded like every other cross-run memory
+    // comparison here.
+    const FLOOR_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+    let margin = FLOOR_MARGIN_BYTES.max((lo as f64 * 0.05) as u64);
+    assert!(
+        floor_peak <= lo + margin,
+        "{arm}: window 1 peaked at {floor_peak} B while some larger window reached {lo} B — over \
+         the {margin} B margin. `TRANSFORMER_WINDOW_SIZE = 1` is published because 1 is the \
+         residency floor, so a larger window that is materially cheaper means the singleton domain \
+         is advertising the wrong point"
+    );
+
+    // **And the spread still has an upper bound.** Retiring the `< 2.0` assertion (which was false
+    // for the packed tiers) must not leave the regression it existed for — residency becoming
+    // *window-proportional* — caught by nothing. That failure is ~50x across `[1 … 50]`, because a
+    // window that held its whole plan resident would scale with the plan. Measured spreads across
+    // every tier and campaign: 1.39-1.41x dense, 2.17x q8, 2.45-3.12x q4. 10.0 sits above the
+    // largest measurement with >3x headroom and below the failure mode by 5x, so it discriminates
+    // the thing it is for without going red on the difference between tiers or between runs.
+    assert!(
+        (hi as f64) / (lo as f64) < 10.0,
+        "{arm}: the window sizes {WINDOWS:?} spread {:.2}x ({lo} B to {hi} B) — residency has \
+         become window-proportional, so a layer is no longer being released as it is consumed and \
+         the singleton `[1]` domain understates what larger windows now cost",
+        (hi as f64) / (lo as f64)
     );
     eprintln!(
         "  window 1 is the FLOOR: {:.2}x spread across {WINDOWS:?} ({lo} B to {hi} B), against \

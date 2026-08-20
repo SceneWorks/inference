@@ -151,13 +151,24 @@ fn the_streamed_request_peak_is_the_declared_one() {
     let dit_tier = env("MINIMAX_H3_DIT")
         .map(|d| common::describe_dit_tier(&d))
         .unwrap_or_else(|| "bf16".to_owned());
+    // **`Err` PANICS rather than collapsing to "bf16" (sc-17153).** The previous
+    // `.ok().flatten()` turned an unreadable tier marker into the dense label, which silently
+    // routed the run out of the q4/q4 branch below — the request-peak constant then graded
+    // nothing and the test still passed green with no message saying so. That is precisely the
+    // failure `common::describe_dit_tier` panics on for the DiT side ("an unlabelled tier would
+    // make every measured cell unattributable"); the two sides now behave the same way.
+    // `None` (no marker present) is still a legitimate dense tier and is not an error.
     let te_tier = env("MINIMAX_H3_TE")
-        .map(|d| {
-            mlx_gen::quant::packed_quant_bits_at(&d)
-                .ok()
-                .flatten()
-                .map(|bits| format!("q{bits}"))
-                .unwrap_or_else(|| "bf16".to_owned())
+        .map(|d| match mlx_gen::quant::packed_quant_bits_at(&d) {
+            Ok(Some(bits)) => format!("q{bits}"),
+            Ok(None) => "bf16".to_owned(),
+            Err(error) => panic!(
+                "{}: cannot read the staged text encoder's quantization marker: {error}. An \
+                 unlabelled tier would send this run's request peak to be graded against — or, \
+                 worse, silently excluded from — a constant captured under different tier \
+                 conditions.",
+                d.display()
+            ),
         })
         .unwrap_or_else(|| "bf16".to_owned());
     println!("── streamed generate (rung 4, window 1, Both), per stage ──────");
@@ -238,6 +249,16 @@ fn the_streamed_request_peak_is_the_declared_one() {
             "RUNG4_REQUEST_PEAK_Q4_BYTES",
             RUNG4_REQUEST_PEAK_Q4_BYTES,
             request_peak as u64,
+        );
+    } else {
+        // **Say so (sc-17153).** This branch is legitimate — the constant was captured at q4/q4 and
+        // grading a bf16 run against it would be wrong — but it is the only assertion this test
+        // makes about `RUNG4_REQUEST_PEAK_Q4_BYTES`, so a silent skip reads exactly like a pass.
+        println!(
+            "  RUNG4_REQUEST_PEAK_Q4_BYTES NOT graded (dit={dit_tier}, te={te_tier}; the constant \
+             is q4 DiT + q4 packed TE only). This run measured {:.2} GB and asserted nothing \
+             against it.",
+            gb(request_peak)
         );
     }
 
