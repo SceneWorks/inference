@@ -198,6 +198,70 @@ pub struct Nvfp4Tensor {
 }
 
 impl Nvfp4Tensor {
+    /// Build the canonical Candle NVFP4 container from a ComfyUI Kitchen serialization.
+    ///
+    /// Kitchen already writes the FP8 block scales in the cuBLAS `to_blocked` layout consumed by
+    /// this crate, and its FP32 second-level scale has the same numeric convention. The one storage
+    /// difference is nibble order: Kitchen's default `hi_first=true` stores the even K element in
+    /// the high nibble, while [`Nvfp4Tensor`] stores it in the low nibble. Swapping every byte is
+    /// therefore a lossless representation conversion; no weight or scale is requantized.
+    ///
+    /// `rows` and `cols` are the logical (already 16-aligned) weight dimensions. The constructor is
+    /// intentionally strict because imported checkpoints are untrusted input and a malformed scale
+    /// surface would otherwise reach cuBLASLt as a device buffer with the wrong layout.
+    pub fn from_kitchen_parts(
+        packed_hi_first: &[u8],
+        blocked_scales: &[u8],
+        global_scale: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if rows == 0 || cols == 0 || !rows.is_multiple_of(16) || !cols.is_multiple_of(NVFP4_BLOCK) {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 Kitchen weight shape must be non-zero and 16-aligned, got [{rows}, {cols}]"
+            )));
+        }
+        let packed_len = rows
+            .checked_mul(cols / 2)
+            .ok_or_else(|| candle_core::Error::Msg("nvfp4 Kitchen weight size overflow".into()))?;
+        if packed_hi_first.len() != packed_len {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 Kitchen packed weight has {} bytes, expected {packed_len} for [{rows}, {cols}]",
+                packed_hi_first.len()
+            )));
+        }
+        let scale_len = Self::scale_tensor_len(rows, cols);
+        if blocked_scales.len() != scale_len {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 Kitchen block scales have {} bytes, expected {scale_len} for [{rows}, {cols}]",
+                blocked_scales.len()
+            )));
+        }
+        if !global_scale.is_finite() || global_scale < 0.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 Kitchen global scale must be finite and non-negative, got {global_scale}"
+            )));
+        }
+
+        let packed = packed_hi_first
+            .iter()
+            .map(|byte| byte.rotate_left(4))
+            .collect();
+        let cols_padded = cols;
+        let sf_rows = round_up(rows, SF_ATOM_ROWS);
+        let sf_cols = round_up(cols / NVFP4_BLOCK, SF_ATOM_COLS);
+        Ok(Self {
+            rows,
+            cols,
+            cols_padded,
+            packed,
+            scales: blocked_scales.to_vec(),
+            sf_rows,
+            sf_cols,
+            global_scale,
+        })
+    }
+
     /// Number of 16-element blocks per row (`cols_padded / 16`).
     #[inline]
     pub fn blocks_per_row(&self) -> usize {
@@ -424,6 +488,27 @@ mod tests {
         assert_eq!(e2m1_from_f32(-1.0) & 0x08, 0x08);
         // Ties-to-even at 2.5 (between 2.0@idx4 and 3.0@idx5) → even index 4 → 2.0.
         assert_eq!(E2M1_LUT[e2m1_from_f32(2.5) as usize], 2.0);
+    }
+
+    #[test]
+    fn kitchen_parts_swap_only_the_nibble_order() -> Result<()> {
+        let (rows, cols) = (128, 64);
+        let mut packed = vec![0u8; rows * cols / 2];
+        // Kitchen hi-first: even element code 1 in the high nibble, odd code 2 in the low nibble.
+        packed[0] = 0x12;
+        let mut scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
+        scales[Nvfp4Tensor::scale_offset_for(0, 0, rows)] = 0x38; // E4M3 1.0
+
+        let tensor = Nvfp4Tensor::from_kitchen_parts(&packed, &scales, 2.0, rows, cols)?;
+        assert_eq!(tensor.packed[0], 0x21);
+        assert_eq!(
+            tensor.scales, scales,
+            "blocked scales must remain byte-exact"
+        );
+        let dense = tensor.dequantize_to_vec();
+        assert_eq!(dense[0], 1.0); // E2M1(1) 0.5 * scale 1.0 * global 2.0
+        assert_eq!(dense[1], 2.0); // E2M1(2) 1.0 * scale 1.0 * global 2.0
+        Ok(())
     }
 
     // ---- container shape / size (the ~4.5-bit + padded scale-tensor expectation) --------------
