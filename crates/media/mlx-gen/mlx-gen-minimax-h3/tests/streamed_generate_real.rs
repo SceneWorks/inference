@@ -210,9 +210,23 @@ fn the_streamed_request_peak_is_the_declared_one() {
 
     // **2. Declared versus measured.** The survey's `requestPeak` row and the contract docs are
     // written from `RUNG4_REQUEST_PEAK_Q4_BYTES`; a drift between that constant and this harness
-    // would leave the provider publishing a request peak it no longer reproduces. A ratio band
-    // rather than bytes: the peak counter carries ~1 GB of run-to-run spread on this machine.
-    if dit_tier == "q4" {
+    // would leave the provider publishing a request peak it no longer reproduces.
+    //
+    // **sc-17153 (activity 20066, rider 1):** bounded absolutely, per constant, via
+    // `common::assert_declared_peak_constant` rather than by a `|measured/declared − 1| < 0.25`
+    // band. Note what the retired comment here got wrong, since it was load-bearing elsewhere: it
+    // claimed this assertion caught the *pair-proportional* drift the block-window ratio bands
+    // cancel. It never did — assertion 1 above bounds the request peak against
+    // `CONDITIONING_STAGE_PEAK_BYTES`, a third constant, and reads neither member of a
+    // resident/windowed pair. That class is now caught where it actually lives, by the per-constant
+    // bounds in `tests/block_window_real.rs`.
+    //
+    // **The tier guard is `dit_tier` AND `te_tier` (sc-17153).** `RUNG4_REQUEST_PEAK_Q4_BYTES` was
+    // captured with a q4 DiT *and* a **q4 packed** text encoder. `MINIMAX_H3_TE` is optional, and
+    // when it is absent the run falls back to the dense ~62 GB upstream encoder while `dit_tier` is
+    // still "q4" — which sent a dense-TE request peak into this branch to be compared against a
+    // packed-TE constant. Both tiers are now required to match the constant's own conditions.
+    if dit_tier == "q4" && te_tier == "q4" {
         let declared = RUNG4_REQUEST_PEAK_Q4_BYTES as f64;
         let measured = request_peak as f64;
         println!(
@@ -220,21 +234,10 @@ fn the_streamed_request_peak_is_the_declared_one() {
             declared / 1e9,
             measured / 1e9
         );
-        // **The band's shape.** Two-sided in ratio space, but multiplicatively asymmetric: this
-        // admits a `RUNG4_REQUEST_PEAK_Q4_BYTES` up to `1/(1 − 0.25) − 1 ≈ 33 %` above what the
-        // hardware reproduces (a constant inflated +30 % deviates only 23.1 %), while `measured`
-        // may exceed `declared` by at most 25 %. Ratio-form bands elsewhere in this rung — the
-        // resident/windowed pairs in `tests/block_window_real.rs` — are additionally blind to
-        // proportional drift, where both constants move by the same factor and cancel; that class
-        // is caught only here, because assertion 1 above bounds the request peak *absolutely*
-        // against `CONDITIONING_STAGE_PEAK_BYTES` rather than as a quotient. Absolute per-constant
-        // bounds are the stronger form throughout and belong with sc-17153's re-measurement of
-        // these cells, which produces the fresh absolute numbers to bound against.
-        assert!(
-            (measured / declared - 1.0).abs() < 0.25,
-            "the streamed q4 request peaked at {measured} B against a declared {declared} B — \
-             RUNG4_REQUEST_PEAK_Q4_BYTES is stale, and the survey's requestPeak row is written \
-             from it"
+        common::assert_declared_peak_constant(
+            "RUNG4_REQUEST_PEAK_Q4_BYTES",
+            RUNG4_REQUEST_PEAK_Q4_BYTES,
+            request_peak as u64,
         );
     }
 

@@ -209,25 +209,32 @@ fn the_text_encoder_arm_is_measured_per_window() {
 
     // **Declared versus measured.** `memory_strategy`'s constants are what the contract's rung-4
     // declaration and its module docs are written from, so a drift between them and this harness
-    // would leave the provider publishing a saving it no longer reproduces. Held as a ratio band
-    // rather than to the byte: the peak counter carries ~1 GB of run-to-run spread on this machine.
-    let declared = mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_RESIDENT_PEAK_BYTES as f64
-        / mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES as f64;
+    // would leave the provider publishing a saving it no longer reproduces.
+    //
+    // **sc-17153 (activity 20066, rider 1): each constant is bounded on its own**, replacing the
+    // `|measured/declared − 1| < 0.25` band on their *quotient*. That band was asymmetric (it
+    // admitted a declared value up to ~1.333x measured) and — the reason it had to go — a quotient
+    // cancels *pair-proportional* drift exactly, so the two constants could both drift by the same
+    // factor and nothing would red. The retired comment claimed the request-peak bound in
+    // `tests/streamed_generate_real.rs` covered that class; it does not, it reads neither of these
+    // constants, so the class was covered by nothing. See `common::assert_declared_peak_constant`.
+    //
+    // The ratio is still *reported*, because window-inertness is the characterization this arm
+    // exists to publish — it is simply no longer the thing asserted.
+    let declared_resident = mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_RESIDENT_PEAK_BYTES;
+    let declared_windowed = mlx_gen_minimax_h3::memory_strategy::RUNG4_TE_WINDOWED_PEAK_BYTES;
+    let declared = declared_resident as f64 / declared_windowed as f64;
     let measured = (resident_peak as f64) / (floor_peak as f64);
     eprintln!("  TE arm declared {declared:.2}x, measured {measured:.2}x");
-    // **What this band does and does not catch (sc-18662 review).** It is two-sided in ratio space
-    // but *multiplicatively asymmetric*: `|measured/declared − 1| < 0.25` lets `declared` run up to
-    // `1/(1 − 0.25) − 1 ≈ 33 %` above `measured` before it reds, while `measured` may only run 25 %
-    // above `declared`. A constant inflated by, say, +30 % scores a deviation of 23.1 % and passes.
-    // It is also blind to *proportional* drift: `RUNG4_TE_RESIDENT_PEAK_BYTES` and
-    // `RUNG4_TE_WINDOWED_PEAK_BYTES` moving by the same factor cancel in the quotient, and only the
-    // absolute request-peak bound in `tests/streamed_generate_real.rs` sees that. Absolute
-    // per-constant bounds are the stronger form; they belong with sc-17153's re-measurement of these
-    // very cells, which is where the fresh absolute numbers to bound against come from.
-    assert!(
-        (measured / declared - 1.0).abs() < 0.25,
-        "the TE arm measured {measured:.2}x against a declared {declared:.2}x — \
-         RUNG4_TE_*_PEAK_BYTES is stale, and the contract's rung-4 declaration is written from it"
+    common::assert_declared_peak_constant(
+        "RUNG4_TE_RESIDENT_PEAK_BYTES",
+        declared_resident,
+        resident_peak,
+    );
+    common::assert_declared_peak_constant(
+        "RUNG4_TE_WINDOWED_PEAK_BYTES",
+        declared_windowed,
+        floor_peak,
     );
     common::write_rung4_evidence("text_encoder", "bf16", &cells, resident_peak);
 }
@@ -327,17 +334,19 @@ fn the_dit_arm_is_measured_per_window_and_tier() {
     let declared = declared_resident as f64 / declared_windowed as f64;
     let measured = (resident_peak as f64) / (floor_peak as f64);
     eprintln!("  DiT arm {tier} declared {declared:.2}x, measured {measured:.2}x");
-    // Same asymmetry as the TE arm, and it applies per tier. The band is two-sided in ratio space
-    // but multiplicatively asymmetric — a `RUNG4_DIT_MEASURED_PEAKS` row inflated up to
-    // `1/(1 − 0.25) − 1 ≈ 33 %` above what the hardware reproduces still passes (a +30 % constant
-    // deviates 23.1 %). Proportional drift of a row's resident/windowed pair cancels in the
-    // quotient entirely and is caught only by the absolute request-peak bound in
-    // `tests/streamed_generate_real.rs`. Absolute per-constant bounds are the stronger form and
-    // belong with sc-17153's re-measurement of these cells.
-    assert!(
-        (measured / declared - 1.0).abs() < 0.25,
-        "the {tier} DiT arm measured {measured:.2}x against a declared {declared:.2}x — \
-         RUNG4_DIT_MEASURED_PEAKS is stale"
+    // sc-17153 (activity 20066, rider 1): bounded per constant, per tier, for the same reason as
+    // the TE arm above — a band on the quotient cancels pair-proportional drift of a
+    // `RUNG4_DIT_MEASURED_PEAKS` row exactly, and nothing else reads these two numbers. The ratio
+    // remains reported as this arm's characterization output.
+    common::assert_declared_peak_constant(
+        &format!("RUNG4_DIT_MEASURED_PEAKS[{tier}].resident"),
+        declared_resident,
+        resident_peak,
+    );
+    common::assert_declared_peak_constant(
+        &format!("RUNG4_DIT_MEASURED_PEAKS[{tier}].windowed"),
+        declared_windowed,
+        floor_peak,
     );
     common::write_rung4_evidence("dit", &tier, &cells, resident_peak);
 }

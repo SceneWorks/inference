@@ -996,10 +996,53 @@ pub fn walk_windowed_blocks(
 /// `MemoryEvidenceKey` needs, and sc-17153 pairs it with the fitted prediction that
 /// `MemoryRunOutcome` requires.
 ///
+/// (see [`assert_declared_peak_constant`] for the per-constant bound these receipts are graded by)
+///
 /// `cells` are `(window, peak_bytes, wall_seconds)`. **The wall figure is recorded but must not be
 /// asserted on**: this Mac is also the `nax-macos` runner and has been measured at load average
 /// 80-109, so a duration taken here is a sample of the fleet's contention, not of the rung. The peak
 /// is a per-process allocator high-water mark and does not read machine load at all.
+/// **Absolute per-constant bound on a declared peak (sc-17153, rider 1 of activity 20066).**
+///
+/// This replaces the `|measured/declared − 1| < 0.25` **ratio** bands that graded rung 4's
+/// constants until sc-17153's re-measurement pass. Two defects motivated the change, both recorded
+/// in the sc-18662 review:
+///
+/// 1. The ratio form was *multiplicatively asymmetric* — it admitted a declared constant up to
+///    `1/(1 − 0.25) ≈ 1.333x` the measured one while allowing measured only `1.25x` declared.
+/// 2. More seriously, a band on a **quotient** of two constants is blind to *pair-proportional*
+///    drift: `RUNG4_TE_RESIDENT_PEAK_BYTES` and `RUNG4_TE_WINDOWED_PEAK_BYTES` (or a
+///    `RUNG4_DIT_MEASURED_PEAKS` row's pair) moving by the same factor cancel exactly. The comments
+///    of the day claimed the absolute request-peak bound caught that class; it does not — it reads
+///    neither constant. So the class was caught by **nothing**.
+///
+/// Bounding each constant against its own measurement closes both: proportional drift moves each
+/// term and is caught on both, and the bound is symmetric in bytes.
+///
+/// **Tolerance** is the harness's own committed convention — the larger of 256 MiB absolute or 5 %
+/// relative (`docs/memory-calibration-harness.md`, the `compare-reuse` tolerance) — reused here so
+/// this rung is graded the way every other cross-run memory comparison in the fleet is, rather than
+/// by a number invented for it. The absolute floor is what makes it usable on the small windowed
+/// constants, where 5 % of ~1.4 GB would be tighter than the counter's own resolution.
+///
+/// Measured spread this bound was sized against (sc-17153 terminal campaign, real weights, Metal):
+/// the q4 DiT windowed peak was **bit-identical** across two runs, its resident peak moved 0.36 %
+/// (~43 MB), and the q8 pair reproduced its declared constants to within 5 KB and 36 KB. The
+/// "~1 GB of run-to-run spread" the retired comments cited was not reproduced on either arm.
+pub fn assert_declared_peak_constant(what: &str, declared: u64, measured: u64) {
+    const ABSOLUTE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+    let tolerance = ABSOLUTE_FLOOR_BYTES.max((declared as f64 * 0.05) as u64);
+    let delta = declared.abs_diff(measured);
+    assert!(
+        delta <= tolerance,
+        "{what}: declared {declared} B against a measured {measured} B — off by {delta} B, over \
+         the {tolerance} B bound (larger of 256 MiB or 5 %). The constant is stale, and the \
+         contract's rung-4 declaration and the survey's requestPeak row are written from it. This \
+         is a per-constant bound precisely so that proportional drift of a resident/windowed pair \
+         cannot cancel out of a quotient."
+    );
+}
+
 pub fn write_rung4_evidence(
     component: &str,
     tier: &str,
