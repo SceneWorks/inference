@@ -194,9 +194,15 @@ impl TierPaths {
         ))
     }
 
-    /// Learned spatial refinement weights co-located with the packed tier.
+    /// Learned spatial refinement weights co-located with the packed tier,
+    /// accepting either upstream staged filename without silently choosing an
+    /// ambiguous directory.
     pub fn upsampler_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
-        candle_gen::mmap_var_builder(&[self.file("upsampler.safetensors")?], dtype, device)
+        candle_gen::mmap_var_builder(
+            &[crate::canonical_upsampler_file(&self.tier_dir)?],
+            dtype,
+            device,
+        )
     }
 
     /// The Gemma-3-12B encoder VarBuilder rooted at `language_model.model.` over the tier's sibling

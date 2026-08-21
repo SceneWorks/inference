@@ -1092,21 +1092,45 @@ fn ltx_checkpoint_in(root: &Path) -> CResult<PathBuf> {
         .expect("cands non-empty"))
 }
 
+/// Published filenames for the learned x2 LTX refinement checkpoint. The
+/// converter stages the upstream name; the short name is the package-local
+/// canonical form. A directory carrying both is ambiguous and rejected rather
+/// than choosing one by incidental listing order.
+const UPSAMPLER_FILENAMES: [&str; 2] = [
+    "upsampler.safetensors",
+    "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+];
+
 /// Resolve the published learned refinement component. A `File` source is
-/// exact; a directory source and ordinary snapshot use the canonical filename.
-fn canonical_upsampler_file(path: &Path) -> CResult<PathBuf> {
+/// exact; a directory source and ordinary snapshot accept either published
+/// filename but fail closed when both are staged.
+pub(crate) fn canonical_upsampler_file(path: &Path) -> CResult<PathBuf> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
-    let canonical = path.join("upsampler.safetensors");
-    if canonical.is_file() {
-        return Ok(canonical);
+    let matches = UPSAMPLER_FILENAMES
+        .iter()
+        .map(|name| path.join(name))
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [single] => Ok(single.clone()),
+        [] => Err(CandleError::Msg(format!(
+            "ltx requires the learned spatial upscaler — provide LoadSpec::components[\"spatial_upscaler\"] \
+             as one of {} in a directory (looked in {})",
+            UPSAMPLER_FILENAMES.join(", "),
+            path.display()
+        ))),
+        _ => Err(CandleError::Msg(format!(
+            "ltx spatial upscaler directory {} is ambiguous: found multiple published files ({})",
+            path.display(),
+            matches
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
-    Err(CandleError::Msg(format!(
-        "ltx requires the learned spatial upscaler — provide LoadSpec::components[\"spatial_upscaler\"] \
-         as upsampler.safetensors or a directory containing it (looked in {})",
-        canonical.display()
-    )))
 }
 
 fn spec_upsampler_file(spec: &LoadSpec, root: &Path) -> CResult<PathBuf> {
@@ -1348,6 +1372,33 @@ mod tests {
     }
 
     #[test]
+    fn directory_component_accepts_the_official_published_upscaler_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let published = staged
+            .path()
+            .join("ltx-2.3-spatial-upscaler-x2-1.1.safetensors");
+        std::fs::File::create(&published).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf())).with_component(
+            gen_core::LTX_SPATIAL_UPSCALER_COMPONENT,
+            WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(spec_upsampler_file(&spec, root.path()).unwrap(), published);
+    }
+
+    #[test]
+    fn directory_component_rejects_ambiguous_published_upscalers() {
+        let staged = tempfile::tempdir().unwrap();
+        for name in UPSAMPLER_FILENAMES {
+            std::fs::File::create(staged.path().join(name)).unwrap();
+        }
+        let error = canonical_upsampler_file(staged.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "got: {error}");
+    }
+
+    #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
@@ -1440,7 +1491,7 @@ mod tests {
     /// sc-13749 load gate: `spatial_upscaler` is the only LTX named component; Gemma still rides the
     /// typed `text_encoder` slot and the uncensored/amoral enhancer remains mlx-only. Unknown component
     /// keys are rejected at load with a typed `Unsupported` error; a no-component spec still loads when
-    /// its canonical `upsampler.safetensors` is co-located (lazy weight resolution).
+    /// either published learned-upscaler filename is co-located (lazy weight resolution).
     #[test]
     fn load_rejects_unknown_component() {
         let bogus = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(
@@ -1505,7 +1556,7 @@ mod tests {
                 "ltx-2.3-22b-dev.safetensors",
                 "ltx-2.3-22b-distilled.safetensors",
                 "ltx-2.3-22b-distilled-lora-384.safetensors",
-                "ltx-2.3-spatial-upscaler-x2.safetensors",
+                "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
             ],),
             "ltx-2.3-22b-distilled.safetensors"
         );
