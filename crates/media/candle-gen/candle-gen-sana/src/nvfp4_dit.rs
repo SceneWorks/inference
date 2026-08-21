@@ -1,9 +1,10 @@
 //! The **NVFP4 precision seam** for the SANA Linear-DiT trunk (sc-11045, epic 11037).
 //!
-//! [`crate::transformer::SanaTransformer`] loads its projections dense (f32 [`Linear`]) by default.
-//! This module adds the seam that lets the SAME trunk serve those projections through
+//! [`crate::transformer::SanaTransformer`] normally loads its projections through [`QLinear`]: dense
+//! f32 for an ordinary checkpoint or MLX-affine packed Q4/Q8 for a hosted tier. This module adds the
+//! separate seam that lets the SAME trunk serve eligible projections through
 //! [`Nvfp4Linear`] instead — the sc-11041 packed-forward NVFP4 path — so a **real Sana-1.6B denoise**
-//! can be run end-to-end on the FP4 tensor cores and compared against the dense f32 baseline.
+//! can be run end-to-end on the FP4 tensor cores and compared against the dense or affine-packed path.
 //!
 //! Two things live here:
 //!
