@@ -566,11 +566,25 @@ pub struct GeneratorCapabilitySnapshot {
     pub samplers: Vec<String>,
     pub schedulers: Vec<String>,
     pub supported_guidance_methods: Vec<String>,
+    /// The **chained denoise-pass** surface (epic 20414, sc-20425) — the projection of
+    /// `Capabilities::denoise_pass_capability`.
+    ///
+    /// This is the one place a weights-free consumer can learn what a per-pass editor may offer:
+    /// whether chains are honored at all, the pass-count and per-pass step caps, which per-pass
+    /// **fields** this model honors, and — after the intersection rules — the sampler/scheduler ids
+    /// a pass may actually name. The flat [`samplers`](Self::samplers) /
+    /// [`schedulers`](Self::schedulers) menus above are NOT the answer for a chain: a family
+    /// legitimately advertises native ids there, and on a chain an unhonored one is a typed
+    /// rejection rather than a fallback. Publishing the derived surface is what keeps a consumer
+    /// from re-deriving that rule, or — as SceneWorks did before this — from maintaining a
+    /// hand-built family table.
+    pub denoise_passes: gen_core::DenoisePassCapability,
 }
 
 impl GeneratorCapabilitySnapshot {
     fn from_descriptor(descriptor: &ModelDescriptor) -> Self {
         Self {
+            denoise_passes: descriptor.capabilities.denoise_pass_capability(),
             id: descriptor.id.to_string(),
             family: descriptor.family.to_string(),
             backend: descriptor.backend.to_string(),
@@ -631,6 +645,9 @@ impl GeneratorCapabilitySnapshot {
             "samplers": self.samplers,
             "schedulers": self.schedulers,
             "supported_guidance_methods": self.supported_guidance_methods,
+            // camelCase inside, matching the rest of the `advanced.denoisePasses` wire contract
+            // (`DenoisePassCapability::to_json`); the key itself follows this dump's snake_case.
+            "denoise_passes": self.denoise_passes.to_json(),
         })
     }
 }
@@ -943,6 +960,85 @@ mod tests {
             GeneratorCapabilitySnapshot::from_descriptor(&descriptor).to_json(),
             GeneratorCapabilitySnapshot::from_descriptor(&mutated).to_json(),
             "prompt-enhancement support must be anti-restamp protected"
+        );
+    }
+
+    /// The chained denoise-pass surface (sc-20425) rides the same snapshot, so a weights-free
+    /// consumer building a per-pass editor never has to re-derive the intersection rules — or, as
+    /// SceneWorks did before this, keep a hand-built family table.
+    #[test]
+    fn generator_capability_snapshot_publishes_the_denoise_pass_surface() {
+        let base = gen_core::ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "chained-probe",
+            family: "test-image",
+            backend: "candle",
+            modality: gen_core::Modality::Image,
+            capabilities: gen_core::Capabilities {
+                min_size: 64,
+                max_size: 2048,
+                max_count: 1,
+                supports_guidance: true,
+                // A real family's shape: curated ids, one uncurated native SAMPLER alias, and one
+                // declared native SCHEDULER alias.
+                samplers: vec!["euler", "ddim", "lightning"],
+                schedulers: vec!["normal", "discrete"],
+                supports_denoise_passes: true,
+                denoise_pass_surface: gen_core::DenoisePassSurface {
+                    native_schedulers: &["discrete"],
+                    per_pass_adapters: false,
+                },
+                ..Default::default()
+            },
+        };
+
+        let json = GeneratorCapabilitySnapshot::from_descriptor(&base).to_json();
+        let dp = &json["denoise_passes"];
+        assert_eq!(dp["supported"], true);
+        assert_eq!(dp["maxPasses"], gen_core::MAX_DENOISE_PASSES);
+        assert_eq!(dp["perPassAdapters"], false);
+        assert_eq!(
+            dp["samplers"],
+            serde_json::json!(["euler", "ddim"]),
+            "the uncurated native sampler alias must not be published as per-pass usable"
+        );
+        assert_eq!(dp["schedulers"], serde_json::json!(["normal", "discrete"]));
+        assert_eq!(
+            dp["fields"],
+            serde_json::json!(["steps", "sampler", "scheduler", "denoise", "guidance"]),
+            "no `adapters` field on a family that cannot re-weight per pass"
+        );
+
+        // A family that does not honor chains publishes the empty surface, not a stale copy of the
+        // flat menus.
+        let mut off = base.clone();
+        off.capabilities.supports_denoise_passes = false;
+        off.capabilities.denoise_pass_surface = gen_core::DenoisePassSurface::NONE;
+        let off_json = GeneratorCapabilitySnapshot::from_descriptor(&off).to_json();
+        assert_eq!(off_json["denoise_passes"]["supported"], false);
+        assert_eq!(
+            off_json["denoise_passes"]["samplers"],
+            serde_json::json!([])
+        );
+        assert_ne!(
+            json, off_json,
+            "flipping the chained-denoise capability must change the machine-readable snapshot"
+        );
+
+        // …and so must a change to the surface alone, which no other field mirrors.
+        let mut re_weighting = base.clone();
+        re_weighting.capabilities.supports_lora = true;
+        re_weighting.capabilities.denoise_pass_surface = gen_core::DenoisePassSurface {
+            native_schedulers: &["discrete"],
+            per_pass_adapters: true,
+        };
+        assert_ne!(
+            json,
+            GeneratorCapabilitySnapshot::from_descriptor(&re_weighting).to_json(),
+            "per-pass adapter support must be anti-restamp protected"
         );
     }
 
