@@ -22,6 +22,183 @@ pub fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize
     (t_lat, h_lat, w_lat)
 }
 
+/// Geometry for the truthful two-stage LTX path. Stage one is exactly half of
+/// the requested spatial resolution; the learned upsampler produces stage two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwoStageGeometry {
+    pub t: usize,
+    pub h1: usize,
+    pub w1: usize,
+    pub h2: usize,
+    pub w2: usize,
+}
+
+/// Seed split consumed by the two-stage A/V route. Keeping it named rather
+/// than scattering `wrapping_add`s makes the four independent streams auditable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TwoStageSeeds {
+    pub video_stage1: u64,
+    pub video_stage2: u64,
+    pub audio_stage1: u64,
+    pub audio_stage2: u64,
+}
+
+/// Production orchestration trace. The renderer calls this small stateful seam
+/// at its real stage boundaries; CPU tests can assert the model-independent
+/// order without loading the 22B weights.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StageOperation {
+    AdapterPass(usize),
+    Stage1Noise(TwoStageSeeds),
+    Keyframes { stage: u8 },
+    ClipsStage1,
+    LearnedUpsample,
+    Stage2Renoise { sigma: f32 },
+    Stage2Forward,
+}
+
+#[derive(Debug)]
+pub(crate) struct TwoStageOrchestration {
+    seeds: TwoStageSeeds,
+    operations: Vec<StageOperation>,
+    phase: StagePhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagePhase {
+    Start,
+    Stage1,
+    Upsampled,
+    Stage2,
+}
+
+impl TwoStageOrchestration {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            seeds: TwoStageSeeds {
+                video_stage1: seed,
+                video_stage2: seed.wrapping_add(1),
+                audio_stage1: seed.wrapping_add(2),
+                audio_stage2: seed.wrapping_add(3),
+            },
+            operations: Vec::new(),
+            phase: StagePhase::Start,
+        }
+    }
+
+    pub(crate) fn stage1_setup(
+        &mut self,
+        has_stage1_keyframes: bool,
+        has_clips: bool,
+        set_adapter_pass: impl FnOnce(usize),
+    ) -> TwoStageSeeds {
+        assert_eq!(
+            self.phase,
+            StagePhase::Start,
+            "stage one may begin only once"
+        );
+        self.phase = StagePhase::Stage1;
+        set_adapter_pass(0);
+        self.operations.push(StageOperation::AdapterPass(0));
+        self.operations
+            .push(StageOperation::Stage1Noise(self.seeds));
+        if has_stage1_keyframes {
+            self.operations.push(StageOperation::Keyframes { stage: 1 });
+        }
+        if has_clips {
+            self.operations.push(StageOperation::ClipsStage1);
+        }
+        self.seeds
+    }
+
+    /// Execute the learned component as the stage boundary. This is a real
+    /// production wrapper, so test traces and render ordering cannot diverge.
+    pub(crate) fn learned_upsample<T>(
+        &mut self,
+        op: impl FnOnce() -> candle_gen::Result<T>,
+    ) -> candle_gen::Result<T> {
+        if self.phase != StagePhase::Stage1 {
+            return Err(candle_gen::CandleError::Msg(
+                "ltx two-stage: learned upsample must follow stage one".into(),
+            ));
+        }
+        let result = op()?;
+        self.operations.push(StageOperation::LearnedUpsample);
+        self.phase = StagePhase::Upsampled;
+        Ok(result)
+    }
+
+    /// Execute fresh re-noise only after the learned component completed.
+    pub(crate) fn stage2_renoise<T>(
+        &mut self,
+        sigma: f32,
+        op: impl FnOnce() -> candle_gen::Result<T>,
+        set_adapter_pass: impl FnOnce(usize),
+    ) -> candle_gen::Result<T> {
+        if self.phase != StagePhase::Upsampled {
+            return Err(candle_gen::CandleError::Msg(
+                "ltx two-stage: stage-two re-noise requires learned upsample output".into(),
+            ));
+        }
+        let result = op()?;
+        set_adapter_pass(1);
+        self.operations
+            .push(StageOperation::Stage2Renoise { sigma });
+        self.operations.push(StageOperation::AdapterPass(1));
+        self.phase = StagePhase::Stage2;
+        Ok(result)
+    }
+
+    /// Apply full-resolution keyframes only after learned upsample and fresh
+    /// re-noise have made the stage-two latent. This deliberately cannot run in
+    /// stage-one setup.
+    pub(crate) fn stage2_keyframes<T>(
+        &mut self,
+        op: impl FnOnce() -> candle_gen::Result<T>,
+    ) -> candle_gen::Result<T> {
+        if self.phase != StagePhase::Stage2 {
+            return Err(candle_gen::CandleError::Msg(
+                "ltx two-stage: full-resolution keyframes require stage-two re-noise".into(),
+            ));
+        }
+        let result = op()?;
+        self.operations.push(StageOperation::Keyframes { stage: 2 });
+        Ok(result)
+    }
+
+    /// Execute one stage-two DiT evaluation. The wrapper protects against a
+    /// refinement forward before re-noise while recording the real invocation.
+    pub(crate) fn stage2_forward<T>(
+        &mut self,
+        op: impl FnOnce() -> candle_gen::Result<T>,
+    ) -> candle_gen::Result<T> {
+        if self.phase != StagePhase::Stage2 {
+            return Err(candle_gen::CandleError::Msg(
+                "ltx two-stage: stage-two forward requires fresh re-noise".into(),
+            ));
+        }
+        let result = op()?;
+        self.operations.push(StageOperation::Stage2Forward);
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operations(&self) -> &[StageOperation] {
+        &self.operations
+    }
+}
+
+pub fn two_stage_geometry(frames: u32, width: u32, height: u32) -> TwoStageGeometry {
+    let (t, h2, w2) = latent_dims(frames, width, height);
+    TwoStageGeometry {
+        t,
+        h1: h2 / 2,
+        w1: w2 / 2,
+        h2,
+        w2,
+    }
+}
+
 /// Deterministic N(0,1) latent noise `[1, 128, t_lat, h_lat, w_lat]` (f32) — CPU `StdRng` (ChaCha),
 /// launch-portable per seed.
 pub fn create_noise(
@@ -58,14 +235,65 @@ pub fn unflatten_latent(tokens: &Tensor, f: usize, h: usize, w: usize) -> Result
 // --- Synchronized audio (sc-5495) ----------------------------------------------------------------
 
 /// Deterministic N(0,1) audio latent noise `[1, 8, audio_frames, 16]` (f32) — seed offset +2 keeps it
-/// distinct from the video noise stream (matches the reference's per-modality keys).
+/// distinct from the video noise stream (callers pass the explicit stream seed).
 pub fn create_audio_noise(seed: u64, audio_frames: usize, device: &Device) -> Result<Tensor> {
     let ch = AUDIO_LATENT_CHANNELS as usize;
     let mel = AUDIO_MEL_BINS as usize;
     let n = ch * audio_frames * mel;
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(2));
+    let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, ch, audio_frames, mel), device)
+}
+
+/// Re-noise a generated clean latent for the next distilled stage.
+pub fn renoise(latent: &Tensor, fresh_noise: &Tensor, sigma: f32) -> Result<Tensor> {
+    (latent * (1.0 - sigma) as f64)? + (fresh_noise * sigma as f64)?
+}
+
+/// Fold sampler-specific progress into LTX's fixed two-stage schedule. Curated
+/// Heun/DPM++ drivers can report a scheduled position more than once for their
+/// extra model evaluations; the product progress contract counts positions, not
+/// evaluations, so each source position is emitted once.
+#[derive(Debug)]
+pub(crate) struct StageProgressFold {
+    offset: u32,
+    stage_steps: u32,
+    total_steps: u32,
+    last_source_position: Option<u32>,
+    emitted: u32,
+}
+
+impl StageProgressFold {
+    pub(crate) fn new(offset: u32, stage_steps: u32, total_steps: u32) -> Self {
+        Self {
+            offset,
+            stage_steps,
+            total_steps,
+            last_source_position: None,
+            emitted: 0,
+        }
+    }
+
+    pub(crate) fn fold(&mut self, event: Progress) -> Option<Progress> {
+        match event {
+            Progress::Step { current, .. } => {
+                if self.emitted == self.stage_steps
+                    || self
+                        .last_source_position
+                        .is_some_and(|last| current <= last)
+                {
+                    return None;
+                }
+                self.last_source_position = Some(current);
+                self.emitted += 1;
+                Some(Progress::Step {
+                    current: self.offset + self.emitted,
+                    total: self.total_steps,
+                })
+            }
+            other => Some(other),
+        }
+    }
 }
 
 /// Audio latent `[1, 8, T, 16]` → tokens `[1, T, 128]` (per time-frame flatten of `(ch, mel)`,
@@ -103,6 +331,7 @@ pub fn denoise_av_conditioned(
     audio_grid: &Tensor,
     sigmas: &[f32],
     cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
     let mut state = video.clone();
@@ -112,6 +341,7 @@ pub fn denoise_av_conditioned(
         if cancel.is_cancelled() {
             return Err(candle_gen::CandleError::Canceled);
         }
+        on_model_forward()?;
         let (sigma, sigma_next) = (window[0], window[1]);
         let aflat = flatten_audio_latent(&alat)?;
         let timesteps = state.token_timesteps(sigma)?;
@@ -196,4 +426,195 @@ pub fn frames_to_images(decoded: &Tensor) -> Result<Vec<Image>> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_stage_geometry_requires_a_64_pixel_final_grid() {
+        let g = two_stage_geometry(49, 704, 512);
+        assert_eq!((g.t, g.h1, g.w1, g.h2, g.w2), (7, 8, 11, 16, 22));
+    }
+
+    #[test]
+    fn stage_streams_have_distinct_seed_offsets() -> Result<()> {
+        let device = Device::Cpu;
+        let video1 = create_noise(9, 1, 1, 1, &device)?;
+        let video2 = create_noise(10, 1, 1, 1, &device)?;
+        let audio1 = create_audio_noise(11, 1, &device)?;
+        let audio2 = create_audio_noise(12, 1, &device)?;
+        assert_ne!(
+            video1.flatten_all()?.to_vec1::<f32>()?,
+            video2.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_ne!(
+            audio1.flatten_all()?.to_vec1::<f32>()?,
+            audio2.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renoise_uses_the_fresh_stage_noise_at_sigma_one() -> Result<()> {
+        let d = Device::Cpu;
+        let latent = Tensor::zeros((1, 1, 1, 1, 1), DType::F32, &d)?;
+        let noise = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &d)?;
+        assert_eq!(
+            renoise(&latent, &noise, 1.0)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            vec![1.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_fold_deduplicates_curated_positions() {
+        let mut fold = StageProgressFold::new(0, 8, 11);
+        let events = [1, 2, 2, 3, 4, 4, 5, 6, 7, 8]
+            .into_iter()
+            .filter_map(|current| {
+                fold.fold(Progress::Step { current, total: 8 })
+                    .and_then(|event| match event {
+                        Progress::Step { current, .. } => Some(current),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn progress_fold_preserves_native_stage_positions_and_global_total() {
+        let mut fold = StageProgressFold::new(8, 3, 11);
+        let events = (1..=3)
+            .map(|current| fold.fold(Progress::Step { current, total: 3 }).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![
+                Progress::Step {
+                    current: 9,
+                    total: 11
+                },
+                Progress::Step {
+                    current: 10,
+                    total: 11
+                },
+                Progress::Step {
+                    current: 11,
+                    total: 11
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn production_two_stage_orchestration_cannot_skip_the_learned_refinement_path() {
+        let mut flow = TwoStageOrchestration::new(41);
+        let pass = std::cell::Cell::new(None);
+        let seeds = flow.stage1_setup(true, true, |selected| pass.set(Some(selected)));
+        assert_eq!(
+            pass.get(),
+            Some(0),
+            "stage one selected the real adapter pass"
+        );
+        assert_eq!(
+            seeds,
+            TwoStageSeeds {
+                video_stage1: 41,
+                video_stage2: 42,
+                audio_stage1: 43,
+                audio_stage2: 44,
+            }
+        );
+        let upsample_calls = std::cell::Cell::new(0);
+        flow.learned_upsample(|| {
+            upsample_calls.set(upsample_calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(upsample_calls.get(), 1, "the learned component was invoked");
+        let device = Device::Cpu;
+        let latent = Tensor::zeros((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let fresh_noise = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let stage2 = flow
+            .stage2_renoise(
+                0.909375,
+                || Ok(renoise(&latent, &fresh_noise, 0.909375)?),
+                |selected| pass.set(Some(selected)),
+            )
+            .unwrap();
+        assert_eq!(
+            pass.get(),
+            Some(1),
+            "stage two selected the real adapter pass"
+        );
+        assert!(
+            stage2.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] > 0.9,
+            "the tested callback must execute renoise at the stage-two sigma"
+        );
+        let keyframe = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let keys = [conditioning::Keyframe {
+            latent: &keyframe,
+            frame_idx: 0,
+            strength: 1.0,
+        }];
+        let keyed = flow
+            .stage2_keyframes(|| Ok(conditioning::apply_keyframes(&stage2, &keys)?))
+            .unwrap();
+        assert_eq!(
+            keyed
+                .latent
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0],
+            "the post-upsample stage-two callback applies the full-resolution keyframe"
+        );
+        let stage2_forwards = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            flow.stage2_forward(|| {
+                stage2_forwards.set(stage2_forwards.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(stage2_forwards.get(), 3);
+        let mut progress = StageProgressFold::new(0, 8, 11);
+        let mut observed_progress = (1..=8)
+            .filter_map(|current| progress.fold(Progress::Step { current, total: 8 }))
+            .collect::<Vec<_>>();
+        let mut stage2_progress = StageProgressFold::new(8, 3, 11);
+        observed_progress.extend(
+            [1, 2, 2, 3]
+                .into_iter()
+                .filter_map(|current| stage2_progress.fold(Progress::Step { current, total: 3 })),
+        );
+        assert_eq!(
+            observed_progress,
+            (1..=11)
+                .map(|current| Progress::Step { current, total: 11 })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            flow.operations(),
+            [
+                StageOperation::AdapterPass(0),
+                StageOperation::Stage1Noise(seeds),
+                StageOperation::Keyframes { stage: 1 },
+                StageOperation::ClipsStage1,
+                StageOperation::LearnedUpsample,
+                StageOperation::Stage2Renoise { sigma: 0.909375 },
+                StageOperation::AdapterPass(1),
+                StageOperation::Keyframes { stage: 2 },
+                StageOperation::Stage2Forward,
+                StageOperation::Stage2Forward,
+                StageOperation::Stage2Forward,
+            ]
+        );
+    }
 }

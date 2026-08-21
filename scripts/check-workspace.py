@@ -310,12 +310,6 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "candle the single-stage `ltx_2_3_distilled`, mlx the two-stage `ltx_2_3`. Both doc "
         "comments state which."
     ),
-    ("ltx", "SIZE_MULTIPLE"): (
-        "32 vs 64, and both doc comments say `Divergent by backend on purpose` with the derivation: "
-        "mlx's stage 1 renders at half resolution, so a request dimension must be a multiple of "
-        "*twice* the 32x VAE spatial compression for that halving to be exact. candle is "
-        "single-stage and needs only SPATIAL_SCALE."
-    ),
     ("mage", "ATTENTION_CHUNK_SIZE"): (
         "candle takes the shared `gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET` "
         "(64 Mi score elements); mlx pins 16 Mi, a quarter of it, under the SC-15509 Apple/Metal "
