@@ -7,11 +7,12 @@
 //! video + per-frame color masks** are a `ControlClip`; `video_mode == "replacement"` toggles the
 //! cross-identity `replace_flag` (else animation). Inference adapters (`spec.adapters`) — LoRA / LoKr /
 //! LoHa, the lightx2v lightning diff-patch, and the Bias-Aware DPO refinement LoRA — are folded into the
-//! dense DiT before build ([`crate::adapters`], sc-6838). Multi-reference awaits the worker request
-//! contract (sc-5583: gen-core has no way to pair an extra reference image with its color-coded mask —
-//! `Conditioning::MultiReference` carries images only); `crate::generate` already supports extra
-//! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
-//! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
+//! dense DiT before build ([`crate::adapters`], sc-6838). Multiple characters use the existing ordered
+//! conditioning carrier: each [`Conditioning::Reference`] must be followed by its color-coded
+//! [`Conditioning::Mask`]. The first pair is the primary character and later pairs reach
+//! [`crate::generate::Scail2Job::additional`] in caller order. The generic
+//! [`Conditioning::MultiReference`] image vector is advertised for routing but is deliberately refused:
+//! it cannot carry the mandatory per-character masks.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -47,6 +48,11 @@ const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
 const DEFAULT_GUIDANCE: f32 = 5.0;
 const DEFAULT_FPS: u32 = 16;
+
+/// The upstream source-position table is trained through source id 5, inclusive. The primary character
+/// occupies id 0, so a request may carry at most five additional image/mask pairs. Refusing the seventh
+/// pair is intentional: silently clipping it would make a caller believe a character was conditioned.
+const MAX_REFERENCE_CHARACTERS: usize = 6;
 
 /// The only DiT projections the SCAIL2 MLX converter packs. These raw `SCAIL2Model` names are
 /// deliberately not diffusers-prefixed: the hosted `dit.safetensors` is a flat file, while the
@@ -146,16 +152,14 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            // Reference character image (Reference) + its color-coded segmentation mask (Mask); the
-            // driving video + its per-frame color masks map to ControlClip. `MultiReference` (extra
-            // characters) is deliberately NOT advertised: gen-core's `Conditioning::MultiReference`
-            // carries images only, with no way to pair each extra reference with its required
-            // color-coded mask, so the request contract can't reach `Scail2Job.additional` yet —
-            // sc-5583 tracks the paired ref+mask contract + worker plumbing (sc-8985: advertising it
-            // let multi-ref requests validate, render for minutes, and silently drop the extras).
+            // A character is a strict ordered Reference + Mask pair. The first pair is primary and up
+            // to five later pairs are extra characters. MultiReference is advertised for the shared
+            // multi-reference routing surface, but its image-only payload is rejected below because it
+            // cannot express the matching masks this model requires.
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
+                ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
             // Inference LoRA / LoKr / LoHa + the lightx2v lightning diff-patch + the Bias-Aware DPO
@@ -641,10 +645,10 @@ impl Generator for Scail2 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // Actionable multi-reference rejection first, so the caller learns WHY (pending contract,
-        // sc-5583) rather than the generic capability-floor "not supported" from `validate_request`
-        // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
-        reject_multi_reference(self.descriptor.id, req)?;
+        // Validate pair/order/cardinality before the generic capability floor. This keeps an image-only
+        // MultiReference or an orphan Mask an actionable request error instead of a render that omits a
+        // character, and does not load any components.
+        let _ = resolve_character_references(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
         // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
         // silently dropping them. One site is enough on this lane: `generate` above calls
@@ -671,25 +675,99 @@ impl Generator for Scail2 {
     }
 }
 
-/// Reject `MultiReference` conditioning loudly instead of letting a multi-character request render
-/// for minutes and silently drop the extra characters (sc-8985). The engine core already supports
-/// extra characters ([`crate::generate::CharacterRef`] / `Scail2Job.additional`), but gen-core's
-/// `Conditioning::MultiReference` carries images only — there is no way to pair each extra reference
-/// with its required color-coded segmentation mask until the paired ref+mask request contract lands
-/// (sc-5583).
-fn reject_multi_reference(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
-    if req
-        .conditioning
-        .iter()
-        .any(|c| matches!(c, Conditioning::MultiReference { .. }))
-    {
+/// One strictly ordered character-pair request, split into the primary subject and any later subjects.
+/// The references borrow from [`GenerationRequest`] so no pixel buffers are copied before the model
+/// pipeline resizes and encodes them.
+#[derive(Debug)]
+struct CharacterReferences<'a> {
+    primary: CharacterRef<'a>,
+    additional: Vec<CharacterRef<'a>>,
+}
+
+/// Parse the public conditioning list into ordered `(Reference, Mask)` character pairs.
+///
+/// `Conditioning::MultiReference` intentionally remains unsupported *as a payload*: it is just an
+/// image vector and therefore cannot name the corresponding color masks. The routing capability is
+/// advertised, while the usable no-schema-change representation is repeated `Reference, Mask` pairs.
+/// We inspect only those two kinds here, so the required `ControlClip` may retain its established
+/// position before, after, or between the pairs without changing its own semantics.
+fn resolve_character_references<'a>(
+    id: &str,
+    req: &'a GenerationRequest,
+) -> gen_core::Result<CharacterReferences<'a>> {
+    let mut pairs = Vec::new();
+    let mut pending: Option<(&Image, usize)> = None;
+
+    for (index, conditioning) in req.conditioning.iter().enumerate() {
+        match conditioning {
+            Conditioning::Reference { image, .. } => {
+                if let Some((_, reference_index)) = pending {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: conditioning[{reference_index}] is a Reference without its following \
+                         Mask before conditioning[{index}] starts another Reference; pass ordered \
+                         Reference, Mask pairs"
+                    )));
+                }
+                pending = Some((image, index));
+            }
+            Conditioning::Mask { image } => {
+                let Some((reference, reference_index)) = pending.take() else {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: conditioning[{index}] is a Mask without a preceding Reference; pass \
+                         ordered Reference, Mask pairs"
+                    )));
+                };
+                pairs.push(CharacterRef {
+                    image: reference,
+                    mask: image,
+                });
+                if pairs.len() > MAX_REFERENCE_CHARACTERS {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: received {} reference/mask character pairs, but SCAIL-2 supports at \
+                         most {MAX_REFERENCE_CHARACTERS}; no pairs were truncated",
+                        pairs.len()
+                    )));
+                }
+                debug_assert!(reference_index < index);
+            }
+            Conditioning::MultiReference { .. } => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{id}: MultiReference carries only images and has no paired color-coded \
+                     segmentation masks; pass ordered Reference, Mask pairs instead"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((_, index)) = pending {
         return Err(gen_core::Error::Unsupported(format!(
-            "{id}: MultiReference (extra reference characters) is not supported yet — each extra \
-             character needs its own color-coded segmentation mask and the paired reference+mask \
-             request contract is pending (sc-5583); pass exactly one Reference + Mask"
+            "{id}: conditioning[{index}] is a Reference without its following Mask; pass ordered \
+             Reference, Mask pairs"
         )));
     }
-    Ok(())
+
+    let Some(primary) = pairs.first() else {
+        return Err(gen_core::Error::Msg(
+            "scail2: a Reference character image paired with a color-coded Mask is required".into(),
+        ));
+    };
+    let primary = CharacterRef {
+        image: primary.image,
+        mask: primary.mask,
+    };
+    let additional = pairs
+        .iter()
+        .skip(1)
+        .map(|pair| CharacterRef {
+            image: pair.image,
+            mask: pair.mask,
+        })
+        .collect();
+    Ok(CharacterReferences {
+        primary,
+        additional,
+    })
 }
 
 /// Refuse the [`Conditioning::ControlClip`] knobs SCAIL-2 does not implement (sc-20262).
@@ -920,14 +998,6 @@ fn reject_over_area(id: &str, width: u32, height: u32) -> gen_core::Result<()> {
     Ok(())
 }
 
-/// The first conditioning input matching `f`.
-fn find_conditioning<'a, T>(
-    req: &'a GenerationRequest,
-    f: impl Fn(&'a Conditioning) -> Option<T>,
-) -> Option<T> {
-    req.conditioning.iter().find_map(f)
-}
-
 impl Scail2 {
     /// Map the request conditioning onto a [`Scail2Job`] and run the denoise pipeline.
     fn run(
@@ -935,23 +1005,8 @@ impl Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
-        let reference = find_conditioning(req, |c| match c {
-            Conditioning::Reference { image, .. } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            CandleError::Msg("scail2: a Reference character image is required".into())
-        })?;
-        let ref_mask = find_conditioning(req, |c| match c {
-            Conditioning::Mask { image } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            CandleError::Msg(
-                "scail2: a Mask (the reference character's color-coded segmentation mask) is required"
-                    .into(),
-            )
-        })?;
+        let characters = resolve_character_references(self.descriptor.id, req)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         let driving = req.control_clip().ok_or_else(|| {
             CandleError::Msg(
                 "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
@@ -973,13 +1028,8 @@ impl Scail2 {
             negative_prompt: &neg,
             width,
             height,
-            reference: CharacterRef {
-                image: reference,
-                mask: ref_mask,
-            },
-            // Extra characters await the paired ref+mask request contract (sc-5583); `validate`
-            // rejects `MultiReference` until then (sc-8985).
-            additional: Vec::new(),
+            reference: characters.primary,
+            additional: characters.additional,
             driving_frames: driving.frames,
             driving_masks: driving.mask,
             replace_flag: req.video_mode.as_deref() == Some("replacement"),
@@ -1749,9 +1799,7 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::Mask));
         assert!(d.capabilities.accepts(ConditioningKind::ControlClip));
-        // MultiReference is deliberately NOT advertised until the paired ref+mask request contract
-        // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
-        assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
+        assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
         assert_eq!(
             d.capabilities.size_floor.explicit_size_multiple(),
@@ -1788,42 +1836,110 @@ mod tests {
     }
 
     #[test]
-    fn multi_reference_is_rejected_loudly() {
-        let img = Image {
+    fn multi_reference_contract_uses_ordered_pairs_and_never_truncates() {
+        let image = |tag| Image {
             width: 64,
             height: 64,
-            pixels: vec![0u8; 64 * 64 * 3],
+            pixels: vec![tag; 64 * 64 * 3],
         };
-        let req = GenerationRequest {
-            prompt: "a character".into(),
+        let primary_image = image(11);
+        let primary_mask = image(12);
+        let extra_image = image(21);
+        let extra_mask = image(22);
+        let paired = GenerationRequest {
+            prompt: "two characters".into(),
             width: 64,
             height: 64,
             count: 1,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: primary_image,
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: primary_mask,
+                },
+                // ControlClip may retain its existing position; pair ordering is evaluated only
+                // across Reference and Mask inputs.
+                Conditioning::ControlClip {
+                    frames: vec![image(31)],
+                    mask: vec![image(32)],
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: Default::default(),
+                },
+                Conditioning::Reference {
+                    image: extra_image,
+                    strength: None,
+                },
+                Conditioning::Mask { image: extra_mask },
+            ],
+            ..Default::default()
+        };
+        descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &paired)
+            .expect("the advertised pair kinds validate");
+        let resolved = resolve_character_references(MODEL_ID, &paired).expect("ordered pairs");
+        assert_eq!(resolved.primary.image.pixels[0], 11);
+        assert_eq!(resolved.primary.mask.pixels[0], 12);
+        assert_eq!(resolved.additional.len(), 1);
+        assert_eq!(resolved.additional[0].image.pixels[0], 21);
+        assert_eq!(resolved.additional[0].mask.pixels[0], 22);
+
+        let image_only = GenerationRequest {
             conditioning: vec![Conditioning::MultiReference {
-                images: vec![img.clone(), img],
+                images: vec![image(41), image(42)],
             }],
             ..Default::default()
         };
-        // The dedicated guard fires with the actionable pending-contract message.
-        let err = reject_multi_reference(MODEL_ID, &req).expect_err("err");
-        assert!(matches!(err, gen_core::Error::Unsupported(_)), "got: {err}");
-        let msg = err.to_string();
-        assert!(msg.contains("MultiReference"), "got: {msg}");
-        assert!(msg.contains("sc-5583"), "got: {msg}");
-        // Backstop: with `MultiReference` unadvertised, the shared capability floor rejects it too.
+        descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &image_only)
+            .expect("MultiReference remains advertised for shared routing");
+        let error =
+            resolve_character_references(MODEL_ID, &image_only).expect_err("maskless input");
         assert!(
-            descriptor()
-                .capabilities
-                .validate_request(MODEL_ID, &req)
-                .is_err(),
-            "the capability floor must reject unadvertised MultiReference conditioning"
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "got: {error}"
         );
-        // A request without MultiReference passes the guard (the floor still enforces the rest).
-        let single = GenerationRequest {
-            conditioning: Vec::new(),
-            ..req
+        assert!(
+            error.to_string().contains("paired color-coded"),
+            "got: {error}"
+        );
+
+        let misordered = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Mask { image: image(51) },
+                Conditioning::Reference {
+                    image: image(52),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
         };
-        assert!(reject_multi_reference(MODEL_ID, &single).is_ok());
+        let error = resolve_character_references(MODEL_ID, &misordered).expect_err("misordered");
+        assert!(error.to_string().contains("without a preceding Reference"));
+
+        let mut too_many = Vec::new();
+        for tag in 0..=MAX_REFERENCE_CHARACTERS {
+            too_many.push(Conditioning::Reference {
+                image: image(tag as u8),
+                strength: None,
+            });
+            too_many.push(Conditioning::Mask {
+                image: image(tag as u8 + 64),
+            });
+        }
+        let error = resolve_character_references(
+            MODEL_ID,
+            &GenerationRequest {
+                conditioning: too_many,
+                ..Default::default()
+            },
+        )
+        .expect_err("the seventh pair must not be silently dropped");
+        assert!(error.to_string().contains("no pairs were truncated"));
     }
 
     #[test]
