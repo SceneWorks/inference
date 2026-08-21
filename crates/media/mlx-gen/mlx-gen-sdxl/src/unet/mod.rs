@@ -37,6 +37,46 @@ pub use controlnet::{ControlNet, ControlResiduals};
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
 
+/// Inject one ControlNet's already-scaled down-path residuals into the U-Net skip stack.
+///
+/// This is kept as the narrow production seam for the control/no-control distinction: every SDXL
+/// denoise route, including the CFG-free Lightning route, reaches this helper through
+/// [`UNet2DConditionModel::forward_planned`]. A mismatched ControlNet geometry remains a typed error
+/// rather than being truncated by `zip`.
+pub(crate) fn inject_control_down_residuals(
+    residuals: &mut [Array],
+    control: Option<&ControlResiduals>,
+) -> Result<()> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    if control.down.len() != residuals.len() {
+        return Err(mlx_gen::Error::Msg(format!(
+            "controlnet produced {} down residuals, UNet expects {}",
+            control.down.len(),
+            residuals.len()
+        )));
+    }
+    for (residual, control_residual) in residuals.iter_mut().zip(&control.down) {
+        *residual = add(&*residual, control_residual)?;
+    }
+    Ok(())
+}
+
+/// Inject one ControlNet's already-scaled mid residual into the U-Net hidden state.
+///
+/// Keeping absent-control as an identity is important for the ordinary SDXL and acceleration paths;
+/// a zero residual is the executable `conditioning_scale = 0` identity used by parity tests.
+pub(crate) fn inject_control_mid_residual(
+    hidden: Array,
+    control: Option<&ControlResiduals>,
+) -> Result<Array> {
+    match control {
+        Some(control) => Ok(add(&hidden, &control.mid)?),
+        None => Ok(hidden),
+    }
+}
+
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
     Ok(w.transpose_axes(&[0, 2, 3, 1])?)
@@ -557,27 +597,14 @@ impl UNet2DConditionModel {
         }
 
         // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
-        if let Some(c) = control {
-            if c.down.len() != residuals.len() {
-                return Err(mlx_gen::Error::Msg(format!(
-                    "controlnet produced {} down residuals, UNet expects {}",
-                    c.down.len(),
-                    residuals.len()
-                )));
-            }
-            for (r, cr) in residuals.iter_mut().zip(&c.down) {
-                *r = add(&*r, cr)?;
-            }
-        }
+        inject_control_down_residuals(&mut residuals, control)?;
 
         // Mid.
         x = self.mid_resnet0.forward(&x, Some(&temb))?;
         x = self.mid_transformer.forward_ip(&x, encoder_x, ip, plan)?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
         // ControlNet: add the (scaled) control mid residual to the mid output.
-        if let Some(c) = control {
-            x = add(&x, &c.mid)?;
-        }
+        x = inject_control_mid_residual(x, control)?;
 
         // Up path — each block pops its skip residuals.
         for block in &self.up_blocks {
