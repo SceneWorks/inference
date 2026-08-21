@@ -409,16 +409,30 @@ jobs:
       # `windows-cuda` dispatch and from `real-weights.yml`, which is the deliberate split — see
       # sc-19447 for the per-target classification and for the real-weight targets no lane names.
       #
-      # A THIRD mechanism existed and was NOT trustworthy: 14 weight-bound cases carried neither
-      # marker and instead printed `SKIP` and `return`ed `Ok(())` when their env var was unset or
-      # the device was not CUDA. libtest reports those as **passed**. Widening this step to
-      # `--tests` would therefore have converted "never evaluated" into "reported as evaluated" —
-      # the exact defect class sc-19447 exists to remove, laundered rather than fixed. All 14 were
-      # converted to `#[ignore = "..."]` in this change (13 files: `candle-gen`'s
-      # `cuda_quant_smoke`, `candle-gen-flux2`'s `vae_encode_parity`, and all eleven
-      # `candle-gen-lens` `*_parity` targets — `encoder_quant_parity` carries two such cases, and
-      # factors its guard into a helper, so a body-only reading of the sources undercounts).
-      # `scripts/tests/test_candle_gen_ci_target_coverage.py` now refuses to count a self-skipping
+      # A THIRD mechanism existed and was NOT trustworthy: 14 cases carried neither marker and
+      # instead printed `SKIP` and `return`ed when their guard was unsatisfied. libtest reports
+      # those as **passed**. Widening this step to `--tests` would therefore have converted "never
+      # evaluated" into "reported as evaluated" — the exact defect class sc-19447 exists to remove,
+      # laundered rather than fixed.
+      #
+      # THE 14 WERE NOT ONE KIND, and sc-19447 converted all of them to `#[ignore]` as though they
+      # were. THE REAL SPLIT IS 13 + 1:
+      #   * 13 are ENV-GATED and weight-bound — `candle-gen-flux2`'s `vae_encode_parity` and all
+      #     eleven `candle-gen-lens` `*_parity` targets (12 files; `encoder_quant_parity` carries
+      #     two such cases and factors its guard into a helper, so a body-only reading of the
+      #     sources undercounts). For these, `#[ignore]` is right: their weights are not on any
+      #     runner, so no lane should run them, and `real-weights.yml` opts in explicitly.
+      #   * 1 is DEVICE-GATED and weight-free, and it was LANE-REACHABLE: `candle-gen`'s
+      #     `cuda_quant_smoke::cuda_qmatmul_matches_cpu`, the sole canary for the sc-7544 silent-
+      #     zeros GGUF QMatMul regression. It gates on `default_device().is_cuda()`, not on an env
+      #     var, and the `windows-cuda` job below runs `--features cuda` with **no `-- --ignored`**
+      #     — so `#[ignore]` did not park it beside the weight-bound twelve, it SILENCED it on the
+      #     one lane that has ever executed it. It is `#![cfg(feature = "cuda")]` now: excluded
+      #     from this lane by the second trustworthy mechanism above (empty binary on
+      #     `ubuntu-latest`), and executed rather than `ignored` under `--features cuda`. Do not
+      #     re-`#[ignore]` it — see that file's module header.
+      #
+      # `scripts/tests/test_candle_gen_ci_target_coverage.py` refuses to count a self-skipping
       # case as weight-free coverage and fails on any new one, so the class cannot re-enter
       # silently. sd3's `reference_manifests_are_consistent_if_present` is deliberately NOT in that
       # set: its references are committed to the repo, so it really does assert on every run.

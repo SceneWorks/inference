@@ -264,10 +264,10 @@ pub use reference::{
 };
 pub use rope::{create_token_ids, Rope3d, RopeTables};
 pub use text_encoder::{
-    encode_grounded, encode_grounded_from_vision, minimax_h3_vision_config, run_vision,
-    GroundedVision, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, SpecialTokens,
-    APPLIES_CHAT_TEMPLATE, LM_PREFIX, MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS, SELECT_HIDDEN,
-    VISION_PREFIX,
+    encode_grounded, encode_grounded_from_vision, inspect_conditioning, minimax_h3_vision_config,
+    run_vision, ConditioningDefect, DegenerateConditioning, GroundedVision, MiniMaxH3TeConfig,
+    MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, SpecialTokens, APPLIES_CHAT_TEMPLATE, LM_PREFIX,
+    MINIMAX_ADDED_SPECIALS, NUM_HIDDEN_LAYERS, SELECT_HIDDEN, VISION_PREFIX,
 };
 pub use vae::{split_fused_qkv, MiniMaxH3VideoVae};
 pub use vae_encoder::{

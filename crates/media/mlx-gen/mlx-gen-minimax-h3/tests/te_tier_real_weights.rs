@@ -244,6 +244,22 @@ fn the_packed_context_tracks_the_dense_one() {
         let w = map_shards(dir, false).expect("map shards");
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg).expect("build encoder");
         let bits = te.packed_bits().expect("uniform width");
+        // ── sc-17153: DO NOT "fix" this by retrying, `#[ignore]`ing, or loosening it ─────────────
+        //
+        // The **bf16 dense** encoder intermittently returns an all-zero forward — `max|out| = 0.0`,
+        // correct shapes, no Metal error — at a measured ~13% of forwards (4 sightings in ~30).
+        // The mechanism is below this crate; see `src/text_encoder/degeneracy.rs` for the evidence
+        // and the non-causes ruled out by counter-measurement.
+        //
+        // `force()` runs the real encoder, so when the hazard fires the dense arm dies **here**, on
+        // the encoder's own degeneracy refusal, with a message naming sc-17153. That is
+        // **deliberate and wanted**: this test is `#[ignore]`d and runs only on the dispatch-only
+        // real-weights lane, never as a PR gate, so an occasional honest red costs nothing and is
+        // the only incidence signal the investigation still gets. A retry, a relaxed bound, or a
+        // silenced arm would destroy it and leave the hazard shipping unobserved.
+        //
+        // If you are here because this failed: record the run (`max|out|`, tier, resident vs
+        // windowed, whether a repeat in a fresh process reproduces) against sc-17153, then re-run.
         let context = force(&te, &ids, &mask);
         let host: Vec<f32> = context
             .as_dtype(Dtype::Float32)
@@ -264,8 +280,10 @@ fn the_packed_context_tracks_the_dense_one() {
     let bits = packed_bits.expect("MINIMAX_H3_TE_PACKED is not a packed tier");
 
     assert_eq!(reference.len(), packed.len(), "context shapes differ");
+    // No `assert!(scale > 0.0)` here any more: the encoder's own sc-17153 screen refuses a zero
+    // context inside `context_of`'s `force()`, so a zero reference can no longer reach this line.
+    // An assertion that cannot fail is a trap — it reads as protection and provides none.
     let scale = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    assert!(scale > 0.0, "a zero reference context cannot gate anything");
     let worst = reference
         .iter()
         .zip(&packed)

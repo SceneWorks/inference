@@ -331,6 +331,18 @@ pub fn snap_reference_frames_down(num_frames: usize) -> usize {
 ///   [`KEYFRAME_NOISE_AUG_T`] the way visual anchors are — that is what
 ///   [`crate::denoise::RowClass::ConditionAudio`] exists to express, and applying the visual
 ///   augmentation here would be the plausible wrong answer.
+///
+/// # It is screened for degeneracy, and it is the only conditioning producer here that can be
+///
+/// The visual producers above ([`encode_keyframe_condition`], [`encode_reference_condition`],
+/// [`keyframe_condition_rows`], [`build_condition_rows`]) all draw a noise sample before returning,
+/// so an all-zero screen on them could never fire even against a completely dead VAE — a guard that
+/// cannot fire is worse than none, because it reads as coverage that is not there.
+///
+/// This one takes the posterior's **mode**, never a sample, so it has no noise floor: an all-zero
+/// audio encode passes straight through as all-zero DiT conditioning. A silent soundtrack does not
+/// produce that — `normalize` is `(z − mean) / std`, so silence lands on `−mean/std` — which is
+/// what makes the screen safe here as well as meaningful. See [`crate::text_encoder::degeneracy`].
 pub fn reference_audio_rows(normalized: &Array) -> Result<Array> {
     let s = normalized.shape();
     if s.len() != 3 {
@@ -339,7 +351,9 @@ pub fn reference_audio_rows(normalized: &Array) -> Result<Array> {
              got {s:?}"
         )));
     }
-    Ok(normalized.reshape(&[1, s[0] * s[1], s[2]])?)
+    let rows = normalized.reshape(&[1, s[0] * s[1], s[2]])?;
+    crate::text_encoder::degeneracy::refuse_if_degenerate("ref2va audio conditioning", &rows)?;
+    Ok(rows)
 }
 
 #[cfg(test)]
