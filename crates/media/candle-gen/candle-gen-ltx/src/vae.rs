@@ -398,6 +398,17 @@ impl LtxVideoVae {
     /// Geometry owned by the concrete decoder and consumed by its planner and tiled driver.
     pub const VAE_TILING: VaeTiling = VaeTiling::LTX;
 
+    /// Convert DiT-normalized latents to the learned-upscaler's VAE latent
+    /// domain. The stats are loaded from the same checkpoint as decode.
+    pub(crate) fn denormalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_mul(&self.std)?.broadcast_add(&self.mean)
+    }
+
+    /// Convert learned-upscaler output back into the DiT-normalized domain.
+    pub(crate) fn normalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+
     /// Build a decoder-only VAE from a VarBuilder rooted at the `vae.` prefix.
     pub fn new(vb: VarBuilder, latent_channels: usize, patch_size: usize) -> Result<Self> {
         Self::build(vb, None, latent_channels, patch_size)
