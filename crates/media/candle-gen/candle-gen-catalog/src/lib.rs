@@ -1068,11 +1068,14 @@ mod preview_advertising {
             // sc-16950's inventory, restated as counts so a blanked route is a diff here too: the
             // pose-control route, the seven `pipeline` render routes (Turbo three-stage / t2i /
             // img2img, Raw t2i / multi-phase / img2img, and the shared Turbo+Raw edit), and the one
-            // deliberately dark trainer site. sc-20418 adds one DIRECT emission in `preview.rs`:
-            // the chained denoise-pass render numbers frames by the executor's chain-global outer
-            // step (each pass owns a fresh schedule, so there is no single σ array for the shared
-            // driver's counter to key on) and emits through `PreviewHook::emit_step` — the SCM
-            // step-keyed precedent, not a bespoke denoise loop.
+            // deliberately dark trainer site. sc-20418 adds one DIRECT emission for the chained
+            // denoise-pass render, which numbers frames by the executor's chain-global outer step
+            // (each pass owns a fresh schedule, so there is no single σ array for the shared
+            // driver's counter to key on) — the SCM step-keyed precedent, not a bespoke denoise
+            // loop. sc-20425 hoisted the counter type into `candle_gen::preview::PassPreview` so
+            // the ε/VE adopters cannot re-derive the σ-less variant that emits nothing, which moved
+            // that emission from this crate's `preview.rs` into the `DenoisePassHost::observe` impl
+            // in `pipeline.rs`.
             routes: &[
                 FileRoutes {
                     file: "control_provider.rs",
@@ -1083,12 +1086,6 @@ mod preview_advertising {
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 7,
-                    direct: 0,
-                    dark: &[],
-                },
-                FileRoutes {
-                    file: "preview.rs",
-                    hooked: 0,
                     direct: 1,
                     dark: &[],
                 },
@@ -1232,13 +1229,19 @@ mod preview_advertising {
             // img2img / `Reference` — because the img2img fork blends its reference into `x_t` and
             // shortens the σ schedule before the driver call rather than opening a second one.
             // No dark site: `load_variant` refuses control / IP-adapter overlays, so this crate ships
-            // no descriptor-less render lane, and it has no trainer. No direct emission either —
-            // `preview.rs` holds only the reused epic-16624 16-channel fit and a layout check, since
-            // SD3.5's running latent is already the `[1, C, h, w]` contract with nothing to unpack.
+            // no descriptor-less render lane, and it has no trainer.
+            //
+            // sc-20425 adds ONE direct emission in the same file: the chained denoise-pass lane
+            // (`Sd3PassHost::observe`). A chain has no single σ array for the shared driver's
+            // counter to key on — each pass builds a fresh schedule — so it numbers frames by the
+            // executor's chain-global outer step through `candle_gen::preview::PassPreview`, the
+            // Krea precedent. The denoise itself is still shared machinery (the executor), not a
+            // bespoke loop. `preview.rs` still holds only the reused epic-16624 16-channel fit and a
+            // layout check, since SD3.5's running latent is already the `[1, C, h, w]` contract.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
                 hooked: 1,
-                direct: 0,
+                direct: 1,
                 dark: &[],
             }],
         },
@@ -1248,8 +1251,15 @@ mod preview_advertising {
             denoise: Denoise::Shared,
             // sc-16954's inventory, and the first to mix both wiring layers in one crate. SDXL ships
             // FOUR emitting lanes across three files plus one deliberately dark trainer site:
-            //   * `pipeline.rs` — the registered route's two lanes: the curated driver call (hooked)
-            //     and the bespoke Lightning Euler loop (direct).
+            //   * `pipeline.rs` — the registered route's THREE lanes: the curated driver call
+            //     (hooked), the bespoke Lightning Euler loop (direct), and — since sc-20425 — the
+            //     chained denoise-pass lane's `SdxlPassHost::observe` (direct). A chain has no
+            //     single σ array for the shared driver's counter to key on, so it numbers frames by
+            //     the executor's chain-global outer step through
+            //     `candle_gen::preview::PassPreview`; the denoise itself is still shared machinery
+            //     (the executor), not a bespoke loop. That emission carries the σ, which this
+            //     family's VE projector requires — the σ-less step-keyed emitter would consume
+            //     every position and deliver nothing.
             //   * `denoise.rs` — the shared helpers the name-driven providers, Kolors and InstantID
             //     all reach: `denoise_curated` (hooked, forwarding its caller's hook) and the bespoke
             //     `denoise_ip_multi_control` ancestral loop (direct).
@@ -1273,7 +1283,7 @@ mod preview_advertising {
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 1,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
@@ -3147,11 +3157,14 @@ mod preview_advertising {
             .collect();
         assert_eq!(
             direct,
-            [("preview.rs".to_string(), 1)],
+            [("pipeline.rs".to_string(), 1)],
             "the one direct emission is the chained denoise-pass chain preview (sc-20418): the \
              chain has no single σ array for the shared driver's counter to key on, so it numbers \
-             frames by the executor's chain-global outer step through PreviewHook::emit_step — \
-             every denoise loop itself still runs through the shared driver"
+             frames by the executor's chain-global outer step. sc-20425 hoisted the counter type \
+             into `candle_gen::preview::PassPreview` — so the ε/VE adopters cannot re-derive the \
+             σ-less variant that emits nothing at all — which moved the emission call from this \
+             crate's `preview.rs` to the `DenoisePassHost::observe` impl in `pipeline.rs`. Every \
+             denoise loop itself still runs through the shared driver"
         );
         assert!(wiring.emits());
     }

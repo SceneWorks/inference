@@ -329,7 +329,37 @@ impl Sd3Large {
         let guidance = req
             .guidance
             .unwrap_or_else(|| self.variant.default_guidance());
-        let cfg_on = guidance != 1.0;
+
+        // Chained denoise passes (epic 20414, sc-20425): resolved ONCE up front so an invalid plan
+        // is rejected before any residency work, then re-resolved per image inside Phase B so each
+        // image's pass seeds derive from its own job seed. The job seed is drawn exactly once
+        // (F-089) — `default_seed` is time-derived, so re-drawing it would make the plan and the
+        // render disagree about the very seeds the plan records for replay.
+        let dp_defaults = sd3_denoise_defaults(self.variant);
+        let dp_ctx = self
+            .descriptor
+            .capabilities
+            .denoise_pass_context(Some(self.loaded_spec.adapters.len()));
+        let dp_resolve = |seed: u64| -> Result<mlx_gen::gen_core::ResolvedDenoisePlan> {
+            req.resolve_denoise_plan(seed, &dp_defaults, &dp_ctx)
+                .map_err(mlx_gen::gen_core::Error::from)
+                .map_err(Error::from)
+        };
+        let dp_plan: Option<mlx_gen::gen_core::ResolvedDenoisePlan> = match &req.denoise_passes {
+            Some(_) => Some(dp_resolve(base_seed)?),
+            None => None,
+        };
+        // The uncond encode gate widens for a chain: it is CFG-on when ANY pass wants guidance
+        // != 1.0, not when the single request-level scale does. Getting this wrong would either
+        // waste an encode or, worse, leave `uncond: None` for a pass that asked for guidance and
+        // silently render it unguided.
+        let cfg_on = match &dp_plan {
+            Some(plan) => {
+                self.variant.uses_classifier_free_guidance()
+                    && plan.passes.iter().any(|p| p.guidance.unwrap_or(1.0) != 1.0)
+            }
+            None => guidance != 1.0,
+        };
 
         // img2img (epic 8588 slice A4, sc-10189): a single `Conditioning::Reference` seeds the denoise
         // from the VAE-encoded reference at `strength` (the reference's own strength, else the
@@ -412,6 +442,34 @@ impl Sd3Large {
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
                 for i in 0..req.count {
                     let seed = base_seed.wrapping_add(i as u64);
+                    if dp_plan.is_some() {
+                        // The chained lane (sc-20425). The plan is re-resolved per image so this
+                        // image's pass seeds derive from ITS job seed, exactly as the single-pass
+                        // lane re-seeds its noise per image.
+                        let plan = dp_resolve(seed)?;
+                        let initial = pipeline::create_noise(seed, req.width, req.height)?;
+                        let (latents, _execution) = pipeline::render_denoise_passes(
+                            &heavy.transformer,
+                            &plan,
+                            initial,
+                            &cond,
+                            uncond.as_ref(),
+                            self.variant.uses_classifier_free_guidance(),
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            attention,
+                            transformer_window,
+                        )?;
+                        on_progress(Progress::Decoding);
+                        images.push(pipeline::decode_to_image_tiled(
+                            &heavy.vae,
+                            &latents,
+                            decode_tiling.as_ref(),
+                            &req.cancel,
+                        )?);
+                        continue;
+                    }
                     let latents = if let Some((init, _)) = reference {
                         pipeline::denoise_img2img_cfg_with_memory(
                             &heavy.transformer,
@@ -504,7 +562,41 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
              negative prompt would be ignored); raise guidance or drop the negative prompt"
         )));
     }
+    // Chained denoise passes (sc-20425) are the **t2i-from-noise** surface: the chain's initial
+    // latent is the seeded prior, so an img2img `Reference` has nowhere to enter. Rejecting the
+    // combination is the Krea precedent — a request mixing them would otherwise render pure txt2img
+    // and report success, silently dropping the reference image. The candle twin rejects identically.
+    if req.denoise_passes.is_some() && !req.conditioning.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "{id}: chained denoise passes are the text-to-image surface — a conditioning image has \
+             no entry point into a chain that starts from noise, so send one or the other"
+        )));
+    }
     Ok(())
+}
+
+/// The model-default rung of the chained-denoise resolution ladder (sc-20425) — what a pass that
+/// names nothing, in a request that names nothing, actually runs.
+///
+/// Both ids it records are **menu-valid and honorable**: `euler` is the curated integrator the
+/// unified flow sampler runs for this family (the advertised `flow_match` sampler alias resolves to
+/// the same integrator through the N3 fallback, but it is not a curated `Solver`, so it could never
+/// replay through pass validation), and `flow_match` as a *scheduler* is the declared native alias
+/// for the family's own static-shift schedule. A resolved plan is a replay artifact, so the defaults
+/// it records must be ids validation accepts. The candle twin records the same pair.
+pub(crate) fn sd3_denoise_defaults(variant: Sd3Variant) -> mlx_gen::gen_core::DenoiseDefaults {
+    let defaults = mlx_gen::gen_core::DenoiseDefaults::new(
+        variant.default_steps(),
+        "euler",
+        crate::pipeline::NATIVE_SCHEDULERS[0],
+    );
+    if variant.uses_classifier_free_guidance() {
+        defaults.with_guidance(variant.default_guidance())
+    } else {
+        // The distilled Turbo has no guidance axis: `None` means "this model's implicit CFG-free
+        // path", not "look it up", and the shared floor rejects a per-pass `guidance` on it.
+        defaults
+    }
 }
 
 /// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A4), or
