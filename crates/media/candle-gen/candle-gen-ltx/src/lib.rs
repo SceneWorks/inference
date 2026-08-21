@@ -512,12 +512,10 @@ impl Pipeline {
         let stage2_keyframes =
             self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
         let clips = self.build_clips(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
-        let stage_seeds = orchestration.stage1_setup(
-            !keyframes.is_empty(),
-            !stage2_keyframes.is_empty(),
-            !clips.is_empty(),
-        );
-        comps.avdit.set_adapter_pass(0);
+        let stage_seeds =
+            orchestration.stage1_setup(!keyframes.is_empty(), !clips.is_empty(), |pass| {
+                comps.avdit.set_adapter_pass(pass)
+            });
         let vnoise =
             pipeline::create_noise(stage_seeds.video_stage1, t_lat, h_lat, w_lat, &self.device)?;
         let anoise = pipeline::create_audio_noise(stage_seeds.audio_stage1, af, &self.device)?;
@@ -657,13 +655,16 @@ impl Pipeline {
             fps as f32,
             &self.device,
         )?;
-        let stage2_initial = orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
-            Ok(AvLatents {
-                video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
-                audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
-            })
-        })?;
-        comps.avdit.set_adapter_pass(1);
+        let stage2_initial = orchestration.stage2_renoise(
+            STAGE2_SIGMAS[0],
+            || {
+                Ok(AvLatents {
+                    video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
+                    audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
+                })
+            },
+            |pass| comps.avdit.set_adapter_pass(pass),
+        )?;
         let mut stage2_fold = pipeline::StageProgressFold::new(NATIVE_STEPS, 3, 11);
         let mut stage2_progress = |event: Progress| {
             if let Some(event) = stage2_fold.fold(event) {
@@ -718,8 +719,10 @@ impl Pipeline {
                     strength: keyframe.strength,
                 })
                 .collect::<Vec<_>>();
-            let conditioned = conditioning::apply_keyframes(&upsampled, &borrowed)?
-                .noised(&stage2_video_noise, STAGE2_SIGMAS[0])?;
+            let conditioned = orchestration.stage2_keyframes(|| {
+                Ok(conditioning::apply_keyframes(&upsampled, &borrowed)?
+                    .noised(&stage2_video_noise, STAGE2_SIGMAS[0])?)
+            })?;
             let state = conditioning::VideoTokenState::from_i2v(&conditioned, &stage2_grid)?;
             let mut stage2_forward = || {
                 orchestration
@@ -1170,8 +1173,9 @@ fn spec_root(spec: &LoadSpec) -> PathBuf {
 ///  * **dense** — [`ltx_checkpoint_in`] picks ONE root file out of a snapshot that also ships
 ///    `fp8`/`mixed`/lora/upscaler siblings. Hosted `Lightricks/LTX-2.3` is ~146 GiB on disk against that
 ///    single-file load, so a directory sum refuses LTX on every GPU that exists.
-///  * **packed tier** — the load reads 4 files (`transformer` + `connector` + `vae_decoder` +
-///    `vae_encoder`); the encoder is required by every advertised video-conditioning lane.
+///  * **packed tier** — the load reads 5 files (`transformer` + `connector` + `vae_decoder` +
+///    `vae_encoder` + learned `upsampler`); the encoder is required by every advertised
+///    video-conditioning lane and the upsampler by every render.
 ///
 /// Mapping onto [`PerComponentBytes`]' three slots: `text_encoder` = the Gemma-3-12B encoder (a
 /// SEPARATE ~24 GB snapshot that is not under the weights root — omitting it would under-count by more
@@ -1232,9 +1236,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             .map(|d| d.to_path_buf())
             .unwrap_or_else(|| p.clone()),
     };
-    // Named-component contract (sc-13658/sc-13749): candle LTX-2.3 recognizes NO `LoadSpec::components`
-    // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
-    // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
+    // Named-component contract (sc-13658/sc-13749): `spatial_upscaler` is the sole optional LTX
+    // `LoadSpec::components` key; its Gemma TE rides the typed `text_encoder` slot, and there is no
+    // uncensored/amoral enhancer variant (the mlx-only `uncensored_enhancer`). Unknown component keys
+    // are rejected up front as `Unsupported`.
     gen_core::reject_unknown_components(
         spec,
         &[gen_core::LTX_SPATIAL_UPSCALER_COMPONENT],
@@ -1892,7 +1897,7 @@ mod tests {
         assert_eq!(fp.text_encoder + fp.dit + fp.vae, 13_000);
     }
 
-    /// sc-12397 — the PACKED TIER layout: the four files the video render loads, plus sibling Gemma.
+    /// sc-12397 — the PACKED TIER layout: the five files the video render loads, plus sibling Gemma.
     /// The VAE encoder is part of the truthful footprint because advertised conditioning consumes it.
     #[test]
     fn component_footprint_tier_sizes_conditioning_encoder_plus_gemma() {

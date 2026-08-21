@@ -89,8 +89,8 @@ impl TwoStageOrchestration {
     pub(crate) fn stage1_setup(
         &mut self,
         has_stage1_keyframes: bool,
-        has_stage2_keyframes: bool,
         has_clips: bool,
+        set_adapter_pass: impl FnOnce(usize),
     ) -> TwoStageSeeds {
         assert_eq!(
             self.phase,
@@ -98,14 +98,12 @@ impl TwoStageOrchestration {
             "stage one may begin only once"
         );
         self.phase = StagePhase::Stage1;
+        set_adapter_pass(0);
         self.operations.push(StageOperation::AdapterPass(0));
         self.operations
             .push(StageOperation::Stage1Noise(self.seeds));
         if has_stage1_keyframes {
             self.operations.push(StageOperation::Keyframes { stage: 1 });
-        }
-        if has_stage2_keyframes {
-            self.operations.push(StageOperation::Keyframes { stage: 2 });
         }
         if has_clips {
             self.operations.push(StageOperation::ClipsStage1);
@@ -135,6 +133,7 @@ impl TwoStageOrchestration {
         &mut self,
         sigma: f32,
         op: impl FnOnce() -> candle_gen::Result<T>,
+        set_adapter_pass: impl FnOnce(usize),
     ) -> candle_gen::Result<T> {
         if self.phase != StagePhase::Upsampled {
             return Err(candle_gen::CandleError::Msg(
@@ -142,10 +141,28 @@ impl TwoStageOrchestration {
             ));
         }
         let result = op()?;
+        set_adapter_pass(1);
         self.operations
             .push(StageOperation::Stage2Renoise { sigma });
         self.operations.push(StageOperation::AdapterPass(1));
         self.phase = StagePhase::Stage2;
+        Ok(result)
+    }
+
+    /// Apply full-resolution keyframes only after learned upsample and fresh
+    /// re-noise have made the stage-two latent. This deliberately cannot run in
+    /// stage-one setup.
+    pub(crate) fn stage2_keyframes<T>(
+        &mut self,
+        op: impl FnOnce() -> candle_gen::Result<T>,
+    ) -> candle_gen::Result<T> {
+        if self.phase != StagePhase::Stage2 {
+            return Err(candle_gen::CandleError::Msg(
+                "ltx two-stage: full-resolution keyframes require stage-two re-noise".into(),
+            ));
+        }
+        let result = op()?;
+        self.operations.push(StageOperation::Keyframes { stage: 2 });
         Ok(result)
     }
 
@@ -497,7 +514,13 @@ mod tests {
     #[test]
     fn production_two_stage_orchestration_cannot_skip_the_learned_refinement_path() {
         let mut flow = TwoStageOrchestration::new(41);
-        let seeds = flow.stage1_setup(true, true, true);
+        let pass = std::cell::Cell::new(None);
+        let seeds = flow.stage1_setup(true, true, |selected| pass.set(Some(selected)));
+        assert_eq!(
+            pass.get(),
+            Some(0),
+            "stage one selected the real adapter pass"
+        );
         assert_eq!(
             seeds,
             TwoStageSeeds {
@@ -514,13 +537,44 @@ mod tests {
         })
         .unwrap();
         assert_eq!(upsample_calls.get(), 1, "the learned component was invoked");
-        let renoise_calls = std::cell::Cell::new(0);
-        flow.stage2_renoise(0.909375, || {
-            renoise_calls.set(renoise_calls.get() + 1);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(renoise_calls.get(), 1, "fresh stage-two noise was consumed");
+        let device = Device::Cpu;
+        let latent = Tensor::zeros((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let fresh_noise = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let stage2 = flow
+            .stage2_renoise(
+                0.909375,
+                || Ok(renoise(&latent, &fresh_noise, 0.909375)?),
+                |selected| pass.set(Some(selected)),
+            )
+            .unwrap();
+        assert_eq!(
+            pass.get(),
+            Some(1),
+            "stage two selected the real adapter pass"
+        );
+        assert!(
+            stage2.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] > 0.9,
+            "the tested callback must execute renoise at the stage-two sigma"
+        );
+        let keyframe = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &device).unwrap();
+        let keys = [conditioning::Keyframe {
+            latent: &keyframe,
+            frame_idx: 0,
+            strength: 1.0,
+        }];
+        let keyed = flow
+            .stage2_keyframes(|| Ok(conditioning::apply_keyframes(&stage2, &keys)?))
+            .unwrap();
+        assert_eq!(
+            keyed
+                .latent
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0],
+            "the post-upsample stage-two callback applies the full-resolution keyframe"
+        );
         let stage2_forwards = std::cell::Cell::new(0);
         for _ in 0..3 {
             flow.stage2_forward(|| {
@@ -552,11 +606,11 @@ mod tests {
                 StageOperation::AdapterPass(0),
                 StageOperation::Stage1Noise(seeds),
                 StageOperation::Keyframes { stage: 1 },
-                StageOperation::Keyframes { stage: 2 },
                 StageOperation::ClipsStage1,
                 StageOperation::LearnedUpsample,
                 StageOperation::Stage2Renoise { sigma: 0.909375 },
                 StageOperation::AdapterPass(1),
+                StageOperation::Keyframes { stage: 2 },
                 StageOperation::Stage2Forward,
                 StageOperation::Stage2Forward,
                 StageOperation::Stage2Forward,
