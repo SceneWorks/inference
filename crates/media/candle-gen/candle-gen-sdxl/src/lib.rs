@@ -40,6 +40,7 @@
 //! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See `pipeline` for the layout
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
+mod control_provider;
 mod pipeline;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
@@ -197,6 +198,7 @@ use candle_gen::gen_core::{
     Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
+use control_provider::SdxlControlGenerator;
 use pipeline::{Components, Pipeline, SdxlComponents};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["sdxl"]`). The
@@ -436,12 +438,22 @@ impl Generator for SdxlGenerator {
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
 /// scale), txt2img, `ddim`, the few-step **`lightning`** sampler (sc-6128 — Euler-trailing, CFG-off,
 /// for distilled Lightning checkpoints), and **LoRA/LoKr** (sc-5165 — load-time merge of a trained
-/// adapter into the UNet weights, see [`load`] + `pipeline`). No conditioning is advertised, and the
-/// other acceleration samplers (lcm/hyper) remain the Python fallback's job (sc-3678) until candle
-/// wires them — so the descriptor never promises a path `generate` can't serve (the false-capability
-/// trap). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
+/// adapter into the UNet weights, see [`load`] + `pipeline`). The registry declares the optional
+/// ControlNet overlay so callers can stage it; a base load without [`LoadSpec::control`] keeps a
+/// narrower descriptor. Other acceleration samplers (lcm/hyper) remain the Python fallback's job
+/// (sc-3678). Two backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and
 /// `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
+    let mut descriptor = plain_descriptor();
+    descriptor.control_kinds = Some(gen_core::AcceptedControlKinds::Any);
+    descriptor.capabilities.conditioning = vec![gen_core::ConditioningKind::Control];
+    descriptor
+}
+
+/// The narrower descriptor installed on an ordinary base load without a ControlNet checkpoint.
+/// Keeping it separate prevents a request from being admitted and then rendered without its control
+/// residuals.
+fn plain_descriptor() -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
@@ -475,9 +487,9 @@ pub fn descriptor() -> ModelDescriptor {
             // guidance value that switches the negative off, so honoring it literally IS the drop.
             supports_negative_prompt: true,
             supports_guidance: true,
-            // txt2img only in sc-3675 — img2img/inpaint/control land later; advertising none means
-            // the shared `validate_request` rejects any conditioning, and the worker keeps those
-            // shapes on the Python path (sc-3678).
+            // The base load is txt2img only. The registry-level descriptor widens this to Control
+            // when the caller stages `LoadSpec::control`; an unloaded base must reject every
+            // conditioning shape rather than silently drop one.
             conditioning: vec![],
             // sc-5165: a trained LoRA/LoKr adapter is merged into the UNet weights at load (`load` +
             // `pipeline::Pipeline::load_components`). Advertised so the worker routes adapter jobs here
@@ -534,6 +546,28 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
     // fused checkpoint.
     let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
+    // A ControlNet changes the graph: route it through the vendored SDXL stack that carries the
+    // add-embedding and residual-injection seams.  Do not let the historical txt2img pipeline
+    // accept an overlay it would never read.
+    if spec.control.is_some() {
+        return Ok(Box::new(SdxlControlGenerator::new(
+            spec,
+            component_paths,
+            candle_gen::default_device()?,
+        )?));
+    }
+    if !spec.extra_controls.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: extra ControlNet checkpoints require LoadSpec::control as the first branch"
+                .into(),
+        ));
+    }
+    if spec.ip_adapter.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "sdxl: generic SDXL does not accept an IP-Adapter overlay; use its dedicated provider"
+                .into(),
+        ));
+    }
     if matches!(spec.weights, WeightsSource::File(_)) && matches!(spec.quantize, Some(Quant::Nvfp4))
     {
         return Err(gen_core::Error::Unsupported(format!(
@@ -564,7 +598,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
     Ok(Box::new(SdxlGenerator {
-        descriptor: descriptor(),
+        descriptor: plain_descriptor(),
         root,
         device,
         dtype: DType::F16,
@@ -689,10 +723,10 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        // txt2img: no conditioning advertised. sc-5165: LoRA/LoKr ARE now wired (load-time merge), so
-        // they are advertised — the worker routes adapter jobs to candle. sc-6128: the few-step
-        // `lightning` accel sampler is wired too (the lcm/hyper accel samplers still are not).
-        assert!(d.capabilities.conditioning.is_empty());
+        // The registry declares ControlNet so orchestration stages the overlay. A bare base load has
+        // a narrower dynamic descriptor and rejects it; that is asserted below.
+        assert_eq!(d.capabilities.conditioning, vec![ConditioningKind::Control]);
+        assert_eq!(d.control_kinds, Some(gen_core::AcceptedControlKinds::Any));
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
         // sc-10767 (epic 9083): the packed q4/q8 MLX-tier inference path (sc-9416/9527/9528) is now
@@ -801,7 +835,8 @@ mod tests {
         };
         assert!(g.validate(&ok).is_ok());
 
-        // Empty prompt, non-multiple-of-8 size, explicit 0 steps, and any conditioning are rejected.
+        // Empty prompt, non-multiple-of-8 size, explicit 0 steps, and any conditioning are rejected
+        // by this base (no-overlay) load.
         for bad in [
             GenerationRequest::default(), // empty prompt
             GenerationRequest {
@@ -822,13 +857,24 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            GenerationRequest {
+                prompt: "x".into(),
+                conditioning: vec![Conditioning::Control {
+                    image: Image::default(),
+                    kind: gen_core::ControlKind::Pose,
+                    scale: None,
+                }],
+                ..Default::default()
+            },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
-        // Sanity: the rejected conditioning above is a kind the descriptor does not advertise.
-        assert!(!descriptor()
+        // The registry advertises ControlNet, but this *base load* deliberately does not: the
+        // capability and the loaded graph stay aligned, so an overlay can never be dropped.
+        assert!(!g
+            .descriptor()
             .capabilities
-            .accepts(ConditioningKind::Reference));
+            .accepts(ConditioningKind::Control));
 
         // sc-12612: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties every advertised SDXL bucket
         // to. Pin the value and mutation-check that a size which is a multiple of 4 but not

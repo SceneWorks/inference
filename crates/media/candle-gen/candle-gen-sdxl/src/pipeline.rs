@@ -163,7 +163,7 @@ pub(crate) fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
 /// the `mlx-gen-sdxl` `LightningSampler` drives, so no candle gen-core pin bump is needed and the two
 /// backends share the reference trailing-spacing + interpolated σ table. The candle side is only the
 /// ~5-line tensor application in [`Pipeline::denoise_lightning`].
-fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
+pub(crate) fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
     let sched = sdxl_alpha_schedule()?;
     Ok(LightningPolicy::new(&sched, SDXL_TRAIN_STEPS, num_steps))
 }
