@@ -64,10 +64,10 @@ pub fn max_latent_tokens() -> usize {
     MAX_LATENT_TOKENS
 }
 
-/// Distilled single-stage rectified-flow sigma schedule (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps:
-/// σ goes 1.0 → 0.0, a complete generation). The 2-stage refinement (upsample + re-noise + the
-/// `STAGE2` sigmas) is deferred to a follow-up; stage-1 alone at the target resolution is a full,
-/// coherent render. The distilled model bakes guidance in → **no CFG**.
+/// Half-resolution stage-one rectified-flow schedule (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps:
+/// σ goes 1.0 → 0.0). Its denoised latent is VAE-denormalized, transformed by the learned 2×
+/// upsampler, re-normalized and freshly re-noised for [`STAGE2_SIGMAS`] at full resolution. The
+/// distilled model bakes guidance in → **no CFG**.
 pub const STAGE1_SIGMAS: [f32; 9] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
 ];

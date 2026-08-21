@@ -104,7 +104,7 @@ impl TierPaths {
         if !p.is_file() {
             return Err(CandleError::Msg(format!(
                 "ltx tier: missing `{name}` in {} (expected a split MLX tier: transformer / connector \
-                 / vae_decoder / vae_encoder / audio_vae / vocoder)",
+                 / vae_decoder / vae_encoder / upsampler / audio_vae / vocoder)",
                 self.tier_dir.display()
             )));
         }
