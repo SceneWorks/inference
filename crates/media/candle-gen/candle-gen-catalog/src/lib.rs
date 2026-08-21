@@ -1271,7 +1271,9 @@ mod preview_advertising {
             register: candle_gen_sdxl::register_providers,
             denoise: Denoise::Shared,
             // sc-16954's inventory, and the first to mix both wiring layers in one crate. SDXL ships
-            // FOUR emitting lanes across three files plus one deliberately dark trainer site:
+            // SIX emitting lanes across four files plus one deliberately dark trainer site:
+            //   * `control_provider.rs` — the generic ControlNet route's bespoke Euler loop
+            //     (direct).
             //   * `pipeline.rs` — the registered route's two lanes: the curated driver call (hooked)
             //     and the bespoke Lightning Euler loop (direct).
             //   * `denoise.rs` — the shared helpers the name-driven providers, Kolors and InstantID
@@ -1282,6 +1284,12 @@ mod preview_advertising {
             // `ip_provider.rs` gets no row: it drives `denoise::denoise_curated` and the ancestral
             // loop rather than a driver of its own, so its wiring is counted where those live.
             routes: &[
+                FileRoutes {
+                    file: "control_provider.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
                 FileRoutes {
                     file: "denoise.rs",
                     hooked: 1,
