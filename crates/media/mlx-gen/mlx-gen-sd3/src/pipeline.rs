@@ -606,7 +606,7 @@ impl mlx_gen::gen_core::sampling::DenoisePassHost<mlx_gen::MlxLatentOps> for Sd3
 }
 
 /// Run one resolved chained-denoise plan over SD3.5 and return the final latent — the chained twin
-/// of [`denoise_cfg_with_memory`].
+/// of `denoise_cfg_with_memory`.
 ///
 /// The caller owns the single VAE decode after the chain, exactly as it does on the single-pass
 /// lane; the executor never decodes.
