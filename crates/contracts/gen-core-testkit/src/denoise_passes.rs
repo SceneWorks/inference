@@ -8,7 +8,8 @@
 //! schedule/solver-state reset, seed isolation, effective-model-evaluation progress accounting,
 //! and cancellation/override-revert hygiene.
 //!
-//! A family adopts by handing its per-pass schedule builder to [`denoise_pass_conformance`]:
+//! A flow-cohort family adopts by handing its per-pass schedule builder to
+//! [`denoise_pass_conformance`]:
 //!
 //! ```ignore
 //! // candle-gen-krea, Raw:
@@ -17,14 +18,32 @@
 //! });
 //! ```
 //!
-//! sc-20425 runs this same suite across the other provider families — the executor contract does
-//! not change per family, which is the point of checking it here once.
+//! # The model-sampling contract is a parameter, not a constant (sc-20425)
+//!
+//! The suite was written against [`FlowModelSampling`] alone, which quietly made it unable to
+//! certify half its intended audience. **The boundary re-noise is the only part of the executor that
+//! reads the model's prediction contract**, and the two cohorts disagree there:
+//!
+//! | cohort | `noise_scaling_coeffs(σ)` | boundary blend |
+//! | --- | --- | --- |
+//! | FLOW (`FlowModelSampling`) | `(σ, 1−σ)` | `x = σ·ε + (1−σ)·x₀` — convex interpolation |
+//! | VE / discrete ε (`DiscreteModelSampling`, `EdmModelSampling`) | `(σ, 1)` | `x = x₀ + σ·ε` — x₀ at full scale |
+//!
+//! Feeding one the other's form is out-of-distribution, and at SDXL's σ range (up to ≈ 14.6) it is
+//! not a subtle difference — it is the difference between a refinement pass and noise. A green
+//! flow-only run therefore said nothing at all about SDXL, the epic's required latent-diffusion
+//! acceptance family.
+//!
+//! [`denoise_pass_conformance_over`] takes the family's own [`ModelSampling`] and drives every check
+//! through it, including a check ([`check_renoise_matches_model_type`]) that the blend which ran is
+//! *this* cohort's and provably not the other's. [`denoise_pass_conformance`] is the flow-cohort
+//! shorthand, unchanged for the families already adopting it.
 
 use gen_core::sampling::{
     denoise as gc_denoise, denoise_pass_renoise_seed, denoise_pass_schedule_steps,
-    execute_denoise_plan, sampler_by_name, terminal_pass_segment, CpuLatentOps, DenoisePassHost,
-    ExecutedDenoisePlan, FlowModelSampling, LatentOps, ModelSampling, PassObservation, Solver,
-    TimestepConvention,
+    execute_denoise_plan, sampler_by_name, terminal_pass_segment, AlphaSchedule, CpuLatentOps,
+    DenoisePassHost, DiscreteModelSampling, ExecutedDenoisePlan, FlowModelSampling, LatentOps,
+    ModelSampling, PassObservation, Solver, TimestepConvention,
 };
 use gen_core::{
     denoise_pass_seed, resolve_denoise_plan, CancelFlag, DenoiseDefaults, DenoisePass,
@@ -38,15 +57,43 @@ use gen_core::{
 /// that step count under the pass's resolved scheduler id (descending, trailing `0.0`).
 pub type PassScheduleBuilder<'a> = dyn Fn(&ResolvedDenoisePass, usize) -> Vec<f32> + 'a;
 
-fn ms() -> FlowModelSampling {
+/// The FLOW cohort's contract — the shorthand [`denoise_pass_conformance`] drives.
+fn flow_ms() -> FlowModelSampling {
     FlowModelSampling::new(TimestepConvention::Sigma)
 }
 
-fn x_init() -> Vec<f32> {
-    vec![0.31, -1.07, 1.93, 0.06, -0.44, 0.72]
+/// The SDXL/Kolors VE ε-prediction contract, ready to hand to
+/// [`denoise_pass_conformance_over`].
+///
+/// Exposed because the alpha schedule is a mouthful (`scaled_linear(1000, 0.00085, 0.012)`) and an
+/// adopter that re-derives it slightly differently would be certifying a *different* σ range than
+/// the one it renders on. Families that build their own `DiscreteModelSampling` from their own
+/// schedule pass that instead.
+#[must_use]
+pub fn sdxl_discrete_model_sampling() -> DiscreteModelSampling {
+    DiscreteModelSampling::sdxl(&AlphaSchedule::scaled_linear(1000, 0.00085, 0.012))
 }
 
-fn stub_velocity(x: &[f32]) -> Vec<f32> {
+/// The chain's initial latent, at a magnitude appropriate to the cohort.
+///
+/// A VE family's initial latent is the unit prior scaled by σ_max (≈ 14.6 on SDXL), and running the
+/// harness on a unit-magnitude latent there would exercise the arithmetic at a scale the family
+/// never sees. `FlowModelSampling::sigma_max()` is exactly `1.0`, so the flow cohort is bit-for-bit
+/// unchanged by this.
+fn x_init_for(ms: &dyn ModelSampling) -> Vec<f32> {
+    let scale = ms.sigma_max().max(1.0);
+    [0.31, -1.07, 1.93, 0.06, -0.44, 0.72]
+        .iter()
+        .map(|v| v * scale)
+        .collect()
+}
+
+/// The deterministic stub model output — velocity for FLOW, ε for the discrete cohort.
+///
+/// One function serves both because [`gc_denoise`] converts whatever the model returns into `x₀`
+/// through the caller's own [`ModelSampling::denoised_coeffs`]; the stub only has to be a fixed,
+/// non-trivial function of the latent.
+fn stub_model_output(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| 0.25 * v + 0.1).collect()
 }
 
@@ -114,7 +161,7 @@ impl DenoisePassHost<CpuLatentOps> for HarnessHost<'_> {
         x: &Vec<f32>,
         _timestep: f32,
     ) -> gen_core::Result<Vec<f32>> {
-        Ok(stub_velocity(x))
+        Ok(stub_model_output(x))
     }
     fn end_pass(&mut self, pass: &ResolvedDenoisePass) -> gen_core::Result<()> {
         self.log.push(format!("end[{}]", pass.index));
@@ -132,6 +179,7 @@ impl DenoisePassHost<CpuLatentOps> for HarnessHost<'_> {
 
 fn run_chain(
     builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
     plan: &ResolvedDenoisePlan,
     on_progress: &mut dyn FnMut(Progress),
     cancel: &CancelFlag,
@@ -141,9 +189,9 @@ fn run_chain(
     let mut host = HarnessHost::new(builder);
     let out = execute_denoise_plan(
         &CpuLatentOps,
-        &ms(),
+        ms,
         plan,
-        x_init(),
+        x_init_for(ms),
         &mut host,
         cancel,
         on_progress,
@@ -210,7 +258,10 @@ pub fn check_pass_schedule_shape(builder: &PassScheduleBuilder<'_>) -> Result<()
 /// **AC1 — one-pass equivalence.** A one-pass plan through the executor is bit-identical to the
 /// same solver driven directly over the family's own schedule with the same seed (the legacy
 /// single-trajectory shape).
-pub fn check_one_pass_equivalence(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_one_pass_equivalence(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     for sampler in [
         "euler",
         "dpmpp_2m",
@@ -220,17 +271,16 @@ pub fn check_one_pass_equivalence(builder: &PassScheduleBuilder<'_>) -> Result<(
     ] {
         let job_seed = 42_u64;
         let plan = plan_for(vec![pass(6, sampler, 1.0)], job_seed)?;
-        let (out, _) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
+        let (out, _) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
 
         let ops = CpuLatentOps;
-        let m = ms();
         let sigmas = builder(&plan.passes[0], 6);
         let solver = sampler_by_name::<CpuLatentOps>(sampler)
             .ok_or_else(|| format!("one-pass equivalence: unknown solver {sampler:?}"))?;
         let mut dn =
-            |x: &Vec<f32>, s: f32| gc_denoise(&ops, &m, x, s, |xin, _t| Ok(stub_velocity(xin)));
+            |x: &Vec<f32>, s: f32| gc_denoise(&ops, ms, x, s, |xin, _t| Ok(stub_model_output(xin)));
         let want = solver
-            .sample(&ops, &m, &mut dn, x_init(), &sigmas, job_seed)
+            .sample(&ops, ms, &mut dn, x_init_for(ms), &sigmas, job_seed)
             .map_err(|e| format!("one-pass equivalence: direct run failed: {e}"))?;
         if out.latent != want {
             return Err(format!(
@@ -245,20 +295,22 @@ pub fn check_one_pass_equivalence(builder: &PassScheduleBuilder<'_>) -> Result<(
 /// **AC2 — boundary re-noise.** Pass 2 first observes exactly the deterministic re-noise of pass
 /// 1's output at its segment-entry σ (the model's `noise_scaling_coeffs` blend with the pass-2
 /// seed's dedicated renoise stream), which genuinely perturbs the latent before denoising resumes.
-pub fn check_boundary_renoise(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_boundary_renoise(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     let job_seed = 7_u64;
     let plan = plan_for(vec![pass(4, "euler", 1.0), pass(3, "euler", 0.5)], job_seed)?;
-    let (out, host) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
+    let (out, host) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
 
     let one = plan_for(vec![pass(4, "euler", 1.0)], job_seed)?;
-    let (only_pass_1, _) = run_chain(builder, &one, &mut |_| {}, &CancelFlag::new())?;
+    let (only_pass_1, _) = run_chain(builder, ms, &one, &mut |_| {}, &CancelFlag::new())?;
     let after_pass_1 = only_pass_1.latent;
 
     let ops = CpuLatentOps;
-    let m = ms();
     let full = builder(&plan.passes[1], denoise_pass_schedule_steps(3, 0.5));
     let seg = terminal_pass_segment(&full, 3);
-    let (k_noise, k_x0) = m.noise_scaling_coeffs(seg[0]);
+    let (k_noise, k_x0) = ms.noise_scaling_coeffs(seg[0]);
     let pass2_seed = denoise_pass_seed(job_seed, 1);
     let noise = ops
         .randn_like(&after_pass_1, denoise_pass_renoise_seed(pass2_seed), 0)
@@ -298,19 +350,21 @@ pub fn check_boundary_renoise(builder: &PassScheduleBuilder<'_>) -> Result<(), S
 /// **AC2 — schedule + solver-state reset.** A 2-pass multistep (`abnorsett_4m`) chain equals
 /// hand-running the solver with a FRESH state per pass segment over the family's own schedules
 /// (re-noise applied at the boundary) — the executor's fresh-schedule / fresh-history invariant.
-pub fn check_state_reset(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_state_reset(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     use gen_core::sampling::{Abnorsett4m, AbnorsettState};
     let job_seed = 5_u64;
     let plan = plan_for(
         vec![pass(5, "abnorsett_4m", 1.0), pass(4, "abnorsett_4m", 1.0)],
         job_seed,
     )?;
-    let (out, _) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
+    let (out, _) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
 
     let ops = CpuLatentOps;
-    let m = ms();
     let mut dn =
-        |x: &Vec<f32>, s: f32| gc_denoise(&ops, &m, x, s, |xin, _t| Ok(stub_velocity(xin)));
+        |x: &Vec<f32>, s: f32| gc_denoise(&ops, ms, x, s, |xin, _t| Ok(stub_model_output(xin)));
     let seg_a_full = builder(&plan.passes[0], 5);
     let seg_a = terminal_pass_segment(&seg_a_full, 5).to_vec();
     let seg_b_full = builder(&plan.passes[1], 4);
@@ -318,13 +372,13 @@ pub fn check_state_reset(builder: &PassScheduleBuilder<'_>) -> Result<(), String
 
     let mut fresh_a = AbnorsettState::default();
     let x_a = Abnorsett4m
-        .sample_with_state(&ops, &mut dn, x_init(), &seg_a, &mut fresh_a)
+        .sample_with_state(&ops, &mut dn, x_init_for(ms), &seg_a, &mut fresh_a)
         .map_err(|e| format!("state reset: hand-run pass 1 failed: {e}"))?;
     let renoise_seed = denoise_pass_renoise_seed(denoise_pass_seed(job_seed, 1));
     let noise = ops
         .randn_like(&x_a, renoise_seed, 0)
         .map_err(|e| format!("state reset: randn failed: {e}"))?;
-    let (kn, kx) = m.noise_scaling_coeffs(seg_b[0]);
+    let (kn, kx) = ms.noise_scaling_coeffs(seg_b[0]);
     let entry_b = ops
         .axpy(kx, &x_a, kn, &noise)
         .map_err(|e| format!("state reset: blend failed: {e}"))?;
@@ -344,16 +398,19 @@ pub fn check_state_reset(builder: &PassScheduleBuilder<'_>) -> Result<(), String
 
 /// **AC2 — seed isolation.** Same request ⇒ identical output; different job seed ⇒ different
 /// output; and different pass indices draw from different renoise streams.
-pub fn check_seed_isolation(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_seed_isolation(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     let passes = || vec![pass(3, "euler", 1.0), pass(3, "euler", 0.5)];
     let plan = plan_for(passes(), 99)?;
-    let (a, _) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
-    let (b, _) = run_chain(builder, &plan, &mut |_| {}, &CancelFlag::new())?;
+    let (a, _) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
+    let (b, _) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
     if a.latent != b.latent {
         return Err("seed isolation: the same request did not reproduce".to_owned());
     }
     let other = plan_for(passes(), 100)?;
-    let (c, _) = run_chain(builder, &other, &mut |_| {}, &CancelFlag::new())?;
+    let (c, _) = run_chain(builder, ms, &other, &mut |_| {}, &CancelFlag::new())?;
     if a.latent == c.latent {
         return Err("seed isolation: a different job seed reproduced the same output".to_owned());
     }
@@ -372,11 +429,15 @@ pub fn check_seed_isolation(builder: &PassScheduleBuilder<'_>) -> Result<(), Str
 /// `current` sweeping exactly `1..=total` across the whole chain with
 /// `total = Σ Solver::model_evals(pass steps)`, and the per-pass detail retained in the execution
 /// record.
-pub fn check_eval_accounting(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_eval_accounting(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     let plan = plan_for(vec![pass(3, "rk6_7s", 1.0), pass(4, "euler", 1.0)], 11)?;
     let mut events: Vec<(u32, u32)> = Vec::new();
     let (out, host) = run_chain(
         builder,
+        ms,
         &plan,
         &mut |p| {
             if let Progress::Step { current, total } = p {
@@ -427,16 +488,19 @@ pub fn check_eval_accounting(builder: &PassScheduleBuilder<'_>) -> Result<(), St
 /// **Cancellation + override-revert hygiene.** A flag tripped mid-chain surfaces as the typed
 /// `Error::Canceled`; `begin_pass`/`end_pass` stay paired on every exit path, so pass-local
 /// overrides are always reverted (no poisoned provider state).
-pub fn check_cancellation(builder: &PassScheduleBuilder<'_>) -> Result<(), String> {
+pub fn check_cancellation(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
     let plan = plan_for(vec![pass(3, "euler", 1.0), pass(3, "euler", 1.0)], 1)?;
     let cancel = CancelFlag::new();
     let mut seen = 0_u32;
     let mut host = HarnessHost::new(builder);
     let err = execute_denoise_plan(
         &CpuLatentOps,
-        &ms(),
+        ms,
         &plan,
-        x_init(),
+        x_init_for(ms),
         &mut host,
         &cancel,
         &mut |p| {
@@ -470,9 +534,9 @@ pub fn check_cancellation(builder: &PassScheduleBuilder<'_>) -> Result<(), Strin
     let mut host = HarnessHost::new(builder);
     let err = execute_denoise_plan(
         &CpuLatentOps,
-        &ms(),
+        ms,
         &plan,
-        x_init(),
+        x_init_for(ms),
         &mut host,
         &cancel,
         &mut |_| {},
@@ -493,28 +557,126 @@ pub fn check_cancellation(builder: &PassScheduleBuilder<'_>) -> Result<(), Strin
     Ok(())
 }
 
-/// Run every denoise-pass executor check against one family's schedule seam, panicking with the
-/// aggregated failures. `family` only labels the panic (e.g. `"candle krea_2_raw"`).
-pub fn denoise_pass_conformance(family: &str, builder: &PassScheduleBuilder<'_>) {
+/// **The boundary blend is this cohort's, and provably not the other's** (sc-20425).
+///
+/// [`check_boundary_renoise`] derives its expected entry latent from the same
+/// [`ModelSampling::noise_scaling_coeffs`] the executor uses, so it would pass just as happily if
+/// *both* sides were wrong about the model type — which is precisely how a flow-only harness came to
+/// look like it certified SDXL. This check closes that by computing the **other** cohort's blend as
+/// well and requiring the two to differ, so a green result is evidence about this family rather than
+/// evidence that one formula was used twice.
+///
+/// FLOW is `σ·ε + (1−σ)·x₀`; VE / discrete ε / EDM is `x₀ + σ·ε`. They agree only where `1−σ = 1`,
+/// i.e. σ = 0, which is never a segment entry, so the discrimination is always available.
+pub fn check_renoise_matches_model_type(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+) -> Result<(), String> {
+    let job_seed = 2024_u64;
+    let plan = plan_for(vec![pass(4, "euler", 1.0), pass(3, "euler", 0.6)], job_seed)?;
+    let (_, host) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
+    let one = plan_for(vec![pass(4, "euler", 1.0)], job_seed)?;
+    let (only_pass_1, _) = run_chain(builder, ms, &one, &mut |_| {}, &CancelFlag::new())?;
+    let after_pass_1 = only_pass_1.latent;
+
+    let full = builder(&plan.passes[1], denoise_pass_schedule_steps(3, 0.6));
+    let seg = terminal_pass_segment(&full, 3);
+    let sigma_entry = seg[0];
+    if !(sigma_entry.is_finite() && sigma_entry > 0.0) {
+        return Err(format!(
+            "renoise convention: pass 2 entered at σ = {sigma_entry}, which cannot discriminate the \
+             two blends"
+        ));
+    }
+
+    let ops = CpuLatentOps;
+    let noise = ops
+        .randn_like(
+            &after_pass_1,
+            denoise_pass_renoise_seed(denoise_pass_seed(job_seed, 1)),
+            0,
+        )
+        .map_err(|e| format!("renoise convention: randn failed: {e}"))?;
+    let blend = |k_x0: f32, k_noise: f32| {
+        ops.axpy(k_x0, &after_pass_1, k_noise, &noise)
+            .map_err(|e| format!("renoise convention: blend failed: {e}"))
+    };
+
+    let (k_noise, k_x0) = ms.noise_scaling_coeffs(sigma_entry);
+    let mine = blend(k_x0, k_noise)?;
+    // The other cohort's form at the same σ. Flow is the convex interpolation; everything else is
+    // the VE default the trait itself documents.
+    let (other_noise, other_x0) =
+        if matches!(ms.prediction(), gen_core::sampling::PredictionType::Flow) {
+            (sigma_entry, 1.0)
+        } else {
+            (sigma_entry, 1.0 - sigma_entry)
+        };
+    let theirs = blend(other_x0, other_noise)?;
+
+    if mine == theirs {
+        return Err(format!(
+            "renoise convention: the FLOW and VE blends coincide at σ = {sigma_entry}, so this run \
+             proves nothing about the model type"
+        ));
+    }
+    let observed = host.first_latent_of_pass.get(1).ok_or_else(|| {
+        "renoise convention: pass 2 was never observed, so no boundary latent exists".to_owned()
+    })?;
+    if observed == &theirs {
+        return Err(format!(
+            "renoise convention: the boundary used the OTHER cohort's blend (prediction type is \
+             {:?}, so it must be x = {k_x0}·x0 + {k_noise}·ε at σ = {sigma_entry})",
+            ms.prediction()
+        ));
+    }
+    if observed != &mine {
+        return Err(format!(
+            "renoise convention: the boundary latent is neither cohort's blend at σ = \
+             {sigma_entry} — the executor is not reading {:?}'s noise_scaling_coeffs",
+            ms.prediction()
+        ));
+    }
+    Ok(())
+}
+
+/// Run every denoise-pass executor check against one family's schedule seam **and its own
+/// [`ModelSampling`]**, panicking with the aggregated failures. `family` only labels the panic
+/// (e.g. `"candle sdxl"`).
+///
+/// This is the entry point for any family outside the flow cohort — see the [module docs](self) for
+/// why the model-sampling contract cannot be assumed.
+pub fn denoise_pass_conformance_over(
+    family: &str,
+    ms: &dyn ModelSampling,
+    builder: &PassScheduleBuilder<'_>,
+) {
     let failures: Vec<String> = [
         check_pass_schedule_shape(builder),
-        check_one_pass_equivalence(builder),
-        check_boundary_renoise(builder),
-        check_state_reset(builder),
-        check_seed_isolation(builder),
-        check_eval_accounting(builder),
-        check_cancellation(builder),
+        check_one_pass_equivalence(builder, ms),
+        check_boundary_renoise(builder, ms),
+        check_renoise_matches_model_type(builder, ms),
+        check_state_reset(builder, ms),
+        check_seed_isolation(builder, ms),
+        check_eval_accounting(builder, ms),
+        check_cancellation(builder, ms),
     ]
     .into_iter()
     .filter_map(|r| r.err())
     .collect();
     if !failures.is_empty() {
         panic!(
-            "denoise-pass executor conformance FAILED for {family} (gen-core {}):\n  - {}",
+            "denoise-pass executor conformance FAILED for {family} over {:?} (gen-core {}):\n  - {}",
+            ms.prediction(),
             gen_core::VERSION,
             failures.join("\n  - ")
         );
     }
+}
+
+/// [`denoise_pass_conformance_over`] for the FLOW cohort — the shorthand every flow family uses.
+pub fn denoise_pass_conformance(family: &str, builder: &PassScheduleBuilder<'_>) {
+    denoise_pass_conformance_over(family, &flow_ms(), builder);
 }
 
 #[cfg(test)]
@@ -523,17 +685,127 @@ mod tests {
     use gen_core::sampling::{schedule_sigmas, Scheduler};
 
     /// The shared gen-core schedule math itself passes the whole suite — the reference every
-    /// family seam is compared against.
-    fn gen_core_builder() -> impl Fn(&ResolvedDenoisePass, usize) -> Vec<f32> {
-        |pass: &ResolvedDenoisePass, steps: usize| {
+    /// family seam is compared against. Parameterized by the cohort's `ModelSampling`, exactly as a
+    /// real family's builder is (`schedule_sigmas` reads the σ table off it).
+    fn gen_core_builder<M: ModelSampling + Clone + 'static>(
+        ms: M,
+    ) -> impl Fn(&ResolvedDenoisePass, usize) -> Vec<f32> {
+        move |pass: &ResolvedDenoisePass, steps: usize| {
             let sched = Scheduler::from_name(&pass.scheduler).unwrap_or(Scheduler::Normal);
-            schedule_sigmas(sched, &ms(), steps)
+            schedule_sigmas(sched, &ms, steps)
         }
     }
 
     #[test]
     fn shared_gen_core_math_passes_the_whole_suite() {
-        denoise_pass_conformance("gen-core", &gen_core_builder());
+        denoise_pass_conformance("gen-core", &gen_core_builder(flow_ms()));
+    }
+
+    /// **The sc-20425 item-5 gap.** The suite was flow-only, so a green run said nothing about the
+    /// VE / discrete ε cohort — SDXL and Kolors — whose boundary re-noise is a *different formula*.
+    /// Running the identical suite over `DiscreteModelSampling` is what makes it able to certify
+    /// them.
+    #[test]
+    fn the_whole_suite_also_runs_over_a_discrete_ve_model() {
+        let ms = sdxl_discrete_model_sampling();
+        assert!(
+            ms.sigma_max() > 10.0,
+            "the SDXL σ range is the point — a unit-σ stand-in would not exercise the VE blend"
+        );
+        denoise_pass_conformance_over("gen-core discrete", &ms, &gen_core_builder(ms.clone()));
+    }
+
+    /// A `ModelSampling` that **declares** the discrete ε cohort while blending like FLOW — the
+    /// advertise/honor mismatch a family lands on by copying a sibling's `noise_scaling_coeffs`
+    /// alongside its own prediction type. Everything but the declaration delegates to flow.
+    struct MisdeclaredVe(FlowModelSampling);
+
+    impl ModelSampling for MisdeclaredVe {
+        fn prediction(&self) -> gen_core::sampling::PredictionType {
+            gen_core::sampling::PredictionType::Eps
+        }
+        fn sigma_min(&self) -> f32 {
+            self.0.sigma_min()
+        }
+        fn sigma_max(&self) -> f32 {
+            self.0.sigma_max()
+        }
+        fn input_scale(&self, sigma: f32) -> f32 {
+            self.0.input_scale(sigma)
+        }
+        fn denoised_coeffs(&self, sigma: f32) -> (f32, f32) {
+            self.0.denoised_coeffs(sigma)
+        }
+        fn noise_scaling_coeffs(&self, sigma: f32) -> (f32, f32) {
+            self.0.noise_scaling_coeffs(sigma)
+        }
+        fn timestep(&self, sigma: f32) -> f32 {
+            self.0.timestep(sigma)
+        }
+        fn sigma(&self, timestep: f32) -> f32 {
+            self.0.sigma(timestep)
+        }
+    }
+
+    /// Negative self-test: a family whose declared prediction type disagrees with the blend it
+    /// actually re-noises with is caught. Without it, "the declaration and the formula are both
+    /// wrong, consistently" reads green — which is the shape of the flow-only harness that looked
+    /// like it certified SDXL.
+    #[test]
+    fn a_model_that_blends_unlike_its_declared_cohort_is_reported() {
+        let lying = MisdeclaredVe(flow_ms());
+        let err = check_renoise_matches_model_type(&gen_core_builder(flow_ms()), &lying)
+            .expect_err("a declared-VE model blending like flow must fail");
+        assert!(err.contains("renoise convention"), "{err}");
+    }
+
+    /// Negative self-test: a boundary that lands on σ = 0 cannot tell the two blends apart (they
+    /// coincide there), so the check refuses to report a pass it did not earn.
+    #[test]
+    fn a_boundary_that_cannot_discriminate_the_blends_is_reported() {
+        let ms = sdxl_discrete_model_sampling();
+        let degenerate = {
+            let inner = gen_core_builder(ms.clone());
+            move |pass: &ResolvedDenoisePass, steps: usize| {
+                if pass.index == 0 {
+                    inner(pass, steps)
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
+        };
+        let err = check_renoise_matches_model_type(&degenerate, &ms)
+            .expect_err("a σ = 0 boundary must not be reported as a pass");
+        assert!(err.contains("cannot discriminate"), "{err}");
+    }
+
+    /// The two cohorts really do produce different chains from the same plan — the property the
+    /// discrimination above relies on, asserted directly so a future change to
+    /// `noise_scaling_coeffs` that collapsed them would be caught here rather than silently
+    /// weakening every VE certification.
+    #[test]
+    fn the_two_cohorts_do_not_produce_the_same_chain() {
+        let plan = plan_for(vec![pass(3, "euler", 1.0), pass(3, "euler", 0.5)], 4242)
+            .expect("plan resolves");
+        let flow = flow_ms();
+        let discrete = sdxl_discrete_model_sampling();
+        let (a, _) = run_chain(
+            &gen_core_builder(flow),
+            &flow,
+            &plan,
+            &mut |_| {},
+            &CancelFlag::new(),
+        )
+        .expect("flow chain runs");
+        let (b, _) = run_chain(
+            &gen_core_builder(discrete.clone()),
+            &discrete,
+            &plan,
+            &mut |_| {},
+            &CancelFlag::new(),
+        )
+        .expect("discrete chain runs");
+        assert_ne!(a.latent, b.latent);
     }
 
     /// Negative self-test: a NON-DETERMINISTIC schedule builder (different σ on a repeated call —
@@ -545,7 +817,7 @@ mod tests {
         let calls = Cell::new(0_u32);
         let broken = move |pass: &ResolvedDenoisePass, steps: usize| {
             let sched = Scheduler::from_name(&pass.scheduler).unwrap_or(Scheduler::Normal);
-            let mut s = schedule_sigmas(sched, &ms(), steps);
+            let mut s = schedule_sigmas(sched, &flow_ms(), steps);
             calls.set(calls.get() + 1);
             if calls.get() > 1 {
                 // Every later call drifts: interior σs shrink by 10%.
@@ -556,7 +828,8 @@ mod tests {
             }
             s
         };
-        let err = check_one_pass_equivalence(&broken).expect_err("a drifting builder must fail");
+        let err = check_one_pass_equivalence(&broken, &flow_ms())
+            .expect_err("a drifting builder must fail");
         assert!(err.contains("one-pass equivalence"), "{err}");
     }
 
@@ -566,7 +839,7 @@ mod tests {
     fn a_builder_without_terminal_zero_is_reported() {
         let broken = |pass: &ResolvedDenoisePass, steps: usize| {
             let sched = Scheduler::from_name(&pass.scheduler).unwrap_or(Scheduler::Normal);
-            let mut s = schedule_sigmas(sched, &ms(), steps);
+            let mut s = schedule_sigmas(sched, &flow_ms(), steps);
             if let Some(last) = s.last_mut() {
                 *last = 0.01;
             }
