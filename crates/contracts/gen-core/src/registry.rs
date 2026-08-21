@@ -1575,6 +1575,20 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 /// 5. **Per-pass adapter overrides on a model with no adapters** — nothing to override.
 /// 6. **A surface declared without the capability** — the inheritance footgun again, in the other
 ///    direction.
+///
+/// # What it does NOT close (sc-20425 review MINOR 9)
+///
+/// A descriptor is data; a [`DenoisePassHost`](crate::sampling::DenoisePassHost) is a trait impl in
+/// a provider crate this one cannot see. So these checks close the *derived-descriptor* half of
+/// "advertises a chain it cannot run" — a control route, a menu with nothing runnable, a
+/// half-inherited surface — but a **non-control** descriptor that sets the flag with no host at all
+/// still passes the sweep. A census of all 73 shipped literals confirms no such instance today.
+///
+/// The other half is checked where it can be: each adopting crate carries a compile-time witness
+/// (`const _: fn(&mut FamilyPassHost<'_>) = |host| { let _: &mut dyn DenoisePassHost<_> = host; };`)
+/// next to its host impl, so deleting or renaming the impl breaks that crate's build rather than
+/// shipping a capability nothing serves. A *new* family flipping the flag without adding either is
+/// the residual gap, and it is caught by the adoption checklist rather than by the compiler.
 fn check_denoise_pass_route(errs: &mut Vec<String>, ctx: &str, d: &ModelDescriptor) {
     use crate::sampling::{Scheduler, Solver};
 

@@ -544,6 +544,19 @@ impl<'a> PassPreview<'a> {
     }
 }
 
+/// Compile-time witness that this crate really implements the chained-denoise host it advertises
+/// (sc-20425 review MINOR 9).
+///
+/// The descriptor conformance sweep closes the *derived-descriptor* half of "advertises without a
+/// host" — a control route, an unusable menu, a half-inherited surface — but it cannot see whether a
+/// `DenoisePassHost` exists at all, because a descriptor is data and the host is a trait impl in
+/// another crate. This is the missing half, in the one place that can check it: if the impl below is
+/// ever deleted or renamed while `supports_denoise_passes` stays `true`, THIS crate stops compiling
+/// rather than shipping a capability nothing serves.
+const _: fn(&mut Sd3PassHost<'_>) = |host| {
+    let _: &mut dyn mlx_gen::gen_core::sampling::DenoisePassHost<mlx_gen::MlxLatentOps> = host;
+};
+
 /// SD3.5's `gen_core::sampling::DenoisePassHost`: the family schedule seam, the per-pass forward
 /// (per-pass guidance combined inside, exactly as `denoise_over_sigmas`'s closure does it), and the
 /// chain-global preview.
