@@ -2135,11 +2135,17 @@ mod tests {
             "got: {err}"
         );
         assert!(err.to_string().contains("does not exist"), "got: {err}");
-        // Q4/Q8 select an already-packed hosted tier; without a snapshot, the missing-dir error
-        // remains more useful than pretending this is an on-the-fly quantization request.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        // Q4/Q8 select an already-packed hosted tier. Use an owned empty directory rather than
+        // `/snap`: the latter is a real system directory on Ubuntu CI, so the correct rejection is
+        // the complete-layout diagnostic, not a missing-directory error.
+        let empty_snapshot = tempfile::tempdir().expect("empty snapshot fixture");
+        let quant = LoadSpec::new(WeightsSource::Dir(empty_snapshot.path().to_path_buf()))
+            .with_quant(Quant::Q8);
         let err = load(&quant).err().expect("err");
-        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(
+            err.to_string().contains("incomplete snapshot"),
+            "got: {err}"
+        );
     }
 
     /// A 640×480 request whose driving ControlClip carries the given sc-20262 knob values.
