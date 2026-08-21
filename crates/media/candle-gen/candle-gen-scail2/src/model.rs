@@ -15,10 +15,11 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::quant::QLinear;
 use candle_gen_wan::rope::apply_rope;
 
 use crate::common::{
-    conv_as_linear, linear, ln_affine, ln_no_affine, patchify, rms, sdpa, unpatchify,
+    conv_as_linear, linear, ln_affine, ln_no_affine, packed_linear, patchify, rms, sdpa, unpatchify,
 };
 use crate::config::Scail2Config;
 use crate::rope::ScailRope;
@@ -39,10 +40,10 @@ fn gated(x: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {
 
 /// Wan self-attention with qk-RMSNorm and 3-axis RoPE, over the full packed sequence.
 struct SelfAttn {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     n: usize,
@@ -55,10 +56,10 @@ impl SelfAttn {
     fn new(vb: &VarBuilder, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: linear(cfg.dim, cfg.dim, vb.pp("q"))?,
-            k: linear(cfg.dim, cfg.dim, vb.pp("k"))?,
-            v: linear(cfg.dim, cfg.dim, vb.pp("v"))?,
-            o: linear(cfg.dim, cfg.dim, vb.pp("o"))?,
+            q: packed_linear(cfg.dim, cfg.dim, vb, "q")?,
+            k: packed_linear(cfg.dim, cfg.dim, vb, "k")?,
+            v: packed_linear(cfg.dim, cfg.dim, vb, "v")?,
+            o: packed_linear(cfg.dim, cfg.dim, vb, "o")?,
             norm_q: vb.pp("norm_q").get(cfg.dim, "weight")?,
             norm_k: vb.pp("norm_k").get(cfg.dim, "weight")?,
             n: cfg.num_heads,
@@ -90,12 +91,12 @@ impl SelfAttn {
 /// Wan **I2V** cross-attention: text tokens through `k`/`v`, CLIP image tokens through `k_img`/`v_img`;
 /// the two attention outputs are summed before the output projection.
 struct CrossAttnI2V {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
-    k_img: Linear,
-    v_img: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
+    k_img: QLinear,
+    v_img: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     norm_k_img: Tensor,
@@ -109,12 +110,12 @@ impl CrossAttnI2V {
     fn new(vb: &VarBuilder, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: linear(cfg.dim, cfg.dim, vb.pp("q"))?,
-            k: linear(cfg.dim, cfg.dim, vb.pp("k"))?,
-            v: linear(cfg.dim, cfg.dim, vb.pp("v"))?,
-            o: linear(cfg.dim, cfg.dim, vb.pp("o"))?,
-            k_img: linear(cfg.dim, cfg.dim, vb.pp("k_img"))?,
-            v_img: linear(cfg.dim, cfg.dim, vb.pp("v_img"))?,
+            q: packed_linear(cfg.dim, cfg.dim, vb, "q")?,
+            k: packed_linear(cfg.dim, cfg.dim, vb, "k")?,
+            v: packed_linear(cfg.dim, cfg.dim, vb, "v")?,
+            o: packed_linear(cfg.dim, cfg.dim, vb, "o")?,
+            k_img: packed_linear(cfg.dim, cfg.dim, vb, "k_img")?,
+            v_img: packed_linear(cfg.dim, cfg.dim, vb, "v_img")?,
             norm_q: vb.pp("norm_q").get(cfg.dim, "weight")?,
             norm_k: vb.pp("norm_k").get(cfg.dim, "weight")?,
             norm_k_img: vb.pp("norm_k_img").get(cfg.dim, "weight")?,
@@ -160,8 +161,8 @@ struct Block {
     cross: CrossAttnI2V,
     norm3_w: Tensor,
     norm3_b: Tensor,
-    ffn0: Linear,
-    ffn2: Linear,
+    ffn0: QLinear,
+    ffn2: QLinear,
     eps: f64,
 }
 
@@ -173,8 +174,8 @@ impl Block {
             cross: CrossAttnI2V::new(&vb.pp("cross_attn"), cfg)?,
             norm3_w: vb.pp("norm3").get(cfg.dim, "weight")?,
             norm3_b: vb.pp("norm3").get(cfg.dim, "bias")?,
-            ffn0: linear(cfg.dim, cfg.ffn_dim, vb.pp("ffn").pp("0"))?,
-            ffn2: linear(cfg.ffn_dim, cfg.dim, vb.pp("ffn").pp("2"))?,
+            ffn0: packed_linear(cfg.dim, cfg.ffn_dim, &vb.pp("ffn"), "0")?,
+            ffn2: packed_linear(cfg.ffn_dim, cfg.dim, &vb.pp("ffn"), "2")?,
             eps: cfg.eps,
         })
     }
