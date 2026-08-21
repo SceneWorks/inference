@@ -45,6 +45,16 @@ Every fixture is an object:
     "supportsDenoisePasses": true,
     "samplers": ["euler", "dpmpp_2m"],
     "schedulers": ["normal", "karras"],
+    "nativeSchedulers": ["flow_match"],     // sc-20425; advertised non-curated ids the family
+                                            // really implements. Default EMPTY (fail-closed, and
+                                            // the production default).
+    "unhonorableSamplers": ["lcm"],         // sc-20425; curated + advertised ids this family
+                                            // cannot honor on a pass. Default EMPTY.
+    "perPassAdapters": false,               // sc-20425; whether pass-local adapter weight
+                                            // overrides are applied AND reverted. Default TRUE
+                                            // here (the inverse of the production default) so the
+                                            // fixtures written before this key keep meaning what
+                                            // they meant.
     "loadedAdapters": 2
   },
   "canonicalDenoisePasses": [ /* ... */ ],  // optional; the re-encoded form, when it differs

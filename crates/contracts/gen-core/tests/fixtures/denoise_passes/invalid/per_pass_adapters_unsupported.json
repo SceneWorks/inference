@@ -1,0 +1,39 @@
+{
+  "fixture": "per_pass_adapters_unsupported",
+  "story": "sc-20425",
+  "description": "A pass-local adapter weight override on a model whose adapters fold irreversibly into its dense weights at load. Nearly every family is in that position, so `perPassAdapters` defaults FALSE on the descriptor and the shared floor rejects the override rather than accepting and ignoring it — accepting it would render the wrong image and report success. An EMPTY adapters list is not an override (it means the load-time stack at its load-time scales) and stays legal everywhere. This is a CAPABILITY gap (typed Error::Unsupported), not a range error.",
+  "request": {
+    "seed": 1234567890,
+    "steps": 20,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "advanced": {
+      "denoisePasses": [
+        { "steps": 10, "denoise": 1.0, "adapters": [] },
+        {
+          "steps": 4,
+          "denoise": 0.2,
+          "adapters": [{ "adapter": 0, "weight": 0.0 }]
+        }
+      ]
+    }
+  },
+  "modelDefaults": {
+    "steps": 28,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "guidance": 7.0
+  },
+  "capabilities": {
+    "supportsDenoisePasses": true,
+    "samplers": ["euler", "dpmpp_2m", "ddim"],
+    "schedulers": ["normal", "karras", "simple"],
+    "perPassAdapters": false,
+    "loadedAdapters": 2
+  },
+  "expectedError": {
+    "passIndex": 1,
+    "field": "adapters",
+    "issue": "perPassAdaptersUnsupported"
+  }
+}

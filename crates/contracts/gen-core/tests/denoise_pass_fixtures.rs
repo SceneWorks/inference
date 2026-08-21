@@ -122,16 +122,28 @@ fn capabilities_of(fixture: &Value) -> Capabilities {
         supports_guidance: true,
         supports_negative_prompt: true,
         supports_lora: true,
-        // The per-family denoise-pass surface (sc-20425). Both keys are optional and default
-        // **permissive**, exactly as `supportsDenoisePasses` above does: a fixture describes a
-        // request shape, and one written before this capability existed must not be retroactively
-        // invalidated by it. A fixture that wants the rejection asks for it by name.
+        // The per-family denoise-pass surface (sc-20425). Every key is optional, and each one's
+        // default is the value that leaves the PRE-EXISTING corpus meaning what it meant — which is
+        // not the same default in every direction, and the review corrected this comment for
+        // claiming it was (MINOR 5):
+        //
+        // * `perPassAdapters` defaults **true**, the inverse of the production default. Fixtures
+        //   older than this key exercise pass-local adapter overrides and must keep passing;
+        //   `invalid/per_pass_adapters_unsupported.json` sets it false to exercise the rejection.
+        // * `nativeSchedulers` and `unhonorableSamplers` default **empty**, which is the production
+        //   default and is fail-closed. That is safe here because no pre-existing fixture names a
+        //   non-curated scheduler or an unhonorable sampler — the corpus predates both axes — so an
+        //   empty declaration changes nothing about it. `invalid/undeclared_native_scheduler.json`
+        //   and `invalid/unhonorable_sampler.json` populate them to exercise both paths.
         denoise_pass_surface: DenoisePassSurface {
             native_schedulers: intern_static(
                 caps.and_then(|c| c.get("nativeSchedulers"))
                     .and_then(Value::as_array),
             ),
-            unhonorable_samplers: &[],
+            unhonorable_samplers: intern_static(
+                caps.and_then(|c| c.get("unhonorableSamplers"))
+                    .and_then(Value::as_array),
+            ),
             per_pass_adapters: caps
                 .and_then(|c| c.get("perPassAdapters"))
                 .and_then(Value::as_bool)
