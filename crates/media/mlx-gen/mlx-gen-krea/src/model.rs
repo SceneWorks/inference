@@ -1513,8 +1513,7 @@ impl Krea {
                     // The execution record (requested + resolved per-pass values + effective
                     // evaluation accounting), emitted exactly once per generation.
                     if let Some(execution) = first_execution {
-                        req.denoise_pass_report
-                            .emit(execution.with_requested(req.denoise_passes.as_deref()));
+                        req.emit_denoise_pass_report(execution);
                     }
                     return Ok(GenerationOutput::Images(images));
                 }

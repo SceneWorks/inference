@@ -437,6 +437,11 @@ impl Sd3Large {
                 ))?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
+                // The FIRST image's chained-pass execution record (sc-20425). Every image in a
+                // batch resolves the same plan shape and differs only in its seeds, and the
+                // contract is exactly one record per generation, so the first one is kept and
+                // emitted after the loop.
+                let mut dp_first_execution: Option<mlx_gen::gen_core::DenoisePlanExecution> = None;
                 let attention = crate::memory_strategy::attention_plan(req);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
@@ -448,7 +453,7 @@ impl Sd3Large {
                         // lane re-seeds its noise per image.
                         let plan = dp_resolve(seed)?;
                         let initial = pipeline::create_noise(seed, req.width, req.height)?;
-                        let (latents, _execution) = pipeline::render_denoise_passes(
+                        let (latents, execution) = pipeline::render_denoise_passes(
                             &heavy.transformer,
                             &plan,
                             initial,
@@ -461,6 +466,9 @@ impl Sd3Large {
                             attention,
                             transformer_window,
                         )?;
+                        if dp_first_execution.is_none() {
+                            dp_first_execution = Some(execution);
+                        }
                         on_progress(Progress::Decoding);
                         images.push(pipeline::decode_to_image_tiled(
                             &heavy.vae,
@@ -516,6 +524,14 @@ impl Sd3Large {
                         decode_tiling.as_ref(),
                         &req.cancel,
                     )?);
+                }
+                // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+                // the requested AND resolved per-pass values plus the effective evaluation
+                // accounting, emitted exactly once per generation after a successful chain and
+                // before the caller sees any image. `None` for every non-chained request, so the
+                // legacy lanes above stay byte-untouched. The candle twin emits identically.
+                if let Some(execution) = dp_first_execution {
+                    req.emit_denoise_pass_report(execution);
                 }
                 Ok(GenerationOutput::Images(images))
             },

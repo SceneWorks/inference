@@ -1215,8 +1215,7 @@ impl Generator for KreaGenerator {
         // effective evaluation accounting. Requests with no `denoisePasses` never reach here with
         // a record, so the legacy paths stay byte-untouched.
         if let Some(execution) = dp_execution.into_inner() {
-            req.denoise_pass_report
-                .emit(execution.with_requested(req.denoise_passes.as_deref()));
+            req.emit_denoise_pass_report(execution);
         }
         Ok(GenerationOutput::Images(images))
     }

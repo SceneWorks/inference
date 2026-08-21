@@ -1336,6 +1336,10 @@ impl Sdxl {
             mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
         );
         let mut images = Vec::with_capacity(req.count as usize);
+        // The FIRST image's chained-pass execution record (sc-20425). Every image in a batch
+        // resolves the same plan shape and differs only in its seeds, and the contract is exactly
+        // one record per generation, so the first one is kept and emitted after the loop.
+        let mut dp_first_execution: Option<mlx_gen::gen_core::DenoisePlanExecution> = None;
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
             let seed = base_seed.wrapping_add(i as u64);
@@ -1374,7 +1378,7 @@ impl Sdxl {
                     })?;
                 let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
                 let initial = multiply(&noise, scalar(entry))?;
-                let (latents, _execution) = crate::pipeline::render_denoise_passes(
+                let (latents, execution) = crate::pipeline::render_denoise_passes(
                     heavy.unet,
                     &ms,
                     &plan,
@@ -1388,6 +1392,9 @@ impl Sdxl {
                     &req.preview,
                     forward_plan,
                 )?;
+                if dp_first_execution.is_none() {
+                    dp_first_execution = Some(execution);
+                }
                 if let Some(observer) = final_latent_observer.as_deref_mut() {
                     observer(heavy.vae, &latents, pid_ref)?;
                 }
@@ -1668,6 +1675,14 @@ impl Sdxl {
                     Some(&req.cancel),
                 )?);
         }
+                // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+                // the requested AND resolved per-pass values plus the effective evaluation
+                // accounting, emitted exactly once per generation after a successful chain and
+                // before the caller sees any image. `None` for every non-chained request, so the
+                // legacy lanes stay byte-untouched. The candle twin emits identically.
+                if let Some(execution) = dp_first_execution {
+                    req.emit_denoise_pass_report(execution);
+                }
                 Ok(GenerationOutput::Images(images))
             },
         )

@@ -201,8 +201,18 @@ impl Generator for Sd3Generator {
                 req.resolve_denoise_plan(seed, &dp_defaults, &dp_ctx)
                     .map_err(gen_core::Error::from)
             };
-            let (images, _execution) =
+            let (images, execution) =
                 pipe.render_denoise_passes(req, &components, &plan, &resolve, on_progress)?;
+            // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+            // emitted exactly once per generation, after a successful chain and before the caller
+            // sees any image, carrying the requested AND resolved per-pass values plus the
+            // effective evaluation accounting. The driver keeps the FIRST image's record because
+            // every image in a batch resolves the same plan shape and differs only in its seeds.
+            // Without this the plan a render actually ran was unrecoverable, so a replay had
+            // nothing to replay from.
+            if let Some(execution) = execution {
+                req.emit_denoise_pass_report(execution);
+            }
             return Ok(GenerationOutput::Images(images));
         }
 
@@ -235,7 +245,7 @@ impl Generator for Sd3Generator {
 /// defaults to when `req.sampler` is unset, and `flow_match` is the advertised native alias for the
 /// family's own shifted schedule. That matters because a resolved plan is a replay artifact — a
 /// default it records that the menu would reject could never be replayed.
-fn sd3_denoise_defaults(variant: Variant) -> gen_core::DenoiseDefaults {
+pub(crate) fn sd3_denoise_defaults(variant: Variant) -> gen_core::DenoiseDefaults {
     let defaults =
         gen_core::DenoiseDefaults::new(variant.default_steps() as u32, "euler", "flow_match");
     if variant.cfg_enabled() {

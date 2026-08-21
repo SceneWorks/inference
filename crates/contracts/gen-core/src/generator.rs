@@ -10,7 +10,7 @@ use crate::approximation::{ApproximationPlan, ApproximationRequest, Approximatio
 use crate::denoise_passes::{
     validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassCapability,
     DenoisePassContext, DenoisePassField, DenoisePassResult, DenoisePassSurface,
-    ResolvedDenoisePlan,
+    DenoisePlanExecution, ResolvedDenoisePlan,
 };
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
@@ -1270,6 +1270,24 @@ impl GenerationRequest {
         ctx: &DenoisePassContext<'_>,
     ) -> DenoisePassResult<ResolvedDenoisePlan> {
         crate::denoise_passes::resolve_denoise_plan(self, job_seed, defaults, ctx)
+    }
+
+    /// Publish the chained-denoise **execution record** for this request (sc-20425).
+    ///
+    /// The other half of [`resolve_denoise_plan`](Self::resolve_denoise_plan), and the only
+    /// supported way to satisfy the [`denoise_pass_report`](Self::denoise_pass_report) contract: a
+    /// provider that executed a chain calls this exactly once, after the chain succeeds and before
+    /// the caller sees an image, with the record the executor returned. It stamps the *requested*
+    /// per-pass values onto the resolved ones so a consumer can tell "the user asked for nothing
+    /// here and the ladder filled it in" apart from "the user asked for exactly this".
+    ///
+    /// It exists as one call rather than as two lines each provider writes because four separate
+    /// adopters each forgot the second line (sc-20425 review): the plan a render actually ran was
+    /// unrecoverable, so the epic's replay path had nothing to replay from. Emitting into an inert
+    /// sink is free, so a provider never has to check first.
+    pub fn emit_denoise_pass_report(&self, execution: DenoisePlanExecution) {
+        self.denoise_pass_report
+            .emit(execution.with_requested(self.denoise_passes.as_deref()));
     }
 
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.

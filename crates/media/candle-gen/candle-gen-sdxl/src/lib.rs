@@ -439,7 +439,7 @@ impl Generator for SdxlGenerator {
                 req.resolve_denoise_plan(seed, &defaults, &ctx)
                     .map_err(gen_core::Error::from)
             };
-            let (images, _execution) = pipe.render_denoise_passes(
+            let (images, execution) = pipe.render_denoise_passes(
                 req,
                 &text_embeddings,
                 &components.unet,
@@ -449,6 +449,16 @@ impl Generator for SdxlGenerator {
                 &resolve,
                 on_progress,
             )?;
+            // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+            // emitted exactly once per generation, after a successful chain and before the caller
+            // sees any image, carrying the requested AND resolved per-pass values plus the
+            // effective evaluation accounting. The driver keeps the FIRST image's record because
+            // every image in a batch resolves the same plan shape and differs only in its seeds.
+            // Without this the plan a render actually ran was unrecoverable, so a replay had
+            // nothing to replay from.
+            if let Some(execution) = execution {
+                req.emit_denoise_pass_report(execution);
+            }
             return Ok(GenerationOutput::Images(images));
         }
         let images = pipe.render(
@@ -472,7 +482,7 @@ impl Generator for SdxlGenerator {
 /// is not a `Solver` at all) and not `discrete` (an alias that means the same schedule `normal`
 /// already names) — a resolved plan is a replay artifact, so the defaults it records must be ids
 /// validation accepts.
-fn sdxl_denoise_defaults() -> gen_core::DenoiseDefaults {
+pub(crate) fn sdxl_denoise_defaults() -> gen_core::DenoiseDefaults {
     gen_core::DenoiseDefaults::new(
         pipeline::DEFAULT_STEPS as u32,
         pipeline::DEFAULT_SAMPLER,

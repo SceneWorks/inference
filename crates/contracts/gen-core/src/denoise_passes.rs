@@ -2377,6 +2377,96 @@ mod tests {
         assert_eq!(json["perPassAdapters"], Value::Bool(false));
     }
 
+    /// **The sc-20425 review's MAJOR 1.** Four adopters each bound `let (images, _execution) = ..`
+    /// and dropped the record on the floor, so the plan a render actually ran was unrecoverable and
+    /// the epic's replay path had nothing to replay from. The emit is now ONE call on the request —
+    /// the other half of `resolve_denoise_plan` — and this pins what it delivers: exactly one
+    /// record, with the *requested* per-pass values stamped onto the resolved ones so a consumer
+    /// can tell an inherited default apart from an explicit choice.
+    #[test]
+    fn the_execution_record_emit_stamps_requested_onto_resolved_exactly_once() {
+        use std::sync::{Arc, Mutex};
+
+        let requested = vec![
+            DenoisePass {
+                steps: Some(6),
+                ..Default::default()
+            },
+            pass(3, "dpmpp_2m", "karras", 0.5),
+        ];
+        let req = GenerationRequest {
+            steps: Some(9),
+            sampler: Some("uni_pc".into()),
+            denoise_passes: Some(requested.clone()),
+            ..Default::default()
+        };
+        let plan = resolve_denoise_plan(&req, 4242, &defaults(), &ctx()).expect("plan resolves");
+        let execution = DenoisePlanExecution {
+            job_seed: plan.job_seed,
+            passes: plan
+                .passes
+                .iter()
+                .map(|resolved| DenoisePassExecutionRecord {
+                    requested: None,
+                    resolved: resolved.clone(),
+                    schedule_steps: resolved.steps as usize,
+                    schedule_len: resolved.steps as usize + 1,
+                    effective_steps: resolved.steps as usize,
+                    model_evals: resolved.steps as usize,
+                    renoised: resolved.index > 0,
+                })
+                .collect(),
+            total_model_evals: 9,
+        };
+
+        let seen: Arc<Mutex<Vec<DenoisePlanExecution>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let req = GenerationRequest {
+            denoise_pass_report: crate::DenoisePassReportSink::new(move |record| {
+                captured.lock().expect("sink mutex").push(record)
+            }),
+            ..req
+        };
+        req.emit_denoise_pass_report(execution);
+
+        let seen = seen.lock().expect("sink mutex");
+        assert_eq!(seen.len(), 1, "exactly one record per generation");
+        let record = &seen[0];
+        assert_eq!(record.job_seed, 4242);
+        assert_eq!(record.passes.len(), 2);
+        // The requested values ride alongside the resolved ones, verbatim.
+        assert_eq!(record.passes[0].requested.as_ref(), Some(&requested[0]));
+        assert_eq!(record.passes[1].requested.as_ref(), Some(&requested[1]));
+        // Pass 0 named only `steps`, so its sampler came from the REQUEST and its scheduler from
+        // the model default — the distinction the stamped `requested` exists to preserve.
+        assert_eq!(record.passes[0].requested.as_ref().unwrap().sampler, None);
+        assert_eq!(record.passes[0].resolved.sampler, "uni_pc");
+        assert_eq!(record.passes[0].resolved.scheduler, "normal");
+        assert_eq!(record.passes[0].resolved.steps, 6);
+        assert!(!record.passes[0].renoised);
+        // Pass 1 named everything, so requested and resolved agree.
+        assert_eq!(record.passes[1].resolved.sampler, "dpmpp_2m");
+        assert_eq!(record.passes[1].resolved.scheduler, "karras");
+        assert_eq!(record.passes[1].resolved.denoise, 0.5);
+        assert!(record.passes[1].renoised);
+        // Per-pass seeds are the derived ones, so a replay reproduces each pass exactly.
+        assert_eq!(record.passes[0].resolved.seed, denoise_pass_seed(4242, 0));
+        assert_eq!(record.passes[1].resolved.seed, denoise_pass_seed(4242, 1));
+        assert_eq!(record.total_model_evals, 9);
+    }
+
+    /// An inert sink is the default, so a provider never has to check before emitting.
+    #[test]
+    fn emitting_into_the_default_inert_sink_is_a_no_op() {
+        let req = GenerationRequest::default();
+        assert!(!req.denoise_pass_report.is_active());
+        req.emit_denoise_pass_report(DenoisePlanExecution {
+            job_seed: 1,
+            passes: Vec::new(),
+            total_model_evals: 0,
+        });
+    }
+
     #[test]
     fn a_model_that_does_not_advertise_passes_rejects_them() {
         let unsupported = DenoisePassContext {

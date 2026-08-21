@@ -698,6 +698,67 @@ mod tests {
         );
     }
 
+    /// **The sc-20425 review's MAJOR 1, on this family.** The generator binds the executor's
+    /// `DenoisePlanExecution` and publishes it through `GenerationRequest::emit_denoise_pass_report`
+    /// before returning any image; without that the plan a render actually ran is unrecoverable and
+    /// the epic's replay path has nothing to replay from. This drives the REAL schedule seam,
+    /// model defaults and descriptor context through the shared adopter check, so the record's
+    /// requested-vs-resolved contents and eval accounting are pinned against this family's own
+    /// resolution ladder.
+    #[test]
+    fn the_generator_publishes_one_execution_record_for_a_chain() {
+        let requested = vec![
+            gen_core::DenoisePass {
+                steps: Some(4),
+                ..Default::default()
+            },
+            gen_core::DenoisePass {
+                steps: Some(3),
+                sampler: Some("euler".to_owned()),
+                denoise: Some(0.5),
+                ..Default::default()
+            },
+        ];
+        let req = GenerationRequest {
+            denoise_passes: Some(requested.clone()),
+            ..Default::default()
+        };
+        let ms = mlx_gen::gen_core::sampling::FlowModelSampling::new(
+            mlx_gen::gen_core::sampling::TimestepConvention::Sigma,
+        );
+        let caps = crate::config::Sd3Variant::Large.descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::model::sd3_denoise_defaults(crate::config::Sd3Variant::Large);
+        let record = gen_core_testkit::denoise_passes::check_execution_record(
+            &|pass: &mlx_gen::gen_core::ResolvedDenoisePass, steps: usize| {
+                pass_schedule(pass, steps).expect("a curated id always resolves")
+            },
+            &ms,
+            &req,
+            0x5eed,
+            &defaults,
+            &ctx,
+        )
+        .expect("the execution record must satisfy the shared adopter contract");
+
+        // The ladder's own answers, published: pass 0 named no sampler/scheduler, so both come
+        // from this family's model defaults; pass 1 named its sampler and denoise.
+        assert_eq!(record.passes.len(), 2);
+        assert_eq!(
+            record.passes[0].resolved.sampler, defaults.sampler,
+            "an unnamed per-pass sampler must resolve to this family's default"
+        );
+        assert_eq!(record.passes[0].resolved.scheduler, defaults.scheduler);
+        assert_eq!(record.passes[0].resolved.steps, 4);
+        assert_eq!(record.passes[1].resolved.sampler, "euler");
+        assert_eq!(record.passes[1].resolved.denoise, 0.5);
+        // And the requested values ride alongside, so a consumer can tell the two apart.
+        assert_eq!(record.passes[0].requested.as_ref(), Some(&requested[0]));
+        assert_eq!(record.passes[1].requested.as_ref(), Some(&requested[1]));
+        // SD3.5 Large has a guidance axis, so the ladder fills it from the model default.
+        assert_eq!(record.passes[0].resolved.guidance, defaults.guidance);
+    }
+
     /// The per-pass schedule seam is the single-pass one: the native static-shift schedule under the
     /// advertised alias, and the curated axis over the same `mu = ln(3)` otherwise.
     #[test]

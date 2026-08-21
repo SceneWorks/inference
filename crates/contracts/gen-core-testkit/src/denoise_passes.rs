@@ -39,6 +39,8 @@
 //! *this* cohort's and provably not the other's. [`denoise_pass_conformance`] is the flow-cohort
 //! shorthand, unchanged for the families already adopting it.
 
+use std::sync::{Arc, Mutex};
+
 use gen_core::sampling::{
     denoise as gc_denoise, denoise_pass_renoise_seed, denoise_pass_schedule_steps,
     execute_denoise_plan, sampler_by_name, terminal_pass_segment, AlphaSchedule, CpuLatentOps,
@@ -47,7 +49,8 @@ use gen_core::sampling::{
 };
 use gen_core::{
     denoise_pass_seed, resolve_denoise_plan, CancelFlag, DenoiseDefaults, DenoisePass,
-    DenoisePassContext, GenerationRequest, Progress, ResolvedDenoisePass, ResolvedDenoisePlan,
+    DenoisePassContext, DenoisePassReportSink, DenoisePlanExecution, GenerationRequest, Progress,
+    ResolvedDenoisePass, ResolvedDenoisePlan,
 };
 
 /// A family's per-pass schedule seam: `(resolved pass, schedule_steps) -> full σ schedule`.
@@ -674,6 +677,115 @@ pub fn denoise_pass_conformance_over(
     }
 }
 
+/// **The execution-record contract, checked against a family's own resolution ladder** (sc-20425).
+///
+/// A provider that runs a chain owes the caller exactly one
+/// [`DenoisePlanExecution`] through [`GenerationRequest::emit_denoise_pass_report`] — the
+/// requested AND resolved per-pass values plus the effective evaluation accounting — before any
+/// image is returned. That record is the only thing a replay has to replay *from*, and four
+/// separate adopters shipped binding it to `_execution` and dropping it, which no test anywhere
+/// could see (the sc-20425 review's MAJOR 1).
+///
+/// This drives the REAL executor over the family's own schedule seam, `defaults` and `ctx`, so the
+/// resolution ladder under test is the shipped one, then checks the record an adopter must
+/// publish: one record, the request's passes stamped verbatim as `requested`, the resolved values
+/// the ladder produced, the per-pass re-noise flags, and an evaluation total that is the sum of
+/// the parts.
+///
+/// `req` must carry `denoise_passes`; an adopter test passes the same request shape its generator
+/// accepts. Returns the record so a caller can assert family-specific details on top.
+pub fn check_execution_record(
+    builder: &PassScheduleBuilder<'_>,
+    ms: &dyn ModelSampling,
+    req: &GenerationRequest,
+    job_seed: u64,
+    defaults: &DenoiseDefaults,
+    ctx: &DenoisePassContext<'_>,
+) -> Result<DenoisePlanExecution, String> {
+    let requested = req
+        .denoise_passes
+        .as_ref()
+        .ok_or_else(|| "execution record: the request must carry `denoisePasses`".to_owned())?
+        .clone();
+    let plan = req
+        .resolve_denoise_plan(job_seed, defaults, ctx)
+        .map_err(|err| format!("execution record: the plan failed to resolve: {err}"))?;
+    let (out, _) = run_chain(builder, ms, &plan, &mut |_| {}, &CancelFlag::new())?;
+
+    // Emit through the shipped seam, over a request that is this one plus a capturing sink.
+    let seen: Arc<Mutex<Vec<DenoisePlanExecution>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&seen);
+    let reporting = GenerationRequest {
+        denoise_passes: Some(requested.clone()),
+        denoise_pass_report: DenoisePassReportSink::new(move |record| {
+            captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(record)
+        }),
+        ..Default::default()
+    };
+    reporting.emit_denoise_pass_report(out.execution);
+
+    let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() != 1 {
+        return Err(format!(
+            "execution record: expected exactly one record per generation, got {}",
+            seen.len()
+        ));
+    }
+    let record = seen[0].clone();
+    if record.job_seed != job_seed {
+        return Err(format!(
+            "execution record: job seed {} != the request's {job_seed}",
+            record.job_seed
+        ));
+    }
+    if record.passes.len() != plan.passes.len() {
+        return Err(format!(
+            "execution record: {} pass records for a {}-pass plan",
+            record.passes.len(),
+            plan.passes.len()
+        ));
+    }
+    for (index, entry) in record.passes.iter().enumerate() {
+        if entry.requested.as_ref() != requested.get(index) {
+            return Err(format!(
+                "execution record: pass {index} requested {:?} != the request's {:?} — a \
+                 consumer cannot tell an inherited default from an explicit choice",
+                entry.requested,
+                requested.get(index)
+            ));
+        }
+        if entry.resolved != plan.passes[index] {
+            return Err(format!(
+                "execution record: pass {index} resolved {:?} != the plan's {:?}",
+                entry.resolved, plan.passes[index]
+            ));
+        }
+        if entry.renoised != (index > 0) {
+            return Err(format!(
+                "execution record: pass {index} renoised={} — only passes after the first \
+                 re-noise",
+                entry.renoised
+            ));
+        }
+        if entry.effective_steps == 0 || entry.model_evals == 0 {
+            return Err(format!(
+                "execution record: pass {index} recorded {} step(s) / {} eval(s)",
+                entry.effective_steps, entry.model_evals
+            ));
+        }
+    }
+    let summed: usize = record.passes.iter().map(|p| p.model_evals).sum();
+    if record.total_model_evals != summed {
+        return Err(format!(
+            "execution record: total_model_evals {} != the per-pass sum {summed}",
+            record.total_model_evals
+        ));
+    }
+    Ok(record)
+}
 /// [`denoise_pass_conformance_over`] for the FLOW cohort — the shorthand every flow family uses.
 pub fn denoise_pass_conformance(family: &str, builder: &PassScheduleBuilder<'_>) {
     denoise_pass_conformance_over(family, &flow_ms(), builder);
