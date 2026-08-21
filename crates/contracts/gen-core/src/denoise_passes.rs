@@ -151,6 +151,150 @@ pub fn denoise_pass_seed(job_seed: u64, pass_index: usize) -> u64 {
 }
 
 // =================================================================================================
+// Capability surface (the model side of the contract)
+// =================================================================================================
+
+/// The per-family denoise-pass surface that a bare `supports_denoise_passes: bool` cannot express
+/// (sc-20425).
+///
+/// [`Capabilities::supports_denoise_passes`](crate::Capabilities::supports_denoise_passes) says
+/// *whether* a family honors a chain. This says *what* it honors, for the two axes where families
+/// genuinely differ and where the difference is otherwise invisible to a caller:
+///
+/// * **Which advertised scheduler ids survive a pass.** A family's
+///   [`schedulers`](crate::Capabilities::schedulers) menu legitimately carries native ids beyond the
+///   curated [`Scheduler`] registry (Krea's `flow_match`, the byte-exact native schedule its
+///   resolution ladder bottoms out on). Those ids are honored by the family's own
+///   [`build_schedule`](crate::sampling::DenoisePassHost::build_schedule) and by nothing else, so
+///   *only the family* can say which of them are real — the rest are advertised for the single-pass
+///   path and, on a chain, would fall through some resolver's native-default branch and render the
+///   wrong algorithm while reporting success. Listing them here turns that silent fallback into a
+///   typed [`DenoisePassIssue::NotHonored`] rejection.
+/// * **Whether per-pass adapter weight overrides are real.** See
+///   [`per_pass_adapters`](Self::per_pass_adapters).
+///
+/// `Default` is the empty surface — no native schedulers, no per-pass adapter overrides — which is
+/// the fail-closed state every non-adopting descriptor keeps with no edit. The descriptor conformance
+/// sweep ([`model_descriptor_errors`](crate::registry::model_descriptor_errors)) rejects a non-empty
+/// surface on a descriptor that does not also set `supports_denoise_passes`, so a *derived*
+/// descriptor (`let mut d = base(); d.id = …;`) can never inherit half of this contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DenoisePassSurface {
+    /// Advertised scheduler ids **outside** the curated [`Scheduler`] registry that this family's
+    /// own `build_schedule` genuinely honors on a chained pass.
+    ///
+    /// Every entry must also appear in [`Capabilities::schedulers`](crate::Capabilities::schedulers)
+    /// (an unadvertised alias is unreachable) and must not shadow a curated id (which needs no
+    /// declaration). Both are cross-checked by the descriptor conformance sweep.
+    pub native_schedulers: &'static [&'static str],
+    /// Whether [`DenoisePass::adapters`] weight overrides are actually **applied and reverted** at
+    /// each pass boundary.
+    ///
+    /// The global v1 policy (sc-20425): a per-pass override re-scales a *live, revertible* adapter
+    /// residual. Nearly every family instead folds LoRA/LoKr into the dense weights once at load and
+    /// keeps no residual, so "adapter off for pass 1, on for pass 2" is physically unavailable
+    /// there — and accepting the field anyway would render the wrong image and report success. So
+    /// this defaults to `false` and the shared floor **rejects** a pass carrying a non-empty
+    /// `adapters` list with a pass-indexed [`DenoisePassIssue::PerPassAdaptersUnsupported`]; a
+    /// family whose adapter seam is a real apply/revert (Krea) sets it `true`. A family that
+    /// advertises no adapters at all
+    /// ([`supports_lora`](crate::Capabilities::supports_lora) /
+    /// [`supports_lokr`](crate::Capabilities::supports_lokr) both `false`) gets the rejection from
+    /// the shared floor for free and must leave this `false` — the conformance sweep enforces that
+    /// pairing.
+    pub per_pass_adapters: bool,
+}
+
+impl DenoisePassSurface {
+    /// The fail-closed surface: no native schedulers, no per-pass adapter overrides.
+    pub const NONE: Self = Self {
+        native_schedulers: &[],
+        per_pass_adapters: false,
+    };
+
+    /// Whether this surface declares anything at all. A descriptor that does not set
+    /// `supports_denoise_passes` must be empty here.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.native_schedulers.is_empty() && !self.per_pass_adapters
+    }
+
+    /// Whether `id` is a curated [`Scheduler`] or a native alias this family declared.
+    #[must_use]
+    pub fn honors_scheduler(&self, id: &str) -> bool {
+        Scheduler::from_name(id).is_some() || self.native_schedulers.contains(&id)
+    }
+}
+
+/// The **explicit** denoise-pass capability surface a consumer reads (sc-20425) — what Studio and the
+/// worker need in order to build a per-pass editor without a model-id table.
+///
+/// Derived wholly from a [`Capabilities`](crate::Capabilities) by
+/// [`Capabilities::denoise_pass_capability`](crate::Capabilities::denoise_pass_capability), so there
+/// is no allowlist anywhere and no second source of truth: a family that changes its menu changes
+/// this in the same edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DenoisePassCapability {
+    /// Whether chained passes are honored at all. Everything below is empty/zero when `false`.
+    pub supported: bool,
+    /// The largest chain this build accepts ([`MAX_DENOISE_PASSES`]).
+    pub max_passes: usize,
+    /// The per-pass `steps` sanity cap ([`crate::generator::MAX_STEPS`]).
+    pub max_steps_per_pass: u32,
+    /// The per-pass fields this model honors, as they appear on the wire — always `steps`,
+    /// `sampler`, `scheduler`, `denoise`; plus `guidance` when the model has a guidance axis, plus
+    /// `adapters` when [`DenoisePassSurface::per_pass_adapters`] is set. A field absent from this
+    /// list is **rejected**, never ignored.
+    pub fields: Vec<&'static str>,
+    /// The sampler ids a pass may name: the advertised menu **intersected** with the curated
+    /// [`Solver`] registry. The intersection is not a nicety — the chained executor boxes a curated
+    /// `Solver` per pass and has no hook a family could use to honor a native sampler name, so an
+    /// advertised-but-uncurated sampler (SDXL's `lightning`, Kolors' `euler_discrete`) is exactly
+    /// the id that used to validate and then silently run Euler.
+    pub samplers: Vec<&'static str>,
+    /// The scheduler ids a pass may name: the advertised menu intersected with the curated
+    /// [`Scheduler`] registry **plus** the family's declared
+    /// [`native_schedulers`](DenoisePassSurface::native_schedulers). Unlike the sampler axis the
+    /// family owns `build_schedule`, so a declared native alias is honorable — an undeclared one is
+    /// not.
+    pub schedulers: Vec<&'static str>,
+    /// Whether per-pass adapter weight overrides are honored
+    /// ([`DenoisePassSurface::per_pass_adapters`]).
+    pub per_pass_adapters: bool,
+}
+
+impl DenoisePassCapability {
+    /// The camelCase JSON a consumer reads, matching the rest of this contract's wire format.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        map.insert("supported".to_owned(), Value::Bool(self.supported));
+        map.insert("maxPasses".to_owned(), Value::from(self.max_passes));
+        map.insert(
+            "maxStepsPerPass".to_owned(),
+            Value::from(self.max_steps_per_pass),
+        );
+        map.insert("fields".to_owned(), str_array(&self.fields));
+        map.insert("samplers".to_owned(), str_array(&self.samplers));
+        map.insert("schedulers".to_owned(), str_array(&self.schedulers));
+        map.insert(
+            "perPassAdapters".to_owned(),
+            Value::Bool(self.per_pass_adapters),
+        );
+        Value::Object(map)
+    }
+}
+
+fn str_array(items: &[&'static str]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|s| Value::String((*s).to_owned()))
+            .collect(),
+    )
+}
+
+// =================================================================================================
 // Request-side types
 // =================================================================================================
 
@@ -278,6 +422,23 @@ pub enum DenoisePassIssue {
     NotFinite { value: f32 },
     /// A sampler/scheduler id that is not in the supported set.
     UnknownId { id: String, supported: Vec<String> },
+    /// A sampler/scheduler id the model **advertises** but cannot honor **on a chained pass**
+    /// (sc-20425).
+    ///
+    /// The trap this closes: the advertised menu is authoritative for the flat request, and a family
+    /// legitimately lists native ids there. On a chain those ids reach a resolver that falls back to
+    /// its family default — the chained executor boxes a curated [`Solver`] and takes
+    /// `unwrap_or(Euler)`; a family scheduler resolver takes its native schedule — so the request
+    /// *validated*, rendered a different algorithm than it named, and reported success. `honored`
+    /// carries the ids that actually work for this axis on this model.
+    NotHonored { id: String, honored: Vec<String> },
+    /// The pass carries adapter weight overrides but this model's adapter seam cannot apply and
+    /// revert them per pass (sc-20425) — see [`DenoisePassSurface::per_pass_adapters`].
+    PerPassAdaptersUnsupported,
+    /// The pass names a `guidance` override but this model has no guidance axis
+    /// ([`Capabilities::supports_guidance`](crate::Capabilities::supports_guidance) is `false`), so
+    /// the value would be accepted and then ignored by a CFG-free forward.
+    GuidanceUnsupported,
     /// An adapter index past the end of the load-time stack.
     AdapterIndexOutOfRange { index: usize, loaded: usize },
     /// Two entries in one pass override the same load-time adapter — contradictory, so rejected
@@ -305,6 +466,9 @@ impl DenoisePassIssue {
             Self::OutOfRange { .. } => "outOfRange",
             Self::NotFinite { .. } => "notFinite",
             Self::UnknownId { .. } => "unknownId",
+            Self::NotHonored { .. } => "notHonored",
+            Self::PerPassAdaptersUnsupported => "perPassAdaptersUnsupported",
+            Self::GuidanceUnsupported => "guidanceUnsupported",
             Self::AdapterIndexOutOfRange { .. } => "adapterIndexOutOfRange",
             Self::DuplicateAdapter { .. } => "duplicateAdapter",
             Self::Malformed { .. } => "malformed",
@@ -332,6 +496,18 @@ impl fmt::Display for DenoisePassIssue {
             Self::NotFinite { value } => write!(f, "must be finite (got {value})"),
             Self::UnknownId { id, supported } => {
                 write!(f, "unknown id {id:?} (supported: {supported:?})")
+            }
+            Self::NotHonored { id, honored } => write!(
+                f,
+                "{id:?} is advertised by this model but cannot be honored on a denoise pass \
+                 (honored here: {honored:?})"
+            ),
+            Self::PerPassAdaptersUnsupported => f.write_str(
+                "this model cannot apply and revert per-pass adapter weight overrides — its \
+                 adapters fold in once at load, so send an empty `adapters` list",
+            ),
+            Self::GuidanceUnsupported => {
+                f.write_str("this model has no guidance axis — a per-pass `guidance` has no effect")
             }
             Self::AdapterIndexOutOfRange { index, loaded } => write!(
                 f,
@@ -414,11 +590,20 @@ impl DenoisePassError {
     /// Whether this is a **capability gap** (the model/backend cannot do it) rather than a malformed
     /// value. Capability gaps map to the typed [`Error::Unsupported`] so a consumer can distinguish
     /// them (F-008); everything else maps to [`Error::Msg`].
+    ///
+    /// The sc-20425 additions all belong here: "this model advertises the id but cannot honor it on
+    /// a pass", "this model cannot re-weight adapters per pass" and "this model has no guidance
+    /// axis" are statements about what the model can do, not about a malformed value — a consumer
+    /// that branches on `Unsupported` to offer a different model must see them.
     #[must_use]
     pub fn is_capability_gap(&self) -> bool {
         matches!(
             self.issue,
-            DenoisePassIssue::Unsupported | DenoisePassIssue::UnknownId { .. }
+            DenoisePassIssue::Unsupported
+                | DenoisePassIssue::UnknownId { .. }
+                | DenoisePassIssue::NotHonored { .. }
+                | DenoisePassIssue::PerPassAdaptersUnsupported
+                | DenoisePassIssue::GuidanceUnsupported
         )
     }
 
@@ -479,6 +664,18 @@ pub struct DenoisePassContext<'a> {
     pub samplers: Option<&'a [&'a str]>,
     /// The model's advertised scheduler menu; `None` ⇒ the curated [`Scheduler`] registry.
     pub schedulers: Option<&'a [&'a str]>,
+    /// Advertised scheduler ids outside the curated registry this family really honors on a pass
+    /// ([`DenoisePassSurface::native_schedulers`]). Empty ⇒ a pass may only name a curated
+    /// [`Scheduler`], whatever else the flat menu advertises.
+    pub native_schedulers: &'a [&'a str],
+    /// Whether the model has a guidance axis
+    /// ([`Capabilities::supports_guidance`](crate::Capabilities::supports_guidance)). `false` ⇒ a
+    /// per-pass `guidance` is [`DenoisePassIssue::GuidanceUnsupported`] rather than an ignored knob.
+    pub supports_guidance: bool,
+    /// Whether per-pass adapter weight overrides are applied and reverted
+    /// ([`DenoisePassSurface::per_pass_adapters`]). `false` ⇒ a non-empty per-pass `adapters` list is
+    /// [`DenoisePassIssue::PerPassAdaptersUnsupported`].
+    pub per_pass_adapters: bool,
     /// How many adapters the load spec provisioned, if known. `None` ⇒ the per-pass adapter index
     /// bound is not checked here (the model re-checks it when it resolves the plan against its real
     /// stack).
@@ -490,12 +687,21 @@ pub struct DenoisePassContext<'a> {
 impl DenoisePassContext<'_> {
     /// A model-free context: structure, ranges, and ids against the **curated** [`Solver`] /
     /// [`Scheduler`] registries.
+    ///
+    /// Deliberately **optimistic** on the three model-only facts — capability, guidance axis,
+    /// per-pass adapter overrides — exactly as it already is on
+    /// [`loaded_adapters`](Self::loaded_adapters): a pre-check with no model in hand must not invent
+    /// a rejection the real model would not make. The model re-validates all four when it resolves
+    /// the plan.
     #[must_use]
     pub fn registry_only() -> Self {
         Self {
             supports_denoise_passes: true,
             samplers: None,
             schedulers: None,
+            native_schedulers: &[],
+            supports_guidance: true,
+            per_pass_adapters: true,
             loaded_adapters: None,
             max_steps: crate::generator::MAX_STEPS,
         }
@@ -628,6 +834,13 @@ fn validate_one_pass(
                 DenoisePassIssue::NotFinite { value: guidance },
             ));
         }
+        if !ctx.supports_guidance {
+            return Err(DenoisePassError::at(
+                index,
+                DenoisePassField::Guidance,
+                DenoisePassIssue::GuidanceUnsupported,
+            ));
+        }
     }
     if let Some(sampler) = &pass.sampler {
         check_id(
@@ -638,6 +851,20 @@ fn validate_one_pass(
             Solver::from_name(sampler).is_some(),
             curated_sampler_ids,
         )?;
+        // Advertised is not the same as honorable (sc-20425). The chained executor boxes a curated
+        // `Solver` per pass and has no hook a family could use to run a native sampler name, so an
+        // advertised-but-uncurated id is precisely the one that passed the menu check above and then
+        // integrated as Euler — the wrong algorithm, reported as success.
+        if Solver::from_name(sampler).is_none() {
+            return Err(DenoisePassError::at(
+                index,
+                DenoisePassField::Sampler,
+                DenoisePassIssue::NotHonored {
+                    id: sampler.clone(),
+                    honored: honored_pass_samplers(ctx),
+                },
+            ));
+        }
     }
     if let Some(scheduler) = &pass.scheduler {
         check_id(
@@ -648,6 +875,31 @@ fn validate_one_pass(
             Scheduler::from_name(scheduler).is_some(),
             curated_scheduler_ids,
         )?;
+        // The scheduler axis differs from the sampler axis in one way that matters: the family owns
+        // `build_schedule`, so a native alias CAN be honorable — but only the family knows which, and
+        // an undeclared one falls through some resolver's native-default branch just as silently.
+        if Scheduler::from_name(scheduler).is_none()
+            && !ctx.native_schedulers.contains(&scheduler.as_str())
+        {
+            return Err(DenoisePassError::at(
+                index,
+                DenoisePassField::Scheduler,
+                DenoisePassIssue::NotHonored {
+                    id: scheduler.clone(),
+                    honored: honored_pass_schedulers(ctx),
+                },
+            ));
+        }
+    }
+    // The global per-pass adapter policy (sc-20425): reject, never accept-and-ignore. A family whose
+    // adapters fold into dense weights once at load cannot re-scale them at a pass boundary, and a
+    // family advertising no adapters at all has nothing to override.
+    if !pass.adapters.is_empty() && !ctx.per_pass_adapters {
+        return Err(DenoisePassError::at(
+            index,
+            DenoisePassField::Adapters,
+            DenoisePassIssue::PerPassAdaptersUnsupported,
+        ));
     }
     let mut seen: Vec<usize> = Vec::with_capacity(pass.adapters.len());
     for entry in &pass.adapters {
@@ -684,6 +936,91 @@ fn validate_one_pass(
         }
     }
     Ok(())
+}
+
+/// The sampler ids a pass may actually name under `ctx`: the advertised menu intersected with the
+/// curated [`Solver`] registry (or the whole curated registry when there is no menu).
+fn honored_pass_samplers(ctx: &DenoisePassContext<'_>) -> Vec<String> {
+    match ctx.samplers {
+        Some(menu) => menu
+            .iter()
+            .filter(|id| Solver::from_name(id).is_some())
+            .map(|id| (*id).to_owned())
+            .collect(),
+        None => curated_sampler_ids().iter().map(|s| (*s).into()).collect(),
+    }
+}
+
+/// The scheduler ids a pass may actually name under `ctx`: the advertised menu intersected with the
+/// curated [`Scheduler`] registry plus the family's declared native aliases.
+fn honored_pass_schedulers(ctx: &DenoisePassContext<'_>) -> Vec<String> {
+    match ctx.schedulers {
+        Some(menu) => menu
+            .iter()
+            .filter(|id| {
+                Scheduler::from_name(id).is_some() || ctx.native_schedulers.contains(&**id)
+            })
+            .map(|id| (*id).to_owned())
+            .collect(),
+        None => curated_scheduler_ids()
+            .iter()
+            .map(|s| (*s).into())
+            .collect(),
+    }
+}
+
+/// The curated [`Solver`] a resolved pass names — the executor's **pre-execution** algorithm
+/// resolution (sc-20425).
+///
+/// The chained executor has no hook for a family-native sampler name, so this either resolves or
+/// rejects: it never falls back. A caller that ran the shared floor first can only reach the error
+/// path by hand-building a plan, which is exactly the case worth failing loudly.
+pub fn resolve_pass_solver(pass: &ResolvedDenoisePass) -> DenoisePassResult<Solver> {
+    Solver::from_name(&pass.sampler).ok_or_else(|| {
+        DenoisePassError::at(
+            pass.index,
+            DenoisePassField::Sampler,
+            DenoisePassIssue::NotHonored {
+                id: pass.sampler.clone(),
+                honored: curated_sampler_ids().iter().map(|s| (*s).into()).collect(),
+            },
+        )
+    })
+}
+
+/// The scheduler a resolved pass names, for a family that honors `native` aliases beyond the curated
+/// registry (sc-20425).
+///
+/// `Ok(Some(scheduler))` is a curated schedule the caller builds through
+/// [`schedule_sigmas`](crate::sampling::schedule_sigmas); `Ok(None)` is one of the caller's own
+/// declared native aliases, which the caller builds itself. `Err` is the id that would otherwise
+/// have fallen through to a native default and rendered the wrong schedule under the requested name.
+///
+/// Adopters pass exactly the list their descriptor advertises in
+/// [`DenoisePassSurface::native_schedulers`], so the advertisement and the honoring cannot drift.
+pub fn resolve_pass_scheduler(
+    pass: &ResolvedDenoisePass,
+    native: &[&str],
+) -> DenoisePassResult<Option<Scheduler>> {
+    if let Some(scheduler) = Scheduler::from_name(&pass.scheduler) {
+        return Ok(Some(scheduler));
+    }
+    if native.contains(&pass.scheduler.as_str()) {
+        return Ok(None);
+    }
+    let mut honored: Vec<String> = curated_scheduler_ids()
+        .iter()
+        .map(|s| (*s).into())
+        .collect();
+    honored.extend(native.iter().map(|s| (*s).to_string()));
+    Err(DenoisePassError::at(
+        pass.index,
+        DenoisePassField::Scheduler,
+        DenoisePassIssue::NotHonored {
+            id: pass.scheduler.clone(),
+            honored,
+        },
+    ))
 }
 
 fn check_id(
@@ -1776,6 +2113,268 @@ mod tests {
         assert!(
             validate_denoise_passes(&[pass(4, "euler", "normal", 1.0)], false, &restricted).is_ok()
         );
+    }
+
+    /// A model context built from a real-shaped advertised menu, for the sc-20425 honorability tests.
+    fn menu_ctx(
+        samplers: &'static [&'static str],
+        schedulers: &'static [&'static str],
+        native: &'static [&'static str],
+    ) -> DenoisePassContext<'static> {
+        DenoisePassContext {
+            samplers: Some(samplers),
+            schedulers: Some(schedulers),
+            native_schedulers: native,
+            ..DenoisePassContext::registry_only()
+        }
+    }
+
+    /// **The sc-20425 item-3 correctness trap.** These are the real ids the 33-family audit found on
+    /// shipped menus. Each one *passed* validation (the menu is authoritative) and then reached
+    /// `Solver::from_name(..).unwrap_or(Solver::Euler)` in the executor — so the render used Euler
+    /// while the metadata said otherwise, and reported success. They are now a pass-indexed,
+    /// field-tagged **pre-execution** rejection.
+    #[test]
+    fn an_advertised_but_uncurated_pass_sampler_is_rejected_not_silently_euler() {
+        // sdxl's `lightning`, kolors' `euler_discrete`, lens' `flow_match_euler` — advertised, and
+        // none of them a curated `Solver`.
+        const MENU: &[&str] = &["euler", "lightning", "euler_discrete", "flow_match_euler"];
+        let ctx = menu_ctx(MENU, &["normal"], &[]);
+        for id in ["lightning", "euler_discrete", "flow_match_euler"] {
+            assert!(
+                Solver::from_name(id).is_none(),
+                "{id} must not be curated, or this test proves nothing"
+            );
+            let err = validate_denoise_passes(&[pass(8, id, "normal", 1.0)], false, &ctx)
+                .expect_err("an unrunnable sampler must be rejected");
+            assert_eq!(err.pass_index(), Some(0));
+            assert_eq!(err.field(), DenoisePassField::Sampler);
+            assert_eq!(err.issue().code(), "notHonored");
+            // The message names what DOES work, so a caller can correct the request.
+            match err.issue() {
+                DenoisePassIssue::NotHonored { honored, .. } => {
+                    assert_eq!(honored, &vec!["euler".to_string()]);
+                }
+                other => panic!("expected NotHonored, got {other:?}"),
+            }
+            assert!(err.is_capability_gap());
+        }
+        // The curated id on the same menu still passes.
+        assert!(validate_denoise_passes(&[pass(8, "euler", "normal", 1.0)], false, &ctx).is_ok());
+        // And the index is the offending pass, not always zero.
+        let err = validate_denoise_passes(
+            &[
+                pass(8, "euler", "normal", 1.0),
+                pass(8, "lightning", "normal", 1.0),
+            ],
+            false,
+            &ctx,
+        )
+        .expect_err("pass 1 is the offender");
+        assert_eq!(err.pass_index(), Some(1));
+    }
+
+    /// The scheduler axis differs from the sampler axis: the family owns `build_schedule`, so a
+    /// native alias *can* be honorable — but only when the family declared it. chroma/sd3 advertise
+    /// `linear`, which no curated `Scheduler` implements; undeclared it would fall through a family
+    /// resolver's native-default branch and render a schedule the request did not name.
+    #[test]
+    fn an_advertised_native_scheduler_is_honored_only_when_the_family_declares_it() {
+        const MENU: &[&str] = &["normal", "linear", "flow_match"];
+        assert!(Scheduler::from_name("linear").is_none());
+        assert!(Scheduler::from_name("flow_match").is_none());
+
+        let undeclared = menu_ctx(&["euler"], MENU, &[]);
+        let err = validate_denoise_passes(&[pass(8, "euler", "linear", 1.0)], false, &undeclared)
+            .expect_err("an undeclared native scheduler must be rejected");
+        assert_eq!(err.field(), DenoisePassField::Scheduler);
+        assert_eq!(err.issue().code(), "notHonored");
+
+        // Declared (the Krea `flow_match` precedent — its resolution ladder bottoms out on it, so a
+        // resolved plan naming it must replay through validation).
+        let declared = menu_ctx(&["euler"], MENU, &["flow_match"]);
+        assert!(
+            validate_denoise_passes(&[pass(8, "euler", "flow_match", 1.0)], false, &declared)
+                .is_ok()
+        );
+        // Declaring one alias does not bless the other.
+        assert!(
+            validate_denoise_passes(&[pass(8, "euler", "linear", 1.0)], false, &declared).is_err()
+        );
+        // A curated id is always honorable, declaration or not.
+        assert!(
+            validate_denoise_passes(&[pass(8, "euler", "normal", 1.0)], false, &declared).is_ok()
+        );
+    }
+
+    /// The executor-side half of the same rule: a hand-built plan that never went through the floor
+    /// still cannot reach a model forward with an id the chain cannot run.
+    #[test]
+    fn pass_algorithm_resolution_rejects_rather_than_falling_back() {
+        let resolved = |sampler: &str, scheduler: &str| ResolvedDenoisePass {
+            index: 2,
+            steps: 8,
+            sampler: sampler.to_string(),
+            scheduler: scheduler.to_string(),
+            denoise: 1.0,
+            guidance: None,
+            seed: 7,
+            adapters: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_pass_solver(&resolved("uni_pc", "normal")).expect("curated"),
+            Solver::UniPc
+        );
+        let err = resolve_pass_solver(&resolved("lightning", "normal"))
+            .expect_err("an uncurated sampler is unrunnable on a chain");
+        assert_eq!(err.pass_index(), Some(2));
+        assert_eq!(err.field(), DenoisePassField::Sampler);
+
+        assert_eq!(
+            resolve_pass_scheduler(&resolved("euler", "karras"), &[]).expect("curated"),
+            Some(Scheduler::Karras)
+        );
+        assert_eq!(
+            resolve_pass_scheduler(&resolved("euler", "flow_match"), &["flow_match"])
+                .expect("declared native"),
+            None
+        );
+        let err = resolve_pass_scheduler(&resolved("euler", "linear"), &["flow_match"])
+            .expect_err("an undeclared native scheduler is unrunnable");
+        assert_eq!(err.pass_index(), Some(2));
+        assert_eq!(err.field(), DenoisePassField::Scheduler);
+    }
+
+    /// The global per-pass adapter policy (sc-20425 item 6b): reject, never accept-and-ignore.
+    /// Nearly every family folds LoRA/LoKr into the dense weights once at load and keeps no residual
+    /// to re-scale, so "adapter off for pass 1, on for pass 2" is physically unavailable there.
+    #[test]
+    fn per_pass_adapter_overrides_are_rejected_when_the_family_cannot_apply_them() {
+        let with_override = DenoisePass {
+            adapters: vec![PhaseAdapter {
+                adapter: 0,
+                weight: Some(0.0),
+            }],
+            ..pass(8, "euler", "normal", 1.0)
+        };
+        let cannot = DenoisePassContext {
+            per_pass_adapters: false,
+            ..ctx()
+        };
+        let err = validate_denoise_passes(std::slice::from_ref(&with_override), false, &cannot)
+            .expect_err("an unappliable override must be rejected");
+        assert_eq!(err.pass_index(), Some(0));
+        assert_eq!(err.field(), DenoisePassField::Adapters);
+        assert_eq!(err.issue(), &DenoisePassIssue::PerPassAdaptersUnsupported);
+        assert!(err.is_capability_gap());
+
+        // An EMPTY list is not an override — it means "the load-time stack at its load-time scales",
+        // so it must stay legal on a family that cannot re-weight.
+        assert!(
+            validate_denoise_passes(&[pass(8, "euler", "normal", 1.0)], false, &cannot).is_ok()
+        );
+        // A family with a real apply/revert seam accepts it.
+        assert!(validate_denoise_passes(&[with_override], false, &ctx()).is_ok());
+    }
+
+    /// A model with no guidance axis (a CFG-free distilled Turbo) would accept a per-pass `guidance`
+    /// and then ignore it in a single conditional forward — the same accept-and-ignore class.
+    #[test]
+    fn per_pass_guidance_is_rejected_on_a_model_with_no_guidance_axis() {
+        let guided = DenoisePass {
+            guidance: Some(3.5),
+            ..pass(8, "euler", "normal", 1.0)
+        };
+        let cfg_free = DenoisePassContext {
+            supports_guidance: false,
+            ..ctx()
+        };
+        let err = validate_denoise_passes(std::slice::from_ref(&guided), false, &cfg_free)
+            .expect_err("an ignored guidance must be rejected");
+        assert_eq!(err.field(), DenoisePassField::Guidance);
+        assert_eq!(err.issue(), &DenoisePassIssue::GuidanceUnsupported);
+        // Omitting it is always fine, and a guided model accepts it.
+        assert!(
+            validate_denoise_passes(&[pass(8, "euler", "normal", 1.0)], false, &cfg_free).is_ok()
+        );
+        assert!(validate_denoise_passes(&[guided], false, &ctx()).is_ok());
+    }
+
+    /// The discoverable capability surface (sc-20425 item 6a) is derived from the descriptor alone —
+    /// no model-id table — and every list it publishes is a promise the floor keeps.
+    #[test]
+    fn the_denoise_pass_capability_surface_is_derived_from_the_descriptor() {
+        let off = Capabilities {
+            samplers: vec!["euler"],
+            schedulers: vec!["normal"],
+            ..Default::default()
+        };
+        let cap = off.denoise_pass_capability();
+        assert!(!cap.supported);
+        assert!(cap.fields.is_empty() && cap.samplers.is_empty() && cap.schedulers.is_empty());
+        assert_eq!(cap.to_json()["supported"], Value::Bool(false));
+
+        let on = Capabilities {
+            supports_denoise_passes: true,
+            supports_guidance: true,
+            supports_lora: true,
+            samplers: vec!["euler", "uni_pc", "lightning"],
+            schedulers: vec!["normal", "flow_match", "linear"],
+            denoise_pass_surface: DenoisePassSurface {
+                native_schedulers: &["flow_match"],
+                per_pass_adapters: true,
+            },
+            ..Default::default()
+        };
+        let cap = on.denoise_pass_capability();
+        assert!(cap.supported);
+        assert_eq!(cap.max_passes, MAX_DENOISE_PASSES);
+        assert_eq!(cap.max_steps_per_pass, crate::generator::MAX_STEPS);
+        // The uncurated sampler is filtered out; the declared native scheduler survives and the
+        // undeclared one does not.
+        assert_eq!(cap.samplers, vec!["euler", "uni_pc"]);
+        assert_eq!(cap.schedulers, vec!["normal", "flow_match"]);
+        assert_eq!(
+            cap.fields,
+            vec![
+                "steps",
+                "sampler",
+                "scheduler",
+                "denoise",
+                "guidance",
+                "adapters"
+            ]
+        );
+        assert!(cap.per_pass_adapters);
+
+        // The published lists and the floor agree — that is the whole point of publishing them.
+        let ctx = on.denoise_pass_context(None);
+        for id in &cap.samplers {
+            assert!(validate_denoise_passes(&[pass(8, id, "normal", 1.0)], false, &ctx).is_ok());
+        }
+        for id in &cap.schedulers {
+            assert!(validate_denoise_passes(&[pass(8, "euler", id, 1.0)], false, &ctx).is_ok());
+        }
+        assert!(
+            validate_denoise_passes(&[pass(8, "lightning", "normal", 1.0)], false, &ctx).is_err()
+        );
+        assert!(validate_denoise_passes(&[pass(8, "euler", "linear", 1.0)], false, &ctx).is_err());
+
+        // A CFG-free / adapter-free model publishes the narrower field list.
+        let narrow = Capabilities {
+            supports_denoise_passes: true,
+            samplers: vec!["euler"],
+            schedulers: vec!["normal"],
+            ..Default::default()
+        };
+        assert_eq!(
+            narrow.denoise_pass_capability().fields,
+            vec!["steps", "sampler", "scheduler", "denoise"]
+        );
+        let json = narrow.denoise_pass_capability().to_json();
+        assert_eq!(json["maxPasses"], Value::from(MAX_DENOISE_PASSES));
+        assert_eq!(json["perPassAdapters"], Value::Bool(false));
     }
 
     #[test]

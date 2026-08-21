@@ -294,6 +294,7 @@ pub fn descriptor() -> ModelDescriptor {
             // variants explicitly opt back OUT below (grounded edit conditioning is not in the
             // t2i-from-noise v1 surface). The candle twin advertises identically.
             supports_denoise_passes: true,
+            denoise_pass_surface: Default::default(),
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],

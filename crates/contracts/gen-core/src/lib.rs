@@ -79,10 +79,11 @@ pub use denoise_passes::{
 pub use denoise_passes::{
     curated_sampler_ids, curated_scheduler_ids, denoise_pass_seed,
     denoise_passes_from_advanced_json, denoise_passes_from_json, denoise_passes_to_json,
-    json_equal_within, resolve_denoise_plan, validate_denoise_passes, DenoiseDefaults, DenoisePass,
+    json_equal_within, resolve_denoise_plan, resolve_pass_scheduler, resolve_pass_solver,
+    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassCapability,
     DenoisePassContext, DenoisePassError, DenoisePassField, DenoisePassIssue, DenoisePassResult,
-    ResolvedDenoisePass, ResolvedDenoisePlan, DEFAULT_PASS_DENOISE, DENOISE_PASS_CONTRACT_VERSION,
-    DENOISE_PASS_SEED_SALT, MAX_DENOISE_PASSES,
+    DenoisePassSurface, ResolvedDenoisePass, ResolvedDenoisePlan, DEFAULT_PASS_DENOISE,
+    DENOISE_PASS_CONTRACT_VERSION, DENOISE_PASS_SEED_SALT, MAX_DENOISE_PASSES,
 };
 pub use encoder_contract::{
     read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,

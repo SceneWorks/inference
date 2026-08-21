@@ -8,7 +8,8 @@
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::denoise_passes::{
-    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassContext, DenoisePassResult,
+    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassCapability,
+    DenoisePassContext, DenoisePassField, DenoisePassResult, DenoisePassSurface,
     ResolvedDenoisePlan,
 };
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
@@ -2076,6 +2077,16 @@ pub struct Capabilities {
     /// Orthogonal to the Krea-RAW-only [`GenerationRequest::phases`]: the two request fields are
     /// mutually exclusive, and a model may support either, both, or neither.
     pub supports_denoise_passes: bool,
+    /// *What* this model honors on a chained pass, beyond the on/off bit above (sc-20425): the
+    /// advertised scheduler ids its own `build_schedule` really implements, and whether per-pass
+    /// adapter weight overrides are applied and reverted. See [`DenoisePassSurface`].
+    ///
+    /// `Default` is the empty, fail-closed surface, so every descriptor that has not adopted chained
+    /// passes keeps today's behaviour with no edit. A non-empty surface without
+    /// [`supports_denoise_passes`](Self::supports_denoise_passes) is rejected by the descriptor
+    /// conformance sweep — that pairing is what stops a *derived* descriptor
+    /// (`let mut d = base(); d.id = …;`) from inheriting half of this contract.
+    pub denoise_pass_surface: DenoisePassSurface,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -2314,14 +2325,80 @@ impl Capabilities {
     ///
     /// This is the same call the shared floor makes, exposed so a provider validates and resolves
     /// against exactly what the floor already checked instead of re-deriving it.
+    ///
+    /// The menus alone are not enough to decide a pass, which is what sc-20425 added: an *advertised*
+    /// id can still be one the chained path cannot honor, so the family's
+    /// [`denoise_pass_surface`](Self::denoise_pass_surface) rides along and the floor rejects the
+    /// difference instead of falling back to Euler / the native schedule.
     #[must_use]
     pub fn denoise_pass_context(&self, loaded_adapters: Option<usize>) -> DenoisePassContext<'_> {
         DenoisePassContext {
             supports_denoise_passes: self.supports_denoise_passes,
             samplers: (!self.samplers.is_empty()).then_some(self.samplers.as_slice()),
             schedulers: (!self.schedulers.is_empty()).then_some(self.schedulers.as_slice()),
+            native_schedulers: self.denoise_pass_surface.native_schedulers,
+            supports_guidance: self.supports_guidance,
+            per_pass_adapters: self.denoise_pass_surface.per_pass_adapters,
             loaded_adapters,
             max_steps: MAX_STEPS,
+        }
+    }
+
+    /// The **explicit** denoise-pass capability surface a consumer reads (sc-20425).
+    ///
+    /// Everything Studio and the worker need to build a per-pass editor: whether chains are honored,
+    /// the pass-count and per-pass step caps, which per-pass *fields* this model honors, and the
+    /// sampler/scheduler ids that survive the intersection rules. Derived entirely from this
+    /// descriptor — there is no model-id table anywhere in the derivation, so a family that edits its
+    /// menu edits this in the same commit.
+    ///
+    /// Every list here is a *promise*: an id or field outside it is rejected by
+    /// [`validate_denoise_passes`](crate::validate_denoise_passes) with a pass-indexed error, never
+    /// accepted and ignored.
+    #[must_use]
+    pub fn denoise_pass_capability(&self) -> DenoisePassCapability {
+        if !self.supports_denoise_passes {
+            return DenoisePassCapability {
+                supported: false,
+                max_passes: 0,
+                max_steps_per_pass: 0,
+                fields: Vec::new(),
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                per_pass_adapters: false,
+            };
+        }
+        let surface = self.denoise_pass_surface;
+        let mut fields = vec![
+            DenoisePassField::Steps.name(),
+            DenoisePassField::Sampler.name(),
+            DenoisePassField::Scheduler.name(),
+            DenoisePassField::Denoise.name(),
+        ];
+        if self.supports_guidance {
+            fields.push(DenoisePassField::Guidance.name());
+        }
+        if surface.per_pass_adapters {
+            fields.push(DenoisePassField::Adapters.name());
+        }
+        DenoisePassCapability {
+            supported: true,
+            max_passes: crate::denoise_passes::MAX_DENOISE_PASSES,
+            max_steps_per_pass: MAX_STEPS,
+            fields,
+            samplers: self
+                .samplers
+                .iter()
+                .copied()
+                .filter(|id| crate::sampling::Solver::from_name(id).is_some())
+                .collect(),
+            schedulers: self
+                .schedulers
+                .iter()
+                .copied()
+                .filter(|id| surface.honors_scheduler(id))
+                .collect(),
+            per_pass_adapters: surface.per_pass_adapters,
         }
     }
 

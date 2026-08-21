@@ -13,7 +13,7 @@ use gen_core::denoise_passes::{
     validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassContext, DenoisePassError,
     ResolvedDenoisePlan,
 };
-use gen_core::{Capabilities, Error, GenerationPhase, GenerationRequest};
+use gen_core::{Capabilities, DenoisePassSurface, Error, GenerationPhase, GenerationRequest};
 use serde_json::Value;
 
 /// The plan comparison tolerance. The contract's floats are `f32` and the fixtures are authored in
@@ -121,11 +121,31 @@ fn capabilities_of(fixture: &Value) -> Capabilities {
         ),
         supports_guidance: true,
         supports_negative_prompt: true,
+        supports_lora: true,
+        // The per-family denoise-pass surface (sc-20425). Both keys are optional and default
+        // **permissive**, exactly as `supportsDenoisePasses` above does: a fixture describes a
+        // request shape, and one written before this capability existed must not be retroactively
+        // invalidated by it. A fixture that wants the rejection asks for it by name.
+        denoise_pass_surface: DenoisePassSurface {
+            native_schedulers: intern_static(
+                caps.and_then(|c| c.get("nativeSchedulers"))
+                    .and_then(Value::as_array),
+            ),
+            per_pass_adapters: caps
+                .and_then(|c| c.get("perPassAdapters"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        },
         max_count: 8,
         min_size: 64,
         max_size: 4096,
         ..Default::default()
     }
+}
+
+/// [`intern`] for the `&'static [&'static str]` shape [`DenoisePassSurface`] carries.
+fn intern_static(values: Option<&Vec<Value>>) -> &'static [&'static str] {
+    Box::leak(intern(values).into_boxed_slice())
 }
 
 fn loaded_adapters_of(fixture: &Value) -> Option<usize> {
