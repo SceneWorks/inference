@@ -1344,14 +1344,12 @@ impl Sdxl {
             // reference stream.
             mlx_rs::random::seed(seed)?;
 
-            // Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
-            // `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents
-            // live in raw σ-space; the curated solver + scheduler are selected per request. Supports
-            // txt2img / img2img / ControlNet / IP-Adapter (inpaint is guarded out above).
             // Chained denoise passes (sc-20425): the curated VE lane, run pass by pass through the
             // shared executor with ONE decode per image after the whole chain. Everything this lane
             // does not serve was refused explicitly above, so reaching here means txt2img with no
-            // control / IP / mask / PiD / CFG++ overlay.
+            // control / IP / mask / PiD / CFG++ overlay. It is checked BEFORE `use_curated` because
+            // a chain names its algorithms per pass — the request-level sampler/scheduler that
+            // `use_curated` reads is only the ladder's inherited default here.
             if dp_plan.is_some() {
                 let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
                 // The plan is re-resolved per image so THIS image's pass seeds derive from its own
@@ -1407,6 +1405,10 @@ impl Sdxl {
                 continue;
             }
 
+            // Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
+            // `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents
+            // live in raw σ-space; the curated solver + scheduler are selected per request. Supports
+            // txt2img / img2img / ControlNet / IP-Adapter (inpaint is guarded out above).
             if use_curated {
                 let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
                 let sched = req
