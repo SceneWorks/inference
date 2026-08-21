@@ -1021,6 +1021,9 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
+        // `OPEN_EXISTING` keeps whatever flag the fixture writer set, so this only re-asserts it —
+        // but the appended span is what would allocate if the base file arrived dense.
+        gen_core_testkit::mark_sparse(path);
         let mut encoded_len = [0_u8; 8];
         file.read_exact(&mut encoded_len).unwrap();
         let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
@@ -1169,6 +1172,9 @@ mod tests {
         }
         let encoded = serde_json::to_vec(&header).unwrap();
         let mut file = std::fs::File::create(&combined).unwrap();
+        // The combined checkpoint carries the encoder's whole multi-GB payload span. Flag it
+        // between the create and the extend, or NTFS allocates all of it (see `mark_sparse`).
+        gen_core_testkit::mark_sparse(&combined);
         file.write_all(&(encoded.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(&encoded).unwrap();

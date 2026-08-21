@@ -51,6 +51,7 @@ pub mod text_encoder;
 pub mod training;
 pub mod transformer;
 pub mod vace;
+mod vace_fun_tier;
 pub mod vae;
 pub mod vae16;
 pub mod wan14b;

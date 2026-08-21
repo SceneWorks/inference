@@ -239,6 +239,39 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
+  # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
+  # like the real checkpoint it stands in for and then leave it unwritten, which is free on APFS and
+  # ext4 but allocates every cluster on NTFS unless the file is flagged sparse first. The assertions
+  # that pin the flag are therefore `#[cfg(windows)]`, and before this lane NOTHING executed them:
+  # `contracts` runs on ubuntu-latest, where those blocks compile out, and `windows-cuda-check`
+  # builds its test binaries with `--no-run`. A regression that made every multi-GB fixture allocate
+  # its full length again -- the failure that filled the Windows CUDA box's system drive twice and
+  # ended a candle-worker run with StorageFull, os error 112 -- was green on every automatic lane.
+  #
+  # Deliberately HOSTED windows-latest, not the self-hosted `[windows, cuda]` pair. The testkit
+  # links no tensor library and no CUDA (see its Cargo.toml), so it builds cold in well under a
+  # minute of hosted time, and the four self-hosted runners stay free for work that needs a GPU box.
+  # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
+  # resource in this repo to run a test that needs nothing but a filesystem.
+  contracts-windows:
+    name: contracts testkit (Windows)
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` -- see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
+      # package set. This lane is here only for the assertions that need a real NTFS volume.
+      - name: Test contracts testkit on NTFS
+        run: cargo test --locked -p sceneworks-gen-core-testkit
+
   # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
   # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
   # steps, with the same commands and the same step names, and all four are gated on the same
@@ -1004,6 +1037,7 @@ jobs:
       - format
       - workspace
       - contracts
+      - contracts-windows
       - candle-cpu-lint
       - candle-cpu-test
       - candle-cpu-conformance

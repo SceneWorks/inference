@@ -29,8 +29,66 @@ fn checked_product(values: &[usize], what: &str) -> Result<usize> {
 
 /// `x.conv2d`, split across batch and then output rows so no im2col buffer can enter candle's u32
 /// overflow band. The row path explicitly pads first, preserving ordinary symmetric-padding math.
-fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize) -> Result<Tensor> {
+pub(crate) fn chunked_conv2d(x: &Tensor, w: &Tensor, padding: usize) -> Result<Tensor> {
     chunked_conv2d_budgeted(x, w, padding, IM2COL_BUDGET)
+}
+
+/// Ordinary same-padded 3-D convolution. Unlike the VAE's `CausalConv3d`, the
+/// latent upscaler was trained with zero padding on both temporal edges.
+pub(crate) struct ZeroPaddedConv3d {
+    weight: Tensor,
+    bias: Tensor,
+    kt: usize,
+    spatial_pad: usize,
+}
+
+impl ZeroPaddedConv3d {
+    pub(crate) fn load(vb: VarBuilder, prefix: &str) -> Result<Self> {
+        let weight = guard_no_scales(&vb, prefix, vb.dtype())?.contiguous()?;
+        let dims = weight.dims();
+        let (out_c, kt, kh) = (dims[0], dims[2], dims[3]);
+        let bias = vb
+            .get_unchecked(&format!("{prefix}.bias"))?
+            .reshape((1, out_c, 1, 1, 1))?;
+        Ok(Self {
+            weight,
+            bias,
+            kt,
+            spatial_pad: (kh - 1) / 2,
+        })
+    }
+
+    /// `[B,C,T,H,W]` -> `[B,O,T,H,W]`, using symmetric zero padding in every
+    /// dimension (the upscaler checkpoint's native convention).
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, t, h, w) = x.dims5()?;
+        let temporal_pad = (self.kt - 1) / 2;
+        let xpad = if temporal_pad == 0 {
+            x.clone()
+        } else {
+            x.pad_with_zeros(2, temporal_pad, temporal_pad)?
+        };
+        let mut acc: Option<Tensor> = None;
+        for kd in 0..self.kt {
+            let wk = self.weight.narrow(2, kd, 1)?.squeeze(2)?.contiguous()?;
+            let frames = xpad.narrow(2, kd, t)?;
+            let merged = frames
+                .permute((0, 2, 1, 3, 4))?
+                .reshape((b * t, c, h, w))?
+                .contiguous()?;
+            let y = chunked_conv2d(&merged, &wk, self.spatial_pad)?;
+            acc = Some(match acc {
+                Some(a) => (a + y)?,
+                None => y,
+            });
+        }
+        let y = acc.expect("kt >= 1");
+        let (_, o, hp, wp) = y.dims4()?;
+        y.reshape((b, t, o, hp, wp))?
+            .permute((0, 2, 1, 3, 4))?
+            .contiguous()?
+            .broadcast_add(&self.bias)
+    }
 }
 
 fn chunked_conv2d_budgeted(
@@ -221,5 +279,34 @@ mod tests {
         let elements = checked_product(&[256, 256, 48, 3, 3], "1024px encoder conv").unwrap();
         assert!(elements < u32::MAX as usize);
         assert!(IM2COL_BUDGET < u32::MAX as usize);
+    }
+
+    #[test]
+    fn upsampler_zero_temporal_padding_is_not_vae_edge_replication() -> Result<()> {
+        let d = Device::Cpu;
+        let weight = Tensor::ones((1, 1, 3, 1, 1), candle_gen::candle_core::DType::F32, &d)?;
+        let bias = Tensor::zeros((1, 1, 1, 1, 1), candle_gen::candle_core::DType::F32, &d)?;
+        let causal = CausalConv3d {
+            weight: weight.clone(),
+            bias: bias.clone(),
+            kt: 3,
+            spatial_pad: 0,
+        };
+        let zero = ZeroPaddedConv3d {
+            weight,
+            bias,
+            kt: 3,
+            spatial_pad: 0,
+        };
+        let x = Tensor::from_vec(vec![1f32, 2.], (1, 1, 2, 1, 1), &d)?;
+        assert_eq!(
+            zero.forward(&x)?.flatten_all()?.to_vec1::<f32>()?,
+            vec![3., 3.]
+        );
+        assert_eq!(
+            causal.forward(&x, false)?.flatten_all()?.to_vec1::<f32>()?,
+            vec![4., 5.]
+        );
+        Ok(())
     }
 }
