@@ -16,8 +16,9 @@
 //! → `LtxVocoder` → a synchronized 48 kHz stereo `AudioTrack`. Registered under
 //! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). Reference I2V, FLF/keyframes,
 //! extend/bridge IC-LoRA clips, and masked replace-person controls share the VAE encoder and per-token
-//! timestep path. The 2-stage latent upsampler, prompt-enhance, and fp8/on-the-fly quant remain
-//! deferred. LTX AudioVideo projection adapters are supported on both dense and packed tiers.
+//! timestep path. The learned 2-stage latent upsampler runs between half-resolution stage one and
+//! full-resolution stage two; prompt-enhance and fp8/on-the-fly quant remain deferred. LTX AudioVideo
+//! projection adapters are supported on both dense and packed tiers.
 //!
 //! **Dtypes:** the DiT, connector, text projection, and Gemma encoder run **bf16** (the checkpoint's
 //! native dtype; 22B+12B does not fit f32 on a single 96 GB GPU); the VAE runs **f32**; attention and
@@ -45,6 +46,7 @@ pub mod text_encoder;
 pub mod tier;
 pub mod training;
 pub mod transformer;
+pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
@@ -64,10 +66,12 @@ use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResu
 use audio_vae::AudioDecoder;
 use config::{
     compute_audio_frames, AudioVaeConfig, AvConfig, ConnectorConfig, GemmaConfig, VocoderConfig,
-    DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, TEXT_MAX_LENGTH,
+    DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, STAGE2_SIGMAS,
+    TEXT_MAX_LENGTH,
 };
 use text_encoder::LtxTextEncoder;
 use transformer::AvDiT;
+use upsampler::LatentUpsampler;
 use vae::LtxVideoVae;
 /// Provider-facing LTX geometry, derived from the decoder implementation.
 pub const VAE_TILING: candle_gen::gen_core::tiling::VaeTiling = LtxVideoVae::VAE_TILING;
@@ -93,13 +97,14 @@ mod vae_tiling_assignment_tests {
 /// single-stage `ltx_2_3_distilled` renders on the 32× VAE grid. Exposed as the pinned-engine stride
 /// SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors `wan::config::SIZE_MULTIPLE_14B`.
 /// Divergent by backend on purpose: mlx's two-stage `ltx_2_3` uses `SIZE_MULTIPLE = 2×SPATIAL_SCALE` (= 64).
-pub const SIZE_MULTIPLE: u32 = config::SPATIAL_SCALE as u32;
+pub const SIZE_MULTIPLE: u32 = (config::SPATIAL_SCALE * 2) as u32;
 
 #[derive(Clone)]
 struct Components {
     te: Arc<LtxTextEncoder>,
     avdit: Arc<AvDiT>,
     vae: Arc<LtxVideoVae>,
+    upsampler: Arc<LatentUpsampler>,
     vae_has_encoder: bool,
     /// Audio decode chain — `None` on the packed MLX tier path (sc-9545), which is **video-only**: the
     /// tier's audio-VAE + vocoder ship in a different key layout (channels-last convs, no `decoder.`/
@@ -141,10 +146,16 @@ struct Pipeline {
     device: Device,
     /// Gemma-encoder path from `LoadSpec::text_encoder` (sc-8827); see [`Pipeline::gemma_dir`].
     gemma_override: Option<PathBuf>,
+    upsampler_override: Option<PathBuf>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device, gemma_override: Option<PathBuf>) -> Self {
+    fn load(
+        root: &Path,
+        device: &Device,
+        gemma_override: Option<PathBuf>,
+        upsampler_override: Option<PathBuf>,
+    ) -> Self {
         Self {
             av_cfg: AvConfig::ltx_2_3(),
             gemma_cfg: GemmaConfig::gemma_3_12b(),
@@ -155,6 +166,7 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             gemma_override,
+            upsampler_override,
         }
     }
 
@@ -172,6 +184,13 @@ impl Pipeline {
     /// co-located `<root>/text_encoder` (sc-13749 — no environment / HF-cache scan any more).
     fn gemma_dir(&self) -> CResult<PathBuf> {
         gemma_dir_for(&self.root, self.gemma_override.as_deref())
+    }
+
+    fn upsampler_file(&self) -> CResult<PathBuf> {
+        if let Some(path) = &self.upsampler_override {
+            return canonical_upsampler_file(path);
+        }
+        canonical_upsampler_file(&self.root)
     }
 
     fn safetensors_in(dir: &Path) -> CResult<Vec<PathBuf>> {
@@ -199,6 +218,8 @@ impl Pipeline {
         let ltx_files = [ltx_file];
         let vb_bf16 = candle_gen::mmap_var_builder(&ltx_files, DIT_DTYPE, &self.device)?;
         let vb_f32 = candle_gen::mmap_var_builder(&ltx_files, VAE_DTYPE, &self.device)?;
+        let upsampler_vb =
+            candle_gen::mmap_var_builder(&[self.upsampler_file()?], VAE_DTYPE, &self.device)?;
         let gemma_vb = candle_gen::mmap_var_builder(&gemma_files, DIT_DTYPE, &self.device)?
             .pp("language_model.model");
 
@@ -223,6 +244,7 @@ impl Pipeline {
         } else {
             LtxVideoVae::new(vb_f32.pp("vae"), config::LATENT_CHANNELS, 4)?
         };
+        let upsampler = LatentUpsampler::load(upsampler_vb)?;
         // The audio VAE decoder + vocoder run f32 (post-sampling quality islands).
         let audio_decoder = AudioDecoder::load(&vb_f32.pp("audio_vae"), &self.audio_vae_cfg)?;
         let vocoder = LtxVocoder::load(vb_f32, &self.device, &self.vocoder_cfg)?;
@@ -236,6 +258,7 @@ impl Pipeline {
             te: Arc::new(te),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            upsampler: Arc::new(upsampler),
             vae_has_encoder: with_vae_encoder,
             audio: Some(AudioChain {
                 decoder: Arc::new(audio_decoder),
@@ -266,6 +289,13 @@ impl Pipeline {
         let dit_vb = paths.dit_vb(DIT_DTYPE, &self.device)?;
         let conn_vb = paths.connector_vb(DIT_DTYPE, &self.device)?;
         let vae_vb = paths.vae_vb(VAE_DTYPE, &self.device)?;
+        // Explicit component sources take precedence even for a split tier;
+        // otherwise the canonical co-located tier file is used.
+        let upsampler_vb = if self.upsampler_override.is_some() {
+            candle_gen::mmap_var_builder(&[self.upsampler_file()?], VAE_DTYPE, &self.device)?
+        } else {
+            paths.upsampler_vb(VAE_DTYPE, &self.device)?
+        };
         let gemma_vb = paths.gemma_vb(DIT_DTYPE, &self.device)?;
 
         // The DiT loader roots at `model.diffusion_model.` (the remap strips it); the connector loader
@@ -293,6 +323,7 @@ impl Pipeline {
         } else {
             LtxVideoVae::new(vae_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
         };
+        let upsampler = LatentUpsampler::load(upsampler_vb)?;
 
         let tok_path = paths.tokenizer_path();
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
@@ -302,6 +333,7 @@ impl Pipeline {
             te: Arc::new(te),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            upsampler: Arc::new(upsampler),
             vae_has_encoder: with_vae_encoder,
             audio: None,
             tokenizer: Arc::new(tokenizer),
@@ -362,6 +394,8 @@ impl Pipeline {
         req: &GenerationRequest,
         vae: &LtxVideoVae,
         latent_frames: usize,
+        width: u32,
+        height: u32,
     ) -> CResult<Vec<EncodedKeyframe>> {
         let mut out = Vec::new();
         let mut reference_seen = false;
@@ -376,7 +410,7 @@ impl Pipeline {
                     }
                     reference_seen = true;
                     out.push(EncodedKeyframe {
-                        latent: self.encode_image(vae, image, req.width, req.height)?,
+                        latent: self.encode_image(vae, image, width, height)?,
                         frame_idx: 0,
                         strength: strength.or(req.strength).unwrap_or(1.0),
                     });
@@ -386,7 +420,7 @@ impl Pipeline {
                     frame_idx,
                     strength,
                 } => out.push(EncodedKeyframe {
-                    latent: self.encode_image(vae, image, req.width, req.height)?,
+                    latent: self.encode_image(vae, image, width, height)?,
                     frame_idx: Self::latent_index(*frame_idx, latent_frames, "keyframe")?,
                     strength: *strength,
                 }),
@@ -402,14 +436,16 @@ impl Pipeline {
         req: &GenerationRequest,
         vae: &LtxVideoVae,
         latent_frames: usize,
+        width: u32,
+        height: u32,
     ) -> CResult<Vec<EncodedClip>> {
         let mut out = Vec::new();
         for clip in req.video_clips() {
             let idx = Self::latent_index(clip.frame_idx, latent_frames, "clip")?;
             let video = conditioning::preprocess_conditioning_clip(
                 clip.frames,
-                req.width,
-                req.height,
+                width,
+                height,
                 &self.device,
             )?;
             out.push(EncodedClip {
@@ -435,12 +471,8 @@ impl Pipeline {
                     conditioning::apply_replacement_mask(frame, mask, control.masking_strength)
                 })
                 .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
-            let video = conditioning::preprocess_conditioning_clip(
-                &masked,
-                req.width,
-                req.height,
-                &self.device,
-            )?;
+            let video =
+                conditioning::preprocess_conditioning_clip(&masked, width, height, &self.device)?;
             out.push(EncodedClip {
                 latent: vae.encode(&video)?,
                 frame_offset: conditioning::latent_frame_to_output_offset(idx)?,
@@ -468,17 +500,22 @@ impl Pipeline {
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
         let (video_ctx, audio_ctx) = comps.te.encode_both(&input_ids, &mask01)?;
 
-        // Latent geometry + position grids (video 3-axis, audio 1-axis time).
-        let (t_lat, h_lat, w_lat) = pipeline::latent_dims(frames, req.width, req.height);
+        // Stage one lives on the half-resolution grid; the learned upsampler is
+        // the only bridge to the full-resolution stage-two grid.
+        let geometry = pipeline::two_stage_geometry(frames, req.width, req.height);
+        let (t_lat, h_lat, w_lat) = (geometry.t, geometry.h1, geometry.w1);
         let af = compute_audio_frames(frames as usize, fps as f64).max(1);
         let video_grid = rope::create_position_grid(t_lat, h_lat, w_lat, fps as f32, &self.device)?;
         let audio_grid = rope::create_audio_position_grid(af, &self.device)?;
 
         let vnoise = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
-        let anoise = pipeline::create_audio_noise(seed, af, &self.device)?;
+        let anoise = pipeline::create_audio_noise(seed.wrapping_add(2), af, &self.device)?;
 
-        let keyframes = self.build_keyframes(req, &comps.vae, t_lat)?;
-        let clips = self.build_clips(req, &comps.vae, t_lat)?;
+        let keyframes =
+            self.build_keyframes(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
+        let stage2_keyframes =
+            self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
+        let clips = self.build_clips(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
         let conditioned = !keyframes.is_empty() || !clips.is_empty();
         if conditioned
             && !matches!(
@@ -500,6 +537,10 @@ impl Pipeline {
         // FLOW `x0 = x − σ·v` recombine + euler == the native scheduler), the N1 no-op. Both streams are
         // velocity-prediction (`Sigma` convention); the AvDiT couples them via cross-modal attention each
         // forward, so the per-step model eval (flatten → AvDiT → unflatten) lives inside the closure.
+        let mut stage1_progress = |event: Progress| match event {
+            Progress::Step { current, .. } => on_progress(Progress::Step { current, total: 11 }),
+            other => on_progress(other),
+        };
         let (vlat, alat) = if conditioned {
             let mut state = if keyframes.is_empty() {
                 conditioning::VideoTokenState::base(&vnoise, &video_grid)?
@@ -536,7 +577,7 @@ impl Pipeline {
                 &audio_grid,
                 &STAGE1_SIGMAS,
                 &req.cancel,
-                on_progress,
+                &mut stage1_progress,
             )?;
             let generated = state.latent.narrow(1, 0, state.target_tokens)?;
             (
@@ -553,7 +594,7 @@ impl Pipeline {
                 },
                 seed,
                 &req.cancel,
-                on_progress,
+                &mut stage1_progress,
                 |av, sigma| -> CResult<AvLatents> {
                     let vflat = pipeline::flatten_latent(&av.video)?;
                     let aflat = pipeline::flatten_audio_latent(&av.audio)?;
@@ -579,6 +620,113 @@ impl Pipeline {
             )?;
             (out.video, out.audio)
         };
+
+        // The denoised half-resolution latent enters the learned upsampler in
+        // VAE space, then returns to DiT-normalized space before fresh stage-two
+        // video/audio re-noise. Never substitute interpolation or a second pass
+        // on the stage-one model output.
+        let upsampled = comps.vae.normalize_latents(
+            &comps
+                .upsampler
+                .forward(&comps.vae.denormalize_latents(&vlat)?)?,
+        )?;
+        let stage2_video_noise = pipeline::create_noise(
+            seed.wrapping_add(1),
+            geometry.t,
+            geometry.h2,
+            geometry.w2,
+            &self.device,
+        )?;
+        let stage2_audio_noise =
+            pipeline::create_audio_noise(seed.wrapping_add(3), af, &self.device)?;
+        let stage2_grid = rope::create_position_grid(
+            geometry.t,
+            geometry.h2,
+            geometry.w2,
+            fps as f32,
+            &self.device,
+        )?;
+        comps.avdit.set_adapter_pass(1);
+        let mut stage2_progress = |event: Progress| match event {
+            Progress::Step { current, .. } => on_progress(Progress::Step {
+                current: 8 + current,
+                total: 11,
+            }),
+            other => on_progress(other),
+        };
+        let stage2 = if stage2_keyframes.is_empty() {
+            run_av_curated_sampler(
+                req.sampler.as_deref(),
+                &STAGE2_SIGMAS,
+                AvLatents {
+                    video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
+                    audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
+                },
+                seed.wrapping_add(1),
+                &req.cancel,
+                &mut stage2_progress,
+                |av, sigma| -> CResult<AvLatents> {
+                    let vflat = pipeline::flatten_latent(&av.video)?;
+                    let aflat = pipeline::flatten_audio_latent(&av.audio)?;
+                    let (vvel, avel) = comps.avdit.forward(
+                        &vflat,
+                        &aflat,
+                        sigma as f64,
+                        &video_ctx,
+                        &audio_ctx,
+                        &stage2_grid,
+                        &audio_grid,
+                    )?;
+                    Ok(AvLatents {
+                        video: pipeline::unflatten_latent(
+                            &vvel.to_dtype(DType::F32)?,
+                            geometry.t,
+                            geometry.h2,
+                            geometry.w2,
+                        )?,
+                        audio: pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?,
+                    })
+                },
+            )?
+        } else {
+            // FLF/I2V keys are encoded at both grids. Clips deliberately stop at
+            // stage one: their appended-token positions are half-resolution IC-LoRA
+            // controls, while stage two conditions only its target video tokens.
+            let borrowed = stage2_keyframes
+                .iter()
+                .map(|keyframe| conditioning::Keyframe {
+                    latent: &keyframe.latent,
+                    frame_idx: keyframe.frame_idx,
+                    strength: keyframe.strength,
+                })
+                .collect::<Vec<_>>();
+            let conditioned = conditioning::apply_keyframes(&upsampled, &borrowed)?
+                .noised(&stage2_video_noise, STAGE2_SIGMAS[0])?;
+            let state = conditioning::VideoTokenState::from_i2v(&conditioned, &stage2_grid)?;
+            let (state, audio) = pipeline::denoise_av_conditioned(
+                &comps.avdit,
+                &state,
+                &pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
+                &video_ctx,
+                &audio_ctx,
+                af,
+                &audio_grid,
+                &STAGE2_SIGMAS,
+                &req.cancel,
+                &mut stage2_progress,
+            )?;
+            let generated = state.latent.narrow(1, 0, state.target_tokens)?;
+            AvLatents {
+                video: pipeline::unflatten_latent(
+                    &generated,
+                    geometry.t,
+                    geometry.h2,
+                    geometry.w2,
+                )?,
+                audio,
+            }
+        };
+        let (vlat, alat) = (stage2.video, stage2.audio);
 
         on_progress(Progress::Decoding);
         // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
@@ -607,6 +755,7 @@ pub struct LtxGenerator {
     /// Optional Gemma-encoder snapshot dir from `LoadSpec::text_encoder` (sc-8827); wins over the
     /// co-located `<root>/text_encoder` fallback in [`Pipeline::gemma_dir`] (sc-13749 — no env / cache).
     gemma_override: Option<PathBuf>,
+    upsampler_override: Option<PathBuf>,
     adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
@@ -799,7 +948,12 @@ impl Generator for LtxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device, self.gemma_override.clone());
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.gemma_override.clone(),
+            self.upsampler_override.clone(),
+        );
         let components = self.components(&pipe, needs_ltx_vae_encoder(req))?;
         let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video { frames, fps, audio })
@@ -885,6 +1039,7 @@ fn ltx_checkpoint_in(root: &Path) -> CResult<PathBuf> {
             name.ends_with(".safetensors")
                 && !name.contains("lora")
                 && !name.contains("upscaler")
+                && !name.contains("upsampler")
                 && !name.contains("fp8")
                 && !name.contains("mixed")
         })
@@ -908,6 +1063,35 @@ fn ltx_checkpoint_in(root: &Path) -> CResult<PathBuf> {
         .into_iter()
         .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .expect("cands non-empty"))
+}
+
+/// Resolve the published learned refinement component. A `File` source is
+/// exact; a directory source and ordinary snapshot use the canonical filename.
+fn canonical_upsampler_file(path: &Path) -> CResult<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    let canonical = path.join("upsampler.safetensors");
+    if canonical.is_file() {
+        return Ok(canonical);
+    }
+    Err(CandleError::Msg(format!(
+        "ltx requires the learned spatial upscaler — provide LoadSpec::components[\"spatial_upscaler\"] \
+         as upsampler.safetensors or a directory containing it (looked in {})",
+        canonical.display()
+    )))
+}
+
+fn spec_upsampler_file(spec: &LoadSpec, root: &Path) -> CResult<PathBuf> {
+    match spec
+        .components
+        .get(gen_core::LTX_SPATIAL_UPSCALER_COMPONENT)
+    {
+        Some(WeightsSource::File(path)) | Some(WeightsSource::Dir(path)) => {
+            canonical_upsampler_file(path)
+        }
+        None => canonical_upsampler_file(root),
+    }
 }
 
 /// The Gemma-3-12B encoder snapshot dir for a `root` + the `LoadSpec::text_encoder` path (sc-8827):
@@ -987,7 +1171,11 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
         let tier_file = |name: &str| gen_core::safetensors_path_bytes(paths.tier_dir.join(name));
         return Ok(PerComponentBytes {
             text_encoder: gen_core::safetensors_path_bytes(&paths.gemma_dir),
-            dit: tier_file("transformer.safetensors") + tier_file("connector.safetensors"),
+            dit: tier_file("transformer.safetensors")
+                + tier_file("connector.safetensors")
+                + spec_upsampler_file(spec, &paths.tier_dir)
+                    .map(gen_core::safetensors_path_bytes)
+                    .unwrap_or(0),
             vae: tier_file("vae_decoder.safetensors") + tier_file("vae_encoder.safetensors"),
         });
     }
@@ -998,7 +1186,10 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
         // The one dense checkpoint bundles DiT + VAE + audio-VAE + vocoder + projection.
         dit: ltx_checkpoint_in(&root)
             .map(gen_core::safetensors_path_bytes)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            + spec_upsampler_file(spec, &root)
+                .map(gen_core::safetensors_path_bytes)
+                .unwrap_or(0),
         vae: 0,
     })
 }
@@ -1020,7 +1211,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Named-component contract (sc-13658/sc-13749): candle LTX-2.3 recognizes NO `LoadSpec::components`
     // keys — its Gemma TE rides the typed `text_encoder` slot, and it has no uncensored/amoral enhancer
     // variant (the mlx-only `uncensored_enhancer`). Reject any component key up front as `Unsupported`.
-    gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    gen_core::reject_unknown_components(
+        spec,
+        &[gen_core::LTX_SPATIAL_UPSCALER_COMPONENT],
+        MODEL_ID,
+    )?;
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle ltx does not support on-the-fly Q4/Q8 quantization yet".into(),
@@ -1037,12 +1232,19 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let gemma_override = spec.text_encoder.as_ref().map(|src| match src {
         WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
     });
+    let upsampler_override = spec
+        .components
+        .get(gen_core::LTX_SPATIAL_UPSCALER_COMPONENT)
+        .map(|src| match src {
+            WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
+        });
     let device = candle_gen::default_device()?;
     Ok(Box::new(LtxGenerator {
         descriptor: descriptor(),
         root,
         device,
         gemma_override,
+        upsampler_override,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
@@ -1107,6 +1309,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_spatial_upscaler_is_actionable() {
+        let root = tempfile::tempdir().unwrap();
+        let error = canonical_upsampler_file(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("spatial_upscaler"), "got: {error}");
+        assert!(error.contains("upsampler.safetensors"), "got: {error}");
+    }
+
+    #[test]
     fn registers_and_resolves_as_candle_video() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = crate::provider_registry()
@@ -1141,6 +1353,7 @@ mod tests {
             Path::new("/nonexistent/root"),
             &Device::Cpu,
             Some(real.clone()),
+            None,
         );
         assert_eq!(pipe.gemma_dir().unwrap(), real);
 
@@ -1149,6 +1362,7 @@ mod tests {
             Path::new("/nonexistent/root"),
             &Device::Cpu,
             Some(PathBuf::from("/nonexistent/ltx_gemma")),
+            None,
         );
         let err = bad.gemma_dir().unwrap_err().to_string();
         assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
@@ -1157,7 +1371,7 @@ mod tests {
         // no text_encoder and no co-located `<root>/text_encoder` must ERROR — the env is never read.
         // (Tests run single-threaded here, `RUST_TEST_THREADS=1`, so mutating the process env is safe.)
         std::env::set_var("LTX_GEMMA_DIR", &real);
-        let no_te = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None);
+        let no_te = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None, None);
         let err = no_te.gemma_dir().unwrap_err().to_string();
         assert!(
             err.contains("LoadSpec::text_encoder"),
@@ -1177,7 +1391,7 @@ mod tests {
     #[test]
     fn gemma_dir_requires_slot_or_colocated() {
         // Absent everywhere → actionable error naming the slot, never the removed env var.
-        let none = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None);
+        let none = Pipeline::load(Path::new("/nonexistent/root"), &Device::Cpu, None, None);
         let err = none.gemma_dir().unwrap_err().to_string();
         assert!(err.contains("LoadSpec::text_encoder"), "got: {err}");
         assert!(
@@ -1190,7 +1404,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         let te = root.join("text_encoder");
         std::fs::create_dir_all(&te).unwrap();
-        let pipe = Pipeline::load(&root, &Device::Cpu, None);
+        let pipe = Pipeline::load(&root, &Device::Cpu, None, None);
         assert_eq!(pipe.gemma_dir().unwrap(), te);
     }
 
@@ -1251,7 +1465,7 @@ mod tests {
             for f in files {
                 std::fs::write(dir.join(f), b"x").unwrap();
             }
-            let pipe = Pipeline::load(&dir, &Device::Cpu, None);
+            let pipe = Pipeline::load(&dir, &Device::Cpu, None, None);
             let got = pipe.ltx_checkpoint().unwrap();
             let name = got.file_name().unwrap().to_str().unwrap().to_owned();
             name
@@ -1321,7 +1535,7 @@ mod tests {
         let base = GenerationRequest {
             prompt: "a person crosses the room".into(),
             width: 704,
-            height: 480,
+            height: 512,
             frames: Some(49),
             ..Default::default()
         };
@@ -1395,7 +1609,7 @@ mod tests {
         let base = GenerationRequest {
             prompt: "x".into(),
             width: 704,
-            height: 480,
+            height: 512,
             frames: Some(49),
             ..Default::default()
         };
@@ -1464,7 +1678,7 @@ mod tests {
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 704,
-            height: 480,
+            height: 512,
             frames: Some(49),
             sampler: Some("rectified-flow".into()),
             ..Default::default()
@@ -1486,19 +1700,19 @@ mod tests {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
         // sc-12587: `SIZE_MULTIPLE` is the pinned stride SceneWorks ties `requiresDimensionsMultipleOf`
-        // to — candle's distilled ltx renders single-stage on the 32× VAE grid. Pin the value and prove
+        // to — candle's distilled ltx refines on the 64× final-output grid. Pin the value and prove
         // a multiple of 16 that is not a multiple of SIZE_MULTIPLE is rejected with the stride error.
-        assert_eq!(SIZE_MULTIPLE, config::SPATIAL_SCALE as u32);
-        assert_eq!(SIZE_MULTIPLE, 32);
+        assert_eq!(SIZE_MULTIPLE, (config::SPATIAL_SCALE * 2) as u32);
+        assert_eq!(SIZE_MULTIPLE, 64);
         let off_stride = g
             .validate(&GenerationRequest {
-                width: 48, // 3×16 — a multiple of 16 but not SIZE_MULTIPLE
+                width: 672, // 21×32 — above the minimum but not SIZE_MULTIPLE
                 ..ok.clone()
             })
             .unwrap_err()
             .to_string();
         assert!(
-            off_stride.contains("multiples of 32"),
+            off_stride.contains("multiples of 64"),
             "expected the stride error, got: {off_stride}"
         );
     }
@@ -1524,7 +1738,7 @@ mod tests {
         let base = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
             width: 704,
-            height: 480,
+            height: 512,
             frames: Some(49),
             ..Default::default()
         };
@@ -1596,7 +1810,7 @@ mod tests {
         let ok = GenerationRequest {
             frames: Some(129),
             width: 704,
-            height: 480,
+            height: 512,
             ..base
         };
         assert!(
@@ -1671,7 +1885,7 @@ mod tests {
             ("vae_encoder.safetensors", 9_000),     // loaded for video conditioning
             ("audio_vae.safetensors", 8_000),       // NOT loaded
             ("vocoder.safetensors", 7_000),         // NOT loaded
-            ("upsampler.safetensors", 6_000),       // NOT loaded
+            ("upsampler.safetensors", 6_000),       // loaded for stage two
         ] {
             std::fs::File::create(tier.join(name))
                 .unwrap()
@@ -1689,10 +1903,10 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(tier.clone()));
         let fp = component_footprint(&spec).expect("footprint");
 
-        assert_eq!(fp.dit, 5_700, "transformer + connector");
+        assert_eq!(fp.dit, 11_700, "transformer + connector + upsampler");
         assert_eq!(fp.vae, 9_300, "decoder + conditioning encoder");
         assert_eq!(fp.text_encoder, 4_000, "the sibling gemma/ dir");
-        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 19_000);
+        assert_eq!(fp.text_encoder + fp.dit + fp.vae, 25_000);
     }
 
     /// An unresolvable snapshot reports NO SIGNAL rather than erroring: the footprint is a pre-load

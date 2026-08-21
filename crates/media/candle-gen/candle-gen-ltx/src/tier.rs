@@ -193,6 +193,11 @@ impl TierPaths {
         ))
     }
 
+    /// Learned spatial refinement weights co-located with the packed tier.
+    pub fn upsampler_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        candle_gen::mmap_var_builder(&[self.file("upsampler.safetensors")?], dtype, device)
+    }
+
     /// The Gemma-3-12B encoder VarBuilder rooted at `language_model.model.` over the tier's sibling
     /// `gemma/` shards. The tier ships Gemma **dense** with the standard `language_model.model.*` keys
     /// (matches the crate exactly), so no remap — just the sorted-shard resolve.

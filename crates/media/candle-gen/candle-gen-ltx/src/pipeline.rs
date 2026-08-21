@@ -22,6 +22,28 @@ pub fn latent_dims(frames: u32, width: u32, height: u32) -> (usize, usize, usize
     (t_lat, h_lat, w_lat)
 }
 
+/// Geometry for the truthful two-stage LTX path. Stage one is exactly half of
+/// the requested spatial resolution; the learned upsampler produces stage two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwoStageGeometry {
+    pub t: usize,
+    pub h1: usize,
+    pub w1: usize,
+    pub h2: usize,
+    pub w2: usize,
+}
+
+pub fn two_stage_geometry(frames: u32, width: u32, height: u32) -> TwoStageGeometry {
+    let (t, h2, w2) = latent_dims(frames, width, height);
+    TwoStageGeometry {
+        t,
+        h1: h2 / 2,
+        w1: w2 / 2,
+        h2,
+        w2,
+    }
+}
+
 /// Deterministic N(0,1) latent noise `[1, 128, t_lat, h_lat, w_lat]` (f32) — CPU `StdRng` (ChaCha),
 /// launch-portable per seed.
 pub fn create_noise(
@@ -58,14 +80,19 @@ pub fn unflatten_latent(tokens: &Tensor, f: usize, h: usize, w: usize) -> Result
 // --- Synchronized audio (sc-5495) ----------------------------------------------------------------
 
 /// Deterministic N(0,1) audio latent noise `[1, 8, audio_frames, 16]` (f32) — seed offset +2 keeps it
-/// distinct from the video noise stream (matches the reference's per-modality keys).
+/// distinct from the video noise stream (callers pass the explicit stream seed).
 pub fn create_audio_noise(seed: u64, audio_frames: usize, device: &Device) -> Result<Tensor> {
     let ch = AUDIO_LATENT_CHANNELS as usize;
     let mel = AUDIO_MEL_BINS as usize;
     let n = ch * audio_frames * mel;
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(2));
+    let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, ch, audio_frames, mel), device)
+}
+
+/// Re-noise a generated clean latent for the next distilled stage.
+pub fn renoise(latent: &Tensor, fresh_noise: &Tensor, sigma: f32) -> Result<Tensor> {
+    (latent * (1.0 - sigma) as f64)? + (fresh_noise * sigma as f64)?
 }
 
 /// Audio latent `[1, 8, T, 16]` → tokens `[1, T, 128]` (per time-frame flatten of `(ch, mel)`,
@@ -196,4 +223,47 @@ pub fn frames_to_images(decoded: &Tensor) -> Result<Vec<Image>> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_stage_geometry_requires_a_64_pixel_final_grid() {
+        let g = two_stage_geometry(49, 704, 512);
+        assert_eq!((g.t, g.h1, g.w1, g.h2, g.w2), (7, 8, 11, 16, 22));
+    }
+
+    #[test]
+    fn stage_streams_have_distinct_seed_offsets() -> Result<()> {
+        let device = Device::Cpu;
+        let video1 = create_noise(9, 1, 1, 1, &device)?;
+        let video2 = create_noise(10, 1, 1, 1, &device)?;
+        let audio1 = create_audio_noise(11, 1, &device)?;
+        let audio2 = create_audio_noise(12, 1, &device)?;
+        assert_ne!(
+            video1.flatten_all()?.to_vec1::<f32>()?,
+            video2.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_ne!(
+            audio1.flatten_all()?.to_vec1::<f32>()?,
+            audio2.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renoise_uses_the_fresh_stage_noise_at_sigma_one() -> Result<()> {
+        let d = Device::Cpu;
+        let latent = Tensor::zeros((1, 1, 1, 1, 1), DType::F32, &d)?;
+        let noise = Tensor::ones((1, 1, 1, 1, 1), DType::F32, &d)?;
+        assert_eq!(
+            renoise(&latent, &noise, 1.0)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            vec![1.0]
+        );
+        Ok(())
+    }
 }
