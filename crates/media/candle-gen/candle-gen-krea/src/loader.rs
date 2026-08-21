@@ -1512,19 +1512,18 @@ mod tests {
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
     }
 
-    /// Replace `target` while a provider has the original file mapped. Unix can exercise the exact
-    /// production failure mode with an atomic rename: the open mmap keeps consuming the original
-    /// inode while the selected path names a new one. Other platforms overwrite an identically shaped
-    /// safetensors payload so the test remains compilable/runnable without relying on Unix rename
-    /// semantics; the retained fingerprint still has to reject that mutation.
-    fn replace_mapped_fixture(replacement: &Path, target: &Path) {
-        #[cfg(unix)]
-        std::fs::rename(replacement, target).expect("atomically replace mapped source");
-        #[cfg(not(unix))]
-        {
-            let bytes = std::fs::read(replacement).expect("read replacement fixture");
-            std::fs::write(target, bytes).expect("overwrite mapped source");
-        }
+    /// Replace `target` while a provider has the original file mapped, exercising the exact
+    /// production failure mode on every platform: the open mmap keeps consuming the original object
+    /// while the selected path comes to name a new one. A replacing rename is the only swap that can
+    /// do that — Windows refuses to truncate or write a file with an open mapped section
+    /// (ERROR_USER_MAPPED_FILE, 1224), so the read+write form this used off-Unix could only ever
+    /// fail. The retained fingerprint still rejects the swap on Windows, via the file id and change
+    /// time, which differ even when the two files share a size and mtime.
+    ///
+    /// Returns the outcome rather than asserting it: callers run this between two barriers, where an
+    /// early return would strand the reader on one and hang the test binary.
+    fn replace_mapped_fixture(replacement: &Path, target: &Path) -> std::io::Result<()> {
+        std::fs::rename(replacement, target)
     }
 
     /// The Krea File loader's guard must end only after Candle has copied the last requested tensor
@@ -1576,12 +1575,14 @@ mod tests {
         let writer_done = Arc::clone(&replacement_done);
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            replace_mapped_fixture(&writer_replacement, &writer_source);
+            let swapped = replace_mapped_fixture(&writer_replacement, &writer_source);
+            // Release the reader whatever the swap did; the outcome is asserted on `join` below.
             writer_done.wait();
+            swapped
         });
 
         let consumed = Arc::clone(&last_consumed);
-        let error = match weights.read_source_unchanged(|| {
+        let outcome = weights.read_source_unchanged(|| {
             let first = weights.get("phase.first")?.to_vec1::<f32>()?;
             assert!(first.iter().all(|value| *value == 0.25));
             first_consumed.wait();
@@ -1595,13 +1596,18 @@ mod tests {
             dev.synchronize()?;
             consumed.store(true, Ordering::SeqCst);
             Ok(())
-        }) {
+        });
+        writer
+            .join()
+            .expect("replacement writer")
+            .expect("replace the mapped source mid-read");
+
+        let error = match outcome {
             Ok(()) => {
                 panic!("replacement during materialization must invalidate the Krea file pin")
             }
             Err(error) => error.to_string(),
         };
-        writer.join().expect("replacement writer");
 
         assert!(
             last_consumed.load(Ordering::SeqCst),
