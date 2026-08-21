@@ -148,7 +148,13 @@ impl AdditiveResidual {
     }
 
     fn is_zero(&self, pass: usize) -> candle_core::Result<bool> {
-        Ok(self.scale_at(pass)? == 0.0)
+        let selected_scale = self.scale_at(pass)?;
+        // Structured LoKr keeps its alpha/rank component baked into the shared factors. The
+        // single-scale API can therefore be disabled either by that legacy effective scale or by
+        // the newly-added selected per-pass strength. Both checks must happen before evaluating
+        // the factors: `0 * NaN` is NaN, not an inert adapter.
+        Ok(selected_scale == 0.0
+            || matches!(self, AdditiveResidual::LokrStructured { factors, .. } if factors.scale == 0.0))
     }
 
     fn validate_scales(scales: &[f64]) -> Result<()> {
