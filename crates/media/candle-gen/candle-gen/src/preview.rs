@@ -88,6 +88,9 @@ type Projector<'a> = Box<dyn Fn(&Tensor, Option<f32>) -> Result<Image> + 'a>;
 pub struct PreviewCounter {
     emitted: Cell<u32>,
     total: u32,
+    /// Frames whose position was consumed but whose projection failed (sc-20425). See
+    /// [`dropped_frames`](Self::dropped_frames).
+    dropped: Cell<u32>,
 }
 
 impl PreviewCounter {
@@ -96,6 +99,7 @@ impl PreviewCounter {
         Self {
             emitted: Cell::new(0),
             total: sigmas.len().saturating_sub(1).max(1) as u32,
+            dropped: Cell::new(0),
         }
     }
 
@@ -106,12 +110,27 @@ impl PreviewCounter {
         Self {
             emitted: Cell::new(0),
             total: steps.max(1) as u32,
+            dropped: Cell::new(0),
         }
     }
 
     /// Total denoise steps represented by this schedule.
     pub fn total(&self) -> u32 {
         self.total
+    }
+
+    /// How many frames this counter consumed a position for and then **failed to project**
+    /// (sc-20425).
+    ///
+    /// A projection failure is swallowed by contract — previews are decorative and a lost frame must
+    /// never fail a render — but "swallowed" had meant *invisible*, and that hid a real defect class:
+    /// a σ-less emission into a projector that requires σ (the VE/ε cohort) fails on **every** frame,
+    /// so the counter marched to the end of the schedule and the sink received nothing at all. That
+    /// is indistinguishable from "the model does not preview" from the outside. Reading this makes
+    /// the difference observable — a test can assert `dropped_frames() == 0` over a whole chain, and
+    /// the first drop also prints a one-shot diagnostic.
+    pub fn dropped_frames(&self) -> u32 {
+        self.dropped.get()
     }
 
     /// Return the 1-based frame number for `sigma`, or `None` if that position was emitted.
@@ -183,17 +202,36 @@ where
     deliver(sink, counter, current, project);
 }
 
-/// Project and push one frame, swallowing a projection failure.
+/// Project and push one frame, swallowing a projection failure — but **recording** it (sc-20425).
+///
+/// Swallowing is the contract: previews are decorative and a lost frame must never fail a render.
+/// Being *silent* about it was not the contract, it was an accident, and it hid the whole
+/// "σ-less emission into a σ-requiring projector" class — a 100 % loss rate that looks exactly like
+/// an unsupported model. The failure now bumps [`PreviewCounter::dropped_frames`] and prints once
+/// per counter, so the first lost frame of a render is visible in the log and every subsequent one
+/// is countable without spamming a per-step message.
 fn deliver<F>(sink: &PreviewSink, counter: &PreviewCounter, current: u32, project: F)
 where
     F: FnOnce() -> Result<Image>,
 {
-    if let Ok(image) = project() {
-        sink.emit(PreviewFrame {
+    match project() {
+        Ok(image) => sink.emit(PreviewFrame {
             current,
             total: counter.total(),
             image,
-        });
+        }),
+        Err(err) => {
+            let first = counter.dropped.get() == 0;
+            counter.dropped.set(counter.dropped.get().saturating_add(1));
+            if first {
+                eprintln!(
+                    "preview: dropping frame {current}/{} — projection failed: {err}. Previews are \
+                     decorative, so the render continues; further drops on this trajectory are \
+                     counted (PreviewCounter::dropped_frames) but not printed.",
+                    counter.total()
+                );
+            }
+        }
     }
 }
 
@@ -320,9 +358,43 @@ impl<'a> PreviewHook<'a> {
 
     /// Step-index-keyed emission — the SCM driver, which has no σ schedule, so a
     /// [`with_sigma`](Self::with_sigma) projector receives `None` here.
+    ///
+    /// **Not the seam for a chained denoise pass on a σ-scaling family.** A
+    /// [`with_sigma`](Self::with_sigma) projector rejects `None` by design (projecting a raw VE
+    /// latent un-normalized is the wrong frame, and a wrong frame is worse than a lost one), so this
+    /// would consume every schedule position and deliver nothing. Use
+    /// [`emit_step_at_sigma`](Self::emit_step_at_sigma) there.
     pub fn emit_step(&self, counter: &PreviewCounter, step: usize, latents: &Tensor) {
         let counter = self.schedule.map_or(counter, |(counter, _)| counter);
         emit_preview_at(self.sink, counter, step, || (self.project)(latents, None));
+    }
+
+    /// Step-index-keyed emission that **still carries the σ** this frame is emitted at (sc-20425) —
+    /// the chained-denoise-pass seam.
+    ///
+    /// A chain has no single σ array to key on: every pass builds a fresh schedule, and frames must
+    /// number `1..=total` across the whole chain rather than restarting per pass, so numbering is
+    /// step-index-keyed on the executor's chain-global outer step. But the *projection* still needs
+    /// σ on the ε/VE cohort, whose fit was measured on the `1/√(σ²+1)`-normalized latent — and σ is
+    /// available: the executor hands every observation the segment σ it is at
+    /// (`PassObservation::sigma`).
+    ///
+    /// Before this existed the only step-keyed emitter passed `None`, so a
+    /// [`with_sigma`](Self::with_sigma) family emitted **zero frames** over a whole chain with no
+    /// error anywhere — the render succeeded and simply looked like a model that does not preview.
+    /// A flow-cohort family built through [`new`](Self::new) ignores the σ and is unaffected, so this
+    /// is the correct call for both cohorts.
+    pub fn emit_step_at_sigma(
+        &self,
+        counter: &PreviewCounter,
+        step: usize,
+        sigma: f32,
+        latents: &Tensor,
+    ) {
+        let counter = self.schedule.map_or(counter, |(counter, _)| counter);
+        emit_preview_at(self.sink, counter, step, || {
+            (self.project)(latents, Some(sigma))
+        });
     }
 }
 
@@ -330,6 +402,75 @@ impl std::fmt::Debug for PreviewHook<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreviewHook")
             .field("active", &self.sink.is_active())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The **chained denoise-pass** preview (epic 20414) — one per image, shared by every adopting
+/// family (sc-20425).
+///
+/// A chain is not a driver call, so nothing owns a counter for it: each pass builds its own fresh σ
+/// schedule, and frames must read as one continuous `1..=total` progression across the whole chain
+/// rather than restarting at 1 per pass. So numbering is keyed on the executor's chain-global outer
+/// step and the counter is sized from the chain total the *first* observation carries — the executor
+/// knows the whole chain's step budget before the first forward, so that total never changes
+/// mid-run.
+///
+/// Frames carry the σ the executor is at, which is what lets one type serve both prediction cohorts:
+/// a flow family ([`PreviewHook::new`]) ignores it, and the ε/VE cohort
+/// ([`PreviewHook::with_sigma`]) needs it to reach the space its fit was measured in. Krea open-coded
+/// this for the flow case in sc-20418; hoisting it here is what stops the next adopter re-deriving
+/// it and landing on the σ-less variant, which emits nothing at all on a VE family.
+pub struct PassPreview<'a> {
+    hook: PreviewHook<'a>,
+    counter: std::cell::RefCell<Option<PreviewCounter>>,
+}
+
+impl<'a> PassPreview<'a> {
+    /// Wrap a family's hook for the chained path. Build one **per image**: the executor runs once
+    /// per image, and a reused counter would find every position already emitted.
+    pub fn new(hook: PreviewHook<'a>) -> Self {
+        Self {
+            hook,
+            counter: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Whether anyone is listening.
+    pub fn is_active(&self) -> bool {
+        self.hook.is_active()
+    }
+
+    /// Best-effort emit of the running latent at one chain-global outer step. Multi-eval solver
+    /// repeats dedup through the step-keyed counter; a projection failure is swallowed (and counted
+    /// — see [`dropped_frames`](Self::dropped_frames)).
+    pub fn emit(&self, chain_step: usize, chain_total_steps: usize, sigma: f32, latents: &Tensor) {
+        if !self.hook.is_active() {
+            return;
+        }
+        let mut slot = self.counter.borrow_mut();
+        let counter =
+            slot.get_or_insert_with(|| PreviewCounter::with_steps(chain_total_steps.max(1)));
+        self.hook
+            .emit_step_at_sigma(counter, chain_step, sigma, latents);
+    }
+
+    /// Frames whose position was consumed and whose projection then failed, over this chain
+    /// ([`PreviewCounter::dropped_frames`]). `0` on a healthy chain; equal to the frame count on the
+    /// σ-less-into-σ-required failure this type exists to prevent.
+    pub fn dropped_frames(&self) -> u32 {
+        self.counter
+            .borrow()
+            .as_ref()
+            .map_or(0, PreviewCounter::dropped_frames)
+    }
+}
+
+impl std::fmt::Debug for PassPreview<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassPreview")
+            .field("active", &self.hook.is_active())
+            .field("dropped_frames", &self.dropped_frames())
             .finish_non_exhaustive()
     }
 }
@@ -446,6 +587,109 @@ mod tests {
         assert_eq!(counter.next(&SIGMAS, 0.85), Some(2));
         assert_eq!(counter.next(&SIGMAS, 0.9), None);
         assert_eq!(counter.next(&SIGMAS, 0.8), Some(3));
+    }
+
+    // --- The chained-denoise-pass seam (sc-20425) -------------------------------------------------
+
+    /// A σ-requiring projector, the ε/VE cohort's shape (`candle-gen-sdxl`'s `project_ve_latents`):
+    /// `None` is an error by design, because projecting a raw VE latent un-normalized ships a wrong
+    /// frame rather than a lost one.
+    fn ve_projector(latents: &Tensor, sigma: Option<f32>) -> Result<Image> {
+        let Some(sigma) = sigma else {
+            return Err(CandleError::Msg("needs the schedule sigma".into()));
+        };
+        let _ = (latents, sigma);
+        Ok(Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        })
+    }
+
+    /// **The sc-20425 item-4 defect, and its fix, in one test.** A chain over a σ-scaling family
+    /// numbers frames on the chain-global outer step, and the only step-keyed emitter used to pass
+    /// `None` — so the counter marched to the end of the chain and the sink received *nothing*, with
+    /// no error anywhere: a render that looked exactly like a model with previews turned off.
+    #[test]
+    fn a_chained_ve_preview_emits_real_frames_and_a_sigma_less_one_is_observably_empty() {
+        let latent = zeros((1, 4, 8, 8));
+        let chain_total = 6;
+
+        // The broken shape: step-keyed, σ dropped. Every position is consumed, nothing is delivered,
+        // and the loss is now COUNTABLE rather than invisible.
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::with_sigma(&sink, ve_projector);
+        let counter = PreviewCounter::with_steps(chain_total);
+        for step in 0..chain_total {
+            hook.emit_step(&counter, step, &latent);
+        }
+        assert!(
+            crate::lock_recover(&frames).is_empty(),
+            "the σ-less emitter cannot project a VE latent"
+        );
+        assert_eq!(
+            counter.dropped_frames(),
+            chain_total as u32,
+            "every lost frame must be observable"
+        );
+
+        // The fix: the same step keying, σ carried through.
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::with_sigma(&sink, ve_projector);
+        let pass_preview = PassPreview::new(hook);
+        for (step, sigma) in SIGMAS[..chain_total].iter().enumerate() {
+            pass_preview.emit(step, chain_total, *sigma, &latent);
+        }
+        let got = crate::lock_recover(&frames);
+        assert_eq!(
+            got.iter().map(|f| f.current).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6],
+            "a chain must read as one continuous progression"
+        );
+        assert!(got.iter().all(|f| f.total == chain_total as u32));
+        assert_eq!(pass_preview.dropped_frames(), 0);
+    }
+
+    /// The flow cohort is unaffected: a [`PreviewHook::new`] projector never sees the σ, so one
+    /// `PassPreview` serves both cohorts and no adopter has to pick the right emitter.
+    #[test]
+    fn a_chained_flow_preview_ignores_the_sigma_it_is_handed() {
+        let latent = zeros((1, 16, 8, 8));
+        let (sink, frames) = collecting_sink();
+        let hook = PreviewHook::new(&sink, |_latents: &Tensor| {
+            Ok(Image {
+                width: 1,
+                height: 1,
+                pixels: vec![1, 2, 3],
+            })
+        });
+        let pass_preview = PassPreview::new(hook);
+        // A multi-eval solver repeats an outer step; the step-keyed counter dedups it.
+        for step in [0usize, 0, 1, 2, 2] {
+            pass_preview.emit(step, 3, SIGMAS[step], &latent);
+        }
+        assert_eq!(
+            crate::lock_recover(&frames)
+                .iter()
+                .map(|f| f.current)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(pass_preview.dropped_frames(), 0);
+    }
+
+    /// An inert sink stays free: no counter is built, nothing is projected, and nothing is recorded
+    /// as dropped (a render with previews off is not a render that lost frames).
+    #[test]
+    fn an_inert_chained_preview_projects_nothing_and_drops_nothing() {
+        let latent = zeros((1, 4, 8, 8));
+        let sink = PreviewSink::default();
+        let pass_preview = PassPreview::new(PreviewHook::with_sigma(&sink, ve_projector));
+        assert!(!pass_preview.is_active());
+        for step in 0..4 {
+            pass_preview.emit(step, 4, 0.5, &latent);
+        }
+        assert_eq!(pass_preview.dropped_frames(), 0);
     }
 
     #[test]

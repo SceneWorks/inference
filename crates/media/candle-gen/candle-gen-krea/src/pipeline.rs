@@ -2041,7 +2041,7 @@ struct KreaPassHost<'h, 's, 'a> {
     context: &'a Tensor,
     neg_context: Option<&'a Tensor>,
     all_specs: &'a [AdapterSpec],
-    hook: crate::preview::PassPreview<'a>,
+    hook: candle_gen::preview::PassPreview<'a>,
 }
 
 impl gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> for KreaPassHost<'_, '_, '_> {
@@ -2107,8 +2107,10 @@ impl gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> for KreaPa
     }
 
     fn observe(&mut self, obs: gen_core::sampling::PassObservation<'_, Tensor>) {
+        // Krea's projector is σ-independent (flow, `input_scale ≡ 1.0`), but the shared seam carries
+        // σ so the ε/VE adopters work through the same call (sc-20425).
         self.hook
-            .emit(obs.chain_step, obs.chain_total_steps, obs.latent);
+            .emit(obs.chain_step, obs.chain_total_steps, obs.sigma, obs.latent);
     }
 }
 

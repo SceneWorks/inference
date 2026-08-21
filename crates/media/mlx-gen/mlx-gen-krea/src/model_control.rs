@@ -65,6 +65,7 @@ pub fn descriptor() -> ModelDescriptor {
     // typed `DenoisePassIssue::Unsupported` rejection. The candle twin has no bug to fix here — its
     // `krea_2_turbo_control` is a descriptor-less by-name route, so there is nothing to inherit.
     d.capabilities.supports_denoise_passes = false;
+    d.capabilities.denoise_pass_surface = mlx_gen::gen_core::DenoisePassSurface::NONE;
     d
 }
 

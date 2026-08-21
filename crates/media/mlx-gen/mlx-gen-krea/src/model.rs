@@ -294,7 +294,23 @@ pub fn descriptor() -> ModelDescriptor {
             // variants explicitly opt back OUT below (grounded edit conditioning is not in the
             // t2i-from-noise v1 surface). The candle twin advertises identically.
             supports_denoise_passes: true,
-            denoise_pass_surface: Default::default(),
+            // What a pass may actually name here, beyond the on/off bit above (sc-20425). The candle
+            // twin declares the same pair.
+            //
+            // `flow_match` is the advertised NATIVE scheduler alias — the byte-exact native
+            // exponential-mu schedule the resolution ladder bottoms out on, honored by
+            // `KreaPassHost::build_schedule` through the family's own resolver and by nothing in the
+            // curated registry. Declaring it keeps a resolved plan naming it replayable through
+            // validation, while an *undeclared* native id stays a typed rejection.
+            //
+            // Per-pass adapter overrides are real here: `prepare_denoise_passes` builds one
+            // job-local DiT clone per pass over that pass's re-scaled stack, so "adapter off for
+            // pass 1, on for pass 2" genuinely renders that way. That is the exception, not the
+            // rule — see `DenoisePassSurface::per_pass_adapters`.
+            denoise_pass_surface: mlx_gen::gen_core::DenoisePassSurface {
+                native_schedulers: &["flow_match"],
+                per_pass_adapters: true,
+            },
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
@@ -351,8 +367,11 @@ pub fn edit_descriptor() -> ModelDescriptor {
     ];
     // Chained denoise passes are wired for the t2i-from-noise Turbo/Raw variants only (sc-20418):
     // the grounded edit conditioning path is out of the v1 surface, so the derived edit descriptor
-    // must not inherit the advertisement.
+    // must not inherit the advertisement. BOTH halves are cleared — a surface without the capability
+    // is rejected by the descriptor conformance sweep (sc-20425), because half-inherited is exactly
+    // how `model_control`'s descriptor came to advertise a chain it cannot run.
     d.capabilities.supports_denoise_passes = false;
+    d.capabilities.denoise_pass_surface = mlx_gen::gen_core::DenoisePassSurface::NONE;
     d
 }
 
@@ -373,8 +392,10 @@ pub fn turbo_edit_descriptor() -> ModelDescriptor {
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
     ];
-    // Chained denoise passes stay off the edit surfaces (sc-20418) — see `edit_descriptor`.
+    // Chained denoise passes stay off the edit surfaces (sc-20418) — see `edit_descriptor`. Both
+    // halves, for the reason recorded there (sc-20425).
     d.capabilities.supports_denoise_passes = false;
+    d.capabilities.denoise_pass_surface = mlx_gen::gen_core::DenoisePassSurface::NONE;
     d
 }
 
