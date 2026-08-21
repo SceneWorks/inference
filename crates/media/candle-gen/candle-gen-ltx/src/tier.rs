@@ -27,8 +27,9 @@
 //!                                       crate-native spelling (`to_out.0`, `ff.net.0.proj`, `ff.net.2`)
 //!   vae_decoder.safetensors    DENSE  — `up_blocks.*` / `conv_in` / `conv_out` / `per_channel_statistics`,
 //!                                       conv weights CHANNELS-LAST `[O,kt,kh,kw,I]`, stats `mean`/`std`
-//!   vae_encoder audio_vae vocoder upsampler   DENSE  (encoder loaded for conditioning; the remaining
-//!                                                    components are outside the current tier decode)
+//!   vae_encoder  DENSE  — loaded for conditioning
+//!   upsampler    DENSE  — learned stage-one→stage-two latent refinement
+//!   audio_vae vocoder DENSE — outside the packed tier's final audio decode
 //! <snapshot>/gemma/            DENSE  — standard `language_model.model.*` 5-shard set + tokenizer.json
 //! ```
 //!
@@ -103,7 +104,7 @@ impl TierPaths {
         if !p.is_file() {
             return Err(CandleError::Msg(format!(
                 "ltx tier: missing `{name}` in {} (expected a split MLX tier: transformer / connector \
-                 / vae_decoder / vae_encoder / audio_vae / vocoder)",
+                 / vae_decoder / vae_encoder / upsampler / audio_vae / vocoder)",
                 self.tier_dir.display()
             )));
         }
@@ -191,6 +192,17 @@ impl TierPaths {
             dtype,
             device.clone(),
         ))
+    }
+
+    /// Learned spatial refinement weights co-located with the packed tier,
+    /// accepting either upstream staged filename without silently choosing an
+    /// ambiguous directory.
+    pub fn upsampler_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        candle_gen::mmap_var_builder(
+            &[crate::canonical_upsampler_file(&self.tier_dir)?],
+            dtype,
+            device,
+        )
     }
 
     /// The Gemma-3-12B encoder VarBuilder rooted at `language_model.model.` over the tier's sibling

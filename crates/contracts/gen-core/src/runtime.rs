@@ -26,6 +26,11 @@ pub const BASE_SNAPSHOT_COMPONENT: &str = "base_snapshot";
 /// alternate decoder; an absent entry preserves the provider's native decoder exactly.
 pub const VAE_COMPONENT: &str = "vae";
 
+/// Optional learned two-stage LTX latent upscaler. Providers may also resolve
+/// the canonical co-located `upsampler.safetensors`, so this is not an
+/// unconditional descriptor requirement.
+pub const LTX_SPATIAL_UPSCALER_COMPONENT: &str = "spatial_upscaler";
+
 /// Optional in-place ComfyUI text-encoder file paired with a single-file DiT.
 pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
 

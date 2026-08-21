@@ -939,11 +939,18 @@ mod tests {
 
     /// Sparse `.safetensors` shards of exact sizes. `safetensors_path_bytes` stats rather than
     /// parses, so this costs no disk and still exercises the real directory-name wiring.
+    ///
+    /// It costs no disk only because the shard is flagged first. These sizes are the real asset
+    /// facts — one `full_snapshot` nominally sums to ~210 GB — and NTFS allocates every byte of a
+    /// `set_len` on an unflagged file. `mark_sparse` must sit between the create and the `set_len`;
+    /// see its docs for why either side of that is silently wrong.
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).expect("component dir");
-            let file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            let path = dir.join("model.safetensors");
+            let file = std::fs::File::create(&path).expect("shard");
+            gen_core_testkit::mark_sparse(&path);
             file.set_len(*bytes).expect("sparse shard");
         }
     }

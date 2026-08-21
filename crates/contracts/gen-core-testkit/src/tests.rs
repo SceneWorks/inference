@@ -830,3 +830,207 @@ fn conformance_panics_on_a_broken_stub() {
         &cheap(),
     );
 }
+
+/// A qwen3-shaped encoder, sized like the ones the provider load-gate tests actually build. The
+/// dimensions are the point: they are what makes `write_encoder_contract_fixture` a ~7.3 GB writer,
+/// which is in turn why the payload has to be a hole rather than bytes.
+const SPARSE_FIXTURE_CONTRACT: gen_core::EncoderContract = gen_core::EncoderContract {
+    architecture: "qwen3",
+    hidden_size: 2560,
+    intermediate_size: 9728,
+    num_hidden_layers: 36,
+    num_attention_heads: 32,
+    num_key_value_heads: 8,
+    head_dim: 128,
+    vocab_size: 151_936,
+    output_width: 2560,
+    loaded_hidden_layers: 36,
+    requires_final_norm: false,
+    requires_lm_head: false,
+    hidden_activation: "silu",
+    attention_dropout: gen_core::EncoderConfigFloat::new(0.0),
+    rms_norm_eps: gen_core::EncoderConfigFloat::new(1e-6),
+    qk_norm_eps: Some(gen_core::EncoderConfigFloat::new(1e-6)),
+    rope_theta: gen_core::EncoderConfigFloat::new(1_000_000.0),
+    max_position_embeddings: 40_960,
+    attention_bias: gen_core::EncoderConfigBool::Required(false),
+    tie_word_embeddings: gen_core::EncoderConfigBool::Required(true),
+    tokenizer: gen_core::EncoderTokenizerContract {
+        family: "testkit",
+        binding: gen_core::EncoderTokenizerBinding::RetainBase,
+        artifact_candidates: &["tokenizer.json"],
+        required_tokens: &[],
+    },
+    prompt_executions: &[],
+    bos_token_id: Some(151_643),
+    eos_token_id: Some(151_645),
+    image_token_id: None,
+    vision_start_token_id: None,
+    vision_end_token_id: None,
+    mrope_section: &[],
+    mrope_interleaved: None,
+    selected_hidden_layers: &[35],
+    packing: None,
+    dense_storage_dtype_probe: None,
+};
+
+/// The fixture's tensor payload must be a **hole**, not written bytes.
+///
+/// Every gate this fixture feeds *stats* the file, so its logical length has to be the full nominal
+/// size — but nothing may read the payload. On APFS and ext4, extending past the end is sparse by
+/// construction, so this cost nothing and nobody noticed. NTFS allocates the clusters instead: these
+/// fixtures wrote ~7.3 GB apiece (~22 GB per run across the q4/q8/bf16 tiers), filled the Windows
+/// CUDA box's system drive twice, and failed a `candle-worker` run with `StorageFull` (os error 112).
+///
+/// Kills the mutation that matters: dropping the [`mark_sparse`] call from
+/// [`write_encoder_contract_fixture_with_quant`] — or moving it *before* the `File::create` that
+/// clears the attribute — leaves `FILE_ATTRIBUTE_SPARSE_FILE` unset and this red on Windows. The
+/// unflagged control below is what gives that assertion teeth.
+///
+/// The Linux `contracts` lane still runs the length and zero-payload halves, which pin the semantics
+/// the flag must not disturb.
+#[test]
+fn encoder_contract_fixture_payload_is_a_hole_not_seven_gigabytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately not named `text_encoder`: that spelling also emits a tokenizer artifact, which is
+    // irrelevant here and would only add a second file to reason about.
+    let root = tmp.path().join("encoder");
+    write_encoder_contract_fixture(&root, SPARSE_FIXTURE_CONTRACT).unwrap();
+
+    let weights = root.join("model.safetensors");
+    let meta = std::fs::metadata(&weights).unwrap();
+    assert!(
+        meta.len() > 4 << 30,
+        "this writer must stay in the multi-GB class or the hole stops being load-bearing: {}",
+        meta.len()
+    );
+
+    // A hole reads back as zeros. Nothing may depend on whatever the filesystem last left there,
+    // which is exactly what flagging the file changes for a reader.
+    let mut file = std::fs::File::open(&weights).unwrap();
+    let mut declared = [0_u8; 8];
+    std::io::Read::read_exact(&mut file, &mut declared).unwrap();
+    let header_end = 8 + u64::from_le_bytes(declared);
+    assert!(
+        header_end < meta.len(),
+        "the fixture must have a payload span past its header"
+    );
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(meta.len() - 4096)).unwrap();
+    let mut tail = [0xAB_u8; 4096];
+    std::io::Read::read_exact(&mut file, &mut tail).unwrap();
+    assert!(
+        tail.iter().all(|&byte| byte == 0),
+        "the unwritten payload must read back as zeros"
+    );
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        /// `FILE_ATTRIBUTE_SPARSE_FILE`.
+        const SPARSE: u32 = 0x0000_0200;
+
+        // The control: the same create-then-extend shape with no flag. If NTFS ever started
+        // reporting *this* as sparse, the assertion below would have stopped meaning anything.
+        let dense = tmp.path().join("dense.safetensors");
+        std::fs::File::create(&dense)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&dense).unwrap().file_attributes() & SPARSE,
+            0,
+            "control: an unflagged extension must NOT report sparse"
+        );
+
+        assert_ne!(
+            meta.file_attributes() & SPARSE,
+            0,
+            "the fixture must carry FILE_ATTRIBUTE_SPARSE_FILE, or NTFS allocates all {} bytes",
+            meta.len()
+        );
+    }
+}
+
+/// Copying a fixture must not be how the hole gets materialized.
+///
+/// `std::fs::copy` reads and writes every byte, so a test that copies a multi-GB fixture to say
+/// "another file appeared" pays for the whole payload on NTFS even when the source is a hole —
+/// which is precisely how one qwen-image test allocated 26 GB. The copy has to reproduce the header
+/// and the logical length onto a flagged destination instead.
+///
+/// Kills the mutation: swapping [`copy_sparse_fixture`] back to `std::fs::copy` drops
+/// `FILE_ATTRIBUTE_SPARSE_FILE` from the destination. The byte assertions here are what pin that the
+/// cheaper copy is still a faithful one.
+#[test]
+fn copying_a_fixture_reproduces_it_without_materializing_the_hole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("encoder");
+    write_encoder_contract_fixture(&root, SPARSE_FIXTURE_CONTRACT).unwrap();
+    let source = root.join("model.safetensors");
+    let destination = root.join("added.safetensors");
+    copy_sparse_fixture(&source, &destination).unwrap();
+
+    let source_meta = std::fs::metadata(&source).unwrap();
+    let copy_meta = std::fs::metadata(&destination).unwrap();
+    assert_eq!(
+        copy_meta.len(),
+        source_meta.len(),
+        "the copy must stat the same as the original"
+    );
+
+    // Header bytes identical, payload still a hole reading as zeros — together that is exactly what
+    // `std::fs::copy` of this fixture would have produced.
+    let read_head = |path: &std::path::Path| {
+        let mut bytes = vec![0_u8; 64 << 10];
+        let mut file = std::fs::File::open(path).unwrap();
+        std::io::Read::read_exact(&mut file, &mut bytes).unwrap();
+        bytes
+    };
+    assert_eq!(
+        read_head(&source),
+        read_head(&destination),
+        "the copy must carry the original's header"
+    );
+    let mut file = std::fs::File::open(&destination).unwrap();
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(copy_meta.len() - 4096)).unwrap();
+    let mut tail = [0xAB_u8; 4096];
+    std::io::Read::read_exact(&mut file, &mut tail).unwrap();
+    assert!(
+        tail.iter().all(|&byte| byte == 0),
+        "the copy's payload must read back as zeros"
+    );
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        /// `FILE_ATTRIBUTE_SPARSE_FILE`.
+        const SPARSE: u32 = 0x0000_0200;
+        assert_ne!(
+            copy_meta.file_attributes() & SPARSE,
+            0,
+            "the copy must be a hole too, or it allocates all {} bytes",
+            copy_meta.len()
+        );
+    }
+}
+
+/// A truncated or corrupt fixture must be a typed error, not a panic or a silent empty copy.
+#[test]
+fn copying_rejects_a_header_that_runs_past_the_end_of_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("truncated.safetensors");
+    std::fs::write(&source, u64::MAX.to_le_bytes()).unwrap();
+    let error = copy_sparse_fixture(&source, &tmp.path().join("copy.safetensors"))
+        .expect_err("a header longer than the file must not be copied");
+    assert!(error.to_string().contains("runs past the end"), "{error}");
+}
+
+/// [`mark_sparse`] is best effort: a fixture that lands dense still holds exactly the right bytes,
+/// so nothing it does may become a test failure. An unwrapped `fsutil` invocation would turn an
+/// unwritable path, a locked file, or a runner image without `fsutil` into a failure of every
+/// fixture test in the workspace instead of a disk-space regression.
+#[test]
+fn mark_sparse_tolerates_a_path_that_does_not_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    mark_sparse(&tmp.path().join("no-such-fixture.safetensors"));
+}

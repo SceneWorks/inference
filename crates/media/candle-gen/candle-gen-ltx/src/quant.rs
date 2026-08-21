@@ -98,14 +98,32 @@ impl QLinear {
         (self.0.out_features(), self.0.in_features())
     }
 
-    /// Attach a shared forward-time additive LoRA residual without changing the frozen base.
-    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
-        self.0.push_additive_lora(a, b, scale);
+    /// Attach a LoRA residual with one strength per distilled denoise pass.
+    pub(crate) fn push_additive_lora_per_pass(
+        &mut self,
+        a: Tensor,
+        b: Tensor,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        self.0
+            .push_additive_lora_per_pass(a, b, scales)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
     }
 
-    /// Attach an allocation-free structured LoKr residual; valid on both dense and packed bases.
-    pub(crate) fn push_additive_lokr(&mut self, factors: LokrFactors) {
-        self.0.push_additive_lokr(factors);
+    /// Attach a structured LoKr residual with one user strength per distilled denoise pass.
+    pub(crate) fn push_additive_lokr_per_pass(
+        &mut self,
+        factors: LokrFactors,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        self.0
+            .push_additive_lokr_per_pass(factors, scales)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+    }
+
+    /// Select the active distilled denoise pass for this projection's additive residuals.
+    pub(crate) fn set_additive_pass(&self, pass: usize) {
+        self.0.set_additive_pass(pass);
     }
 
     /// Wrap this frozen projection in the shared training-time LoRA seam without changing its
@@ -398,7 +416,9 @@ mod tests {
         let rank = 4;
         let a = Tensor::randn(0f32, 0.1f32, (in_dim, rank), &dev)?;
         let bfac = Tensor::randn(0f32, 0.1f32, (rank, out_dim), &dev)?;
-        packed.push_additive_lora(a.clone(), bfac.clone(), 0.7);
+        packed
+            .push_additive_lora_per_pass(a.clone(), bfac.clone(), vec![0.7])
+            .unwrap();
         assert!(
             packed.is_packed(),
             "adding LoRA must preserve packed residency"
@@ -408,7 +428,8 @@ mod tests {
         assert!(effect > 1e-6, "nonzero LoRA must change packed output");
 
         let mut zero = qlinear(&blk, "to_out", true)?;
-        zero.push_additive_lora(a, bfac, 0.0);
+        zero.push_additive_lora_per_pass(a, bfac, vec![0.0])
+            .unwrap();
         assert!(
             zero.is_packed(),
             "scale=0 LoRA must preserve packed residency"
