@@ -130,7 +130,7 @@ impl Pipeline {
                 return tier.component_vb(sub, dtype, &self.device);
             }
             return crate::text_encode::component_vb(
-                tier.shared_root(),
+                self.shared_root(),
                 sub,
                 dtype,
                 &self.device,
@@ -148,17 +148,30 @@ impl Pipeline {
         )
     }
 
+    /// The snapshot root that owns the dense shared components. A hosted split tier carries only
+    /// the two packed experts; its text encoder, VAE, and tokenizer are siblings at this root.
+    fn shared_root(&self) -> &Path {
+        self.tier
+            .as_ref()
+            .map(VaceFunTierPaths::shared_root)
+            .unwrap_or(&self.root)
+    }
+
+    fn build_tokenizer(&self) -> CResult<candle_gen::gen_core::tokenizer::TextTokenizer> {
+        crate::text_encode::build_umt5_tokenizer(
+            self.shared_root(),
+            &self.text_cfg,
+            MODEL_ID_VACE_FUN,
+        )
+    }
+
     fn load_shared(&self) -> CResult<SharedComponents> {
         let te = Umt5Encoder::new(
             &self.text_cfg,
             self.component_vb("text_encoder", ENC_DTYPE)?,
         )?;
         let vae = WanVae16::new_with_encoder(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
-        let tok = crate::text_encode::build_umt5_tokenizer(
-            &self.root,
-            &self.text_cfg,
-            MODEL_ID_VACE_FUN,
-        )?;
+        let tok = self.build_tokenizer()?;
         Ok(SharedComponents {
             te: Arc::new(te),
             vae: Arc::new(vae),
@@ -767,6 +780,36 @@ mod tests {
             )
             .expect("VACE-Fun registration is lazy");
         assert!(generator.validate(&request()).is_ok());
+    }
+
+    #[test]
+    fn split_tier_loads_tokenizer_from_the_shared_parent_root() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let tier_root = snapshot.path().join("q8");
+        std::fs::create_dir(&tier_root).unwrap();
+        for component in ["text_encoder", "vae", "tokenizer"] {
+            std::fs::create_dir(snapshot.path().join(component)).unwrap();
+        }
+        // The tier directory deliberately has no tokenizer/: hosted split tiers keep this file at
+        // the parent snapshot alongside the dense TE/VAE components.
+        std::fs::write(
+            snapshot.path().join("tokenizer/tokenizer.json"),
+            r#"{
+  "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+  "normalizer": null, "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null, "decoder": null,
+  "model": { "type": "WordLevel", "vocab": { "<unk>": 0 }, "unk_token": "<unk>" }
+}"#,
+        )
+        .unwrap();
+        let tier = VaceFunTierPaths::test_paths(
+            tier_root.clone(),
+            snapshot.path().to_path_buf(),
+            Quant::Q8,
+        );
+        let pipeline = Pipeline::new(&tier_root, &Device::Cpu, Vec::new(), Some(tier));
+        assert_eq!(pipeline.shared_root(), snapshot.path());
+        assert!(pipeline.build_tokenizer().is_ok());
     }
 
     #[test]
