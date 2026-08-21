@@ -2353,8 +2353,7 @@ impl Capabilities {
     /// menu edits this in the same commit.
     ///
     /// Every list here is a *promise*: an id or field outside it is rejected by
-    /// [`validate_denoise_passes`](crate::validate_denoise_passes) with a pass-indexed error, never
-    /// accepted and ignored.
+    /// [`validate_denoise_passes`] with a pass-indexed error, never accepted and ignored.
     #[must_use]
     pub fn denoise_pass_capability(&self) -> DenoisePassCapability {
         if !self.supports_denoise_passes {

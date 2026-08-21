@@ -239,7 +239,7 @@ pub struct DenoisePassCapability {
     pub supported: bool,
     /// The largest chain this build accepts ([`MAX_DENOISE_PASSES`]).
     pub max_passes: usize,
-    /// The per-pass `steps` sanity cap ([`crate::generator::MAX_STEPS`]).
+    /// The per-pass `steps` sanity cap (the shared request floor's `MAX_STEPS`).
     pub max_steps_per_pass: u32,
     /// The per-pass fields this model honors, as they appear on the wire — always `steps`,
     /// `sampler`, `scheduler`, `denoise`; plus `guidance` when the model has a guidance axis, plus

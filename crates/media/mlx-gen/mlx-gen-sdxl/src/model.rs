@@ -96,6 +96,21 @@ pub(crate) const DEFAULT_GUIDANCE: f32 = 7.0;
 /// variant manifest, epic 2755) — selecting one without its LoRA loaded yields undertrained noise.
 pub(crate) const ACCEL_SAMPLERS: [&str; 3] = ["lcm", "lightning", "hyper"];
 
+/// The model-default rung of the chained-denoise resolution ladder (sc-20425) — what a pass that
+/// names nothing, in a request that names nothing, actually runs.
+///
+/// Both ids are **menu-valid and honorable**: `ddim` is a curated `Solver` this family advertises,
+/// and `normal` is the curated schedule the curated lane's native σ table is built from.
+/// Deliberately NOT `euler_ancestral` (this crate's flat default, whose bespoke vendored loop is not
+/// the curated `Solver` of the same name), not `lightning`/`hyper` (distilled bespoke lanes that are
+/// not `Solver`s at all), and not `discrete` (an alias meaning the same schedule `normal` already
+/// names). A resolved plan is a replay artifact, so the defaults it records must be ids validation
+/// accepts. The candle twin records the same pair.
+pub(crate) fn sdxl_denoise_defaults() -> mlx_gen::gen_core::DenoiseDefaults {
+    mlx_gen::gen_core::DenoiseDefaults::new(DEFAULT_STEPS, "ddim", "normal")
+        .with_guidance(DEFAULT_GUIDANCE)
+}
+
 /// `original_inference_steps` for the LCM/TCD timestep selection (diffusers' default).
 const LCM_ORIGINAL_STEPS: usize = 50;
 
@@ -180,7 +195,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `discrete` is the native ancestral schedule; the rest are the curated σ schedulers
             // (epic 7114 scheduler axis) usable with any curated sampler.
             schedulers: {
-                let mut s = vec!["discrete"];
+                let mut s = crate::pipeline::NATIVE_SCHEDULERS.to_vec();
                 s.extend(curated_scheduler_names());
                 s
             },
@@ -208,9 +223,29 @@ pub fn descriptor() -> ModelDescriptor {
             supports_multi_speaker: false,
             supports_conversation_history: false,
             supports_conversation_session: false,
-            // Chained denoise passes are not wired for this provider (sc-20415).
-            supports_denoise_passes: false,
-            denoise_pass_surface: Default::default(),
+            // Chained denoise passes (epic 20414, sc-20425) — the non-Krea LATENT-DIFFUSION
+            // acceptance family, advertised in lockstep with the wiring in `generate_impl`'s chained
+            // branch and `pipeline::render_denoise_passes`. The chain rides the CURATED lane (the
+            // additive k-diffusion path over `DiscreteModelSampling`), never the bespoke ancestral
+            // default and never the distilled accel lanes — those are refused explicitly by
+            // `validate_request` rather than silently mis-routed. The candle twin advertises
+            // identically.
+            supports_denoise_passes: true,
+            // `discrete` is the honored native scheduler alias (this family's own σ table).
+            // Per-pass adapter overrides are NOT honored: `apply_sdxl_adapters` mutates the U-Net in
+            // place at load through `lora_delta` — a true irreversible fold with no re-scale or
+            // revert seam — so a per-pass weight could be neither applied nor undone, and the shared
+            // floor rejects a pass that asks.
+            //
+            // Note what is deliberately absent from every per-pass menu: `lightning`, `hyper` and
+            // `euler_ancestral`'s bespoke twin. The first two are advertised above for their
+            // distilled bespoke lanes and are not curated `Solver`s, so a pass naming either is a
+            // typed `DenoisePassIssue::NotHonored` rejection rather than a silent downgrade to
+            // Euler (sc-20425 item 3).
+            denoise_pass_surface: mlx_gen::gen_core::DenoisePassSurface {
+                native_schedulers: crate::pipeline::NATIVE_SCHEDULERS,
+                per_pass_adapters: false,
+            },
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
@@ -952,6 +987,43 @@ impl Sdxl {
                 req.scheduler.as_deref().unwrap_or_default()
             )));
         }
+        // Chained denoise passes (epic 20414, sc-20425) ride the CURATED lane only. Everything the
+        // chain does not serve is refused EXPLICITLY here rather than silently mis-routed — this
+        // crate has three denoise lanes (bespoke ancestral, distilled accel, curated) and a chain
+        // that fell into the wrong one would render a different image and report success.
+        let chained = req.denoise_passes.is_some();
+        if chained {
+            if is_accel {
+                return Err(Error::Unsupported(format!(
+                    "sdxl: the {sampler_name:?} acceleration sampler runs its own distilled few-step \
+                     lane and cannot honor chained denoise passes — omit `sampler` (or pick a \
+                     curated one) to chain"
+                )));
+            }
+            if !req.conditioning.is_empty() {
+                return Err(Error::Unsupported(
+                    "sdxl: chained denoise passes are the text-to-image surface — a conditioning \
+                     image (Reference / Mask / Control) has no entry point into a chain that starts \
+                     from noise, so send one or the other"
+                        .into(),
+                ));
+            }
+            if req.use_pid {
+                return Err(Error::Unsupported(
+                    "sdxl: the PiD decoder's from_ldm early stop truncates the σ schedule, which \
+                     has no defined meaning across a chain of fresh schedules — drop `use_pid` to \
+                     chain"
+                        .into(),
+                ));
+            }
+            if req.guidance_method.as_deref() == Some("cfg_pp") {
+                return Err(Error::Unsupported(
+                    "sdxl: chained denoise passes run the plain curated CFG combine; `cfg_pp` is \
+                     not wired across a pass boundary — drop `guidance_method` to chain"
+                        .into(),
+                ));
+            }
+        }
         // Per-variant defaults for the few-step samplers; the production defaults otherwise.
         let (def_steps, def_cfg, eta) = if is_accel {
             accel_defaults(sampler_name)
@@ -960,7 +1032,36 @@ impl Sdxl {
         };
         let steps = req.steps.unwrap_or(def_steps) as usize;
         let cfg = req.guidance.unwrap_or(def_cfg);
-        let cfg_on = cfg > 1.0;
+        // Chained denoise passes: resolve the plan ONCE up front so an invalid one is rejected
+        // before any residency work, then re-resolve per image inside the render loop so each
+        // image's pass seeds derive from its own job seed. The job seed is drawn exactly once
+        // (F-089) — `default_seed` is time-derived, so re-drawing it would make the plan and the
+        // render disagree about the very seeds the plan records for replay.
+        let dp_defaults = sdxl_denoise_defaults();
+        // `None` for the loaded-adapter count: this family declares `per_pass_adapters: false`, so
+        // the floor rejects a non-empty per-pass `adapters` list outright and the index bound the
+        // count would check is unreachable.
+        let dp_ctx = self.descriptor.capabilities.denoise_pass_context(None);
+        let dp_resolve = |seed: u64| -> Result<mlx_gen::gen_core::ResolvedDenoisePlan> {
+            req.resolve_denoise_plan(seed, &dp_defaults, &dp_ctx)
+                .map_err(mlx_gen::gen_core::Error::from)
+                .map_err(Error::from)
+        };
+        let dp_plan: Option<mlx_gen::gen_core::ResolvedDenoisePlan> = match chained {
+            true => Some(dp_resolve(req.seed.unwrap_or_else(default_seed))?),
+            false => None,
+        };
+        // The conditioning batch shape is decided ONCE per job, but a chain's CFG is per pass: build
+        // the `[cond, uncond]` stack when ANY pass wants guidance, and let the host narrow to the
+        // positive row for the passes that do not. Deciding this from the flat `cfg` alone would
+        // leave a guided pass with no uncond row to combine against — silently unguided.
+        let cfg_on = match &dp_plan {
+            Some(plan) => plan
+                .passes
+                .iter()
+                .any(|p| p.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0),
+            None => cfg > 1.0,
+        };
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let reference = self.resolve_reference(req)?;
@@ -1247,6 +1348,65 @@ impl Sdxl {
             // `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents
             // live in raw σ-space; the curated solver + scheduler are selected per request. Supports
             // txt2img / img2img / ControlNet / IP-Adapter (inpaint is guarded out above).
+            // Chained denoise passes (sc-20425): the curated VE lane, run pass by pass through the
+            // shared executor with ONE decode per image after the whole chain. Everything this lane
+            // does not serve was refused explicitly above, so reaching here means txt2img with no
+            // control / IP / mask / PiD / CFG++ overlay.
+            if dp_plan.is_some() {
+                let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
+                // The plan is re-resolved per image so THIS image's pass seeds derive from its own
+                // job seed, exactly as the single-pass lanes re-seed their noise per image.
+                let plan = dp_resolve(seed)?;
+                let first = plan.passes.first().ok_or_else(|| {
+                    Error::Msg("sdxl: a resolved denoise plan carries no passes".into())
+                })?;
+                // The VE prior is unit noise · the σ the FIRST pass actually enters at — the same
+                // `ε·σ_max` the curated lane builds, read off pass 0's own segment so a
+                // `denoise < 1.0` first pass starts at its own entry σ rather than the schedule top.
+                let schedule_steps = mlx_gen::gen_core::sampling::denoise_pass_schedule_steps(
+                    first.steps,
+                    first.denoise,
+                );
+                let sigmas = crate::pipeline::pass_schedule(first, schedule_steps, &ms)?;
+                let entry = mlx_gen::gen_core::sampling::terminal_pass_segment(&sigmas, first.steps)
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::Msg("sdxl: pass 0 produced a degenerate schedule".into())
+                    })?;
+                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
+                let initial = multiply(&noise, scalar(entry))?;
+                let (latents, _execution) = crate::pipeline::render_denoise_passes(
+                    heavy.unet,
+                    &ms,
+                    &plan,
+                    initial,
+                    &conditioning,
+                    &pooled,
+                    &time_ids,
+                    cfg_on,
+                    &req.cancel,
+                    on_progress,
+                    &req.preview,
+                    forward_plan,
+                )?;
+                if let Some(observer) = final_latent_observer.as_deref_mut() {
+                    observer(heavy.vae, &latents, pid_ref)?;
+                }
+                mlx_gen::diagnostics::record_phase_boundary(
+                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+                );
+                on_progress(Progress::Decoding);
+                images.push(crate::pipeline::decode_image_tiled(
+                    heavy.vae,
+                    &latents,
+                    pid_ref,
+                    decode_tiling.as_ref(),
+                    Some(&req.cancel),
+                )?);
+                continue;
+            }
+
             if use_curated {
                 let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
                 let sched = req
@@ -1641,6 +1801,52 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.width, req.height
         )));
     }
+    validate_chained_sampler_names(req)?;
+    Ok(())
+}
+
+/// Sampler ids whose name means a **different algorithm** on this family's flat path than the
+/// curated `Solver` of the same name (sc-20425).
+///
+/// `lcm` is an [`ACCEL_SAMPLERS`] entry driving the distilled `LcmSampler` paired with an
+/// acceleration LoRA at load; `euler_ancestral` is the bespoke vendored ancestral loop kept
+/// byte-exact as the production default. Both are also curated `Solver`s, so a chained pass naming
+/// either would validate against the advertised menu and then run the *curated* solver — a different
+/// image than the same name produces on a flat request, reported as success. That is the exact
+/// accept-and-mis-route class this epic exists to close, so the chain refuses them by name.
+///
+/// The distilled `lightning` / `hyper` need no entry: they are not curated `Solver`s at all, so the
+/// shared floor already rejects them with `DenoisePassIssue::NotHonored`.
+pub(crate) const CHAIN_AMBIGUOUS_SAMPLERS: &[&str] = &["lcm", "euler_ancestral"];
+
+/// Refuse a chained plan whose sampler — per pass, or inherited from the flat request through the
+/// resolution ladder — is one of [`CHAIN_AMBIGUOUS_SAMPLERS`].
+fn validate_chained_sampler_names(req: &GenerationRequest) -> Result<()> {
+    let Some(passes) = req.denoise_passes.as_ref() else {
+        return Ok(());
+    };
+    let reject = |id: &str, where_: &str| {
+        Err(Error::Unsupported(format!(
+            "sdxl: {id:?} names this family's {} lane on a flat request, and the curated solver of \
+             the same name on a chained pass — the two render differently, so it is refused {where_} \
+             rather than silently substituted. Pick a sampler whose meaning does not change (euler, \
+             heun, dpmpp_2m, dpmpp_sde, uni_pc, ddim).",
+            if id == "lcm" { "distilled few-step" } else { "bespoke ancestral" }
+        )))
+    };
+    for (index, pass) in passes.iter().enumerate() {
+        if let Some(id) = pass.sampler.as_deref() {
+            if CHAIN_AMBIGUOUS_SAMPLERS.contains(&id) {
+                return reject(id, &format!("on pass {index}"));
+            }
+        }
+    }
+    // The ladder inherits the flat `sampler` for any pass that names none, so it is reachable too.
+    if let Some(id) = req.sampler.as_deref() {
+        if CHAIN_AMBIGUOUS_SAMPLERS.contains(&id) && passes.iter().any(|p| p.sampler.is_none()) {
+            return reject(id, "as the inherited request-level sampler");
+        }
+    }
     Ok(())
 }
 
@@ -1868,6 +2074,113 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_preview);
+    }
+
+    /// The chained-denoise advertisement (sc-20425) and the surface that goes with it. SDXL is the
+    /// epic's LATENT-DIFFUSION acceptance family, so the published surface is asserted in full:
+    /// `discrete` is the honored native scheduler alias, the honorable sampler set is the advertised
+    /// menu intersected with the curated registry (`lightning` and `hyper` filtered OUT even though
+    /// the menu advertises them for their distilled lanes), and per-pass adapter overrides are off
+    /// because `apply_sdxl_adapters` mutates the U-Net in place at load with no revert seam.
+    #[test]
+    fn descriptor_advertises_chained_denoise_passes_without_distilled_samplers() {
+        let d = descriptor();
+        let caps = &d.capabilities;
+        assert!(caps.supports_denoise_passes);
+        assert_eq!(caps.denoise_pass_surface.native_schedulers, &["discrete"]);
+        assert!(!caps.denoise_pass_surface.per_pass_adapters);
+
+        let cap = caps.denoise_pass_capability();
+        assert!(cap.supported);
+        assert_eq!(cap.max_passes, mlx_gen::gen_core::MAX_DENOISE_PASSES);
+        for id in ["lightning", "hyper"] {
+            assert!(caps.samplers.contains(&id));
+            assert!(
+                !cap.samplers.contains(&id),
+                "{id} is a distilled bespoke lane, not a per-pass usable solver"
+            );
+        }
+        for id in ["euler", "ddim", "dpmpp_2m", "uni_pc"] {
+            assert!(cap.samplers.contains(&id), "{id}");
+        }
+        assert!(cap.schedulers.contains(&"discrete"));
+        assert!(cap.schedulers.contains(&"normal"));
+        assert_eq!(
+            cap.fields,
+            vec!["steps", "sampler", "scheduler", "denoise", "guidance"],
+            "no `adapters` field — MLX SDXL folds adapters irreversibly at load"
+        );
+
+        // The conformance sweep accepts the pairing.
+        let errs = mlx_gen::gen_core::registry::model_descriptor_errors(&d);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        // The model defaults are menu-valid AND honorable — notably not `euler_ancestral` (this
+        // crate's flat default, whose bespoke loop is not the curated solver of that name).
+        let defaults = sdxl_denoise_defaults();
+        assert_eq!(
+            (
+                defaults.steps,
+                defaults.sampler.as_str(),
+                defaults.scheduler.as_str()
+            ),
+            (DEFAULT_STEPS, "ddim", "normal")
+        );
+        assert_eq!(defaults.guidance, Some(DEFAULT_GUIDANCE));
+        assert!(cap.samplers.contains(&defaults.sampler.as_str()));
+        assert!(cap.schedulers.contains(&defaults.scheduler.as_str()));
+    }
+
+    /// The name-collision refusal (sc-20425): `lcm` and `euler_ancestral` are curated `Solver`s AND
+    /// this family's own distilled / bespoke lane names, so the same id renders differently on a flat
+    /// request than on a chained pass. The chain refuses them by name — per pass, and through the
+    /// resolution ladder's inherited request-level `sampler` — rather than substituting silently.
+    #[test]
+    fn a_chain_refuses_the_sampler_names_that_mean_a_different_lane_here() {
+        let base = |passes: Vec<mlx_gen::gen_core::DenoisePass>,
+                    sampler: Option<&str>|
+         -> GenerationRequest {
+            GenerationRequest {
+                prompt: "a cat".into(),
+                width: 512,
+                height: 512,
+                count: 1,
+                sampler: sampler.map(str::to_owned),
+                denoise_passes: Some(passes),
+                ..Default::default()
+            }
+        };
+        let named = |id: &str| mlx_gen::gen_core::DenoisePass {
+            sampler: Some(id.to_owned()),
+            ..Default::default()
+        };
+
+        for id in CHAIN_AMBIGUOUS_SAMPLERS {
+            assert!(
+                Solver::from_name(id).is_some(),
+                "{id} must be curated, or the shared floor would already reject it"
+            );
+            let err = validate_chained_sampler_names(&base(vec![named(id)], None))
+                .expect_err("a per-pass ambiguous sampler must be refused");
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            // Inherited through the ladder by a pass that names nothing.
+            let err = validate_chained_sampler_names(&base(
+                vec![mlx_gen::gen_core::DenoisePass::default()],
+                Some(id),
+            ))
+            .expect_err("an inherited ambiguous sampler must be refused");
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            // But NOT when every pass names its own unambiguous sampler.
+            assert!(validate_chained_sampler_names(&base(vec![named("ddim")], Some(id))).is_ok());
+        }
+        // An unambiguous curated sampler passes.
+        assert!(validate_chained_sampler_names(&base(vec![named("dpmpp_2m")], None)).is_ok());
+        // And a request with no chain at all is untouched.
+        assert!(validate_chained_sampler_names(&GenerationRequest {
+            sampler: Some("lcm".into()),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     #[test]
