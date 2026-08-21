@@ -1,9 +1,10 @@
 //! The **NVFP4 precision seam** for the SANA Linear-DiT trunk (sc-11045, epic 11037).
 //!
-//! [`crate::transformer::SanaTransformer`] loads its projections dense (f32 [`Linear`]) by default.
-//! This module adds the seam that lets the SAME trunk serve those projections through
+//! [`crate::transformer::SanaTransformer`] normally loads its projections through [`QLinear`]: dense
+//! f32 for an ordinary checkpoint or MLX-affine packed Q4/Q8 for a hosted tier. This module adds the
+//! separate seam that lets the SAME trunk serve eligible projections through
 //! [`Nvfp4Linear`] instead — the sc-11041 packed-forward NVFP4 path — so a **real Sana-1.6B denoise**
-//! can be run end-to-end on the FP4 tensor cores and compared against the dense f32 baseline.
+//! can be run end-to-end on the FP4 tensor cores and compared against the dense or affine-packed path.
 //!
 //! Two things live here:
 //!
@@ -36,10 +37,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module};
 use candle_gen::lock_recover;
 use candle_gen::quant::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity, QLinear,
 };
 
 /// How the trunk should serve one projection's activations when running NVFP4.
@@ -284,12 +284,13 @@ impl ActProbe {
     }
 }
 
-/// One trunk projection, served either dense (f32 [`Linear`]) or through [`Nvfp4Linear`].
+/// One trunk projection, served through Candle's dense-or-MLX-packed [`QLinear`] seam or through
+/// the distinct [`Nvfp4Linear`] format.
 ///
 /// The dense arm is the pre-existing behaviour verbatim; the NVFP4 arm is the sc-11041 packed-forward
 /// path (which itself falls back to dequant→bf16 off `sm_120`).
 pub(crate) enum SanaProj {
-    Dense(Linear),
+    Packed(Box<QLinear>),
     Nvfp4(Box<Nvfp4Linear>),
 }
 
@@ -320,7 +321,7 @@ impl Proj {
             p.record(&self.name, self.act, x)?;
         }
         match &self.inner {
-            SanaProj::Dense(l) => l.forward(x),
+            SanaProj::Packed(l) => l.forward(x),
             SanaProj::Nvfp4(l) => {
                 if self.checked {
                     l.forward_checked(x)
@@ -335,8 +336,13 @@ impl Proj {
     fn nvfp4(&self) -> Option<&Nvfp4Linear> {
         match &self.inner {
             SanaProj::Nvfp4(l) => Some(l),
-            SanaProj::Dense(_) => None,
+            SanaProj::Packed(_) => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_mlx_packed(&self) -> bool {
+        matches!(&self.inner, SanaProj::Packed(linear) if linear.is_quantized())
     }
 }
 

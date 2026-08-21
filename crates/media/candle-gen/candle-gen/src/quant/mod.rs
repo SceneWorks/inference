@@ -106,6 +106,7 @@ pub use nvfp4_linear::{
 };
 pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 
+use crate::Weights;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
@@ -1098,6 +1099,61 @@ pub fn lin_gs(
     } else {
         QLinear::linear_no_bias(in_dim, out_dim, vb.pp(base))
     }
+}
+
+/// Load a raw-map projection from a [`Weights`] checkpoint. This is the `Weights` counterpart to
+/// [`lin_gs`]: the MLX affine `{base}.weight/.scales/.biases` triple is consumed directly when
+/// present, otherwise the original dense `Linear` is retained. Raw-map consumers must not interpret
+/// packed U32 codes as a dense float matrix merely because they do not use a `VarBuilder`.
+///
+/// The packed source parts are copied to host only for the repack operation. Q4 is repacked
+/// losslessly to `Q4_1`; Q8 follows the established per-projection affine-grid → `Q8_0` requant
+/// path. Neither route materializes a dense checkpoint or falls back to the dense loader.
+pub fn linear_from_weights_gs(
+    weights: &Weights,
+    base: &str,
+    bias: bool,
+    group_size: usize,
+) -> crate::Result<QLinear> {
+    let scales_key = format!("{base}.scales");
+    if weights.contains(&scales_key) {
+        let weight_key = format!("{base}.weight");
+        let device = weights.require(&weight_key)?.device().clone();
+        let host = Device::Cpu;
+        let wq = weights.require(&weight_key)?.to_device(&host)?;
+        let scales = weights.require(&scales_key)?.to_device(&host)?;
+        let biases = weights
+            .require(&format!("{base}.biases"))?
+            .to_device(&host)?;
+        let bias = if bias {
+            Some(weights.require(&format!("{base}.bias"))?)
+        } else {
+            None
+        };
+        return Ok(QLinear::from_packed_gs(
+            &wq, &scales, &biases, bias, group_size, &device,
+        )?);
+    }
+
+    let weight = weights.require(&format!("{base}.weight"))?;
+    if weight.dtype() == DType::U32 {
+        return Err(crate::CandleError::Msg(format!(
+            "packed MLX projection {base} has U32 codes but no {base}.scales sidecar; refusing to interpret packed codes as a dense weight"
+        )));
+    }
+    let bias = if bias {
+        Some(weights.require(&format!("{base}.bias"))?)
+    } else {
+        None
+    };
+    Ok(QLinear::from_dense(DenseLinear::Linear(Linear::new(
+        weight, bias,
+    ))))
+}
+
+/// [`linear_from_weights_gs`] at MLX's hosted group-64 affine layout.
+pub fn linear_from_weights(weights: &Weights, base: &str, bias: bool) -> crate::Result<QLinear> {
+    linear_from_weights_gs(weights, base, bias, MLX_GROUP_SIZE)
 }
 
 /// Load `{base}` as a [`QEmbedding`] — packed when `{base}.scales` is present, else dense (the
