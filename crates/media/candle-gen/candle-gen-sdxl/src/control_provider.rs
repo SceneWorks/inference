@@ -22,8 +22,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::conditioning::SdxlConditioner;
 use crate::denoise::{
-    decode_image, denoise_curated, preprocess_control_image, seeded_sigma_prior, text_time_ids,
-    ControlContext,
+    decode_image, denoise_curated, seeded_sigma_prior, text_time_ids, ControlContext,
 };
 use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae};
 use crate::pipeline::{lightning_policy, sdxl_alpha_schedule, SdxlComponents};
@@ -35,6 +34,16 @@ const DEFAULT_STEPS: usize = 30;
 const DEFAULT_GUIDANCE: f64 = 7.0;
 const LIGHTNING_DEFAULT_STEPS: usize = 4;
 const DEFAULT_CONTROL_SCALE: f32 = 1.0;
+
+/// Resolve the guidance actually used by the selected denoise loop. Lightning is trained and run
+/// CFG-free, so an omitted value means `1.0`; ordinary SDXL retains its production default `7.0`.
+fn effective_guidance(req: &GenerationRequest) -> f64 {
+    if req.sampler.as_deref() == Some("lightning") {
+        req.guidance.unwrap_or(1.0) as f64
+    } else {
+        req.guidance.unwrap_or(DEFAULT_GUIDANCE as f32) as f64
+    }
+}
 
 /// The loaded, prompt-independent SDXL ControlNet graph.  The CLIP conditioner deliberately stays
 /// outside this cache: it is loaded, used, and dropped before the UNet/control/VAE group, preserving
@@ -203,7 +212,7 @@ impl Generator for SdxlControlGenerator {
             ));
         }
         if req.sampler.as_deref() == Some("lightning") {
-            if req.guidance.unwrap_or(DEFAULT_GUIDANCE as f32) > 1.0 {
+            if req.guidance.is_some_and(|guidance| guidance > 1.0) {
                 return Err(gen_core::Error::Unsupported(
                     "sdxl: ControlNet with the CFG-free `lightning` sampler requires guidance <= 1.0"
                         .into(),
@@ -232,8 +241,8 @@ impl Generator for SdxlControlGenerator {
             return Err(gen_core::Error::Canceled);
         }
 
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE as f32) as f64;
         let lightning = req.sampler.as_deref() == Some("lightning");
+        let guidance = effective_guidance(req);
         let steps = req.steps.unwrap_or(if lightning {
             LIGHTNING_DEFAULT_STEPS as u32
         } else {
@@ -263,8 +272,9 @@ impl Generator for SdxlControlGenerator {
             .iter()
             .zip(components.controls.iter())
             .map(|((image, scale), controlnet)| {
-                let image = preprocess_control_image(image, req.width, req.height, &self.device)?
-                    .to_dtype(DTYPE)?;
+                let image =
+                    preprocess_generic_control_image(image, req.width, req.height, &self.device)?
+                        .to_dtype(DTYPE)?;
                 let image = if cfg_on {
                     Tensor::cat(&[&image, &image], 0)?
                 } else {
@@ -344,6 +354,44 @@ impl Generator for SdxlControlGenerator {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Prepare an arbitrary caller-supplied SDXL ControlNet map. Generic ControlNet follows the MLX and
+/// diffusers API contract: resize the RGB map to the requested render geometry with Lanczos, then
+/// normalize `[0, 255]` to `[0, 1]` NCHW. This is intentionally separate from
+/// [`crate::denoise::preprocess_control_image`], whose exact-size rejection belongs to the
+/// InstantID kps/OpenPose renderers that always draw at target size.
+fn preprocess_generic_control_image(
+    image: &gen_core::Image,
+    target_width: u32,
+    target_height: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    let (source_width, source_height) = (image.width as usize, image.height as usize);
+    let expected = gen_core::imageops::checked_image_buffer_len(source_width, source_height, 3)
+        .unwrap_or(usize::MAX);
+    if image.pixels.len() != expected {
+        return Err(CandleError::Msg(format!(
+            "sdxl control image pixel buffer {} != {source_width}x{source_height}x3",
+            image.pixels.len()
+        )));
+    }
+
+    let (target_width, target_height) = (target_width as usize, target_height as usize);
+    let resized = if (source_width, source_height) == (target_width, target_height) {
+        image.pixels.iter().map(|&pixel| pixel as f32).collect()
+    } else {
+        gen_core::imageops::resize_lanczos_u8(
+            &image.pixels,
+            source_height,
+            source_width,
+            target_height,
+            target_width,
+        )?
+    };
+    let normalized: Vec<f32> = resized.into_iter().map(|pixel| pixel / 255.0).collect();
+    let hwc = Tensor::from_vec(normalized, (target_height, target_width, 3), device)?;
+    Ok(hwc.permute((2, 0, 1))?.unsqueeze(0)?.contiguous()?)
 }
 
 fn control_descriptor() -> ModelDescriptor {
@@ -521,6 +569,11 @@ mod tests {
 
         let mut lightning = base.clone();
         lightning.sampler = Some("lightning".into());
+        // The registered Lightning contract is CFG-free by default: omitted guidance resolves to
+        // 1.0, not the ordinary SDXL default 7.0, and therefore must validate.
+        lightning.guidance = None;
+        assert!(generator.validate(&lightning).is_ok());
+        assert!((effective_guidance(&lightning) - 1.0).abs() < f64::EPSILON);
         lightning.guidance = Some(1.0);
         assert!(generator.validate(&lightning).is_ok());
         lightning.guidance = Some(7.0);
@@ -535,5 +588,28 @@ mod tests {
             &[Quant::Q4, Quant::Q8],
             "control uses the existing packed-aware vendored UNet loader"
         );
+    }
+
+    #[test]
+    fn generic_control_resizes_and_normalizes_but_instantid_stays_exact_size() {
+        let source = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![255; 2 * 3],
+        };
+        let resized = preprocess_generic_control_image(&source, 4, 2, &Device::Cpu).unwrap();
+        assert_eq!(resized.dims4().unwrap(), (1, 3, 2, 4));
+        let values = resized.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(values.len(), 4 * 2 * 3);
+        assert!(
+            values
+                .iter()
+                .all(|value| (*value - 1.0).abs() < f32::EPSILON),
+            "an all-white map must remain normalized white after Lanczos resize"
+        );
+
+        // The generic helper must not weaken the InstantID-specific kps/OpenPose contract: those
+        // callers draw at target size and a mismatch remains an error there.
+        assert!(crate::denoise::preprocess_control_image(&source, 4, 2, &Device::Cpu).is_err());
     }
 }
