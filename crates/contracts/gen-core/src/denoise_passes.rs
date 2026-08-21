@@ -2512,6 +2512,44 @@ mod tests {
         assert_eq!(json["perPassAdapters"], Value::Bool(false));
     }
 
+    /// **The sc-20425 review's MINOR 7.** An EMPTY menu means "no advertised menu", which the floor
+    /// reads as "every curated id is acceptable". Publishing `[]` for that shape was a promise the
+    /// floor does not keep, so the two derivations are made to agree by construction. No shipped
+    /// descriptor takes this branch — the conformance sweep rejects an empty menu on a
+    /// chained-denoise descriptor — which is exactly why nothing caught it.
+    #[test]
+    fn an_empty_menu_publishes_the_curated_registry_the_floor_accepts() {
+        let caps = Capabilities {
+            supports_denoise_passes: true,
+            samplers: Vec::new(),
+            schedulers: Vec::new(),
+            ..Default::default()
+        };
+        let cap = caps.denoise_pass_capability();
+        assert_eq!(cap.samplers, curated_sampler_ids());
+        assert_eq!(cap.schedulers, curated_scheduler_ids());
+
+        // The published list and the floor agree — which is the whole claim.
+        let ctx = caps.denoise_pass_context(None);
+        for id in &cap.samplers {
+            assert!(validate_denoise_passes(&[pass(4, id, "normal", 1.0)], false, &ctx).is_ok());
+        }
+        for id in &cap.schedulers {
+            assert!(validate_denoise_passes(&[pass(4, "euler", id, 1.0)], false, &ctx).is_ok());
+        }
+        // And a declared subtraction still applies to the curated fallback.
+        let narrowed = Capabilities {
+            denoise_pass_surface: DenoisePassSurface {
+                unhonorable_samplers: &["lcm"],
+                ..DenoisePassSurface::NONE
+            },
+            ..caps
+        };
+        let cap = narrowed.denoise_pass_capability();
+        assert!(!cap.samplers.contains(&"lcm"));
+        assert!(cap.samplers.contains(&"euler"));
+    }
+
     /// **The sc-20425 review's MAJOR 2.** A curated sampler a family cannot honor on a chain — one
     /// whose *flat* meaning there is a different lane — was refused by the family and still
     /// PUBLISHED by the capability surface, so a consumer built from that surface offered an id it

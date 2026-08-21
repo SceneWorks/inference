@@ -1947,6 +1947,22 @@ pub enum StagedResidencyAvailability {
     UnconditionallyEngaged,
 }
 
+/// The advertised `menu` filtered by `honorable`, or — when the menu is EMPTY — the curated registry
+/// filtered the same way.
+///
+/// An empty menu is "no advertised menu", which the denoise-pass floor reads as "every curated id is
+/// acceptable" ([`Capabilities::denoise_pass_context`] maps it to `None`). Deriving the published
+/// list by filtering the empty menu would publish `[]` for that shape: a promise the floor does not
+/// keep (sc-20425 review MINOR 7).
+fn menu_or_curated(
+    menu: &[&'static str],
+    curated: &[&'static str],
+    honorable: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let source = if menu.is_empty() { curated } else { menu };
+    source.iter().copied().filter(|id| honorable(id)).collect()
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -2404,18 +2420,20 @@ impl Capabilities {
             max_passes: crate::denoise_passes::MAX_DENOISE_PASSES,
             max_steps_per_pass: MAX_STEPS,
             fields,
-            samplers: self
-                .samplers
-                .iter()
-                .copied()
-                .filter(|id| surface.honors_sampler(id))
-                .collect(),
-            schedulers: self
-                .schedulers
-                .iter()
-                .copied()
-                .filter(|id| surface.honors_scheduler(id))
-                .collect(),
+            // An EMPTY menu means "no advertised menu", which
+            // [`denoise_pass_context`](Self::denoise_pass_context) maps to `None` and the floor
+            // reads as "the whole curated registry is acceptable". Publishing `[]` for that shape
+            // would be a promise the floor does not keep — a list that says nothing is usable while
+            // every curated id is (sc-20425 review MINOR 7). The descriptor conformance sweep
+            // separately rejects an empty menu on a chained-denoise descriptor, so no shipped model
+            // takes this branch; it exists so the two derivations cannot disagree for anyone
+            // building a `Capabilities` by hand.
+            samplers: menu_or_curated(&self.samplers, &crate::curated_sampler_ids(), |id| {
+                surface.honors_sampler(id)
+            }),
+            schedulers: menu_or_curated(&self.schedulers, &crate::curated_scheduler_ids(), |id| {
+                surface.honors_scheduler(id)
+            }),
             per_pass_adapters: surface.per_pass_adapters,
         }
     }
