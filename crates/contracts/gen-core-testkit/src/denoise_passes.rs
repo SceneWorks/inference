@@ -617,27 +617,60 @@ pub fn check_renoise_matches_model_type(
         };
     let theirs = blend(other_x0, other_noise)?;
 
+    // At any σ > 0 the two forms are distinct — `(σ, 1)` vs `(σ, 1−σ)` — so if this model's own
+    // coefficients equal the other cohort's, its DECLARATION and its blend disagree. That is a real
+    // defect (a family copying a sibling's `noise_scaling_coeffs` alongside its own prediction type),
+    // not a harness limitation, and it is reported as such rather than as "cannot discriminate".
     if mine == theirs {
         return Err(format!(
-            "renoise convention: the FLOW and VE blends coincide at σ = {sigma_entry}, so this run \
-             proves nothing about the model type"
+            "renoise convention: this model declares {:?} but its noise_scaling_coeffs at σ = \
+             {sigma_entry} are the OTHER cohort's — the declaration and the blend disagree, so \
+             every certification over it would be vacuous",
+            ms.prediction()
         ));
     }
     let observed = host.first_latent_of_pass.get(1).ok_or_else(|| {
         "renoise convention: pass 2 was never observed, so no boundary latent exists".to_owned()
     })?;
-    if observed == &theirs {
+    classify_boundary_latent(
+        observed,
+        &mine,
+        &theirs,
+        ms.prediction(),
+        (k_x0, k_noise),
+        sigma_entry,
+    )
+}
+
+/// Which of the three things the observed boundary latent is: this cohort's blend (`Ok`), the other
+/// cohort's, or neither.
+///
+/// Split out of [`check_renoise_matches_model_type`] so the two failing arms are **reachable from a
+/// test**. They are EXECUTOR regression guards and deliberately unreachable from any
+/// [`ModelSampling`] a family can write — the observation is the executor's own blend through the
+/// same `ms`, so with a correct executor it always equals `mine`. They fire only if the executor
+/// stops reading `noise_scaling_coeffs` and hardcodes a form, which is exactly the flow-only shape
+/// this suite lived in before sc-20425 and which no test could then see. Keeping them separate keeps
+/// the diagnosis specific: "it used the other cohort's formula" is a different bug from "it used
+/// neither" (sc-20425 review MINOR 3).
+fn classify_boundary_latent(
+    observed: &[f32],
+    mine: &[f32],
+    theirs: &[f32],
+    prediction: gen_core::sampling::PredictionType,
+    (k_x0, k_noise): (f32, f32),
+    sigma_entry: f32,
+) -> Result<(), String> {
+    if observed == theirs {
         return Err(format!(
             "renoise convention: the boundary used the OTHER cohort's blend (prediction type is \
-             {:?}, so it must be x = {k_x0}·x0 + {k_noise}·ε at σ = {sigma_entry})",
-            ms.prediction()
+             {prediction:?}, so it must be x = {k_x0}·x0 + {k_noise}·ε at σ = {sigma_entry})"
         ));
     }
-    if observed != &mine {
+    if observed != mine {
         return Err(format!(
             "renoise convention: the boundary latent is neither cohort's blend at σ = \
-             {sigma_entry} — the executor is not reading {:?}'s noise_scaling_coeffs",
-            ms.prediction()
+             {sigma_entry} — the executor is not reading {prediction:?}'s noise_scaling_coeffs"
         ));
     }
     Ok(())
@@ -860,15 +893,68 @@ mod tests {
     }
 
     /// Negative self-test: a family whose declared prediction type disagrees with the blend it
-    /// actually re-noises with is caught. Without it, "the declaration and the formula are both
-    /// wrong, consistently" reads green — which is the shape of the flow-only harness that looked
-    /// like it certified SDXL.
+    /// actually re-noises with is caught, and caught AS THAT — not as the generic "cannot
+    /// discriminate" the earlier version returned, whose assertion matched every message this
+    /// function can emit and so discriminated nothing (sc-20425 review MINOR 3).
     #[test]
     fn a_model_that_blends_unlike_its_declared_cohort_is_reported() {
         let lying = MisdeclaredVe(flow_ms());
         let err = check_renoise_matches_model_type(&gen_core_builder(flow_ms()), &lying)
             .expect_err("a declared-VE model blending like flow must fail");
-        assert!(err.contains("renoise convention"), "{err}");
+        assert!(
+            err.contains("the declaration and the blend disagree"),
+            "expected the misdeclaration diagnosis, got: {err}"
+        );
+        assert!(
+            err.contains("Eps"),
+            "it must name the declared cohort: {err}"
+        );
+        // And it is NOT the σ-degenerate diagnosis, which would mean the harness gave up rather
+        // than found something.
+        assert!(!err.contains("cannot discriminate"), "{err}");
+    }
+
+    /// Negative self-test for the two EXECUTOR-regression arms, driven through the real classifier.
+    ///
+    /// No `ModelSampling` can trip them — the executor blends through the `ms` it was handed, so a
+    /// correct one always lands on `mine` — which is why the comparison is split out and called
+    /// directly here. Without this the arms were untested code the reviewer could only read as dead
+    /// (sc-20425 review MINOR 3).
+    #[test]
+    fn a_boundary_latent_from_the_wrong_cohort_is_reported() {
+        use gen_core::sampling::PredictionType;
+
+        let mine = vec![1.0_f32, 2.0, 3.0];
+        let theirs = vec![1.5_f32, 2.5, 3.5];
+        let neither = vec![9.0_f32, 9.0, 9.0];
+        let coeffs = (1.0_f32, 0.5_f32);
+
+        // The healthy case: the executor blended through this model's own coefficients.
+        classify_boundary_latent(&mine, &mine, &theirs, PredictionType::Eps, coeffs, 0.5)
+            .expect("this cohort's blend is the pass condition");
+
+        // The executor used the other cohort's formula.
+        let err =
+            classify_boundary_latent(&theirs, &mine, &theirs, PredictionType::Eps, coeffs, 0.5)
+                .expect_err("the other cohort's blend must be reported");
+        assert!(
+            err.contains("the boundary used the OTHER cohort's blend"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Eps"),
+            "it must name the declared cohort: {err}"
+        );
+
+        // The executor used neither — a third formula entirely.
+        let err =
+            classify_boundary_latent(&neither, &mine, &theirs, PredictionType::Flow, coeffs, 0.5)
+                .expect_err("an unrecognized blend must be reported");
+        assert!(err.contains("neither cohort's blend"), "{err}");
+        assert!(
+            err.contains("not reading Flow's noise_scaling_coeffs"),
+            "{err}"
+        );
     }
 
     /// Negative self-test: a boundary that lands on σ = 0 cannot tell the two blends apart (they
@@ -888,7 +974,16 @@ mod tests {
         };
         let err = check_renoise_matches_model_type(&degenerate, &ms)
             .expect_err("a σ = 0 boundary must not be reported as a pass");
-        assert!(err.contains("cannot discriminate"), "{err}");
+        assert!(
+            err.contains("cannot discriminate the"),
+            "expected the σ-degenerate diagnosis, got: {err}"
+        );
+        // And it is NOT the misdeclaration diagnosis: this model is consistent, the boundary is not
+        // informative.
+        assert!(
+            !err.contains("the declaration and the blend disagree"),
+            "{err}"
+        );
     }
 
     /// The two cohorts really do produce different chains from the same plan — the property the
