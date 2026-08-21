@@ -942,12 +942,29 @@ fn load_native_dit_at_dtype(
         let cfg = Krea2Config::from_snapshot(root)?;
         // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
         // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-        let source_device = if quant.is_some() {
+        let source_device = if matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
             &Device::Cpu
         } else {
             device
         };
         let mut dit_w = Weights::from_pinned_native_file(native_dit, source_device, dit_dtype)?;
+        let native_nvfp4 = dit_w.is_native_nvfp4();
+        if native_nvfp4 && !adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 imports do not yet support LoRA/LoKr or diff-patch adapters"
+                    .into(),
+            ));
+        }
+        if native_nvfp4 && stream_blocks {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
+            ));
+        }
+        if native_nvfp4 && matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),
+            ));
+        }
         #[cfg(test)]
         run_native_dit_load_test_hook(&dit_w, device)?;
         crate::convert::validate_native_transformer(&dit_w, &cfg)?;
@@ -965,7 +982,7 @@ fn load_native_dit_at_dtype(
         if !adapters.is_empty() {
             crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
         }
-        if let Some(quant) = quant {
+        if let Some(quant) = quant.filter(|_| !native_nvfp4) {
             dit.quantize_onto(quant, device)?;
         }
 
