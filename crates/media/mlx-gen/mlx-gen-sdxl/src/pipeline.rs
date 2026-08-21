@@ -1224,6 +1224,7 @@ pub(crate) fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::{AlphaSchedule, LightningSampler};
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
     /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a
@@ -1284,5 +1285,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("zero dimension"), "unexpected error: {e}");
+    }
+
+    /// The acceleration change must not be a validation-only admission. This CPU-only synthetic
+    /// denoise step stands in for the U-Net's documented residual injection: a nonzero ControlNet
+    /// mid residual changes the conditioned epsilon, and the actual `LightningSampler` carries that
+    /// change into the next latent. The production path does this at every step through
+    /// `forward_eps` → `UNet2DConditionModel::forward_planned`; this keeps the CFG-free sampler
+    /// boundary covered without requiring SDXL or ControlNet weights.
+    #[test]
+    fn synthetic_control_residual_materially_changes_lightning_step() {
+        let schedule = AlphaSchedule::scaled_linear(1_000, 0.00085, 0.012);
+        let sampler = LightningSampler::new(&schedule, 1_000, 4, mlx_rs::Dtype::Float16);
+        let latents = Array::from_slice(&[1.0f32, -2.0], &[1, 2]);
+        let plain_epsilon = Array::from_slice(&[0.25f32, -0.5], &[1, 2]);
+        let residuals = ControlResiduals {
+            // The down residuals are injected on the U-Net skip path; this minimal vector models
+            // the corresponding nonzero residual surface and keeps the synthetic fixture tiny.
+            down: vec![Array::from_slice(&[0.0f32, 0.0], &[1, 2])],
+            // The U-Net also injects the ControlNet mid residual before its output head. Model that
+            // live contribution in the synthetic epsilon, rather than merely checking admission.
+            mid: Array::from_slice(&[0.75f32, 0.25], &[1, 2]),
+        };
+        let controlled_epsilon = add(&plain_epsilon, &residuals.mid).unwrap();
+
+        let plain = sampler.step(&plain_epsilon, &latents, 0).unwrap();
+        let controlled = sampler.step(&controlled_epsilon, &latents, 0).unwrap();
+        let delta = add(&controlled, &multiply(&plain, scalar(-1.0)).unwrap()).unwrap();
+        assert!(
+            delta
+                .as_slice::<f32>()
+                .iter()
+                .any(|value| value.abs() > f32::EPSILON),
+            "a nonzero ControlNet residual must alter the Lightning trajectory"
+        );
     }
 }

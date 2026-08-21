@@ -118,6 +118,34 @@ fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
     }
 }
 
+/// ControlNet can share the CFG-free Lightning denoise loop: it builds a one-row control context,
+/// produces residuals for that same row, and [`crate::pipeline::forward_eps`] injects them before
+/// the U-Net prediction. The other acceleration profiles have not been validated with ControlNet,
+/// so keep that boundary explicit rather than accepting a combination just because the common loop
+/// happens to be mechanically capable of running it.
+///
+/// Lightning is distilled CFG-free. In particular, an omitted guidance value resolves to its normal
+/// `1.0` default; an explicitly larger value must be rejected rather than silently running a
+/// two-row CFG path against a checkpoint trained for a single conditioned prediction.
+fn validate_control_acceleration(sampler: &str, guidance: Option<f32>) -> Result<()> {
+    if !ACCEL_SAMPLERS.contains(&sampler) {
+        return Ok(());
+    }
+    if sampler != "lightning" {
+        return Err(Error::Msg(format!(
+            "sdxl: ControlNet is supported with the CFG-free `lightning` acceleration sampler only \
+             (got {sampler:?})"
+        )));
+    }
+    if guidance.is_some_and(|value| value > 1.0) {
+        return Err(Error::Msg(
+            "sdxl: ControlNet with the CFG-free `lightning` sampler requires guidance <= 1.0"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TARGETS["sdxl"]`).
 pub const MODEL_ID: &str = "sdxl";
 
@@ -976,14 +1004,12 @@ impl Sdxl {
         }
         // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
         // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
-        // summed. Needs the ancestral path; not combined with an inpaint mask in this build.
+        // summed. The common denoiser correctly carries those residuals through Lightning's one-row,
+        // CFG-free loop; LCM/Hyper remain deliberately unsupported until separately characterized.
+        // Control still does not combine with an inpaint mask in this build.
         let control_reqs = self.resolve_control(req)?;
         if !control_reqs.is_empty() {
-            if is_accel {
-                return Err(Error::Msg(
-                    "sdxl: ControlNet is not supported with the acceleration samplers".into(),
-                ));
-            }
+            validate_control_acceleration(sampler_name, req.guidance)?;
             if control_reqs.len() != self.control_count {
                 return Err(Error::Msg(format!(
                     "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
@@ -1816,6 +1842,30 @@ mod tests {
                 ancestral_strength_schedule(steps, max_time, strength),
                 previous
             );
+        }
+    }
+
+    #[test]
+    fn control_acceleration_admission_is_lightning_only_and_cfg_free() {
+        // The ordinary no-ControlNet acceleration paths keep their established defaults. This
+        // contract applies only to the control-aware path, where a Lightning checkpoint must never
+        // be silently driven through CFG.
+        assert_eq!(accel_defaults("lightning"), (4, 1.0, 0.0));
+        assert!(validate_control_acceleration("euler_ancestral", Some(7.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", None).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(1.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(0.5)).is_ok());
+
+        let guidance = validate_control_acceleration("lightning", Some(1.01))
+            .unwrap_err()
+            .to_string();
+        assert!(guidance.contains("guidance <= 1.0"), "got: {guidance}");
+
+        for sampler in ["lcm", "hyper"] {
+            let err = validate_control_acceleration(sampler, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("lightning"), "{sampler}: {err}");
         }
     }
 
