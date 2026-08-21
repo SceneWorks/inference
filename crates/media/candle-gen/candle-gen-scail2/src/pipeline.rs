@@ -13,7 +13,7 @@
 //! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
 //! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -324,12 +324,29 @@ fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
     Ok(VarBuilder::from_tensors(map, DType::F32, device))
 }
 
-fn expected_packed_dit_bases(cfg: &Scail2Config) -> BTreeSet<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedProjectionSchema {
+    output: usize,
+    input: usize,
+}
+
+/// Every MLX-packed SCAIL2 projection, including its logical dense matrix shape. The packed
+/// triple alone is not enough to prove this: `QLinear` infers its bit width from the triple and
+/// intentionally does not compare the inferred matrix dimensions with its caller's schema.
+fn expected_packed_dit_projections(cfg: &Scail2Config) -> BTreeMap<String, PackedProjectionSchema> {
     (0..cfg.num_layers)
         .flat_map(|block| {
-            PACKED_DIT_SUFFIXES
-                .iter()
-                .map(move |suffix| format!("blocks.{block}.{suffix}"))
+            PACKED_DIT_SUFFIXES.iter().map(move |suffix| {
+                let (output, input) = match *suffix {
+                    "ffn.0" => (cfg.ffn_dim, cfg.dim),
+                    "ffn.2" => (cfg.dim, cfg.ffn_dim),
+                    _ => (cfg.dim, cfg.dim),
+                };
+                (
+                    format!("blocks.{block}.{suffix}"),
+                    PackedProjectionSchema { output, input },
+                )
+            })
         })
         .collect()
 }
@@ -365,7 +382,7 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
         return Ok(());
     };
 
-    let expected = expected_packed_dit_bases(cfg);
+    let expected = expected_packed_dit_projections(cfg);
     for name in tensors
         .keys()
         .filter(|name| name.ends_with(".scales") || name.ends_with(".biases"))
@@ -376,7 +393,7 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
             ".biases"
         };
         let base = name.strip_suffix(suffix).expect("suffix checked");
-        if !expected.contains(base) {
+        if !expected.contains_key(base) {
             return Err(CandleError::Msg(format!(
                 "scail2: packed DiT has orphan or non-SCAIL2 sidecar {name}"
             )));
@@ -385,17 +402,18 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
     for (name, header) in &tensors {
         if name.ends_with(".weight") && header.dtype == Dtype::U32 {
             let base = name.strip_suffix(".weight").expect("suffix checked");
-            if !expected.contains(base) {
+            if !expected.contains_key(base) {
                 return Err(CandleError::Msg(format!(
                     "scail2: packed DiT has unrecognized U32 weight {name}"
                 )));
             }
         }
     }
-    for base in expected {
+    for (base, schema) in expected {
         let weight_key = format!("{base}.weight");
         let scales_key = format!("{base}.scales");
         let biases_key = format!("{base}.biases");
+        let bias_key = format!("{base}.bias");
         let weight = tensors.get(&weight_key).ok_or_else(|| {
             CandleError::Msg(format!("scail2: packed DiT is missing {weight_key}"))
         })?;
@@ -405,13 +423,57 @@ fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
         let biases = tensors.get(&biases_key).ok_or_else(|| {
             CandleError::Msg(format!("scail2: packed DiT is missing {biases_key}"))
         })?;
-        // The shared helper validates U32 codes, rank-2 shape compatibility, floating sidecars,
-        // and GGML block alignment without reading a tensor payload.
-        mlx_packed_qtensor_resident_bytes(weight, scales, biases, MLX_GROUP_SIZE)?;
-        let bits = mlx_packed_bits_gs(weight.shape[1], scales.shape[1], MLX_GROUP_SIZE);
-        if bits != quant.bits() as usize {
+        let bias = tensors
+            .get(&bias_key)
+            .ok_or_else(|| CandleError::Msg(format!("scail2: packed DiT is missing {bias_key}")))?;
+        if !matches!(scales.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+            || !matches!(biases.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+        {
             return Err(CandleError::Msg(format!(
-                "scail2: packed DiT {base} is Q{bits}, but config.json declares Q{}",
+                "scail2: packed DiT {base} sidecars must be F16, BF16, or F32 (scales {:?}, biases {:?})",
+                scales.dtype, biases.dtype
+            )));
+        }
+        let input = schema.input;
+        let scale_columns = input.checked_div(MLX_GROUP_SIZE).filter(|_| input.is_multiple_of(MLX_GROUP_SIZE)).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "scail2: packed DiT {base} input width {input} is not divisible by group size {MLX_GROUP_SIZE}"
+            ))
+        })?;
+        let bits = quant.bits() as usize;
+        let packed_columns = input
+            .checked_mul(bits)
+            .filter(|encoded| encoded.is_multiple_of(32))
+            .map(|encoded| encoded / 32)
+            .ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "scail2: packed DiT {base} schema {input}×Q{bits} cannot form U32 code words"
+                ))
+            })?;
+        if weight.shape.as_slice() != [schema.output, packed_columns]
+            || scales.shape.as_slice() != [schema.output, scale_columns]
+            || biases.shape.as_slice() != [schema.output, scale_columns]
+            || bias.shape.as_slice() != [schema.output]
+        {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} violates its schema: expected weight [{}, {packed_columns}], \
+                 scales/biases [{}, {scale_columns}], and bias [{}]; got weight {:?}, scales {:?}, biases {:?}, bias {:?}",
+                schema.output,
+                schema.output,
+                schema.output,
+                weight.shape,
+                scales.shape,
+                biases.shape,
+                bias.shape,
+            )));
+        }
+        // The shared helper then validates U32 codes, triple compatibility, and GGML block
+        // alignment without reading a tensor payload.
+        mlx_packed_qtensor_resident_bytes(weight, scales, biases, MLX_GROUP_SIZE)?;
+        let packed_bits = mlx_packed_bits_gs(weight.shape[1], scales.shape[1], MLX_GROUP_SIZE);
+        if packed_bits != bits {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} is Q{packed_bits}, but config.json declares Q{}",
                 quant.bits()
             )));
         }
@@ -945,35 +1007,49 @@ mod tests {
 
     fn mini_packed_config(quant: Option<Quant>) -> Scail2Config {
         let mut cfg = Scail2Config::scail2_14b();
+        // Keep the real projection *schema* (attention/cross-attention dim×dim and asymmetric
+        // FFN matrices) while making the safetensors fixture small enough for ordinary CPU CI.
+        cfg.dim = 64;
+        cfg.ffn_dim = 192;
+        cfg.num_heads = 1;
         cfg.num_layers = 1;
         cfg.packed_quant = quant;
         cfg
     }
 
+    fn packed_projection(bits: usize, output: usize, input: usize) -> (Tensor, Tensor, Tensor) {
+        let dense = Tensor::from_vec(
+            vec![0.25_f32; output * input],
+            (output, input),
+            &Device::Cpu,
+        )
+        .unwrap();
+        candle_gen::quant::pack_mlx_affine(&dense, bits, 64).unwrap()
+    }
+
     fn packed_dit_map(bits: usize) -> HashMap<String, Tensor> {
         let mut out = HashMap::new();
-        for base in expected_packed_dit_bases(&mini_packed_config(Some(Quant::Q4))) {
-            let dense = Tensor::from_vec(vec![0.25_f32; 128], (2, 64), &Device::Cpu).unwrap();
-            let (weight, scales, biases) =
-                candle_gen::quant::pack_mlx_affine(&dense, bits, 64).unwrap();
+        for (base, schema) in expected_packed_dit_projections(&mini_packed_config(Some(Quant::Q4)))
+        {
+            let (weight, scales, biases) = packed_projection(bits, schema.output, schema.input);
             out.insert(format!("{base}.weight"), weight);
             out.insert(format!("{base}.scales"), scales);
             out.insert(format!("{base}.biases"), biases);
             out.insert(
                 format!("{base}.bias"),
-                Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap(),
+                Tensor::zeros(schema.output, DType::F32, &Device::Cpu).unwrap(),
             );
         }
         out
     }
 
     fn dense_dit_map() -> HashMap<String, Tensor> {
-        expected_packed_dit_bases(&mini_packed_config(None))
+        expected_packed_dit_projections(&mini_packed_config(None))
             .into_iter()
-            .map(|base| {
+            .map(|(base, schema)| {
                 (
                     format!("{base}.weight"),
-                    Tensor::zeros((2, 64), DType::F32, &Device::Cpu).unwrap(),
+                    Tensor::zeros((schema.output, schema.input), DType::F32, &Device::Cpu).unwrap(),
                 )
             })
             .collect()
@@ -1023,6 +1099,9 @@ mod tests {
             std::fs::write(
                 tmp.path().join("config.json"),
                 serde_json::json!({
+                    "dim": cfg.dim,
+                    "ffn_dim": cfg.ffn_dim,
+                    "num_heads": cfg.num_heads,
                     "num_layers": 1,
                     "quantization": { "bits": bits, "group_size": 64 }
                 })
@@ -1042,13 +1121,89 @@ mod tests {
                 &Device::Cpu,
             )
             .unwrap();
-            let q = crate::common::packed_linear(64, 2, &vb, "blocks.0.self_attn.q").unwrap();
+            let q = crate::common::packed_linear(cfg.dim, cfg.dim, &vb, "blocks.0.self_attn.q")
+                .unwrap();
             assert!(q.is_quantized(), "Q{bits} must stay packed-resident");
             assert_eq!(
-                q.forward(&Tensor::ones((1, 64), DType::F32, &Device::Cpu).unwrap())
+                q.forward(&Tensor::ones((1, cfg.dim), DType::F32, &Device::Cpu).unwrap())
                     .unwrap()
                     .dims(),
-                &[1, 2]
+                &[1, cfg.dim]
+            );
+        }
+    }
+
+    #[test]
+    fn packed_projection_schema_matches_scail2_14b() {
+        let cfg = Scail2Config::scail2_14b();
+        let expected = expected_packed_dit_projections(&cfg);
+        for base in [
+            "blocks.0.self_attn.q",
+            "blocks.0.cross_attn.k_img",
+            "blocks.39.cross_attn.v_img",
+        ] {
+            assert_eq!(
+                expected[base],
+                PackedProjectionSchema {
+                    output: 5120,
+                    input: 5120
+                },
+                "{base} must remain a dim×dim projection"
+            );
+        }
+        assert_eq!(
+            expected["blocks.0.ffn.0"],
+            PackedProjectionSchema {
+                output: 13824,
+                input: 5120
+            }
+        );
+        assert_eq!(
+            expected["blocks.39.ffn.2"],
+            PackedProjectionSchema {
+                output: 5120,
+                input: 13824
+            }
+        );
+    }
+
+    #[test]
+    fn packed_dit_sidecars_must_be_floating() {
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            for key in ["blocks.0.self_attn.q.scales", "blocks.0.self_attn.q.biases"] {
+                map.insert(
+                    key.into(),
+                    Tensor::zeros((64, 1), dtype, &Device::Cpu).unwrap(),
+                );
+            }
+            write_dit(tmp.path(), &map);
+            assert!(
+                validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q4)))
+                    .is_ok(),
+                "{dtype:?} sidecars must be accepted"
+            );
+        }
+
+        for (key, dtype) in [
+            ("blocks.0.self_attn.q.scales", DType::U32),
+            ("blocks.0.self_attn.q.biases", DType::U32),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            map.insert(
+                key.into(),
+                Tensor::zeros((64, 1), dtype, &Device::Cpu).unwrap(),
+            );
+            write_dit(tmp.path(), &map);
+            let error =
+                validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q4)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("sidecars must be F16, BF16, or F32"),
+                "got: {error}"
             );
         }
     }
@@ -1083,7 +1238,35 @@ mod tests {
                     map.remove("blocks.0.self_attn.q.biases");
                     map.insert(
                         "blocks.0.self_attn.q.weight".into(),
-                        Tensor::zeros((2, 64), DType::F32, &Device::Cpu).unwrap(),
+                        Tensor::zeros((64, 64), DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "wrong but internally consistent ffn schema",
+                Box::new(|map| {
+                    let (weight, scales, biases) = packed_projection(4, 64, 64);
+                    map.insert("blocks.0.ffn.0.weight".into(), weight);
+                    map.insert("blocks.0.ffn.0.scales".into(), scales);
+                    map.insert("blocks.0.ffn.0.biases".into(), biases);
+                    map.insert(
+                        "blocks.0.ffn.0.bias".into(),
+                        Tensor::zeros(64, DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "missing dense bias",
+                Box::new(|map| {
+                    map.remove("blocks.0.cross_attn.k_img.bias");
+                }),
+            ),
+            (
+                "wrong dense bias length",
+                Box::new(|map| {
+                    map.insert(
+                        "blocks.0.self_attn.o.bias".into(),
+                        Tensor::zeros(63, DType::F32, &Device::Cpu).unwrap(),
                     );
                 }),
             ),
@@ -1116,7 +1299,7 @@ mod tests {
         let error = validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q8)))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("declares Q8"), "got: {error}");
+        assert!(error.contains("violates its schema"), "got: {error}");
     }
 
     #[test]
