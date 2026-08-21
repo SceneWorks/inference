@@ -13,7 +13,7 @@
 //! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
 //! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +47,24 @@ const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
 const DEFAULT_GUIDANCE: f32 = 5.0;
 const DEFAULT_FPS: u32 = 16;
+
+/// The only DiT projections the SCAIL2 MLX converter packs. These raw `SCAIL2Model` names are
+/// deliberately not diffusers-prefixed: the hosted `dit.safetensors` is a flat file, while the
+/// legacy candle tree is a separate dense format.
+const PACKED_DIT_SUFFIXES: &[&str] = &[
+    "self_attn.q",
+    "self_attn.k",
+    "self_attn.v",
+    "self_attn.o",
+    "cross_attn.q",
+    "cross_attn.k",
+    "cross_attn.v",
+    "cross_attn.o",
+    "cross_attn.k_img",
+    "cross_attn.v_img",
+    "ffn.0",
+    "ffn.2",
+];
 
 /// SceneWorks/engine model id (matches `mlx-gen-scail2` so a consumer resolves the same engine across
 /// backends). A still image is `num_frames == 1`.
@@ -151,7 +169,7 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 32,
             max_size: 1280,
             max_count: 1,
-            supported_quants: &[] as &[Quant],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
             // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
             size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
@@ -306,6 +324,101 @@ fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
     Ok(VarBuilder::from_tensors(map, DType::F32, device))
 }
 
+fn expected_packed_dit_bases(cfg: &Scail2Config) -> BTreeSet<String> {
+    (0..cfg.num_layers)
+        .flat_map(|block| {
+            PACKED_DIT_SUFFIXES
+                .iter()
+                .map(move |suffix| format!("blocks.{block}.{suffix}"))
+        })
+        .collect()
+}
+
+/// Validate the published SCAIL2 packed-DiT *format* from safetensors headers only. This runs
+/// before constructing a VarBuilder, so an incomplete or mixed payload cannot fall through to a
+/// dense U32 read and it never stages full weights. The manifest and every triple must agree on
+/// the exact raw SCAIL2 block namespace and the hosted group-64 Q4/Q8 representation.
+fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
+    use candle_gen::gen_core::weightsmeta::Dtype;
+    use candle_gen::quant::{
+        mlx_packed_bits_gs, mlx_packed_qtensor_resident_bytes, MLX_GROUP_SIZE,
+    };
+
+    let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+        root.join("dit.safetensors"),
+    )?;
+    let tensors: BTreeMap<_, _> = headers
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect();
+    let has_packed_leaf = tensors.iter().any(|(name, header)| {
+        name.ends_with(".scales")
+            || name.ends_with(".biases")
+            || (name.ends_with(".weight") && header.dtype == Dtype::U32)
+    });
+    let Some(quant) = cfg.packed_quant else {
+        if has_packed_leaf {
+            return Err(CandleError::Msg(
+                "scail2: dense config.json cannot admit MLX packed DiT leaves".into(),
+            ));
+        }
+        return Ok(());
+    };
+
+    let expected = expected_packed_dit_bases(cfg);
+    for name in tensors
+        .keys()
+        .filter(|name| name.ends_with(".scales") || name.ends_with(".biases"))
+    {
+        let suffix = if name.ends_with(".scales") {
+            ".scales"
+        } else {
+            ".biases"
+        };
+        let base = name.strip_suffix(suffix).expect("suffix checked");
+        if !expected.contains(base) {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT has orphan or non-SCAIL2 sidecar {name}"
+            )));
+        }
+    }
+    for (name, header) in &tensors {
+        if name.ends_with(".weight") && header.dtype == Dtype::U32 {
+            let base = name.strip_suffix(".weight").expect("suffix checked");
+            if !expected.contains(base) {
+                return Err(CandleError::Msg(format!(
+                    "scail2: packed DiT has unrecognized U32 weight {name}"
+                )));
+            }
+        }
+    }
+    for base in expected {
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        let weight = tensors.get(&weight_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {weight_key}"))
+        })?;
+        let scales = tensors.get(&scales_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {scales_key}"))
+        })?;
+        let biases = tensors.get(&biases_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {biases_key}"))
+        })?;
+        // The shared helper validates U32 codes, rank-2 shape compatibility, floating sidecars,
+        // and GGML block alignment without reading a tensor payload.
+        mlx_packed_qtensor_resident_bytes(weight, scales, biases, MLX_GROUP_SIZE)?;
+        let bits = mlx_packed_bits_gs(weight.shape[1], scales.shape[1], MLX_GROUP_SIZE);
+        if bits != quant.bits() as usize {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} is Q{bits}, but config.json declares Q{}",
+                quant.bits()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The loaded SCAIL-2 model: resolved config + snapshot dir, with the heavy components (DiT / VAE /
 /// UMT5 / CLIP) loaded lazily on first generate and cached.
 pub struct Scail2 {
@@ -410,7 +523,8 @@ impl Scail2 {
 /// candle component tree (`text_encoder/`, `transformer/`, `vae/`, `clip/`, and
 /// `tokenizer/tokenizer.json`). Inference
 /// adapters (`spec.adapters` — LoRA / LoKr / LoHa / lightx2v lightning diff-patch / Bias-Aware DPO) are
-/// merged into the dense DiT before build (sc-6838); on-the-fly quantization is still rejected.
+/// merged into the dense DiT before build (sc-6838). Q4/Q8 select the matching hosted packed tier;
+/// they are not on-the-fly quantization.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -423,11 +537,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle scail2 does not support on-the-fly Q4/Q8 quantization yet".into(),
-        ));
-    }
     if !root.exists() {
         return Err(gen_core::Error::Msg(format!(
             "scail2: snapshot dir does not exist: {}",
@@ -436,6 +545,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let layout = snapshot_layout(&root)?;
     let config = Scail2Config::from_model_dir(&root)?;
+    if layout == SnapshotLayout::SharedMlxTier {
+        validate_shared_packed_dit(&root, &config)?;
+    }
+    if spec.quantize != config.packed_quant {
+        return Err(gen_core::Error::Unsupported(format!(
+            "scail2: requested precision tier {:?} does not match the snapshot's {:?} DiT layout",
+            spec.quantize, config.packed_quant
+        )));
+    }
+    if config.packed_quant.is_some() && !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "scail2: adapters require the dense DiT; packed Q4/Q8 tiers refuse adapter merging rather than staging a dense base".into(),
+        ));
+    }
     let device = candle_gen::default_device()?;
     Ok(Box::new(Scail2 {
         descriptor: descriptor(),
@@ -818,6 +941,48 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    type MapMutation = Box<dyn Fn(&mut HashMap<String, Tensor>)>;
+
+    fn mini_packed_config(quant: Option<Quant>) -> Scail2Config {
+        let mut cfg = Scail2Config::scail2_14b();
+        cfg.num_layers = 1;
+        cfg.packed_quant = quant;
+        cfg
+    }
+
+    fn packed_dit_map(bits: usize) -> HashMap<String, Tensor> {
+        let mut out = HashMap::new();
+        for base in expected_packed_dit_bases(&mini_packed_config(Some(Quant::Q4))) {
+            let dense = Tensor::from_vec(vec![0.25_f32; 128], (2, 64), &Device::Cpu).unwrap();
+            let (weight, scales, biases) =
+                candle_gen::quant::pack_mlx_affine(&dense, bits, 64).unwrap();
+            out.insert(format!("{base}.weight"), weight);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+            out.insert(
+                format!("{base}.bias"),
+                Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        out
+    }
+
+    fn dense_dit_map() -> HashMap<String, Tensor> {
+        expected_packed_dit_bases(&mini_packed_config(None))
+            .into_iter()
+            .map(|base| {
+                (
+                    format!("{base}.weight"),
+                    Tensor::zeros((2, 64), DType::F32, &Device::Cpu).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn write_dit(root: &Path, tensors: &HashMap<String, Tensor>) {
+        cst::save(tensors, root.join("dit.safetensors")).unwrap();
+    }
+
     fn touch(path: &Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -840,6 +1005,118 @@ mod tests {
         let error = snapshot_layout(tmp.path()).unwrap_err().to_string();
         assert!(error.contains("t5_encoder.safetensors"), "got: {error}");
         assert!(error.contains("text_encoder/"), "got: {error}");
+    }
+
+    #[test]
+    fn hosted_q4_q8_scail2_block_keys_load_as_quantized_without_dense_staging() {
+        for (bits, quant) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_dit(tmp.path(), &packed_dit_map(bits));
+            let cfg = mini_packed_config(Some(quant));
+            validate_shared_packed_dit(tmp.path(), &cfg).unwrap();
+
+            for file in SHARED_TIER_FILES {
+                if *file != "config.json" && *file != "dit.safetensors" {
+                    touch(&tmp.path().join(file));
+                }
+            }
+            std::fs::write(
+                tmp.path().join("config.json"),
+                serde_json::json!({
+                    "num_layers": 1,
+                    "quantization": { "bits": bits, "group_size": 64 }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let selected =
+                LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf())).with_quant(quant);
+            assert!(load(&selected).is_ok(), "Q{bits} tier must be selectable");
+
+            // This is the exact bounded mmap + raw SCAIL2 key form used by transformer_vb.  The
+            // assertion proves the q/k block projection chose QLinear's packed arm rather than a
+            // dense `Linear` over the U32 codes.
+            let vb = cpu_cast_mmap_var_builder(
+                &[tmp.path().join("dit.safetensors")],
+                DType::F32,
+                &Device::Cpu,
+            )
+            .unwrap();
+            let q = crate::common::packed_linear(64, 2, &vb, "blocks.0.self_attn.q").unwrap();
+            assert!(q.is_quantized(), "Q{bits} must stay packed-resident");
+            assert_eq!(
+                q.forward(&Tensor::ones((1, 64), DType::F32, &Device::Cpu).unwrap())
+                    .unwrap()
+                    .dims(),
+                &[1, 2]
+            );
+        }
+    }
+
+    #[test]
+    fn dense_base_uses_raw_scail2_keys_and_refuses_packed_leaves_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dit(tmp.path(), &dense_dit_map());
+        validate_shared_packed_dit(tmp.path(), &mini_packed_config(None)).unwrap();
+
+        write_dit(tmp.path(), &packed_dit_map(4));
+        let error = validate_shared_packed_dit(tmp.path(), &mini_packed_config(None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dense config.json"), "got: {error}");
+    }
+
+    #[test]
+    fn packed_dit_fails_closed_on_partial_mixed_or_orphan_sidecars() {
+        let cfg = mini_packed_config(Some(Quant::Q4));
+        let cases: Vec<(&str, MapMutation)> = vec![
+            (
+                "missing biases",
+                Box::new(|map| {
+                    map.remove("blocks.0.self_attn.q.biases");
+                }),
+            ),
+            (
+                "mixed dense q",
+                Box::new(|map| {
+                    map.remove("blocks.0.self_attn.q.scales");
+                    map.remove("blocks.0.self_attn.q.biases");
+                    map.insert(
+                        "blocks.0.self_attn.q.weight".into(),
+                        Tensor::zeros((2, 64), DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "orphan sidecar",
+                Box::new(|map| {
+                    map.insert(
+                        "transformer.blocks.0.self_attn.q.scales".into(),
+                        Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+        ];
+        for (label, mutate) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            mutate(&mut map);
+            write_dit(tmp.path(), &map);
+            assert!(
+                validate_shared_packed_dit(tmp.path(), &cfg).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_dit_rejects_manifest_payload_bit_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dit(tmp.path(), &packed_dit_map(4));
+        let error = validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q8)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declares Q8"), "got: {error}");
     }
 
     #[test]
@@ -1675,12 +1952,11 @@ mod tests {
             "got: {err}"
         );
         assert!(err.to_string().contains("does not exist"), "got: {err}");
-        // on-the-fly quant is still rejected
+        // Q4/Q8 select an already-packed hosted tier; without a snapshot, the missing-dir error
+        // remains more useful than pretending this is an on-the-fly quantization request.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        let err = load(&quant).err().expect("err");
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
 
     /// A 640×480 request whose driving ControlClip carries the given sc-20262 knob values.
