@@ -2553,15 +2553,22 @@ mod tests {
         let writer_selected = selected.clone();
         let writer = std::thread::spawn(move || {
             writer_start.wait();
-            std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
-            std::fs::rename(staged_a, &writer_selected)
-                .expect("replace selected path with a recreated A link");
+            let rebound = std::fs::rename(staged_b, &writer_selected)
+                .and_then(|()| std::fs::rename(staged_a, &writer_selected));
+            // Release the main thread whatever the rebinding did. It is parked on `mutation_done`
+            // below, so a writer that panics — or returns — ahead of this barrier strands it there
+            // and hangs the whole test binary; the outcome is asserted on `join` instead, so a
+            // failed rebinding reads as a red test naming the error.
             writer_done.wait();
+            rebound
         });
 
         start_mutation.wait();
         mutation_done.wait();
-        writer.join().expect("writer thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("rebind the selected path through B back to a recreated A");
         assert_eq!(
             std::fs::read(&selected).expect("read final selected target"),
             b"same-size-a",
@@ -2649,15 +2656,21 @@ mod tests {
             let writer_selected = selected.clone();
             let writer = std::thread::spawn(move || {
                 writer_start.wait();
-                std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
-                std::fs::rename(staged_a, &writer_selected)
-                    .expect("replace selected path with a recreated A link");
+                let rebound = std::fs::rename(staged_b, &writer_selected)
+                    .and_then(|()| std::fs::rename(staged_a, &writer_selected));
+                // Release the main thread whatever the rebinding did; see the sibling test above.
+                // Returning ahead of this barrier strands the main thread on it and hangs the test
+                // binary. The outcome is asserted on `join` instead.
                 writer_done.wait();
+                rebound
             });
 
             start_mutation.wait();
             mutation_done.wait();
-            writer.join().expect("writer thread");
+            writer
+                .join()
+                .expect("writer thread")
+                .expect("rebind the selected path through B back to a recreated A");
             assert_eq!(
                 std::fs::read(&selected).expect("read final selected target"),
                 b"same-size-a"
