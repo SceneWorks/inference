@@ -79,20 +79,30 @@ pub struct Scail2Job<'a> {
     pub segment_overlap: usize,
 }
 
-/// Encode every additional character while observing cancellation between individual VAE/mask passes.
-/// Extra references are input-side work and intentionally emit no progress events: the existing global
-/// denoise sweep remains the sole `Progress::Step` sequence and therefore stays monotonic.
-fn map_additional_references<T>(
+/// Encode every additional character while observing cancellation before, between, and after the
+/// individual VAE/mask passes. Extra references are input-side work and intentionally emit no
+/// progress events: the existing global denoise sweep remains the sole `Progress::Step` sequence
+/// and therefore stays monotonic.
+fn map_additional_references<T, U>(
     additional: &[CharacterRef<'_>],
     cancel: &CancelFlag,
-    mut encode: impl FnMut(&CharacterRef<'_>) -> CResult<T>,
-) -> CResult<Vec<T>> {
+    mut encode_image: impl FnMut(&CharacterRef<'_>) -> CResult<T>,
+    mut encode_mask: impl FnMut(&CharacterRef<'_>) -> CResult<U>,
+) -> CResult<Vec<(T, U)>> {
     let mut encoded = Vec::with_capacity(additional.len());
     for reference in additional {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        encoded.push(encode(reference)?);
+        let image = encode_image(reference)?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let mask = encode_mask(reference)?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        encoded.push((image, mask));
     }
     Ok(encoded)
 }
@@ -388,20 +398,28 @@ pub fn generate(
     let (additional_ref_latent, additional_ref_masks) = if job.additional.is_empty() {
         (None, None)
     } else {
-        let encoded = map_additional_references(&job.additional, cancel, |c| {
-            let img =
-                image_to_chw(c.image, tw, th, Interp::Bicubic, dev)?.reshape((3, 1, th, tw))?;
-            let latent = vae_encode_cthw(&comps.vae, &img)?;
-            let mk =
-                image_to_chw(c.mask, tw, th, Interp::Bilinear, dev)?.reshape((3, 1, th, tw))?;
-            let mask = extract_and_compress_mask_to_latent(&mk, TEMPORAL_STRIDE)?;
-            Ok((latent, mask))
-        })?;
+        let encoded = map_additional_references(
+            &job.additional,
+            cancel,
+            |c| {
+                let img =
+                    image_to_chw(c.image, tw, th, Interp::Bicubic, dev)?.reshape((3, 1, th, tw))?;
+                vae_encode_cthw(&comps.vae, &img)
+            },
+            |c| {
+                let mk =
+                    image_to_chw(c.mask, tw, th, Interp::Bilinear, dev)?.reshape((3, 1, th, tw))?;
+                Ok(extract_and_compress_mask_to_latent(&mk, TEMPORAL_STRIDE)?)
+            },
+        )?;
         let (lats, masks): (Vec<_>, Vec<_>) = encoded.into_iter().unzip();
         let lr: Vec<&Tensor> = lats.iter().collect();
         let mr: Vec<&Tensor> = masks.iter().collect();
         (Some(Tensor::cat(&lr, 1)?), Some(Tensor::cat(&mr, 1)?))
     };
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
 
     // --- UMT5 text encode + CLIP reference-image features (once) ---
     // The tokenizer is loaded+parsed once at component load (sc-8991 / F-011) — reuse the cached one.
@@ -873,33 +891,68 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_observed_between_additional_reference_encodes() {
+    fn cancellation_during_one_extra_vae_stops_before_mask_and_later_conditioning() {
         let first = sample_image(2, 2, 1);
-        let second = sample_image(2, 2, 2);
-        let third = sample_image(2, 2, 3);
-        let refs = [
-            CharacterRef {
-                image: &first,
-                mask: &first,
-            },
-            CharacterRef {
-                image: &second,
-                mask: &second,
-            },
-            CharacterRef {
-                image: &third,
-                mask: &third,
-            },
-        ];
+        let refs = [CharacterRef {
+            image: &first,
+            mask: &first,
+        }];
         let cancel = CancelFlag::new();
-        let mut encoded = 0;
-        let error = map_additional_references(&refs, &cancel, |_| {
-            encoded += 1;
-            cancel.cancel();
-            Ok(())
-        })
-        .expect_err("the second extra reference must not begin after cancellation");
+        let mut vae_passes = 0;
+        let mut mask_passes = 0;
+        let mut later_conditioning_entered = false;
+        let result = map_additional_references(
+            &refs,
+            &cancel,
+            |_| {
+                vae_passes += 1;
+                cancel.cancel();
+                Ok(())
+            },
+            |_| {
+                mask_passes += 1;
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            later_conditioning_entered = true;
+        }
+        let error = result.expect_err("cancellation during VAE must stop the single extra pair");
         assert!(matches!(error, CandleError::Canceled), "got: {error}");
-        assert_eq!(encoded, 1, "only the first extra reference was encoded");
+        assert_eq!(vae_passes, 1, "the extra reference entered its VAE pass");
+        assert_eq!(mask_passes, 0, "mask preprocessing must not begin");
+        assert!(
+            !later_conditioning_entered,
+            "later text/image conditioning must not begin"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_last_extra_mask_stops_before_later_conditioning() {
+        let first = sample_image(2, 2, 1);
+        let refs = [CharacterRef {
+            image: &first,
+            mask: &first,
+        }];
+        let cancel = CancelFlag::new();
+        let mut later_conditioning_entered = false;
+        let result = map_additional_references(
+            &refs,
+            &cancel,
+            |_| Ok(()),
+            |_| {
+                cancel.cancel();
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            later_conditioning_entered = true;
+        }
+        let error = result.expect_err("cancellation after the last mask must stop conditioning");
+        assert!(matches!(error, CandleError::Canceled), "got: {error}");
+        assert!(
+            !later_conditioning_entered,
+            "later text/image conditioning must not begin"
+        );
     }
 }
