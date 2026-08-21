@@ -96,6 +96,19 @@ pub(crate) const DEFAULT_GUIDANCE: f32 = 7.0;
 /// variant manifest, epic 2755) — selecting one without its LoRA loaded yields undertrained noise.
 pub(crate) const ACCEL_SAMPLERS: [&str; 3] = ["lcm", "lightning", "hyper"];
 
+/// The DDPM alpha schedule every SDXL load builds, in ONE place (sc-20425 review MINOR 4).
+///
+/// Both loaders and the chained-denoise conformance test read it here. The test used to rebuild
+/// `scaled_linear(1000, 0.00085, 0.012)` by hand, which meant it certified the
+/// `DiscreteModelSampling` the TEST constructed rather than the one the render runs, with nothing
+/// pinning that the two agreed — and the sigma range is exactly what the VE boundary re-noise is
+/// keyed on. The candle twin already had a single `sdxl_alpha_schedule()`; this is its MLX
+/// counterpart.
+pub(crate) fn sdxl_alpha_schedule() -> AlphaSchedule {
+    let cfg = DiffusionConfig::sdxl_base();
+    AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end)
+}
+
 /// The model-default rung of the chained-denoise resolution ladder (sc-20425) — what a pass that
 /// names nothing, in a request that names nothing, actually runs.
 ///
@@ -428,8 +441,7 @@ pub fn load_concrete(spec: &LoadSpec) -> Result<Sdxl> {
     let root = resolve_root(spec)?;
 
     let cfg = DiffusionConfig::sdxl_base();
-    let alpha_schedule =
-        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    let alpha_schedule = sdxl_alpha_schedule();
     // Component residency (epic 10834 Phase 1, sc-10839): the default `Resident` builds every heavy
     // component now and holds it warm; `Sequential` keeps only the spec and re-loads per generate in
     // phase order (encode → drop encoders → denoise/decode) to bound peak memory. The `Resident`
@@ -483,8 +495,7 @@ pub fn load_from_ldm_file(spec: &LoadSpec, tokenizer_root: &Path) -> Result<Box<
     }
     let residency = build_ldm_residency(spec, &file_pin)?;
     let cfg = DiffusionConfig::sdxl_base();
-    let alpha_schedule =
-        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
+    let alpha_schedule = sdxl_alpha_schedule();
     // A fused LDM/A1111 checkpoint has no re-openable **per-component** source — every component is
     // cut out of one file by `ldm::split_ldm_checkpoint` — so `memory_strategy::streamable` reports
     // `false` for its `WeightsSource::File` and rung 4 is declared Missing for this load rather than

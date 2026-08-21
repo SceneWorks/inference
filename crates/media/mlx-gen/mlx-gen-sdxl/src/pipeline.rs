@@ -1479,10 +1479,12 @@ mod tests {
         }
     }
 
+    /// The `DiscreteModelSampling` the RENDER builds, not a hand-rolled stand-in (sc-20425 review
+    /// MINOR 4). `crate::model::sdxl_alpha_schedule` is the single constructor both loaders use, so
+    /// the harness certifies production's sigma range — which is precisely what the VE boundary
+    /// re-noise is keyed on — rather than a copy that nothing pins.
     fn dp_ms() -> mlx_gen::DiscreteModelSampling {
-        mlx_gen::DiscreteModelSampling::sdxl(&mlx_gen::AlphaSchedule::scaled_linear(
-            1000, 0.00085, 0.012,
-        ))
+        mlx_gen::DiscreteModelSampling::sdxl(&crate::model::sdxl_alpha_schedule())
     }
 
     /// Adoption: the backend-neutral executor conformance suite runs over SDXL's REAL per-pass
@@ -1588,6 +1590,16 @@ mod tests {
         // The VE prior really is unit noise · σ_max, so the initial-latent scale the chained lane
         // reads off pass 0 is the same one the curated lane applies.
         assert!(native[0] > 10.0, "SDXL's σ_max is ≈14.6, got {}", native[0]);
+        // And that σ range comes from the schedule the LOADERS build, not a test-local copy.
+        assert_eq!(
+            crate::model::sdxl_alpha_schedule().alphas_cumprod,
+            mlx_gen::AlphaSchedule::scaled_linear(
+                crate::config::DiffusionConfig::sdxl_base().num_train_steps,
+                crate::config::DiffusionConfig::sdxl_base().beta_start,
+                crate::config::DiffusionConfig::sdxl_base().beta_end,
+            )
+            .alphas_cumprod
+        );
     }
 
     /// **The sc-20425 item-3 trap, on this family.** `lightning` and `hyper` are advertised in the
