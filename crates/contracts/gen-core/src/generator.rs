@@ -504,11 +504,14 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_denoise_passes`](Capabilities::supports_denoise_passes).
     pub denoise_passes: Option<Vec<DenoisePass>>,
     /// Optional consumer sink for the chained denoise-pass **execution record** (sc-20418): a
-    /// provider executing a `denoisePasses` chain emits exactly one
-    /// [`DenoisePlanExecution`](crate::denoise_passes::DenoisePlanExecution) — the requested AND
-    /// resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus the effective
-    /// evaluation accounting — before decoding. Requests with no `denoisePasses` never emit; the
-    /// inert default costs nothing (the [`PromptEnhancementSink`] pattern).
+    /// provider executing a `denoisePasses` chain emits exactly one [`DenoisePlanExecution`] — the
+    /// requested AND resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus
+    /// the effective evaluation accounting — before decoding. Requests with no `denoisePasses` never
+    /// emit; the inert default costs nothing (the [`PromptEnhancementSink`] pattern).
+    ///
+    /// Providers publish through [`emit_denoise_pass_report`](GenerationRequest::emit_denoise_pass_report)
+    /// rather than touching this field, so the requested-vs-resolved stamping cannot be forgotten
+    /// (sc-20425).
     pub denoise_pass_report: DenoisePassReportSink,
 
     // --- Control ---

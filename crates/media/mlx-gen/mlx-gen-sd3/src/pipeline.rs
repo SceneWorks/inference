@@ -530,7 +530,7 @@ impl<'a> PassPreview<'a> {
                 image,
             }),
             Err(err) => {
-                let first = self.dropped.get() == 0;
+                let first = self.dropped_frames() == 0;
                 self.dropped.set(self.dropped.get().saturating_add(1));
                 if first {
                     eprintln!(
