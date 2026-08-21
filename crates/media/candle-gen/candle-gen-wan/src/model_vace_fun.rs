@@ -27,6 +27,7 @@ use crate::vace::{
     build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
     vace_control_scales, WanVaceTransformer,
 };
+use crate::vace_fun_tier::VaceFunTierPaths;
 use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
 
@@ -97,6 +98,7 @@ fn selected_adapters(adapters: &[AdapterSpec], expert: MoeExpert) -> Vec<Adapter
 
 struct Pipeline {
     root: PathBuf,
+    tier: Option<VaceFunTierPaths>,
     device: Device,
     text_cfg: TextEncoderConfig,
     vae_cfg: Vae16Config,
@@ -105,9 +107,15 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
+    fn new(
+        root: &Path,
+        device: &Device,
+        adapters: Vec<AdapterSpec>,
+        tier: Option<VaceFunTierPaths>,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
+            tier,
             device: device.clone(),
             text_cfg: TextEncoderConfig::umt5_xxl(),
             vae_cfg: Vae16Config::wan21(),
@@ -117,6 +125,19 @@ impl Pipeline {
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
+        if let Some(tier) = &self.tier {
+            if matches!(sub, "transformer" | "transformer_2") {
+                return tier.component_vb(sub, dtype, &self.device);
+            }
+            return crate::text_encode::component_vb(
+                tier.shared_root(),
+                sub,
+                dtype,
+                &self.device,
+                MODEL_ID_VACE_FUN,
+                "Wan2.2 VACE-Fun A14B split packed tier",
+            );
+        }
         crate::text_encode::component_vb(
             &self.root,
             sub,
@@ -159,15 +180,10 @@ impl Pipeline {
         };
         let adapters = selected_adapters(&self.adapters, expert);
         let vb = self.component_vb(sub, DIT_DTYPE)?;
-        if vb.contains_tensor("proj_out.scales") {
+        if vb.contains_tensor("blocks.0.attn1.to_q.scales") && !adapters.is_empty() {
             return Err(CandleError::Msg(format!(
-                "{MODEL_ID_VACE_FUN}: packed VACE experts are not supported by the Candle VACE \
-                 transformer; use the dense bf16 tier{}",
-                if adapters.is_empty() {
-                    ""
-                } else {
-                    " (adapters were not applied)"
-                }
+                "{MODEL_ID_VACE_FUN}: adapters on a packed VACE-Fun tier are not implemented; \
+                 refusing to materialize dense weights for the {expert:?} expert"
             )));
         }
         if adapters.is_empty() {
@@ -369,6 +385,7 @@ pub struct WanVaceFunGenerator {
     device: Device,
     adapters: Vec<AdapterSpec>,
     offload: OffloadPolicy,
+    tier: Option<VaceFunTierPaths>,
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
 }
@@ -500,7 +517,12 @@ impl Generator for WanVaceFunGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate_request(req)?;
-        let pipeline = Pipeline::new(&self.root, &self.device, self.adapters.clone());
+        let pipeline = Pipeline::new(
+            &self.root,
+            &self.device,
+            self.adapters.clone(),
+            self.tier.clone(),
+        );
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
         let (mut prepared, resident_shared) = match self.offload {
@@ -640,7 +662,7 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            supported_quants: &[] as &[Quant],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_sequential_offload: true,
             ..Default::default()
         },
@@ -668,9 +690,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
+    let tier = VaceFunTierPaths::detect(&root)?;
+    if let Some(tier) = &tier {
+        tier.validate_requested_quant(spec.quantize)?;
+    } else if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "wan2_2_vace_fun_14b on-the-fly quantization is not supported; use dense bf16".into(),
+            "wan2_2_vace_fun_14b accepts Q4/Q8 only from a complete hosted split packed tier; on-the-fly quantization is not supported".into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -685,6 +710,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         adapters: spec.adapters.clone(),
         offload: spec.offload_policy,
+        tier,
         shared: Mutex::new(None),
         experts: Mutex::new(None),
     }))

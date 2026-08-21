@@ -16,15 +16,16 @@
 //! bf16; VACE follows it).
 
 use candle_gen::candle_core::{DType, Device, Error as CoreError, Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{CancelFlag, GenerationRequest};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::WanVaceConfig;
 use crate::model_vace::ProviderVae;
 use crate::pipeline::cfg;
+use crate::quant::QLinear;
 use crate::scheduler::{FlowScheduler, Sampler};
-use crate::transformer::{linear, ln_no_affine, timestep_sinusoid, Block};
+use crate::transformer::{ln_no_affine, timestep_sinusoid, Block};
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
 const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
@@ -56,23 +57,23 @@ fn load_patch_conv(
 /// main noisy-latent tokens into the control stream once) and `proj_out` (every block — emits the
 /// per-layer hint). Diffusers `WanVACETransformerBlock`.
 struct VaceBlock {
-    proj_in: Option<Linear>,
+    proj_in: Option<QLinear>,
     core: Block,
-    proj_out: Linear,
+    proj_out: QLinear,
 }
 
 impl VaceBlock {
     fn new(cfg: &WanVaceConfig, vb: VarBuilder, has_proj_in: bool) -> Result<Self> {
         let dim = cfg.base.dim;
         let proj_in = if has_proj_in {
-            Some(linear(dim, dim, vb.pp("proj_in"))?)
+            Some(QLinear::linear_detect(dim, dim, &vb, "proj_in", true)?)
         } else {
             None
         };
         Ok(Self {
             proj_in,
             core: Block::new(&cfg.base, vb.clone())?,
-            proj_out: linear(dim, dim, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect(dim, dim, &vb, "proj_out", true)?,
         })
     }
 
@@ -105,15 +106,15 @@ pub struct WanVaceTransformer {
     patch_b: Tensor,
     vace_patch_w: Tensor, // vace_patch_embedding (96→dim)
     vace_patch_b: Tensor,
-    text_l1: Linear,
-    text_l2: Linear,
-    time_l1: Linear,
-    time_l2: Linear,
-    time_proj: Linear,
+    text_l1: QLinear,
+    text_l2: QLinear,
+    time_l1: QLinear,
+    time_l2: QLinear,
+    time_proj: QLinear,
     blocks: Vec<Block>,
     vace_blocks: Vec<VaceBlock>,
     scale_shift_table: Tensor, // head [1,2,dim] f32
-    proj_out: Linear,          // head proj
+    proj_out: QLinear,         // head proj
     cfg: WanVaceConfig,
     device: Device,
     dtype: DType,
@@ -136,11 +137,13 @@ impl WanVaceTransformer {
         )?;
 
         let ce = vb.pp("condition_embedder");
-        let text_l1 = linear(base.text_dim, dim, ce.pp("text_embedder").pp("linear_1"))?;
-        let text_l2 = linear(dim, dim, ce.pp("text_embedder").pp("linear_2"))?;
-        let time_l1 = linear(base.freq_dim, dim, ce.pp("time_embedder").pp("linear_1"))?;
-        let time_l2 = linear(dim, dim, ce.pp("time_embedder").pp("linear_2"))?;
-        let time_proj = linear(dim, 6 * dim, ce.pp("time_proj"))?;
+        let text_l1 =
+            QLinear::linear_detect(base.text_dim, dim, &ce, "text_embedder.linear_1", true)?;
+        let text_l2 = QLinear::linear_detect(dim, dim, &ce, "text_embedder.linear_2", true)?;
+        let time_l1 =
+            QLinear::linear_detect(base.freq_dim, dim, &ce, "time_embedder.linear_1", true)?;
+        let time_l2 = QLinear::linear_detect(dim, dim, &ce, "time_embedder.linear_2", true)?;
+        let time_proj = QLinear::linear_detect(dim, 6 * dim, &ce, "time_proj", true)?;
 
         let mut blocks = Vec::with_capacity(base.num_layers);
         for i in 0..base.num_layers {
@@ -154,7 +157,8 @@ impl WanVaceTransformer {
             vace_blocks.push(VaceBlock::new(cfg, vb.pp("vace_blocks").pp(j), j == 0)?);
         }
 
-        let proj_out = linear(dim, base.out_channels * pt * ph * pw, vb.pp("proj_out"))?;
+        let proj_out =
+            QLinear::linear_detect(dim, base.out_channels * pt * ph * pw, &vb, "proj_out", true)?;
         let scale_shift_table = vb
             .get((1, 2, dim), "scale_shift_table")?
             .to_dtype(DType::F32)?;
