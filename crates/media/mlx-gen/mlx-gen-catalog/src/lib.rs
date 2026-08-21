@@ -246,6 +246,154 @@ pub fn conservative_video_decode_memory_profile(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_mlx_bindings() {
+        use mlx_gen::gen_core::{
+            CheckpointBackend, ImportedModelOperation, ImportedModelRegistration,
+            ImportedModelSource, KREA_2_CHECKPOINT_ADAPTER, MAGE_FLOW_CHECKPOINT_ADAPTER,
+            SDXL_CHECKPOINT_ADAPTER,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let expected = [
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &MAGE_FLOW_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+        ];
+        let adapters: Vec<_> = registry.checkpoint_adapters().collect();
+        assert_eq!(adapters.len(), expected.len());
+        for portable in expected {
+            let bound = adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == portable.adapter_id)
+                .unwrap_or_else(|| panic!("missing MLX adapter {}", portable.adapter_id));
+            assert!(
+                bound.has_same_portable_metadata(portable),
+                "{} drifted from portable metadata",
+                portable.adapter_id
+            );
+            assert!(bound
+                .backend_bindings
+                .iter()
+                .all(|binding| binding.backend == CheckpointBackend::Mlx));
+        }
+
+        let binding_operations = |adapter_id| {
+            adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == adapter_id)
+                .unwrap()
+                .backend_bindings
+                .iter()
+                .map(|binding| binding.operation)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            binding_operations(KREA_2_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+                ImportedModelOperation::Pose,
+                ImportedModelOperation::MultiPhase,
+            ]
+        );
+        assert_eq!(
+            binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+            ]
+        );
+        assert_eq!(
+            binding_operations(MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id),
+            [ImportedModelOperation::Generate]
+        );
+        let mage = adapters
+            .iter()
+            .copied()
+            .find(|adapter| adapter.adapter_id == MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id)
+            .expect("the real Mage MLX adapter is registered");
+        assert_eq!(mage.family, "mage_flow");
+        assert_eq!(mage.compatibility_projection.family, "mage-flow");
+        for adapter in &adapters {
+            for operation in adapter.operations {
+                assert!(
+                    adapter
+                        .backend_bindings
+                        .iter()
+                        .any(|binding| binding.operation == *operation),
+                    "the real MLX catalog leaves {} {operation:?} implementation-free",
+                    adapter.adapter_id
+                );
+            }
+        }
+        let expected_legacy_projection = [
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Edit,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_EDIT_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Pose,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_CONTROL_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::MultiPhase,
+                provider_id: mlx_gen_krea::KREA_2_RAW_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "mage-flow",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "mage_flow_base",
+                required_components: Some(mlx_gen_mage::REQUIRED_COMPONENTS),
+                inherit_adapters: false,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Generate,
+                provider_id: mlx_gen_sdxl::MODEL_ID,
+                required_components: Some(&[mlx_gen_sdxl::LDM_TOKENIZER_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Edit,
+                provider_id: mlx_gen_sdxl::MODEL_ID,
+                required_components: Some(&[mlx_gen_sdxl::LDM_TOKENIZER_COMPONENT]),
+                inherit_adapters: true,
+            },
+        ];
+        assert_eq!(
+            registry.imported_models().copied().collect::<Vec<_>>(),
+            expected_legacy_projection,
+            "the legacy catalog surface must be the exact pre-registry compatibility projection"
+        );
+    }
+
+    #[test]
     fn benchmark_capabilities_are_explicit_for_every_p6_provider() {
         use std::collections::BTreeSet;
 

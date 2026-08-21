@@ -154,21 +154,26 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
-            provider_id: MODEL_ID,
-            required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                    provider_id: MODEL_ID,
+                    required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
+                    provider_id: MODEL_ID,
+                    required_components: Some(&[LDM_TOKENIZER_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..mlx_gen::gen_core::SDXL_CHECKPOINT_ADAPTER
         })
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)

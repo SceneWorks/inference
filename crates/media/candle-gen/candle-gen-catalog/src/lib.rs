@@ -4207,6 +4207,146 @@ mod tests {
     use candle_gen::gen_core::ConditioningKind;
 
     #[test]
+    fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bindings() {
+        use candle_gen::gen_core::{
+            CheckpointBackend, ImportedModelOperation, ImportedModelRegistration,
+            ImportedModelSource, BASE_SNAPSHOT_COMPONENT, FLUX2_CHECKPOINT_ADAPTER,
+            KREA_2_CHECKPOINT_ADAPTER, QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER,
+            Z_IMAGE_CHECKPOINT_ADAPTER,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let expected = [
+            &FLUX2_CHECKPOINT_ADAPTER,
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &QWEN_IMAGE_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+            &Z_IMAGE_CHECKPOINT_ADAPTER,
+        ];
+        let adapters: Vec<_> = registry.checkpoint_adapters().collect();
+        assert_eq!(adapters.len(), expected.len());
+        for portable in expected {
+            let bound = adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == portable.adapter_id)
+                .unwrap_or_else(|| panic!("missing Candle adapter {}", portable.adapter_id));
+            assert!(
+                bound.has_same_portable_metadata(portable),
+                "{} drifted from portable metadata",
+                portable.adapter_id
+            );
+            assert!(bound
+                .backend_bindings
+                .iter()
+                .all(|binding| binding.backend == CheckpointBackend::Candle));
+        }
+
+        let binding_operations = |adapter_id| {
+            adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == adapter_id)
+                .unwrap()
+                .backend_bindings
+                .iter()
+                .map(|binding| binding.operation)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            binding_operations(KREA_2_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+                ImportedModelOperation::MultiPhase,
+            ],
+            "Candle truthfully omits the MLX-only Krea pose route"
+        );
+        assert_eq!(
+            binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
+            [ImportedModelOperation::Generate],
+            "Candle truthfully omits the MLX-only fused SDXL edit route"
+        );
+        for adapter in &adapters {
+            if adapter.eligible_backends == [CheckpointBackend::Candle] {
+                for operation in adapter.operations {
+                    assert!(
+                        adapter
+                            .backend_bindings
+                            .iter()
+                            .any(|binding| binding.operation == *operation),
+                        "single-backend Candle adapter {} leaves {operation:?} implementation-free",
+                        adapter.adapter_id
+                    );
+                }
+            }
+        }
+        let expected_legacy_projection = [
+            ImportedModelRegistration {
+                family: "flux2",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_flux2::config::FLUX2_DEV_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_krea::KREA_2_TURBO_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Edit,
+                provider_id: candle_gen_krea::KREA_2_TURBO_EDIT_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::MultiPhase,
+                provider_id: candle_gen_krea::KREA_2_RAW_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "qwen-image",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_qwen_image::config::MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_sdxl::MODEL_ID,
+                required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "z-image",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_z_image::MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+        ];
+        assert_eq!(
+            registry.imported_models().copied().collect::<Vec<_>>(),
+            expected_legacy_projection,
+            "the legacy catalog surface must be the exact pre-registry compatibility projection"
+        );
+    }
+
+    #[test]
     fn modelled_video_provider_ids_have_typed_vae_assignments() {
         let registry = super::provider_registry().unwrap();
         let registered: Vec<&str> = registry

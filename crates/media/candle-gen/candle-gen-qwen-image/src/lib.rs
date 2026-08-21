@@ -1278,13 +1278,16 @@ pub fn register_providers(
             route_id: "qwen_image_control",
             provider_id: MODEL_ID,
         })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "qwen-image",
-            source: gen_core::ImportedModelSource::ComfyUiTree,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
+                backend: gen_core::CheckpointBackend::Candle,
+                source: gen_core::ImportedModelSource::ComfyUiTree,
+                operation: gen_core::ImportedModelOperation::Generate,
+                provider_id: MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            }],
+            ..gen_core::QWEN_IMAGE_CHECKPOINT_ADAPTER
         });
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
