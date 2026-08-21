@@ -486,9 +486,13 @@ mod tests {
             match shape {
                 "file" => std::fs::write(selected.join("config.json"), b"{}").unwrap(),
                 "dir" => {
-                    std::fs::copy(
-                        selected.join("model.safetensors"),
-                        selected.join("added.safetensors"),
+                    // The mutation under test is that a new `.safetensors` appeared in the prepared
+                    // directory. `std::fs::copy` would write out the encoder fixture's whole
+                    // multi-GB payload to say that; the sparse copy leaves the same bytes behind a
+                    // hole.
+                    gen_core_testkit::copy_sparse_fixture(
+                        &selected.join("model.safetensors"),
+                        &selected.join("added.safetensors"),
                     )
                     .unwrap();
                 }

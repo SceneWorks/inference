@@ -93,6 +93,101 @@ use gen_core::{
     Generator, Image, Modality, Progress, StepSupport, VisionEncoderContract,
 };
 
+/// Mark `path` as an NTFS sparse file so a later `set_len` reserves no clusters for the hole.
+///
+/// Fixture weights are sized like the real checkpoints they stand in for — an encoder fixture is
+/// several GB, a full video snapshot hundreds — because the gates under test *stat* the file rather
+/// than read it. On APFS and ext4 that costs nothing: extending past the end of a file leaves a
+/// hole. NTFS is the exception. It allocates every cluster on `SetEndOfFile` unless the file already
+/// carries `FILE_ATTRIBUTE_SPARSE_FILE`, so fixtures that were free on the Mac and Linux lanes wrote
+/// their full nominal size on Windows — enough to fill the CUDA box's system drive twice and fail a
+/// `candle-worker` run with `StorageFull` (os error 112).
+///
+/// **Ordering is load-bearing.** The attribute lives on a file that exists, and `File::create` is
+/// `CREATE_ALWAYS`, which *clears* it — so flagging before the create silently does nothing. Call
+/// this between creating the file and the `set_len` that extends it; a header written on either side
+/// of the call is fine, since writes to a sparse file allocate only the range they touch. Extending
+/// an already-flagged file through a later `OpenOptions::open` keeps the attribute, so a consumer
+/// that reopens a fixture to append a tensor inherits sparseness for free.
+///
+/// Best effort by design. A fixture that lands dense still holds exactly the right bytes, so a
+/// failure here is a disk-space regression, never a test failure — it warns and returns. The
+/// workspace forbids `unsafe`, so the flag goes on through `fsutil` rather than a raw
+/// `FSCTL_SET_SPARSE`; off Windows the whole thing is a no-op.
+pub fn mark_sparse(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let outcome = std::process::Command::new("fsutil")
+            .args(["sparse", "setflag"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output();
+        match outcome {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                // fsutil reports its own failures on stdout; keep stderr as the fallback.
+                let mut detail = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if detail.is_empty() {
+                    detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                }
+                eprintln!(
+                    "gen-core-testkit: `fsutil sparse setflag {}` failed ({}: {detail}); this \
+                     fixture will allocate its full length",
+                    path.display(),
+                    output.status,
+                );
+            }
+            Err(error) => eprintln!(
+                "gen-core-testkit: could not run `fsutil sparse setflag {}` ({error}); this fixture \
+                 will allocate its full length",
+                path.display(),
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
+/// Copy a fixture whose tensor payload is a hole, without materializing that hole.
+///
+/// [`std::fs::copy`] reads and writes every byte, so copying a multi-GB fixture allocates the whole
+/// payload in the destination even when the source is a hole — the copy is how a fixture that costs
+/// nothing to *create* still fills a disk. This reproduces the source's header and logical length
+/// onto a freshly-flagged destination instead.
+///
+/// The result is byte-for-byte what `std::fs::copy` would have produced **for a fixture**, whose
+/// payload is never written and therefore reads back as zeros. Do not reach for this to copy a real
+/// checkpoint: any non-zero payload byte in `source` would be silently dropped.
+pub fn copy_sparse_fixture(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    let mut input = std::fs::File::open(source)?;
+    let total = input.metadata()?.len();
+    let mut declared = [0_u8; 8];
+    input.read_exact(&mut declared)?;
+    let header_len = u64::from_le_bytes(declared);
+    if header_len.checked_add(8).is_none_or(|end| end > total) {
+        return Err(std::io::Error::other(
+            "fixture header runs past the end of the file",
+        ));
+    }
+    let mut header = vec![0_u8; usize::try_from(header_len).map_err(std::io::Error::other)?];
+    input.read_exact(&mut header)?;
+
+    let mut output = std::fs::File::create(destination)?;
+    // Same ordering rule as everywhere else: after the create, before the extend.
+    mark_sparse(destination);
+    output.write_all(&declared)?;
+    output.write_all(&header)?;
+    output.set_len(total)?;
+    Ok(())
+}
+
 /// Write a sparse, validation-complete text-encoder fixture for provider load-gate tests.
 ///
 /// Every required layer projection, norm, architecture signature, and optional packed affine
@@ -211,6 +306,11 @@ pub fn write_multimodal_encoder_contract_fixture_with_quant(
         .read(true)
         .write(true)
         .open(&weights_path)?;
+    // Redundant today, and deliberately kept: the language writer called at the top of this
+    // function created and flagged this exact file, and `OPEN_EXISTING` preserves that flag. What
+    // the re-assertion buys is that the `set_len` below stays correct on its own terms — it only
+    // *grows* the file, so it would allocate the new range against any base that was not flagged.
+    mark_sparse(&weights_path);
     let mut len = [0_u8; 8];
     file.read_exact(&mut len)?;
     let old_header_len = u64::from_le_bytes(len) as usize;
@@ -487,7 +587,11 @@ pub fn write_encoder_contract_fixture_with_quant(
         offset = end;
     }
     let encoded = serde_json::to_vec(&header)?;
-    let mut file = std::fs::File::create(root.join("model.safetensors"))?;
+    let weights_path = root.join("model.safetensors");
+    let mut file = std::fs::File::create(&weights_path)?;
+    // Between the create and the `set_len`: `File::create` is `CREATE_ALWAYS` and would clear an
+    // earlier flag, and the `set_len` is what allocates. See [`mark_sparse`].
+    mark_sparse(&weights_path);
     file.write_all(&(encoded.len() as u64).to_le_bytes())?;
     file.write_all(&encoded)?;
     file.set_len(8 + encoded.len() as u64 + offset)?;
