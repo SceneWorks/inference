@@ -1501,6 +1501,7 @@ pub(crate) fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::GenerationRequest;
 
     // ---- Chained denoise passes (epic 20414, sc-20425) ------------------------------------------
 

@@ -693,6 +693,8 @@ pub fn render_denoise_passes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core;
+    use mlx_gen::GenerationRequest;
     use mlx_rs::transforms::eval;
 
     use crate::loader::{resolve_clip_pad_id, CLIP_EOS_ID};
