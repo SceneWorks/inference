@@ -14,7 +14,7 @@
 //! 3-D RoPE, per-head gated attention, adaLN-single, bidirectional cross-modal attention) joint
 //! denoise → the temporal VAE decoder (frames) **plus** the `AudioDecoder`
 //! → `LtxVocoder` → a synchronized 48 kHz stereo `AudioTrack`. Registered under
-//! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). Reference I2V, FLF/keyframes,
+//! `"ltx_2_3_distilled"`; two-stage distilled denoise (no CFG). Reference I2V, FLF/keyframes,
 //! extend/bridge IC-LoRA clips, and masked replace-person controls share the VAE encoder and per-token
 //! timestep path. The learned 2-stage latent upsampler runs between half-resolution stage one and
 //! full-resolution stage two; prompt-enhance and fp8/on-the-fly quant remain deferred. LTX AudioVideo
@@ -93,10 +93,9 @@ mod vae_tiling_assignment_tests {
         assert_eq!(super::vae_tiling("ltx_2_3"), None);
     }
 }
-/// The request width/height multiple `validate` enforces (= `config::SPATIAL_SCALE` = 32): candle's
-/// single-stage `ltx_2_3_distilled` renders on the 32× VAE grid. Exposed as the pinned-engine stride
-/// SceneWorks ties `requiresDimensionsMultipleOf` to (sc-12587); mirrors `wan::config::SIZE_MULTIPLE_14B`.
-/// Divergent by backend on purpose: mlx's two-stage `ltx_2_3` uses `SIZE_MULTIPLE = 2×SPATIAL_SCALE` (= 64).
+/// The request width/height multiple `validate` enforces (= `2×config::SPATIAL_SCALE` = 64): both
+/// LTX backends run stage one on the half-resolution VAE grid and stage two on the final grid.
+/// Exposed as the pinned-engine stride SceneWorks ties `requiresDimensionsMultipleOf` to.
 pub const SIZE_MULTIPLE: u32 = (config::SPATIAL_SCALE * 2) as u32;
 
 #[derive(Clone)]
@@ -491,10 +490,10 @@ impl Pipeline {
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let mut orchestration = pipeline::TwoStageOrchestration::new(seed);
         // Every render begins at the first distilled stage. The adapter overlay retains its complete
         // per-pass vector, so a two-stage caller switches this selector before its stage-two denoise
         // instead of collapsing Eros's `[1.0, 0.4]` at load time.
-        comps.avdit.set_adapter_pass(0);
 
         // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
@@ -508,14 +507,20 @@ impl Pipeline {
         let video_grid = rope::create_position_grid(t_lat, h_lat, w_lat, fps as f32, &self.device)?;
         let audio_grid = rope::create_audio_position_grid(af, &self.device)?;
 
-        let vnoise = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
-        let anoise = pipeline::create_audio_noise(seed.wrapping_add(2), af, &self.device)?;
-
         let keyframes =
             self.build_keyframes(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
         let stage2_keyframes =
             self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
         let clips = self.build_clips(req, &comps.vae, t_lat, req.width / 2, req.height / 2)?;
+        let stage_seeds = orchestration.stage1_setup(
+            !keyframes.is_empty(),
+            !stage2_keyframes.is_empty(),
+            !clips.is_empty(),
+        );
+        comps.avdit.set_adapter_pass(0);
+        let vnoise =
+            pipeline::create_noise(stage_seeds.video_stage1, t_lat, h_lat, w_lat, &self.device)?;
+        let anoise = pipeline::create_audio_noise(stage_seeds.audio_stage1, af, &self.device)?;
         let conditioned = !keyframes.is_empty() || !clips.is_empty();
         if conditioned
             && !matches!(
@@ -537,9 +542,11 @@ impl Pipeline {
         // FLOW `x0 = x − σ·v` recombine + euler == the native scheduler), the N1 no-op. Both streams are
         // velocity-prediction (`Sigma` convention); the AvDiT couples them via cross-modal attention each
         // forward, so the per-step model eval (flatten → AvDiT → unflatten) lives inside the closure.
-        let mut stage1_progress = |event: Progress| match event {
-            Progress::Step { current, .. } => on_progress(Progress::Step { current, total: 11 }),
-            other => on_progress(other),
+        let mut stage1_fold = pipeline::StageProgressFold::new(0, NATIVE_STEPS, 11);
+        let mut stage1_progress = |event: Progress| {
+            if let Some(event) = stage1_fold.fold(event) {
+                on_progress(event);
+            }
         };
         let (vlat, alat) = if conditioned {
             let mut state = if keyframes.is_empty() {
@@ -567,6 +574,7 @@ impl Pipeline {
                     fps as f32,
                 )?;
             }
+            let mut stage1_forward = || Ok(());
             let (state, audio) = pipeline::denoise_av_conditioned(
                 &comps.avdit,
                 &state,
@@ -577,6 +585,7 @@ impl Pipeline {
                 &audio_grid,
                 &STAGE1_SIGMAS,
                 &req.cancel,
+                &mut stage1_forward,
                 &mut stage1_progress,
             )?;
             let generated = state.latent.narrow(1, 0, state.target_tokens)?;
@@ -625,20 +634,22 @@ impl Pipeline {
         // VAE space, then returns to DiT-normalized space before fresh stage-two
         // video/audio re-noise. Never substitute interpolation or a second pass
         // on the stage-one model output.
-        let upsampled = comps.vae.normalize_latents(
-            &comps
-                .upsampler
-                .forward(&comps.vae.denormalize_latents(&vlat)?)?,
-        )?;
+        let upsampled = orchestration.learned_upsample(|| {
+            Ok(comps.vae.normalize_latents(
+                &comps
+                    .upsampler
+                    .forward(&comps.vae.denormalize_latents(&vlat)?)?,
+            )?)
+        })?;
         let stage2_video_noise = pipeline::create_noise(
-            seed.wrapping_add(1),
+            stage_seeds.video_stage2,
             geometry.t,
             geometry.h2,
             geometry.w2,
             &self.device,
         )?;
         let stage2_audio_noise =
-            pipeline::create_audio_noise(seed.wrapping_add(3), af, &self.device)?;
+            pipeline::create_audio_noise(stage_seeds.audio_stage2, af, &self.device)?;
         let stage2_grid = rope::create_position_grid(
             geometry.t,
             geometry.h2,
@@ -646,45 +657,52 @@ impl Pipeline {
             fps as f32,
             &self.device,
         )?;
+        let stage2_initial = orchestration.stage2_renoise(STAGE2_SIGMAS[0], || {
+            Ok(AvLatents {
+                video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
+                audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
+            })
+        })?;
         comps.avdit.set_adapter_pass(1);
-        let mut stage2_progress = |event: Progress| match event {
-            Progress::Step { current, .. } => on_progress(Progress::Step {
-                current: 8 + current,
-                total: 11,
-            }),
-            other => on_progress(other),
+        let mut stage2_fold = pipeline::StageProgressFold::new(NATIVE_STEPS, 3, 11);
+        let mut stage2_progress = |event: Progress| {
+            if let Some(event) = stage2_fold.fold(event) {
+                on_progress(event);
+            }
         };
         let stage2 = if stage2_keyframes.is_empty() {
             run_av_curated_sampler(
                 req.sampler.as_deref(),
                 &STAGE2_SIGMAS,
-                AvLatents {
-                    video: pipeline::renoise(&upsampled, &stage2_video_noise, STAGE2_SIGMAS[0])?,
-                    audio: pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
-                },
-                seed.wrapping_add(1),
+                stage2_initial,
+                stage_seeds.video_stage2,
                 &req.cancel,
                 &mut stage2_progress,
                 |av, sigma| -> CResult<AvLatents> {
-                    let vflat = pipeline::flatten_latent(&av.video)?;
-                    let aflat = pipeline::flatten_audio_latent(&av.audio)?;
-                    let (vvel, avel) = comps.avdit.forward(
-                        &vflat,
-                        &aflat,
-                        sigma as f64,
-                        &video_ctx,
-                        &audio_ctx,
-                        &stage2_grid,
-                        &audio_grid,
-                    )?;
-                    Ok(AvLatents {
-                        video: pipeline::unflatten_latent(
-                            &vvel.to_dtype(DType::F32)?,
-                            geometry.t,
-                            geometry.h2,
-                            geometry.w2,
-                        )?,
-                        audio: pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?,
+                    orchestration.stage2_forward(|| {
+                        let vflat = pipeline::flatten_latent(&av.video)?;
+                        let aflat = pipeline::flatten_audio_latent(&av.audio)?;
+                        let (vvel, avel) = comps.avdit.forward(
+                            &vflat,
+                            &aflat,
+                            sigma as f64,
+                            &video_ctx,
+                            &audio_ctx,
+                            &stage2_grid,
+                            &audio_grid,
+                        )?;
+                        Ok(AvLatents {
+                            video: pipeline::unflatten_latent(
+                                &vvel.to_dtype(DType::F32)?,
+                                geometry.t,
+                                geometry.h2,
+                                geometry.w2,
+                            )?,
+                            audio: pipeline::unflatten_audio_latent(
+                                &avel.to_dtype(DType::F32)?,
+                                af,
+                            )?,
+                        })
                     })
                 },
             )?
@@ -703,16 +721,22 @@ impl Pipeline {
             let conditioned = conditioning::apply_keyframes(&upsampled, &borrowed)?
                 .noised(&stage2_video_noise, STAGE2_SIGMAS[0])?;
             let state = conditioning::VideoTokenState::from_i2v(&conditioned, &stage2_grid)?;
+            let mut stage2_forward = || {
+                orchestration
+                    .stage2_forward(|| Ok(()))
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            };
             let (state, audio) = pipeline::denoise_av_conditioned(
                 &comps.avdit,
                 &state,
-                &pipeline::renoise(&alat, &stage2_audio_noise, STAGE2_SIGMAS[0])?,
+                &stage2_initial.audio,
                 &video_ctx,
                 &audio_ctx,
                 af,
                 &audio_grid,
                 &STAGE2_SIGMAS,
                 &req.cancel,
+                &mut stage2_forward,
                 &mut stage2_progress,
             )?;
             let generated = state.latent.narrow(1, 0, state.target_tokens)?;
@@ -960,13 +984,13 @@ impl Generator for LtxGenerator {
     }
 }
 
-/// LTX-2.3 distilled video descriptor — single-stage rectified-flow (no CFG / negative prompt;
+/// LTX-2.3 distilled video descriptor — two-stage rectified-flow (no CFG / negative prompt;
 /// guidance is distilled in) with image/keyframe/IC-LoRA clip conditioning. The denoise step count is
 /// FIXED at [`NATIVE_STEPS`] (the baked
-/// `STAGE1_SIGMAS` schedule); an explicit non-native `req.steps` is rejected in `validate` rather than
-/// silently ignored (sc-9027 / F-043). Synchronized audio is produced (sc-5495, the joint video+audio
-/// streams); the upsampler and on-the-fly quant remain deferred. AudioVideo projection adapters are
-/// supported through the shared additive adapter core.
+/// `STAGE1_SIGMAS` schedule); stage two always runs its fixed three-step `STAGE2_SIGMAS` refinement.
+/// An explicit non-native `req.steps` is rejected in `validate` rather than silently ignored (sc-9027 /
+/// F-043). Synchronized audio is produced (sc-5495, the joint video+audio streams); on-the-fly quant
+/// remains deferred. AudioVideo projection adapters are supported through the shared additive adapter core.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
@@ -1408,10 +1432,10 @@ mod tests {
         assert_eq!(pipe.gemma_dir().unwrap(), te);
     }
 
-    /// sc-13749 load gate: candle LTX-2.3 recognizes NO `LoadSpec::components` keys — its Gemma TE rides
-    /// the typed `text_encoder` slot and there is no uncensored/amoral enhancer variant (that is
-    /// mlx-only). Any component key is rejected at load with a typed `Unsupported` error; a
-    /// no-component spec still loads (lazy — weight resolution is deferred to the first generate).
+    /// sc-13749 load gate: `spatial_upscaler` is the only LTX named component; Gemma still rides the
+    /// typed `text_encoder` slot and the uncensored/amoral enhancer remains mlx-only. Unknown component
+    /// keys are rejected at load with a typed `Unsupported` error; a no-component spec still loads when
+    /// its canonical `upsampler.safetensors` is co-located (lazy weight resolution).
     #[test]
     fn load_rejects_unknown_component() {
         let bogus = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_component(

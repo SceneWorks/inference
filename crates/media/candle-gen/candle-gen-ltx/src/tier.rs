@@ -27,8 +27,9 @@
 //!                                       crate-native spelling (`to_out.0`, `ff.net.0.proj`, `ff.net.2`)
 //!   vae_decoder.safetensors    DENSE  — `up_blocks.*` / `conv_in` / `conv_out` / `per_channel_statistics`,
 //!                                       conv weights CHANNELS-LAST `[O,kt,kh,kw,I]`, stats `mean`/`std`
-//!   vae_encoder audio_vae vocoder upsampler   DENSE  (encoder loaded for conditioning; the remaining
-//!                                                    components are outside the current tier decode)
+//!   vae_encoder  DENSE  — loaded for conditioning
+//!   upsampler    DENSE  — learned stage-one→stage-two latent refinement
+//!   audio_vae vocoder DENSE — outside the packed tier's final audio decode
 //! <snapshot>/gemma/            DENSE  — standard `language_model.model.*` 5-shard set + tokenizer.json
 //! ```
 //!
