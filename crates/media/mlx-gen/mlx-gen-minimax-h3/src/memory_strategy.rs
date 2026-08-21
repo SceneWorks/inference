@@ -622,8 +622,20 @@ pub const RUNG4_DIT_MEASURED_PEAKS: [(&str, u64, u64); 3] = [
 /// 2.03 GB, decode **5.80 GB** — so the request is decode-bound, which is what the phase
 /// envelope's `max(TE, DiT, decode)` arithmetic predicted (5.77 GB) before the request ran.
 ///
-/// Held to a ±25% band by the harness rather than to the byte — the peak counter carries ~1 GB of
-/// run-to-run spread on this machine.
+/// **Graded to ±290 MB, not to a ±25% band** (sc-17153). `tests/streamed_generate_real.rs` puts
+/// this constant through `common::assert_declared_peak_constant`, whose tolerance is the larger of
+/// 256 MiB and 5 % of the declared value — 5 % wins here, at 290_218_452 B. That grader replaced the
+/// `|measured/declared − 1| < 0.25` ratio band, which was multiplicatively asymmetric and, on a
+/// quotient of two constants, blind to pair-proportional drift.
+///
+/// The retired "~1 GB of run-to-run spread on this machine" figure was **retracted** with it: it was
+/// not reproduced on either arm of the sc-17153 terminal campaign (the q4 DiT windowed peak came
+/// back bit-identical across two runs, its resident peak moved 0.36 %). Do not size a new bound
+/// from it. The grading is TIGHTER than the retired comment claimed, so a red here is a real drift
+/// or a pin bump — `assert_declared_peak_constant`'s own docs carry the two limits of the bound.
+///
+/// Only graded when the run is q4 DiT **and** q4 packed TE, the conditions this figure was captured
+/// under; the harness prints that it asserted nothing when either differs.
 pub const RUNG4_REQUEST_PEAK_Q4_BYTES: u64 = 5_804_369_044;
 
 /// The stage-ordered lifecycle every MiniMax-H3 render runs.

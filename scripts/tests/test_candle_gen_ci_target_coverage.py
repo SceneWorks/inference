@@ -34,9 +34,26 @@ trustworthy, and this module recognises only those two:
     variable still reports SUCCESS"), and
   * a file-level `#![cfg(...)]` that is off on this lane — the target compiles to an empty binary.
 
-14 cases across 13 files were converted to `#[ignore]` in sc-19447 for exactly this reason.
-`test_no_counted_case_self_skips` fails on any new one rather than silently dropping it, so the
-class cannot re-enter. Note the consequence, recorded rather than hidden: `candle-gen-lens`
+14 cases across 13 files were converted to `#[ignore]` in sc-19447 for exactly this reason, and the
+conversion was WRONG ON ONE OF THEM. The 14 split 13 + 1:
+
+  * 13 are ENV-GATED and weight-bound — `candle-gen-flux2/tests/vae_encode_parity.rs` and all
+    eleven `candle-gen-lens` `*_parity` targets (12 files). Their weights are on no runner, so
+    `#[ignore]` is the right marker and `real-weights.yml` is the explicit opt-in.
+  * 1 is DEVICE-GATED, weight-free, and was LANE-REACHABLE:
+    `candle-gen/tests/cuda_quant_smoke.rs::cuda_qmatmul_matches_cpu`, the sole canary for the
+    sc-7544 silent-zeros GGUF QMatMul regression. Its guard is `default_device().is_cuda()`, not an
+    env var, and `ci.yml`'s `windows-cuda` job runs `--features cuda` with no `-- --ignored` — so
+    `#[ignore]` silenced it on the only lane that has ever executed it. It now uses the SECOND
+    mechanism above, a file-level `#![cfg(feature = "cuda")]`: empty binary on this lane, compiled
+    and RUN under `--features cuda`. `compiles_empty_on_this_lane` classifies it accordingly, so it
+    is neither counted as weight-free coverage here nor reported by `self_skipping_cases`.
+
+The measured counts quoted above are sc-19447's, taken while all 14 were `#[ignore]`d; correcting
+that one case moves it out of the `ignored` column as well, into "not compiled on this lane".
+
+`test_no_counted_case_self_skips` fails on any new self-skipper rather than silently dropping it,
+so the class cannot re-enter. Note the consequence, recorded rather than hidden: `candle-gen-lens`
 contributes NO weight-free integration coverage at all — all eleven of its `*_parity` targets are
 real-weight — so this lane proves nothing about that crate's integration surface.
 
@@ -80,6 +97,18 @@ LANE_TARGET_OS = "linux"
 # is that negative control.
 SKIP_MARKER = re.compile(r'(?:eprintln|println)!\(\s*(?:\n\s*)?"\s*SKIP')
 SKIP_LOOKBACK_LINES = 10
+
+# The one case sc-19447 mis-classified (see the module docstring): device-gated, weight-free, and
+# reachable from `windows-cuda`, so `#[ignore]` silenced it rather than parking it. Pinned by name
+# because nothing else notices when a canary stops being evaluated — that is the whole failure mode
+# it guards against, one level up.
+CUDA_CANARY_CRATE = "candle-gen"
+CUDA_CANARY_TARGET = "cuda_quant_smoke"
+CUDA_CANARY_CASE = "cuda_qmatmul_matches_cpu"
+# The `windows-cuda` step that executes it. Named rather than globbed: `windows-cuda-check`'s step
+# compiles the same selectors `--no-run` and would satisfy every check below while running nothing.
+CUDA_STEP_NAME = "Test Candle CUDA packages"
+CUDA_STEP_JOB = "windows-cuda"
 
 
 def _job_spans(workflow: str) -> dict[str, tuple[int, int]]:
@@ -203,6 +232,39 @@ def _balanced(text: str, open_at: int) -> str:
     raise AssertionError("unbalanced parentheses in a cfg attribute")
 
 
+def inner_attribute_prologue(text: str) -> str:
+    """The head of a source file where inner attributes are legal, comment lines dropped.
+
+    PROSE IS NOT WIRING. `#![cfg(...)]` is an INNER attribute — rustc accepts it only before the
+    first item — so scanning the WHOLE file for the token also matches a `//!` or `///` comment that
+    *names* the attribute it is documenting. A file whose header explains its own gating would then
+    be classified as compiling to an empty binary with the real attribute deleted, and silently
+    dropped from this lane's coverage.
+
+    That is not hypothetical: `candle-gen/tests/cuda_quant_smoke.rs`'s module header explains in
+    words why it is `#![cfg(feature = "cuda")]` rather than `#[ignore]`d, and a whole-file scan
+    returned FOUR predicates for that file's ONE attribute.
+
+    The prologue ends at the first line that is neither blank, nor a line comment, nor part of an
+    inner attribute; bracket depth is tracked so a multi-line `#![cfg(all(\\n ... \\n))]` is kept
+    whole. Block comments (`/* ... */`) before the first attribute are not handled — no target in
+    this tree opens with one, and the failure mode would be a truncated prologue, i.e. a file
+    over-counted and this check failing loudly, not a gate silently disappearing.
+    """
+    out: list[str] = []
+    depth = 0
+    for line in text.splitlines():
+        if depth == 0:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("//"):
+                continue
+            if not stripped.startswith("#!["):
+                break
+        out.append(line)
+        depth = max(0, depth + line.count("[") - line.count("]"))
+    return "\n".join(out)
+
+
 def file_level_cfgs(text: str) -> list[str]:
     """Every inner-attribute `#![cfg(...)]` predicate, as source, multi-line safe.
 
@@ -210,10 +272,14 @@ def file_level_cfgs(text: str) -> list[str]:
     is legal rustfmt output and a single-line pattern silently misses it, which would count a
     target that compiles to an empty binary as weight-free coverage. The wrapping parens are
     stripped, so each element is the predicate itself (`feature = "cuda"`, `all(...)`, ...).
+
+    Scanned over [`inner_attribute_prologue`], not the raw text — see there for why a comment that
+    mentions the attribute must not count as the attribute.
     """
+    prologue = inner_attribute_prologue(text)
     out: list[str] = []
-    for m in re.finditer(r"#!\[\s*cfg\s*\(", text):
-        out.append(_balanced(text, m.end() - 1)[1:-1])
+    for m in re.finditer(r"#!\[\s*cfg\s*\(", prologue):
+        out.append(_balanced(prologue, m.end() - 1)[1:-1])
     return out
 
 
@@ -482,6 +548,116 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
             job_needs(self.workflow, GATE_JOB),
             f"{OWNING_JOB} is not in {GATE_JOB}.needs, so its failure no longer blocks the merge "
             "and the step's result is advisory.",
+        )
+
+    def test_a_comment_that_names_a_file_cfg_is_not_a_file_cfg(self) -> None:
+        """PROSE IS NOT WIRING — see `inner_attribute_prologue`.
+
+        The whole-file token scan this replaced read a `//!` header explaining a gate as the gate
+        itself, so a target could lose its real `#![cfg]` and still be classified as compiling to an
+        empty binary — dropped from coverage with nothing red. `cuda_quant_smoke.rs` is the live
+        instance: its header documents its own gating, and the old scan returned four predicates for
+        one attribute.
+        """
+        prose_only = (
+            '//! Documented, not wired: `#![cfg(feature = "cuda")]` is what this WOULD use.\n'
+            "\nuse candle_gen::default_device;\n"
+        )
+        self.assertEqual(
+            file_level_cfgs(prose_only),
+            [],
+            "a #![cfg] named only in a comment is being read as a real inner attribute",
+        )
+        self.assertFalse(
+            compiles_empty_on_this_lane(prose_only, CANDLE_GEN / EPIC_CRATE),
+            "a target with no real file-level #![cfg] is classified as an empty binary because a "
+            "comment mentions one — it would be silently dropped from this lane's coverage",
+        )
+        # The real attribute still counts when the same file also discusses it in prose.
+        both = '//! Gated with `#![cfg(feature = "cuda")]`.\n#![cfg(feature = "cuda")]\n'
+        self.assertEqual(file_level_cfgs(both), ['feature = "cuda"'])
+        # And the live file it was found on resolves to exactly its one real attribute.
+        canary = (
+            CANDLE_GEN / CUDA_CANARY_CRATE / "tests" / f"{CUDA_CANARY_TARGET}.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            file_level_cfgs(canary),
+            ['feature = "cuda"'],
+            "the sc-7544 canary's header prose is being counted as extra file-level cfgs",
+        )
+
+    def test_the_sc7544_cuda_canary_is_cfg_gated_and_still_runs_on_windows_cuda(self) -> None:
+        """The one case sc-19447 mis-classified. Both halves are asserted, because either alone
+        can be satisfied by a target that proves nothing:
+
+          * excluded from THIS lane — by the `#![cfg]` empty-binary mechanism, not by `#[ignore]`;
+          * still EXECUTED on the lane that has a GPU — `windows-cuda`'s test step selects it and
+            passes no `-- --ignored`, so an `#[ignore]` here is silence, not deferral.
+
+        `#[ignore]` was applied in sc-19447 on the belief that this was an env-var self-skipper
+        parked out of reach. It is device-gated (`default_device().is_cuda()`) and weight-free, and
+        `windows-cuda` ran it. Nothing noticed for a whole PR cycle — which is exactly the failure
+        mode the canary itself guards against, so it is pinned by name here.
+        """
+        crate = CANDLE_GEN / CUDA_CANARY_CRATE
+        source = crate / "tests" / f"{CUDA_CANARY_TARGET}.rs"
+        self.assertTrue(source.is_file(), f"the sc-7544 CUDA canary moved or was deleted: {source}")
+        text = source.read_text(encoding="utf-8")
+
+        case = next((c for c in _cases(text) if c[0] == CUDA_CANARY_CASE), None)
+        self.assertIsNotNone(
+            case, f"{CUDA_CANARY_CASE} is gone from {source.name}; the sc-7544 canary is unguarded"
+        )
+        ignored = any(a.startswith("#[ignore") for a in case[1])
+
+        # HALF 1 — off this lane by the empty-binary mechanism.
+        self.assertTrue(
+            compiles_empty_on_this_lane(text, crate),
+            f"{source.name} no longer carries a file-level #![cfg] that is false on "
+            f"{LANE_TARGET_OS}. Without it the canary would need a CUDA device on ubuntu-latest.",
+        )
+        self.assertNotIn(
+            CUDA_CANARY_TARGET,
+            crates_with_weight_free_integration_cases().get(CUDA_CANARY_CRATE, []),
+            f"{source.name} is being counted as weight-free coverage for this lane, which cannot "
+            "run it — the classification and the gating disagree.",
+        )
+
+        # HALF 2 — the lane with a GPU still evaluates it.
+        cuda_step = step_run_block(self.workflow, CUDA_STEP_NAME)
+        self.assertEqual(
+            job_of_step(self.workflow, CUDA_STEP_NAME),
+            CUDA_STEP_JOB,
+            f"the {CUDA_STEP_NAME!r} step left {CUDA_STEP_JOB!r}; this check would then be reading "
+            "some other job's command line.",
+        )
+        self.assertIn(
+            "--features cuda",
+            cuda_step,
+            f"the {CUDA_STEP_NAME!r} step no longer enables the cuda feature, so the canary's "
+            "own #![cfg] now compiles it out of EVERY lane.",
+        )
+        self.assertNotRegex(
+            cuda_step,
+            r"--no-run\b",
+            f"the {CUDA_STEP_NAME!r} step gained --no-run; it would build the canary and throw it "
+            "away, which is the windows-cuda-check hole, not a lane that runs it.",
+        )
+        self.assertTrue(
+            any(
+                fnmatch.fnmatchcase(CUDA_CANARY_CRATE, spec)
+                for spec in selected_packages(cuda_step)
+            ),
+            f"{CUDA_CANARY_CRATE} is selected by no -p spec in the {CUDA_STEP_NAME!r} step "
+            f"(specs: {selected_packages(cuda_step)}).",
+        )
+        self.assertTrue(
+            (not ignored) or "--ignored" in cuda_step,
+            f"{CUDA_CANARY_CASE} is #[ignore]d and the {CUDA_STEP_NAME!r} step passes no "
+            "`-- --ignored`, so libtest reports it `ignored` on the only lane that has ever "
+            "executed it. That is how the sc-7544 canary was silenced in PR #712. Exclude it with "
+            "the file-level #![cfg(feature = \"cuda\")] instead — or add `-- --ignored` to that "
+            "step and rewrite this check's rationale.",
         )
 
     def test_no_counted_case_self_skips(self) -> None:
