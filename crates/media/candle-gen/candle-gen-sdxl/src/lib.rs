@@ -421,6 +421,46 @@ impl Generator for SdxlGenerator {
         let tokenizers = self.tokenizers()?;
         let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
         let components = self.components(&pipe)?;
+        // Chained denoise passes (epic 20414, sc-20425): resolved ONCE up front so an invalid plan is
+        // rejected before any denoise work, then re-resolved per image inside the driver so each
+        // image's pass seeds derive from its own job seed. The job seed is drawn exactly once (F-089)
+        // — `default_seed` is time-derived, so re-drawing it would make the plan and the render
+        // disagree about the very seeds the plan records for replay.
+        if req.denoise_passes.is_some() {
+            let ctx = self
+                .descriptor
+                .capabilities
+                .denoise_pass_context(Some(self.adapters.len()));
+            let defaults = sdxl_denoise_defaults();
+            let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+            // Resolve once here purely to fail fast; the driver re-resolves per image.
+            req.resolve_denoise_plan(base_seed, &defaults, &ctx)?;
+            let resolve = |seed: u64| -> gen_core::Result<gen_core::ResolvedDenoisePlan> {
+                req.resolve_denoise_plan(seed, &defaults, &ctx)
+                    .map_err(gen_core::Error::from)
+            };
+            let (images, execution) = pipe.render_denoise_passes(
+                req,
+                &text_embeddings,
+                &components.unet,
+                &components.vae,
+                components.pid.as_deref(),
+                base_seed,
+                &resolve,
+                on_progress,
+            )?;
+            // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+            // emitted exactly once per generation, after a successful chain and before the caller
+            // sees any image, carrying the requested AND resolved per-pass values plus the
+            // effective evaluation accounting. The driver keeps the FIRST image's record because
+            // every image in a batch resolves the same plan shape and differs only in its seeds.
+            // Without this the plan a render actually ran was unrecoverable, so a replay had
+            // nothing to replay from.
+            if let Some(execution) = execution {
+                req.emit_denoise_pass_report(execution);
+            }
+            return Ok(GenerationOutput::Images(images));
+        }
         let images = pipe.render(
             req,
             &text_embeddings,
@@ -431,6 +471,24 @@ impl Generator for SdxlGenerator {
         )?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// The model-default rung of the chained-denoise resolution ladder (sc-20425) — what a pass that
+/// names nothing, in a request that names nothing, actually runs.
+///
+/// Both ids are **menu-valid and honorable**: `ddim` is `DEFAULT_SAMPLER`, the curated solver the
+/// omitted-sampler default has resolved to since sc-10826, and `normal` is the curated schedule the
+/// curated lane's `native` is built from. Deliberately NOT `lightning` (a distilled bespoke lane that
+/// is not a `Solver` at all) and not `discrete` (an alias that means the same schedule `normal`
+/// already names) — a resolved plan is a replay artifact, so the defaults it records must be ids
+/// validation accepts.
+pub(crate) fn sdxl_denoise_defaults() -> gen_core::DenoiseDefaults {
+    gen_core::DenoiseDefaults::new(
+        pipeline::DEFAULT_STEPS as u32,
+        pipeline::DEFAULT_SAMPLER,
+        "normal",
+    )
+    .with_guidance(pipeline::DEFAULT_GUIDANCE as f32)
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
@@ -500,7 +558,7 @@ pub fn descriptor() -> ModelDescriptor {
             ),
             schedulers: candle_gen::menu_with_aliases(
                 candle_gen::curated_scheduler_names(),
-                &["discrete"],
+                pipeline::NATIVE_SCHEDULERS,
             ),
             supported_guidance_methods: vec![],
             min_size: 512,
@@ -529,8 +587,28 @@ pub fn descriptor() -> ModelDescriptor {
             supports_multi_speaker: false,
             supports_conversation_history: false,
             supports_conversation_session: false,
-            // Chained denoise passes are not wired for this provider (sc-20415).
-            supports_denoise_passes: false,
+            // Chained denoise passes (epic 20414, sc-20425) — the non-Krea LATENT-DIFFUSION
+            // acceptance family, and the first ε/VE cohort member to adopt. The curated lane has been
+            // the default render since sc-10826, so the chain wraps the shipped code path:
+            // `SdxlPassHost` runs the same `DiscreteModelSampling` contract, the same UNet+CFG
+            // forward and the same per-pass schedule seam. `conditioning: vec![]` above means this is
+            // inherently the t2i-from-noise surface, matching the v1 scope with nothing to reject.
+            supports_denoise_passes: true,
+            // `discrete` is the honored native scheduler alias (this family's legacy name for its own
+            // σ table). Per-pass adapter overrides are NOT honored: SDXL installs LoRA/LoKr as
+            // forward residuals once at load and `LoraLinear` has no `clear_additive` or re-scale
+            // seam, so a per-pass weight could not be applied OR reverted — the shared floor rejects
+            // a pass that asks rather than accepting and ignoring it.
+            //
+            // Note what is deliberately absent: `lightning`. It is advertised in `samplers` above,
+            // but it is a distilled bespoke lane, not a `Solver`, so a pass naming it is a typed
+            // rejection from the shared floor (`DenoisePassIssue::NotHonored`) rather than a silent
+            // downgrade to Euler.
+            denoise_pass_surface: gen_core::DenoisePassSurface {
+                native_schedulers: pipeline::NATIVE_SCHEDULERS,
+                unhonorable_samplers: &[],
+                per_pass_adapters: false,
+            },
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
@@ -743,6 +821,58 @@ mod tests {
             d.required_components,
             &["tokenizer_clip_l", "tokenizer_clip_bigg", "vae_fp16_fix"]
         );
+    }
+
+    /// The chained-denoise advertisement (sc-20425) and the surface that goes with it. SDXL is the
+    /// epic's LATENT-DIFFUSION acceptance family, so the published surface is asserted in full:
+    /// `discrete` is the honored native scheduler alias, the honorable sampler set is the curated
+    /// registry only (`lightning` is filtered OUT even though the menu advertises it for the
+    /// single-pass lane), and per-pass adapter overrides are off because SDXL's LoRA/LoKr install as
+    /// forward residuals once at load with no removal or re-scale seam.
+    #[test]
+    fn descriptor_advertises_chained_denoise_passes_without_lightning_or_per_pass_adapters() {
+        let d = descriptor();
+        let caps = &d.capabilities;
+        assert!(caps.supports_denoise_passes);
+        assert_eq!(caps.denoise_pass_surface.native_schedulers, &["discrete"]);
+        assert!(!caps.denoise_pass_surface.per_pass_adapters);
+
+        let cap = caps.denoise_pass_capability();
+        assert!(cap.supported);
+        assert_eq!(cap.max_passes, gen_core::MAX_DENOISE_PASSES);
+        assert_eq!(cap.samplers, candle_gen::curated_sampler_names());
+        assert!(
+            !cap.samplers.contains(&"lightning"),
+            "an advertised-but-uncurated sampler must not be published as per-pass usable"
+        );
+        assert!(cap.schedulers.contains(&"discrete"));
+        assert!(cap.schedulers.contains(&"normal"));
+        assert_eq!(
+            cap.fields,
+            vec!["steps", "sampler", "scheduler", "denoise", "guidance"],
+            "no `adapters` field — SDXL cannot re-weight per pass"
+        );
+        assert!(!cap.per_pass_adapters);
+
+        // The conformance sweep accepts the pairing (control-route, honorable-menu, native-alias and
+        // adapter cross-checks all pass).
+        let errs = candle_gen::gen_core::registry::model_descriptor_errors(&d);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        // The model defaults the ladder bottoms out on are menu-valid AND honorable ids — notably
+        // NOT `lightning`, which the descriptor advertises but a chain cannot run.
+        let defaults = sdxl_denoise_defaults();
+        assert_eq!(
+            (
+                defaults.steps,
+                defaults.sampler.as_str(),
+                defaults.scheduler.as_str()
+            ),
+            (30, "ddim", "normal")
+        );
+        assert_eq!(defaults.guidance, Some(7.0));
+        assert!(cap.samplers.contains(&defaults.sampler.as_str()));
+        assert!(cap.schedulers.contains(&defaults.scheduler.as_str()));
     }
 
     /// epic 13657 (sc-13663): the load gate. Every declared `required_components` id, removed in turn,

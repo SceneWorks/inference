@@ -63,8 +63,8 @@ use std::sync::Arc;
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::{
-    schedule_sigmas, AlphaSchedule, DiscreteModelSampling, LightningPolicy, SamplerPolicy,
-    Scheduler,
+    schedule_sigmas, AlphaSchedule, DiscreteModelSampling, LightningPolicy, ModelSampling,
+    SamplerPolicy, Scheduler,
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{
@@ -100,8 +100,8 @@ use tokenizers::Tokenizer;
 pub(crate) const VAE_SCALE: f64 = 0.13025;
 /// Production SDXL defaults (the SceneWorks `sdxl` row): 30 steps, CFG 7.0 — used when the request
 /// omits them.
-const DEFAULT_STEPS: usize = 30;
-const DEFAULT_GUIDANCE: f64 = 7.0;
+pub(crate) const DEFAULT_STEPS: usize = 30;
+pub(crate) const DEFAULT_GUIDANCE: f64 = 7.0;
 /// The sampler an **omitted** `req.sampler` resolves to (sc-10826): the curated `ddim` solver — a
 /// k-diffusion DDIM (eta=0, non-ancestral) over the SDXL ε-schedule, driven by the unified
 /// [`gen_core::sampling`] framework via [`Pipeline::denoise_curated`]. It **replaces** the native
@@ -111,7 +111,7 @@ const DEFAULT_GUIDANCE: f64 = 7.0;
 /// determinism the native default targeted (generation stays a pure function of `(seed, request)`),
 /// and `ddim` is part of the advertised curated vocabulary ([`candle_gen::curated_sampler_names`]),
 /// so it remains a valid selection.
-const DEFAULT_SAMPLER: &str = "ddim";
+pub(crate) const DEFAULT_SAMPLER: &str = "ddim";
 
 /// The curated solver a txt2img render resolves `req.sampler` to (sc-10826), factored out of
 /// [`Pipeline::render`] so the default-routing rule is unit-testable without a GPU:
@@ -1272,6 +1272,94 @@ impl Pipeline {
         Ok(out.to_dtype(self.dtype)?)
     }
 
+    /// Render `req` as a **chained denoise plan** (epic 20414, sc-20425) — the curated VE lane, run
+    /// pass by pass through the shared executor, with ONE decode per image after the whole chain.
+    ///
+    /// The batch shape is [`render`](Self::render)'s: the same per-image seed walk, the same
+    /// CPU-seeded prior, the same decode seam (PiD included). What differs is that the trajectory
+    /// comes from [`gen_core::sampling::execute_denoise_plan`] instead of one `run_curated_sampler`
+    /// call, and the plan is re-resolved per image so each image's pass seeds derive from its own job
+    /// seed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_denoise_passes(
+        &self,
+        req: &GenerationRequest,
+        text_embeddings: &Tensor,
+        unet: &SdxlUnet,
+        vae: &SdxlVaeDecoder,
+        pid: Option<&PidEngine>,
+        base_seed: u64,
+        resolve: &dyn Fn(u64) -> gen_core::Result<gen_core::ResolvedDenoisePlan>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+        let sched = sdxl_alpha_schedule()?;
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, crate::MODEL_ID)?;
+        // The `[uncond, cond]` stack is narrowed per pass inside the host, because a chain's CFG is
+        // per-pass: pass 1 may run guided and pass 2 unguided, and feeding a batch-2 stack to a
+        // batch-1 forward kills the UNet inside cross-attention (sc-14195).
+        let mut execution: Option<gen_core::DenoisePlanExecution> = None;
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let plan = resolve(seed)?;
+            let first = plan.passes.first().ok_or_else(|| {
+                CandleError::Msg("sdxl: a resolved plan carries no passes".into())
+            })?;
+            // The VE prior is unit noise · the σ the FIRST pass actually enters at — the same
+            // `init * sigmas[0]` the single-pass lane builds, read off pass 0's own segment so a
+            // `denoise < 1.0` first pass starts at its own entry σ rather than the schedule top.
+            let schedule_steps =
+                gen_core::sampling::denoise_pass_schedule_steps(first.steps, first.denoise);
+            let sigmas = pass_schedule(first, schedule_steps, &ms)?;
+            let entry = gen_core::sampling::terminal_pass_segment(&sigmas, first.steps)
+                .first()
+                .copied()
+                .unwrap_or(ms.sigma_max());
+            let n = 4 * lat_h * lat_w;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let noise = candle_gen::seeded_normal_vec(&mut rng, n);
+            let init = Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?
+                .to_device(&self.device)?;
+            let initial = (&init * entry as f64)?;
+
+            let mut host = SdxlPassHost {
+                unet,
+                text_embeddings,
+                dtype: self.dtype,
+                ms: &ms,
+                // Built over the REQUEST's sink and fresh per image, exactly as the single-pass lane
+                // builds its own. `ve_hook` is the σ-carrying projector this family needs, and the
+                // chained seam feeds it `PassObservation::sigma` (sc-20425) — a σ-less emitter would
+                // consume every position and deliver nothing.
+                hook: candle_gen::preview::PassPreview::new(crate::preview::ve_hook(&req.preview)),
+            };
+            let run = gen_core::sampling::execute_denoise_plan(
+                &candle_gen::CandleLatentOps,
+                &ms,
+                &plan,
+                initial,
+                &mut host,
+                &req.cancel,
+                on_progress,
+            )?;
+            if execution.is_none() {
+                execution = Some(run.execution);
+            }
+            on_progress(Progress::Decoding);
+            let latents = run.latent.to_dtype(self.dtype)?;
+            self.decode(
+                vae,
+                pid_decoder
+                    .as_ref()
+                    .map(|decoder| decoder as &dyn LatentDecoder),
+                &latents,
+                &req.cancel,
+            )
+        })?;
+        Ok((images, execution))
+    }
+
     /// Decode latents to an RGB8 [`Image`], either through the native VAE or — when a PiD decoder
     /// resolved (epic 7840 / sc-7853) — the super-resolving PiD student (emits a larger `[1,3,4H,4W]`
     /// tensor). Both produce `[-1, 1]` pixels; [`to_image`](Self::to_image) reads the size from the
@@ -1425,6 +1513,127 @@ pub(crate) fn detect_packed_unet(root: &Path) -> Result<Option<(PathBuf, usize)>
     Ok(Some((file, group_size)))
 }
 
+// =================================================================================================
+// Chained denoise passes (epic 20414, sc-20425)
+// =================================================================================================
+
+/// The scheduler ids SDXL honors on a chained pass **beyond** the curated registry.
+///
+/// `discrete` is the legacy alias this family already advertises for "the native σ table" — which,
+/// on the curated lane, is the `normal` schedule over [`DiscreteModelSampling`]. It is honored here
+/// for the same reason it is advertised there. Every other non-curated id (notably `lightning`,
+/// which is a *sampler* alias and not a schedule at all) stays a typed rejection.
+pub(crate) const NATIVE_SCHEDULERS: &[&str] = &["discrete"];
+
+/// One chained pass's **fresh** σ schedule over SDXL's discrete ε contract — the
+/// [`gen_core::sampling::DenoisePassHost`] seam.
+///
+/// Deliberately the same two lines [`Pipeline::denoise_curated`] runs: the native ComfyUI SDXL
+/// default (`normal` over the alpha table) then the curated scheduler axis over it. The addition is
+/// [`gen_core::resolve_pass_scheduler`], which rejects an id this family cannot honor before
+/// `resolve_schedule` would quietly return the native schedule under that name.
+pub(crate) fn pass_schedule(
+    pass: &gen_core::ResolvedDenoisePass,
+    schedule_steps: usize,
+    ms: &DiscreteModelSampling,
+) -> Result<Vec<f32>> {
+    gen_core::resolve_pass_scheduler(pass, NATIVE_SCHEDULERS)
+        .map_err(|e| CandleError::Msg(format!("{}: {e}", crate::MODEL_ID)))?;
+    let native = schedule_sigmas(Scheduler::Normal, ms, schedule_steps);
+    Ok(candle_gen::resolve_schedule(
+        Some(pass.scheduler.as_str()),
+        ms,
+        schedule_steps,
+        &native,
+    ))
+}
+
+/// Compile-time witness that this crate really implements the chained-denoise host it advertises
+/// (sc-20425 review MINOR 9).
+///
+/// The descriptor conformance sweep closes the *derived-descriptor* half of "advertises without a
+/// host" — a control route, an unusable menu, a half-inherited surface — but it cannot see whether a
+/// `DenoisePassHost` exists at all, because a descriptor is data and the host is a trait impl in
+/// another crate. This is the missing half, in the one place that can check it: if the impl below is
+/// ever deleted or renamed while `supports_denoise_passes` stays `true`, THIS crate stops compiling
+/// rather than shipping a capability nothing serves.
+const _: fn(&mut SdxlPassHost<'_>) = |host| {
+    let _: &mut dyn gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> = host;
+};
+
+/// SDXL's [`gen_core::sampling::DenoisePassHost`]: the family schedule seam and the per-pass UNet
+/// forward with the per-pass CFG combine, lifted verbatim from
+/// [`Pipeline::denoise_curated`]'s closure.
+///
+/// **The batch narrowing is per pass, not per render.** `text_embeddings` is always the
+/// `[uncond, cond]` stack, and a CFG-off forward must run over the cond row alone — feeding it the
+/// batch-2 stack puts a batch-1 query against batch-2 cross-attention K/V and kills the UNet inside
+/// the attention matmul (sc-14195). On a chain the CFG decision is a property of the *pass*, so the
+/// narrowing moves inside the forward.
+///
+/// SDXL folds no per-pass adapter state (its LoRA/LoKr install as forward residuals once at load and
+/// there is no removal or re-scale seam), so `begin_pass`/`end_pass` stay the trait defaults and the
+/// descriptor's `per_pass_adapters` is `false`.
+struct SdxlPassHost<'a> {
+    unet: &'a SdxlUnet,
+    text_embeddings: &'a Tensor,
+    dtype: DType,
+    ms: &'a DiscreteModelSampling,
+    hook: candle_gen::preview::PassPreview<'a>,
+}
+
+impl gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> for SdxlPassHost<'_> {
+    fn build_schedule(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> gen_core::Result<Vec<f32>> {
+        Ok(pass_schedule(pass, schedule_steps, self.ms)?)
+    }
+
+    fn predict(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        x_in: &Tensor,
+        timestep: f32,
+    ) -> gen_core::Result<Tensor> {
+        // `x_in` is already `1/√(σ²+1)`-scaled by the shared `denoise()`; `timestep` is the nearest
+        // training-step index the UNet embeds — the same pair `run_curated_sampler` hands the
+        // single-pass closure.
+        let guidance = pass.guidance.map(f64::from).unwrap_or(DEFAULT_GUIDANCE);
+        let use_guide = guidance > 1.0;
+        let run = || -> Result<Tensor> {
+            let ehs = if use_guide {
+                self.text_embeddings.clone()
+            } else {
+                self.text_embeddings.narrow(0, 1, 1)?.contiguous()?
+            };
+            let model_in = if use_guide {
+                Tensor::cat(&[x_in, x_in], 0)?
+            } else {
+                x_in.clone()
+            };
+            let model_in = model_in.to_dtype(self.dtype)?;
+            let noise_pred = self.unet.forward(&model_in, timestep as f64, &ehs)?;
+            let eps = if use_guide {
+                let chunks = noise_pred.chunk(2, 0)?;
+                let (uncond, cond) = (&chunks[0], &chunks[1]);
+                (uncond + ((cond - uncond)? * guidance)?)?
+            } else {
+                noise_pred
+            };
+            // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        };
+        run().map_err(Into::into)
+    }
+
+    fn observe(&mut self, obs: gen_core::sampling::PassObservation<'_, Tensor>) {
+        self.hook
+            .emit(obs.chain_step, obs.chain_total_steps, obs.sigma, obs.latent);
+    }
+}
+
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
 /// single-file RealVisXL checkpoint that lacks the diffusers multi-component tree — sc-3677).
 pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -1443,6 +1652,214 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    // ---- Chained denoise passes (epic 20414, sc-20425) ------------------------------------------
+
+    fn dp_resolved(sampler: &str, scheduler: &str, steps: u32) -> gen_core::ResolvedDenoisePass {
+        gen_core::ResolvedDenoisePass {
+            index: 0,
+            steps,
+            sampler: sampler.to_owned(),
+            scheduler: scheduler.to_owned(),
+            denoise: 1.0,
+            guidance: None,
+            seed: 99,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Adoption: the backend-neutral executor conformance suite runs over SDXL's REAL per-pass
+    /// schedule seam **and its own `DiscreteModelSampling`** — the ε/VE contract, not flow. That
+    /// distinction is the whole point of `denoise_pass_conformance_over` (sc-20425): the boundary
+    /// re-noise blend differs between the cohorts, so a flow-driven run would certify nothing about
+    /// this family. Weights-free and CPU-only.
+    #[test]
+    fn shared_pass_executor_conformance_over_the_sdxl_ve_schedule_seam() {
+        let sched = sdxl_alpha_schedule().expect("the SDXL alpha schedule builds");
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        gen_core_testkit::denoise_passes::denoise_pass_conformance_over(
+            "candle sdxl",
+            &ms,
+            &|pass, steps| pass_schedule(pass, steps, &ms).expect("a curated id always resolves"),
+        );
+        // And over the advertised native alias.
+        gen_core_testkit::denoise_passes::denoise_pass_conformance_over(
+            "candle sdxl discrete alias",
+            &ms,
+            &|_pass, steps| {
+                pass_schedule(&dp_resolved("euler", "discrete", steps as u32), steps, &ms)
+                    .expect("the declared native alias is honored")
+            },
+        );
+    }
+
+    /// **The sc-20425 review's MAJOR 1, on this family.** The generator binds the executor's
+    /// `DenoisePlanExecution` and publishes it through `GenerationRequest::emit_denoise_pass_report`
+    /// before returning any image; without that the plan a render actually ran is unrecoverable and
+    /// the epic's replay path has nothing to replay from. This drives the REAL schedule seam,
+    /// model defaults and descriptor context through the shared adopter check, so the record's
+    /// requested-vs-resolved contents and eval accounting are pinned against this family's own
+    /// resolution ladder.
+    #[test]
+    fn the_generator_publishes_one_execution_record_for_a_chain() {
+        let requested = vec![
+            gen_core::DenoisePass {
+                steps: Some(4),
+                ..Default::default()
+            },
+            gen_core::DenoisePass {
+                steps: Some(3),
+                sampler: Some("euler".to_owned()),
+                denoise: Some(0.5),
+                ..Default::default()
+            },
+        ];
+        let req = GenerationRequest {
+            denoise_passes: Some(requested.clone()),
+            ..Default::default()
+        };
+        let sched = sdxl_alpha_schedule().expect("the SDXL alpha schedule builds");
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let caps = crate::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::sdxl_denoise_defaults();
+        let record = gen_core_testkit::denoise_passes::check_execution_record(
+            &|pass: &gen_core::ResolvedDenoisePass, steps: usize| {
+                pass_schedule(pass, steps, &ms).expect("a curated id always resolves")
+            },
+            &ms,
+            &req,
+            0x5eed,
+            &defaults,
+            &ctx,
+        )
+        .expect("the execution record must satisfy the shared adopter contract");
+
+        // The ladder's own answers, published: pass 0 named no sampler/scheduler, so both come
+        // from this family's model defaults; pass 1 named its sampler and denoise.
+        assert_eq!(record.passes.len(), 2);
+        assert_eq!(
+            record.passes[0].resolved.sampler, defaults.sampler,
+            "an unnamed per-pass sampler must resolve to this family's default"
+        );
+        assert_eq!(record.passes[0].resolved.scheduler, defaults.scheduler);
+        assert_eq!(record.passes[0].resolved.steps, 4);
+        assert_eq!(record.passes[1].resolved.sampler, "euler");
+        assert_eq!(record.passes[1].resolved.denoise, 0.5);
+        // And the requested values ride alongside, so a consumer can tell the two apart.
+        assert_eq!(record.passes[0].requested.as_ref(), Some(&requested[0]));
+        assert_eq!(record.passes[1].requested.as_ref(), Some(&requested[1]));
+        // The VE cohort re-noises pass 1 at its own segment entry, which the record flags.
+        assert!(!record.passes[0].renoised && record.passes[1].renoised);
+    }
+
+    /// The per-pass schedule seam is the single-pass one: the native ComfyUI `normal` schedule over
+    /// the SDXL alpha table, with the curated axis over it.
+    #[test]
+    fn a_pass_schedule_is_the_single_pass_curated_schedule() {
+        let sched = sdxl_alpha_schedule().unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let native = schedule_sigmas(Scheduler::Normal, &ms, 8);
+        assert_eq!(
+            pass_schedule(&dp_resolved("ddim", "discrete", 8), 8, &ms).unwrap(),
+            native,
+            "the native alias must return the family's own schedule"
+        );
+        assert_eq!(
+            pass_schedule(&dp_resolved("ddim", "karras", 8), 8, &ms).unwrap(),
+            candle_gen::resolve_schedule(Some("karras"), &ms, 8, &native),
+            "a curated id must resolve through the same seam denoise_curated uses"
+        );
+        // The VE prior really is unit noise · σ_max, so the initial-latent scale the chained driver
+        // reads off pass 0 is the same one `denoise_curated` applies.
+        assert!(native[0] > 10.0, "SDXL's σ_max is ≈14.6, got {}", native[0]);
+    }
+
+    /// **The sc-20425 review's MINOR 8, on this family.** A pass that names no sampler inherits the
+    /// request's, so a chained request carrying a flat `sampler: "lightning"` reached the executor
+    /// before being refused — after the UNet had loaded. The shared floor now refuses it at
+    /// `Generator::validate`, naming the pass that would have inherited it, and the resolver refuses
+    /// it again for a caller that skipped the floor. The legacy single-pass lane still honors it.
+    #[test]
+    fn an_inherited_lightning_is_refused_before_the_model_loads() {
+        let caps = crate::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::sdxl_denoise_defaults();
+        let base = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            sampler: Some("lightning".into()),
+            ..Default::default()
+        };
+
+        // Legacy single-pass: `lightning` is this family's few-step lane and stays honored.
+        assert!(caps.validate_request(crate::MODEL_ID, &base).is_ok());
+
+        // Chained, with a pass that names nothing: the flat value IS the pass's sampler.
+        let inheriting = GenerationRequest {
+            denoise_passes: Some(vec![gen_core::DenoisePass::default()]),
+            ..base.clone()
+        };
+        let err = caps
+            .validate_request(crate::MODEL_ID, &inheriting)
+            .expect_err("an inherited lightning must be refused at validate");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "a capability gap must stay typed: {err:?}"
+        );
+        assert!(inheriting.resolve_denoise_plan(7, &defaults, &ctx).is_err());
+
+        // Chained, with every pass naming its own honorable sampler: nothing inherits it.
+        let all_named = GenerationRequest {
+            denoise_passes: Some(vec![gen_core::DenoisePass {
+                sampler: Some("ddim".to_owned()),
+                ..Default::default()
+            }]),
+            ..base
+        };
+        assert!(caps.validate_request(crate::MODEL_ID, &all_named).is_ok());
+        assert!(all_named.resolve_denoise_plan(7, &defaults, &ctx).is_ok());
+    }
+
+    /// **The sc-20425 item-3 trap, on this family.** `lightning` is advertised in SDXL's *sampler*
+    /// menu but is a distilled bespoke lane, not a curated `Solver`; before this it validated and
+    /// then integrated as Euler. Both it and the MLX twin's `hyper` are now typed, pass-indexed
+    /// rejections from the shared floor, and the schedule seam refuses an unhonored scheduler id the
+    /// same way.
+    #[test]
+    fn lightning_is_never_silently_downgraded_on_a_chain() {
+        let caps = crate::descriptor().capabilities;
+        assert!(
+            caps.samplers.contains(&"lightning"),
+            "the menu still advertises it for the single-pass lane"
+        );
+        let ctx = caps.denoise_pass_context(None);
+        for id in ["lightning", "hyper"] {
+            let err = gen_core::validate_denoise_passes(
+                &[gen_core::DenoisePass {
+                    sampler: Some(id.to_owned()),
+                    ..Default::default()
+                }],
+                false,
+                &ctx,
+            )
+            .expect_err("an unrunnable sampler must be rejected");
+            assert_eq!(err.pass_index(), Some(0));
+            assert_eq!(err.field(), gen_core::DenoisePassField::Sampler);
+            assert!(err.is_capability_gap());
+        }
+        // The scheduler axis refuses an id this family does not honor.
+        let sched = sdxl_alpha_schedule().unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let err = pass_schedule(&dp_resolved("ddim", "linear", 8), 8, &ms)
+            .expect_err("an undeclared native scheduler must be rejected");
+        assert!(
+            format!("{err}").contains("denoisePasses[0].scheduler"),
+            "{err}"
+        );
+    }
 
     struct SdxlDecodeSpy {
         output: Tensor,

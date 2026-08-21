@@ -48,15 +48,29 @@ pub fn emit_nhwc_preview(
         return;
     }
     mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
-        let shape = latents.shape();
-        if shape.len() != 4 || shape[0] != 1 || shape[3] != 4 {
-            return Err(mlx_gen::Error::Msg(format!(
-                "SDXL preview latent must have shape [1, h, w, 4], got {shape:?}"
-            )));
-        }
-        let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
-        mlx_gen::preview::project_latents(&nchw, &RGB_FACTORS, RGB_BIAS)
+        project_nhwc_latents(latents)
     });
+}
+
+/// Validate the native NHWC layout, transpose it, and project it with the committed fit.
+///
+/// Factored out of [`emit_nhwc_preview`] for the chained denoise-pass lane (sc-20425), which numbers
+/// frames on the executor's chain-global outer step rather than on a σ position and so cannot reuse
+/// the σ-keyed emitter. Both lanes projecting through this one function is what keeps the two from
+/// drifting to different fits or different layout checks.
+///
+/// This family's fit was measured on the raw VE latent and needs **no** σ-dependent
+/// renormalization — unlike the candle twin's, whose projector requires the σ. That is why the MLX
+/// chained lane can key on the step index alone.
+pub(crate) fn project_nhwc_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
+    let shape = latents.shape();
+    if shape.len() != 4 || shape[0] != 1 || shape[3] != 4 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "SDXL preview latent must have shape [1, h, w, 4], got {shape:?}"
+        )));
+    }
+    let nchw = latents.transpose_axes(&[0, 3, 1, 2])?;
+    mlx_gen::preview::project_latents(&nchw, &RGB_FACTORS, RGB_BIAS)
 }
 
 #[cfg(test)]

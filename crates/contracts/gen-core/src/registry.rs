@@ -1545,6 +1545,128 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
     }
 }
 
+/// The chained-denoise-pass route cross-check (sc-20425) — the descriptor-level dual of the shared
+/// floor's per-pass rejections.
+///
+/// # Why this exists
+///
+/// Descriptors are routinely *derived*: `let mut d = base_descriptor(); d.id = OTHER_ID; …`. A derived
+/// descriptor inherits every field it does not override, so a route with no chained execution at all
+/// can inherit `supports_denoise_passes: true` from a sibling that has it — which is exactly how
+/// `krea_2_turbo_control` shipped admitting an `advanced.denoisePasses` request and then silently
+/// dropping the chain (sc-20425 item 1). "Remember to clear the flag" is not a mechanism; these
+/// checks are, and they run over every registered descriptor through
+/// [`ProviderRegistry::descriptor_conformance_errors`].
+///
+/// What they reject, all of it derived from the descriptor with no model-id table anywhere:
+///
+/// 1. **A dedicated control route.** `control_kinds: Some(..)` is the shape a ControlNet/pose branch
+///    declares; those routes are outside the epic-20414 v1 surface, and every one of them today is a
+///    descriptor derived from a t2i sibling.
+/// 2. **A menu with no honorable sampler.** The chained executor boxes a curated
+///    [`Solver`](crate::sampling::Solver) per pass and offers no hook for a family-native sampler
+///    name, so a menu whose entries are all native (a single bespoke id, say) advertises a capability
+///    no request could ever exercise.
+/// 3. **A menu with no honorable scheduler** — the same, allowing for the family's declared
+///    [`native_schedulers`](crate::DenoisePassSurface::native_schedulers).
+/// 4. **An unreachable or redundant native-scheduler declaration** — one that is not in the
+///    advertised menu (no request can name it), or one that shadows a curated id (which needs no
+///    declaration and would mask a real registry entry).
+/// 5. **Per-pass adapter overrides on a model with no adapters** — nothing to override.
+/// 6. **A surface declared without the capability** — the inheritance footgun again, in the other
+///    direction.
+///
+/// # What it does NOT close (sc-20425 review MINOR 9)
+///
+/// A descriptor is data; a [`DenoisePassHost`](crate::sampling::DenoisePassHost) is a trait impl in
+/// a provider crate this one cannot see. So these checks close the *derived-descriptor* half of
+/// "advertises a chain it cannot run" — a control route, a menu with nothing runnable, a
+/// half-inherited surface — but a **non-control** descriptor that sets the flag with no host at all
+/// still passes the sweep. A census of all 73 shipped literals confirms no such instance today.
+///
+/// The other half is checked where it can be: each adopting crate carries a compile-time witness
+/// (`const _: fn(&mut FamilyPassHost<'_>) = |host| { let _: &mut dyn DenoisePassHost<_> = host; };`)
+/// next to its host impl, so deleting or renaming the impl breaks that crate's build rather than
+/// shipping a capability nothing serves. A *new* family flipping the flag without adding either is
+/// the residual gap, and it is caught by the adoption checklist rather than by the compiler.
+fn check_denoise_pass_route(errs: &mut Vec<String>, ctx: &str, d: &ModelDescriptor) {
+    use crate::sampling::{Scheduler, Solver};
+
+    let caps = &d.capabilities;
+    let surface = caps.denoise_pass_surface;
+    if !caps.supports_denoise_passes {
+        if !surface.is_empty() {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface is non-empty but supports_denoise_passes is not set — \
+                 a derived descriptor must clear both halves of this contract or neither"
+            ));
+        }
+        return;
+    }
+    if d.control_kinds.is_some() {
+        errs.push(format!(
+            "{ctx}: supports_denoise_passes is set on a control route (control_kinds is Some) — \
+             control routes are outside the chained-denoise-pass surface, and a derived descriptor \
+             must clear the inherited flag"
+        ));
+    }
+    if !caps.samplers.is_empty() && !caps.samplers.iter().any(|id| surface.honors_sampler(id)) {
+        errs.push(format!(
+            "{ctx}: supports_denoise_passes is set but no advertised sampler is a curated Solver \
+             this family honors ({:?}) — a pass can only run a curated integrator, so no request \
+             could ever name one",
+            caps.samplers
+        ));
+    }
+    for id in surface.unhonorable_samplers {
+        if !caps.samplers.contains(id) {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares unhonorable sampler {id:?} but it is not \
+                 in the advertised `samplers` menu — nothing could name it in the first place"
+            ));
+        }
+        if Solver::from_name(id).is_none() {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares unhonorable sampler {id:?}, which is not \
+                 a curated Solver — an uncurated id is already rejected, so the declaration is \
+                 dead"
+            ));
+        }
+    }
+    if !caps.schedulers.is_empty()
+        && !caps
+            .schedulers
+            .iter()
+            .any(|id| surface.honors_scheduler(id))
+    {
+        errs.push(format!(
+            "{ctx}: supports_denoise_passes is set but no advertised scheduler is curated or \
+             declared in denoise_pass_surface.native_schedulers ({:?})",
+            caps.schedulers
+        ));
+    }
+    for id in surface.native_schedulers {
+        if !caps.schedulers.contains(id) {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares native scheduler {id:?} but it is not in the \
+                 advertised `schedulers` menu — no request could name it"
+            ));
+        }
+        if Scheduler::from_name(id).is_some() {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares native scheduler {id:?}, which is a curated \
+                 Scheduler — curated ids need no declaration"
+            ));
+        }
+    }
+    if surface.per_pass_adapters && !caps.supports_lora && !caps.supports_lokr {
+        errs.push(format!(
+            "{ctx}: denoise_pass_surface.per_pass_adapters is set but the model advertises neither \
+             supports_lora nor supports_lokr — there is no adapter stack to re-weight per pass"
+        ));
+    }
+}
+
 /// The weights-free invariants a generator [`ModelDescriptor`] must satisfy — everything checkable
 /// from `(registration.descriptor)()` alone, with no model load (sc-9098, F-009):
 ///
@@ -1679,6 +1801,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ));
         }
     }
+    check_denoise_pass_route(&mut errs, &ctx, d);
     if let Some(space) = d.denoiser_output_latent_space {
         let validation = space.validation();
         if validation.zero_channels {
@@ -4462,6 +4585,219 @@ mod tests {
         // The cross-check is scoped to the opt-in: a descriptor that leaves the flag false keeps the
         // menus optional, which is what every descriptor shipping today relies on.
         assert!(errors_of(false, vec![], vec![]).is_empty());
+    }
+
+    /// A denoise-pass descriptor whose test shape the sc-20425 route cross-checks are asserted
+    /// against. `Modality::Audio` keeps the size-bounds floor out of the way so a conformant case can
+    /// assert an *empty* error list rather than a filtered one.
+    fn pass_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "chained",
+            family: "test",
+            backend: "candle",
+            modality: Modality::Audio,
+            capabilities: Capabilities {
+                max_count: 1,
+                supports_denoise_passes: true,
+                samplers: vec!["euler"],
+                schedulers: vec!["normal"],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// **The sc-20425 item-1 bug, made structurally impossible.** `krea_2_turbo_control` was
+    /// `let mut d = turbo_descriptor(); d.id = …; d.conditioning = [Control]; d.control_kinds = …;`
+    /// and therefore inherited `supports_denoise_passes: true` from a sibling that has a
+    /// `DenoisePassHost` while itself having none — the chain was admitted and dropped. A control
+    /// route is outside the epic-20414 surface, so the sweep rejects the inherited flag.
+    #[test]
+    fn model_descriptor_errors_flags_denoise_passes_on_a_control_route() {
+        let conformant = pass_descriptor();
+        assert!(model_descriptor_errors(&conformant).is_empty());
+
+        let derived_control = ModelDescriptor {
+            control_kinds: Some(crate::control::AcceptedControlKinds::Any),
+            ..pass_descriptor()
+        };
+        let errs = model_descriptor_errors(&derived_control);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("supports_denoise_passes is set on a control route")),
+            "{errs:?}"
+        );
+
+        // Clearing the inherited flag — the fix — is conformant with the control surface intact.
+        let mut fixed = derived_control;
+        fixed.capabilities.supports_denoise_passes = false;
+        assert!(model_descriptor_errors(&fixed).is_empty());
+    }
+
+    /// A menu that is non-empty but carries no id the chained path can run is a capability no request
+    /// could ever exercise — the hole the sc-20415 emptiness check leaves open (a family advertising a
+    /// single bespoke sampler id passes it). Each axis is asserted independently so an inverted or
+    /// dropped condition cannot hide behind the other one firing.
+    #[test]
+    fn model_descriptor_errors_flags_denoise_pass_menus_with_nothing_honorable() {
+        let with_menus = |samplers: Vec<&'static str>, schedulers: Vec<&'static str>| {
+            let mut d = pass_descriptor();
+            d.capabilities.samplers = samplers;
+            d.capabilities.schedulers = schedulers;
+            model_descriptor_errors(&d)
+        };
+        let has = |errs: &[String], needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        let errs = with_menus(vec!["seedvr2_euler"], vec!["seedvr2_euler"]);
+        assert!(
+            has(&errs, "no advertised sampler is a curated Solver"),
+            "{errs:?}"
+        );
+        assert!(
+            has(&errs, "no advertised scheduler is curated or declared"),
+            "{errs:?}"
+        );
+
+        // One honorable id per axis is enough — a family may advertise native ids alongside.
+        assert!(with_menus(vec!["lightning", "euler"], vec!["discrete", "normal"]).is_empty());
+
+        // Only the sampler axis broken: the scheduler half must not fire.
+        let errs = with_menus(vec!["lightning"], vec!["normal"]);
+        assert!(
+            has(&errs, "no advertised sampler is a curated Solver"),
+            "{errs:?}"
+        );
+        assert!(!has(&errs, "no advertised scheduler"), "{errs:?}");
+
+        // Only the scheduler axis broken: the sampler half must not fire.
+        let errs = with_menus(vec!["euler"], vec!["discrete"]);
+        assert!(
+            has(&errs, "no advertised scheduler is curated or declared"),
+            "{errs:?}"
+        );
+        assert!(!has(&errs, "no advertised sampler"), "{errs:?}");
+    }
+
+    /// A declared unhonorable sampler must be advertised (else nothing could name it) and curated
+    /// (else it is already rejected and the declaration is dead) — sc-20425 review MAJOR 2.
+    #[test]
+    fn model_descriptor_errors_flags_an_inconsistent_unhonorable_sampler_declaration() {
+        let has = |errs: &[String], needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        let mut declared = pass_descriptor();
+        declared.capabilities.samplers = vec!["euler", "lcm"];
+        declared.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lcm"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        assert!(model_descriptor_errors(&declared).is_empty());
+
+        let mut unadvertised = pass_descriptor();
+        unadvertised.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lcm"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&unadvertised);
+        assert!(has(&errs, "in the advertised `samplers` menu"), "{errs:?}");
+
+        let mut uncurated = pass_descriptor();
+        uncurated.capabilities.samplers = vec!["euler", "lightning"];
+        uncurated.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lightning"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&uncurated);
+        assert!(has(&errs, "which is not"), "{errs:?}");
+
+        // Subtracting the ONLY honorable sampler leaves a capability no request could exercise.
+        let mut emptied = pass_descriptor();
+        emptied.capabilities.samplers = vec!["euler"];
+        emptied.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["euler"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&emptied);
+        assert!(
+            has(
+                &errs,
+                "no advertised sampler is a curated Solver this family honors"
+            ),
+            "{errs:?}"
+        );
+    }
+
+    /// The [`crate::DenoisePassSurface`] declarations must be reachable and non-redundant, and the
+    /// surface itself must never outlive the capability it belongs to — the same inheritance footgun
+    /// the control-route check closes, in the other direction.
+    #[test]
+    fn model_descriptor_errors_flags_an_inconsistent_denoise_pass_surface() {
+        let has = |errs: &[String], needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        // A declared native alias that is in the menu is conformant.
+        let mut declared = pass_descriptor();
+        declared.capabilities.schedulers = vec!["normal", "discrete"];
+        declared.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            native_schedulers: &["discrete"],
+            unhonorable_samplers: &[],
+            per_pass_adapters: false,
+        };
+        assert!(model_descriptor_errors(&declared).is_empty());
+
+        // Declared but unadvertised: no request could ever name it.
+        let mut unreachable = pass_descriptor();
+        unreachable.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            native_schedulers: &["discrete"],
+            unhonorable_samplers: &[],
+            per_pass_adapters: false,
+        };
+        let errs = model_descriptor_errors(&unreachable);
+        assert!(
+            has(&errs, "is not in the advertised `schedulers` menu"),
+            "{errs:?}"
+        );
+
+        // Declaring a curated id shadows a real registry entry and is redundant.
+        let mut shadowing = pass_descriptor();
+        shadowing.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            native_schedulers: &["normal"],
+            unhonorable_samplers: &[],
+            per_pass_adapters: false,
+        };
+        let errs = model_descriptor_errors(&shadowing);
+        assert!(has(&errs, "which is a curated Scheduler"), "{errs:?}");
+
+        // Per-pass adapter overrides with no adapter stack to override.
+        let mut no_adapters = pass_descriptor();
+        no_adapters.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            native_schedulers: &[],
+            unhonorable_samplers: &[],
+            per_pass_adapters: true,
+        };
+        let errs = model_descriptor_errors(&no_adapters);
+        assert!(
+            has(&errs, "neither supports_lora nor supports_lokr"),
+            "{errs:?}"
+        );
+        no_adapters.capabilities.supports_lora = true;
+        assert!(model_descriptor_errors(&no_adapters).is_empty());
+
+        // A surface inherited by a descriptor that cleared the capability.
+        let mut orphaned = pass_descriptor();
+        orphaned.capabilities.supports_denoise_passes = false;
+        orphaned.capabilities.supports_lora = true;
+        orphaned.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            native_schedulers: &[],
+            unhonorable_samplers: &[],
+            per_pass_adapters: true,
+        };
+        let errs = model_descriptor_errors(&orphaned);
+        assert!(
+            has(&errs, "denoise_pass_surface is non-empty but"),
+            "{errs:?}"
+        );
     }
 
     /// The size-bounds floor is exempt for `Modality::Audio` (sc-13314): a pure-audio generator has

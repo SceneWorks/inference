@@ -401,17 +401,21 @@ mod tests {
     fn the_render_lane_builds_its_hook_from_the_requests_sink() {
         let shipped = shipped_pipeline();
 
-        // The sink: exactly one hook is built in shipped code, and it is built over the request's.
+        // The sinks: exactly TWO hooks are built in shipped code — the single-pass `Pipeline::render`
+        // lane and the chained denoise-pass lane (sc-20425) — and BOTH are built over the request's.
+        // The count is pinned so a *third* lane cannot appear without being named in this crate's
+        // inventory and in the catalog's.
         assert_eq!(
             shipped.matches("preview::hook(").count(),
-            1,
-            "pipeline.rs must build exactly one preview hook in shipped code — a second render lane \
-             must be named in this crate's inventory (and in the catalog's) rather than appearing here"
+            2,
+            "pipeline.rs must build exactly two preview hooks in shipped code (the single-pass render \
+             lane and the chained denoise-pass lane) — a further render lane must be named in this \
+             crate's inventory (and in the catalog's) rather than appearing here"
         );
         assert_eq!(
             shipped.matches("preview::hook(&req.preview)").count(),
-            1,
-            "the render lane must build its hook over the REQUEST's sink; a hook over any other sink \
+            2,
+            "every render lane must build its hook over the REQUEST's sink; a hook over any other sink \
              is a dark lane that still passes every argument-shaped check"
         );
 

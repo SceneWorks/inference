@@ -56,6 +56,16 @@ pub fn descriptor() -> ModelDescriptor {
     d.capabilities.conditioning = vec![ConditioningKind::Control];
     // Pose only — this branch is a single-signal ControlNet, not a Fun-Union.
     d.control_kinds = Some(AcceptedControlKinds::Only(vec![mlx_gen::ControlKind::Pose]));
+    // Chained denoise passes stay off every control route (epic 20414, sc-20425). This descriptor is
+    // derived from the Turbo one, which advertises the capability, and a derived descriptor inherits
+    // every field it does not override — so leaving this alone admitted an `advanced.denoisePasses`
+    // request at the capability gate and then **silently dropped the chain**, because this file
+    // contains no `DenoisePassHost`, no `resolve_denoise_plan` and no `execute_denoise_plan`: the
+    // pose lane runs its own single `generate` trajectory. Clearing it makes the same request a
+    // typed `DenoisePassIssue::Unsupported` rejection. The candle twin has no bug to fix here — its
+    // `krea_2_turbo_control` is a descriptor-less by-name route, so there is nothing to inherit.
+    d.capabilities.supports_denoise_passes = false;
+    d.capabilities.denoise_pass_surface = mlx_gen::gen_core::DenoisePassSurface::NONE;
     d
 }
 
@@ -1211,6 +1221,27 @@ mod tests {
             kind: ControlKind::Pose,
             scale: Some(0.6),
         };
+    }
+
+    /// The pose-control descriptor must NOT inherit the Turbo base's chained-denoise-pass
+    /// advertisement (sc-20425). This file drives its own single `generate` trajectory and has no
+    /// `DenoisePassHost`, so an inherited `true` admitted an `advanced.denoisePasses` request and
+    /// then dropped the chain without a word. The base is asserted alongside so the test fails if
+    /// the fix is ever "achieved" by turning the whole family off.
+    #[test]
+    fn control_descriptor_does_not_inherit_denoise_pass_support() {
+        let base = crate::model::descriptor();
+        assert!(base.capabilities.supports_denoise_passes);
+        assert!(!descriptor().capabilities.supports_denoise_passes);
+        // And the rejection is the typed capability gap, not a silent drop.
+        let err = gen_core::validate_denoise_passes(
+            &[gen_core::DenoisePass::default()],
+            false,
+            &descriptor().capabilities.denoise_pass_context(None),
+        )
+        .expect_err("a control route must refuse a chain");
+        assert!(err.is_capability_gap());
+        assert_eq!(err.issue().code(), "unsupported");
     }
 
     /// Real-weight harness for the native single-file + pose-branch assembly (the control twin of

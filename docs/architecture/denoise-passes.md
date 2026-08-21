@@ -122,17 +122,69 @@ and **field** (`DenoisePassError::pass_index()` / `::field()`, rendered as e.g.
   overflows to `±Inf` when narrowed to the contract's `f32`);
 - an unknown sampler or scheduler id — validated against the model's advertised menu when it has
   one, else the curated `Solver` / `Scheduler` registries;
+- an **advertised but unhonorable** sampler or scheduler id (see *What a model honors per pass*);
+- a per-pass `guidance` on a model with no guidance axis, or a per-pass `adapters` override on a
+  model whose adapters cannot be re-weighted per pass (same section);
 - an adapter index past the end of the load-time stack, or two overrides for the same adapter in one
   pass;
 - structurally malformed JSON, including an **unknown key**.
 
-Capability gaps (`supports_denoise_passes`, unknown ids) surface as the typed `Error::Unsupported`;
-malformed values surface as `Error::Msg` — the same split the rest of the shared request floor uses.
+Capability gaps (`supports_denoise_passes`, unknown ids, unhonorable ids, unsupported per-pass
+guidance/adapters) surface as the typed `Error::Unsupported`; malformed values surface as
+`Error::Msg` — the same split the rest of the shared request floor uses.
 
 The adapter *index bound* is the one check the model-free request floor cannot make: it holds a
 `Capabilities`, never a `LoadSpec`, so it does not know how many adapters were provisioned. That
 check belongs to the model resolving the plan against its real stack, and the fixtures mark it
 `checkedBy: "model"`.
+
+## What a model honors per pass
+
+`Capabilities::supports_denoise_passes` says *whether* a family runs a chain.
+`Capabilities::denoise_pass_surface` (`DenoisePassSurface`) says *what* it honors, and
+`Capabilities::denoise_pass_capability()` projects the two into the explicit
+`DenoisePassCapability` a consumer reads — pass-count cap, per-pass step cap, the per-pass **fields**
+this model honors, and the per-pass sampler/scheduler menus. It is derived from the descriptor
+alone: there is no model-id table anywhere in the derivation, so a family that edits its menu edits
+its published surface in the same commit. Studio and the worker read it instead of maintaining a
+family table.
+
+**Advertised is not the same as honorable.** A family's flat `samplers` / `schedulers` menus
+legitimately carry native ids beyond the curated registries, and those ids are meaningful on the
+single-pass path. On a chain they are not automatically meaningful, and the difference is what the
+intersection rules encode:
+
+| axis | per-pass set | why |
+|---|---|---|
+| sampler | advertised ∩ curated `Solver` | The executor boxes a curated `Solver` per pass and has **no hook** a family could use to run a native sampler name. An uncurated id used to validate and then integrate as Euler — the wrong algorithm, reported as success. |
+| scheduler | advertised ∩ (curated `Scheduler` ∪ `native_schedulers`) | The family owns `build_schedule`, so a native alias *can* be honorable — but only the family knows which, and an undeclared one falls through a resolver's native-default branch just as silently. |
+
+Adopters resolve a pass through `gen_core::resolve_pass_solver` / `resolve_pass_scheduler`, which
+reject rather than fall back, so the advertisement and the honoring cannot drift.
+
+### The global per-pass adapter policy
+
+A per-pass `adapters` entry re-scales a **live, revertible** adapter residual at a pass boundary.
+Nearly every family instead folds LoRA/LoKr into its dense weights once at load and keeps no residual
+to re-scale, so "adapter off for pass 1, on for pass 2" is physically unavailable there — and
+accepting the field anyway would render the wrong image and report success.
+
+So `DenoisePassSurface::per_pass_adapters` defaults to `false` and the shared floor **rejects** a
+non-empty per-pass `adapters` list with a pass-indexed `PerPassAdaptersUnsupported`. Reject, never
+accept-and-ignore. A family whose adapter seam is a real apply/revert sets it `true`; a family that
+advertises no adapters at all (`supports_lora` and `supports_lokr` both `false`) gets the rejection
+from the shared floor for free. An **empty** list is not an override — it means "the load-time stack
+at its load-time scales" — and stays legal everywhere.
+
+### Descriptor conformance
+
+`registry::model_descriptor_errors` cross-checks the surface against the rest of the descriptor, so
+the pairing cannot be got wrong by *inheritance* — the way `krea_2_turbo_control` inherited
+`supports_denoise_passes: true` from the Turbo descriptor it derives from while having no chained
+execution at all. It rejects: a control route (`control_kinds: Some(..)`) advertising the capability;
+a menu with no curated sampler or no honorable scheduler (a capability no request could exercise); a
+declared native scheduler that is unadvertised or shadows a curated id; `per_pass_adapters` with no
+adapter support; and a non-empty surface on a descriptor that does not set the capability.
 
 ## Versioning
 

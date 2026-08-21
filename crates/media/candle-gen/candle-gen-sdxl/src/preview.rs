@@ -229,6 +229,65 @@ mod tests {
         Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap()
     }
 
+    /// **The sc-20425 review's MINOR 6.** The PR claimed "a test can assert zero drops across a
+    /// whole chain" and nothing did, so the observability half of item 4 was unexercised on the very
+    /// family it exists for. This drives the crate's REAL chained seam — `ve_hook` behind
+    /// `PassPreview`, exactly as `render_denoise_passes` builds it — over a VE σ ladder and asserts
+    /// both halves: every outer step delivered a frame, and nothing was dropped.
+    ///
+    /// The discriminating half is the σ. `project_ve_latents` rejects `None` by design, so the
+    /// σ-less step-keyed emitter this crate would otherwise have used consumes every position and
+    /// delivers NOTHING — a render that succeeds and looks like previews are off. That failure is
+    /// asserted alongside, and it is `dropped_frames` that makes it visible at all.
+    #[test]
+    fn the_chained_ve_preview_delivers_every_frame_and_drops_none() {
+        use std::sync::{Arc, Mutex};
+
+        // A real SDXL-shaped VE ladder: σ_max ≈ 14.6 down to the clean end.
+        const SIGMAS: [f32; 6] = [14.6, 8.0, 4.0, 2.0, 0.7, 0.2];
+        let latent = zeros((1, 4, 2, 3));
+
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame));
+        let preview = candle_gen::preview::PassPreview::new(ve_hook(&sink));
+        for (step, sigma) in SIGMAS.iter().enumerate() {
+            // A multi-eval solver repeats an outer step; the counter dedups it.
+            preview.emit(step, SIGMAS.len(), *sigma, &latent);
+            preview.emit(step, SIGMAS.len(), *sigma, &latent);
+        }
+        let got = candle_gen::lock_recover(&frames);
+        assert_eq!(
+            got.iter().map(|f| f.current).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6],
+            "a chain must read as one continuous progression"
+        );
+        assert!(got.iter().all(|f| f.total == SIGMAS.len() as u32));
+        assert_eq!(
+            preview.dropped_frames(),
+            0,
+            "the VE projector must accept every σ the chained seam hands it"
+        );
+
+        // The σ-less emitter is what item 4 exists to prevent, and dropped_frames is what makes its
+        // failure observable rather than indistinguishable from "previews are off".
+        let (silent, silent_frames) = {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&frames);
+            (
+                PreviewSink::new(move |frame| candle_gen::lock_recover(&captured).push(frame)),
+                frames,
+            )
+        };
+        let hook = ve_hook(&silent);
+        let counter = candle_gen::preview::PreviewCounter::with_steps(SIGMAS.len());
+        for step in 0..SIGMAS.len() {
+            hook.emit_step(&counter, step, &latent);
+        }
+        assert!(candle_gen::lock_recover(&silent_frames).is_empty());
+        assert_eq!(counter.dropped_frames(), SIGMAS.len() as u32);
+    }
+
     /// A zero latent projects to the fit's intercept — the one place the committed bias is directly
     /// observable, so a typo in `RGB_BIAS` cannot pass.
     #[test]

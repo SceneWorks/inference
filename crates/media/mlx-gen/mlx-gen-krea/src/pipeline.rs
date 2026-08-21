@@ -367,6 +367,12 @@ pub enum DenoisePassPlans {
 struct PassPreview<'a> {
     sink: &'a PreviewSink,
     emitted: std::cell::Cell<u32>,
+    /// Frames whose position was consumed and whose projection then failed (sc-20425 review
+    /// MINOR 6). Swallowing is the contract — previews are decorative and a lost frame must never
+    /// fail a render — but *silence* was an accident, and it hides a 100 % loss rate behind
+    /// something indistinguishable from "this model does not preview". The candle twin
+    /// (`candle_gen::preview::PreviewCounter::dropped_frames`) counts and logs; so does this.
+    dropped: std::cell::Cell<u32>,
 }
 
 impl<'a> PassPreview<'a> {
@@ -374,7 +380,15 @@ impl<'a> PassPreview<'a> {
         Self {
             sink,
             emitted: std::cell::Cell::new(0),
+            dropped: std::cell::Cell::new(0),
         }
+    }
+
+    /// Frames this chain consumed a position for and then failed to project. `0` on a healthy
+    /// chain; equal to the frame count on the σ-less-into-σ-required failure the shared seam exists
+    /// to prevent.
+    fn dropped_frames(&self) -> u32 {
+        self.dropped.get()
     }
 
     fn emit(&self, chain_step: usize, chain_total_steps: usize, latents: &Array) {
@@ -389,12 +403,23 @@ impl<'a> PassPreview<'a> {
         // Consume the position before projecting (the shared emit_preview contract): a failed
         // projection loses only this decorative frame and is never retried as a duplicate.
         self.emitted.set(candidate);
-        if let Ok(image) = mlx_gen_qwen_image::preview::project_spatial_latents(latents) {
-            self.sink.emit(mlx_gen::gen_core::PreviewFrame {
+        match mlx_gen_qwen_image::preview::project_spatial_latents(latents) {
+            Ok(image) => self.sink.emit(mlx_gen::gen_core::PreviewFrame {
                 current: candidate,
                 total,
                 image,
-            });
+            }),
+            Err(err) => {
+                let first = self.dropped_frames() == 0;
+                self.dropped.set(self.dropped.get().saturating_add(1));
+                if first {
+                    eprintln!(
+                        "preview: dropping frame {candidate}/{total} — projection failed: {err}. \
+                         Previews are decorative, so the render continues; further drops on this \
+                         trajectory are counted but not printed."
+                    );
+                }
+            }
         }
     }
 }
@@ -2947,10 +2972,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, 4), (2, 4), (3, 4), (4, 4)]
         );
-        // An inert sink does no work and emits nothing.
+        assert_eq!(
+            pv.dropped_frames(),
+            0,
+            "a healthy chain must lose no frames"
+        );
+        // An inert sink does no work and emits nothing — and loses nothing either: a render with
+        // previews off is not a render that dropped frames.
         let inert = PreviewSink::default();
         let pv = PassPreview::new(&inert);
         pv.emit(0, 4, &latent);
+        assert_eq!(pv.dropped_frames(), 0);
+    }
+
+    /// A projection failure stays swallowed — previews are decorative and never fail a render — but
+    /// is now COUNTED and logged once, so a chain that silently delivers nothing is distinguishable
+    /// from a model that does not preview at all (sc-20425 review MINOR 6). The candle twin counts
+    /// the same way, in `candle_gen::preview::PreviewCounter::dropped_frames`.
+    #[test]
+    fn a_dropped_chain_frame_is_swallowed_but_counted() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let pv = PassPreview::new(&sink);
+        let malformed = Array::zeros::<f32>(&[1, 15, 2, 2]).unwrap();
+        let valid = Array::zeros::<f32>(&[1, 16, 2, 2]).unwrap();
+        pv.emit(0, 3, &malformed);
+        pv.emit(1, 3, &valid);
+        pv.emit(2, 3, &malformed);
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames.iter().map(|f| f.current).collect::<Vec<_>>(),
+            vec![2],
+            "only the well-formed frame is delivered, and its position is preserved"
+        );
+        assert_eq!(pv.dropped_frames(), 2);
     }
 
     #[test]

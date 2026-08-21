@@ -8,8 +8,9 @@
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::denoise_passes::{
-    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassContext, DenoisePassResult,
-    ResolvedDenoisePlan,
+    validate_denoise_passes, DenoiseDefaults, DenoisePass, DenoisePassCapability,
+    DenoisePassContext, DenoisePassField, DenoisePassResult, DenoisePassSurface,
+    DenoisePlanExecution, ResolvedDenoisePlan,
 };
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::media::{AudioChunk, AudioTrack, Image};
@@ -503,11 +504,14 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_denoise_passes`](Capabilities::supports_denoise_passes).
     pub denoise_passes: Option<Vec<DenoisePass>>,
     /// Optional consumer sink for the chained denoise-pass **execution record** (sc-20418): a
-    /// provider executing a `denoisePasses` chain emits exactly one
-    /// [`DenoisePlanExecution`](crate::denoise_passes::DenoisePlanExecution) — the requested AND
-    /// resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus the effective
-    /// evaluation accounting — before decoding. Requests with no `denoisePasses` never emit; the
-    /// inert default costs nothing (the [`PromptEnhancementSink`] pattern).
+    /// provider executing a `denoisePasses` chain emits exactly one [`DenoisePlanExecution`] — the
+    /// requested AND resolved per-pass sampler/scheduler/steps/denoise/guidance/adapters/seed plus
+    /// the effective evaluation accounting — before decoding. Requests with no `denoisePasses` never
+    /// emit; the inert default costs nothing (the [`PromptEnhancementSink`] pattern).
+    ///
+    /// Providers publish through [`emit_denoise_pass_report`](GenerationRequest::emit_denoise_pass_report)
+    /// rather than touching this field, so the requested-vs-resolved stamping cannot be forgotten
+    /// (sc-20425).
     pub denoise_pass_report: DenoisePassReportSink,
 
     // --- Control ---
@@ -1271,6 +1275,24 @@ impl GenerationRequest {
         crate::denoise_passes::resolve_denoise_plan(self, job_seed, defaults, ctx)
     }
 
+    /// Publish the chained-denoise **execution record** for this request (sc-20425).
+    ///
+    /// The other half of [`resolve_denoise_plan`](Self::resolve_denoise_plan), and the only
+    /// supported way to satisfy the [`denoise_pass_report`](Self::denoise_pass_report) contract: a
+    /// provider that executed a chain calls this exactly once, after the chain succeeds and before
+    /// the caller sees an image, with the record the executor returned. It stamps the *requested*
+    /// per-pass values onto the resolved ones so a consumer can tell "the user asked for nothing
+    /// here and the ladder filled it in" apart from "the user asked for exactly this".
+    ///
+    /// It exists as one call rather than as two lines each provider writes because four separate
+    /// adopters each forgot the second line (sc-20425 review): the plan a render actually ran was
+    /// unrecoverable, so the epic's replay path had nothing to replay from. Emitting into an inert
+    /// sink is free, so a provider never has to check first.
+    pub fn emit_denoise_pass_report(&self, execution: DenoisePlanExecution) {
+        self.denoise_pass_report
+            .emit(execution.with_requested(self.denoise_passes.as_deref()));
+    }
+
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
     pub fn keyframes(&self) -> Vec<KeyframeRef<'_>> {
         self.conditioning
@@ -1928,6 +1950,22 @@ pub enum StagedResidencyAvailability {
     UnconditionallyEngaged,
 }
 
+/// The advertised `menu` filtered by `honorable`, or — when the menu is EMPTY — the curated registry
+/// filtered the same way.
+///
+/// An empty menu is "no advertised menu", which the denoise-pass floor reads as "every curated id is
+/// acceptable" ([`Capabilities::denoise_pass_context`] maps it to `None`). Deriving the published
+/// list by filtering the empty menu would publish `[]` for that shape: a promise the floor does not
+/// keep (sc-20425 review MINOR 7).
+fn menu_or_curated(
+    menu: &[&'static str],
+    curated: &[&'static str],
+    honorable: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let source = if menu.is_empty() { curated } else { menu };
+    source.iter().copied().filter(|id| honorable(id)).collect()
+}
+
 /// What a model supports — drives `validate()` and consumer UI. `Default` is "supports
 /// nothing"; a model turns on what it offers (`Capabilities { supports_guidance: true,
 /// ..Default::default() }`).
@@ -2076,6 +2114,16 @@ pub struct Capabilities {
     /// Orthogonal to the Krea-RAW-only [`GenerationRequest::phases`]: the two request fields are
     /// mutually exclusive, and a model may support either, both, or neither.
     pub supports_denoise_passes: bool,
+    /// *What* this model honors on a chained pass, beyond the on/off bit above (sc-20425): the
+    /// advertised scheduler ids its own `build_schedule` really implements, and whether per-pass
+    /// adapter weight overrides are applied and reverted. See [`DenoisePassSurface`].
+    ///
+    /// `Default` is the empty, fail-closed surface, so every descriptor that has not adopted chained
+    /// passes keeps today's behaviour with no edit. A non-empty surface without
+    /// [`supports_denoise_passes`](Self::supports_denoise_passes) is rejected by the descriptor
+    /// conformance sweep — that pairing is what stops a *derived* descriptor
+    /// (`let mut d = base(); d.id = …;`) from inheriting half of this contract.
+    pub denoise_pass_surface: DenoisePassSurface,
     /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
     /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
@@ -2314,14 +2362,82 @@ impl Capabilities {
     ///
     /// This is the same call the shared floor makes, exposed so a provider validates and resolves
     /// against exactly what the floor already checked instead of re-deriving it.
+    ///
+    /// The menus alone are not enough to decide a pass, which is what sc-20425 added: an *advertised*
+    /// id can still be one the chained path cannot honor, so the family's
+    /// [`denoise_pass_surface`](Self::denoise_pass_surface) rides along and the floor rejects the
+    /// difference instead of falling back to Euler / the native schedule.
     #[must_use]
     pub fn denoise_pass_context(&self, loaded_adapters: Option<usize>) -> DenoisePassContext<'_> {
         DenoisePassContext {
             supports_denoise_passes: self.supports_denoise_passes,
             samplers: (!self.samplers.is_empty()).then_some(self.samplers.as_slice()),
             schedulers: (!self.schedulers.is_empty()).then_some(self.schedulers.as_slice()),
+            native_schedulers: self.denoise_pass_surface.native_schedulers,
+            unhonorable_samplers: self.denoise_pass_surface.unhonorable_samplers,
+            supports_guidance: self.supports_guidance,
+            per_pass_adapters: self.denoise_pass_surface.per_pass_adapters,
             loaded_adapters,
             max_steps: MAX_STEPS,
+        }
+    }
+
+    /// The **explicit** denoise-pass capability surface a consumer reads (sc-20425).
+    ///
+    /// Everything Studio and the worker need to build a per-pass editor: whether chains are honored,
+    /// the pass-count and per-pass step caps, which per-pass *fields* this model honors, and the
+    /// sampler/scheduler ids that survive the intersection rules. Derived entirely from this
+    /// descriptor — there is no model-id table anywhere in the derivation, so a family that edits its
+    /// menu edits this in the same commit.
+    ///
+    /// Every list here is a *promise*: an id or field outside it is rejected by
+    /// [`validate_denoise_passes`] with a pass-indexed error, never accepted and ignored.
+    #[must_use]
+    pub fn denoise_pass_capability(&self) -> DenoisePassCapability {
+        if !self.supports_denoise_passes {
+            return DenoisePassCapability {
+                supported: false,
+                max_passes: 0,
+                max_steps_per_pass: 0,
+                fields: Vec::new(),
+                samplers: Vec::new(),
+                schedulers: Vec::new(),
+                per_pass_adapters: false,
+            };
+        }
+        let surface = self.denoise_pass_surface;
+        let mut fields = vec![
+            DenoisePassField::Steps.name(),
+            DenoisePassField::Sampler.name(),
+            DenoisePassField::Scheduler.name(),
+            DenoisePassField::Denoise.name(),
+        ];
+        if self.supports_guidance {
+            fields.push(DenoisePassField::Guidance.name());
+        }
+        if surface.per_pass_adapters {
+            fields.push(DenoisePassField::Adapters.name());
+        }
+        DenoisePassCapability {
+            supported: true,
+            max_passes: crate::denoise_passes::MAX_DENOISE_PASSES,
+            max_steps_per_pass: MAX_STEPS,
+            fields,
+            // An EMPTY menu means "no advertised menu", which
+            // [`denoise_pass_context`](Self::denoise_pass_context) maps to `None` and the floor
+            // reads as "the whole curated registry is acceptable". Publishing `[]` for that shape
+            // would be a promise the floor does not keep — a list that says nothing is usable while
+            // every curated id is (sc-20425 review MINOR 7). The descriptor conformance sweep
+            // separately rejects an empty menu on a chained-denoise descriptor, so no shipped model
+            // takes this branch; it exists so the two derivations cannot disagree for anyone
+            // building a `Capabilities` by hand.
+            samplers: menu_or_curated(&self.samplers, &crate::curated_sampler_ids(), |id| {
+                surface.honors_sampler(id)
+            }),
+            schedulers: menu_or_curated(&self.schedulers, &crate::curated_scheduler_ids(), |id| {
+                surface.honors_scheduler(id)
+            }),
+            per_pass_adapters: surface.per_pass_adapters,
         }
     }
 
@@ -2650,12 +2766,15 @@ impl Capabilities {
         // the same denoise (fresh-schedule-per-pass vs. slices of one global schedule), so a request
         // that sets both is rejected rather than silently resolved in favor of one.
         if let Some(passes) = &req.denoise_passes {
-            validate_denoise_passes(
-                passes,
-                req.phases.is_some(),
-                &self.denoise_pass_context(None),
-            )
-            .map_err(|err| err.into_gen_error(id))?;
+            let ctx = self.denoise_pass_context(None);
+            validate_denoise_passes(passes, req.phases.is_some(), &ctx)
+                .map_err(|err| err.into_gen_error(id))?;
+            // The request-level sampler/scheduler a pass INHERITS is as load-bearing as an explicit
+            // one, and the check above cannot see it (sc-20425 review MINOR 8). Without this, a
+            // chained request naming nothing per pass and carrying a flat `sampler: "lightning"`
+            // passed `validate` outright and was caught only inside the executor, after the load.
+            crate::denoise_passes::validate_inherited_pass_ids(req, &ctx)
+                .map_err(|err| err.into_gen_error(id))?;
         }
         req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {

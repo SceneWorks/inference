@@ -155,6 +155,7 @@ impl Generator for Sd3Generator {
                 req.width, req.height
             )));
         }
+        validate_denoise_pass_surface(id, req)?;
         Ok(())
     }
 
@@ -183,6 +184,38 @@ impl Generator for Sd3Generator {
         // `validate` already rejects any non-`Reference` conditioning. The fork `start_step` is computed
         // against the SAME step count `render` uses (`req.steps` or the variant default), so the strength
         // knob maps to the intended σ node. Mirrors the mlx-gen-sd3 `denoise_img2img_cfg` lane (sc-10189).
+        // Chained denoise passes (epic 20414, sc-20425): resolved ONCE up front so an invalid plan
+        // is rejected before any weights work, then re-resolved per image inside the driver so each
+        // image's pass seeds derive from its own job seed. The job seed is drawn exactly once (F-089)
+        // — `default_seed` is time-derived, so re-drawing it would make the plan and the render
+        // disagree about the very seeds the plan records for replay.
+        let dp_ctx = self
+            .descriptor
+            .capabilities
+            .denoise_pass_context(Some(self.adapters.len()));
+        let dp_defaults = sd3_denoise_defaults(self.variant);
+        if req.denoise_passes.is_some() {
+            let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+            let plan = req.resolve_denoise_plan(base_seed, &dp_defaults, &dp_ctx)?;
+            let resolve = |seed: u64| -> gen_core::Result<gen_core::ResolvedDenoisePlan> {
+                req.resolve_denoise_plan(seed, &dp_defaults, &dp_ctx)
+                    .map_err(gen_core::Error::from)
+            };
+            let (images, execution) =
+                pipe.render_denoise_passes(req, &components, &plan, &resolve, on_progress)?;
+            // The chained-pass execution record (sc-20418 contract, wired here by sc-20425):
+            // emitted exactly once per generation, after a successful chain and before the caller
+            // sees any image, carrying the requested AND resolved per-pass values plus the
+            // effective evaluation accounting. The driver keeps the FIRST image's record because
+            // every image in a batch resolves the same plan shape and differs only in its seeds.
+            // Without this the plan a render actually ran was unrecoverable, so a replay had
+            // nothing to replay from.
+            if let Some(execution) = execution {
+                req.emit_denoise_pass_report(execution);
+            }
+            return Ok(GenerationOutput::Images(images));
+        }
+
         let reference = pipeline::resolve_reference(req)?;
         let steps = req
             .steps
@@ -203,6 +236,42 @@ impl Generator for Sd3Generator {
         let images = pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// The model-default rung of the chained-denoise resolution ladder (sc-20425) — what a pass that
+/// names nothing, in a request that names nothing, actually runs.
+///
+/// Both ids it records are **menu-valid**: `euler` is the curated integrator `run_flow_sampler`
+/// defaults to when `req.sampler` is unset, and `flow_match` is the advertised native alias for the
+/// family's own shifted schedule. That matters because a resolved plan is a replay artifact — a
+/// default it records that the menu would reject could never be replayed.
+pub(crate) fn sd3_denoise_defaults(variant: Variant) -> gen_core::DenoiseDefaults {
+    let defaults =
+        gen_core::DenoiseDefaults::new(variant.default_steps() as u32, "euler", "flow_match");
+    if variant.cfg_enabled() {
+        defaults.with_guidance(variant.default_cfg())
+    } else {
+        // The distilled Turbo has no guidance axis: `None` means "this model's implicit CFG-free
+        // path", not "look it up", and the shared floor rejects a per-pass `guidance` on it.
+        defaults
+    }
+}
+
+/// SD3.5's family-side denoise-pass floor (sc-20425): the surface a chain is *not* part of.
+///
+/// The shared floor already covers arity, ranges, ids, per-pass adapters and per-pass guidance from
+/// the descriptor. What only this family knows is that chained passes are the **t2i-from-noise**
+/// surface: the chain's initial latent is the seeded prior, so an img2img `Reference` has nowhere to
+/// enter. Rejecting the combination is the Krea precedent — a request that mixes them would
+/// otherwise render pure txt2img and report success, silently dropping the reference image.
+fn validate_denoise_pass_surface(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
+    if req.denoise_passes.is_some() && !req.conditioning.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: chained denoise passes are the text-to-image surface — a conditioning image has \
+             no entry point into a chain that starts from noise, so send one or the other"
+        )));
+    }
+    Ok(())
 }
 
 /// SD3.5 **Large**'s identity + the wired surface: txt2img with CFG + negative prompt (SD3.5 Large is
@@ -262,7 +331,17 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
-            schedulers: candle_gen::curated_scheduler_names(),
+            // The curated axis plus the NATIVE alias `flow_match` (sc-20425). The alias names the
+            // family's own shifted flow-match schedule — the byte-exact default an unset
+            // `req.scheduler` already resolves to through the N3 fallback. It has to be *nameable*
+            // for a chained plan: the resolution ladder bottoms out on the model default, and a
+            // resolved plan must replay through validation, so the default it records cannot be an
+            // id the menu rejects. Advertising it changes no single-pass behaviour (the same
+            // fallback, reached by name instead of by absence) — the Krea precedent.
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                pipeline::NATIVE_SCHEDULERS,
+            ),
             supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
@@ -287,8 +366,22 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_multi_speaker: false,
             supports_conversation_history: false,
             supports_conversation_session: false,
-            // Chained denoise passes are not wired for this provider (sc-20415).
-            supports_denoise_passes: false,
+            // Chained denoise passes (epic 20414, sc-20425) — the non-Krea FLOW acceptance family.
+            // All three ids share one render core whose schedule seam already IS
+            // `resolve_flow_schedule` and whose CFG (or distilled `None => v_cond`) combine already
+            // lives inside the predict closure, so `Sd3PassHost` wraps existing code and introduces
+            // no new numerics: a one-pass chain is the legacy render.
+            supports_denoise_passes: true,
+            // `flow_match` is the honored native scheduler alias advertised above; per-pass adapter
+            // weight overrides are NOT honored — SD3's LoRA/LoKr fold into the MMDiT's dense weights
+            // once at load (sc-7881) and are quantized on top, so there is no residual left to
+            // re-scale at a pass boundary. The shared floor therefore rejects a pass carrying
+            // `adapters` rather than accepting and ignoring it.
+            denoise_pass_surface: gen_core::DenoisePassSurface {
+                native_schedulers: pipeline::NATIVE_SCHEDULERS,
+                unhonorable_samplers: &[],
+                per_pass_adapters: false,
+            },
             max_speakers: None,
             // No audio surface (sc-12834): pure image/video model.
             audio_sample_rates: vec![],
@@ -426,6 +519,104 @@ mod tests {
         assert_eq!(g.descriptor().family, "stable-diffusion-3");
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Image);
+    }
+
+    /// The chained-denoise advertisement (sc-20425) and the surface that goes with it: all three ids
+    /// honor chains, all three advertise the native alias the resolution ladder's model default
+    /// names, and per-pass adapter overrides are explicitly OFF because SD3's LoRA/LoKr fold into the
+    /// MMDiT's dense weights at load with no residual left to re-scale.
+    #[test]
+    fn descriptor_advertises_chained_denoise_passes_without_per_pass_adapters() {
+        for d in [descriptor(), descriptor_turbo(), descriptor_medium()] {
+            let caps = &d.capabilities;
+            assert!(caps.supports_denoise_passes, "{}", d.id);
+            assert!(caps.schedulers.contains(&"flow_match"), "{}", d.id);
+            assert_eq!(
+                caps.denoise_pass_surface.native_schedulers,
+                &["flow_match"],
+                "{}",
+                d.id
+            );
+            assert!(!caps.denoise_pass_surface.per_pass_adapters, "{}", d.id);
+            // The published surface and the floor agree.
+            let cap = caps.denoise_pass_capability();
+            assert!(cap.supported);
+            assert!(cap.samplers.contains(&"euler"));
+            assert!(cap.schedulers.contains(&"flow_match"));
+            assert!(!cap.fields.contains(&"adapters"), "{}", d.id);
+            assert_eq!(
+                cap.fields.contains(&"guidance"),
+                caps.supports_guidance,
+                "{}",
+                d.id
+            );
+            // `lightning`-class ids are not in this family's menu at all, and the honorable sampler
+            // set is exactly the curated registry.
+            assert!(!cap.samplers.contains(&"lightning"), "{}", d.id);
+            // The conformance sweep accepts the pairing.
+            assert!(
+                candle_gen::gen_core::registry::model_descriptor_errors(&d).is_empty(),
+                "{}: {:?}",
+                d.id,
+                candle_gen::gen_core::registry::model_descriptor_errors(&d)
+            );
+        }
+        // The model defaults the ladder bottoms out on are menu-valid ids with the variant's own
+        // step count and guidance.
+        let large = sd3_denoise_defaults(Variant::Large);
+        assert_eq!(
+            (
+                large.steps,
+                large.sampler.as_str(),
+                large.scheduler.as_str()
+            ),
+            (28, "euler", "flow_match")
+        );
+        assert_eq!(large.guidance, Some(4.0));
+        // The distilled Turbo genuinely has no guidance axis.
+        assert_eq!(sd3_denoise_defaults(Variant::LargeTurbo).guidance, None);
+    }
+
+    /// Chained passes are the text-to-image surface: mixing them with an img2img `Reference` would
+    /// otherwise render pure txt2img and report success, silently dropping the reference image.
+    #[test]
+    fn a_chain_with_a_conditioning_image_is_rejected() {
+        let req = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            denoise_passes: Some(vec![gen_core::DenoisePass::default()]),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 8,
+                    height: 8,
+                    pixels: vec![0u8; 8 * 8 * 3],
+                },
+                strength: Some(0.5),
+            }],
+            ..Default::default()
+        };
+        let err = validate_denoise_pass_surface(MODEL_ID, &req)
+            .expect_err("a chain plus a reference must be refused");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)), "{err:?}");
+        // Either alone is fine.
+        assert!(validate_denoise_pass_surface(
+            MODEL_ID,
+            &GenerationRequest {
+                denoise_passes: req.denoise_passes.clone(),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        assert!(validate_denoise_pass_surface(
+            MODEL_ID,
+            &GenerationRequest {
+                conditioning: req.conditioning.clone(),
+                ..Default::default()
+            }
+        )
+        .is_ok());
     }
 
     #[test]

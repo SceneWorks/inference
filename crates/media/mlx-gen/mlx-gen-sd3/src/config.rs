@@ -238,6 +238,15 @@ impl Sd3Variant {
                 schedulers: {
                     let mut s = curated_scheduler_names();
                     s.push("linear");
+                    // The NATIVE alias for the family's own static-shift flow-match schedule
+                    // (sc-20425). It has to be *nameable* for a chained plan: the resolution ladder
+                    // bottoms out on the model default, and a resolved plan must replay through
+                    // validation, so the default it records cannot be an id the menu rejects.
+                    // Advertising it changes no single-pass behaviour — the same N3 fallback,
+                    // reached by name instead of by absence. `linear` above stays advertised for the
+                    // flat request and stays UNdeclared for a chain: this family does not implement
+                    // it, so a pass naming it is a typed rejection rather than a silent fallback.
+                    s.extend_from_slice(crate::pipeline::NATIVE_SCHEDULERS);
                     s
                 },
                 supported_guidance_methods: vec![],
@@ -264,8 +273,23 @@ impl Sd3Variant {
                 supports_multi_speaker: false,
                 supports_conversation_history: false,
                 supports_conversation_session: false,
-                // Chained denoise passes are not wired for this provider (sc-20415).
-                supports_denoise_passes: false,
+                // Chained denoise passes (epic 20414, sc-20425) — the non-Krea FLOW acceptance
+                // family, advertised in lockstep with the wiring in `model.rs` (`generate_impl`'s
+                // chained branch) and `pipeline.rs` (`Sd3PassHost` + `render_denoise_passes`). All
+                // three variants share one render core whose schedule seam already IS
+                // `resolve_flow_schedule` and whose CFG combine already lives inside the predict
+                // closure, so the chain wraps existing code: a one-pass chain is the legacy render.
+                // The candle twin advertises identically.
+                supports_denoise_passes: true,
+                // `flow_match` is the honored native scheduler alias advertised above; per-pass
+                // adapter weight overrides are NOT honored — SD3's LoRA/LoKr fold into the MMDiT's
+                // weights once at load, so there is no residual left to re-scale at a pass boundary
+                // and the shared floor rejects a pass carrying `adapters`.
+                denoise_pass_surface: mlx_gen::gen_core::DenoisePassSurface {
+                    native_schedulers: crate::pipeline::NATIVE_SCHEDULERS,
+                    unhonorable_samplers: &[],
+                    per_pass_adapters: false,
+                },
                 max_speakers: None,
                 // No audio surface (sc-12834): pure image/video model.
                 audio_sample_rates: vec![],

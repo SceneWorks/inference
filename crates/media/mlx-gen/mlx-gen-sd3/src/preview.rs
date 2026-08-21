@@ -61,14 +61,28 @@ pub fn emit_preview(
         return;
     }
     mlx_gen::preview::emit_preview(sink, counter, sigmas, sigma, || {
-        let shape = latents.shape();
-        if shape.len() != 4 || shape[0] != 1 || shape[1] != 16 {
-            return Err(mlx_gen::Error::Msg(format!(
-                "SD3.5 preview latent must have shape [1, 16, h, w], got {shape:?}"
-            )));
-        }
-        mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
+        project_pass_latents(latents)
     });
+}
+
+/// Validate the native `[1, 16, h, w]` layout and project it with the committed fit.
+///
+/// Factored out of [`emit_preview`] for the chained denoise-pass lane (sc-20425), which numbers
+/// frames on the executor's chain-global outer step rather than on a σ position and so cannot reuse
+/// the σ-keyed emitter. Both lanes projecting through this one function is what keeps the two from
+/// drifting to different fits or different layout checks.
+///
+/// SD3.5's `FlowModelSampling` has `input_scale ≡ 1.0`, so the running latent already is the tensor
+/// the fit was measured against and no σ-dependent renormalization is needed here — unlike the ε/VE
+/// cohort, whose projector requires the σ.
+pub(crate) fn project_pass_latents(latents: &Array) -> mlx_gen::Result<mlx_gen::Image> {
+    let shape = latents.shape();
+    if shape.len() != 4 || shape[0] != 1 || shape[1] != 16 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "SD3.5 preview latent must have shape [1, 16, h, w], got {shape:?}"
+        )));
+    }
+    mlx_gen::preview::project_latents(latents, &RGB_FACTORS, RGB_BIAS)
 }
 
 #[cfg(test)]

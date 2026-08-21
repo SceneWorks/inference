@@ -895,6 +895,284 @@ pub fn denoise_curated_with_preview(
     )
 }
 
+// =================================================================================================
+// Chained denoise passes (epic 20414, sc-20425)
+// =================================================================================================
+
+/// The scheduler ids SDXL honors on a chained pass **beyond** the curated registry.
+///
+/// `discrete` is the legacy alias this family already advertises for "the native σ table" — which,
+/// on the curated lane, is the `normal` schedule over `DiscreteModelSampling`. Every other
+/// non-curated id stays a typed rejection; notably `lightning` and `hyper`, which are advertised
+/// *sampler* ids for distilled bespoke lanes, are not schedules at all and are refused on the
+/// sampler axis by the shared floor (they are not curated `Solver`s).
+pub const NATIVE_SCHEDULERS: &[&str] = &["discrete"];
+
+/// One chained pass's **fresh** σ schedule over SDXL's discrete ε contract — the
+/// `gen_core::sampling::DenoisePassHost` seam.
+///
+/// Deliberately the same two lines `model.rs`'s curated branch runs: the native ComfyUI SDXL default
+/// (`normal` over the alpha table) then the curated scheduler axis over it. The addition is
+/// `gen_core::resolve_pass_scheduler`, which rejects an id this family cannot honor before
+/// `resolve_schedule` would quietly return the native schedule under that name.
+pub fn pass_schedule(
+    pass: &gen_core::ResolvedDenoisePass,
+    schedule_steps: usize,
+    ms: &mlx_gen::DiscreteModelSampling,
+) -> gen_core::Result<Vec<f32>> {
+    gen_core::resolve_pass_scheduler(pass, NATIVE_SCHEDULERS)?;
+    let native = gen_core::sampling::schedule_sigmas(
+        gen_core::sampling::Scheduler::Normal,
+        ms,
+        schedule_steps,
+    );
+    Ok(mlx_gen::resolve_schedule(
+        Some(pass.scheduler.as_str()),
+        ms,
+        schedule_steps,
+        &native,
+    ))
+}
+
+/// Chain-global denoise-pass preview (sc-20425), the MLX SDXL twin of
+/// `candle_gen::preview::PassPreview` and a copy of the shape `mlx-gen-krea` established in
+/// sc-20418.
+///
+/// Frames are numbered by the executor's `chain_step` (0-based outer step across the WHOLE chain),
+/// so a multi-pass job reads as one continuous `1..=total` trajectory instead of restarting per
+/// pass; each pass owns a fresh schedule, so there is no single σ array for the shared σ-position
+/// counter to key on. This family's fit was measured on the raw VE latent and needs no σ-dependent
+/// renormalization, so the step index alone is enough here. One per image. Projection failures are
+/// swallowed (previews are decorative and never fail a render).
+struct PassPreview<'a> {
+    sink: &'a PreviewSink,
+    emitted: std::cell::Cell<u32>,
+    /// Frames whose position was consumed and whose projection then failed (sc-20425 review
+    /// MINOR 6). Swallowing is the contract — previews are decorative and a lost frame must never
+    /// fail a render — but *silence* was an accident, and it hides a 100 % loss rate behind
+    /// something indistinguishable from "this model does not preview". The candle twin
+    /// (`candle_gen::preview::PreviewCounter::dropped_frames`) counts and logs; so does this.
+    dropped: std::cell::Cell<u32>,
+}
+
+impl<'a> PassPreview<'a> {
+    fn new(sink: &'a PreviewSink) -> Self {
+        Self {
+            sink,
+            emitted: std::cell::Cell::new(0),
+            dropped: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Frames this chain consumed a position for and then failed to project. `0` on a healthy
+    /// chain; equal to the frame count on the σ-less-into-σ-required failure the shared seam exists
+    /// to prevent.
+    fn dropped_frames(&self) -> u32 {
+        self.dropped.get()
+    }
+
+    fn emit(&self, chain_step: usize, chain_total_steps: usize, latents: &Array) {
+        if !self.sink.is_active() {
+            return;
+        }
+        let total = chain_total_steps.max(1) as u32;
+        let candidate = (chain_step as u32 + 1).min(total);
+        if candidate <= self.emitted.get() {
+            return;
+        }
+        // Consume the position before projecting (the shared emit_preview contract): a failed
+        // projection loses only this decorative frame and is never retried as a duplicate.
+        self.emitted.set(candidate);
+        match crate::preview::project_nhwc_latents(latents) {
+            Ok(image) => self.sink.emit(gen_core::PreviewFrame {
+                current: candidate,
+                total,
+                image,
+            }),
+            Err(err) => {
+                let first = self.dropped_frames() == 0;
+                self.dropped.set(self.dropped.get().saturating_add(1));
+                if first {
+                    eprintln!(
+                        "preview: dropping frame {candidate}/{total} — projection failed: {err}. \
+                         Previews are decorative, so the render continues; further drops on this \
+                         trajectory are counted but not printed."
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Compile-time witness that this crate really implements the chained-denoise host it advertises
+/// (sc-20425 review MINOR 9).
+///
+/// The descriptor conformance sweep closes the *derived-descriptor* half of "advertises without a
+/// host" — a control route, an unusable menu, a half-inherited surface — but it cannot see whether a
+/// `DenoisePassHost` exists at all, because a descriptor is data and the host is a trait impl in
+/// another crate. This is the missing half, in the one place that can check it: if the impl below is
+/// ever deleted or renamed while `supports_denoise_passes` stays `true`, THIS crate stops compiling
+/// rather than shipping a capability nothing serves.
+const _: fn(&mut SdxlPassHost<'_>) = |host| {
+    let _: &mut dyn gen_core::sampling::DenoisePassHost<MlxLatentOps> = host;
+};
+
+/// SDXL's `gen_core::sampling::DenoisePassHost`: the family schedule seam and the per-pass UNet
+/// forward with the per-pass CFG combine, lifted from `denoise_curated_with_preview`'s closure.
+///
+/// **The CFG batch shape is decided per pass, not per render.** `conditioning` / `pooled` /
+/// `time_ids` are the `[cond, uncond]` stack whenever ANY pass in the chain wants guidance, and a
+/// pass that does not is narrowed to row 0 — feeding a batch-2 conditioning to a batch-1 latent puts
+/// a batch-1 query against batch-2 cross-attention K/V and kills the U-Net inside the attention
+/// matmul (the candle twin's sc-14195). `cfg_batched` records which shape the caller built.
+///
+/// The chained lane is txt2img-only in v1: control / IP-Adapter / inpaint / img2img are refused by
+/// the family floor before this is built, so there is nothing here to CFG-batch alongside the
+/// conditioning.
+struct SdxlPassHost<'a> {
+    unet: &'a UNet2DConditionModel,
+    ms: &'a mlx_gen::DiscreteModelSampling,
+    conditioning: &'a Array,
+    pooled: &'a Array,
+    time_ids: &'a Array,
+    cfg_batched: bool,
+    plan: crate::plan::SdxlForwardPlan<'a>,
+    preview: PassPreview<'a>,
+}
+
+impl SdxlPassHost<'_> {
+    /// Row 0 of a CFG-batched array — the positive branch (`denoise_curated_with_preview` reads
+    /// `row(0)` as `eps_text`).
+    fn cond_row(array: &Array) -> Result<Array> {
+        Ok(array.take_axis(Array::from_slice(&[0], &[1]), 0)?)
+    }
+}
+
+impl gen_core::sampling::DenoisePassHost<MlxLatentOps> for SdxlPassHost<'_> {
+    fn build_schedule(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> gen_core::Result<Vec<f32>> {
+        pass_schedule(pass, schedule_steps, self.ms)
+    }
+
+    fn predict(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        x_in: &Array,
+        timestep: f32,
+    ) -> gen_core::Result<Array> {
+        let cfg = pass.guidance.unwrap_or(crate::model::DEFAULT_GUIDANCE);
+        let cfg_on = cfg > 1.0 && self.cfg_batched;
+        let run = || -> Result<Array> {
+            // Per-eval compute boundary (the shared driver contract): force the prior step's lazy
+            // graph so the chain stays cancellable per evaluation.
+            mlx_rs::transforms::eval([x_in])?;
+            // `x_in` is already the c_in-scaled latent (f32); cast to the U-Net compute dtype, then
+            // CFG-batch — exactly as the single-pass curated closure does.
+            let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
+            let x_unet = if cfg_on {
+                concatenate_axis(&[&x16, &x16], 0)?
+            } else {
+                x16
+            };
+            // Narrow the conditioning to the positive row for an unguided pass in a chain whose
+            // conditioning was built batched for a guided sibling.
+            let narrowed = if self.cfg_batched && !cfg_on {
+                Some((
+                    Self::cond_row(self.conditioning)?,
+                    Self::cond_row(self.pooled)?,
+                    Self::cond_row(self.time_ids)?,
+                ))
+            } else {
+                None
+            };
+            let (cond_ref, pooled_ref, time_ids_ref) = match &narrowed {
+                Some((cond, pooled, time_ids)) => (cond, pooled, time_ids),
+                None => (self.conditioning, self.pooled, self.time_ids),
+            };
+            let eps = forward_eps(
+                self.unet,
+                &x_unet,
+                timestep,
+                cond_ref,
+                pooled_ref,
+                time_ids_ref,
+                &[],
+                cond_ref,
+                None,
+                self.plan,
+            )?;
+            if cfg_on {
+                let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
+                let eps_text = row(0)?;
+                let eps_neg = row(1)?;
+                Ok(gen_core::guidance::cfg(
+                    &MlxLatentOps,
+                    &eps_text,
+                    &eps_neg,
+                    cfg,
+                )?)
+            } else {
+                Ok(eps)
+            }
+        };
+        run().map_err(Into::into)
+    }
+
+    fn observe(&mut self, obs: gen_core::sampling::PassObservation<'_, Array>) {
+        self.preview
+            .emit(obs.chain_step, obs.chain_total_steps, obs.latent);
+    }
+}
+
+/// Run one resolved chained-denoise plan over SDXL's curated VE lane and return the final latent —
+/// the chained twin of [`denoise_curated_with_preview`].
+///
+/// `initial` is the VE prior the caller built (unit noise · the σ pass 0 enters at); the caller owns
+/// the single VAE/PiD decode after the chain, exactly as it does on the single-pass lane.
+#[allow(clippy::too_many_arguments)] // mirrors the sibling denoise entry points in this module
+pub fn render_denoise_passes(
+    unet: &UNet2DConditionModel,
+    ms: &mlx_gen::DiscreteModelSampling,
+    plan: &gen_core::ResolvedDenoisePlan,
+    initial: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg_batched: bool,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    forward_plan: crate::plan::SdxlForwardPlan<'_>,
+) -> Result<(Array, gen_core::DenoisePlanExecution)> {
+    // Same SiLU-fusion compile scope as the single-pass lanes (sc-2963) — bit-exact in fp16.
+    let _compile_glue = crate::CompileGlueGuard::enable();
+    let mut host = SdxlPassHost {
+        unet,
+        ms,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg_batched,
+        plan: forward_plan,
+        preview: PassPreview::new(preview),
+    };
+    let run = gen_core::sampling::execute_denoise_plan(
+        &MlxLatentOps,
+        ms,
+        plan,
+        initial,
+        &mut host,
+        cancel,
+        on_progress,
+    )?;
+    // Force the final step's lazy graph before decode (the shared driver's tail contract).
+    mlx_rs::transforms::eval([&run.latent])?;
+    Ok((run.latent, run.execution))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfgpp(
     unet: &UNet2DConditionModel,
@@ -1223,6 +1501,232 @@ pub(crate) fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::GenerationRequest;
+
+    // ---- Chained denoise passes (epic 20414, sc-20425) ------------------------------------------
+
+    fn dp_resolved(sampler: &str, scheduler: &str, steps: u32) -> gen_core::ResolvedDenoisePass {
+        gen_core::ResolvedDenoisePass {
+            index: 0,
+            steps,
+            sampler: sampler.to_owned(),
+            scheduler: scheduler.to_owned(),
+            denoise: 1.0,
+            guidance: None,
+            seed: 99,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// The `DiscreteModelSampling` the RENDER builds, not a hand-rolled stand-in (sc-20425 review
+    /// MINOR 4). `crate::model::sdxl_alpha_schedule` is the single constructor both loaders use, so
+    /// the harness certifies production's sigma range — which is precisely what the VE boundary
+    /// re-noise is keyed on — rather than a copy that nothing pins.
+    fn dp_ms() -> mlx_gen::DiscreteModelSampling {
+        mlx_gen::DiscreteModelSampling::sdxl(&crate::model::sdxl_alpha_schedule())
+    }
+
+    /// Adoption: the backend-neutral executor conformance suite runs over SDXL's REAL per-pass
+    /// schedule seam **and its own `DiscreteModelSampling`** — the ε/VE contract, not flow. That
+    /// distinction is the point of `denoise_pass_conformance_over` (sc-20425): the boundary re-noise
+    /// blend differs between the cohorts, so a flow-driven run would certify nothing about this
+    /// family. Pure host math, weights-free (no `Array` anywhere) — the same invocation shape as the
+    /// candle twin.
+    #[test]
+    fn shared_pass_executor_conformance_over_the_sdxl_ve_schedule_seam() {
+        let ms = dp_ms();
+        gen_core_testkit::denoise_passes::denoise_pass_conformance_over(
+            "mlx sdxl",
+            &ms,
+            &|pass, steps| pass_schedule(pass, steps, &ms).expect("a curated id always resolves"),
+        );
+        gen_core_testkit::denoise_passes::denoise_pass_conformance_over(
+            "mlx sdxl discrete alias",
+            &ms,
+            &|_pass, steps| {
+                pass_schedule(&dp_resolved("ddim", "discrete", steps as u32), steps, &ms)
+                    .expect("the declared native alias is honored")
+            },
+        );
+    }
+
+    /// **The sc-20425 review's MAJOR 1, on this family.** The generator binds the executor's
+    /// `DenoisePlanExecution` and publishes it through `GenerationRequest::emit_denoise_pass_report`
+    /// before returning any image; without that the plan a render actually ran is unrecoverable and
+    /// the epic's replay path has nothing to replay from. This drives the REAL schedule seam,
+    /// model defaults and descriptor context through the shared adopter check, so the record's
+    /// requested-vs-resolved contents and eval accounting are pinned against this family's own
+    /// resolution ladder.
+    #[test]
+    fn the_generator_publishes_one_execution_record_for_a_chain() {
+        let requested = vec![
+            gen_core::DenoisePass {
+                steps: Some(4),
+                ..Default::default()
+            },
+            gen_core::DenoisePass {
+                steps: Some(3),
+                sampler: Some("euler".to_owned()),
+                denoise: Some(0.5),
+                ..Default::default()
+            },
+        ];
+        let req = GenerationRequest {
+            denoise_passes: Some(requested.clone()),
+            ..Default::default()
+        };
+        let ms = dp_ms();
+        let caps = crate::model::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::model::sdxl_denoise_defaults();
+        let record = gen_core_testkit::denoise_passes::check_execution_record(
+            &|pass: &gen_core::ResolvedDenoisePass, steps: usize| {
+                pass_schedule(pass, steps, &ms).expect("a curated id always resolves")
+            },
+            &ms,
+            &req,
+            0x5eed,
+            &defaults,
+            &ctx,
+        )
+        .expect("the execution record must satisfy the shared adopter contract");
+
+        // The ladder's own answers, published: pass 0 named no sampler/scheduler, so both come
+        // from this family's model defaults; pass 1 named its sampler and denoise.
+        assert_eq!(record.passes.len(), 2);
+        assert_eq!(
+            record.passes[0].resolved.sampler, defaults.sampler,
+            "an unnamed per-pass sampler must resolve to this family's default"
+        );
+        assert_eq!(record.passes[0].resolved.scheduler, defaults.scheduler);
+        assert_eq!(record.passes[0].resolved.steps, 4);
+        assert_eq!(record.passes[1].resolved.sampler, "euler");
+        assert_eq!(record.passes[1].resolved.denoise, 0.5);
+        // And the requested values ride alongside, so a consumer can tell the two apart.
+        assert_eq!(record.passes[0].requested.as_ref(), Some(&requested[0]));
+        assert_eq!(record.passes[1].requested.as_ref(), Some(&requested[1]));
+        // The VE cohort re-noises pass 1 at its own segment entry, which the record flags.
+        assert!(!record.passes[0].renoised && record.passes[1].renoised);
+    }
+
+    /// The per-pass schedule seam is the single-pass curated one: the native ComfyUI `normal`
+    /// schedule over the SDXL alpha table, with the curated axis over it.
+    #[test]
+    fn a_pass_schedule_is_the_single_pass_curated_schedule() {
+        let ms = dp_ms();
+        let native =
+            gen_core::sampling::schedule_sigmas(gen_core::sampling::Scheduler::Normal, &ms, 8);
+        assert_eq!(
+            pass_schedule(&dp_resolved("ddim", "discrete", 8), 8, &ms).unwrap(),
+            native,
+            "the native alias must return the family's own schedule"
+        );
+        assert_eq!(
+            pass_schedule(&dp_resolved("ddim", "karras", 8), 8, &ms).unwrap(),
+            mlx_gen::resolve_schedule(Some("karras"), &ms, 8, &native),
+            "a curated id must resolve through the same seam the curated lane uses"
+        );
+        // The VE prior really is unit noise · σ_max, so the initial-latent scale the chained lane
+        // reads off pass 0 is the same one the curated lane applies.
+        assert!(native[0] > 10.0, "SDXL's σ_max is ≈14.6, got {}", native[0]);
+        // And that σ range comes from the schedule the LOADERS build, not a test-local copy.
+        assert_eq!(
+            crate::model::sdxl_alpha_schedule().alphas_cumprod,
+            mlx_gen::AlphaSchedule::scaled_linear(
+                crate::config::DiffusionConfig::sdxl_base().num_train_steps,
+                crate::config::DiffusionConfig::sdxl_base().beta_start,
+                crate::config::DiffusionConfig::sdxl_base().beta_end,
+            )
+            .alphas_cumprod
+        );
+    }
+
+    /// **The sc-20425 item-3 trap, on this family.** `lightning` and `hyper` are advertised in the
+    /// sampler menu but drive distilled bespoke lanes and are not curated `Solver`s; before this they
+    /// validated and then integrated as Euler. The scheduler axis refuses an id this family does not
+    /// honor the same way.
+    #[test]
+    fn distilled_sampler_names_are_never_silently_downgraded_on_a_chain() {
+        let caps = crate::model::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        for id in ["lightning", "hyper"] {
+            assert!(
+                caps.samplers.contains(&id),
+                "still advertised for the flat lane"
+            );
+            let err = gen_core::validate_denoise_passes(
+                &[gen_core::DenoisePass {
+                    sampler: Some(id.to_owned()),
+                    ..Default::default()
+                }],
+                false,
+                &ctx,
+            )
+            .expect_err("an unrunnable sampler must be rejected");
+            assert_eq!(err.field(), gen_core::DenoisePassField::Sampler);
+            assert!(err.is_capability_gap());
+        }
+        let err = pass_schedule(&dp_resolved("ddim", "linear", 8), 8, &dp_ms())
+            .expect_err("an undeclared native scheduler must be rejected");
+        assert!(
+            format!("{err}").contains("denoisePasses[0].scheduler"),
+            "{err}"
+        );
+    }
+
+    /// The chained denoise-pass preview numbers frames by the executor's chain-global outer step —
+    /// one continuous `1..=total` run across pass boundaries — and dedups the multi-eval solver
+    /// repeats of a step.
+    #[test]
+    fn pass_preview_numbers_chain_steps_once_across_passes() {
+        use std::sync::{Arc, Mutex};
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let preview = PassPreview::new(&sink);
+        let latents = Array::zeros::<f32>(&[1, 2, 2, 4]).unwrap();
+        for step in [0usize, 1, 1, 2, 3, 4, 4, 5] {
+            preview.emit(step, 6, &latents);
+        }
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames.iter().map(|f| f.current).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert!(frames.iter().all(|f| f.total == 6));
+        assert_eq!(
+            preview.dropped_frames(),
+            0,
+            "a healthy chain must lose no frames"
+        );
+    }
+
+    /// A projection failure stays swallowed — previews are decorative and never fail a render — but
+    /// is now COUNTED and logged once, so a chain that silently delivers nothing is distinguishable
+    /// from a model that does not preview at all (sc-20425 review MINOR 6). The candle twin counts
+    /// the same way, in `candle_gen::preview::PreviewCounter::dropped_frames`.
+    #[test]
+    fn a_dropped_chain_frame_is_swallowed_but_counted() {
+        use std::sync::{Arc, Mutex};
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink = PreviewSink::new(move |frame| captured.lock().unwrap().push(frame));
+        let preview = PassPreview::new(&sink);
+        // A latent that is not the LAYOUT contract: the projector rejects it.
+        let malformed = Array::zeros::<f32>(&[1, 2, 2, 3]).unwrap();
+        let valid = Array::zeros::<f32>(&[1, 2, 2, 4]).unwrap();
+        preview.emit(0, 3, &malformed);
+        preview.emit(1, 3, &valid);
+        preview.emit(2, 3, &malformed);
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames.iter().map(|f| f.current).collect::<Vec<_>>(),
+            vec![2],
+            "only the well-formed frame is delivered, and its position is preserved"
+        );
+        assert_eq!(preview.dropped_frames(), 2);
+    }
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
     /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a

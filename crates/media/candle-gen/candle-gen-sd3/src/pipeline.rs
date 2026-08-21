@@ -515,6 +515,45 @@ impl Pipeline {
             )
         })
     }
+
+    /// Render `req` as a **chained denoise plan** (epic 20414, sc-20425) — the same batch shape as
+    /// [`render`](Self::render), with the trajectory coming from the shared executor.
+    ///
+    /// The uncond encode is hoisted the same way [`render`](Self::render) hoists it, but the gate
+    /// widens: a chain is CFG-on when **any** pass wants guidance ≠ 1.0, not when the single
+    /// request-level scale does. Getting that wrong would either waste an encode or, worse, leave
+    /// `uncond: None` for a pass that asked for guidance and silently render it unguided.
+    pub(crate) fn render_denoise_passes(
+        &self,
+        req: &GenerationRequest,
+        components: &Components,
+        plan: &gen_core::ResolvedDenoisePlan,
+        resolve: &dyn Fn(u64) -> gen_core::Result<gen_core::ResolvedDenoisePlan>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let lat_h = (req.height / VAE_SCALE) as usize;
+        let lat_w = (req.width / VAE_SCALE) as usize;
+        let any_guided = plan.passes.iter().any(|p| p.guidance.unwrap_or(1.0) != 1.0);
+        // `conditioning` reads this only as the CFG on/off gate, so any value ≠ 1.0 selects the
+        // uncond encode; the per-pass scale is applied inside the host's forward.
+        let cfg_gate = if any_guided { 0.0 } else { 1.0 };
+        let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_gate)?;
+        render_denoise_passes(
+            &components.transformer,
+            &components.vae,
+            &cond,
+            uncond.as_ref(),
+            self.variant,
+            (lat_h, lat_w),
+            &self.device,
+            self.dtype,
+            base_seed,
+            resolve,
+            req,
+            on_progress,
+        )
+    }
 }
 
 /// The render core shared by [`Pipeline::render`] and the structural/CUDA smoke tests: build the
@@ -621,6 +660,196 @@ pub(crate) fn render_core(
     decode_image(vae, &latents)
 }
 
+// =================================================================================================
+// Chained denoise passes (epic 20414, sc-20425)
+// =================================================================================================
+
+/// The scheduler ids SD3.5 honors on a chained pass **beyond** the curated registry.
+///
+/// `flow_match` names the family's own shifted flow-match schedule ([`sd3_sigmas`]) — the byte-exact
+/// default an unset `req.scheduler` already resolves to through `resolve_flow_schedule`'s N3
+/// fallback. It is advertised (`descriptor_for`) and declared (`denoise_pass_surface`) so a resolved
+/// plan can *name* the model default and replay through validation; every other non-curated id stays
+/// a typed rejection instead of silently taking the same fallback.
+pub(crate) const NATIVE_SCHEDULERS: &[&str] = &["flow_match"];
+
+/// One chained pass's **fresh** σ schedule (the [`gen_core::sampling::DenoisePassHost`] seam).
+///
+/// Deliberately the same two lines [`render_core`] runs — the native shifted schedule for
+/// `schedule_steps`, then the curated scheduler axis over it — so a one-pass chain is the legacy
+/// render rather than a second numerical path. The only addition is
+/// [`gen_core::resolve_pass_scheduler`], which turns an id this family cannot honor into a typed,
+/// pass-indexed rejection *before* `resolve_flow_schedule` would quietly hand back the native
+/// schedule under someone else's name.
+pub(crate) fn pass_schedule(
+    pass: &gen_core::ResolvedDenoisePass,
+    schedule_steps: usize,
+    shift: f32,
+) -> gen_core::Result<Vec<f32>> {
+    gen_core::resolve_pass_scheduler(pass, NATIVE_SCHEDULERS)?;
+    let native = sd3_sigmas(schedule_steps, shift);
+    Ok(candle_gen::resolve_flow_schedule(
+        Some(pass.scheduler.as_str()),
+        0.0,
+        schedule_steps,
+        &native,
+    ))
+}
+
+/// Compile-time witness that this crate really implements the chained-denoise host it advertises
+/// (sc-20425 review MINOR 9).
+///
+/// The descriptor conformance sweep closes the *derived-descriptor* half of "advertises without a
+/// host" — a control route, an unusable menu, a half-inherited surface — but it cannot see whether a
+/// `DenoisePassHost` exists at all, because a descriptor is data and the host is a trait impl in
+/// another crate. This is the missing half, in the one place that can check it: if the impl below is
+/// ever deleted or renamed while `supports_denoise_passes` stays `true`, THIS crate stops compiling
+/// rather than shipping a capability nothing serves.
+const _: fn(&mut Sd3PassHost<'_>) = |host| {
+    let _: &mut dyn gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> = host;
+};
+
+/// SD3.5's [`gen_core::sampling::DenoisePassHost`]: the family schedule seam, the per-pass forward
+/// (per-pass guidance combined inside, exactly as [`render_core`]'s closure does it), and the
+/// chain-global preview.
+///
+/// Everything it holds is a shared borrow or `Copy` — the same set [`render_core`]'s predict closure
+/// captures — because SD3's conditioning is hoisted once per batch and the transformer is immutable
+/// during a render. There is no per-pass adapter state to apply or revert (SD3 folds adapters at
+/// load), so `begin_pass`/`end_pass` stay the trait defaults and the descriptor's
+/// `per_pass_adapters` is `false`.
+struct Sd3PassHost<'a> {
+    transformer: &'a Sd3Transformer,
+    cond: &'a Sd3Conditioning,
+    uncond: Option<&'a Sd3Conditioning>,
+    device: Device,
+    dtype: DType,
+    shift: f32,
+    /// The guidance a pass that names none inherits — already resolved by the plan, kept here only
+    /// for the CFG-enabled test.
+    cfg_enabled: bool,
+    hook: candle_gen::preview::PassPreview<'a>,
+}
+
+impl gen_core::sampling::DenoisePassHost<candle_gen::CandleLatentOps> for Sd3PassHost<'_> {
+    fn build_schedule(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        schedule_steps: usize,
+    ) -> gen_core::Result<Vec<f32>> {
+        pass_schedule(pass, schedule_steps, self.shift)
+    }
+
+    fn predict(
+        &mut self,
+        pass: &gen_core::ResolvedDenoisePass,
+        x: &Tensor,
+        timestep: f32,
+    ) -> gen_core::Result<Tensor> {
+        // `timestep` is `FlowModelSampling::timestep(σ) == σ` (the Sigma convention); SD3 feeds the
+        // DiT `t = σ·1000`, exactly as `render_core`'s closure does.
+        let run = || -> Result<Tensor> {
+            let t = Tensor::from_vec(vec![timestep * 1000.0], (1,), &self.device)?;
+            let v_cond = self
+                .transformer
+                .forward(x, &self.cond.context, &self.cond.pooled, &t)?;
+            // Per-pass CFG: the distilled Turbo has no guidance axis at all (`cfg_enabled` false, and
+            // the shared floor rejects a per-pass `guidance` on it), and a CFG variant collapses to
+            // the conditional branch at scale 1.0 exactly as the single-pass lane does.
+            let cfg_scale = if self.cfg_enabled {
+                pass.guidance.unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            let v = match self.uncond {
+                Some(uncond) if cfg_scale != 1.0 => {
+                    let v_uncond =
+                        self.transformer
+                            .forward(x, &uncond.context, &uncond.pooled, &t)?;
+                    (&v_uncond + ((&v_cond - &v_uncond)? * cfg_scale as f64)?)?
+                }
+                _ => v_cond,
+            };
+            Ok(v.to_dtype(self.dtype)?)
+        };
+        run().map_err(Into::into)
+    }
+
+    fn observe(&mut self, obs: gen_core::sampling::PassObservation<'_, Tensor>) {
+        self.hook
+            .emit(obs.chain_step, obs.chain_total_steps, obs.sigma, obs.latent);
+    }
+}
+
+/// Run a resolved chained-denoise plan over SD3.5, one image per `req.count`, decoding **once** per
+/// image after the whole chain.
+///
+/// The chained twin of [`Pipeline::render`]: same conditioning hoist, same per-image seed walk, same
+/// single VAE decode. What differs is that the trajectory comes from
+/// [`gen_core::sampling::execute_denoise_plan`] instead of one `run_flow_sampler` call, and the plan
+/// is re-resolved per image so each image's pass seeds derive from its own job seed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_denoise_passes(
+    transformer: &Sd3Transformer,
+    vae: &AutoEncoderKL,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    variant: Variant,
+    latent_hw: (usize, usize),
+    device: &Device,
+    dtype: DType,
+    base_seed: u64,
+    resolve: &dyn Fn(u64) -> gen_core::Result<gen_core::ResolvedDenoisePlan>,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<(Vec<Image>, Option<gen_core::DenoisePlanExecution>)> {
+    use gen_core::sampling::{FlowModelSampling, TimestepConvention};
+
+    let (lat_h, lat_w) = latent_hw;
+    let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+    let mut execution: Option<gen_core::DenoisePlanExecution> = None;
+    let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let plan = resolve(seed)?;
+        // The chain's initial latent is the ordinary txt2img prior: the same CPU-seeded N(0,1) the
+        // single-pass lane builds. Chained passes are the t2i-from-noise surface (`Reference` is
+        // rejected alongside them), so there is no img2img fork here.
+        let n = LATENT_CHANNELS * lat_h * lat_w;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let noise = candle_gen::seeded_normal_vec(&mut rng, n);
+        let initial = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+            .to_device(device)?
+            .to_dtype(dtype)?;
+
+        let mut host = Sd3PassHost {
+            transformer,
+            cond,
+            uncond,
+            device: device.clone(),
+            dtype,
+            shift: variant.shift(),
+            cfg_enabled: variant.cfg_enabled(),
+            // Built over the REQUEST's sink and fresh per image, exactly as the single-pass lane's
+            // hook is — the crate's preview inventory pins both halves of that.
+            hook: candle_gen::preview::PassPreview::new(crate::preview::hook(&req.preview)),
+        };
+        let run = gen_core::sampling::execute_denoise_plan(
+            &candle_gen::CandleLatentOps,
+            &ms,
+            &plan,
+            initial,
+            &mut host,
+            &req.cancel,
+            on_progress,
+        )?;
+        if execution.is_none() {
+            execution = Some(run.execution);
+        }
+        on_progress(Progress::Decoding);
+        decode_image(vae, &run.latent)
+    })?;
+    Ok((images, execution))
+}
+
 /// VAE-decode the final latents `(1, 16, h, w)` to an RGB8 [`Image`]. The VAE applies its own
 /// `/scaling_factor + shift_factor` un-scale inside `decode`; the `[-1, 1]` output maps to `[0, 255]`
 /// u8.
@@ -677,6 +906,147 @@ mod tests {
             .config()
             .dual_attention_layers
             .is_empty());
+    }
+
+    // ---- Chained denoise passes (epic 20414, sc-20425) -------------------------------------------
+
+    fn resolved(sampler: &str, scheduler: &str, steps: u32) -> gen_core::ResolvedDenoisePass {
+        gen_core::ResolvedDenoisePass {
+            index: 0,
+            steps,
+            sampler: sampler.to_owned(),
+            scheduler: scheduler.to_owned(),
+            denoise: 1.0,
+            guidance: None,
+            seed: 1234,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Adoption: the backend-neutral executor conformance suite
+    /// (`gen_core_testkit::denoise_passes`) runs over SD3.5's REAL per-pass schedule seam, for the
+    /// distilled and non-distilled shifts alike and for the advertised native alias the resolution
+    /// ladder's model default names. Weights-free and CPU-only — the executor is driven over
+    /// `CpuLatentOps` with a stub model, so what varies per family is exactly the schedule math.
+    #[test]
+    fn shared_pass_executor_conformance_over_the_sd3_schedule_seam() {
+        for (label, variant) in [
+            ("candle sd3_5_large", Variant::Large),
+            ("candle sd3_5_large_turbo", Variant::LargeTurbo),
+            ("candle sd3_5_medium", Variant::Medium),
+        ] {
+            gen_core_testkit::denoise_passes::denoise_pass_conformance(label, &|pass, steps| {
+                pass_schedule(pass, steps, variant.shift()).expect("a curated id always resolves")
+            });
+        }
+        gen_core_testkit::denoise_passes::denoise_pass_conformance(
+            "candle sd3_5 flow_match alias",
+            &|_pass, steps| {
+                pass_schedule(
+                    &resolved("euler", "flow_match", steps as u32),
+                    steps,
+                    Variant::Large.shift(),
+                )
+                .expect("the declared native alias is honored")
+            },
+        );
+    }
+
+    /// **The sc-20425 review's MAJOR 1, on this family.** The generator binds the executor's
+    /// `DenoisePlanExecution` and publishes it through `GenerationRequest::emit_denoise_pass_report`
+    /// before returning any image; without that the plan a render actually ran is unrecoverable and
+    /// the epic's replay path has nothing to replay from. This drives the REAL schedule seam,
+    /// model defaults and descriptor context through the shared adopter check, so the record's
+    /// requested-vs-resolved contents and eval accounting are pinned against this family's own
+    /// resolution ladder.
+    #[test]
+    fn the_generator_publishes_one_execution_record_for_a_chain() {
+        let requested = vec![
+            gen_core::DenoisePass {
+                steps: Some(4),
+                ..Default::default()
+            },
+            gen_core::DenoisePass {
+                steps: Some(3),
+                sampler: Some("euler".to_owned()),
+                denoise: Some(0.5),
+                ..Default::default()
+            },
+        ];
+        let req = GenerationRequest {
+            denoise_passes: Some(requested.clone()),
+            ..Default::default()
+        };
+        let ms = gen_core::sampling::FlowModelSampling::new(TimestepConvention::Sigma);
+        let caps = crate::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::sd3_denoise_defaults(Variant::Large);
+        let record = gen_core_testkit::denoise_passes::check_execution_record(
+            &|pass: &gen_core::ResolvedDenoisePass, steps: usize| {
+                pass_schedule(pass, steps, Variant::Large.shift())
+                    .expect("a curated id always resolves")
+            },
+            &ms,
+            &req,
+            0x5eed,
+            &defaults,
+            &ctx,
+        )
+        .expect("the execution record must satisfy the shared adopter contract");
+
+        // The ladder's own answers, published: pass 0 named no sampler/scheduler, so both come
+        // from this family's model defaults; pass 1 named its sampler and denoise.
+        assert_eq!(record.passes.len(), 2);
+        assert_eq!(
+            record.passes[0].resolved.sampler, defaults.sampler,
+            "an unnamed per-pass sampler must resolve to this family's default"
+        );
+        assert_eq!(record.passes[0].resolved.scheduler, defaults.scheduler);
+        assert_eq!(record.passes[0].resolved.steps, 4);
+        assert_eq!(record.passes[1].resolved.sampler, "euler");
+        assert_eq!(record.passes[1].resolved.denoise, 0.5);
+        // And the requested values ride alongside, so a consumer can tell the two apart.
+        assert_eq!(record.passes[0].requested.as_ref(), Some(&requested[0]));
+        assert_eq!(record.passes[1].requested.as_ref(), Some(&requested[1]));
+        // SD3.5 Large has a guidance axis, so the ladder fills it from the model default.
+        assert_eq!(record.passes[0].resolved.guidance, defaults.guidance);
+    }
+
+    /// The per-pass schedule seam is the single-pass one. A curated id re-shapes σ through the shared
+    /// `schedule_sigmas`; the advertised native alias returns the byte-exact family schedule, exactly
+    /// as an unset `req.scheduler` does in `render_core`.
+    #[test]
+    fn a_pass_schedule_is_the_single_pass_schedule() {
+        let shift = Variant::Large.shift();
+        let native = sd3_sigmas(8, shift);
+        assert_eq!(
+            pass_schedule(&resolved("euler", "flow_match", 8), 8, shift).unwrap(),
+            native,
+            "the native alias must not re-shape the family's own schedule"
+        );
+        assert_eq!(
+            pass_schedule(&resolved("euler", "karras", 8), 8, shift).unwrap(),
+            candle_gen::resolve_flow_schedule(Some("karras"), 0.0, 8, &native),
+            "a curated id must resolve through the same seam render_core uses"
+        );
+    }
+
+    /// **The sc-20425 item-3 trap, on this family.** `linear` is the kind of id a sibling advertises
+    /// (mlx-gen-sd3 has it in its scheduler menu) and no curated `Scheduler` implements. Undeclared,
+    /// `resolve_flow_schedule` would hand back the native schedule under that name — the wrong
+    /// algorithm, reported as success. It is now a typed, pass-indexed rejection.
+    #[test]
+    fn an_unhonored_pass_scheduler_is_rejected_before_any_schedule_math() {
+        let err = pass_schedule(&resolved("euler", "linear", 8), 8, Variant::Large.shift())
+            .expect_err("an undeclared native scheduler must be rejected");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "a capability gap must stay typed: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("denoisePasses[0].scheduler"),
+            "{err}"
+        );
     }
 
     /// The SD3 σ schedule: `steps + 1` sigmas, max σ at the shifted 1.0, strictly decreasing, terminal

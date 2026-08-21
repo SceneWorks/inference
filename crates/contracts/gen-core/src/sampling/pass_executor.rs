@@ -224,6 +224,16 @@ pub fn execute_denoise_plan<L: LatentOps + 'static>(
     // known before the first model forward — the progress denominator never changes mid-run.
     let mut prepared: Vec<PreparedPass> = Vec::with_capacity(plan.passes.len());
     for pass in &plan.passes {
+        // Resolve the algorithm BEFORE any schedule math, so an unrunnable pass costs nothing and
+        // the rejection is unambiguously pre-execution (sc-20425).
+        //
+        // This used to be `Solver::from_name(&pass.sampler).unwrap_or(Solver::Euler)` — the
+        // single-pass drivers' N3 native-alias fallback, carried over by analogy. The analogy does
+        // not hold: a single-pass driver falling back to Euler still runs the family's *own* default
+        // integrator, whereas here the pass NAMED an algorithm and would have silently got a
+        // different one — the wrong render, reported as success. There is no host hook for a
+        // family-native sampler on this path, so an uncurated id is unrunnable, not defaulted.
+        let solver = crate::denoise_passes::resolve_pass_solver(pass)?;
         let schedule_steps = denoise_pass_schedule_steps(pass.steps, pass.denoise);
         let sigmas = host.build_schedule(pass, schedule_steps)?;
         if sigmas.len() < 2 {
@@ -236,9 +246,6 @@ pub fn execute_denoise_plan<L: LatentOps + 'static>(
             )));
         }
         let segment = terminal_pass_segment(&sigmas, pass.steps).to_vec();
-        // N3: an id outside the curated registry (a family-native alias) integrates as Euler,
-        // exactly as the single-pass drivers fall back.
-        let solver = Solver::from_name(&pass.sampler).unwrap_or(Solver::Euler);
         prepared.push(PreparedPass {
             model_evals: segment_model_evals(solver, &segment),
             schedule_steps,
