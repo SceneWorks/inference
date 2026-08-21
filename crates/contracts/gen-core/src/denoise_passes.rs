@@ -187,6 +187,24 @@ pub struct DenoisePassSurface {
     /// (an unadvertised alias is unreachable) and must not shadow a curated id (which needs no
     /// declaration). Both are cross-checked by the descriptor conformance sweep.
     pub native_schedulers: &'static [&'static str],
+    /// Advertised sampler ids that ARE curated [`Solver`]s but which this family cannot honor **on a
+    /// chained pass** — the subtract axis to [`native_schedulers`](Self::native_schedulers)'s add.
+    ///
+    /// The case this exists for: MLX SDXL advertises `lcm` and `euler_ancestral`, and both resolve
+    /// through [`Solver::from_name`]. But on that family's *flat* path those names select a distilled
+    /// few-step lane and a bespoke vendored ancestral loop respectively, not the curated solvers of
+    /// the same name — so the same id renders differently depending on whether a chain is present.
+    /// Refusing them is right; refusing them while
+    /// [`denoise_pass_capability`](crate::Capabilities::denoise_pass_capability) still *published*
+    /// them was the advertise/honor mismatch this story exists to close, recreated one layer up
+    /// (sc-20425 review). Declaring them here is what makes the published menu and the floor agree:
+    /// the capability subtracts them and validation rejects them, from one source of truth.
+    ///
+    /// Every entry must be advertised in [`Capabilities::samplers`](crate::Capabilities::samplers)
+    /// (an unadvertised id is already rejected) and must be a curated [`Solver`] (an uncurated one is
+    /// already rejected, so declaring it is redundant). Both are cross-checked by the descriptor
+    /// conformance sweep.
+    pub unhonorable_samplers: &'static [&'static str],
     /// Whether [`DenoisePass::adapters`] weight overrides are actually **applied and reverted** at
     /// each pass boundary.
     ///
@@ -209,6 +227,7 @@ impl DenoisePassSurface {
     /// The fail-closed surface: no native schedulers, no per-pass adapter overrides.
     pub const NONE: Self = Self {
         native_schedulers: &[],
+        unhonorable_samplers: &[],
         per_pass_adapters: false,
     };
 
@@ -216,7 +235,15 @@ impl DenoisePassSurface {
     /// `supports_denoise_passes` must be empty here.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.native_schedulers.is_empty() && !self.per_pass_adapters
+        self.native_schedulers.is_empty()
+            && self.unhonorable_samplers.is_empty()
+            && !self.per_pass_adapters
+    }
+
+    /// Whether `id` is a curated [`Solver`] this family has NOT declared unhonorable.
+    #[must_use]
+    pub fn honors_sampler(&self, id: &str) -> bool {
+        Solver::from_name(id).is_some() && !self.unhonorable_samplers.contains(&id)
     }
 
     /// Whether `id` is a curated [`Scheduler`] or a native alias this family declared.
@@ -247,10 +274,13 @@ pub struct DenoisePassCapability {
     /// list is **rejected**, never ignored.
     pub fields: Vec<&'static str>,
     /// The sampler ids a pass may name: the advertised menu **intersected** with the curated
-    /// [`Solver`] registry. The intersection is not a nicety — the chained executor boxes a curated
-    /// `Solver` per pass and has no hook a family could use to honor a native sampler name, so an
-    /// advertised-but-uncurated sampler (SDXL's `lightning`, Kolors' `euler_discrete`) is exactly
-    /// the id that used to validate and then silently run Euler.
+    /// [`Solver`] registry, **minus** the family's declared
+    /// [`unhonorable_samplers`](DenoisePassSurface::unhonorable_samplers). The intersection is not a
+    /// nicety — the chained executor boxes a curated `Solver` per pass and has no hook a family could
+    /// use to honor a native sampler name, so an advertised-but-uncurated sampler (SDXL's
+    /// `lightning`, Kolors' `euler_discrete`) is exactly the id that used to validate and then
+    /// silently run Euler. The subtraction covers the mirror case: a curated id whose *flat* meaning
+    /// on that family is a different lane (MLX SDXL's `lcm` / `euler_ancestral`).
     pub samplers: Vec<&'static str>,
     /// The scheduler ids a pass may name: the advertised menu intersected with the curated
     /// [`Scheduler`] registry **plus** the family's declared
@@ -668,6 +698,10 @@ pub struct DenoisePassContext<'a> {
     /// ([`DenoisePassSurface::native_schedulers`]). Empty ⇒ a pass may only name a curated
     /// [`Scheduler`], whatever else the flat menu advertises.
     pub native_schedulers: &'a [&'a str],
+    /// Curated sampler ids this family cannot honor on a pass
+    /// ([`DenoisePassSurface::unhonorable_samplers`]). Empty ⇒ every curated id the menu advertises
+    /// is honorable.
+    pub unhonorable_samplers: &'a [&'a str],
     /// Whether the model has a guidance axis
     /// ([`Capabilities::supports_guidance`](crate::Capabilities::supports_guidance)). `false` ⇒ a
     /// per-pass `guidance` is [`DenoisePassIssue::GuidanceUnsupported`] rather than an ignored knob.
@@ -700,6 +734,7 @@ impl DenoisePassContext<'_> {
             samplers: None,
             schedulers: None,
             native_schedulers: &[],
+            unhonorable_samplers: &[],
             supports_guidance: true,
             per_pass_adapters: true,
             loaded_adapters: None,
@@ -855,7 +890,7 @@ fn validate_one_pass(
         // `Solver` per pass and has no hook a family could use to run a native sampler name, so an
         // advertised-but-uncurated id is precisely the one that passed the menu check above and then
         // integrated as Euler — the wrong algorithm, reported as success.
-        if Solver::from_name(sampler).is_none() {
+        if !sampler_is_honorable(ctx, sampler) {
             return Err(DenoisePassError::at(
                 index,
                 DenoisePassField::Sampler,
@@ -878,9 +913,7 @@ fn validate_one_pass(
         // The scheduler axis differs from the sampler axis in one way that matters: the family owns
         // `build_schedule`, so a native alias CAN be honorable — but only the family knows which, and
         // an undeclared one falls through some resolver's native-default branch just as silently.
-        if Scheduler::from_name(scheduler).is_none()
-            && !ctx.native_schedulers.contains(&scheduler.as_str())
-        {
+        if !scheduler_is_honorable(ctx, scheduler) {
             return Err(DenoisePassError::at(
                 index,
                 DenoisePassField::Scheduler,
@@ -944,11 +977,27 @@ fn honored_pass_samplers(ctx: &DenoisePassContext<'_>) -> Vec<String> {
     match ctx.samplers {
         Some(menu) => menu
             .iter()
-            .filter(|id| Solver::from_name(id).is_some())
+            .filter(|id| sampler_is_honorable(ctx, id))
             .map(|id| (*id).to_owned())
             .collect(),
-        None => curated_sampler_ids().iter().map(|s| (*s).into()).collect(),
+        None => curated_sampler_ids()
+            .iter()
+            .filter(|id| sampler_is_honorable(ctx, id))
+            .map(|id| (*id).to_string())
+            .collect(),
     }
+}
+
+/// Whether a pass may name `id` as its sampler: a curated [`Solver`] the family has not declared
+/// unhonorable ([`DenoisePassSurface::unhonorable_samplers`]).
+fn sampler_is_honorable(ctx: &DenoisePassContext<'_>, id: &str) -> bool {
+    Solver::from_name(id).is_some() && !ctx.unhonorable_samplers.contains(&id)
+}
+
+/// Whether a pass may name `id` as its scheduler: a curated [`Scheduler`], or a native alias the
+/// family declared ([`DenoisePassSurface::native_schedulers`]).
+fn scheduler_is_honorable(ctx: &DenoisePassContext<'_>, id: &str) -> bool {
+    Scheduler::from_name(id).is_some() || ctx.native_schedulers.contains(&id)
 }
 
 /// The scheduler ids a pass may actually name under `ctx`: the advertised menu intersected with the
@@ -973,8 +1022,14 @@ fn honored_pass_schedulers(ctx: &DenoisePassContext<'_>) -> Vec<String> {
 /// resolution (sc-20425).
 ///
 /// The chained executor has no hook for a family-native sampler name, so this either resolves or
-/// rejects: it never falls back. A caller that ran the shared floor first can only reach the error
-/// path by hand-building a plan, which is exactly the case worth failing loudly.
+/// rejects: it never falls back.
+///
+/// It is the executor's **last** line, not its first: the shared floor rejects an unhonorable
+/// explicit or inherited id, and [`resolve_denoise_plan`] rejects an unhonorable *resolved* one, so
+/// a caller that went through either cannot reach this error path. A hand-built plan can, which is
+/// exactly the case worth failing loudly. No model menu is in hand here, so the `honored` list it
+/// reports is the whole curated registry — the model-specific list is what the two earlier gates
+/// report.
 pub fn resolve_pass_solver(pass: &ResolvedDenoisePass) -> DenoisePassResult<Solver> {
     Solver::from_name(&pass.sampler).ok_or_else(|| {
         DenoisePassError::at(
@@ -1021,6 +1076,55 @@ pub fn resolve_pass_scheduler(
             honored,
         },
     ))
+}
+
+/// The request-level `sampler` / `scheduler` a pass **inherits** must be honorable too (sc-20425
+/// review MINOR 8).
+///
+/// [`validate_denoise_passes`] only sees the per-pass ids, so a chained request that names nothing
+/// per pass and carries a flat `sampler: "lightning"` used to pass `Generator::validate` outright and
+/// be caught only inside the executor — after the model had loaded. The resolution ladder makes that
+/// flat value the pass's sampler, so it is exactly as load-bearing as an explicit one and is checked
+/// here, at the same boundary, with the same pass-indexed error.
+///
+/// Scoped to a **chained** request on purpose: a legacy single-pass render may still name any id its
+/// flat menu advertises, and nothing about this contract changes that.
+pub fn validate_inherited_pass_ids(
+    req: &crate::GenerationRequest,
+    ctx: &DenoisePassContext<'_>,
+) -> DenoisePassResult<()> {
+    let Some(passes) = req.denoise_passes.as_ref() else {
+        return Ok(());
+    };
+    if let Some(sampler) = req.sampler.as_deref() {
+        if let Some(index) = passes.iter().position(|p| p.sampler.is_none()) {
+            if !sampler_is_honorable(ctx, sampler) {
+                return Err(DenoisePassError::at(
+                    index,
+                    DenoisePassField::Sampler,
+                    DenoisePassIssue::NotHonored {
+                        id: sampler.to_owned(),
+                        honored: honored_pass_samplers(ctx),
+                    },
+                ));
+            }
+        }
+    }
+    if let Some(scheduler) = req.scheduler.as_deref() {
+        if let Some(index) = passes.iter().position(|p| p.scheduler.is_none()) {
+            if !scheduler_is_honorable(ctx, scheduler) {
+                return Err(DenoisePassError::at(
+                    index,
+                    DenoisePassField::Scheduler,
+                    DenoisePassIssue::NotHonored {
+                        id: scheduler.to_owned(),
+                        honored: honored_pass_schedulers(ctx),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_id(
@@ -1205,10 +1309,40 @@ pub fn resolve_denoise_plan(
             adapters: pass.adapters.clone(),
         })
         .collect();
-    Ok(ResolvedDenoisePlan {
+    let plan = ResolvedDenoisePlan {
         passes: resolved,
         job_seed,
-    })
+    };
+    // Re-validate the RESOLVED ids for a chained request (sc-20425 review MINOR 8). The ladder can
+    // hand a pass an id no pass named — the request's flat `sampler`/`scheduler`, or the model
+    // default — and until this ran, an unhonorable inherited value reached the executor. Scoped to a
+    // chained request: the implicit one-pass plan a legacy render resolves through this same
+    // function must keep accepting whatever its flat menu advertises.
+    if req.denoise_passes.is_some() {
+        for pass in &plan.passes {
+            if !sampler_is_honorable(ctx, &pass.sampler) {
+                return Err(DenoisePassError::at(
+                    pass.index,
+                    DenoisePassField::Sampler,
+                    DenoisePassIssue::NotHonored {
+                        id: pass.sampler.clone(),
+                        honored: honored_pass_samplers(ctx),
+                    },
+                ));
+            }
+            if !scheduler_is_honorable(ctx, &pass.scheduler) {
+                return Err(DenoisePassError::at(
+                    pass.index,
+                    DenoisePassField::Scheduler,
+                    DenoisePassIssue::NotHonored {
+                        id: pass.scheduler.clone(),
+                        honored: honored_pass_schedulers(ctx),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(plan)
 }
 
 // =================================================================================================
@@ -2323,6 +2457,7 @@ mod tests {
             schedulers: vec!["normal", "flow_match", "linear"],
             denoise_pass_surface: DenoisePassSurface {
                 native_schedulers: &["flow_match"],
+                unhonorable_samplers: &[],
                 per_pass_adapters: true,
             },
             ..Default::default()
@@ -2375,6 +2510,161 @@ mod tests {
         let json = narrow.denoise_pass_capability().to_json();
         assert_eq!(json["maxPasses"], Value::from(MAX_DENOISE_PASSES));
         assert_eq!(json["perPassAdapters"], Value::Bool(false));
+    }
+
+    /// **The sc-20425 review's MAJOR 2.** A curated sampler a family cannot honor on a chain — one
+    /// whose *flat* meaning there is a different lane — was refused by the family and still
+    /// PUBLISHED by the capability surface, so a consumer built from that surface offered an id it
+    /// would then be refused. The subtract axis makes both halves read one declaration.
+    #[test]
+    fn a_declared_unhonorable_sampler_is_rejected_and_unpublished() {
+        const MENU: &[&str] = &["euler", "ddim", "lcm", "euler_ancestral"];
+        const UNHONORABLE: &[&str] = &["lcm", "euler_ancestral"];
+        let ctx = DenoisePassContext {
+            samplers: Some(MENU),
+            schedulers: Some(&["normal"]),
+            unhonorable_samplers: UNHONORABLE,
+            ..DenoisePassContext::registry_only()
+        };
+        for id in UNHONORABLE {
+            assert!(
+                Solver::from_name(id).is_some(),
+                "{id} must be curated, or this test proves nothing"
+            );
+            let err = validate_denoise_passes(&[pass(4, id, "normal", 1.0)], false, &ctx)
+                .expect_err("a declared-unhonorable sampler must be rejected");
+            assert_eq!(err.field(), DenoisePassField::Sampler);
+            assert_eq!(err.issue().code(), "notHonored");
+            match err.issue() {
+                DenoisePassIssue::NotHonored { honored, .. } => assert_eq!(
+                    honored,
+                    &vec!["euler".to_string(), "ddim".to_string()],
+                    "the message must name what DOES work"
+                ),
+                other => panic!("expected NotHonored, got {other:?}"),
+            }
+        }
+        assert!(validate_denoise_passes(&[pass(4, "ddim", "normal", 1.0)], false, &ctx).is_ok());
+
+        // …and the PUBLISHED menu excludes exactly those ids.
+        let caps = Capabilities {
+            supports_denoise_passes: true,
+            samplers: MENU.to_vec(),
+            schedulers: vec!["normal"],
+            denoise_pass_surface: DenoisePassSurface {
+                unhonorable_samplers: UNHONORABLE,
+                ..DenoisePassSurface::NONE
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            caps.denoise_pass_capability().samplers,
+            vec!["euler", "ddim"]
+        );
+        // The published list and the floor agree, in both directions.
+        let ctx = caps.denoise_pass_context(None);
+        for id in caps.denoise_pass_capability().samplers {
+            assert!(validate_denoise_passes(&[pass(4, id, "normal", 1.0)], false, &ctx).is_ok());
+        }
+        for id in UNHONORABLE {
+            assert!(validate_denoise_passes(&[pass(4, id, "normal", 1.0)], false, &ctx).is_err());
+        }
+    }
+
+    /// **The sc-20425 review's MINOR 8.** A pass that names no sampler INHERITS the request's, so a
+    /// chained request carrying a flat `sampler: "lightning"` used to pass the whole floor and be
+    /// caught only inside the executor — after the model had loaded. Both the floor and the
+    /// resolver now refuse it, and both name the pass that would have inherited it.
+    #[test]
+    fn an_inherited_request_level_id_is_checked_like_an_explicit_one() {
+        const MENU: &[&str] = &["euler", "lightning"];
+        let caps = Capabilities {
+            supports_denoise_passes: true,
+            supports_guidance: true,
+            max_count: 1,
+            min_size: 64,
+            max_size: 2048,
+            samplers: MENU.to_vec(),
+            schedulers: vec!["normal"],
+            ..Default::default()
+        };
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = DenoiseDefaults::new(8, "euler", "normal");
+        let inheriting = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            sampler: Some("lightning".into()),
+            denoise_passes: Some(vec![
+                pass(4, "euler", "normal", 1.0),
+                DenoisePass::default(),
+            ]),
+            ..Default::default()
+        };
+
+        // The floor names pass 1 — the one that would inherit it, not pass 0.
+        let err = crate::denoise_passes::validate_inherited_pass_ids(&inheriting, &ctx)
+            .expect_err("an unhonorable inherited sampler must be rejected");
+        assert_eq!(err.pass_index(), Some(1));
+        assert_eq!(err.field(), DenoisePassField::Sampler);
+        assert!(err.is_capability_gap());
+        // The shared request floor runs it, so `Generator::validate` refuses before any load.
+        assert!(caps.validate_request("probe", &inheriting).is_err());
+        // And the resolver refuses too, for a caller that skipped the floor.
+        assert!(inheriting.resolve_denoise_plan(7, &defaults, &ctx).is_err());
+
+        // A flat value nothing inherits is fine: every pass names its own.
+        let all_named = GenerationRequest {
+            denoise_passes: Some(vec![pass(4, "euler", "normal", 1.0)]),
+            ..GenerationRequest {
+                prompt: "a cat".into(),
+                width: 512,
+                height: 512,
+                count: 1,
+                sampler: Some("lightning".into()),
+                ..Default::default()
+            }
+        };
+        assert!(crate::denoise_passes::validate_inherited_pass_ids(&all_named, &ctx).is_ok());
+        assert!(all_named.resolve_denoise_plan(7, &defaults, &ctx).is_ok());
+
+        // And a LEGACY single-pass request may still name it — nothing about this contract changes
+        // the flat lane.
+        let legacy = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 512,
+            height: 512,
+            count: 1,
+            sampler: Some("lightning".into()),
+            ..Default::default()
+        };
+        assert!(crate::denoise_passes::validate_inherited_pass_ids(&legacy, &ctx).is_ok());
+        assert!(legacy.resolve_denoise_plan(7, &defaults, &ctx).is_ok());
+    }
+
+    /// The model DEFAULT rung is reachable the same way, so a family whose defaults name an id it
+    /// cannot honor is caught at resolve time rather than in the executor.
+    #[test]
+    fn an_unhonorable_model_default_is_rejected_at_resolve_time() {
+        let ctx = DenoisePassContext {
+            samplers: Some(&["euler", "lightning"]),
+            schedulers: Some(&["normal"]),
+            ..DenoisePassContext::registry_only()
+        };
+        let req = GenerationRequest {
+            denoise_passes: Some(vec![DenoisePass::default()]),
+            ..Default::default()
+        };
+        let bad = DenoiseDefaults::new(8, "lightning", "normal");
+        let err = req
+            .resolve_denoise_plan(7, &bad, &ctx)
+            .expect_err("an unhonorable model default must be rejected");
+        assert_eq!(err.pass_index(), Some(0));
+        assert_eq!(err.field(), DenoisePassField::Sampler);
+        assert!(req
+            .resolve_denoise_plan(7, &DenoiseDefaults::new(8, "euler", "normal"), &ctx)
+            .is_ok());
     }
 
     /// **The sc-20425 review's MAJOR 1.** Four adopters each bound `let (images, _execution) = ..`

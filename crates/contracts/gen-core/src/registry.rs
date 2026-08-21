@@ -1596,17 +1596,28 @@ fn check_denoise_pass_route(errs: &mut Vec<String>, ctx: &str, d: &ModelDescript
              must clear the inherited flag"
         ));
     }
-    if !caps.samplers.is_empty()
-        && !caps
-            .samplers
-            .iter()
-            .any(|id| Solver::from_name(id).is_some())
-    {
+    if !caps.samplers.is_empty() && !caps.samplers.iter().any(|id| surface.honors_sampler(id)) {
         errs.push(format!(
             "{ctx}: supports_denoise_passes is set but no advertised sampler is a curated Solver \
-             ({:?}) — a pass can only run a curated integrator, so no request could ever name one",
+             this family honors ({:?}) — a pass can only run a curated integrator, so no request \
+             could ever name one",
             caps.samplers
         ));
+    }
+    for id in surface.unhonorable_samplers {
+        if !caps.samplers.contains(id) {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares unhonorable sampler {id:?} but it is not \
+                 in the advertised `samplers` menu — nothing could name it in the first place"
+            ));
+        }
+        if Solver::from_name(id).is_none() {
+            errs.push(format!(
+                "{ctx}: denoise_pass_surface declares unhonorable sampler {id:?}, which is not \
+                 a curated Solver — an uncurated id is already rejected, so the declaration is \
+                 dead"
+            ));
+        }
     }
     if !caps.schedulers.is_empty()
         && !caps
@@ -4656,6 +4667,54 @@ mod tests {
         assert!(!has(&errs, "no advertised sampler"), "{errs:?}");
     }
 
+    /// A declared unhonorable sampler must be advertised (else nothing could name it) and curated
+    /// (else it is already rejected and the declaration is dead) — sc-20425 review MAJOR 2.
+    #[test]
+    fn model_descriptor_errors_flags_an_inconsistent_unhonorable_sampler_declaration() {
+        let has = |errs: &[String], needle: &str| errs.iter().any(|e| e.contains(needle));
+
+        let mut declared = pass_descriptor();
+        declared.capabilities.samplers = vec!["euler", "lcm"];
+        declared.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lcm"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        assert!(model_descriptor_errors(&declared).is_empty());
+
+        let mut unadvertised = pass_descriptor();
+        unadvertised.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lcm"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&unadvertised);
+        assert!(has(&errs, "in the advertised `samplers` menu"), "{errs:?}");
+
+        let mut uncurated = pass_descriptor();
+        uncurated.capabilities.samplers = vec!["euler", "lightning"];
+        uncurated.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["lightning"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&uncurated);
+        assert!(has(&errs, "which is not"), "{errs:?}");
+
+        // Subtracting the ONLY honorable sampler leaves a capability no request could exercise.
+        let mut emptied = pass_descriptor();
+        emptied.capabilities.samplers = vec!["euler"];
+        emptied.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
+            unhonorable_samplers: &["euler"],
+            ..crate::DenoisePassSurface::NONE
+        };
+        let errs = model_descriptor_errors(&emptied);
+        assert!(
+            has(
+                &errs,
+                "no advertised sampler is a curated Solver this family honors"
+            ),
+            "{errs:?}"
+        );
+    }
+
     /// The [`crate::DenoisePassSurface`] declarations must be reachable and non-redundant, and the
     /// surface itself must never outlive the capability it belongs to — the same inheritance footgun
     /// the control-route check closes, in the other direction.
@@ -4668,6 +4727,7 @@ mod tests {
         declared.capabilities.schedulers = vec!["normal", "discrete"];
         declared.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
             native_schedulers: &["discrete"],
+            unhonorable_samplers: &[],
             per_pass_adapters: false,
         };
         assert!(model_descriptor_errors(&declared).is_empty());
@@ -4676,6 +4736,7 @@ mod tests {
         let mut unreachable = pass_descriptor();
         unreachable.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
             native_schedulers: &["discrete"],
+            unhonorable_samplers: &[],
             per_pass_adapters: false,
         };
         let errs = model_descriptor_errors(&unreachable);
@@ -4688,6 +4749,7 @@ mod tests {
         let mut shadowing = pass_descriptor();
         shadowing.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
             native_schedulers: &["normal"],
+            unhonorable_samplers: &[],
             per_pass_adapters: false,
         };
         let errs = model_descriptor_errors(&shadowing);
@@ -4697,6 +4759,7 @@ mod tests {
         let mut no_adapters = pass_descriptor();
         no_adapters.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
             native_schedulers: &[],
+            unhonorable_samplers: &[],
             per_pass_adapters: true,
         };
         let errs = model_descriptor_errors(&no_adapters);
@@ -4713,6 +4776,7 @@ mod tests {
         orphaned.capabilities.supports_lora = true;
         orphaned.capabilities.denoise_pass_surface = crate::DenoisePassSurface {
             native_schedulers: &[],
+            unhonorable_samplers: &[],
             per_pass_adapters: true,
         };
         let errs = model_descriptor_errors(&orphaned);

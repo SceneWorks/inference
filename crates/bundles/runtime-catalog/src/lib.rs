@@ -989,6 +989,7 @@ mod tests {
                 supports_denoise_passes: true,
                 denoise_pass_surface: gen_core::DenoisePassSurface {
                     native_schedulers: &["discrete"],
+                    unhonorable_samplers: &[],
                     per_pass_adapters: false,
                 },
                 ..Default::default()
@@ -1033,6 +1034,7 @@ mod tests {
         re_weighting.capabilities.supports_lora = true;
         re_weighting.capabilities.denoise_pass_surface = gen_core::DenoisePassSurface {
             native_schedulers: &["discrete"],
+            unhonorable_samplers: &[],
             per_pass_adapters: true,
         };
         assert_ne!(

@@ -131,6 +131,7 @@ fn capabilities_of(fixture: &Value) -> Capabilities {
                 caps.and_then(|c| c.get("nativeSchedulers"))
                     .and_then(Value::as_array),
             ),
+            unhonorable_samplers: &[],
             per_pass_adapters: caps
                 .and_then(|c| c.get("perPassAdapters"))
                 .and_then(Value::as_bool)

@@ -1337,6 +1337,7 @@ pub fn descriptor() -> ModelDescriptor {
             // exception, not the rule — see `DenoisePassSurface::per_pass_adapters`.
             denoise_pass_surface: gen_core::DenoisePassSurface {
                 native_schedulers: &["flow_match"],
+                unhonorable_samplers: &[],
                 per_pass_adapters: true,
             },
             max_speakers: None,

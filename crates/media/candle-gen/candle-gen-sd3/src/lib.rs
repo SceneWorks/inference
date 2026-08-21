@@ -379,6 +379,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // `adapters` rather than accepting and ignoring it.
             denoise_pass_surface: gen_core::DenoisePassSurface {
                 native_schedulers: pipeline::NATIVE_SCHEDULERS,
+                unhonorable_samplers: &[],
                 per_pass_adapters: false,
             },
             max_speakers: None,

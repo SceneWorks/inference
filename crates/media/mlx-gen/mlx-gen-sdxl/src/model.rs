@@ -244,6 +244,15 @@ pub fn descriptor() -> ModelDescriptor {
             // Euler (sc-20425 item 3).
             denoise_pass_surface: mlx_gen::gen_core::DenoisePassSurface {
                 native_schedulers: crate::pipeline::NATIVE_SCHEDULERS,
+                // `lcm` and `euler_ancestral` ARE curated `Solver`s, and this crate advertises both
+                // — but on the flat path those names select the distilled few-step lane and the
+                // bespoke vendored ancestral loop, not the curated solvers of the same name. A
+                // chained pass naming either would render something the request did not name.
+                // Declaring them here is what makes the refusal and the PUBLISHED menu agree:
+                // `denoise_pass_capability()` subtracts them and the shared floor rejects them, from
+                // this one source of truth (sc-20425 review MAJOR 2). `lightning`/`hyper` need no
+                // entry — they are not curated `Solver`s, so they are already rejected.
+                unhonorable_samplers: CHAIN_AMBIGUOUS_SAMPLERS,
                 per_pass_adapters: false,
             },
             max_speakers: None,
@@ -1818,7 +1827,6 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.width, req.height
         )));
     }
-    validate_chained_sampler_names(req)?;
     Ok(())
 }
 
@@ -1829,43 +1837,17 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 /// acceleration LoRA at load; `euler_ancestral` is the bespoke vendored ancestral loop kept
 /// byte-exact as the production default. Both are also curated `Solver`s, so a chained pass naming
 /// either would validate against the advertised menu and then run the *curated* solver — a different
-/// image than the same name produces on a flat request, reported as success. That is the exact
-/// accept-and-mis-route class this epic exists to close, so the chain refuses them by name.
+/// image than the same name produces on a flat request, reported as success.
+///
+/// This is the descriptor's `denoise_pass_surface.unhonorable_samplers`, so it drives BOTH halves
+/// from one place: the shared floor rejects a pass (or an inherited request-level sampler) naming
+/// one, and `denoise_pass_capability()` subtracts them from the published per-pass menu. Publishing
+/// ids that are then refused was the advertise/honor mismatch this story exists to close, recreated
+/// one layer up (sc-20425 review MAJOR 2).
 ///
 /// The distilled `lightning` / `hyper` need no entry: they are not curated `Solver`s at all, so the
 /// shared floor already rejects them with `DenoisePassIssue::NotHonored`.
 pub(crate) const CHAIN_AMBIGUOUS_SAMPLERS: &[&str] = &["lcm", "euler_ancestral"];
-
-/// Refuse a chained plan whose sampler — per pass, or inherited from the flat request through the
-/// resolution ladder — is one of [`CHAIN_AMBIGUOUS_SAMPLERS`].
-fn validate_chained_sampler_names(req: &GenerationRequest) -> Result<()> {
-    let Some(passes) = req.denoise_passes.as_ref() else {
-        return Ok(());
-    };
-    let reject = |id: &str, where_: &str| {
-        Err(Error::Unsupported(format!(
-            "sdxl: {id:?} names this family's {} lane on a flat request, and the curated solver of \
-             the same name on a chained pass — the two render differently, so it is refused {where_} \
-             rather than silently substituted. Pick a sampler whose meaning does not change (euler, \
-             heun, dpmpp_2m, dpmpp_sde, uni_pc, ddim).",
-            if id == "lcm" { "distilled few-step" } else { "bespoke ancestral" }
-        )))
-    };
-    for (index, pass) in passes.iter().enumerate() {
-        if let Some(id) = pass.sampler.as_deref() {
-            if CHAIN_AMBIGUOUS_SAMPLERS.contains(&id) {
-                return reject(id, &format!("on pass {index}"));
-            }
-        }
-    }
-    // The ladder inherits the flat `sampler` for any pass that names none, so it is reachable too.
-    if let Some(id) = req.sampler.as_deref() {
-        if CHAIN_AMBIGUOUS_SAMPLERS.contains(&id) && passes.iter().any(|p| p.sampler.is_none()) {
-            return reject(id, "as the inherited request-level sampler");
-        }
-    }
-    Ok(())
-}
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
@@ -2148,14 +2130,22 @@ mod tests {
         assert!(cap.schedulers.contains(&defaults.scheduler.as_str()));
     }
 
-    /// The name-collision refusal (sc-20425): `lcm` and `euler_ancestral` are curated `Solver`s AND
-    /// this family's own distilled / bespoke lane names, so the same id renders differently on a flat
-    /// request than on a chained pass. The chain refuses them by name — per pass, and through the
-    /// resolution ladder's inherited request-level `sampler` — rather than substituting silently.
+    /// The name-collision refusal (sc-20425), and — after the review's MAJOR 2 — the guarantee that
+    /// the PUBLISHED menu agrees with it.
+    ///
+    /// `lcm` and `euler_ancestral` are curated `Solver`s AND this family's own distilled / bespoke
+    /// lane names, so the same id renders differently on a flat request than on a chained pass.
+    /// Refusing them was already right; refusing them while `denoise_pass_capability()` still listed
+    /// them meant a Studio per-pass editor built from `GeneratorCapabilitySnapshot` would offer both
+    /// and get `Error::Unsupported` — the advertise/honor mismatch this story exists to close,
+    /// recreated one layer up. Both halves now read `denoise_pass_surface.unhonorable_samplers`.
     #[test]
     fn a_chain_refuses_the_sampler_names_that_mean_a_different_lane_here() {
-        let base = |passes: Vec<mlx_gen::gen_core::DenoisePass>,
-                    sampler: Option<&str>|
+        let caps = descriptor().capabilities;
+        let cap = caps.denoise_pass_capability();
+        let ctx = caps.denoise_pass_context(None);
+        let chained = |passes: Vec<mlx_gen::gen_core::DenoisePass>,
+                       sampler: Option<&str>|
          -> GenerationRequest {
             GenerationRequest {
                 prompt: "a cat".into(),
@@ -2171,33 +2161,57 @@ mod tests {
             sampler: Some(id.to_owned()),
             ..Default::default()
         };
+        let defaults = sdxl_denoise_defaults();
 
         for id in CHAIN_AMBIGUOUS_SAMPLERS {
             assert!(
                 Solver::from_name(id).is_some(),
-                "{id} must be curated, or the shared floor would already reject it"
+                "{id} must be curated, or it would already be rejected as uncurated"
             );
-            let err = validate_chained_sampler_names(&base(vec![named(id)], None))
+            assert!(
+                caps.samplers.contains(id),
+                "{id} is still advertised for the flat lane"
+            );
+            // The PUBLISHED per-pass menu excludes it, so a consumer never offers it.
+            assert!(
+                !cap.samplers.contains(id),
+                "{id} must not be published as per-pass usable"
+            );
+            // And the shared floor refuses it, per pass...
+            let err = validate_request(&caps, &chained(vec![named(id)], None))
                 .expect_err("a per-pass ambiguous sampler must be refused");
             assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
-            // Inherited through the ladder by a pass that names nothing.
-            let err = validate_chained_sampler_names(&base(
-                vec![mlx_gen::gen_core::DenoisePass::default()],
-                Some(id),
-            ))
+            // ...and when a pass that names nothing INHERITS it from the flat request.
+            let err = validate_request(
+                &caps,
+                &chained(vec![mlx_gen::gen_core::DenoisePass::default()], Some(id)),
+            )
             .expect_err("an inherited ambiguous sampler must be refused");
             assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
-            // But NOT when every pass names its own unambiguous sampler.
-            assert!(validate_chained_sampler_names(&base(vec![named("ddim")], Some(id))).is_ok());
+            // ...and again when the plan resolves, for a caller that skipped the floor.
+            assert!(chained(vec![named(id)], None)
+                .resolve_denoise_plan(7, &defaults, &ctx)
+                .is_err());
+            // But NOT when every pass names its own unambiguous sampler: the flat value is then
+            // inherited by nothing.
+            assert!(validate_request(&caps, &chained(vec![named("ddim")], Some(id))).is_ok());
+            // And a request with no chain at all is untouched — the flat lane still honors it.
+            assert!(validate_request(
+                &caps,
+                &GenerationRequest {
+                    prompt: "a cat".into(),
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    sampler: Some((*id).to_owned()),
+                    ..Default::default()
+                }
+            )
+            .is_ok());
         }
-        // An unambiguous curated sampler passes.
-        assert!(validate_chained_sampler_names(&base(vec![named("dpmpp_2m")], None)).is_ok());
-        // And a request with no chain at all is untouched.
-        assert!(validate_chained_sampler_names(&GenerationRequest {
-            sampler: Some("lcm".into()),
-            ..Default::default()
-        })
-        .is_ok());
+        // An unambiguous curated sampler passes, and IS published.
+        assert!(validate_request(&caps, &chained(vec![named("dpmpp_2m")], None)).is_ok());
+        assert!(cap.samplers.contains(&"dpmpp_2m"));
     }
 
     #[test]

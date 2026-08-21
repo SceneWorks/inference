@@ -1762,6 +1762,54 @@ mod tests {
         assert!(native[0] > 10.0, "SDXL's σ_max is ≈14.6, got {}", native[0]);
     }
 
+    /// **The sc-20425 review's MINOR 8, on this family.** A pass that names no sampler inherits the
+    /// request's, so a chained request carrying a flat `sampler: "lightning"` reached the executor
+    /// before being refused — after the UNet had loaded. The shared floor now refuses it at
+    /// `Generator::validate`, naming the pass that would have inherited it, and the resolver refuses
+    /// it again for a caller that skipped the floor. The legacy single-pass lane still honors it.
+    #[test]
+    fn an_inherited_lightning_is_refused_before_the_model_loads() {
+        let caps = crate::descriptor().capabilities;
+        let ctx = caps.denoise_pass_context(None);
+        let defaults = crate::sdxl_denoise_defaults();
+        let base = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            sampler: Some("lightning".into()),
+            ..Default::default()
+        };
+
+        // Legacy single-pass: `lightning` is this family's few-step lane and stays honored.
+        assert!(caps.validate_request(crate::MODEL_ID, &base).is_ok());
+
+        // Chained, with a pass that names nothing: the flat value IS the pass's sampler.
+        let inheriting = GenerationRequest {
+            denoise_passes: Some(vec![gen_core::DenoisePass::default()]),
+            ..base.clone()
+        };
+        let err = caps
+            .validate_request(crate::MODEL_ID, &inheriting)
+            .expect_err("an inherited lightning must be refused at validate");
+        assert!(
+            matches!(err, gen_core::Error::Unsupported(_)),
+            "a capability gap must stay typed: {err:?}"
+        );
+        assert!(inheriting.resolve_denoise_plan(7, &defaults, &ctx).is_err());
+
+        // Chained, with every pass naming its own honorable sampler: nothing inherits it.
+        let all_named = GenerationRequest {
+            denoise_passes: Some(vec![gen_core::DenoisePass {
+                sampler: Some("ddim".to_owned()),
+                ..Default::default()
+            }]),
+            ..base
+        };
+        assert!(caps.validate_request(crate::MODEL_ID, &all_named).is_ok());
+        assert!(all_named.resolve_denoise_plan(7, &defaults, &ctx).is_ok());
+    }
+
     /// **The sc-20425 item-3 trap, on this family.** `lightning` is advertised in SDXL's *sampler*
     /// menu but is a distilled bespoke lane, not a curated `Solver`; before this it validated and
     /// then integrated as Euler. Both it and the MLX twin's `hyper` are now typed, pass-indexed

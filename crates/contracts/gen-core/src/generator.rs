@@ -2355,6 +2355,7 @@ impl Capabilities {
             samplers: (!self.samplers.is_empty()).then_some(self.samplers.as_slice()),
             schedulers: (!self.schedulers.is_empty()).then_some(self.schedulers.as_slice()),
             native_schedulers: self.denoise_pass_surface.native_schedulers,
+            unhonorable_samplers: self.denoise_pass_surface.unhonorable_samplers,
             supports_guidance: self.supports_guidance,
             per_pass_adapters: self.denoise_pass_surface.per_pass_adapters,
             loaded_adapters,
@@ -2407,7 +2408,7 @@ impl Capabilities {
                 .samplers
                 .iter()
                 .copied()
-                .filter(|id| crate::sampling::Solver::from_name(id).is_some())
+                .filter(|id| surface.honors_sampler(id))
                 .collect(),
             schedulers: self
                 .schedulers
@@ -2744,12 +2745,15 @@ impl Capabilities {
         // the same denoise (fresh-schedule-per-pass vs. slices of one global schedule), so a request
         // that sets both is rejected rather than silently resolved in favor of one.
         if let Some(passes) = &req.denoise_passes {
-            validate_denoise_passes(
-                passes,
-                req.phases.is_some(),
-                &self.denoise_pass_context(None),
-            )
-            .map_err(|err| err.into_gen_error(id))?;
+            let ctx = self.denoise_pass_context(None);
+            validate_denoise_passes(passes, req.phases.is_some(), &ctx)
+                .map_err(|err| err.into_gen_error(id))?;
+            // The request-level sampler/scheduler a pass INHERITS is as load-bearing as an explicit
+            // one, and the check above cannot see it (sc-20425 review MINOR 8). Without this, a
+            // chained request naming nothing per pass and carrying a flat `sampler: "lightning"`
+            // passed `validate` outright and was caught only inside the executor, after the load.
+            crate::denoise_passes::validate_inherited_pass_ids(req, &ctx)
+                .map_err(|err| err.into_gen_error(id))?;
         }
         req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {
