@@ -101,8 +101,9 @@ use std::path::PathBuf;
 use mlx_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, MemoryBackend,
     MemoryCalibrationIdentity, MemoryEvidenceKey, MemoryEvidenceLogRecord, MemoryGeometry,
-    MemoryMode, MemoryNumericTier, MemoryParityContract, MemoryParityResult, MemoryStrategy,
-    MemoryStrategyParameters, MemoryStrategySupport, Progress, TransformerComponent,
+    MemoryMode, MemoryNumericTier, MemoryParityContract, MemoryParityResult, MemoryReferenceShape,
+    MemoryStrategy, MemoryStrategyParameters, MemoryStrategySupport, Progress,
+    TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
@@ -1254,6 +1255,7 @@ fn evidence(
 ) -> MemoryEvidenceLogRecord {
     MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
+            model_family: "sana".to_owned(),
             resolved_route: entry.to_owned(),
             backend: MemoryBackend::Mlx,
             tier: MemoryNumericTier {
@@ -1263,6 +1265,7 @@ fn evidence(
             },
             load_shape: load.load_shape,
             mode: MemoryMode::TextToImage,
+            reference_shape: MemoryReferenceShape::None,
             overlay: None,
             geometry: MemoryGeometry {
                 width: edge,
@@ -1271,6 +1274,7 @@ fn evidence(
                 frames: 1,
                 reference_count: 0,
             },
+            frames_per_second: None,
             strategy,
             engaged_composition: contract.engaged_composition(strategy),
             // The exact parameters the measured row RAN with, taken from the request block rather

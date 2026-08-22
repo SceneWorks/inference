@@ -154,6 +154,9 @@ const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
 /// The payload after this prefix is compact JSON. Keeping the version outside the JSON makes mixed
 /// test output cheap to scan without accepting a legacy `SEQ_AB` line by accident.
 pub const MEMORY_EVIDENCE_V1_PREFIX: &str = "MEMORY_EVIDENCE_V1 ";
+/// Wire schema for [`MemoryEvidenceLogRecord`] payloads. The V1 line prefix is retained for log
+/// discovery; version 2 is required because the evidence cell gained family/reference/FPS axes.
+pub const MEMORY_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2652,6 +2655,38 @@ pub struct MemoryGeometry {
     pub reference_count: u32,
 }
 
+/// Shape of the reference input consumed by one provider request.
+///
+/// This is intentionally separate from [`MemoryGeometry::reference_count`].  A count says how
+/// many references are present; it does not say whether the provider consumed images, a clip, a
+/// mask, or another conditioning carrier.  Evidence for one carrier must never price another.
+/// `Other` keeps the contract extensible without silently collapsing future shapes into one key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryReferenceShape {
+    None,
+    Image,
+    Video,
+    Mask,
+    Other(String),
+}
+
+impl MemoryReferenceShape {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub fn as_key(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Mask => "mask",
+            Self::Other(shape) => shape,
+        }
+    }
+
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// One deterministic production latent used to judge a tiled-decode policy.
 ///
 /// `production_latent_provenance` names the immutable model revision, prompt fixture, denoise
@@ -3214,14 +3249,21 @@ impl MemoryEvidenceDimensions {
 /// Fully-qualified key for one evidence cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryEvidenceKey {
+    /// Resolved catalog family.  Engines shared by two catalog families must not share evidence.
+    pub model_family: String,
     pub resolved_route: String,
     pub backend: MemoryBackend,
     pub tier: MemoryNumericTier,
     /// Exact intra-phase materialization shape measured by this evidence cell.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
+    /// Carrier shape for the exact number of references in [`Self::geometry`].
+    pub reference_shape: MemoryReferenceShape,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
+    /// Exact output frame rate when the request has temporal output. `None` is the non-temporal
+    /// identity; it is not interchangeable with an arbitrary numeric rate.
+    pub frames_per_second: Option<u32>,
     pub strategy: MemoryStrategy,
     /// Exact, canonically ordered strategy set active when this evidence was measured.
     pub engaged_composition: Vec<MemoryStrategy>,
@@ -3235,6 +3277,27 @@ impl MemoryEvidenceKey {
                 .engaged_composition
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
+    }
+
+    fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.model_family.trim().is_empty() {
+            errors.push("evidence model family must be non-empty".to_owned());
+        }
+        if self.reference_shape.is_none() != (self.geometry.reference_count == 0) {
+            errors.push(
+                "evidence reference shape must be none exactly when reference count is zero"
+                    .to_owned(),
+            );
+        }
+        if matches!(&self.reference_shape, MemoryReferenceShape::Other(shape) if shape.trim().is_empty())
+        {
+            errors.push("evidence other reference shape must be non-empty".to_owned());
+        }
+        if self.frames_per_second == Some(0) {
+            errors.push("evidence frame rate must be positive when present".to_owned());
+        }
+        errors
     }
 }
 
@@ -3331,6 +3394,7 @@ impl MemoryEvidenceLogRecord {
     /// Validate the persisted protocol invariants before emitting a line.
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        errors.extend(self.key.validation_errors());
         if !self.key.has_canonical_engaged_composition() {
             errors.push(
                 "evidence engaged composition must be a non-empty canonical strategy set"
@@ -3440,7 +3504,7 @@ impl MemoryEvidenceLogRecord {
         }
 
         let json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": MEMORY_EVIDENCE_SCHEMA_VERSION,
             "key": evidence_key_json(&self.key),
             "declared_calibration": calibration_identity_json(&self.declared_calibration),
             "observed_calibration": calibration_identity_json(&self.observed_calibration),
@@ -3522,6 +3586,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({
+        "model_family": key.model_family,
         "resolved_route": key.resolved_route,
         "backend": key.backend.as_key(),
         "tier": {
@@ -3531,6 +3596,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
         },
         "load_shape": load_shape_key(key.load_shape),
         "mode": key.mode.as_key(),
+        "reference_shape": key.reference_shape.as_key(),
         "overlay": key.overlay,
         "geometry": {
             "width": key.geometry.width,
@@ -3539,6 +3605,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
             "frames": key.geometry.frames,
             "reference_count": key.geometry.reference_count,
         },
+        "frames_per_second": key.frames_per_second,
         "strategy": memory_strategy_key(key.strategy),
         "engaged_composition": key.engaged_composition.iter().copied().map(memory_strategy_key).collect::<Vec<_>>(),
         "parameters": {
@@ -5087,6 +5154,7 @@ mod tests {
         let contract = adopted_contract();
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
@@ -5096,6 +5164,7 @@ mod tests {
                 },
                 load_shape: contract.load_shape,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
@@ -5104,6 +5173,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
@@ -5556,6 +5626,7 @@ mod tests {
         let contract = adopted_contract();
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
@@ -5565,6 +5636,7 @@ mod tests {
                 },
                 load_shape: contract.load_shape,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 512,
@@ -5573,6 +5645,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
@@ -6116,11 +6189,13 @@ mod tests {
             MemoryCalibrationIdentity::new("test-layout-v1", LoadShape::EagerMaterialization);
         MemoryEvidenceLogRecord {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test_provider".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: bf16(),
                 load_shape: LoadShape::EagerMaterialization,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
@@ -6129,6 +6204,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::StagedResidency,
                 engaged_composition: vec![
                     MemoryStrategy::Resident,
@@ -6157,9 +6233,12 @@ mod tests {
         assert!(line.starts_with(MEMORY_EVIDENCE_V1_PREFIX));
         let value: serde_json::Value =
             serde_json::from_str(&line[MEMORY_EVIDENCE_V1_PREFIX.len()..]).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], MEMORY_EVIDENCE_SCHEMA_VERSION);
         assert_eq!(value["key"]["backend"], "mlx");
+        assert_eq!(value["key"]["model_family"], "test-family");
         assert_eq!(value["key"]["mode"], "text_to_image");
+        assert_eq!(value["key"]["reference_shape"], "none");
+        assert_eq!(value["key"]["frames_per_second"], serde_json::Value::Null);
         assert_eq!(value["key"]["load_shape"], "eager_materialization");
         assert_eq!(value["key"]["geometry"]["reference_count"], 0);
         assert_eq!(value["key"]["strategy"], "staged_residency");
@@ -6178,6 +6257,22 @@ mod tests {
 
     #[test]
     fn evidence_writer_rejects_identity_revision_and_fingerprint_drift() {
+        let mut record = evidence_log_record();
+        record.key.reference_shape = MemoryReferenceShape::Image;
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("reference shape"));
+
+        let mut record = evidence_log_record();
+        record.key.frames_per_second = Some(0);
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("frame rate"));
+
         let mut record = evidence_log_record();
         record.key.engaged_composition = vec![MemoryStrategy::Resident];
         assert!(record
