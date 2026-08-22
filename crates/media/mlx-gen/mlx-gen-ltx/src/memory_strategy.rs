@@ -20,7 +20,9 @@
 //! weights-free factory exists only for registry conformance and deliberately injects zero asset
 //! facts; production registry resolution never consults it.
 
-use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::asset_facts::{
+    projected_safetensors_bytes, projected_safetensors_tensors, ResidentProjection,
+};
 use mlx_gen::gen_core::{
     self, AdapterKind, AdapterResidencyMode, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
@@ -85,15 +87,65 @@ fn uncensored_enhancer_resident_bytes(spec: &LoadSpec) -> Result<u64> {
             "ltx_2_3: uncensored_enhancer must be a directory source".into(),
         ));
     };
-    // The amoral Gemma loader retains the packed affine tensors plus their on-disk scale/bias
-    // tensors; it does not materialize a dense copy. Stored safetensors bytes therefore price the
-    // exact artifact loaded by `load_uncensored_enhancer`. Its autoregressive KV work is bounded
-    // separately by the request-scope MAX_ENHANCE_TOKENS ceiling.
-    required_projected_safetensors_bytes(
-        path,
-        "uncensored Gemma enhancer",
-        ResidentProjection::Stored,
-    )
+    // The amoral Gemma loader retains packed affine tensors plus their on-disk scale/bias tensors,
+    // while its quantized token embedding is materialized as dense bf16. The projection below
+    // mirrors those two loader behaviors, so the exact artifact loaded by
+    // `load_uncensored_enhancer` is priced. Its autoregressive KV work is bounded separately by
+    // the request-scope MAX_ENHANCE_TOKENS ceiling.
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(mlx_gen::Error::from)?;
+    let projected = projected_safetensors_tensors(path, |_| ResidentProjection::Stored)
+        .map_err(mlx_gen::Error::from)?;
+    let bytes = projected.into_iter().try_fold(0_u64, |total, tensor| {
+        let resident = if tensor.name.ends_with("embed_tokens.weight") {
+            let header = headers
+                .iter()
+                .find(|header| header.name == tensor.name)
+                .ok_or_else(|| {
+                    mlx_gen::Error::Msg(format!(
+                        "ltx_2_3: missing header for uncensored Gemma tensor {:?}",
+                        tensor.name
+                    ))
+                })?;
+            header
+                .shape
+                .iter()
+                .try_fold(1_u64, |elements, dimension| {
+                    elements
+                        .checked_mul(u64::try_from(*dimension).map_err(|_| {
+                            mlx_gen::Error::Msg(format!(
+                                "ltx_2_3: uncensored Gemma tensor {:?} has an unrepresentable dimension",
+                                tensor.name
+                            ))
+                        })?)
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Msg(format!(
+                                "ltx_2_3: uncensored Gemma tensor {:?} element count overflows u64",
+                                tensor.name
+                            ))
+                        })
+                })?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    mlx_gen::Error::Msg(format!(
+                        "ltx_2_3: uncensored Gemma tensor {:?} bf16 size overflows u64",
+                        tensor.name
+                    ))
+                })?
+        } else {
+            tensor.resident_bytes
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma resident bytes overflow u64".into())
+        })
+    })?;
+    if bytes == 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "ltx_2_3: uncensored Gemma enhancer has no projected resident safetensors bytes at {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 struct AssetDeclaration {
@@ -1312,14 +1364,14 @@ mod tests {
     #[test]
     fn uncensored_enhancer_artifact_is_charged_to_conditioning_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let header = br#"{"gemma.weight":{"dtype":"F16","shape":[2,2],"data_offsets":[0,8]}}"#;
+        let header = br#"{"model.embed_tokens.weight":{"dtype":"U32","shape":[2,2],"data_offsets":[0,16]},"model.embed_tokens.scales":{"dtype":"F16","shape":[2,1],"data_offsets":[16,20]},"model.embed_tokens.biases":{"dtype":"F16","shape":[2,1],"data_offsets":[20,24]},"model.layer.weight":{"dtype":"F16","shape":[2,2],"data_offsets":[24,32]}}"#;
         let mut padded = header.to_vec();
         while (padded.len() + 8) % 8 != 0 {
             padded.push(b' ');
         }
         let mut file = (padded.len() as u64).to_le_bytes().to_vec();
         file.extend_from_slice(&padded);
-        file.extend_from_slice(&[0; 8]);
+        file.extend_from_slice(&[0; 32]);
         std::fs::write(dir.path().join("model.safetensors"), file).unwrap();
 
         let mut spec = fixture_spec();
@@ -1328,7 +1380,9 @@ mod tests {
             WeightsSource::Dir(dir.path().to_path_buf()),
         );
         let enhancer_bytes = uncensored_enhancer_resident_bytes(&spec).unwrap();
-        assert_eq!(enhancer_bytes, 8);
+        // The packed affine tensors retain their stored bytes, but the quantized embedding is
+        // dequantized to a dense bf16 table by `load_embedding` (8 B instead of its 16 B payload).
+        assert_eq!(enhancer_bytes, 24);
 
         let contract = build_contract(
             &spec,
