@@ -589,6 +589,8 @@ pub struct Bernini {
     device: Device,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
 }
 
 impl Bernini {
@@ -629,6 +631,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) = (None, None);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         knobs,
@@ -636,6 +642,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        memory_strategy,
+        memory_tier,
     }))
 }
 
@@ -694,6 +702,30 @@ impl Generator for Bernini {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         Ok(self.generate_impl(req, on_progress)?)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -1008,7 +1040,9 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let decoded = vae.decode_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
+        let decoded =
+            vae.decode_budgeted_with_cancel_and_tile_cap(&latents, &req.cancel, decode_cap)?;
         let images_out = frames_to_images(&decoded)?;
 
         if frames == 1 {

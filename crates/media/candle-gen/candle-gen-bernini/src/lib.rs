@@ -53,6 +53,7 @@ pub mod convert;
 pub mod forward;
 pub mod guidance;
 pub mod mar;
+pub mod memory_strategy;
 mod nn;
 pub mod pipeline;
 pub mod preprocess;
@@ -142,9 +143,23 @@ pub use vit_preprocess::{
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
-        .register_generator(bernini::FULL_REGISTRATION)
+        .register_generator(bernini::FULL_REGISTRATION);
+    #[cfg(any(feature = "cuda", test))]
+    let registry = memory_strategy::register_memory_strategy(registry)
+        .register_memory_behavior(memory_strategy::RENDERER_MEMORY_BEHAVIOR)
+        .register_memory_behavior(memory_strategy::FULL_MEMORY_BEHAVIOR);
+    registry
+}
+
+/// Register Bernini's weights-free memory-contract declarations in the catalog-only registry.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    // The non-CUDA catalog still needs the provider-owned registration callbacks as well as the
+    // weights-free fixtures; the callbacks fail closed until terminal CUDA evidence exists.
+    memory_strategy::register_memory_strategy(registry)
 }
 
 /// Build the complete explicit Candle Bernini provider catalog.
