@@ -918,7 +918,13 @@ impl Generator for Flux2 {
             return Ok(None);
         };
         if matches!(self.variant, Flux2Variant::Dev | Flux2Variant::DevEdit) {
-            return Ok(None);
+            let expected_tier = self.memory_numeric_tier.ok_or_else(|| {
+                mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{} has no loaded numeric tier for memory admission",
+                    self.descriptor.id
+                ))
+            })?;
+            return crate::memory_strategy::begin_dev_request(contract, context, expected_tier);
         }
         crate::memory_strategy::begin_klein_request(&self.loaded_spec, contract, context)
     }
@@ -1722,6 +1728,20 @@ pub(crate) const KLEIN_KV_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehavio
         provider_id: crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
         valid_fixtures: crate::memory_strategy::registered_klein_fixture,
         begin_request: crate::memory_strategy::registered_klein_begin_request,
+    };
+
+pub(crate) const DEV_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::config::FLUX2_DEV_ID,
+        valid_fixtures: crate::memory_strategy::registered_dev_fixture,
+        begin_request: crate::memory_strategy::registered_dev_begin_request,
+    };
+
+pub(crate) const DEV_EDIT_MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
+    mlx_gen::gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::config::FLUX2_DEV_EDIT_ID,
+        valid_fixtures: crate::memory_strategy::registered_dev_fixture,
+        begin_request: crate::memory_strategy::registered_dev_begin_request,
     };
 
 #[cfg(test)]
