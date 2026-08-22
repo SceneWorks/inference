@@ -1377,6 +1377,17 @@ mod tests {
                 ..
             }]
         ));
+        assert_eq!(
+            control_fixture.request.image_reference_count(),
+            control_fixture.context.geometry.reference_count,
+            "the control map must be part of the exact admitted request geometry"
+        );
+        let mut crossed_control_context = control_fixture.context.clone();
+        crossed_control_context.overlay = None;
+        assert!(matches!(
+            registered_dev_control_safety_check(&control_spec, &control, &crossed_control_context),
+            MemorySafetyDecision::Reject { .. }
+        ));
         let mut control_scope =
             registered_dev_begin_request(&control_spec, &control, &control_fixture.context)
                 .unwrap()
