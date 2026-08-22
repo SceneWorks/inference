@@ -11,11 +11,12 @@
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Quant,
-    TransformerComponent,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
+    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, Quant, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -31,10 +32,10 @@ pub fn contract_for_variant(
     spec: &LoadSpec,
 ) -> mlx_gen::Result<Option<MemoryProviderContract>> {
     if variant == Flux2Variant::Dev {
-        return Ok(Some(build_dev_t2i_contract()));
+        return Ok(Some(build_dev_t2i_contract_for_spec(spec)));
     }
     if variant == Flux2Variant::DevEdit {
-        return Ok(Some(build_contract()));
+        return Ok(Some(build_contract_for_spec(spec)));
     }
     if matches!(
         variant,
@@ -45,7 +46,7 @@ pub fn contract_for_variant(
     Ok(None)
 }
 
-fn build_contract() -> MemoryProviderContract {
+fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_EDIT_ID,
         MemoryBackendRealization::MlxMetal {
@@ -55,6 +56,8 @@ fn build_contract() -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    // The only base/edit calibration receipts are eager-load captures.  A sequential lifecycle
+    // releases phases after that eager assembly; it is not deferred-materialization evidence.
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.formula = MemoryFormulaKind::Affine {
         variables: vec![
@@ -66,15 +69,11 @@ fn build_contract() -> MemoryProviderContract {
         CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
-    for capability in &mut contract.strategies {
-        if capability.strategy != MemoryStrategy::Resident {
-            capability.support = MemoryStrategySupport::Missing;
-        }
-    }
+    configure_dev_staged_residency(&mut contract, spec, true);
     contract
 }
 
-fn build_dev_t2i_contract() -> MemoryProviderContract {
+fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_ID,
         MemoryBackendRealization::MlxMetal {
@@ -84,6 +83,7 @@ fn build_dev_t2i_contract() -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    // See the edit contract above: this fingerprint remains bound to the measured eager load.
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.formula = MemoryFormulaKind::Affine {
         variables: vec![
@@ -95,15 +95,58 @@ fn build_dev_t2i_contract() -> MemoryProviderContract {
         DEV_T2I_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    configure_dev_staged_residency(&mut contract, spec, true);
     contract
+}
+
+#[cfg(test)]
+fn build_contract() -> MemoryProviderContract {
+    build_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
+}
+
+#[cfg(test)]
+fn build_dev_t2i_contract() -> MemoryProviderContract {
+    build_dev_t2i_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
+}
+
+/// Publish only the request-selectable lifecycle the Dev providers actually execute.  The
+/// sequential residency seam materializes conditioning and releases it before the heavy phase;
+/// activation/decode/transformer rungs remain Missing until route-specific evidence exists.
+fn configure_dev_staged_residency(
+    contract: &mut MemoryProviderContract,
+    spec: &LoadSpec,
+    route_is_configured: bool,
+) {
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
+        ..Default::default()
+    };
+    for capability in &mut contract.strategies {
+        capability.support = match capability.strategy {
+            MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
+            MemoryStrategy::StagedResidency
+                if route_is_configured
+                    && matches!(spec.offload_policy, OffloadPolicy::Sequential)
+                    && spec.load_shape == LoadShape::EagerMaterialization =>
+            {
+                MemoryStrategySupport::Implemented
+            }
+            _ => MemoryStrategySupport::Missing,
+        };
+    }
 }
 
 /// Honest pre-calibration contract for the standalone MLX Fun-Controlnet route.
 ///
-/// The provider has a real resident execution path and a registered component-footprint fallback,
-/// but no control-specific optimization evidence. Keep every optimized rung Missing and calibration
-/// absent rather than borrowing the base Dev receipt. The route/tier safety gate below remains fully
-/// load-exact. Asset facts deliberately remain empty: the registry fallback prices the base split,
+/// The provider has a real resident execution path, a request-selectable sequential lifecycle, and
+/// a registered component-footprint fallback. It has no control-specific calibration evidence, so
+/// its staged strategy remains estimate-authorized only; the route/tier safety gate below remains
+/// fully load-exact. Asset facts deliberately remain empty: the registry fallback prices the base split,
 /// while its consumer adds the control checkpoint. Relabelling that estimate as provider load-exact
 /// facts would hide the runtime distinction between an effective packed base and a dense control
 /// branch when no explicit quantization request was made.
@@ -118,15 +161,9 @@ fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.lifecycle = MemoryLifecycleCapabilities {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
-        ..Default::default()
-    };
+    // Unlike base/edit, this route is not complete without its separately-addressed control
+    // artifact.  Do not publish a selectable staged rung for a bare base `LoadSpec`.
+    configure_dev_staged_residency(&mut contract, spec, spec.control.is_some());
     contract
 }
 
@@ -228,17 +265,22 @@ pub fn dev_control_safety_check(
             )));
         }
         if context.mode != MemoryMode::TextToImage
-            || context.has_reference
-            || context.geometry.reference_count != 0
+            || !context.has_reference
+            || context.geometry.reference_count != 1
             || context.overlay.as_deref() != Some(DEV_CONTROL_OVERLAY)
         {
             return Err(CoreError::Unsupported(format!(
-                "{FLUX2_DEV_CONTROL_ID}: memory-safety context must describe reference-free text-to-image with the control overlay"
+                "{FLUX2_DEV_CONTROL_ID}: memory-safety context must describe text-to-image with exactly one control image and the control overlay"
             )));
         }
         if context.load_shape != contract.load_shape {
             return Err(CoreError::Unsupported(format!(
                 "{FLUX2_DEV_CONTROL_ID}: memory context load shape does not match the loaded contract"
+            )));
+        }
+        if context.calibration_abi != 0 || !context.calibration_fingerprint.is_empty() {
+            return Err(CoreError::Unsupported(format!(
+                "{FLUX2_DEV_CONTROL_ID}: uncalibrated control staging must carry the explicit empty calibration handshake"
             )));
         }
         if context.use_pid {
@@ -264,7 +306,7 @@ pub fn dev_control_safety_check(
 pub fn registered_dev_contract(
     _spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract())
+    Ok(build_contract_for_spec(_spec))
 }
 
 pub fn registered_dev_safety_check(
@@ -283,7 +325,7 @@ pub fn registered_dev_safety_check(
 pub fn registered_dev_t2i_contract(
     _spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_dev_t2i_contract())
+    Ok(build_dev_t2i_contract_for_spec(_spec))
 }
 
 pub fn registered_dev_t2i_safety_check(
@@ -325,6 +367,187 @@ pub fn registered_dev_control_safety_check(
             reason: error.to_string(),
         },
     }
+}
+
+/// Provider-owned, weights-free conformance fixtures for the exact FLUX.2 Dev routes.
+///
+/// A staged selection is meaningful only after a sequential load.  Each fixture carries the real
+/// route mode, overlay and reference cardinality, so registry conformance cannot accidentally use
+/// text-to-image evidence to authorize edit or control behavior.
+pub(crate) fn registered_dev_fixture(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> mlx_gen::gen_core::Result<Vec<MemoryBehaviorFixture>> {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
+        return Ok(Vec::new());
+    }
+
+    let tier = crate::model::effective_dev_memory_numeric_tier(spec, &contract.provider_id)?;
+    let route = match contract.provider_id.as_str() {
+        FLUX2_DEV_ID => MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: true,
+            overlay: None,
+        },
+        FLUX2_DEV_EDIT_ID => MemoryBehaviorRoute {
+            mode: MemoryMode::Edit,
+            reference_count: 2,
+            use_pid: false,
+            has_phases: true,
+            overlay: None,
+        },
+        FLUX2_DEV_CONTROL_ID => {
+            return Ok(vec![dev_control_fixture(contract, strategy, tier)?]);
+        }
+        provider_id => {
+            return Err(CoreError::Unsupported(format!(
+                "unknown FLUX.2 Dev memory provider {provider_id}"
+            )))
+        }
+    };
+    let context =
+        mlx_gen::gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?;
+    Ok(vec![executable_dev_fixture(context)])
+}
+
+fn executable_dev_fixture(context: MemoryRunContext) -> MemoryBehaviorFixture {
+    let mut fixture = MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free FLUX.2 Dev memory behavior".to_owned();
+    if fixture.context.mode == MemoryMode::Edit {
+        fixture.request.conditioning = vec![mlx_gen::Conditioning::MultiReference {
+            images: (0..fixture.context.geometry.reference_count)
+                .map(|_| mlx_gen::media::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                })
+                .collect(),
+        }];
+    }
+    fixture
+}
+
+fn dev_control_fixture(
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+    tier: MemoryNumericTier,
+) -> mlx_gen::gen_core::Result<MemoryBehaviorFixture> {
+    let context = MemoryRunContext {
+        selection: contract.representative_selection(strategy, tier, false)?,
+        // The control route intentionally has no measured calibration.  Its staged lifecycle is
+        // admitted under the explicit conservative estimate class, never a borrowed Dev/Edit key.
+        optimization_authority: MemoryOptimizationAuthority::Estimated,
+        calibration_abi: 0,
+        calibration_fingerprint: String::new(),
+        load_shape: contract.load_shape,
+        mode: MemoryMode::TextToImage,
+        // `GenerationRequest::image_reference_count` includes a control map. This is not an edit
+        // reference semantically, but it is part of the exact admitted geometry seen by the scope.
+        has_reference: true,
+        use_pid: false,
+        // The control sampler is intentionally single-phase; its sequential lifetime releases
+        // model components between conditioning, denoise, and decode rather than accepting the
+        // multi-phase denoise request feature.
+        has_phases: false,
+        geometry: mlx_gen::gen_core::MemoryGeometry {
+            width: 1024,
+            height: 1024,
+            batch: 1,
+            frames: 1,
+            reference_count: 1,
+        },
+        overlay: Some(DEV_CONTROL_OVERLAY.to_owned()),
+        budget: MemoryBudget {
+            total_bytes: 8 * 1024 * 1024 * 1024,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        },
+        predicted_peak_bytes: 1024 * 1024 * 1024,
+        cache_state: MemoryCacheState::Cold,
+        evidence_revision: "weights-free-flux2-dev-control-estimate".to_owned(),
+    };
+    let mut fixture = MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = "weights-free FLUX.2 Dev control memory behavior".to_owned();
+    fixture.request.conditioning = vec![mlx_gen::Conditioning::Control {
+        image: mlx_gen::media::Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        },
+        kind: mlx_gen::ControlKind::Pose,
+        scale: None,
+    }];
+    Ok(fixture)
+}
+
+pub(crate) fn registered_dev_begin_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    let tier = crate::model::effective_dev_memory_numeric_tier(spec, &contract.provider_id)?;
+    begin_dev_request(contract, context, tier)
+}
+
+/// Open the shared request scope for the one non-resident Dev strategy.  Residency itself is
+/// selected before load through `LoadSpec::offload_policy`; the scope records that request choice,
+/// installs the typed generation-memory marker, and guarantees terminal cleanup on success,
+/// cancellation, or error.  It deliberately refuses any decode validator use because no Dev
+/// decode rung is advertised by this contract.
+pub(crate) fn begin_dev_request(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    expected_tier: MemoryNumericTier,
+) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    let decision = match contract.provider_id.as_str() {
+        FLUX2_DEV_ID => dev_t2i_safety_check(contract, context, expected_tier),
+        FLUX2_DEV_EDIT_ID => safety_check(contract, context, expected_tier),
+        FLUX2_DEV_CONTROL_ID => dev_control_safety_check(contract, context, expected_tier),
+        provider => MemorySafetyDecision::Reject {
+            reason: format!("unknown FLUX.2 Dev memory provider {provider}"),
+        },
+    };
+    if let MemorySafetyDecision::Reject { reason } = decision {
+        return Err(CoreError::Unsupported(reason));
+    }
+    if !context.selection.strategy.is_optimized() {
+        return Ok(None);
+    }
+    let provider_id = match contract.provider_id.as_str() {
+        FLUX2_DEV_ID => FLUX2_DEV_ID,
+        FLUX2_DEV_EDIT_ID => FLUX2_DEV_EDIT_ID,
+        FLUX2_DEV_CONTROL_ID => FLUX2_DEV_CONTROL_ID,
+        _ => unreachable!("provider was checked above"),
+    };
+    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+        provider_id,
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        false,
+        48,
+        |_use_pid, _edge, _overlap| {
+            Err(CoreError::Unsupported(
+                "FLUX.2 Dev does not expose a bounded-decode strategy".to_owned(),
+            ))
+        },
+    )?;
+    Ok(Some(Box::new(
+        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
+            config,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        ),
+    )))
 }
 
 // ---- FLUX.2 Klein shared image-memory ladder (SC-15518) -------------------------------
@@ -1058,6 +1281,114 @@ mod tests {
             reason.contains("cannot execute StagedResidency"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn sequential_dev_contracts_publish_only_staged_residency_and_open_a_cleanup_scope() {
+        let spec = LoadSpec::new(WeightsSource::Dir(Default::default()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let t2i = build_dev_t2i_contract_for_spec(&spec);
+        let edit = build_contract_for_spec(&spec);
+        let control_spec = spec.clone().with_control(WeightsSource::File(
+            "/nonexistent/flux2-dev-fun-controlnet-union.safetensors".into(),
+        ));
+        let control = build_dev_control_contract(&control_spec);
+        for contract in [&t2i, &edit, &control] {
+            assert!(contract.lifecycle.synchronized_phase_release);
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::StagedResidency)
+                    .expect("complete ladder")
+                    .support,
+                MemoryStrategySupport::Implemented,
+                "{} must expose the loaded sequential lifecycle",
+                contract.provider_id
+            );
+            for strategy in [
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ] {
+                assert_eq!(
+                    contract
+                        .capability(strategy)
+                        .expect("complete ladder")
+                        .support,
+                    MemoryStrategySupport::Missing,
+                    "{} must not borrow {strategy:?} evidence",
+                    contract.provider_id
+                );
+            }
+        }
+
+        assert_eq!(
+            build_dev_control_contract(&spec)
+                .capability(MemoryStrategy::StagedResidency)
+                .expect("complete ladder")
+                .support,
+            MemoryStrategySupport::Missing,
+            "a control memory strategy must not be selectable before its overlay is configured"
+        );
+        let deferred_spec = spec
+            .clone()
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        assert_eq!(
+            build_dev_t2i_contract_for_spec(&deferred_spec)
+                .capability(MemoryStrategy::StagedResidency)
+                .expect("complete ladder")
+                .support,
+            MemoryStrategySupport::Missing,
+            "eager-only Dev calibration must not be relabelled as deferred-materialization evidence"
+        );
+
+        let mut context = dev_t2i_context(128.0);
+        context.selection.strategy = MemoryStrategy::StagedResidency;
+        context.optimization_authority = mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated;
+        context.load_shape = spec.load_shape;
+        context.calibration_abi = t2i.calibration.as_ref().unwrap().abi;
+        context.calibration_fingerprint = t2i.calibration.as_ref().unwrap().fingerprint.clone();
+        let mut request = GenerationRequest::default();
+        let mut scope = begin_dev_request(&t2i, &context, context.selection.tier)
+            .unwrap()
+            .expect("staged selection must open a request scope");
+        scope.configure_request(&mut request).unwrap();
+        assert!(request.memory.expect("configured request").stage_residency);
+        scope
+            .finish(mlx_gen::gen_core::MemoryRunOutcome::Canceled)
+            .unwrap();
+
+        let mut control_fixture =
+            registered_dev_fixture(&control_spec, &control, MemoryStrategy::StagedResidency)
+                .unwrap()
+                .pop()
+                .expect("configured control route must have a behavior fixture");
+        assert!(matches!(
+            registered_dev_control_safety_check(&control_spec, &control, &control_fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        assert_eq!(
+            control_fixture.context.overlay.as_deref(),
+            Some(DEV_CONTROL_OVERLAY)
+        );
+        assert!(matches!(
+            control_fixture.request.conditioning.as_slice(),
+            [mlx_gen::Conditioning::Control {
+                kind: mlx_gen::ControlKind::Pose,
+                ..
+            }]
+        ));
+        let mut control_scope =
+            registered_dev_begin_request(&control_spec, &control, &control_fixture.context)
+                .unwrap()
+                .expect("configured control staging must open a request scope");
+        control_scope
+            .configure_request(&mut control_fixture.request)
+            .unwrap();
+        control_scope
+            .finish(mlx_gen::gen_core::MemoryRunOutcome::Error {
+                message: "weights-free cleanup probe".to_owned(),
+            })
+            .unwrap();
     }
 
     #[test]
