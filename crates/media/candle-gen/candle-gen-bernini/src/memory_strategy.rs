@@ -8,14 +8,17 @@
 //! intentionally absent until the Windows/CUDA real-weight campaign exists.
 
 use candle_gen::candle_core::Device;
+use std::path::Path;
+
 use candle_gen::gen_core::LoadShape;
 use candle_gen::gen_core::{
     self, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryWindowMaterialization, ResidentRequestMemory,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
+    ResidentRequestMemory,
 };
 #[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryMode};
@@ -23,10 +26,13 @@ use candle_gen::{CandleError, Result as CandleResult};
 
 use crate::config::Defaults;
 use candle_gen_wan::config::{DEFAULT_FRAMES_14B, MAX_AREA_14B, SIZE_MULTIPLE_14B};
+use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-v2v-v1";
+pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
+    &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
 
 fn tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
@@ -34,6 +40,141 @@ fn tier(spec: &LoadSpec) -> MemoryNumericTier {
         quant: spec.quantize,
         component_precision_floors: &[],
     }
+}
+
+fn validate_geometry(width: u32, height: u32) -> gen_core::Result<()> {
+    if ADVERTISED_GEOMETRIES.contains(&(width, height)) {
+        Ok(())
+    } else {
+        Err(gen_core::Error::Unsupported(format!(
+            "Bernini memory evidence requires one of the advertised geometries {ADVERTISED_GEOMETRIES:?}, got {width}x{height}"
+        )))
+    }
+}
+
+fn known_provider(provider_id: &str) -> gen_core::Result<()> {
+    [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID]
+        .contains(&provider_id)
+        .then_some(())
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!("unknown Bernini provider {provider_id}"))
+        })
+}
+
+fn component_bytes(root: &Path, component: &str) -> gen_core::Result<u64> {
+    let path = root.join(component);
+    let bytes = gen_core::weightsmeta::safetensors_path_bytes(&path);
+    if bytes == 0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini Candle memory contract requires a non-empty {component} safetensors component at {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<u8>> {
+    let path = root.join(component).join("quantize_config.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            gen_core::Error::Unsupported(format!(
+                "{}: invalid quant marker: {error}",
+                path.display()
+            ))
+        })?;
+    let bits = value
+        .get("bits")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!("{}: quant marker has no bits", path.display()))
+        })?;
+    u8::try_from(bits).map(Some).map_err(|_| {
+        gen_core::Error::Unsupported(format!(
+            "{}: quant marker bits {bits} is out of range",
+            path.display()
+        ))
+    })
+}
+
+fn validate_quant_tier(root: &Path, spec: &LoadSpec, provider_id: &str) -> gen_core::Result<()> {
+    let expected = match spec.quantize {
+        None => 0,
+        Some(gen_core::Quant::Q4) => 4,
+        Some(gen_core::Quant::Q8) => 8,
+        Some(other) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini Candle memory contract does not recognize quant tier {other:?}"
+            )))
+        }
+    };
+    let components = if provider_id == crate::bernini::MODEL_ID {
+        ["transformer", "transformer_2", "mllm"].as_slice()
+    } else {
+        ["transformer", "transformer_2"].as_slice()
+    };
+    for component in components {
+        let marker = quant_marker(root, component)?;
+        let actual = marker.unwrap_or(0);
+        if actual != expected {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini Candle tier {:?} crossed {component} marker {actual}-bit (expected {expected}-bit)",
+                spec.quantize
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn adapter_identity(spec: &LoadSpec) -> gen_core::Result<(u64, String)> {
+    if spec.adapters.is_empty() {
+        return Ok((0, String::new()));
+    }
+    let mut total = 0_u64;
+    let mut identities = Vec::with_capacity(spec.adapters.len());
+    for adapter in &spec.adapters {
+        let bytes = std::fs::read(&adapter.path).map_err(|error| {
+            gen_core::Error::Unsupported(format!(
+                "Bernini adapter {} is not readable: {error}",
+                adapter.path.display()
+            ))
+        })?;
+        if bytes.is_empty() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini adapter {} is empty",
+                adapter.path.display()
+            )));
+        }
+        // The digest and resident bytes come from this same verified read. The metadata helper is
+        // only a loadability/extension guard; a second stat must never become the priced source.
+        let file_bytes = u64::try_from(bytes.len())
+            .map_err(|_| gen_core::Error::Msg("Bernini adapter byte length overflow".into()))?;
+        if gen_core::weightsmeta::safetensors_path_bytes(&adapter.path) != file_bytes
+            || file_bytes == 0
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini adapter {} is not a non-empty load-exact safetensors artifact",
+                adapter.path.display()
+            )));
+        }
+        let expert_count = if adapter.moe_expert.is_none() { 2 } else { 1 };
+        total = total
+            .checked_add(file_bytes.saturating_mul(expert_count))
+            .ok_or_else(|| {
+                gen_core::Error::Msg("Bernini adapter resident bytes overflow".into())
+            })?;
+        identities.push(format!(
+            "artifact={};digest=sha256:{:x};kind={:?};scale={:.9};expert={:?}",
+            adapter.path.display(),
+            Sha256::digest(&bytes),
+            adapter.kind,
+            adapter.scale,
+            adapter.moe_expert
+        ));
+    }
+    Ok((total, format!("adapters:[{}]", identities.join(","))))
 }
 
 fn strategies() -> Vec<MemoryStrategyCapability> {
@@ -66,12 +207,46 @@ fn contract(
     provider_id: &str,
     spec: &LoadSpec,
     calibration: Option<MemoryCalibrationIdentity>,
+    facts: MemoryAssetFacts,
+    adapter_identity: Option<String>,
 ) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
         MemoryPhase::Decode,
     ];
+    let mut variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::FrameCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::DecodeTileArea,
+    ];
+    let resident_components = if facts.overlay_bytes > 0 {
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+        vec![MemoryResidentComponent {
+            id: adapter_identity.unwrap_or_else(|| "adapter_stack".to_owned()),
+            kind: MemoryComponentKind::AdapterStack,
+            resident_bytes: facts.overlay_bytes,
+            bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
+        }]
+    } else {
+        Vec::new()
+    };
+    let formula = if resident_components.is_empty() {
+        MemoryFormulaKind::PhaseEnvelope {
+            phases: phases.clone(),
+            variables,
+        }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: phases.clone(),
+            variables,
+            resident_components,
+        }
+    };
     MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -94,19 +269,9 @@ fn contract(
             attention_chunking: false,
             transformer_window_materialization: false,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
-            phases,
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::FrameCount,
-                MemoryFormulaVariable::BatchCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                MemoryFormulaVariable::DecodeTileArea,
-            ],
-        },
+        formula,
         calibration,
-        asset_facts: MemoryAssetFacts::default(),
+        asset_facts: facts,
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     }
 }
@@ -131,18 +296,74 @@ pub fn weights_free_memory_strategy_contract(
             STATIC_CALIBRATION,
             spec.load_shape,
         )),
+        MemoryAssetFacts::default(),
+        None,
     ))
 }
 
-/// Real loads currently expose no contract: no Windows/CUDA evidence has been minted.
+fn production_assets(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<(MemoryAssetFacts, MemoryNumericTier, Option<String>)> {
+    known_provider(provider_id)?;
+    let gen_core::WeightsSource::Dir(root) = &spec.weights else {
+        return Err(gen_core::Error::Unsupported(
+            "Bernini Candle memory contract requires a snapshot directory".into(),
+        ));
+    };
+    if spec.load_shape != LoadShape::EagerMaterialization {
+        return Err(gen_core::Error::Unsupported(
+            "Bernini Candle memory contract requires EagerMaterialization".into(),
+        ));
+    }
+    validate_quant_tier(root, spec, provider_id)?;
+    let conditioning = component_bytes(root, "text_encoder")?;
+    let transformer = component_bytes(root, "transformer")?
+        .checked_add(component_bytes(root, "transformer_2")?)
+        .ok_or_else(|| gen_core::Error::Msg("Bernini transformer bytes overflow".into()))?;
+    let decoder = component_bytes(root, "vae")?;
+    let planner = if provider_id == crate::bernini::MODEL_ID {
+        ["mllm", "connector", "vit_decoder"]
+            .into_iter()
+            .map(|component| component_bytes(root, component))
+            .try_fold(0_u64, |total, next| {
+                total
+                    .checked_add(next?)
+                    .ok_or_else(|| gen_core::Error::Msg("Bernini planner bytes overflow".into()))
+            })?
+    } else {
+        0
+    };
+    let (overlay_bytes, overlay_identity) = adapter_identity(spec)?;
+    let facts = MemoryAssetFacts {
+        base_bytes: conditioning
+            .checked_add(planner)
+            .and_then(|value| value.checked_add(transformer))
+            .and_then(|value| value.checked_add(decoder))
+            .ok_or_else(|| gen_core::Error::Msg("Bernini base bytes overflow".into()))?,
+        conditioning_bytes: conditioning
+            .checked_add(planner)
+            .ok_or_else(|| gen_core::Error::Msg("Bernini conditioning bytes overflow".into()))?,
+        transformer_bytes: transformer,
+        decoder_bytes: decoder,
+        overlay_bytes,
+    };
+    Ok((
+        facts,
+        tier(spec),
+        (!overlay_identity.is_empty()).then_some(overlay_identity),
+    ))
+}
+
+/// Real loads expose load-exact asset/tier identity, but no calibration identity until the
+/// Windows/CUDA evidence campaign exists. That makes the shared selector reachable while every
+/// optimized selection still refuses through the normal uncalibrated contract path.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let _ = (provider_id, spec);
-    Err(gen_core::Error::Unsupported(
-        "Bernini Candle memory contract has no production calibration evidence".to_owned(),
-    ))
+    let (facts, _tier, adapter_identity) = production_assets(provider_id, spec)?;
+    Ok(contract(provider_id, spec, None, facts, adapter_identity))
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
@@ -173,20 +394,33 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
             contract.provider_id
         )));
     }
-    if let Some(overlay) = context.overlay.as_deref() {
-        if let Some(adapter_axis) = overlay
+    validate_geometry(context.geometry.width, context.geometry.height)?;
+    if context.overlay.as_deref().is_some_and(|overlay| {
+        overlay
+            .split('+')
+            .find(|axis| axis.starts_with("provider_video_mode:"))
+            .is_some_and(|axis| axis != "provider_video_mode:v2v")
+    }) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{} provider video mode overlay crossed the v2v contract",
+            contract.provider_id
+        )));
+    }
+    let adapter_axis = context.overlay.as_deref().and_then(|overlay| {
+        overlay
             .split('+')
             .find(|axis| axis.starts_with("adapters:["))
-        {
-            for field in ["artifact=", "digest=sha256:", "kind=", "scale=", "expert="] {
-                if !adapter_axis.contains(field) {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "{} adapter overlay is missing exact {field} identity",
-                        contract.provider_id
-                    )));
-                }
-            }
-        }
+    });
+    let expected_adapter_axis = contract
+        .resident_components()
+        .iter()
+        .find(|component| component.kind == MemoryComponentKind::AdapterStack)
+        .map(|component| component.id.as_str());
+    if adapter_axis != expected_adapter_axis {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{} adapter artifact identity is missing or crossed the loaded contract",
+            contract.provider_id
+        )));
     }
     let area = u64::from(context.geometry.width) * u64::from(context.geometry.height);
     if !context.geometry.width.is_multiple_of(SIZE_MULTIPLE_14B)
@@ -250,6 +484,7 @@ fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
                 .to_owned(),
         ));
     }
+    validate_geometry(request.width, request.height)?;
     Ok(())
 }
 
@@ -290,12 +525,17 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
 
 #[cfg(any(feature = "cuda", test))]
 pub fn contract_for_loaded(
-    _spec: &LoadSpec,
-    _provider_id: &str,
+    spec: &LoadSpec,
+    provider_id: &str,
 ) -> gen_core::Result<Option<(MemoryProviderContract, MemoryNumericTier)>> {
-    // No production fingerprint or adapter artifact digest exists yet. Keep the generator's
-    // historical path available while refusing optimized admission until the Windows/CUDA campaign.
-    Ok(None)
+    let (facts, loaded_tier, adapter_identity) = match production_assets(provider_id, spec) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((
+        contract(provider_id, spec, None, facts, adapter_identity),
+        loaded_tier,
+    )))
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -559,5 +799,112 @@ mod tests {
         request.video_mode = Some("v2v".to_owned());
         request.fps = Some(24);
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn candle_bernini_scope_admits_only_advertised_geometry_and_frames() {
+        for &(width, height) in ADVERTISED_GEOMETRIES {
+            for frames in [45, 61, 77] {
+                let request = GenerationRequest {
+                    prompt: "v2v".to_owned(),
+                    width,
+                    height,
+                    frames: Some(frames),
+                    fps: Some(16),
+                    video_mode: Some("v2v".to_owned()),
+                    conditioning: vec![Conditioning::VideoClip {
+                        frames: vec![gen_core::Image {
+                            width: 2,
+                            height: 2,
+                            pixels: vec![0; 12],
+                        }],
+                        frame_idx: 0,
+                        strength: 1.0,
+                    }],
+                    ..Default::default()
+                };
+                assert!(
+                    validate_request(&request).is_ok(),
+                    "{width}x{height}/{frames}"
+                );
+            }
+        }
+        let mut crossed = GenerationRequest {
+            width: 640,
+            height: 640,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("v2v".to_owned()),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![gen_core::Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0; 12],
+                }],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_request(&crossed).is_err());
+        crossed.width = 848;
+        crossed.height = 480;
+        crossed.fps = Some(24);
+        assert!(validate_request(&crossed).is_err());
+    }
+
+    #[test]
+    fn candle_bernini_loaded_contract_prices_shared_adapter_per_expert_and_exact_tier() {
+        let root = tempfile::tempdir().unwrap();
+        for component in [
+            "text_encoder",
+            "transformer",
+            "transformer_2",
+            "mllm",
+            "connector",
+            "vit_decoder",
+            "vae",
+        ] {
+            std::fs::create_dir_all(root.path().join(component)).unwrap();
+            std::fs::write(
+                root.path().join(component).join("model.safetensors"),
+                vec![7; 8],
+            )
+            .unwrap();
+            if ["transformer", "transformer_2", "mllm"].contains(&component) {
+                std::fs::write(
+                    root.path().join(component).join("quantize_config.json"),
+                    br#"{"bits":4,"quantization":{"group_size":64}}"#,
+                )
+                .unwrap();
+            }
+        }
+        let adapter = root.path().join("adapter.safetensors");
+        std::fs::write(&adapter, vec![3; 11]).unwrap();
+        let high_adapter = root.path().join("high-adapter.safetensors");
+        std::fs::write(&high_adapter, vec![5; 7]).unwrap();
+        let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
+            .with_quant(gen_core::Quant::Q4);
+        spec.adapters = vec![
+            gen_core::AdapterSpec::new(adapter, 0.5, gen_core::AdapterKind::Lora),
+            gen_core::AdapterSpec {
+                path: high_adapter,
+                scale: 1.0,
+                kind: gen_core::AdapterKind::Lokr,
+                moe_expert: Some(gen_core::MoeExpert::High),
+                pass_scales: None,
+            },
+        ];
+        let contract = memory_strategy_contract(crate::bernini::MODEL_ID, &spec).unwrap();
+        assert_eq!(contract.calibration, None);
+        assert_eq!(contract.asset_facts.overlay_bytes, 29);
+        assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert!(contract.resident_components().iter().any(|component| {
+            component.kind == MemoryComponentKind::AdapterStack
+                && component.resident_bytes == 29
+                && component.id.contains("digest=sha256:")
+        }));
+        let stale = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &stale).is_err());
     }
 }

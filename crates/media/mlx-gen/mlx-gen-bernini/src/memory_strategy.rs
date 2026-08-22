@@ -125,6 +125,8 @@ pub const DECODE_TILE_EDGE: u32 = 512;
 /// The single published overlap. One overlap per route keeps admission able to reject a geometry
 /// assembled for a different one.
 pub const DECODE_OVERLAP: u32 = 64;
+pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
+    &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
 
 /// Rung 3 — the shared constrained score budget. Bernini does not invent its own.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -443,6 +445,16 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
     Ok(())
 }
 
+fn validate_geometry(width: u32, height: u32) -> CoreResult<()> {
+    if ADVERTISED_GEOMETRIES.contains(&(width, height)) {
+        Ok(())
+    } else {
+        Err(CoreError::Unsupported(format!(
+            "bernini: memory evidence requires one of the advertised geometries {ADVERTISED_GEOMETRIES:?}, got {width}x{height}"
+        )))
+    }
+}
+
 /// Reject a window cadence outside the published domain.
 fn validate_window(size: u32) -> CoreResult<()> {
     if !TRANSFORMER_WINDOW_SIZES.contains(&size) {
@@ -481,6 +493,17 @@ pub(crate) fn safety_check(
                 "{}: Bernini memory evidence is scoped to exactly one video_to_video clip",
                 contract.provider_id
             )));
+        }
+        validate_geometry(context.geometry.width, context.geometry.height)?;
+        if context.overlay.as_deref().is_some_and(|overlay| {
+            overlay
+                .split('+')
+                .find(|axis| axis.starts_with("provider_video_mode:"))
+                .is_some_and(|axis| axis != "provider_video_mode:v2v")
+        }) {
+            return Err(CoreError::Unsupported(
+                "bernini MLX provider video mode overlay crossed the v2v contract".to_owned(),
+            ));
         }
         if context
             .overlay
@@ -780,6 +803,7 @@ fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()
                 .to_owned(),
         ));
     }
+    validate_geometry(request.width, request.height)?;
     Ok(())
 }
 
@@ -1456,5 +1480,57 @@ mod tests {
         valid.fps = Some(16);
         valid.conditioning.clear();
         assert!(validate_video_to_video_request(&valid).is_err());
+    }
+
+    #[test]
+    fn v2v_scope_admits_only_advertised_geometry_and_frames() {
+        for &(width, height) in ADVERTISED_GEOMETRIES {
+            for frames in [45, 61, 77] {
+                let request = GenerationRequest {
+                    prompt: "v2v".to_owned(),
+                    width,
+                    height,
+                    frames: Some(frames),
+                    fps: Some(16),
+                    video_mode: Some("v2v".to_owned()),
+                    conditioning: vec![Conditioning::VideoClip {
+                        frames: vec![mlx_gen::gen_core::Image {
+                            width: 2,
+                            height: 2,
+                            pixels: vec![0; 12],
+                        }],
+                        frame_idx: 0,
+                        strength: 1.0,
+                    }],
+                    ..Default::default()
+                };
+                assert!(
+                    validate_video_to_video_request(&request).is_ok(),
+                    "{width}x{height}/{frames}"
+                );
+            }
+        }
+        let mut crossed = GenerationRequest {
+            width: 640,
+            height: 640,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("v2v".to_owned()),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![mlx_gen::gen_core::Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0; 12],
+                }],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_video_to_video_request(&crossed).is_err());
+        crossed.width = 848;
+        crossed.height = 480;
+        crossed.fps = Some(24);
+        assert!(validate_video_to_video_request(&crossed).is_err());
     }
 }

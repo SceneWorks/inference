@@ -632,7 +632,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
     #[cfg(any(feature = "cuda", test))]
-    let (memory_strategy, memory_tier) = (None, None);
+    let (memory_strategy, memory_tier) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
     #[cfg(not(any(feature = "cuda", test)))]
     let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(Bernini {
