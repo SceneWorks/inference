@@ -50,7 +50,7 @@ use common::snapshot;
 use mlx_gen::gen_core::{
     GenerationMemory, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
     MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
-    MemoryParityResult, MemoryStrategy, MemoryStrategyParameters,
+    MemoryParityResult, MemoryReferenceShape, MemoryStrategy, MemoryStrategyParameters,
 };
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
