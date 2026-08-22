@@ -34,6 +34,7 @@ pub mod adapters;
 pub mod conditioner;
 pub mod config;
 pub mod loader;
+pub mod memory_strategy;
 pub mod nn;
 pub mod pipeline;
 // Per-step latent previews (epic 16948, sc-16953). Anima carries no fit of its own: it reuses the
@@ -56,7 +57,7 @@ pub use text_encoder::AnimaQwen3;
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
@@ -133,17 +134,108 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 pub struct Anima {
     descriptor: ModelDescriptor,
     variant: Variant,
-    root: WeightsSource,
     device: Device,
     /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
     /// model). Captured at load; folded lazily when the pipeline is first assembled.
     adapters: Vec<gen_core::AdapterSpec>,
-    /// Lazily-built, shared pipeline behind the shared read-through cache ([`candle_gen::cached`],
-    /// sc-7792). The slot holds an `Arc<AnimaPipeline>` — cheap to clone — so `pipeline()` can return
-    /// an owned handle and **release the cache lock before the denoise** (see [`Anima::pipeline`]),
-    /// matching every sibling candle-gen provider. Before sc-10608 this was a bespoke
-    /// `Mutex<Option<AnimaPipeline>>` whose guard was held *across* the whole generation.
-    pipeline: Mutex<Option<Arc<AnimaPipeline>>>,
+    /// The request-scoped owner keeps the warm resident pipeline correct after a staged request:
+    /// staging evicts it, and a subsequent resident request rebuilds the exact same variant.
+    residency: candle_gen::Residency<AnimaTextPhase, AnimaHeavyPhase>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+}
+
+enum AnimaTextPhase {
+    Resident(Arc<AnimaPipeline>),
+    Staged(loader::AnimaConditioningComponents),
+}
+
+enum AnimaHeavyPhase {
+    Resident(Arc<AnimaPipeline>),
+    Staged(loader::AnimaRenderComponents),
+}
+
+struct AnimaMemoryScope {
+    memory: Option<gen_core::GenerationMemory>,
+    geometry: gen_core::MemoryGeometry,
+    finished: bool,
+}
+
+impl AnimaMemoryScope {
+    fn new(
+        contract: &gen_core::MemoryProviderContract,
+        context: &gen_core::MemoryRunContext,
+    ) -> Self {
+        Self {
+            memory: contract.generation_memory(&context.selection),
+            geometry: context.geometry,
+            finished: false,
+        }
+    }
+
+    fn active(&self) -> gen_core::Result<()> {
+        if self.finished {
+            Err(gen_core::Error::Msg(
+                "anima memory request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl gen_core::MemoryRequestScope for AnimaMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.active()?;
+        let geometry = gen_core::MemoryGeometry {
+            width: request.width,
+            height: request.height,
+            batch: request.count,
+            frames: request.frames.unwrap_or(1),
+            reference_count: request.image_reference_count(),
+        };
+        if geometry != self.geometry || !request.conditioning.is_empty() {
+            return Err(gen_core::Error::Unsupported(
+                "anima: request geometry or conditioning changed after memory admission".to_owned(),
+            ));
+        }
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.active()
+    }
+    fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.active()
+    }
+    fn configure_decode(
+        &mut self,
+        _: u32,
+        _: u32,
+        _: gen_core::MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: bounded decode is not implemented".to_owned(),
+        ))
+    }
+    fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: bounded attention is not implemented".to_owned(),
+        ))
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: transformer block streaming is not implemented".to_owned(),
+        ))
+    }
+    fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.active()?;
+        self.finished = true;
+        Ok(())
+    }
 }
 
 pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -185,63 +277,93 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     }
     // LoRA/LoKr adapters (`spec.adapters`) are accepted — folded onto the DiT + conditioner when the
     // pipeline is assembled (`adapters::apply_anima_adapters`).
+    let root = spec.weights.clone();
     let device = candle_gen::default_device().map_err(gen_core::Error::from)?;
+    let resident_root = root.clone();
+    let resident_device = device.clone();
+    let resident_adapters = spec.adapters.clone();
+    let text_root = root.clone();
+    let text_device = device.clone();
+    let heavy_root = root.clone();
+    let heavy_device = device.clone();
+    let staged_adapters = spec.adapters.clone();
+    let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
+        move |_| {
+            let pipeline = AnimaPipeline::from_source(
+                &resident_root,
+                variant,
+                &resident_device,
+                &resident_adapters,
+            )
+            .map(Arc::new)?;
+            Ok((
+                AnimaTextPhase::Resident(pipeline.clone()),
+                AnimaHeavyPhase::Resident(pipeline),
+            ))
+        },
+        move |_, cancel| {
+            candle_gen::check_cancel(cancel)?;
+            if !staged_adapters.is_empty() {
+                return Err(candle_gen::CandleError::Msg(
+                    "anima: staged residency does not support adapter overlays".to_owned(),
+                ));
+            }
+            loader::AnimaConditioningComponents::load(&text_root, variant, &text_device)
+                .map(AnimaTextPhase::Staged)
+        },
+        move |_, _, cancel| {
+            candle_gen::check_cancel(cancel)?;
+            loader::AnimaRenderComponents::load(&heavy_root, variant, &heavy_device)
+                .map(AnimaHeavyPhase::Staged)
+        },
+    );
+    #[cfg(any(feature = "cuda", test))]
+    let memory_contract = Some(memory_strategy::contract(id, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_contract = None;
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,
-        root: spec.weights.clone(),
         device,
         adapters: spec.adapters.clone(),
-        pipeline: Mutex::new(None),
+        residency,
+        memory_contract,
     }))
-}
-
-impl Anima {
-    /// Lazily assemble (and cache) the pipeline on first `generate`, returning a **shared owned
-    /// handle**.
-    ///
-    /// ## Concurrency decision (sc-10608)
-    ///
-    /// This adopts the shared [`candle_gen::cached`] read-through cache (sc-7792) that every sibling
-    /// candle-gen provider uses. The consequence — the whole point of the story — is a deliberate
-    /// change to the lock/denoise relationship:
-    ///
-    /// - **Before:** a bespoke `Mutex<Option<AnimaPipeline>>` whose guard was held **across the entire
-    ///   denoise**. A second `generate` on the same loaded model blocked on the cache mutex until the
-    ///   first finished all its steps — concurrent generation was serialized *by accident*.
-    /// - **Now:** `cached()` holds the lock only across the (idempotent) build and a cheap `Arc` clone,
-    ///   then drops the guard. `generate` runs the denoise on the returned `Arc<AnimaPipeline>`
-    ///   **outside the lock**, so a second caller only waits to clone the `Arc`, not for the first
-    ///   generation to finish.
-    ///
-    /// Running the denoise outside the lock is **safe** here — this is verified deliberately, not
-    /// inherited from the siblings:
-    /// 1. `AnimaPipeline` / `AnimaComponents` are stateless forwards over **immutable, `Arc`-backed
-    ///    candle weights** — every `forward`/`encode`/`decode` in the generate path takes `&self`. The
-    ///    only `&mut self` methods (`visit_adaptable_mut` adapter installers) run at load, never during
-    ///    generation. No `RefCell`/`Cell`/scratch buffer is mutated per step, and each `generate` draws
-    ///    its own noise + tensors. There is therefore no shared mutable state for two concurrent
-    ///    generations to race on.
-    /// 2. `Arc<AnimaPipeline>: Send + Sync` is compiler-enforced: the cache is `Mutex<Option<Arc<…>>>`,
-    ///    and `Anima` must be `Sync` to satisfy the `Generator` bound, which requires the pipeline to be
-    ///    `Send + Sync` (pinned by `pipeline_handle_is_send_and_sync`).
-    /// 3. The candle `Device` internally synchronizes GPU submission, so concurrent forwards are
-    ///    serialized at the driver — safe, never corrupting.
-    ///
-    /// The lock-release contract is pinned by `cache_lock_is_released_before_generation` below;
-    /// returning an owned `Arc` (not a `MutexGuard`) makes "hold the lock across the denoise"
-    /// structurally impossible to reintroduce without changing this signature.
-    fn pipeline(&self) -> gen_core::Result<Arc<AnimaPipeline>> {
-        Ok(candle_gen::cached(&self.pipeline, || {
-            AnimaPipeline::from_source(&self.root, self.variant, &self.device, &self.adapters)
-                .map(Arc::new)
-        })?)
-    }
 }
 
 impl Generator for Anima {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory_contract
+            .as_ref()
+            .map_or(gen_core::MemorySafetyDecision::Accept, |contract| {
+                memory_strategy::provider_safety_check(contract, context)
+            })
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        if let gen_core::MemorySafetyDecision::Reject { reason } =
+            self.memory_strategy_safety_check(context)
+        {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
+        Ok(Some(Box::new(AnimaMemoryScope::new(contract, context))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -254,10 +376,6 @@ impl Generator for Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        // Build-or-clone the shared pipeline, then run the denoise on the returned `Arc` **outside**
-        // the cache lock (sc-10608 — see `Anima::pipeline` for the concurrency decision).
-        let pipeline = self.pipeline()?;
-
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = if self.variant.uses_cfg() {
@@ -270,6 +388,13 @@ impl Generator for Anima {
         // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
         // derivation + `Vec` collect that every provider repeats. The model body stays hand-written in
         // the closure (captures `on_progress` + the borrowed pipeline).
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        if stage_residency && !self.adapters.is_empty() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: staged residency refuses LoRA/LoKr overlays because their conditioner and DiT loads are one atomic artifact",
+                self.descriptor.id
+            )));
+        }
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let opts = GenOptions {
                 width: req.width,
@@ -282,13 +407,56 @@ impl Generator for Anima {
                 // an absent sink is inert and the denoise never projects anything.
                 preview: req.preview.clone(),
             };
-            pipeline.generate(
-                &req.prompt,
-                &negative,
-                self.variant,
-                &opts,
+            self.residency.run_request_scoped(
+                stage_residency,
+                false,
                 &req.cancel,
+                false,
                 on_progress,
+                |text| match text {
+                    AnimaTextPhase::Resident(pipeline) => {
+                        let cond = pipeline.encode_prompt(&req.prompt)?;
+                        let uncond = self
+                            .variant
+                            .uses_cfg()
+                            .then(|| pipeline.encode_prompt(&negative))
+                            .transpose()?;
+                        Ok((cond, uncond))
+                    }
+                    AnimaTextPhase::Staged(components) => {
+                        let cond =
+                            AnimaPipeline::encode_staged(components, &self.device, &req.prompt)?;
+                        let uncond = self
+                            .variant
+                            .uses_cfg()
+                            .then(|| {
+                                AnimaPipeline::encode_staged(components, &self.device, &negative)
+                            })
+                            .transpose()?;
+                        Ok((cond, uncond))
+                    }
+                },
+                |_| Ok(self.device.synchronize()?),
+                |heavy, (cond, uncond), progress| match heavy {
+                    AnimaHeavyPhase::Resident(pipeline) => AnimaPipeline::render_encoded(
+                        pipeline.components(),
+                        &self.device,
+                        cond,
+                        uncond,
+                        &opts,
+                        &req.cancel,
+                        progress,
+                    ),
+                    AnimaHeavyPhase::Staged(components) => AnimaPipeline::render_encoded(
+                        components,
+                        &self.device,
+                        cond,
+                        uncond,
+                        &opts,
+                        &req.cancel,
+                        progress,
+                    ),
+                },
             )
         })?;
         Ok(GenerationOutput::Images(images))
@@ -341,11 +509,41 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(AESTHETIC_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry);
+    registry
+}
+
+/// Register the weights-free contracts on non-CUDA catalog builds and the executable contracts on
+/// CUDA builds.  The three ids deliberately receive independent registrations: they share code but
+/// have distinct checkpoint, tier, mode, and calibration identities.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: "anima_base",
+            contract: |spec| memory_strategy::contract("anima_base", spec),
+        })
+        .register_memory_strategy(memory_strategy::AESTHETIC_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: "anima_aesthetic",
+            contract: |spec| memory_strategy::contract("anima_aesthetic", spec),
+        })
+        .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: "anima_turbo",
+            contract: |spec| memory_strategy::contract("anima_turbo", spec),
+        })
 }
 
 /// Build the complete explicit Candle Anima provider catalog.

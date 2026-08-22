@@ -142,6 +142,24 @@ pub struct AnimaComponents {
     pub dtype: DType,
 }
 
+/// The conditioning half of an Anima request.  It deliberately owns the Qwen3 encoder and the
+/// bundled conditioner, but not the DiT or VAE, so a staged request can release it before the
+/// denoise/decode phase without changing the prompt, seed, schedule, or compute dtype.
+pub struct AnimaConditioningComponents {
+    pub conditioner: AnimaTextConditioner,
+    pub text_encoder: AnimaQwen3,
+    pub tokenizers: AnimaTokenizers,
+    pub dtype: DType,
+}
+
+/// The denoise/decode half of an Anima request.  Kept separate from
+/// [`AnimaConditioningComponents`] for the request-scoped Candle residency path.
+pub struct AnimaRenderComponents {
+    pub dit: CosmosDiT,
+    pub vae: QwenVae,
+    pub dtype: DType,
+}
+
 impl AnimaComponents {
     /// Load all components for `variant`. `adapters` are LoRA/LoKr `.safetensors` baked onto the DiT +
     /// bundled conditioner at load (stacked, mixed) — empty for the plain model.
@@ -214,6 +232,60 @@ impl AnimaComponents {
             text_encoder,
             vae,
             tokenizers,
+            dtype,
+        })
+    }
+}
+
+impl AnimaConditioningComponents {
+    /// Load only the components needed to turn prompts into immutable DiT conditioning.  Staged
+    /// residency intentionally refuses adapters at the caller: a packed adapter residual spans
+    /// both this conditioner and the DiT, and splitting it would otherwise risk a partial overlay.
+    pub fn load(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+        let root = resolve_split_files(source)?;
+        let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+        if !dit_path.is_file() {
+            return Err(CandleError::Msg(format!(
+                "anima: DiT file not found: {}",
+                dit_path.display()
+            )));
+        }
+        let dtype = compute_dtype();
+        let prefix = detect_dit_prefix(&dit_path)?;
+        let dit_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?;
+        let conditioner = AnimaTextConditioner::new(
+            &dit_vb.pp(&prefix).pp("llm_adapter"),
+            ConditionerConfig::anima(),
+        )?;
+        let te_path = root.join(TEXT_ENCODER_FILE);
+        let te_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&te_path), dtype, device)?;
+        Ok(Self {
+            conditioner,
+            text_encoder: AnimaQwen3::new(&te_vb.pp("model"), &Qwen3Config::anima())?,
+            tokenizers: AnimaTokenizers::load()?,
+            dtype,
+        })
+    }
+}
+
+impl AnimaRenderComponents {
+    /// Load only the DiT and VAE for an adapter-free staged request.  Adapter-bearing requests
+    /// remain resident because their exact load-time overlay spans the split boundary.
+    pub fn load(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+        let root = resolve_split_files(source)?;
+        let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+        if !dit_path.is_file() {
+            return Err(CandleError::Msg(format!(
+                "anima: DiT file not found: {}",
+                dit_path.display()
+            )));
+        }
+        let dtype = compute_dtype();
+        let prefix = detect_dit_prefix(&dit_path)?;
+        let dit_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?;
+        Ok(Self {
+            dit: CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?,
+            vae: load_vae(root.join(VAE_FILE), device)?,
             dtype,
         })
     }
