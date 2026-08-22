@@ -252,15 +252,59 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> Result<MemoryNumericTier> {
     numeric_tier_from_split(spec, &SplitModel::from_model_dir(root)?)
 }
 
-pub(crate) fn route_overlay(spec: &LoadSpec) -> Option<String> {
+/// Canonical request overlay spelling shared with the SceneWorks admission identity.
+///
+/// Adapter count is part of the identity (the auto-distill adapter is therefore not allowed to
+/// borrow a plain-T2V cell), enhancer is a load-bearing asset axis, and the provider mode is a
+/// request-only axis.  The latter is appended by SceneWorks because `LoadSpec` does not carry the
+/// per-request `video_mode` field.
+pub(crate) fn canonical_overlay(
+    adapter_count: usize,
+    enhancer: bool,
+    video_mode: Option<&str>,
+) -> Option<String> {
     let mut axes = Vec::new();
-    if !spec.adapters.is_empty() {
-        axes.push("adapters");
+    if adapter_count > 0 {
+        axes.push(format!("adapters:{adapter_count}"));
     }
-    if spec.components.contains_key("uncensored_enhancer") {
-        axes.push("uncensored-enhancer");
+    if enhancer {
+        axes.push("enhancer".to_owned());
     }
-    (!axes.is_empty()).then(|| axes.join("-"))
+    if let Some(video_mode) = video_mode {
+        axes.push(format!("provider_video_mode:{video_mode}"));
+    }
+    (!axes.is_empty()).then(|| axes.join("+"))
+}
+
+pub(crate) fn route_overlay(spec: &LoadSpec) -> Option<String> {
+    canonical_overlay(
+        spec.adapters.len(),
+        spec.components.contains_key("uncensored_enhancer"),
+        None,
+    )
+}
+
+/// Compare a request overlay to the loaded route without dropping request-only axes.
+///
+/// The provider contract is created from `LoadSpec`, so it can only know the loaded adapter and
+/// enhancer axes.  `provider_video_mode:*` is carried by the request identity and is accepted only
+/// as an additional, explicitly named axis.  Unknown or missing load axes still fail closed.
+fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) -> bool {
+    let load_axes = |overlay: Option<&str>| {
+        overlay
+            .into_iter()
+            .flat_map(|value| value.split('+'))
+            .filter(|axis| !axis.starts_with("provider_video_mode:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let actual_axes = actual.into_iter().flat_map(|value| value.split('+'));
+    if actual_axes.clone().any(|axis| {
+        axis.starts_with("provider_video_mode:") && !matches!(axis, "provider_video_mode:no_audio")
+    }) {
+        return false;
+    }
+    load_axes(actual) == load_axes(expected)
 }
 
 fn strategies() -> Vec<MemoryStrategyCapability> {
@@ -506,7 +550,7 @@ pub(crate) fn safety_check(
                     .into(),
             ));
         }
-        if context.overlay.as_deref() != expected_overlay {
+        if !overlay_matches_loaded_route(context.overlay.as_deref(), expected_overlay) {
             return Err(gen_core::Error::Unsupported(format!(
                 "ltx_2_3: memory overlay {:?} does not match the loaded route {:?}",
                 context.overlay, expected_overlay
@@ -609,6 +653,7 @@ fn begin_with_cleanup(
     )?;
     Ok(Some(Box::new(LtxMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+        expected_overlay: expected_overlay.map(str::to_owned),
     })))
 }
 
@@ -618,30 +663,42 @@ fn begin_with_cleanup(
 /// represent (temporal conditioning and prompt enhancement).
 struct LtxMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
+    expected_overlay: Option<String>,
 }
 
 impl LtxMemoryRequestScope {
-    fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    fn validate_request(
+        request: &GenerationRequest,
+        expected_overlay: Option<&str>,
+    ) -> gen_core::Result<()> {
         if !request.conditioning.is_empty() {
             return Err(gen_core::Error::Unsupported(
                 "ltx_2_3: calibrated memory route requires empty conditioning".into(),
             ));
         }
-        if request.enhance_prompt || request.use_uncensored_enhancer {
+        // These controls are part of the exact request identity.  They are safe to carry through
+        // a future variant-specific evidence cell; they must not be silently erased or borrow the
+        // plain cell.  `SceneWorks` keeps them fail-open until that cell is packaged.
+        let expected_has_enhancer = expected_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .any(|axis| axis == "enhancer");
+        if (request.enhance_prompt || request.use_uncensored_enhancer) && !expected_has_enhancer {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route does not include prompt enhancement controls"
-                    .into(),
+                "ltx_2_3: enhancer request does not match the loaded overlay".into(),
             ));
         }
-        if request.video_mode.is_some() {
-            return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route does not include video_mode variants".into(),
-            ));
+        if let Some(video_mode) = request.video_mode.as_deref() {
+            if video_mode != "no_audio" {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ltx_2_3: unsupported video_mode variant {video_mode:?}"
+                )));
+            }
         }
         let fps = request.fps.unwrap_or(24);
-        if !(24..=30).contains(&fps) {
+        if !matches!(fps, 24 | 25 | 30) {
             return Err(gen_core::Error::Unsupported(format!(
-                "ltx_2_3: calibrated memory route requires fps in 24..=30, got {fps}"
+                "ltx_2_3: calibrated memory route requires public fps 24, 25, or 30, got {fps}"
             )));
         }
         Ok(())
@@ -650,7 +707,7 @@ impl LtxMemoryRequestScope {
 
 impl MemoryRequestScope for LtxMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        Self::validate_request(request)?;
+        Self::validate_request(request, self.expected_overlay.as_deref())?;
         self.inner.configure_request(request)
     }
 
@@ -980,29 +1037,68 @@ mod tests {
             assert_eq!(temporal_conditioning.memory, None);
         }
 
-        let mut enhanced = GenerationRequest {
-            enhance_prompt: true,
+        for variant in [
+            GenerationRequest {
+                enhance_prompt: true,
+                ..request.clone()
+            },
+            GenerationRequest {
+                use_uncensored_enhancer: true,
+                ..request.clone()
+            },
+        ] {
+            let mut variant = variant;
+            let error = scope
+                .configure_request(&mut variant)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("enhancer request does not match the loaded overlay"));
+            assert_eq!(variant.memory, None);
+        }
+
+        let mut enhancer_spec = fixture_spec();
+        enhancer_spec.components.insert(
+            "uncensored_enhancer".into(),
+            WeightsSource::Dir("/nonexistent-enhancer-fixture".into()),
+        );
+        let enhancer_contract = weights_free_memory_strategy_contract(&enhancer_spec).unwrap();
+        let enhancer_fixture = registered_valid_fixtures(
+            &enhancer_spec,
+            &enhancer_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let mut enhancer_scope = registered_begin_request(
+            &enhancer_spec,
+            &enhancer_contract,
+            &enhancer_fixture.context,
+        )
+        .unwrap()
+        .unwrap();
+        for mut variant in [
+            GenerationRequest {
+                enhance_prompt: true,
+                ..enhancer_fixture.request.clone()
+            },
+            GenerationRequest {
+                use_uncensored_enhancer: true,
+                ..enhancer_fixture.request.clone()
+            },
+        ] {
+            enhancer_scope.configure_request(&mut variant).unwrap();
+            assert!(variant.memory.unwrap().stage_residency);
+        }
+
+        let mut no_audio = GenerationRequest {
+            video_mode: Some("no_audio".into()),
             ..request.clone()
         };
-        let error = scope
-            .configure_request(&mut enhanced)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("does not include prompt enhancement controls"));
-        assert_eq!(enhanced.memory, None);
+        scope.configure_request(&mut no_audio).unwrap();
+        assert!(no_audio.memory.unwrap().stage_residency);
 
-        let mut uncensored = GenerationRequest {
-            use_uncensored_enhancer: true,
-            ..request.clone()
-        };
-        let error = scope
-            .configure_request(&mut uncensored)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("does not include prompt enhancement controls"));
-        assert_eq!(uncensored.memory, None);
-
-        for video_mode in ["no_audio", "video_only"] {
+        for video_mode in ["video_only", "image_to_video"] {
             let mut variant = GenerationRequest {
                 video_mode: Some(video_mode.into()),
                 ..request.clone()
@@ -1011,11 +1107,11 @@ mod tests {
                 .configure_request(&mut variant)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("does not include video_mode variants"));
+            assert!(error.contains("unsupported video_mode variant"));
             assert_eq!(variant.memory, None);
         }
 
-        for fps in [Some(0), Some(23), Some(31)] {
+        for fps in [Some(0), Some(23), Some(26), Some(29), Some(31)] {
             let mut outside_envelope = GenerationRequest {
                 fps,
                 ..request.clone()
@@ -1024,7 +1120,7 @@ mod tests {
                 .configure_request(&mut outside_envelope)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("requires fps in 24..=30"));
+            assert!(error.contains("requires public fps 24, 25, or 30"));
             assert_eq!(outside_envelope.memory, None);
         }
 
@@ -1037,5 +1133,26 @@ mod tests {
             .unwrap();
         let mut after_finish = request;
         assert!(scope.configure_request(&mut after_finish).is_err());
+    }
+
+    #[test]
+    fn canonical_overlay_preserves_adapter_count_enhancer_and_provider_mode() {
+        assert_eq!(canonical_overlay(0, false, None), None);
+        assert_eq!(
+            canonical_overlay(2, true, Some("no_audio")).as_deref(),
+            Some("adapters:2+enhancer+provider_video_mode:no_audio")
+        );
+        assert!(overlay_matches_loaded_route(
+            Some("adapters:2+enhancer+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer")
+        ));
+        assert!(!overlay_matches_loaded_route(
+            Some("adapters:1+enhancer+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer")
+        ));
+        assert!(!overlay_matches_loaded_route(
+            Some("provider_video_mode:video_only"),
+            None
+        ));
     }
 }
