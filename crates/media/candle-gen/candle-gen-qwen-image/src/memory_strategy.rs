@@ -790,7 +790,18 @@ pub(crate) fn registered_valid_fixture(
             overlay: (edit && !spec.adapters.is_empty()).then(|| "lora".to_owned()),
         },
     )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+    let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+    if edit {
+        let exact_base = std::path::PathBuf::from("models--SceneWorks--qwen-image-edit-2511-mlx")
+            .join("snapshots")
+            .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
+            .join("bf16");
+        let mut exact_spec = spec.clone();
+        exact_spec.weights = WeightsSource::Dir(exact_base);
+        exact_spec.resolved_route = Some(crate::edit::EDIT_2511_BASE_ROUTE.to_owned());
+        fixture = fixture.with_load_spec(exact_spec);
+    }
+    Ok(vec![fixture])
 }
 
 pub(crate) fn registered_begin_request(
@@ -1177,6 +1188,26 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{quant:?} {strategy:?}: {error}"));
             }
         }
+    }
+
+    #[test]
+    fn edit_catalog_behavior_fixture_owns_an_exact_base_artifact_receipt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let exact = fixture
+            .load_spec
+            .as_ref()
+            .expect("route-sensitive fixture must carry its exact load receipt");
+        assert!(crate::edit::validate_memory_artifact_recipe(exact).is_ok());
+        assert!(matches!(
+            registered_safety_check(exact, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
     }
 
     #[test]
