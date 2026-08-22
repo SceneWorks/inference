@@ -138,9 +138,9 @@ pub struct Anima {
     /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
     /// model). Captured at load; folded lazily when the pipeline is first assembled.
     adapters: Vec<gen_core::AdapterSpec>,
-    /// The loaded numeric tier is an admission identity, not an inferred descriptor property.
-    /// Retain the exact spec so generator-side admission cannot accept crossed-tier evidence.
-    load_spec: LoadSpec,
+    /// The physical numeric tier is derived from the loaded DiT header before any components are
+    /// materialized; it is the generator-side admission identity.
+    memory_tier: gen_core::MemoryNumericTier,
     /// The request-scoped owner keeps the warm resident pipeline correct after a staged request:
     /// staging evicts it, and a subsequent resident request rebuilds the exact same variant.
     residency: candle_gen::Residency<AnimaTextPhase, AnimaHeavyPhase>,
@@ -160,28 +160,65 @@ enum AnimaHeavyPhase {
 struct AnimaMemoryScope {
     memory: Option<gen_core::GenerationMemory>,
     geometry: gen_core::MemoryGeometry,
-    finished: bool,
+    use_pid: bool,
+    has_phases: bool,
+    cleanup: Box<dyn FnMut() -> gen_core::Result<()>>,
+    lifecycle: AnimaMemoryLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnimaMemoryLifecycle {
+    Active,
+    CleanupPending,
+    Complete,
 }
 
 impl AnimaMemoryScope {
     fn new(
         contract: &gen_core::MemoryProviderContract,
         context: &gen_core::MemoryRunContext,
+        device: Device,
+    ) -> Self {
+        Self::with_cleanup(
+            contract,
+            context,
+            Box::new(move || device.synchronize().map_err(gen_core::Error::backend)),
+        )
+    }
+
+    fn with_cleanup(
+        contract: &gen_core::MemoryProviderContract,
+        context: &gen_core::MemoryRunContext,
+        cleanup: Box<dyn FnMut() -> gen_core::Result<()>>,
     ) -> Self {
         Self {
             memory: contract.generation_memory(&context.selection),
             geometry: context.geometry,
-            finished: false,
+            use_pid: context.use_pid,
+            has_phases: context.has_phases,
+            cleanup,
+            lifecycle: AnimaMemoryLifecycle::Active,
         }
     }
 
     fn active(&self) -> gen_core::Result<()> {
-        if self.finished {
+        if self.lifecycle != AnimaMemoryLifecycle::Active {
             Err(gen_core::Error::Msg(
                 "anima memory request scope is already finished".to_owned(),
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn cleanup_pending(&mut self) -> gen_core::Result<()> {
+        debug_assert_eq!(self.lifecycle, AnimaMemoryLifecycle::CleanupPending);
+        match (self.cleanup)() {
+            Ok(()) => {
+                self.lifecycle = AnimaMemoryLifecycle::Complete;
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -196,9 +233,18 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
             frames: request.frames.unwrap_or(1),
             reference_count: request.image_reference_count(),
         };
-        if geometry != self.geometry || !request.conditioning.is_empty() {
+        let has_phases = request
+            .phases
+            .as_ref()
+            .is_some_and(|phases| !phases.is_empty());
+        if geometry != self.geometry
+            || !request.conditioning.is_empty()
+            || request.use_pid != self.use_pid
+            || has_phases != self.has_phases
+        {
             return Err(gen_core::Error::Unsupported(
-                "anima: request geometry or conditioning changed after memory admission".to_owned(),
+                "anima: request route, geometry, or conditioning changed after memory admission"
+                    .to_owned(),
             ));
         }
         request.memory = self.memory;
@@ -236,8 +282,19 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
     }
     fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
         self.active()?;
-        self.finished = true;
-        Ok(())
+        self.lifecycle = AnimaMemoryLifecycle::CleanupPending;
+        self.cleanup_pending()
+    }
+}
+
+impl Drop for AnimaMemoryScope {
+    fn drop(&mut self) {
+        if self.lifecycle == AnimaMemoryLifecycle::Active {
+            self.lifecycle = AnimaMemoryLifecycle::CleanupPending;
+        }
+        if self.lifecycle == AnimaMemoryLifecycle::CleanupPending {
+            let _ = self.cleanup_pending();
+        }
     }
 }
 
@@ -270,14 +327,28 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     // DENSE DiT would silently build bf16 and return success (a tier downgrade the caller never sees).
     // Assert the DiT is packed; otherwise reject naming the requested tier and what was found. Same
     // runtime-lie class as sc-10515 (advertising a tier the load can't honor).
-    if let Some(q) = spec.quantize {
-        if !loader::dit_is_packed(&spec.weights, variant).map_err(gen_core::Error::from)? {
+    let physical_quant =
+        loader::dit_quant_tier(&spec.weights, variant).map_err(gen_core::Error::from)?;
+    match (spec.quantize, physical_quant) {
+        (None, None) => {}
+        (Some(requested), Some(actual)) if requested == actual => {}
+        (Some(requested), None) => {
             return Err(gen_core::Error::Unsupported(format!(
-                "{id}: {q:?} tier requested but the DiT checkpoint is DENSE (no packed `.scales` \
-                 tensors) — Anima ships no packed Q4/Q8 tier yet; load the dense tier (no quantize)"
+                "{id}: {requested:?} tier requested but the DiT checkpoint is DENSE (no packed `.scales` tensors)"
+            )));
+        }
+        (Some(requested), Some(actual)) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: {requested:?} tier requested but the physical DiT codes are {actual:?}"
+            )));
+        }
+        (None, Some(actual)) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: physical DiT codes are {actual:?}, but LoadSpec selected the dense tier"
             )));
         }
     }
+    let memory_tier = memory_strategy::resolved_numeric_tier(spec, physical_quant)?;
     // LoRA/LoKr adapters (`spec.adapters`) are accepted — folded onto the DiT + conditioner when the
     // pipeline is assembled (`adapters::apply_anima_adapters`).
     let root = spec.weights.clone();
@@ -331,7 +402,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         variant,
         device,
         adapters: spec.adapters.clone(),
-        load_spec: spec.clone(),
+        memory_tier,
         residency,
         memory_contract,
     }))
@@ -353,7 +424,12 @@ impl Generator for Anima {
         self.memory_contract
             .as_ref()
             .map_or(gen_core::MemorySafetyDecision::Accept, |contract| {
-                memory_strategy::provider_safety_check(&self.load_spec, contract, context)
+                memory_strategy::loaded_safety_check(
+                    !self.adapters.is_empty(),
+                    self.memory_tier,
+                    contract,
+                    context,
+                )
             })
     }
 
@@ -369,7 +445,11 @@ impl Generator for Anima {
         {
             return Err(gen_core::Error::Unsupported(reason));
         }
-        Ok(Some(Box::new(AnimaMemoryScope::new(contract, context))))
+        Ok(Some(Box::new(AnimaMemoryScope::new(
+            contract,
+            context,
+            self.device.clone(),
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -618,18 +698,21 @@ mod tests {
 
     #[test]
     fn three_variants_registered_as_candle() {
-        for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
-            let g = crate::provider_registry()
-                .unwrap()
-                .load(
-                    id,
-                    &LoadSpec::new(gen_core::WeightsSource::Dir("/nonexistent".into())),
-                )
-                .unwrap_or_else(|_| panic!("id {id} not registered"));
-            assert_eq!(g.descriptor().id, id);
-            assert_eq!(g.descriptor().family, "anima");
-            assert_eq!(g.descriptor().backend, "candle");
-        }
+        let registry = crate::provider_registry().unwrap();
+        let descriptors: Vec<_> = registry
+            .generators()
+            .map(|entry| (entry.descriptor)())
+            .collect();
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>(),
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.family == "anima" && descriptor.backend == "candle"));
     }
 
     #[test]
@@ -725,19 +808,23 @@ mod tests {
         root
     }
 
-    /// Write a minimal **packed** DiT split_files layout (an anchor tensor WITH a `.scales`/`.biases`
-    /// sibling) so the quant-guard header-detects it as packed. Returns the split_files root.
-    fn write_packed_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    /// Write a minimal physically self-describing packed DiT layout. The code/scales shapes encode
+    /// the requested Q4 or Q8 width at the canonical group size 64.
+    fn write_packed_split_files(tmp: &tempfile::TempDir, quant: Quant) -> std::path::PathBuf {
         use candle_gen::candle_core::{DType, Device, Tensor};
-        let root = tmp.path().join("anima_packed_guard");
+        let root = tmp.path().join(format!("anima_packed_guard_{quant:?}"));
         let dm = root.join("diffusion_models");
         std::fs::create_dir_all(&dm).unwrap();
         let mut m = std::collections::HashMap::new();
-        // The anchor `.weight` (u32 codes) + `.scales`/`.biases` — enough for the header-only packed
-        // detect (`dit_path_is_packed` looks only for a `.scales` sibling).
+        let packed_columns = match quant {
+            Quant::Q4 => 8,
+            Quant::Q8 => 16,
+            Quant::Nvfp4 => unreachable!("Anima does not advertise NVFP4"),
+        };
+        // `[out, in·bits/32]` codes + `[out, in/64]` scales derive the physical bit width.
         m.insert(
             "net.x_embedder.proj.1.weight".to_string(),
-            Tensor::zeros((2, 2), DType::U32, &Device::Cpu).unwrap(),
+            Tensor::zeros((2, packed_columns), DType::U32, &Device::Cpu).unwrap(),
         );
         m.insert(
             "net.x_embedder.proj.1.scales".to_string(),
@@ -803,7 +890,7 @@ mod tests {
 
         // sc-10640: Q4/Q8 + LoRA on a **packed** checkpoint is now ACCEPTED at load (built lazily; the
         // residual install runs at first generate). This is exactly the combo that used to be rejected.
-        let packed_root = write_packed_split_files(&tmp);
+        let packed_root = write_packed_split_files(&tmp, Quant::Q8);
         let packed = gen_core::WeightsSource::Dir(packed_root.clone());
         assert!(
             load_base(
@@ -815,8 +902,20 @@ mod tests {
             "packed tier + LoRA must be accepted at load (sc-10640) — no combo rejection"
         );
 
+        let q4_root = write_packed_split_files(&tmp, Quant::Q4);
+        let mismatch = load_base(
+            &LoadSpec::new(gen_core::WeightsSource::Dir(q4_root.clone())).with_quant(Quant::Q8),
+        )
+        .err()
+        .expect("Q8 request must reject physical Q4 codes");
+        assert!(
+            mismatch.to_string().contains("physical DiT codes are Q4"),
+            "expected physical tier mismatch, got: {mismatch}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&packed_root);
+        let _ = std::fs::remove_dir_all(&q4_root);
     }
 
     /// The pipeline handle must be `Send + Sync` so the denoise can run outside the cache lock
@@ -942,6 +1041,83 @@ mod tests {
             run(false, false, &live).unwrap(),
             30,
             "warm request recovers after cancellation/error"
+        );
+    }
+
+    #[test]
+    fn memory_scope_binds_request_axes_and_retries_failed_cleanup_only_on_drop() {
+        use gen_core::{GenerationPhase, MemoryRequestScope, MemoryRunOutcome};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/anima".into()));
+        let contract = memory_strategy::contract("anima_base", &spec).unwrap();
+        let context = memory_strategy::registered_valid_fixture(
+            &spec,
+            &contract,
+            gen_core::MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        let cleanup_calls = Rc::new(Cell::new(0));
+        let cleanup_calls_for_scope = Rc::clone(&cleanup_calls);
+        let mut scope = AnimaMemoryScope::with_cleanup(
+            &contract,
+            &context,
+            Box::new(move || {
+                let calls = cleanup_calls_for_scope.get() + 1;
+                cleanup_calls_for_scope.set(calls);
+                (calls > 1)
+                    .then_some(())
+                    .ok_or_else(|| gen_core::Error::Msg("injected synchronize failure".to_owned()))
+            }),
+        );
+        let exact = || gen_core::MemoryBehaviorFixture::new(context.clone()).request;
+        let mut admitted = exact();
+        scope.configure_request(&mut admitted).unwrap();
+
+        let mut pid = exact();
+        pid.use_pid = true;
+        assert!(scope.configure_request(&mut pid).is_err());
+        let mut phases = exact();
+        phases.phases = Some(vec![GenerationPhase {
+            steps: 1,
+            guidance: None,
+            adapters: Vec::new(),
+        }]);
+        assert!(scope.configure_request(&mut phases).is_err());
+        let mut conditioning = exact();
+        conditioning
+            .conditioning
+            .push(gen_core::Conditioning::Reference {
+                image: gen_core::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+                strength: None,
+            });
+        assert!(scope.configure_request(&mut conditioning).is_err());
+
+        assert!(scope
+            .finish(MemoryRunOutcome::Error {
+                message: "synthetic request failure".to_owned(),
+            })
+            .is_err());
+        assert!(scope.configure_request(&mut exact()).is_err());
+        assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
+        assert_eq!(
+            cleanup_calls.get(),
+            1,
+            "failed finish must not retry cleanup inline"
+        );
+        drop(scope);
+        assert_eq!(
+            cleanup_calls.get(),
+            2,
+            "drop retries the pending synchronize cleanup"
         );
     }
 }

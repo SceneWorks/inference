@@ -9,7 +9,7 @@ use candle_gen::gen_core::{
     self, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant,
 };
 
 const IDS: &[&str] = &["anima_base", "anima_aesthetic", "anima_turbo"];
@@ -62,11 +62,36 @@ pub fn contract(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<MemoryPr
         .iter_mut()
         .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
         .expect("compatibility contract contains every strategy");
-    // This is a route capability, not a statement about every request overlay.  The request
-    // safety check refuses adapters only when staged residency is selected; resident LoRA/LoKr
-    // remains the advertised and implemented load path.
-    staged.support = MemoryStrategySupport::Implemented;
+    // Staging cannot reproduce a loaded LoRA/LoKr because its conditioner and DiT mutations span
+    // the phase boundary. This classification applies only to the staged rung; Resident remains
+    // available for the same adapter-bearing load surface.
+    staged.support = if spec.adapters.is_empty() {
+        MemoryStrategySupport::Implemented
+    } else {
+        MemoryStrategySupport::StructurallyNotApplicable {
+            reason: "Anima adapter overlays span the conditioner and DiT load boundary; staged residency refuses them rather than applying a partial overlay".to_owned(),
+        }
+    };
     Ok(contract)
+}
+
+/// Anima's CUDA path is native bf16. A `Precision::Fp32` request is not an alternate loaded tier;
+/// accepting it would label bf16 CUDA execution with false memory evidence.
+pub fn resolved_numeric_tier(
+    spec: &LoadSpec,
+    physical_quant: Option<Quant>,
+) -> gen_core::Result<MemoryNumericTier> {
+    if spec.precision != Precision::Bf16 {
+        return Err(gen_core::Error::Unsupported(
+            "anima: Candle/CUDA memory residency supports only the native bf16 precision"
+                .to_owned(),
+        ));
+    }
+    Ok(MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: physical_quant,
+        component_precision_floors: &[],
+    })
 }
 
 pub fn safety_check(
@@ -74,11 +99,17 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    provider_safety_check(spec, contract, context)
+    match resolved_numeric_tier(spec, spec.quantize) {
+        Ok(tier) => loaded_safety_check(!spec.adapters.is_empty(), tier, contract, context),
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
 }
 
-pub fn provider_safety_check(
-    spec: &LoadSpec,
+pub fn loaded_safety_check(
+    has_adapters: bool,
+    loaded_tier: MemoryNumericTier,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
@@ -87,7 +118,7 @@ pub fn provider_safety_check(
         if !staged {
             return Ok(());
         }
-        if !spec.adapters.is_empty() {
+        if has_adapters {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: staged residency refuses LoRA/LoKr overlays because their conditioner and DiT loads are one atomic artifact",
                 contract.provider_id
@@ -110,11 +141,7 @@ pub fn provider_safety_check(
     gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(loaded_tier),
         Some(&route_gate),
     )
 }
@@ -133,11 +160,7 @@ pub fn registered_valid_fixture(
         gen_core::standard_memory_behavior_context(
             contract,
             strategy,
-            MemoryNumericTier {
-                precision: spec.precision,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
+            resolved_numeric_tier(spec, spec.quantize)?,
             gen_core::MemoryBehaviorRoute {
                 mode: MemoryMode::TextToImage,
                 reference_count: 0,
@@ -160,7 +183,9 @@ pub fn registered_begin_request(
         return Err(gen_core::Error::Unsupported(reason));
     }
     Ok(Some(Box::new(crate::AnimaMemoryScope::new(
-        contract, context,
+        contract,
+        context,
+        candle_gen::candle_core::Device::Cpu,
     ))))
 }
 
@@ -224,9 +249,16 @@ mod tests {
             1.0,
             AdapterKind::Lora,
         ));
-        let contract = contract("anima_base", &spec).unwrap();
+        let adapter_contract = contract("anima_base", &spec).unwrap();
+        assert!(matches!(
+            adapter_contract
+                .capability(MemoryStrategy::StagedResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::StructurallyNotApplicable { .. }
+        ));
         let resident = gen_core::standard_memory_behavior_context(
-            &contract,
+            &adapter_contract,
             MemoryStrategy::Resident,
             MemoryNumericTier {
                 precision: Precision::Bf16,
@@ -243,27 +275,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            safety_check(&spec, &contract, &resident),
+            safety_check(&spec, &adapter_contract, &resident),
             MemorySafetyDecision::Accept
         );
 
         spec.adapters[0].kind = AdapterKind::Lokr;
         assert_eq!(
-            safety_check(&spec, &contract, &resident),
+            safety_check(&spec, &adapter_contract, &resident),
             MemorySafetyDecision::Accept
         );
 
+        let plain = LoadSpec::new(WeightsSource::Dir("/anima".into()));
+        let plain_contract = contract("anima_base", &plain).unwrap();
         let mut staged =
-            registered_valid_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
+            registered_valid_fixture(&plain, &plain_contract, MemoryStrategy::StagedResidency)
                 .unwrap()
                 .pop()
                 .unwrap()
                 .context;
         staged.overlay = Some("lokr:overlay".to_owned());
         assert!(matches!(
-            safety_check(&spec, &contract, &staged),
+            safety_check(&spec, &adapter_contract, &staged),
             MemorySafetyDecision::Reject { .. }
         ));
+        assert!(registered_valid_fixture(
+            &spec,
+            &adapter_contract,
+            MemoryStrategy::StagedResidency
+        )
+        .is_err());
     }
 
     #[test]
@@ -292,6 +332,34 @@ mod tests {
         crossed_route.calibration_fingerprint = aesthetic.calibration.unwrap().fingerprint;
         assert!(matches!(
             safety_check(&spec, &base, &crossed_route),
+            MemorySafetyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn fp32_is_refused_instead_of_mislabelling_bf16_cuda_execution() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/anima".into()));
+        spec.precision = Precision::Fp32;
+        let contract = contract("anima_base", &spec).unwrap();
+        let context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::StagedResidency,
+            MemoryNumericTier {
+                precision: Precision::Fp32,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            safety_check(&spec, &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
     }
