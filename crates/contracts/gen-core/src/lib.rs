@@ -132,7 +132,8 @@ pub use memory_strategy::{
     MemoryStrategyCapability, MemoryStrategyEngagementExclusion, MemoryStrategyParameters,
     MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWarmRunSemantics,
     MemoryWindowMaterialization, ResidentRequestMemory, TransformerComponent,
-    MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_V1_PREFIX,
+    MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION,
+    MEMORY_EVIDENCE_V1_PREFIX,
 };
 pub use registry::{
     candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,

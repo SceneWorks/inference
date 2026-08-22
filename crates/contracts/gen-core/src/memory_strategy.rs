@@ -154,6 +154,9 @@ const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
 /// The payload after this prefix is compact JSON. Keeping the version outside the JSON makes mixed
 /// test output cheap to scan without accepting a legacy `SEQ_AB` line by accident.
 pub const MEMORY_EVIDENCE_V1_PREFIX: &str = "MEMORY_EVIDENCE_V1 ";
+/// Wire schema for [`MemoryEvidenceLogRecord`] payloads. The V1 line prefix is retained for log
+/// discovery; version 2 is required because the evidence cell gained family/reference/FPS axes.
+pub const MEMORY_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3501,7 +3504,7 @@ impl MemoryEvidenceLogRecord {
         }
 
         let json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": MEMORY_EVIDENCE_SCHEMA_VERSION,
             "key": evidence_key_json(&self.key),
             "declared_calibration": calibration_identity_json(&self.declared_calibration),
             "observed_calibration": calibration_identity_json(&self.observed_calibration),
@@ -6230,7 +6233,7 @@ mod tests {
         assert!(line.starts_with(MEMORY_EVIDENCE_V1_PREFIX));
         let value: serde_json::Value =
             serde_json::from_str(&line[MEMORY_EVIDENCE_V1_PREFIX.len()..]).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], MEMORY_EVIDENCE_SCHEMA_VERSION);
         assert_eq!(value["key"]["backend"], "mlx");
         assert_eq!(value["key"]["model_family"], "test-family");
         assert_eq!(value["key"]["mode"], "text_to_image");
