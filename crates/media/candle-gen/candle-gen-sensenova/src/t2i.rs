@@ -317,6 +317,7 @@ impl T2iModel {
 
     /// Gen-path velocity prediction for one diffusion step against a prefilled cache: `forward_prepared`
     /// (Gen, use-only) over the conditioned image block, `fm_head` → `x_pred`, then the velocity.
+    #[allow(clippy::too_many_arguments)]
     fn predict_v(
         &self,
         image_embeds: &Tensor,

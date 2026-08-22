@@ -630,6 +630,7 @@ impl Qwen3Backbone {
     }
 
     /// Cached attention: project the new tokens, RoPE q/k, merge with the cache, GQA-expand, attend.
+    #[allow(clippy::too_many_arguments)]
     fn attention_cached(
         &self,
         x: &Tensor,

@@ -957,10 +957,9 @@ pub fn register_providers(
         .register_generator(QUALITY_REGISTRATION)
         .register_generator(FAST_REGISTRATION);
     let registry = register_memory_contract_surfaces(registry);
-    let registry = registry
-        .register_memory_behavior(QUALITY_MEMORY_BEHAVIOR)
-        .register_memory_behavior(FAST_MEMORY_BEHAVIOR);
     registry
+        .register_memory_behavior(QUALITY_MEMORY_BEHAVIOR)
+        .register_memory_behavior(FAST_MEMORY_BEHAVIOR)
 }
 
 pub fn register_memory_contract_surfaces(
