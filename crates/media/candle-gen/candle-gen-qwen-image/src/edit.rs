@@ -67,11 +67,12 @@ pub(crate) enum QwenEditArtifactRecipe {
     Plain,
     UserAdapters,
     Lightning,
+    LightningWithUserAdapters,
 }
 
 impl QwenEditArtifactRecipe {
     fn is_lightning(self) -> bool {
-        self == Self::Lightning
+        matches!(self, Self::Lightning | Self::LightningWithUserAdapters)
     }
 }
 
@@ -1000,8 +1001,9 @@ fn adapter_has_exact_receipt(
 }
 
 fn is_exact_lightning_path(path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     path_has_suffix(
-        path,
+        &path,
         &[
             EDIT_2511_LIGHTNING_REPO_DIR,
             "snapshots",
@@ -1015,6 +1017,8 @@ fn is_exact_lightning_path(path: &Path) -> bool {
 pub(crate) fn validate_memory_artifact_recipe(
     spec: &candle_gen::gen_core::LoadSpec,
 ) -> Result<QwenEditArtifactRecipe> {
+    spec.validate_prepared_file_pins()
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
     let _tier = exact_base_tier(spec)?;
     for adapter in &spec.adapters {
         adapter_has_exact_receipt(spec, adapter)?;
@@ -1038,23 +1042,28 @@ pub(crate) fn validate_memory_artifact_recipe(
             Ok(QwenEditArtifactRecipe::UserAdapters)
         }
         Some(EDIT_2511_LIGHTNING_ROUTE) => {
-            let [adapter] = spec.adapters.as_slice() else {
+            let Some((built_in, user)) = spec.adapters.split_first() else {
                 return Err(CandleError::Msg(
-                    "qwen edit: Lightning requires exactly one built-in distillation adapter"
+                    "qwen edit: Lightning requires its built-in distillation adapter first"
                         .to_owned(),
                 ));
             };
-            if !is_exact_lightning_path(&adapter.path)
-                || adapter.scale.to_bits() != 1.0_f32.to_bits()
-                || adapter.kind != candle_gen::gen_core::AdapterKind::Lora
-                || adapter.pass_scales.is_some()
-                || adapter.moe_expert.is_some()
+            if !is_exact_lightning_path(&built_in.path)
+                || built_in.scale.to_bits() != 1.0_f32.to_bits()
+                || built_in.kind != candle_gen::gen_core::AdapterKind::Lora
+                || built_in.pass_scales.is_some()
+                || built_in.moe_expert.is_some()
+                || user.iter().any(|adapter| is_exact_lightning_path(&adapter.path))
             {
                 return Err(CandleError::Msg(format!(
-                    "qwen edit: Lightning requires {EDIT_2511_LIGHTNING_REPO_DIR}/snapshots/{EDIT_2511_LIGHTNING_REVISION}/{EDIT_2511_LIGHTNING_FILE} as one LoRA at scale 1.0"
+                    "qwen edit: Lightning requires {EDIT_2511_LIGHTNING_REPO_DIR}/snapshots/{EDIT_2511_LIGHTNING_REVISION}/{EDIT_2511_LIGHTNING_FILE} first as one LoRA at scale 1.0, followed only by user adapters"
                 )));
             }
-            Ok(QwenEditArtifactRecipe::Lightning)
+            Ok(if user.is_empty() {
+                QwenEditArtifactRecipe::Lightning
+            } else {
+                QwenEditArtifactRecipe::LightningWithUserAdapters
+            })
         }
         route => Err(CandleError::Msg(format!(
             "qwen edit: optimized memory does not authorize route {route:?}; expected {EDIT_2511_BASE_ROUTE} or {EDIT_2511_LIGHTNING_ROUTE}"
@@ -1537,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn lightning_recipe_rejects_plain_and_user_adapter_crossings_in_both_directions() {
+    fn lightning_recipe_preserves_ordered_user_stack_but_rejects_crossings() {
         let lightning_tmp = tempfile::tempdir().unwrap();
         let (lightning, _, _) = admitted_edit_context(&lightning_tmp, 1, true);
         assert_eq!(
@@ -1551,16 +1560,35 @@ mod tests {
 
         let user_tmp = tempfile::tempdir().unwrap();
         let (mut user_on_lightning, _, _) = admitted_edit_context(&user_tmp, 1, false);
+        let built_in = user_tmp
+            .path()
+            .join(EDIT_2511_LIGHTNING_REPO_DIR)
+            .join("snapshots")
+            .join(EDIT_2511_LIGHTNING_REVISION)
+            .join(EDIT_2511_LIGHTNING_FILE);
+        std::fs::create_dir_all(built_in.parent().unwrap()).unwrap();
+        std::fs::write(&built_in, b"lightning-receipt").unwrap();
+        user_on_lightning.adapters.push(AdapterSpec::new(
+            built_in,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
         let user_path = user_tmp.path().join("user.safetensors");
         std::fs::write(&user_path, b"user-adapter").unwrap();
         user_on_lightning.adapters.push(AdapterSpec::new(
-            user_path,
+            user_path.clone(),
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         ));
         user_on_lightning.resolved_route = Some(EDIT_2511_LIGHTNING_ROUTE.to_owned());
         user_on_lightning.prepare_file_sources().unwrap();
-        assert!(validate_memory_artifact_recipe(&user_on_lightning).is_err());
+        assert_eq!(
+            validate_memory_artifact_recipe(&user_on_lightning).unwrap(),
+            QwenEditArtifactRecipe::LightningWithUserAdapters
+        );
+        let changed_bytes = user_on_lightning.clone();
+        std::fs::write(&user_path, b"changed-user-adapter").unwrap();
+        assert!(validate_memory_artifact_recipe(&changed_bytes).is_err());
 
         let mut wrong_kind = lightning.clone();
         wrong_kind.adapters[0].kind = candle_gen::gen_core::AdapterKind::Lokr;
@@ -1579,13 +1607,43 @@ mod tests {
             .join("foreign-revision")
             .join(EDIT_2511_LIGHTNING_FILE);
         assert!(validate_memory_artifact_recipe(&wrong_revision).is_err());
-        let mut multiple = lightning;
+        let mut multiple = lightning.clone();
+        let duplicate = multiple.adapters[0].path.clone();
         multiple.adapters.push(AdapterSpec::new(
-            lightning_tmp.path().join("user.safetensors"),
+            duplicate,
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         ));
+        multiple.prepare_file_sources().unwrap();
         assert!(validate_memory_artifact_recipe(&multiple).is_err());
+
+        let original = lightning_tmp
+            .path()
+            .join(EDIT_2511_LIGHTNING_REPO_DIR)
+            .join("snapshots")
+            .join(EDIT_2511_LIGHTNING_REVISION)
+            .join(EDIT_2511_LIGHTNING_FILE);
+        let lexical_alias = original
+            .parent()
+            .unwrap()
+            .join("..")
+            .join(EDIT_2511_LIGHTNING_REVISION)
+            .join(EDIT_2511_LIGHTNING_FILE);
+        let mut alias = candle_gen::gen_core::LoadSpec::new(lightning.weights.clone())
+            .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization)
+            .with_resolved_route(EDIT_2511_LIGHTNING_ROUTE);
+        alias.adapters.push(AdapterSpec::new(
+            original,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        alias.adapters.push(AdapterSpec::new(
+            lexical_alias,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        alias.prepare_file_sources().unwrap();
+        assert!(validate_memory_artifact_recipe(&alias).is_err());
     }
 
     #[test]
