@@ -8,7 +8,10 @@
 //! intentionally absent until the Windows/CUDA real-weight campaign exists.
 
 use candle_gen::candle_core::Device;
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::LoadShape;
 use candle_gen::gen_core::{
@@ -61,16 +64,129 @@ fn known_provider(provider_id: &str) -> gen_core::Result<()> {
         })
 }
 
-fn component_bytes(root: &Path, component: &str) -> gen_core::Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComponentPacking {
+    Dense,
+    Q4,
+    Q8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComponentReceipt {
+    verified_bytes: u64,
+}
+
+fn nested_safetensors(path: &Path, depth: usize) -> gen_core::Result<Option<PathBuf>> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if entry.file_type()?.is_dir() {
+            if let Some(found) = nested_safetensors(&child, depth + 1)? {
+                return Ok(Some(found));
+            }
+        } else if depth > 0 && child.extension().is_some_and(|ext| ext == "safetensors") {
+            return Ok(Some(child));
+        }
+    }
+    Ok(None)
+}
+
+/// Inspect exactly the direct safetensors files `component_vb` opens. Recursive byte scans and a
+/// marker alone are not loader evidence: both can be satisfied by a stale or foreign nested file.
+fn component_receipt(
+    root: &Path,
+    component: &str,
+    expected: ComponentPacking,
+) -> gen_core::Result<ComponentReceipt> {
     let path = root.join(component);
-    let bytes = gen_core::weightsmeta::safetensors_path_bytes(&path);
-    if bytes == 0 {
+    if let Some(foreign) = nested_safetensors(&path, 0)? {
         return Err(gen_core::Error::Unsupported(format!(
-            "Bernini Candle memory contract requires a non-empty {component} safetensors component at {}",
+            "Bernini {component} contains nested foreign safetensors {}; only direct component files are loadable evidence",
+            foreign.display()
+        )));
+    }
+    let mut direct_files = Vec::new();
+    for entry in std::fs::read_dir(&path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "safetensors")
+        {
+            direct_files.push(entry.path());
+        }
+    }
+    direct_files.sort();
+    if direct_files.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini Candle memory contract requires direct {component} safetensors files at {}",
             path.display()
         )));
     }
-    Ok(bytes)
+
+    let mut names = BTreeSet::new();
+    let mut verified_bytes = 0_u64;
+    for file in &direct_files {
+        let raw = std::fs::read(file)?;
+        let parsed = safetensors::SafeTensors::deserialize(&raw).map_err(|error| {
+            gen_core::Error::Unsupported(format!(
+                "Bernini {component} direct artifact {} is not safetensors: {error}",
+                file.display()
+            ))
+        })?;
+        verified_bytes = verified_bytes
+            .checked_add(u64::try_from(raw.len()).map_err(|_| {
+                gen_core::Error::Msg(format!("Bernini {component} byte length overflow"))
+            })?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("Bernini {component} byte total overflow"))
+            })?;
+        names.extend(parsed.tensors().into_iter().map(|(name, _)| name));
+    }
+    if verified_bytes == 0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} direct safetensors are empty"
+        )));
+    }
+
+    let scale_names = names
+        .iter()
+        .filter(|name| name.ends_with(".scales"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for scales in &scale_names {
+        let base = scales.trim_end_matches(".scales");
+        if !names.contains(&format!("{base}.weight")) || !names.contains(&format!("{base}.biases"))
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini {component} has orphan/incomplete packed evidence at {scales}"
+            )));
+        }
+    }
+    let marker = quant_marker(root, component)?;
+    let loader_packed = if matches!(component, "transformer" | "transformer_2") {
+        names.contains("proj_out.scales")
+    } else {
+        !scale_names.is_empty()
+    };
+    let packing = match (loader_packed, marker) {
+        (false, None | Some(0)) if scale_names.is_empty() => ComponentPacking::Dense,
+        (true, Some(4)) => ComponentPacking::Q4,
+        (true, Some(8)) => ComponentPacking::Q8,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini {component} packing evidence is mixed or inconsistent: loader_packed={loader_packed}, scales={}, marker={marker:?}",
+                scale_names.len()
+            )))
+        }
+    };
+    if packing != expected {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} loads as {packing:?}, crossed requested tier {expected:?}"
+        )));
+    }
+    Ok(ComponentReceipt { verified_bytes })
 }
 
 fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<u8>> {
@@ -99,80 +215,158 @@ fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<u8>> {
     })
 }
 
-fn validate_quant_tier(root: &Path, spec: &LoadSpec, provider_id: &str) -> gen_core::Result<()> {
-    let expected = match spec.quantize {
-        None => 0,
-        Some(gen_core::Quant::Q4) => 4,
-        Some(gen_core::Quant::Q8) => 8,
-        Some(other) => {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini Candle memory contract does not recognize quant tier {other:?}"
-            )))
-        }
-    };
-    let components = if provider_id == crate::bernini::MODEL_ID {
-        ["transformer", "transformer_2", "mllm"].as_slice()
-    } else {
-        ["transformer", "transformer_2"].as_slice()
-    };
-    for component in components {
-        let marker = quant_marker(root, component)?;
-        let actual = marker.unwrap_or(0);
-        if actual != expected {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini Candle tier {:?} crossed {component} marker {actual}-bit (expected {expected}-bit)",
-                spec.quantize
-            )));
-        }
+fn expected_packing(spec: &LoadSpec) -> gen_core::Result<ComponentPacking> {
+    match spec.quantize {
+        None => Ok(ComponentPacking::Dense),
+        Some(gen_core::Quant::Q4) => Ok(ComponentPacking::Q4),
+        Some(gen_core::Quant::Q8) => Ok(ComponentPacking::Q8),
+        Some(other) => Err(gen_core::Error::Unsupported(format!(
+            "Bernini Candle memory contract does not recognize quant tier {other:?}"
+        ))),
     }
-    Ok(())
 }
 
-fn adapter_identity(spec: &LoadSpec) -> gen_core::Result<(u64, String)> {
+#[derive(Clone, Debug, PartialEq)]
+struct AdapterLoadReceipt {
+    canonical_path: PathBuf,
+    digest: [u8; 32],
+    kind: gen_core::AdapterKind,
+    scale_bits: u32,
+    pass_scale_bits: Option<Vec<u32>>,
+    expert: Option<gen_core::MoeExpert>,
+    verified_bytes: u64,
+}
+
+impl AdapterLoadReceipt {
+    fn identity(&self) -> String {
+        let path_hex = self
+            .canonical_path
+            .to_string_lossy()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let pass_scales = self.pass_scale_bits.as_ref().map_or_else(
+            || "none".to_owned(),
+            |bits| {
+                bits.iter()
+                    .map(|bits| format!("{bits:08x}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        );
+        format!(
+            "artifact=safetensors;path_hex={path_hex};digest=sha256:{};kind={:?};scale_bits={:08x};pass_scale_bits={pass_scales};expert={:?};verified_bytes={};stable=true",
+            self.digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            self.kind,
+            self.scale_bits,
+            self.expert,
+            self.verified_bytes
+        )
+    }
+}
+
+fn read_adapter_receipt(adapter: &gen_core::AdapterSpec) -> gen_core::Result<AdapterLoadReceipt> {
+    if adapter
+        .path
+        .extension()
+        .is_none_or(|extension| extension != "safetensors")
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} is not a safetensors artifact",
+            adapter.path.display()
+        )));
+    }
+    let canonical_path = std::fs::canonicalize(&adapter.path).map_err(|error| {
+        gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} cannot be resolved exactly: {error}",
+            adapter.path.display()
+        ))
+    })?;
+    let before = std::fs::metadata(&canonical_path)?;
+    let mut file = File::open(&canonical_path)?;
+    let opened = file.metadata()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = std::fs::metadata(&canonical_path)?;
+    if bytes.is_empty()
+        || before.len() != opened.len()
+        || opened.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || u64::try_from(bytes.len()).ok() != Some(after.len())
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} changed while its load receipt was read",
+            canonical_path.display()
+        )));
+    }
+    let parsed = safetensors::SafeTensors::deserialize(&bytes).map_err(|error| {
+        gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} is not loadable safetensors: {error}",
+            canonical_path.display()
+        ))
+    })?;
+    let tensor_bytes = parsed
+        .tensors()
+        .into_iter()
+        .try_fold(0_u64, |total, (_, tensor)| {
+            total.checked_add(u64::try_from(tensor.data().len()).ok()?)
+        })
+        .ok_or_else(|| gen_core::Error::Msg("Bernini adapter tensor bytes overflow".into()))?;
+    let verified_again = std::fs::read(&canonical_path)?;
+    if verified_again != bytes {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} changed during its post-read stability check",
+            canonical_path.display()
+        )));
+    }
+    if !adapter.scale.is_finite()
+        || adapter
+            .pass_scales
+            .as_ref()
+            .is_some_and(|scales| scales.iter().any(|scale| !scale.is_finite()))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini adapter {} has non-finite scale evidence",
+            canonical_path.display()
+        )));
+    }
+    Ok(AdapterLoadReceipt {
+        canonical_path,
+        digest: Sha256::digest(&bytes).into(),
+        kind: adapter.kind,
+        scale_bits: adapter.scale.to_bits(),
+        pass_scale_bits: adapter
+            .pass_scales
+            .as_ref()
+            .map(|scales| scales.iter().map(|scale| scale.to_bits()).collect()),
+        expert: adapter.moe_expert,
+        // The packed additive path keeps tensor payloads on the expert device, not the container
+        // header. Charging the parsed payload is the exact independent resident quantity.
+        verified_bytes: tensor_bytes,
+    })
+}
+
+fn adapter_identity(spec: &LoadSpec, packing: ComponentPacking) -> gen_core::Result<(u64, String)> {
     if spec.adapters.is_empty() {
         return Ok((0, String::new()));
     }
     let mut total = 0_u64;
     let mut identities = Vec::with_capacity(spec.adapters.len());
     for adapter in &spec.adapters {
-        let bytes = std::fs::read(&adapter.path).map_err(|error| {
-            gen_core::Error::Unsupported(format!(
-                "Bernini adapter {} is not readable: {error}",
-                adapter.path.display()
-            ))
-        })?;
-        if bytes.is_empty() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini adapter {} is empty",
-                adapter.path.display()
-            )));
+        let receipt = read_adapter_receipt(adapter)?;
+        // Dense adapters are folded into each expert's base map and leave no independent resident
+        // allocation. Packed tiers keep an additive residual alive; shared adapters are installed
+        // on both loaded experts, while an expert-targeted one is installed once.
+        if packing != ComponentPacking::Dense {
+            let loaded_experts = if receipt.expert.is_none() { 2 } else { 1 };
+            total = total
+                .checked_add(receipt.verified_bytes.saturating_mul(loaded_experts))
+                .ok_or_else(|| {
+                    gen_core::Error::Msg("Bernini adapter resident bytes overflow".into())
+                })?;
         }
-        // The digest and resident bytes come from this same verified read. The metadata helper is
-        // only a loadability/extension guard; a second stat must never become the priced source.
-        let file_bytes = u64::try_from(bytes.len())
-            .map_err(|_| gen_core::Error::Msg("Bernini adapter byte length overflow".into()))?;
-        if gen_core::weightsmeta::safetensors_path_bytes(&adapter.path) != file_bytes
-            || file_bytes == 0
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini adapter {} is not a non-empty load-exact safetensors artifact",
-                adapter.path.display()
-            )));
-        }
-        let expert_count = if adapter.moe_expert.is_none() { 2 } else { 1 };
-        total = total
-            .checked_add(file_bytes.saturating_mul(expert_count))
-            .ok_or_else(|| {
-                gen_core::Error::Msg("Bernini adapter resident bytes overflow".into())
-            })?;
-        identities.push(format!(
-            "artifact={};digest=sha256:{:x};kind={:?};scale={:.9};expert={:?}",
-            adapter.path.display(),
-            Sha256::digest(&bytes),
-            adapter.kind,
-            adapter.scale,
-            adapter.moe_expert
-        ));
+        identities.push(receipt.identity());
     }
     Ok((total, format!("adapters:[{}]", identities.join(","))))
 }
@@ -223,10 +417,10 @@ fn contract(
         MemoryFormulaVariable::ConditioningTokenCount,
         MemoryFormulaVariable::DecodeTileArea,
     ];
-    let resident_components = if facts.overlay_bytes > 0 {
+    let resident_components = if let Some(adapter_identity) = adapter_identity {
         variables.push(MemoryFormulaVariable::OverlayBytes);
         vec![MemoryResidentComponent {
-            id: adapter_identity.unwrap_or_else(|| "adapter_stack".to_owned()),
+            id: adapter_identity,
             kind: MemoryComponentKind::AdapterStack,
             resident_bytes: facts.overlay_bytes,
             bounded_by: None,
@@ -316,25 +510,27 @@ fn production_assets(
             "Bernini Candle memory contract requires EagerMaterialization".into(),
         ));
     }
-    validate_quant_tier(root, spec, provider_id)?;
-    let conditioning = component_bytes(root, "text_encoder")?;
-    let transformer = component_bytes(root, "transformer")?
-        .checked_add(component_bytes(root, "transformer_2")?)
+    let expected = expected_packing(spec)?;
+    let conditioning =
+        component_receipt(root, "text_encoder", ComponentPacking::Dense)?.verified_bytes;
+    let transformer = component_receipt(root, "transformer", expected)?
+        .verified_bytes
+        .checked_add(component_receipt(root, "transformer_2", expected)?.verified_bytes)
         .ok_or_else(|| gen_core::Error::Msg("Bernini transformer bytes overflow".into()))?;
-    let decoder = component_bytes(root, "vae")?;
+    let decoder = component_receipt(root, "vae", ComponentPacking::Dense)?.verified_bytes;
     let planner = if provider_id == crate::bernini::MODEL_ID {
-        ["mllm", "connector", "vit_decoder"]
-            .into_iter()
-            .map(|component| component_bytes(root, component))
-            .try_fold(0_u64, |total, next| {
-                total
-                    .checked_add(next?)
-                    .ok_or_else(|| gen_core::Error::Msg("Bernini planner bytes overflow".into()))
-            })?
+        let mllm = component_receipt(root, "mllm", expected)?.verified_bytes;
+        let connector =
+            component_receipt(root, "connector", ComponentPacking::Dense)?.verified_bytes;
+        let vit_decoder =
+            component_receipt(root, "vit_decoder", ComponentPacking::Dense)?.verified_bytes;
+        mllm.checked_add(connector)
+            .and_then(|total| total.checked_add(vit_decoder))
+            .ok_or_else(|| gen_core::Error::Msg("Bernini planner bytes overflow".into()))?
     } else {
         0
     };
-    let (overlay_bytes, overlay_identity) = adapter_identity(spec)?;
+    let (overlay_bytes, overlay_identity) = adapter_identity(spec, expected)?;
     let facts = MemoryAssetFacts {
         base_bytes: conditioning
             .checked_add(planner)
@@ -728,6 +924,54 @@ pub fn register_memory_strategy(
 mod tests {
     use super::*;
 
+    fn write_safetensors(path: &Path, names: &[&str]) {
+        let bytes = [0_u8; 4];
+        let tensors = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &bytes)
+                        .unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        safetensors::serialize_to_file(tensors, None, path).unwrap();
+    }
+
+    fn write_component(root: &Path, component: &str, packing: ComponentPacking) {
+        let dir = root.join(component);
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = match packing {
+            ComponentPacking::Dense => vec!["proj_out.weight"],
+            ComponentPacking::Q4 | ComponentPacking::Q8 => {
+                vec!["proj_out.weight", "proj_out.scales", "proj_out.biases"]
+            }
+        };
+        write_safetensors(&dir.join("model.safetensors"), &names);
+        let bits = match packing {
+            ComponentPacking::Dense => None,
+            ComponentPacking::Q4 => Some(4),
+            ComponentPacking::Q8 => Some(8),
+        };
+        if let Some(bits) = bits {
+            std::fs::write(
+                dir.join("quantize_config.json"),
+                format!(r#"{{"bits":{bits},"quantization":{{"group_size":64}}}}"#),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_full_snapshot(root: &Path, packing: ComponentPacking) {
+        for component in ["text_encoder", "connector", "vit_decoder", "vae"] {
+            write_component(root, component, ComponentPacking::Dense);
+        }
+        for component in ["transformer", "transformer_2", "mllm"] {
+            write_component(root, component, packing);
+        }
+    }
+
     #[test]
     fn candle_bernini_declares_missing_attention_and_transformer_rungs() {
         let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/missing".into()));
@@ -856,33 +1100,25 @@ mod tests {
     #[test]
     fn candle_bernini_loaded_contract_prices_shared_adapter_per_expert_and_exact_tier() {
         let root = tempfile::tempdir().unwrap();
-        for component in [
-            "text_encoder",
-            "transformer",
-            "transformer_2",
-            "mllm",
-            "connector",
-            "vit_decoder",
-            "vae",
-        ] {
-            std::fs::create_dir_all(root.path().join(component)).unwrap();
-            std::fs::write(
-                root.path().join(component).join("model.safetensors"),
-                vec![7; 8],
-            )
-            .unwrap();
-            if ["transformer", "transformer_2", "mllm"].contains(&component) {
-                std::fs::write(
-                    root.path().join(component).join("quantize_config.json"),
-                    br#"{"bits":4,"quantization":{"group_size":64}}"#,
-                )
-                .unwrap();
-            }
-        }
+        write_full_snapshot(root.path(), ComponentPacking::Q4);
         let adapter = root.path().join("adapter.safetensors");
-        std::fs::write(&adapter, vec![3; 11]).unwrap();
+        write_safetensors(&adapter, &["blocks.0.attn.lora_A.weight"]);
         let high_adapter = root.path().join("high-adapter.safetensors");
-        std::fs::write(&high_adapter, vec![5; 7]).unwrap();
+        write_safetensors(&high_adapter, &["blocks.0.attn.lokr_w1"]);
+        let adapter_bytes = read_adapter_receipt(&gen_core::AdapterSpec::new(
+            adapter.clone(),
+            0.5,
+            gen_core::AdapterKind::Lora,
+        ))
+        .unwrap()
+        .verified_bytes;
+        let high_bytes = read_adapter_receipt(&gen_core::AdapterSpec::new(
+            high_adapter.clone(),
+            1.0,
+            gen_core::AdapterKind::Lokr,
+        ))
+        .unwrap()
+        .verified_bytes;
         let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
             .with_quant(gen_core::Quant::Q4);
         spec.adapters = vec![
@@ -897,14 +1133,146 @@ mod tests {
         ];
         let contract = memory_strategy_contract(crate::bernini::MODEL_ID, &spec).unwrap();
         assert_eq!(contract.calibration, None);
-        assert_eq!(contract.asset_facts.overlay_bytes, 29);
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            adapter_bytes * 2 + high_bytes
+        );
         assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
         assert!(contract.resident_components().iter().any(|component| {
             component.kind == MemoryComponentKind::AdapterStack
-                && component.resident_bytes == 29
+                && component.resident_bytes == adapter_bytes * 2 + high_bytes
                 && component.id.contains("digest=sha256:")
+                && component.id.contains("scale_bits=3f000000")
+                && component.id.contains("expert=Some(High)")
         }));
         let stale = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
         assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &stale).is_err());
+    }
+
+    #[test]
+    fn adapter_receipt_binds_every_load_knob_and_post_read_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("adapter.safetensors");
+        write_safetensors(&path, &["blocks.0.attn.lora_A.weight"]);
+        let base =
+            gen_core::AdapterSpec::new(path.clone(), 0.123_456_79, gen_core::AdapterKind::Lora);
+        let base_id = read_adapter_receipt(&base).unwrap().identity();
+        assert!(base_id.contains(&format!("scale_bits={:08x}", base.scale.to_bits())));
+        assert!(base_id.contains("pass_scale_bits=none"));
+        assert!(base_id.contains("expert=None"));
+        assert!(base_id.contains("verified_bytes="));
+        assert!(base_id.contains("stable=true"));
+
+        let mut crossed_scale = base.clone();
+        crossed_scale.scale = f32::from_bits(base.scale.to_bits() + 1);
+        let mut crossed_pass = base.clone();
+        crossed_pass.pass_scales = Some(vec![0.25, 0.75]);
+        let crossed_high = base.clone().with_moe_expert(gen_core::MoeExpert::High);
+        let mut crossed_kind = base.clone();
+        crossed_kind.kind = gen_core::AdapterKind::Lokr;
+        for crossed in [&crossed_scale, &crossed_pass, &crossed_high, &crossed_kind] {
+            assert_ne!(read_adapter_receipt(crossed).unwrap().identity(), base_id);
+        }
+        assert!(read_adapter_receipt(&crossed_pass)
+            .unwrap()
+            .identity()
+            .contains(&format!(
+                "pass_scale_bits={:08x}/{:08x}",
+                0.25_f32.to_bits(),
+                0.75_f32.to_bits()
+            )));
+
+        // A post-receipt artifact mutation cannot borrow the old identity, even when the file stays
+        // valid safetensors and happens to retain the same filesystem path.
+        write_safetensors(
+            &path,
+            &["blocks.0.attn.lora_B.weight", "blocks.1.attn.lora_B.weight"],
+        );
+        let mutated_id = read_adapter_receipt(&base).unwrap().identity();
+        assert_ne!(mutated_id, base_id);
+        assert!(mutated_id.contains("verified_bytes=8"));
+
+        let second = root.path().join("second.safetensors");
+        write_safetensors(&second, &["blocks.1.attn.lora_A.weight"]);
+        let mut stack = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
+        stack.adapters = vec![
+            base,
+            gen_core::AdapterSpec::new(second, 1.0, gen_core::AdapterKind::Lora)
+                .with_moe_expert(gen_core::MoeExpert::Low),
+        ];
+        let (_, multi) = adapter_identity(&stack, ComponentPacking::Q4).unwrap();
+        assert_eq!(
+            adapter_identity(&stack, ComponentPacking::Q4).unwrap().0,
+            20,
+            "shared payload is installed on both experts and Low-targeted payload once"
+        );
+        assert_eq!(multi.matches("artifact=safetensors").count(), 2);
+        assert!(multi.contains("expert=Some(Low)"));
+    }
+
+    #[test]
+    fn dense_folded_adapters_keep_exact_identity_but_zero_independent_residency() {
+        let root = tempfile::tempdir().unwrap();
+        write_full_snapshot(root.path(), ComponentPacking::Dense);
+        let shared = root.path().join("shared.safetensors");
+        let low = root.path().join("low.safetensors");
+        write_safetensors(&shared, &["blocks.0.attn.lora_A.weight"]);
+        write_safetensors(&low, &["blocks.0.attn.lora_B.weight"]);
+        let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
+        spec.adapters = vec![
+            gen_core::AdapterSpec::new(shared, 0.75, gen_core::AdapterKind::Lora),
+            gen_core::AdapterSpec::new(low, 1.25, gen_core::AdapterKind::Lokr)
+                .with_moe_expert(gen_core::MoeExpert::Low),
+        ];
+        let contract = memory_strategy_contract(crate::bernini::MODEL_ID, &spec).unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        let receipt = contract
+            .resident_components()
+            .iter()
+            .find(|component| component.kind == MemoryComponentKind::AdapterStack)
+            .expect("dense folded stack retains request identity");
+        assert_eq!(receipt.resident_bytes, 0);
+        assert_eq!(receipt.id.matches("artifact=safetensors").count(), 2);
+        assert!(receipt.id.contains("expert=Some(Low)"));
+    }
+
+    #[test]
+    fn component_receipt_uses_only_direct_parseable_loader_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        write_full_snapshot(root.path(), ComponentPacking::Q4);
+        let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
+            .with_quant(gen_core::Quant::Q4);
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_ok());
+
+        // A stale marker cannot upgrade dense direct weights.
+        write_component(root.path(), "transformer", ComponentPacking::Dense);
+        std::fs::write(
+            root.path().join("transformer/quantize_config.json"),
+            r#"{"bits":4}"#,
+        )
+        .unwrap();
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
+
+        // Restore the direct tier, then add a foreign nested container. Recursive byte counters
+        // would price it even though component_vb never opens it.
+        write_component(root.path(), "transformer", ComponentPacking::Q4);
+        let nested = root.path().join("transformer/foreign");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_safetensors(&nested.join("model.safetensors"), &["proj_out.scales"]);
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
+        std::fs::remove_dir_all(nested).unwrap();
+
+        // A `.safetensors` suffix is not evidence unless the direct artifact parses.
+        std::fs::write(
+            root.path().join("transformer_2/model.safetensors"),
+            b"not safetensors",
+        )
+        .unwrap();
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
+
+        // Mixed expert tiers are rejected even if each marker is internally plausible.
+        write_component(root.path(), "transformer_2", ComponentPacking::Q8);
+        spec.quantize = Some(gen_core::Quant::Q4);
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
     }
 }

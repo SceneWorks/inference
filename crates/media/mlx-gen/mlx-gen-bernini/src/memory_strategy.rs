@@ -495,6 +495,12 @@ pub(crate) fn safety_check(
             )));
         }
         validate_geometry(context.geometry.width, context.geometry.height)?;
+        if !matches!(context.geometry.frames, 45 | 61 | 77) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: Bernini V2V memory evidence covers exactly 45, 61, or 77 frames, got {}",
+                contract.provider_id, context.geometry.frames
+            )));
+        }
         if context.overlay.as_deref().is_some_and(|overlay| {
             overlay
                 .split('+')
@@ -1532,5 +1538,42 @@ mod tests {
         crossed.height = 480;
         crossed.fps = Some(24);
         assert!(validate_video_to_video_request(&crossed).is_err());
+    }
+
+    /// Safety owns the context axis before a request scope is constructed. A valid request cannot
+    /// rescue a context whose frame cell was crossed after selection.
+    #[test]
+    fn v2v_safety_binds_the_exact_context_frame_cell_before_configure() {
+        for provider_id in PROVIDER_IDS {
+            let spec = spec(LoadShape::DeferredMaterialization);
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            let mut context =
+                registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .remove(0)
+                    .context;
+            for frames in [45, 61, 77] {
+                context.geometry.frames = frames;
+                assert_eq!(
+                    safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}/{frames}"
+                );
+            }
+            for frames in [1, 44, 46, 60, 62, 76, 78] {
+                context.geometry.frames = frames;
+                assert!(
+                    matches!(
+                        safety_check(&spec, &contract, &context),
+                        MemorySafetyDecision::Reject { .. }
+                    ),
+                    "{provider_id}/{frames} must be rejected before configure_request"
+                );
+                assert!(
+                    registered_begin_request(provider_id, &spec, &contract, &context).is_err(),
+                    "{provider_id}/{frames} crossed context reached request scope"
+                );
+            }
+        }
     }
 }
