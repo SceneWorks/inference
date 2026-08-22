@@ -3,9 +3,8 @@
 //! The checkpoint is one flat, fused dual-path Qwen3 model. There is no separately releasable text
 //! encoder or VAE: conditioning and denoise use different weights interleaved in every resident
 //! layer, while the final FM head already emits RGB patches. Consequently staged component
-//! residency and bounded decode are structural N/A. Bounded attention is wired only through the
-//! generation path used by denoise; understanding, VQA, interleave text, and think-token forwards
-//! retain their historical unbounded attention path.
+//! residency and bounded decode are structural N/A. Bounded attention is request-scoped through
+//! both paths, including VQA, interleave text/source-image context, and think-token forwards.
 //!
 //! ## Declared ladder (sc-18608)
 //!
@@ -15,8 +14,8 @@
 //! * [`MemoryStrategy::Resident`] — every surface;
 //! * [`MemoryStrategy::BoundedAttention`] — every surface. `chunk_attention` +
 //!   `attention_chunk_size` reach [`crate::t2i::T2iOptions::attention_score_budget`], which is what
-//!   builds the budgeted `AttentionPlan` for both the T2I and the reference-conditioned edit
-//!   denoise loops. Nothing about it depends on the artifact layout.
+//!   builds the budgeted `AttentionPlan` for all understanding and generation forwards. Nothing
+//!   about it depends on the artifact layout.
 //! * [`MemoryStrategy::BoundedTransformerResidency`] — the **deferred** surfaces of a verified
 //!   single-file snapshot only, and for `_fast` only once the distill LoRA is pre-merged. This is
 //!   provider-local block windowing over the generation-path Qwen stack, reached through
@@ -28,6 +27,10 @@
 //! [`MemoryStrategy::StagedResidency`] and [`MemoryStrategy::BoundedDecode`] stay
 //! [`MemoryStrategySupport::StructurallyNotApplicable`] on every surface for the structural reasons
 //! above — there is no separable conditioning component to stage and no decoder phase to tile.
+//! Bounded attention is request-scoped across both the understanding and generation paths, so it
+//! also covers VQA text, interleave text/source-image context, and think-token forwards. Transformer
+//! block residency stays generation-only: it applies to denoise in T2I/edit/character/interleave,
+//! while VQA is explicitly structural N/A for that rung.
 //!
 //! ## Envelope vs. structure in the request route gate (sc-20569)
 //!
@@ -73,6 +76,59 @@ const STATIC_BEHAVIOR_CALIBRATION: &str = "sensenova-static-registry-behavior-v2
 /// `reject_unknown_components` allow-list and this module's contract gate cannot drift apart.
 pub(crate) const DISTILL_LORA_COMPONENT: &str = "distill_lora";
 
+pub const QUALITY_PUBLIC_ROUTES: &[&str] = &[
+    "sensenova_u1_8b",
+    "sensenova_u1_8b_infographic_v2",
+    "sensenova_u1_8b_infographic_v3",
+];
+pub const FAST_PUBLIC_ROUTES: &[&str] = &[
+    "sensenova_u1_8b_fast",
+    "sensenova_u1_8b_infographic_v2_fast",
+    "sensenova_u1_8b_infographic_v3_fast",
+];
+
+pub fn public_routes(provider_id: &str) -> CoreResult<&'static [&'static str]> {
+    match provider_id {
+        crate::MODEL_ID => Ok(QUALITY_PUBLIC_ROUTES),
+        crate::MODEL_ID_FAST => Ok(FAST_PUBLIC_ROUTES),
+        _ => Err(CoreError::Unsupported(format!(
+            "unknown SenseNova provider {provider_id}"
+        ))),
+    }
+}
+
+fn expected_repository(route: &str) -> Option<String> {
+    QUALITY_PUBLIC_ROUTES
+        .iter()
+        .chain(FAST_PUBLIC_ROUTES)
+        .find(|candidate| **candidate == route)
+        .map(|route| format!("{}-mlx", route.replace('_', "-")))
+}
+
+/// Bind the public route to the repository-bearing resolved path. [`PinnedArtifact`] then freezes
+/// the exact snapshot entry and canonical target for every operation.
+pub(crate) fn validate_resolved_artifact_binding(spec: &LoadSpec) -> CoreResult<()> {
+    let (Some(route), WeightsSource::Dir(root)) = (spec.resolved_route.as_deref(), &spec.weights)
+    else {
+        return Ok(());
+    };
+    let expected = expected_repository(route).ok_or_else(|| {
+        CoreError::Unsupported(format!("unknown SenseNova resolved route {route}"))
+    })?;
+    let expected_hf = format!("models--SceneWorks--{expected}");
+    let expected_app = format!("SceneWorks__{expected}");
+    if root.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        component == expected || component == expected_hf || component == expected_app
+    }) {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "sensenova: resolved route {route} requires repository identity SceneWorks/{expected}, but weights path {} carries no matching repository component",
+        root.display()
+    )))
+}
+
 /// The exact production load compositions the SenseNova memory routes are wired for.
 ///
 /// [`crate::model::load`] refuses a non-directory source, any precision override, user adapters,
@@ -82,7 +138,8 @@ pub(crate) const DISTILL_LORA_COMPONENT: &str = "distill_lora";
 /// contract for either shape would declare a rung on a route that cannot load at all, or that
 /// cannot honor the composition it was handed. Both are unreachable declarations, so admission
 /// fails closed here rather than emitting a contract nothing can execute.
-fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
+pub(crate) fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    let routes = public_routes(provider_id)?;
     let known_components: &[&str] = match provider_id {
         crate::MODEL_ID => &[],
         crate::MODEL_ID_FAST => &[DISTILL_LORA_COMPONENT],
@@ -96,6 +153,14 @@ fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> 
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: SenseNova memory routes require a snapshot directory, not a single file"
         )));
+    }
+    if let Some(route) = spec.resolved_route.as_deref() {
+        if !routes.contains(&route) {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: resolved route {route:?} does not belong to this SenseNova provider; expected one of {}",
+                routes.join(", ")
+            )));
+        }
     }
     if spec.precision != mlx_gen::Precision::Bf16 {
         return Err(CoreError::Unsupported(format!(
@@ -427,6 +492,12 @@ fn calibration_fingerprint(
     spec: &LoadSpec,
     artifact: Option<&PinnedArtifact>,
 ) -> Option<&'static str> {
+    // The recorded digests belong to the two original public routes. Infographic aliases are
+    // tensor-compatible but independently resolved checkpoints; until each alias has its own
+    // artifact-bound campaign it may use estimated admission only, never borrow sibling evidence.
+    if spec.resolved_route.as_deref().unwrap_or(provider_id) != provider_id {
+        return None;
+    }
     if spec.precision != mlx_gen::Precision::Bf16
         || spec.quantize != Some(Quant::Q8)
         || !spec.adapters.is_empty()
@@ -447,6 +518,54 @@ fn calibration_fingerprint(
         }
         _ => None,
     }
+}
+
+/// Validate converter-written packed-tier provenance. MLX may still quantize a dense source at load
+/// time, so an absent marker is compatible with any declared tier; once a packed marker is present,
+/// however, its bit-width and group size must match the declaration exactly.
+pub(crate) fn validate_artifact_tier(spec: &LoadSpec) -> CoreResult<()> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(());
+    };
+    // Preserve the loader's existing actionable missing-source/component errors. Once a resolved
+    // snapshot directory exists, its config becomes mandatory tier provenance.
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let path = root.join("config.json");
+    let body = std::fs::read_to_string(&path).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "sensenova: cannot bind numeric tier without {}: {error}",
+            path.display()
+        ))
+    })?;
+    let config: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "sensenova: malformed tier provenance {}: {error}",
+            path.display()
+        ))
+    })?;
+    let Some(quantization) = config
+        .get("quantization")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    let recorded_bits = quantization.get("bits").and_then(|value| value.as_i64());
+    let recorded_group = quantization
+        .get("group_size")
+        .and_then(|value| value.as_i64());
+    let declared = spec.quantize.map(Quant::bits);
+    if matches!(
+        (declared, recorded_bits, recorded_group),
+        (Some(declared), Some(recorded), Some(64)) if i64::from(declared) == recorded
+    ) {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "sensenova: declared numeric tier {:?} does not match config quantization provenance bits={recorded_bits:?} group_size={recorded_group:?}",
+        declared
+    )))
 }
 
 fn structurally_can_stream_gen(provider_id: &str, spec: &LoadSpec) -> bool {
@@ -491,6 +610,7 @@ pub fn memory_strategy_contract(
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
     validate_load_contract(provider_id, spec)?;
+    validate_resolved_artifact_binding(spec)?;
     let artifact = verified_artifact(spec);
     memory_strategy_contract_with_artifact(provider_id, spec, artifact.as_ref())
 }
@@ -507,6 +627,7 @@ pub(crate) fn validated_memory_strategy_contract_with_artifact(
     artifact: Option<&PinnedArtifact>,
 ) -> CoreResult<MemoryProviderContract> {
     validate_load_contract(provider_id, spec)?;
+    validate_resolved_artifact_binding(spec)?;
     memory_strategy_contract_with_artifact(provider_id, spec, artifact)
 }
 
@@ -692,6 +813,50 @@ pub(crate) fn safety_check(
         // amount of estimate authority makes SenseNova grow a PiD seam or a multi-phase trajectory.
         let claims_measured_evidence =
             context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
+        let structurally_supported = match (&context.mode, context.geometry.reference_count) {
+            (MemoryMode::TextToImage, 0) => true,
+            (MemoryMode::Edit | MemoryMode::ImageToImage, 1..=5) => true,
+            (MemoryMode::Other(mode), 1..=5)
+                if mode == "edit_image" || mode == "character_image" =>
+            {
+                true
+            }
+            (MemoryMode::Other(mode), 1)
+                if contract.provider_id == crate::MODEL_ID && mode == "vqa" =>
+            {
+                true
+            }
+            (MemoryMode::Other(mode), 0..=10)
+                if contract.provider_id == crate::MODEL_ID && mode == "interleave" =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !structurally_supported {
+            return Err(CoreError::Msg(format!(
+                "{}: unsupported SenseNova route {}/{} references",
+                contract.provider_id,
+                context.mode.as_key(),
+                context.geometry.reference_count
+            )));
+        }
+        if matches!(&context.mode, MemoryMode::Other(mode) if mode == "interleave")
+            && !(1..=10).contains(&context.geometry.batch)
+        {
+            return Err(CoreError::Msg(format!(
+                "{}: interleave generated-image count must be 1..=10, got {}",
+                contract.provider_id, context.geometry.batch
+            )));
+        }
+        if matches!(&context.mode, MemoryMode::Other(mode) if mode == "vqa")
+            && context.selection.strategy == MemoryStrategy::BoundedTransformerResidency
+        {
+            return Err(CoreError::Msg(format!(
+                "{}: bounded transformer residency is structurally not applicable to VQA understanding",
+                contract.provider_id
+            )));
+        }
         // Every refusal below is built with `CoreError::Msg`, not `CoreError::Unsupported`. The
         // shared pipeline stringifies a route-gate error into `MemorySafetyDecision::Reject`
         // immediately (`error.to_string()`), so nothing downstream can read the type, while
@@ -756,6 +921,28 @@ pub(crate) fn registered_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     safety_check(contract, spec.quantize, context)
+}
+
+pub(crate) fn validate_direct_operation_identity(
+    provider_id: &str,
+    context: &MemoryRunContext,
+    actual_mode: &MemoryMode,
+    actual_geometry: mlx_gen::gen_core::MemoryGeometry,
+) -> CoreResult<()> {
+    if &context.mode == actual_mode && context.geometry == actual_geometry {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "{provider_id}: direct operation {}/{} references at {}x{} does not match admitted {}/{} references at {}x{}",
+        actual_mode.as_key(),
+        actual_geometry.reference_count,
+        actual_geometry.width,
+        actual_geometry.height,
+        context.mode.as_key(),
+        context.geometry.reference_count,
+        context.geometry.width,
+        context.geometry.height
+    )))
 }
 
 pub(crate) fn begin_request(
@@ -1052,6 +1239,24 @@ mod tests {
                 );
             }
         }
+        let contract = calibrated_contract(crate::MODEL_ID, &spec);
+        let mut vqa_btr = route_context(
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("vqa".into()),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        );
+        vqa_btr.optimization_authority = MemoryOptimizationAuthority::Estimated;
+        assert!(matches!(
+            safety_check(&contract, Some(Quant::Q8), &vqa_btr),
+            MemorySafetyDecision::Reject { reason }
+                if reason.contains("structurally not applicable to VQA")
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1067,9 +1272,8 @@ mod tests {
             let contract = calibrated_contract(provider_id, &spec);
             for (mode, reference_count) in [
                 (MemoryMode::ImageToImage, 1),
-                (MemoryMode::TextToImage, 1),
-                (MemoryMode::Edit, 0),
                 (MemoryMode::Edit, 2),
+                (MemoryMode::Other("character_image".into()), 1),
             ] {
                 let label = format!("{provider_id} {mode:?}/{reference_count}");
                 let measured = route_context(
@@ -1100,6 +1304,25 @@ mod tests {
                     MemorySafetyDecision::Accept,
                     "{label}: a legacy/estimated claim must degrade, not refuse"
                 );
+            }
+            for (mode, reference_count) in [(MemoryMode::TextToImage, 1), (MemoryMode::Edit, 0)] {
+                let mut context = route_context(
+                    &contract,
+                    MemoryStrategy::BoundedAttention,
+                    MemoryBehaviorRoute {
+                        mode,
+                        reference_count,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                );
+                context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                assert!(matches!(
+                    safety_check(&contract, Some(Quant::Q8), &context),
+                    MemorySafetyDecision::Reject { reason }
+                        if reason.contains("unsupported SenseNova route")
+                ));
             }
         }
         std::fs::remove_dir_all(root).ok();
@@ -1873,6 +2096,268 @@ mod tests {
     }
 
     #[test]
+    fn public_route_identities_are_exact_and_provider_partitioned() {
+        assert_eq!(
+            public_routes(crate::MODEL_ID).unwrap(),
+            [
+                "sensenova_u1_8b",
+                "sensenova_u1_8b_infographic_v2",
+                "sensenova_u1_8b_infographic_v3",
+            ]
+        );
+        assert_eq!(
+            public_routes(crate::MODEL_ID_FAST).unwrap(),
+            [
+                "sensenova_u1_8b_fast",
+                "sensenova_u1_8b_infographic_v2_fast",
+                "sensenova_u1_8b_infographic_v3_fast",
+            ]
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let tier = match quant {
+                Some(quant) => spec.clone().with_quant(quant),
+                None => spec.clone(),
+            };
+            for route in QUALITY_PUBLIC_ROUTES {
+                assert!(weights_free_memory_strategy_contract(
+                    crate::MODEL_ID,
+                    &tier.clone().with_resolved_route(*route)
+                )
+                .is_ok());
+                assert!(weights_free_memory_strategy_contract(
+                    crate::MODEL_ID_FAST,
+                    &tier.clone().with_resolved_route(*route)
+                )
+                .is_err());
+            }
+            for route in FAST_PUBLIC_ROUTES {
+                assert!(weights_free_memory_strategy_contract(
+                    crate::MODEL_ID_FAST,
+                    &tier.clone().with_resolved_route(*route)
+                )
+                .is_ok());
+                assert!(weights_free_memory_strategy_contract(
+                    crate::MODEL_ID,
+                    &tier.clone().with_resolved_route(*route)
+                )
+                .is_err());
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn each_public_route_is_bound_to_its_repository_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        for route in QUALITY_PUBLIC_ROUTES.iter().chain(FAST_PUBLIC_ROUTES) {
+            let repository = expected_repository(route).unwrap();
+            let exact = LoadSpec::new(WeightsSource::Dir(
+                tmp.path().join(repository).join("snapshots/revision/q8"),
+            ))
+            .with_resolved_route(*route);
+            assert!(
+                validate_resolved_artifact_binding(&exact).is_ok(),
+                "{route}"
+            );
+
+            let crossed_route = QUALITY_PUBLIC_ROUTES
+                .iter()
+                .chain(FAST_PUBLIC_ROUTES)
+                .find(|candidate| *candidate != route)
+                .unwrap();
+            assert!(validate_resolved_artifact_binding(
+                &exact.clone().with_resolved_route(*crossed_route)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn packed_tier_provenance_refuses_crossed_numeric_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tier");
+        std::fs::create_dir(&root).unwrap();
+        let base = LoadSpec::new(WeightsSource::Dir(root.clone()));
+
+        std::fs::write(root.join("config.json"), "{}").unwrap();
+        assert!(validate_artifact_tier(&base).is_ok());
+        assert!(validate_artifact_tier(&base.clone().with_quant(Quant::Q4)).is_ok());
+
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        assert!(validate_artifact_tier(&base.clone().with_quant(Quant::Q4)).is_ok());
+        assert!(validate_artifact_tier(&base.clone().with_quant(Quant::Q8)).is_err());
+        assert!(validate_artifact_tier(&base).is_err());
+
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        assert!(validate_artifact_tier(&base.with_quant(Quant::Q8)).is_ok());
+    }
+
+    #[test]
+    fn direct_execution_requires_the_exact_admitted_mode_and_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        let spec = spec.with_quant(Quant::Q8);
+        let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        let context = route_context(
+            &contract,
+            MemoryStrategy::BoundedAttention,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("vqa".into()),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        );
+        assert!(validate_direct_operation_identity(
+            crate::MODEL_ID,
+            &context,
+            &context.mode,
+            context.geometry,
+        )
+        .is_ok());
+        assert!(validate_direct_operation_identity(
+            crate::MODEL_ID,
+            &context,
+            &MemoryMode::Other("interleave".into()),
+            context.geometry,
+        )
+        .is_err());
+        let mut crossed_geometry = context.geometry;
+        crossed_geometry.reference_count = 2;
+        assert!(validate_direct_operation_identity(
+            crate::MODEL_ID,
+            &context,
+            &context.mode,
+            crossed_geometry,
+        )
+        .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn advertised_modes_have_exact_structural_applicability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        let spec = spec.with_quant(Quant::Q8);
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let contract = calibrated_contract(provider_id, &spec);
+            let routes = [
+                (MemoryMode::TextToImage, 0, true),
+                (MemoryMode::Edit, 1, true),
+                (MemoryMode::Edit, 5, true),
+                (MemoryMode::ImageToImage, 5, true),
+                (MemoryMode::Other("character_image".into()), 5, true),
+                (
+                    MemoryMode::Other("vqa".into()),
+                    1,
+                    provider_id == crate::MODEL_ID,
+                ),
+                (
+                    MemoryMode::Other("interleave".into()),
+                    10,
+                    provider_id == crate::MODEL_ID,
+                ),
+                (MemoryMode::Edit, 6, false),
+                (MemoryMode::Other("vqa".into()), 0, false),
+                (MemoryMode::Other("interleave".into()), 11, false),
+            ];
+            for (mode, reference_count, supported) in routes {
+                let mut context = route_context(
+                    &contract,
+                    MemoryStrategy::BoundedAttention,
+                    MemoryBehaviorRoute {
+                        mode,
+                        reference_count,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                );
+                context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                assert_eq!(
+                    safety_check(&contract, Some(Quant::Q8), &context)
+                        == MemorySafetyDecision::Accept,
+                    supported,
+                    "{provider_id} {}/{}",
+                    context.mode.as_key(),
+                    reference_count
+                );
+                if supported {
+                    let scope = begin_request(
+                        provider_id,
+                        &contract,
+                        Some(Quant::Q8),
+                        &context,
+                        mlx_gen::request_scope::MlxScopeCleanup::None,
+                    )
+                    .unwrap()
+                    .expect("every advertised direct/registry route owns a request scope");
+                    drop(scope);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn interleave_admission_binds_one_through_ten_generated_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        for count in 1..=10 {
+            let mut context = route_context(
+                &contract,
+                MemoryStrategy::BoundedAttention,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("interleave".into()),
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: None,
+                },
+            );
+            context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+            context.geometry.batch = count;
+            assert_eq!(
+                safety_check(&contract, Some(Quant::Q8), &context),
+                MemorySafetyDecision::Accept
+            );
+        }
+        for count in [0, 11] {
+            let mut context = route_context(
+                &contract,
+                MemoryStrategy::BoundedAttention,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("interleave".into()),
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: None,
+                },
+            );
+            context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+            context.geometry.batch = count;
+            assert!(matches!(
+                safety_check(&contract, Some(Quant::Q8), &context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn runner_gate_requires_exact_provider_sha_and_calibration() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, spec) = fixture_spec(&tmp);
@@ -1931,14 +2416,22 @@ mod tests {
         }
         for rejected in [
             context(MemoryMode::ImageToImage, 1),
-            context(MemoryMode::TextToImage, 1),
-            context(MemoryMode::Edit, 0),
             context(MemoryMode::Edit, 2),
         ] {
             assert!(matches!(
                 safety_check(&contract, Some(Quant::Q8), &rejected),
                 MemorySafetyDecision::Reject { reason }
                     if reason.contains("exactly TextToImage with zero references and Edit with one reference")
+            ));
+        }
+        for rejected in [
+            context(MemoryMode::TextToImage, 1),
+            context(MemoryMode::Edit, 0),
+        ] {
+            assert!(matches!(
+                safety_check(&contract, Some(Quant::Q8), &rejected),
+                MemorySafetyDecision::Reject { reason }
+                    if reason.contains("unsupported SenseNova route")
             ));
         }
 

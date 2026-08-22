@@ -153,16 +153,205 @@ fn guard_pinned_artifact<T>(
 }
 
 impl SenseNova {
-    /// The unified model, for the worker paths the `Generator` contract can't express (VQA text,
-    /// interleave text+images): call [`T2iModel::vqa`] / [`T2iModel::interleave_gen`] directly.
-    pub fn model(&self) -> &T2iModel {
-        &self.model
+    /// Execute a worker-owned VQA/interleave operation under the same before/after artifact guard
+    /// as registry generation. The post-check also runs on cancellation and ordinary errors, and a
+    /// crossed artifact mutation takes precedence over a stale result.
+    fn with_runtime<T>(
+        &self,
+        operation: impl FnOnce(&T2iModel, &mlx_gen::tokenizer::TextTokenizer) -> Result<T>,
+    ) -> Result<T> {
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            operation(&self.model, &self.tokenizer)
+        })
     }
 
-    /// The tokenizer (shared by every mode).
-    pub fn tokenizer(&self) -> &mlx_gen::tokenizer::TextTokenizer {
-        &self.tokenizer
+    fn validate_direct_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        actual_mode: gen_core::MemoryMode,
+        request: &GenerationRequest,
+        actual_reference_count: usize,
+    ) -> Result<()> {
+        let actual_reference_count = u32::try_from(actual_reference_count)
+            .map_err(|_| Error::Msg("sensenova: too many direct image references".into()))?;
+        if request.image_reference_count() != actual_reference_count {
+            return Err(Error::Msg(format!(
+                "sensenova: request declares {} image references but direct execution received {actual_reference_count}",
+                request.image_reference_count()
+            )));
+        }
+        Ok(crate::memory_strategy::validate_direct_operation_identity(
+            self.descriptor.id,
+            context,
+            &actual_mode,
+            gen_core::MemoryGeometry {
+                width: request.width,
+                height: request.height,
+                batch: request.count,
+                frames: request.frames.unwrap_or(context.geometry.frames),
+                reference_count: actual_reference_count,
+            },
+        )?)
     }
+
+    fn apply_request_memory(request: &GenerationRequest, options: &mut T2iOptions) {
+        let memory = request.memory;
+        options.attention_score_budget = memory
+            .filter(|memory| memory.chunk_attention)
+            .and_then(|memory| memory.attention_chunk_size);
+        options.transformer_window_size = memory
+            .filter(|memory| memory.stream_transformer_blocks)
+            .and_then(|memory| memory.transformer_window_size);
+    }
+
+    fn finish_direct<T>(
+        scope: &mut dyn gen_core::MemoryRequestScope,
+        result: Result<T>,
+    ) -> Result<T> {
+        let outcome = match &result {
+            Ok(_) => gen_core::MemoryRunOutcome::Complete,
+            Err(Error::Canceled) => gen_core::MemoryRunOutcome::Canceled,
+            Err(error) => gen_core::MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        scope.finish(outcome)?;
+        result
+    }
+
+    fn run_direct_scope<T>(
+        scope: &mut dyn gen_core::MemoryRequestScope,
+        request: &mut GenerationRequest,
+        operation: impl FnOnce(&GenerationRequest) -> Result<T>,
+    ) -> Result<T> {
+        let result = scope
+            .configure_request(request)
+            .map_err(Error::from)
+            .and_then(|()| operation(request));
+        Self::finish_direct(scope, result)
+    }
+
+    fn begin_direct_scope(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> Result<Box<dyn gen_core::MemoryRequestScope>> {
+        crate::memory_strategy::begin_request(
+            self.descriptor.id,
+            &self.memory_strategy,
+            self.loaded_quant,
+            context,
+            mlx_gen::request_scope::MlxScopeCleanup::Device,
+        )?
+        .ok_or_else(|| {
+            Error::Msg("sensenova: admitted direct route produced no request scope".into())
+        })
+    }
+
+    /// Run VQA under the exact admitted request. The concrete operation and configured options stay
+    /// inside this provider-owned method, and the request scope is finished exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        mut request: GenerationRequest,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: crate::runtime::Sampler,
+        mut options: T2iOptions,
+        cancel: Option<&gen_core::CancelFlag>,
+    ) -> Result<String> {
+        self.validate_direct_request(
+            context,
+            gen_core::MemoryMode::Other("vqa".into()),
+            &request,
+            images.len(),
+        )?;
+        let mut scope = self.begin_direct_scope(context)?;
+        Self::run_direct_scope(&mut *scope, &mut request, |request| {
+            Self::apply_request_memory(request, &mut options);
+            self.with_runtime(|model, tokenizer| {
+                model.vqa_with_options(
+                    tokenizer,
+                    question,
+                    images,
+                    max_new_tokens,
+                    sampler,
+                    &options,
+                    cancel,
+                )
+            })
+        })
+    }
+
+    /// Run Document Studio interleave under the exact admitted request and lifecycle scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        mut request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        mut options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<crate::t2i::InterleaveOutput> {
+        validate_interleave_count(&request, max_images)?;
+        if i64::from(request.width) != i64::from(width)
+            || i64::from(request.height) != i64::from(height)
+        {
+            return Err(Error::Msg(format!(
+                "sensenova: interleave execution {width}x{height} does not match request {}x{}",
+                request.width, request.height
+            )));
+        }
+        self.validate_direct_request(
+            context,
+            gen_core::MemoryMode::Other("interleave".into()),
+            &request,
+            input_images.len(),
+        )?;
+        let mut scope = self.begin_direct_scope(context)?;
+        Self::run_direct_scope(&mut *scope, &mut request, |request| {
+            Self::apply_request_memory(request, &mut options);
+            self.with_runtime(|model, tokenizer| {
+                model.interleave_gen(
+                    tokenizer,
+                    prompt,
+                    input_images,
+                    width,
+                    height,
+                    &options,
+                    system_message,
+                    max_new_tokens,
+                    max_images,
+                    init_noises,
+                    cancel,
+                    on_progress,
+                )
+            })
+        })
+    }
+
+    pub fn memory_contract(&self) -> &gen_core::MemoryProviderContract {
+        &self.memory_strategy
+    }
+}
+
+fn validate_interleave_count(request: &GenerationRequest, max_images: usize) -> Result<()> {
+    if !(1..=10).contains(&max_images) || request.count != max_images as u32 {
+        return Err(Error::Msg(format!(
+            "sensenova: interleave max_images must be 1..=10 and exactly match admitted request count (max_images={max_images}, count={})",
+            request.count
+        )));
+    }
+    Ok(())
 }
 
 /// Construct the base [`SenseNova`] (`sensenova_u1_8b`) from a [`LoadSpec`]. `spec.weights` must be a
@@ -170,6 +359,13 @@ impl SenseNova {
 /// at their on-disk dtype (bf16); `spec.quantize` (Q4/Q8) then quantizes the backbone decoder stack
 /// (sc-3193).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_runtime(spec)?))
+}
+
+/// Typed loader for worker-owned VQA/interleave routes. It preserves the exact registry loader's
+/// artifact pin, quantization, provider contract, and cache identity instead of constructing a
+/// second bespoke runtime beside the registered provider.
+pub fn load_runtime(spec: &LoadSpec) -> Result<SenseNova> {
     load_inner(spec, false)
 }
 
@@ -184,11 +380,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 ///   is already baked into the on-disk weights, so the loader skips it (a packed tier cannot re-merge
 ///   — its base is quantized). Either way the distilled 8-NFE / CFG-1.0 defaults apply.
 pub fn load_fast(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_runtime_fast(spec)?))
+}
+
+pub fn load_runtime_fast(spec: &LoadSpec) -> Result<SenseNova> {
     load_inner(spec, true)
 }
 
-fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
+fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     let id = if fast { MODEL_ID_FAST } else { MODEL_ID };
+    crate::memory_strategy::validate_load_contract(id, spec)?;
+    crate::memory_strategy::validate_resolved_artifact_binding(spec)?;
+    crate::memory_strategy::validate_artifact_tier(spec)?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only dense bf16 is wired (drop the precision override)"
@@ -292,7 +495,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         model.quantize(q.bits())?;
     }
     let tokenizer = load_tokenizer(root)?;
-    Ok(Box::new(SenseNova {
+    Ok(SenseNova {
         descriptor: descriptor_for(id),
         tokenizer,
         model,
@@ -304,7 +507,7 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
         )?,
         loaded_quant: spec.quantize,
         pinned_artifact,
-    }))
+    })
 }
 
 impl SenseNova {
@@ -586,6 +789,127 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingScope {
+        configured: usize,
+        outcomes: Vec<gen_core::MemoryRunOutcome>,
+        reject_configure: bool,
+    }
+
+    impl gen_core::MemoryRequestScope for RecordingScope {
+        fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+            self.configured += 1;
+            if self.reject_configure {
+                return Err(gen_core::Error::Unsupported("crossed request".into()));
+            }
+            request.memory = Some(gen_core::GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(123),
+                ..Default::default()
+            });
+            Ok(())
+        }
+        fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _tile_edge: u32,
+            _overlap: u32,
+            _geometry: gen_core::MemoryGeometry,
+        ) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_attention(&mut self, _chunk_size: u32) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _first_block: u32,
+            _block_count: u32,
+        ) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self, outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+            if !self.outcomes.is_empty() {
+                return Err(gen_core::Error::Msg("finished twice".into()));
+            }
+            self.outcomes.push(outcome);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_direct_scope_configures_and_finishes_every_terminal_outcome_once() {
+        let mut complete = RecordingScope::default();
+        let mut request = GenerationRequest::default();
+        let value = SenseNova::run_direct_scope(&mut complete, &mut request, |configured| {
+            assert_eq!(
+                configured
+                    .memory
+                    .and_then(|memory| memory.attention_chunk_size),
+                Some(123)
+            );
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(complete.configured, 1);
+        assert_eq!(complete.outcomes, [gen_core::MemoryRunOutcome::Complete]);
+
+        let mut canceled = RecordingScope::default();
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut canceled, &mut GenerationRequest::default(), |_| {
+                Err(Error::Canceled)
+            });
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(canceled.outcomes, [gen_core::MemoryRunOutcome::Canceled]);
+
+        let mut failed = RecordingScope::default();
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut failed, &mut GenerationRequest::default(), |_| {
+                Err(Error::Msg("operation failed".into()))
+            });
+        assert!(result.is_err());
+        assert!(matches!(
+            failed.outcomes.as_slice(),
+            [gen_core::MemoryRunOutcome::Error { message }] if message == "operation failed"
+        ));
+
+        let mut crossed = RecordingScope {
+            reject_configure: true,
+            ..Default::default()
+        };
+        let mut called = false;
+        let result: Result<()> =
+            SenseNova::run_direct_scope(&mut crossed, &mut GenerationRequest::default(), |_| {
+                called = true;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert!(!called);
+        assert_eq!(crossed.configured, 1);
+        assert!(matches!(
+            crossed.outcomes.as_slice(),
+            [gen_core::MemoryRunOutcome::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn interleave_output_count_is_exactly_admission_bound() {
+        let request = GenerationRequest {
+            count: 4,
+            ..Default::default()
+        };
+        assert!(validate_interleave_count(&request, 4).is_ok());
+        for crossed in [0, 3, 5, 11] {
+            assert!(validate_interleave_count(&request, crossed).is_err());
+        }
+    }
 
     #[test]
     fn request_guard_reports_post_materialization_mutation_even_after_operation_error() {
