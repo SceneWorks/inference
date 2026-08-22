@@ -76,6 +76,26 @@ fn required_projected_safetensors_bytes(
     Ok(bytes)
 }
 
+fn uncensored_enhancer_resident_bytes(spec: &LoadSpec) -> Result<u64> {
+    let Some(source) = spec.components.get("uncensored_enhancer") else {
+        return Ok(0);
+    };
+    let WeightsSource::Dir(path) = source else {
+        return Err(mlx_gen::Error::Unsupported(
+            "ltx_2_3: uncensored_enhancer must be a directory source".into(),
+        ));
+    };
+    // The amoral Gemma loader retains the packed affine tensors plus their on-disk scale/bias
+    // tensors; it does not materialize a dense copy. Stored safetensors bytes therefore price the
+    // exact artifact loaded by `load_uncensored_enhancer`. Its autoregressive KV work is bounded
+    // separately by the request-scope MAX_ENHANCE_TOKENS ceiling.
+    required_projected_safetensors_bytes(
+        path,
+        "uncensored Gemma enhancer",
+        ResidentProjection::Stored,
+    )
+}
+
 struct AssetDeclaration {
     facts: MemoryAssetFacts,
     resident_components: Vec<MemoryResidentComponent>,
@@ -111,10 +131,10 @@ fn production_asset_declaration(
         ));
     };
 
-    // The calibrated route rejects prompt enhancement, so its conditioning phase is exactly the
-    // canonical dense Gemma snapshot plus the LTX connector. Both loaders materialize every tensor
-    // as bf16 irrespective of the stored payload width. A provisioned uncensored enhancer remains a
-    // supported generator feature but is not materialized by this route.
+    // The conditioning phase includes the canonical dense Gemma snapshot, the LTX connector, and
+    // the optional uncensored Gemma artifact when that exact overlay is loaded. Standard prompt
+    // enhancement reuses the canonical Gemma; its autoregressive working set is bounded by the
+    // request-scope MAX_ENHANCE_TOKENS ceiling.
     let conditioning_bytes = checked_sum(
         "conditioning",
         [
@@ -128,6 +148,7 @@ fn production_asset_declaration(
                 "connector",
                 ResidentProjection::Bfloat16,
             )?,
+            uncensored_enhancer_resident_bytes(spec)?,
         ],
     )?;
 
@@ -727,6 +748,14 @@ impl LtxMemoryRequestScope {
                 "ltx_2_3: provider video mode does not match admitted overlay".into(),
             ));
         }
+        if let Some(tokens) = request.enhance_max_tokens {
+            if tokens == 0 || tokens > gen_core::generator::MAX_ENHANCE_TOKENS {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ltx_2_3: enhance_max_tokens must be in 1..={}, got {tokens}",
+                    gen_core::generator::MAX_ENHANCE_TOKENS
+                )));
+            }
+        }
         let fps = request.fps.unwrap_or(24);
         if !matches!(fps, 24 | 25 | 30) {
             return Err(gen_core::Error::Unsupported(format!(
@@ -1123,13 +1152,27 @@ mod tests {
             .to_string();
         assert!(error.contains("enhancer flavor does not match admitted overlay"));
         let mut admitted_uncensored = GenerationRequest {
+            enhance_prompt: true,
             use_uncensored_enhancer: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
             ..enhancer_fixture.request.clone()
         };
         enhancer_scope
             .configure_request(&mut admitted_uncensored)
             .unwrap();
         assert!(admitted_uncensored.memory.unwrap().stage_residency);
+        let mut crossed_token_budget = GenerationRequest {
+            enhance_prompt: true,
+            use_uncensored_enhancer: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS + 1),
+            ..enhancer_fixture.request.clone()
+        };
+        let error = enhancer_scope
+            .configure_request(&mut crossed_token_budget)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enhance_max_tokens must be in 1..="));
+        assert_eq!(crossed_token_budget.memory, None);
 
         let standard_spec = fixture_spec();
         let standard_contract = weights_free_memory_strategy_contract(&standard_spec).unwrap();
@@ -1149,6 +1192,7 @@ mod tests {
                 .unwrap();
         let mut admitted_standard = GenerationRequest {
             enhance_prompt: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
             ..request.clone()
         };
         standard_scope
@@ -1263,5 +1307,43 @@ mod tests {
             Some("provider_video_mode:video_only"),
             None
         ));
+    }
+
+    #[test]
+    fn uncensored_enhancer_artifact_is_charged_to_conditioning_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = br#"{"gemma.weight":{"dtype":"F16","shape":[2,2],"data_offsets":[0,8]}}"#;
+        let mut padded = header.to_vec();
+        while (padded.len() + 8) % 8 != 0 {
+            padded.push(b' ');
+        }
+        let mut file = (padded.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&padded);
+        file.extend_from_slice(&[0; 8]);
+        std::fs::write(dir.path().join("model.safetensors"), file).unwrap();
+
+        let mut spec = fixture_spec();
+        spec.components.insert(
+            "uncensored_enhancer".into(),
+            WeightsSource::Dir(dir.path().to_path_buf()),
+        );
+        let enhancer_bytes = uncensored_enhancer_resident_bytes(&spec).unwrap();
+        assert_eq!(enhancer_bytes, 8);
+
+        let contract = build_contract(
+            &spec,
+            AssetDeclaration {
+                facts: MemoryAssetFacts {
+                    base_bytes: enhancer_bytes,
+                    conditioning_bytes: enhancer_bytes,
+                    ..Default::default()
+                },
+                resident_components: Vec::new(),
+            },
+            STATIC_CALIBRATION_FINGERPRINT,
+        )
+        .unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, enhancer_bytes);
+        assert_eq!(contract.total_resident_bytes(), enhancer_bytes);
     }
 }
