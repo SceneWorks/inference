@@ -29,7 +29,7 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub(crate) const TRANSFORMER_BLOCKS: u32 = 60;
 pub const CALIBRATION_FINGERPRINT: &str =
-    "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
+    "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
 
 fn streamable(spec: &LoadSpec) -> bool {
     // File and Dir share the provider identity, but the evidence matrix has no source axis. Keep the
@@ -388,6 +388,66 @@ pub(crate) fn validate_context(
     Ok(())
 }
 
+/// Validate the request axes owned by the bespoke Qwen-Image-Edit route. The shared safety check
+/// binds the calibration handshake, load shape, tier, selection, and budget; this gate binds the
+/// remaining provider semantics that must not cross between base/edit, plain/adapter, or unrelated
+/// request envelopes.
+fn validate_edit_route(context: &MemoryRunContext, has_adapters: bool) -> gen_core::Result<()> {
+    if context.mode != MemoryMode::Edit {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory mode {:?} is not the edit route",
+            context.mode
+        )));
+    }
+    if context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || !(1..=5).contains(&context.geometry.reference_count)
+        || !context.has_reference
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory context requires batch=1, frames=1, and 1..=5 references (got batch={}, frames={}, references={}, has_reference={})",
+            context.geometry.batch,
+            context.geometry.frames,
+            context.geometry.reference_count,
+            context.has_reference
+        )));
+    }
+    if context.geometry.width == 0 || context.geometry.height == 0 {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: memory context requires non-zero image geometry".to_owned(),
+        ));
+    }
+    if context.use_pid {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: PiD is not implemented by the bespoke edit provider".to_owned(),
+        ));
+    }
+    if context.has_phases {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: multi-phase denoise is not implemented by the bespoke edit provider"
+                .to_owned(),
+        ));
+    }
+    let expected_overlay = has_adapters.then_some("lora");
+    if context.overlay.as_deref() != expected_overlay {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory overlay {:?} does not match loaded adapter profile {:?}",
+            context.overlay, expected_overlay
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_edit_context(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+    has_adapters: bool,
+) -> gen_core::Result<()> {
+    validate_context("qwen_image_edit", contract, context, loaded_quant)?;
+    validate_edit_route(context, has_adapters)
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
@@ -411,7 +471,12 @@ pub(crate) fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(provider_id, contract, context, loaded_quant) {
+    let validated = if provider_id == "qwen_image_edit" {
+        validate_edit_context(contract, context, loaded_quant, false)
+    } else {
+        validate_context(provider_id, contract, context, loaded_quant)
+    };
+    match validated {
         Ok(()) => MemorySafetyDecision::Accept,
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
@@ -626,7 +691,19 @@ pub(crate) fn registered_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
+        Ok(quant) => {
+            let result = if contract.provider_id == "qwen_image_edit" {
+                validate_edit_context(contract, context, quant, !spec.adapters.is_empty())
+            } else {
+                validate_context(&contract.provider_id, contract, context, quant)
+            };
+            match result {
+                Ok(()) => MemorySafetyDecision::Accept,
+                Err(error) => MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            }
+        }
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
         },
@@ -655,7 +732,7 @@ pub(crate) fn registered_valid_fixture(
             reference_count: u32::from(edit),
             use_pid: false,
             has_phases: false,
-            overlay: None,
+            overlay: (edit && !spec.adapters.is_empty()).then(|| "lora".to_owned()),
         },
     )?;
     Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
@@ -668,7 +745,11 @@ pub(crate) fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     let quant = snapshot_quant_tier(spec, provider_id)?;
-    validate_context(provider_id, contract, context, quant)?;
+    if provider_id == "qwen_image_edit" {
+        validate_edit_context(contract, context, quant, !spec.adapters.is_empty())?;
+    } else {
+        validate_context(provider_id, contract, context, quant)?;
+    }
     Ok(Some(Box::new(QwenMemoryScope::new(
         provider_id,
         Device::Cpu,
@@ -950,6 +1031,10 @@ mod tests {
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
+        selection_for_tier(strategy, None)
+    }
+
+    fn selection_for_tier(strategy: MemoryStrategy, quant: Option<Quant>) -> MemorySelection {
         let mut parameters = MemoryStrategyParameters::default();
         if matches!(
             strategy,
@@ -975,7 +1060,7 @@ mod tests {
             parameters,
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
-                quant: None,
+                quant,
                 component_precision_floors: &[],
             },
         }
@@ -1013,6 +1098,70 @@ mod tests {
                 TRANSFORMER_WINDOW_SIZES
             );
         }
+    }
+
+    #[test]
+    fn plain_edit_admits_all_five_rungs_at_bf16_q4_and_q8() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-edit".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for strategy in MemoryStrategy::ALL {
+                contract
+                    .validate_selection(&selection_for_tier(strategy, quant))
+                    .unwrap_or_else(|error| panic!("{quant:?} {strategy:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn edit_context_rejects_crossed_mode_overlay_and_request_shape() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-edit".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedAttention,
+            MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: MemoryMode::Edit,
+                reference_count: 2,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert!(validate_edit_context(&contract, &context, None, false).is_ok());
+
+        context.mode = MemoryMode::TextToImage;
+        assert!(validate_edit_context(&contract, &context, None, false).is_err());
+        context.mode = MemoryMode::Edit;
+        context.overlay = Some("lora".to_owned());
+        assert!(validate_edit_context(&contract, &context, None, false).is_err());
+        assert!(validate_edit_context(&contract, &context, None, true).is_ok());
+        context.geometry.reference_count = 0;
+        context.has_reference = false;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.geometry.reference_count = 6;
+        context.has_reference = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.geometry.reference_count = 2;
+        context.use_pid = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.use_pid = false;
+        context.has_phases = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.has_phases = false;
+        context.selection.tier.quant = Some(Quant::Q8);
+        assert!(validate_edit_context(&contract, &context, Some(Quant::Q4), true).is_err());
+        context.selection.tier.quant = None;
+        context.load_shape = LoadShape::EagerMaterialization;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
     }
 
     #[test]

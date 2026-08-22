@@ -28,7 +28,8 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
-    AdapterSpec, GenerationMemory, Image, OffloadPolicy, PreviewSink, Progress, WeightsSource,
+    AdapterSpec, GenerationMemory, Image, MemoryProviderContract, MemoryRunContext, OffloadPolicy,
+    PreviewSink, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 
@@ -328,6 +329,11 @@ pub struct QwenEdit {
     zero_cond_t: bool,
     /// Complete caller-prepared identity retained across request-scoped deferred loads.
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
+    /// Executable provider contract and exact context retained by the context-bearing constructor.
+    /// `None` preserves the historical resident-only compatibility path.
+    memory_contract: Option<MemoryProviderContract>,
+    admitted_context: Option<MemoryRunContext>,
+    loaded_quant: Option<candle_gen::gen_core::Quant>,
 }
 
 struct EditText {
@@ -462,6 +468,9 @@ impl QwenEdit {
             processor: QwenImageProcessor::default(),
             tokenizer,
             prepared_spec: None,
+            memory_contract: None,
+            admitted_context: None,
+            loaded_quant: None,
         })
     }
 
@@ -494,6 +503,49 @@ impl QwenEdit {
             })
         })?;
         model.prepared_spec = Some(spec.clone());
+        Ok(model)
+    }
+
+    /// Load the exact Qwen-Image-Edit artifact and request-scoped realization admitted by the shared
+    /// memory ladder. The complete context remains provider-owned until generation, where every axis
+    /// is revalidated immediately before tensor work.
+    pub fn load_with_memory_context(
+        paths: &QwenEditPaths,
+        spec: &candle_gen::gen_core::LoadSpec,
+        context: &MemoryRunContext,
+    ) -> Result<Self> {
+        validate_base_binding(paths, spec)?;
+        validate_memory_load_spec(spec)?;
+        let loaded_quant = crate::memory_strategy::snapshot_quant_tier(spec, "qwen_image_edit")
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        if spec.quantize.is_some() && spec.quantize != loaded_quant {
+            return Err(CandleError::Msg(format!(
+                "qwen edit: requested {:?} but the admitted snapshot resolves to {loaded_quant:?}",
+                spec.quantize
+            )));
+        }
+        let contract = crate::memory_strategy::provider_contract("qwen_image_edit", spec)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_edit_context(
+            &contract,
+            context,
+            loaded_quant,
+            !spec.adapters.is_empty(),
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+
+        let mut model = spec.read_prepared_files_unchanged(|| {
+            Self::load(&QwenEditPaths {
+                root: paths.root.clone(),
+                text_encoder: spec.text_encoder.clone(),
+                adapters: spec.adapters.clone(),
+                offload_policy: paths.offload_policy,
+            })
+        })?;
+        model.prepared_spec = Some(spec.clone());
+        model.memory_contract = Some(contract);
+        model.admitted_context = Some(context.clone());
+        model.loaded_quant = loaded_quant;
         Ok(model)
     }
 
@@ -719,46 +771,281 @@ impl QwenEdit {
         references: &[Image],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        read_with_prepared_spec(self.prepared_spec.as_ref(), || {
-            *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
-            let memory = req.memory.unwrap_or_default();
-            let stage_residency = req.stage_residency || memory.stage_residency;
-            if (memory.tile_vae_decode
-                || memory.chunk_attention
-                || memory.stream_transformer_blocks)
-                && !stage_residency
-            {
-                return Err(CandleError::Msg(
-                    "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
-                        .into(),
-                ));
-            }
-            self.residency.run_request_scoped(
-                stage_residency,
-                memory.stream_transformer_blocks,
-                &req.cancel,
-                false,
-                on_progress,
-                |text| {
-                    self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references)
-                },
-                |_| Ok(self.device.synchronize()?),
-                |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
-                    let result = self.denoise_and_decode(
-                        &heavy.transformer,
-                        &heavy.vae,
-                        req,
-                        &pos,
-                        neg.as_ref(),
-                        &static_latents,
-                        &cond_grids,
-                        on_progress,
-                    );
-                    candle_gen::synchronize_result(&self.device, result)
-                },
-            )
-        })
+        run_edit_request(
+            &self.lifecycle,
+            || {
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    ensure_ordinary_generate_allowed(self.admitted_context.as_ref())?;
+                    validate_memory_authority(req, self.admitted_context.as_ref())?;
+                    self.generate_inner(req, references, on_progress)
+                })
+            },
+            || self.device.synchronize(),
+        )
+    }
+
+    /// Execute the exact request admitted at load. The retained context, load-time adapter profile,
+    /// request geometry, reference count, recipe, and translated execution controls are rechecked
+    /// while the lifecycle lock is held. A final device fence runs on success, cancellation, or error.
+    pub fn generate_with_memory_context(
+        &self,
+        context: &MemoryRunContext,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        run_edit_request(
+            &self.lifecycle,
+            || {
+                read_with_prepared_spec(self.prepared_spec.as_ref(), || {
+                    let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "qwen edit: model was not loaded with a memory context".to_owned(),
+                        )
+                    })?;
+                    let contract = self.memory_contract.as_ref().ok_or_else(|| {
+                        CandleError::Msg(
+                            "qwen edit: admitted model lost its memory contract".to_owned(),
+                        )
+                    })?;
+                    let spec = self.prepared_spec.as_ref().ok_or_else(|| {
+                        CandleError::Msg("qwen edit: admitted model lost its load spec".to_owned())
+                    })?;
+                    validate_admitted_context(admitted, context)?;
+                    crate::memory_strategy::validate_edit_context(
+                        contract,
+                        context,
+                        self.loaded_quant,
+                        !spec.adapters.is_empty(),
+                    )
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                    validate_memory_request(context, contract, spec, req, references.len())?;
+                    self.generate_inner(req, references, on_progress)
+                })
+            },
+            || self.device.synchronize(),
+        )
+    }
+
+    fn generate_inner(
+        &self,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        if references.is_empty() {
+            return Err(CandleError::Msg(
+                "qwen edit: at least one reference image is required".to_owned(),
+            ));
+        }
+        *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
+        let memory = req.memory.unwrap_or_default();
+        let stage_residency = req.stage_residency || memory.stage_residency;
+        if (memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks)
+            && !stage_residency
+        {
+            return Err(CandleError::Msg(
+                "qwen edit: bounded decode, attention, and transformer residency require request-scoped staged residency"
+                    .into(),
+            ));
+        }
+        self.residency.run_request_scoped(
+            stage_residency,
+            memory.stream_transformer_blocks,
+            &req.cancel,
+            false,
+            on_progress,
+            |text| self.encode_conditioning(&text.vl_encoder, &text.vae_encoder, req, references),
+            |_| Ok(self.device.synchronize()?),
+            |heavy, (pos, neg, static_latents, cond_grids), on_progress| {
+                let result = self.denoise_and_decode(
+                    &heavy.transformer,
+                    &heavy.vae,
+                    req,
+                    &pos,
+                    neg.as_ref(),
+                    &static_latents,
+                    &cond_grids,
+                    on_progress,
+                );
+                candle_gen::synchronize_result(&self.device, result)
+            },
+        )
+    }
+}
+
+fn validate_base_binding(
+    paths: &QwenEditPaths,
+    spec: &candle_gen::gen_core::LoadSpec,
+) -> Result<()> {
+    match &spec.weights {
+        WeightsSource::Dir(admitted_root) if admitted_root == &paths.root => Ok(()),
+        WeightsSource::Dir(admitted_root) => Err(CandleError::Msg(format!(
+            "qwen edit: runtime base {} differs from admitted base {}",
+            paths.root.display(),
+            admitted_root.display()
+        ))),
+        WeightsSource::File(_) => Err(CandleError::Msg(
+            "qwen edit: admitted base must be the runtime snapshot directory".to_owned(),
+        )),
+    }
+}
+
+fn validate_memory_load_spec(spec: &candle_gen::gen_core::LoadSpec) -> Result<()> {
+    spec.validate_prepared_file_pins()
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+    if spec.precision != candle_gen::gen_core::Precision::Bf16 {
+        return Err(CandleError::Msg(
+            "qwen edit: the memory route supports only the native bf16 compute tier".to_owned(),
+        ));
+    }
+    let mut unsupported = Vec::new();
+    if spec.control.is_some() {
+        unsupported.push("control");
+    }
+    if !spec.extra_controls.is_empty() {
+        unsupported.push("extra_controls");
+    }
+    if spec.ip_adapter.is_some() {
+        unsupported.push("ip_adapter");
+    }
+    if spec.pid.is_some() {
+        unsupported.push("pid");
+    }
+    if spec.identity.is_some() {
+        unsupported.push("identity");
+    }
+    if !spec.components.is_empty() {
+        unsupported.push("components");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(CandleError::Msg(format!(
+            "qwen edit memory route does not realize LoadSpec fields: {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
+fn ensure_ordinary_generate_allowed(admitted_context: Option<&MemoryRunContext>) -> Result<()> {
+    if admitted_context.is_some() {
+        Err(CandleError::Msg(
+            "qwen edit: admitted model requires generate_with_memory_context".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_memory_authority(
+    req: &QwenEditRequest,
+    admitted_context: Option<&MemoryRunContext>,
+) -> Result<()> {
+    if admitted_context.is_none()
+        && (req.stage_residency || req.memory.unwrap_or_default() != GenerationMemory::default())
+    {
+        Err(CandleError::Msg(
+            "qwen edit: constrained memory requires an exact admitted context".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_admitted_context(
+    admitted: &MemoryRunContext,
+    runtime: &MemoryRunContext,
+) -> Result<()> {
+    if admitted != runtime {
+        Err(CandleError::Msg(
+            "qwen edit: request memory context changed after provider load".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_memory_request(
+    context: &MemoryRunContext,
+    contract: &MemoryProviderContract,
+    spec: &candle_gen::gen_core::LoadSpec,
+    req: &QwenEditRequest,
+    reference_count: usize,
+) -> Result<()> {
+    let expected_references = u32::try_from(reference_count).map_err(|_| {
+        CandleError::Msg("qwen edit: reference count exceeds the admitted domain".to_owned())
+    })?;
+    if context.geometry.width != req.width
+        || context.geometry.height != req.height
+        || context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || context.geometry.reference_count != expected_references
+        || !context.has_reference
+    {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: request changed after admission (admitted={}x{} batch={} frames={} references={} has_reference={}; runtime={}x{} batch=1 frames=1 references={} has_reference=true)",
+            context.geometry.width,
+            context.geometry.height,
+            context.geometry.batch,
+            context.geometry.frames,
+            context.geometry.reference_count,
+            context.has_reference,
+            req.width,
+            req.height,
+            expected_references,
+        )));
+    }
+
+    let expected_memory = contract.generation_memory(&context.selection);
+    let expected_stage = expected_memory.unwrap_or_default().stage_residency;
+    if req.memory != expected_memory || req.stage_residency != expected_stage {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: request memory controls changed after admission (expected {expected_memory:?} and stage_residency={expected_stage}, got {:?} and stage_residency={})",
+            req.memory, req.stage_residency
+        )));
+    }
+
+    let lightning_route = spec.resolved_route.as_deref() == Some("qwen_image_edit_2511_lightning");
+    if req.lightning != lightning_route {
+        return Err(CandleError::Msg(format!(
+            "qwen edit: runtime lightning={} does not match admitted route {:?}",
+            req.lightning, spec.resolved_route
+        )));
+    }
+    if lightning_route {
+        if spec.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "qwen edit: Lightning route requires its admitted distillation adapter".to_owned(),
+            ));
+        }
+        if req.steps != 4 || req.guidance != 1.0 {
+            return Err(CandleError::Msg(format!(
+                "qwen edit: Lightning route requires steps=4 and guidance=1.0 (got steps={} guidance={})",
+                req.steps, req.guidance
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize one Qwen edit request and always fence its device before releasing the lifecycle lock.
+/// The request error wins when execution and synchronization both fail.
+fn run_edit_request<T>(
+    lifecycle: &Mutex<()>,
+    run: impl FnOnce() -> Result<T>,
+    synchronize: impl FnOnce() -> candle_gen::candle_core::Result<()>,
+) -> Result<T> {
+    let _lifecycle = candle_gen::lock_recover(lifecycle);
+    let result = run();
+    let synchronized = synchronize().map_err(CandleError::Candle);
+    match (result, synchronized) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -784,6 +1071,53 @@ fn image_input(im: &Image) -> ImageInput<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admitted_edit_context(
+        reference_count: u32,
+        lightning: bool,
+    ) -> (
+        candle_gen::gen_core::LoadSpec,
+        MemoryProviderContract,
+        MemoryRunContext,
+    ) {
+        let mut spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+            "/qwen-image-edit-2511",
+        )))
+        .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization)
+        .with_resolved_route(if lightning {
+            "qwen_image_edit_2511_lightning"
+        } else {
+            "qwen_image_edit_2511"
+        });
+        if lightning {
+            spec.adapters.push(AdapterSpec::new(
+                PathBuf::from("lightning.safetensors"),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            ));
+        }
+        let contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract("qwen_image_edit", &spec)
+                .unwrap();
+        let context = candle_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            candle_gen::gen_core::MemoryStrategy::BoundedAttention,
+            candle_gen::gen_core::MemoryNumericTier {
+                precision: candle_gen::gen_core::Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            candle_gen::gen_core::MemoryBehaviorRoute {
+                mode: candle_gen::gen_core::MemoryMode::Edit,
+                reference_count,
+                use_pid: false,
+                has_phases: false,
+                overlay: lightning.then(|| "lora".to_owned()),
+            },
+        )
+        .unwrap();
+        (spec, contract, context)
+    }
 
     fn edit_paths(root: &Path, offload_policy: OffloadPolicy) -> QwenEditPaths {
         QwenEditPaths {
@@ -832,6 +1166,133 @@ mod tests {
         assert_eq!((r.width, r.height), (1024, 1024));
         assert_eq!(r.steps, 30);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn admitted_edit_rejects_ordinary_generation_and_context_mutation() {
+        let (_, _, admitted) = admitted_edit_context(2, false);
+        assert!(ensure_ordinary_generate_allowed(Some(&admitted)).is_err());
+        assert!(ensure_ordinary_generate_allowed(None).is_ok());
+
+        let constrained = QwenEditRequest {
+            stage_residency: true,
+            ..Default::default()
+        };
+        assert!(validate_memory_authority(&constrained, None).is_err());
+        assert!(validate_memory_authority(&constrained, Some(&admitted)).is_ok());
+        assert!(validate_memory_authority(&QwenEditRequest::default(), None).is_ok());
+
+        let mut mutated = admitted.clone();
+        mutated.mode = candle_gen::gen_core::MemoryMode::Other("character_image".to_owned());
+        assert!(validate_admitted_context(&admitted, &mutated).is_err());
+        assert!(validate_admitted_context(&admitted, &admitted).is_ok());
+    }
+
+    #[test]
+    fn admitted_edit_binds_geometry_references_memory_and_lightning_recipe() {
+        let (spec, contract, context) = admitted_edit_context(2, false);
+        let memory = contract.generation_memory(&context.selection);
+        let mut request = QwenEditRequest {
+            prompt: "edit".to_owned(),
+            stage_residency: memory.unwrap_or_default().stage_residency,
+            memory,
+            ..Default::default()
+        };
+        assert!(validate_memory_request(&context, &contract, &spec, &request, 2).is_ok());
+        request.width = 512;
+        assert!(validate_memory_request(&context, &contract, &spec, &request, 2).is_err());
+        request.width = 1024;
+        assert!(validate_memory_request(&context, &contract, &spec, &request, 1).is_err());
+        request.memory = None;
+        assert!(validate_memory_request(&context, &contract, &spec, &request, 2).is_err());
+        request.memory = memory;
+        request.lightning = true;
+        request.steps = 4;
+        request.guidance = 1.0;
+        assert!(validate_memory_request(&context, &contract, &spec, &request, 2).is_err());
+
+        let (lightning_spec, lightning_contract, lightning_context) =
+            admitted_edit_context(1, true);
+        let lightning_memory = lightning_contract.generation_memory(&lightning_context.selection);
+        let mut lightning_request = QwenEditRequest {
+            prompt: "edit".to_owned(),
+            steps: 4,
+            guidance: 1.0,
+            lightning: true,
+            stage_residency: lightning_memory.unwrap_or_default().stage_residency,
+            memory: lightning_memory,
+            ..Default::default()
+        };
+        assert!(validate_memory_request(
+            &lightning_context,
+            &lightning_contract,
+            &lightning_spec,
+            &lightning_request,
+            1
+        )
+        .is_ok());
+        lightning_request.steps = 5;
+        assert!(validate_memory_request(
+            &lightning_context,
+            &lightning_contract,
+            &lightning_spec,
+            &lightning_request,
+            1
+        )
+        .is_err());
+        lightning_request.steps = 4;
+        lightning_request.lightning = false;
+        assert!(validate_memory_request(
+            &lightning_context,
+            &lightning_contract,
+            &lightning_spec,
+            &lightning_request,
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn admitted_edit_binds_runtime_base_and_rejects_unrealized_load_fields() {
+        let paths = QwenEditPaths {
+            root: PathBuf::from("/runtime"),
+            text_encoder: None,
+            adapters: Vec::new(),
+            offload_policy: OffloadPolicy::Resident,
+        };
+        let matching = candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(paths.root.clone()));
+        assert!(validate_base_binding(&paths, &matching).is_ok());
+        let mismatched =
+            candle_gen::gen_core::LoadSpec::new(WeightsSource::Dir(PathBuf::from("/admitted")));
+        assert!(validate_base_binding(&paths, &mismatched).is_err());
+
+        let mut unsupported = matching;
+        unsupported.identity = Some(candle_gen::gen_core::IdentityWeights::default());
+        let error = validate_memory_load_spec(&unsupported)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity"), "{error}");
+        unsupported.identity = None;
+        unsupported.precision = candle_gen::gen_core::Precision::Fp32;
+        assert!(validate_memory_load_spec(&unsupported).is_err());
+    }
+
+    #[test]
+    fn request_lifecycle_always_runs_terminal_fence() {
+        use std::cell::Cell;
+
+        let lifecycle = Mutex::new(());
+        let fenced = Cell::new(0_u32);
+        let result: Result<()> = run_edit_request(
+            &lifecycle,
+            || Err(CandleError::Msg("request failed".to_owned())),
+            || {
+                fenced.set(fenced.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "request failed");
+        assert_eq!(fenced.get(), 1);
     }
 
     #[test]
@@ -1018,7 +1479,7 @@ mod tests {
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c follow-up, sc-10968) — the edit sibling of
     /// `qwen_image_probed_generate_for_offload_ab`. ONE probed reference edit whose residency is carried
-    /// by `QwenEditRequest::stage_residency`; prints the device peak VRAM and writes
+    /// by the retained provider-owned [`MemoryRunContext`]; prints the device peak VRAM and writes
     /// the raw RGB pixels to `QWEN_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and
     /// compare: the pixel files must be byte-identical (parity) and the sequential peak materially lower
     /// (the Qwen2.5-VL encoder + VAE encoder dropped before the DiT loads). Two processes are REQUIRED —
@@ -1062,12 +1523,38 @@ mod tests {
         } else {
             vec![]
         };
-        let mut memory_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let mut memory_spec =
+            LoadSpec::new(WeightsSource::Dir(root.clone())).with_resolved_route(if lightning {
+                "qwen_image_edit_2511_lightning"
+            } else {
+                "qwen_image_edit_2511"
+            });
         memory_spec.adapters = adapters.clone();
         let (observed_calibration, tier) =
             crate::memory_strategy::evidence_identity_and_tier("qwen_image_edit", &memory_spec)
                 .expect("resolve qwen_image_edit executable evidence identity and tier");
         let evidence_load_shape = observed_calibration.load_shape;
+        let contract = crate::memory_strategy::provider_contract("qwen_image_edit", &memory_spec)
+            .expect("resolve qwen_image_edit provider contract");
+        let strategy = if stage_residency {
+            candle_gen::gen_core::MemoryStrategy::StagedResidency
+        } else {
+            candle_gen::gen_core::MemoryStrategy::Resident
+        };
+        let context = candle_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            strategy,
+            tier,
+            candle_gen::gen_core::MemoryBehaviorRoute {
+                mode: candle_gen::gen_core::MemoryMode::Edit,
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: lightning.then(|| "lora".to_owned()),
+            },
+        )
+        .expect("build exact qwen edit memory context");
+        let memory = contract.generation_memory(&context.selection);
         let req = QwenEditRequest {
             prompt: "make the background a snowy mountain at sunset".into(),
             width: 1024,
@@ -1076,7 +1563,8 @@ mod tests {
             guidance: if lightning { 1.0 } else { 4.0 },
             seed: 42,
             lightning,
-            stage_residency,
+            stage_residency: memory.unwrap_or_default().stage_residency,
+            memory,
             ..Default::default()
         };
 
@@ -1086,17 +1574,21 @@ mod tests {
         );
         let mut probe = VramProbe::start_rendered();
         let load_phase = probe.phase();
-        let model = QwenEdit::load(&QwenEditPaths {
-            root,
-            text_encoder: None,
-            adapters,
-            offload_policy: OffloadPolicy::Resident,
-        })
-        .expect("load QwenEdit");
+        let model = QwenEdit::load_with_memory_context(
+            &QwenEditPaths {
+                root,
+                text_encoder: None,
+                adapters,
+                offload_policy: OffloadPolicy::Resident,
+            },
+            &memory_spec,
+            &context,
+        )
+        .expect("load admitted QwenEdit");
         probe.end_load(load_phase);
         let generate_phase = probe.phase();
         let img = model
-            .generate(&req, &[reference], &mut |_| {})
+            .generate_with_memory_context(&context, &req, &[reference], &mut |_| {})
             .expect("generate");
         probe.end_gen(generate_phase);
         let report = probe.report().assert_trustworthy(1.0);
@@ -1108,11 +1600,6 @@ mod tests {
         );
         std::fs::write(&out, &img.pixels).expect("write pixels");
 
-        let strategy = if stage_residency {
-            candle_gen::gen_core::MemoryStrategy::StagedResidency
-        } else {
-            candle_gen::gen_core::MemoryStrategy::Resident
-        };
         let path = if lightning { "lightning" } else { "base" };
         eprintln!(
             "{}",
@@ -1130,7 +1617,7 @@ mod tests {
                     observed_calibration,
                     tier,
                     mode: candle_gen::gen_core::MemoryMode::Edit,
-                    overlay: lightning.then(|| "lightning".to_owned()),
+                    overlay: lightning.then(|| "lora".to_owned()),
                     geometry: candle_gen::gen_core::MemoryGeometry {
                         width: req.width,
                         height: req.height,
@@ -1149,7 +1636,7 @@ mod tests {
                     },
                     parameters: candle_gen::gen_core::MemoryStrategyParameters::default(),
                     observed_peak_bytes: live_peak_bytes,
-                    harness_version: "candle-qwen-image-edit-residency-v1",
+                    harness_version: "candle-qwen-image-edit-residency-v2",
                     output_bytes: &img.pixels,
                 }
             )
