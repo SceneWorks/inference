@@ -260,15 +260,15 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> Result<MemoryNumericTier> {
 /// per-request `video_mode` field.
 pub(crate) fn canonical_overlay(
     adapter_count: usize,
-    enhancer: bool,
+    enhancer: Option<&str>,
     video_mode: Option<&str>,
 ) -> Option<String> {
     let mut axes = Vec::new();
     if adapter_count > 0 {
         axes.push(format!("adapters:{adapter_count}"));
     }
-    if enhancer {
-        axes.push("enhancer".to_owned());
+    if let Some(enhancer) = enhancer {
+        axes.push(format!("enhancer:{enhancer}"));
     }
     if let Some(video_mode) = video_mode {
         axes.push(format!("provider_video_mode:{video_mode}"));
@@ -279,7 +279,9 @@ pub(crate) fn canonical_overlay(
 pub(crate) fn route_overlay(spec: &LoadSpec) -> Option<String> {
     canonical_overlay(
         spec.adapters.len(),
-        spec.components.contains_key("uncensored_enhancer"),
+        spec.components
+            .contains_key("uncensored_enhancer")
+            .then_some("uncensored"),
         None,
     )
 }
@@ -294,7 +296,9 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
         overlay
             .into_iter()
             .flat_map(|value| value.split('+'))
-            .filter(|axis| !axis.starts_with("provider_video_mode:"))
+            .filter(|axis| {
+                !axis.starts_with("provider_video_mode:") && axis != &"enhancer:standard"
+            })
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
@@ -654,6 +658,7 @@ fn begin_with_cleanup(
     Ok(Some(Box::new(LtxMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
         expected_overlay: expected_overlay.map(str::to_owned),
+        admitted_overlay: context.overlay.clone(),
     })))
 }
 
@@ -664,12 +669,14 @@ fn begin_with_cleanup(
 struct LtxMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
     expected_overlay: Option<String>,
+    admitted_overlay: Option<String>,
 }
 
 impl LtxMemoryRequestScope {
     fn validate_request(
         request: &GenerationRequest,
         expected_overlay: Option<&str>,
+        admitted_overlay: Option<&str>,
     ) -> gen_core::Result<()> {
         if !request.conditioning.is_empty() {
             return Err(gen_core::Error::Unsupported(
@@ -682,18 +689,43 @@ impl LtxMemoryRequestScope {
         let expected_has_enhancer = expected_overlay
             .into_iter()
             .flat_map(|overlay| overlay.split('+'))
-            .any(|axis| axis == "enhancer");
-        if (request.enhance_prompt || request.use_uncensored_enhancer) && !expected_has_enhancer {
+            .any(|axis| axis == "enhancer:uncensored");
+        let request_enhancer = if request.use_uncensored_enhancer {
+            Some("uncensored")
+        } else if request.enhance_prompt {
+            Some("standard")
+        } else {
+            None
+        };
+        let admitted_enhancer = admitted_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .find_map(|axis| axis.strip_prefix("enhancer:"));
+        if request_enhancer != admitted_enhancer {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: enhancer request does not match the loaded overlay".into(),
+                "ltx_2_3: enhancer flavor does not match admitted overlay".into(),
             ));
         }
+        if request.use_uncensored_enhancer && !expected_has_enhancer {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: uncensored enhancer does not match the loaded overlay".into(),
+            ));
+        }
+        let admitted_video_mode = admitted_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .find_map(|axis| axis.strip_prefix("provider_video_mode:"));
         if let Some(video_mode) = request.video_mode.as_deref() {
             if video_mode != "no_audio" {
                 return Err(gen_core::Error::Unsupported(format!(
                     "ltx_2_3: unsupported video_mode variant {video_mode:?}"
                 )));
             }
+        }
+        if request.video_mode.as_deref() != admitted_video_mode {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: provider video mode does not match admitted overlay".into(),
+            ));
         }
         let fps = request.fps.unwrap_or(24);
         if !matches!(fps, 24 | 25 | 30) {
@@ -707,7 +739,11 @@ impl LtxMemoryRequestScope {
 
 impl MemoryRequestScope for LtxMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        Self::validate_request(request, self.expected_overlay.as_deref())?;
+        Self::validate_request(
+            request,
+            self.expected_overlay.as_deref(),
+            self.admitted_overlay.as_deref(),
+        )?;
         self.inner.configure_request(request)
     }
 
@@ -1052,7 +1088,7 @@ mod tests {
                 .configure_request(&mut variant)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("enhancer request does not match the loaded overlay"));
+            assert!(error.contains("enhancer flavor does not match admitted overlay"));
             assert_eq!(variant.memory, None);
         }
 
@@ -1077,26 +1113,99 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        for mut variant in [
-            GenerationRequest {
-                enhance_prompt: true,
-                ..enhancer_fixture.request.clone()
-            },
-            GenerationRequest {
-                use_uncensored_enhancer: true,
-                ..enhancer_fixture.request.clone()
-            },
-        ] {
-            enhancer_scope.configure_request(&mut variant).unwrap();
-            assert!(variant.memory.unwrap().stage_residency);
-        }
+        let mut crossed_standard = GenerationRequest {
+            enhance_prompt: true,
+            ..enhancer_fixture.request.clone()
+        };
+        let error = enhancer_scope
+            .configure_request(&mut crossed_standard)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enhancer flavor does not match admitted overlay"));
+        let mut admitted_uncensored = GenerationRequest {
+            use_uncensored_enhancer: true,
+            ..enhancer_fixture.request.clone()
+        };
+        enhancer_scope
+            .configure_request(&mut admitted_uncensored)
+            .unwrap();
+        assert!(admitted_uncensored.memory.unwrap().stage_residency);
+
+        let standard_spec = fixture_spec();
+        let standard_contract = weights_free_memory_strategy_contract(&standard_spec).unwrap();
+        let mut standard_context = registered_valid_fixtures(
+            &standard_spec,
+            &standard_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        standard_context.overlay = Some("enhancer:standard".into());
+        let mut standard_scope =
+            registered_begin_request(&standard_spec, &standard_contract, &standard_context)
+                .unwrap()
+                .unwrap();
+        let mut admitted_standard = GenerationRequest {
+            enhance_prompt: true,
+            ..request.clone()
+        };
+        standard_scope
+            .configure_request(&mut admitted_standard)
+            .unwrap();
+        assert!(admitted_standard.memory.unwrap().stage_residency);
+        let mut crossed_uncensored = GenerationRequest {
+            use_uncensored_enhancer: true,
+            ..request.clone()
+        };
+        let error = standard_scope
+            .configure_request(&mut crossed_uncensored)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enhancer flavor does not match admitted overlay"));
 
         let mut no_audio = GenerationRequest {
             video_mode: Some("no_audio".into()),
             ..request.clone()
         };
-        scope.configure_request(&mut no_audio).unwrap();
-        assert!(no_audio.memory.unwrap().stage_residency);
+        let error = scope
+            .configure_request(&mut no_audio)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider video mode does not match admitted overlay"));
+        assert_eq!(no_audio.memory, None);
+
+        let no_audio_spec = fixture_spec();
+        let no_audio_contract = weights_free_memory_strategy_contract(&no_audio_spec).unwrap();
+        let mut no_audio_context = registered_valid_fixtures(
+            &no_audio_spec,
+            &no_audio_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        no_audio_context.overlay = Some("provider_video_mode:no_audio".into());
+        let mut no_audio_scope =
+            registered_begin_request(&no_audio_spec, &no_audio_contract, &no_audio_context)
+                .unwrap()
+                .unwrap();
+        let mut admitted_no_audio = GenerationRequest {
+            video_mode: Some("no_audio".into()),
+            ..request.clone()
+        };
+        no_audio_scope
+            .configure_request(&mut admitted_no_audio)
+            .unwrap();
+        assert!(admitted_no_audio.memory.unwrap().stage_residency);
+        let mut crossed_plain = request.clone();
+        let error = no_audio_scope
+            .configure_request(&mut crossed_plain)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider video mode does not match admitted overlay"));
 
         for video_mode in ["video_only", "image_to_video"] {
             let mut variant = GenerationRequest {
@@ -1137,18 +1246,18 @@ mod tests {
 
     #[test]
     fn canonical_overlay_preserves_adapter_count_enhancer_and_provider_mode() {
-        assert_eq!(canonical_overlay(0, false, None), None);
+        assert_eq!(canonical_overlay(0, None, None), None);
         assert_eq!(
-            canonical_overlay(2, true, Some("no_audio")).as_deref(),
-            Some("adapters:2+enhancer+provider_video_mode:no_audio")
+            canonical_overlay(2, Some("uncensored"), Some("no_audio")).as_deref(),
+            Some("adapters:2+enhancer:uncensored+provider_video_mode:no_audio")
         );
         assert!(overlay_matches_loaded_route(
-            Some("adapters:2+enhancer+provider_video_mode:no_audio"),
-            Some("adapters:2+enhancer")
+            Some("adapters:2+enhancer:uncensored+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer:uncensored")
         ));
         assert!(!overlay_matches_loaded_route(
-            Some("adapters:1+enhancer+provider_video_mode:no_audio"),
-            Some("adapters:2+enhancer")
+            Some("adapters:1+enhancer:uncensored+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer:uncensored")
         ));
         assert!(!overlay_matches_loaded_route(
             Some("provider_video_mode:video_only"),
