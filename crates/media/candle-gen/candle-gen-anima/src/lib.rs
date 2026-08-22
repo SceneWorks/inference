@@ -62,7 +62,7 @@ use std::sync::Arc;
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, Progress, Quant,
 };
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
@@ -138,6 +138,9 @@ pub struct Anima {
     /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
     /// model). Captured at load; folded lazily when the pipeline is first assembled.
     adapters: Vec<gen_core::AdapterSpec>,
+    /// The loaded numeric tier is an admission identity, not an inferred descriptor property.
+    /// Retain the exact spec so generator-side admission cannot accept crossed-tier evidence.
+    load_spec: LoadSpec,
     /// The request-scoped owner keeps the warm resident pipeline correct after a staged request:
     /// staging evicts it, and a subsequent resident request rebuilds the exact same variant.
     residency: candle_gen::Residency<AnimaTextPhase, AnimaHeavyPhase>,
@@ -146,12 +149,12 @@ pub struct Anima {
 
 enum AnimaTextPhase {
     Resident(Arc<AnimaPipeline>),
-    Staged(loader::AnimaConditioningComponents),
+    Staged(Box<loader::AnimaConditioningComponents>),
 }
 
 enum AnimaHeavyPhase {
     Resident(Arc<AnimaPipeline>),
-    Staged(loader::AnimaRenderComponents),
+    Staged(Box<loader::AnimaRenderComponents>),
 }
 
 struct AnimaMemoryScope {
@@ -309,11 +312,13 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
                 ));
             }
             loader::AnimaConditioningComponents::load(&text_root, variant, &text_device)
+                .map(Box::new)
                 .map(AnimaTextPhase::Staged)
         },
         move |_, _, cancel| {
             candle_gen::check_cancel(cancel)?;
             loader::AnimaRenderComponents::load(&heavy_root, variant, &heavy_device)
+                .map(Box::new)
                 .map(AnimaHeavyPhase::Staged)
         },
     );
@@ -326,6 +331,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         variant,
         device,
         adapters: spec.adapters.clone(),
+        load_spec: spec.clone(),
         residency,
         memory_contract,
     }))
@@ -347,7 +353,7 @@ impl Generator for Anima {
         self.memory_contract
             .as_ref()
             .map_or(gen_core::MemorySafetyDecision::Accept, |contract| {
-                memory_strategy::provider_safety_check(contract, context)
+                memory_strategy::provider_safety_check(&self.load_spec, contract, context)
             })
     }
 
@@ -448,7 +454,7 @@ impl Generator for Anima {
                         progress,
                     ),
                     AnimaHeavyPhase::Staged(components) => AnimaPipeline::render_encoded(
-                        components,
+                        components.as_ref(),
                         &self.device,
                         cond,
                         uncond,
@@ -525,7 +531,7 @@ pub fn register_providers(
 pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
@@ -539,12 +545,44 @@ pub fn register_memory_contract_surfaces(
             contract: |spec| memory_strategy::contract("anima_aesthetic", spec),
         })
         .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
-            provider_id: "anima_turbo",
-            contract: |spec| memory_strategy::contract("anima_turbo", spec),
-        })
+        .register_memory_contract_fixture(
+            candle_gen::gen_core::MemoryContractFixtureRegistration {
+                surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+                provider_id: "anima_turbo",
+                contract: |spec| memory_strategy::contract("anima_turbo", spec),
+            },
+        );
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(AESTHETIC_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR);
+    registry
 }
+
+#[cfg(feature = "cuda")]
+const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_base",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+#[cfg(feature = "cuda")]
+const AESTHETIC_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_aesthetic",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+#[cfg(feature = "cuda")]
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_turbo",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
 
 /// Build the complete explicit Candle Anima provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -585,7 +623,7 @@ mod tests {
                 .unwrap()
                 .load(
                     id,
-                    &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+                    &LoadSpec::new(gen_core::WeightsSource::Dir("/nonexistent".into())),
                 )
                 .unwrap_or_else(|_| panic!("id {id} not registered"));
             assert_eq!(g.descriptor().id, id);
@@ -719,7 +757,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let root = write_dense_split_files(&tmp);
-        let base = WeightsSource::Dir(root.clone());
+        let base = gen_core::WeightsSource::Dir(root.clone());
         let lora_spec = || {
             vec![AdapterSpec::new(
                 "/lora.safetensors".into(),
@@ -766,7 +804,7 @@ mod tests {
         // sc-10640: Q4/Q8 + LoRA on a **packed** checkpoint is now ACCEPTED at load (built lazily; the
         // residual install runs at first generate). This is exactly the combo that used to be rejected.
         let packed_root = write_packed_split_files(&tmp);
-        let packed = WeightsSource::Dir(packed_root.clone());
+        let packed = gen_core::WeightsSource::Dir(packed_root.clone());
         assert!(
             load_base(
                 &LoadSpec::new(packed)
@@ -793,67 +831,117 @@ mod tests {
         assert_send_sync::<Anima>();
     }
 
-    /// Pins the concurrency decision of sc-10608: the pipeline cache lock is **released before the
-    /// denoise**, so a second request can obtain the pipeline while the first is mid-generation. Before
-    /// sc-10608, `Anima` held the cache guard **across** the whole generation, serializing concurrent
-    /// callers by accident; adopting [`candle_gen::cached`] (which returns an owned `Arc` and drops the
-    /// guard) removes that.
-    ///
-    /// This drives the exact mechanism `Anima::pipeline` now uses — `candle_gen::cached()` over a
-    /// `Mutex<Option<Arc<T>>>` — with a stand-in payload, because building a real `AnimaPipeline` needs
-    /// full weights (exercised on the gated real-weights lane, not this CPU unit test). Returning an
-    /// owned `Arc` (not a `MutexGuard`) is what makes the pre-sc-10608 "hold the lock across the
-    /// denoise" shape structurally impossible to reintroduce without changing `pipeline()`'s signature.
+    /// Exercise Anima's actual production lifecycle owner, rather than the removed `cached` stand-in.
+    /// The sequence proves warm → staged → warm rebuilding, text-before-heavy ordering, and that
+    /// cancellation/error exits leave the owner usable for the next admitted request.
     #[test]
-    fn cache_lock_is_released_before_generation() {
-        use std::sync::mpsc;
-        use std::sync::{Arc, Barrier, Mutex};
-        use std::time::Duration;
+    fn residency_warm_staged_warm_and_failed_requests_leave_no_poisoned_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
 
-        // The shared read-through cache anima uses (`Mutex<Option<Arc<T>>>`); `u32` stands in for
-        // `Arc<AnimaPipeline>`.
-        let slot: Arc<Mutex<Option<Arc<u32>>>> = Arc::new(Mutex::new(None));
-
-        let in_gen = Arc::new(Barrier::new(2)); // A now holds its handle and is "mid-generation"
-        let end_gen = Arc::new(Barrier::new(2)); // A may finish only after B acquired concurrently
-        let (slot_a, in_a, end_a) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
-
-        let a = std::thread::spawn(move || {
-            // Build-or-clone via the shared accessor path, then hold ONLY the returned `Arc` across the
-            // "denoise" — never the cache guard (the sc-10608 contract).
-            let handle = candle_gen::cached(&slot_a, || Ok::<_, ()>(Arc::new(7u32))).unwrap();
-            in_a.wait();
-            end_a.wait(); // if B were blocked on the cache lock, this rendezvous would never complete
-            *handle
-        });
-
-        let (tx, rx) = mpsc::channel();
-        let (slot_b, in_b, end_b) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
-        std::thread::spawn(move || {
-            in_b.wait(); // A is holding its pipeline handle right now.
-                         // A second request must obtain the pipeline WHILE A is mid-generation. The
-                         // pre-sc-10608 "guard held across the denoise" shape would block this until A
-                         // finished; `cached()` returns immediately (and hits the cache — the panic
-                         // asserts no double-build).
-            let handle = candle_gen::cached(&slot_b, || -> Result<Arc<u32>, ()> {
-                panic!("cache hit expected, not a rebuild")
-            })
-            .unwrap();
-            let _ = tx.send(*handle);
-            end_b.wait();
-        });
-
-        // B must acquire the pipeline promptly while A is still mid-generation — not after A releases.
-        // A held-across-denoise regression would make B block and this `recv_timeout` fire.
-        let got = rx.recv_timeout(Duration::from_secs(2)).expect(
-            "second caller must obtain the pipeline while the first is mid-generation — the cache lock \
-             must NOT be held across the denoise (sc-10608)",
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let warm_loads = Arc::new(AtomicUsize::new(0));
+        let text_loads = Arc::new(AtomicUsize::new(0));
+        let heavy_loads = Arc::new(AtomicUsize::new(0));
+        let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
+            {
+                let events = Arc::clone(&events);
+                let warm_loads = Arc::clone(&warm_loads);
+                move |_| {
+                    warm_loads.fetch_add(1, Ordering::SeqCst);
+                    events.lock().unwrap().push("warm-load");
+                    Ok::<_, candle_gen::CandleError>((10u8, 20u16))
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                let text_loads = Arc::clone(&text_loads);
+                move |_, cancel| {
+                    candle_gen::check_cancel(cancel)?;
+                    text_loads.fetch_add(1, Ordering::SeqCst);
+                    events.lock().unwrap().push("text-load");
+                    Ok::<_, candle_gen::CandleError>(30u8)
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                let heavy_loads = Arc::clone(&heavy_loads);
+                move |_, _, cancel| {
+                    candle_gen::check_cancel(cancel)?;
+                    heavy_loads.fetch_add(1, Ordering::SeqCst);
+                    events.lock().unwrap().push("heavy-load");
+                    Ok::<_, candle_gen::CandleError>(40u16)
+                }
+            },
         );
-        assert_eq!(got, 7, "second caller got the cached pipeline, no rebuild");
-        assert_eq!(a.join().unwrap(), 7);
+        let run = |staged: bool, fail_encode: bool, cancel: &gen_core::CancelFlag| {
+            residency.run_request_scoped(
+                staged,
+                false,
+                cancel,
+                false,
+                &mut |_| {},
+                |text| {
+                    events.lock().unwrap().push("encode");
+                    if fail_encode {
+                        Err(candle_gen::CandleError::Msg(
+                            "synthetic encode failure".to_owned(),
+                        ))
+                    } else {
+                        Ok(*text)
+                    }
+                },
+                |_| {
+                    events.lock().unwrap().push("synchronize");
+                    Ok(())
+                },
+                |heavy, text, _| {
+                    events.lock().unwrap().push("render");
+                    Ok::<_, candle_gen::CandleError>(u32::from(*heavy) + u32::from(text))
+                },
+            )
+        };
+
+        let live = gen_core::CancelFlag::new();
+        assert_eq!(run(false, false, &live).unwrap(), 30);
+        assert_eq!(run(true, false, &live).unwrap(), 70);
+        assert_eq!(run(false, false, &live).unwrap(), 30);
+        assert_eq!(
+            warm_loads.load(Ordering::SeqCst),
+            2,
+            "staged evicts and the next warm request rebuilds"
+        );
+        assert_eq!(text_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "warm-load",
+                "encode",
+                "render",
+                "text-load",
+                "encode",
+                "synchronize",
+                "heavy-load",
+                "render",
+                "warm-load",
+                "encode",
+                "render"
+            ],
+            "staged request must encode and synchronize before heavy materialization"
+        );
+
+        let cancelled = gen_core::CancelFlag::new();
+        cancelled.cancel();
+        assert!(run(true, false, &cancelled).is_err());
         assert!(
-            slot.try_lock().is_ok(),
-            "cache lock is free after generation, never wedged across a denoise"
+            run(true, true, &live).is_err(),
+            "error path must release the lifecycle owner"
+        );
+        assert_eq!(
+            run(false, false, &live).unwrap(),
+            30,
+            "warm request recovers after cancellation/error"
         );
     }
 }
