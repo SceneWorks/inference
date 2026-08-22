@@ -570,6 +570,17 @@ impl Generator for Flux2DevControl {
             self.memory_numeric_tier,
         )
     }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_dev_request(
+            &self.memory_strategy,
+            context,
+            self.memory_numeric_tier,
+        )
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -586,6 +597,13 @@ pub(crate) const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
         provider_id: FLUX2_DEV_CONTROL_ID,
         contract: crate::memory_strategy::registered_dev_control_contract,
         safety_check: crate::memory_strategy::registered_dev_control_safety_check,
+    };
+
+pub(crate) const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX2_DEV_CONTROL_ID,
+        valid_fixtures: crate::memory_strategy::registered_dev_fixture,
+        begin_request: crate::memory_strategy::registered_dev_begin_request,
     };
 
 #[cfg(test)]
@@ -690,7 +708,7 @@ mod tests {
             calibration_fingerprint: String::new(),
             load_shape: contract.load_shape,
             mode: MemoryMode::TextToImage,
-            has_reference: false,
+            has_reference: true,
             use_pid: false,
             has_phases: false,
             geometry: MemoryGeometry {
@@ -698,7 +716,7 @@ mod tests {
                 height: 768,
                 batch: 1,
                 frames: 1,
-                reference_count: 0,
+                reference_count: 1,
             },
             overlay: Some(crate::memory_strategy::DEV_CONTROL_OVERLAY.to_owned()),
             budget: MemoryBudget {
@@ -800,12 +818,18 @@ mod tests {
                 assert!(contract.calibration.is_none());
                 assert_eq!(contract.asset_facts, Default::default());
                 assert!(contract.conformance_errors().is_empty());
-                assert!(contract.strategies.iter().all(|capability| {
-                    capability.strategy == MemoryStrategy::Resident
-                        && capability.support == gen_core::MemoryStrategySupport::Implemented
-                        || capability.strategy != MemoryStrategy::Resident
-                            && capability.support == gen_core::MemoryStrategySupport::Missing
-                }));
+                assert!(contract
+                    .strategies
+                    .iter()
+                    .all(|capability| match capability.strategy {
+                        MemoryStrategy::Resident => {
+                            capability.support == gen_core::MemoryStrategySupport::Implemented
+                        }
+                        MemoryStrategy::StagedResidency => {
+                            capability.support == gen_core::MemoryStrategySupport::Implemented
+                        }
+                        _ => capability.support == gen_core::MemoryStrategySupport::Missing,
+                    }));
                 let tier = MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(quant),
