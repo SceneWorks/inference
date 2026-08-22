@@ -1546,7 +1546,11 @@ mod tests {
 
     #[test]
     fn load_rejects_unwired_surfaces_and_single_file() {
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+        // Use a guaranteed-missing path: `/snap` is an existing system directory on Ubuntu CI, and
+        // existing directories are intentionally inspected for exact artifact-tier provenance.
+        let temp = tempfile::tempdir().unwrap();
+        let missing_snapshot = temp.path().join("missing-snapshot");
+        let lora = LoadSpec::new(WeightsSource::Dir(missing_snapshot.clone())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(matches!(
@@ -1560,10 +1564,10 @@ mod tests {
         ));
 
         // sc-14249: a tier `Quant` is ACCEPTED now (it was `Unsupported` while the loader was dense-f32
-        // only). Both tiers load lazily against the resolved dir — the precision comes from the
-        // weights there, so nothing about the spec can fail at this point.
+        // only). Both tiers load lazily against a not-yet-present resolved dir; once a directory
+        // exists, its converter-written provenance and tensor dtypes are validated before load.
         for q in [Quant::Q4, Quant::Q8] {
-            let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(q);
+            let quant = LoadSpec::new(WeightsSource::Dir(missing_snapshot.clone())).with_quant(q);
             assert!(load(&quant).is_ok(), "{q:?} tier select must be accepted");
         }
 
