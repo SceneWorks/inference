@@ -352,6 +352,7 @@ fn check_behavior_fixture(
     mut fixture: gen_core::MemoryBehaviorFixture,
     errors: &mut Vec<String>,
 ) {
+    let fixture_spec = fixture.load_spec.as_ref().unwrap_or(spec);
     if fixture.context.selection.strategy != strategy {
         errors.push(format!(
             "{}: {strategy:?} fixture selected {:?}",
@@ -373,7 +374,7 @@ fn check_behavior_fixture(
         ));
         return;
     }
-    let decision = (registration.safety_check)(spec, contract, &fixture.context);
+    let decision = (registration.safety_check)(fixture_spec, contract, &fixture.context);
     if !matches!(decision, MemorySafetyDecision::Accept) {
         errors.push(format!(
             "{}: implemented {strategy:?} rejects its provider-owned valid context: {decision:?}",
@@ -385,7 +386,7 @@ fn check_behavior_fixture(
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_abi),
+        (registration.safety_check)(fixture_spec, contract, &mutated_abi),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -398,7 +399,7 @@ fn check_behavior_fixture(
         .calibration_fingerprint
         .push_str("-mutated");
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_fingerprint),
+        (registration.safety_check)(fixture_spec, contract, &mutated_fingerprint),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -412,7 +413,7 @@ fn check_behavior_fixture(
         gen_core::LoadShape::DeferredMaterialization => gen_core::LoadShape::EagerMaterialization,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_shape),
+        (registration.safety_check)(fixture_spec, contract, &mutated_shape),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -427,7 +428,7 @@ fn check_behavior_fixture(
         _ => Precision::Bf16,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &tier),
+        (registration.safety_check)(fixture_spec, contract, &tier),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -445,7 +446,7 @@ fn check_behavior_fixture(
         reserved_headroom_bytes: 0,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &over_budget),
+        (registration.safety_check)(fixture_spec, contract, &over_budget),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -455,7 +456,7 @@ fn check_behavior_fixture(
     }
 
     let expected_memory = contract.generation_memory(&fixture.context.selection);
-    let mut scope = match (behavior.begin_request)(spec, contract, &fixture.context) {
+    let mut scope = match (behavior.begin_request)(fixture_spec, contract, &fixture.context) {
         Ok(Some(scope)) => scope,
         Ok(None) => {
             errors.push(format!(
