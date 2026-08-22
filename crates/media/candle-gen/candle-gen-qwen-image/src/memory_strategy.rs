@@ -739,7 +739,15 @@ pub(crate) fn registered_safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     if contract.provider_id == "qwen_image_edit" {
-        if let Err(error) = crate::edit::validate_memory_artifact_recipe(spec) {
+        let recipe = match crate::edit::validate_memory_artifact_recipe(spec) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if let Err(error) = crate::edit::validate_memory_recipe_context(recipe, context) {
             return MemorySafetyDecision::Reject {
                 reason: error.to_string(),
             };
@@ -811,7 +819,9 @@ pub(crate) fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     if provider_id == "qwen_image_edit" {
-        crate::edit::validate_memory_artifact_recipe(spec)
+        let recipe = crate::edit::validate_memory_artifact_recipe(spec)
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+        crate::edit::validate_memory_recipe_context(recipe, context)
             .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
     }
     let quant = snapshot_quant_tier(spec, provider_id)?;

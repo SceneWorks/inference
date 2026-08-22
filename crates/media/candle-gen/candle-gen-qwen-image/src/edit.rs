@@ -19,7 +19,7 @@
 //! this by chunking over query rows once the scores exceed `ATTN_SCORES_BUDGET` (sc-6217), and the
 //! `edit_validate` high-res run confirms a coherent 1536² edit through that chunked path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +68,24 @@ pub(crate) enum QwenEditArtifactRecipe {
     UserAdapters,
     Lightning,
     LightningWithUserAdapters,
+}
+
+/// The built-in Lightning distill has optimized evidence only as a singleton adapter recipe.
+/// A user adapter changes the executable composition, so it remains a valid resident/direct load
+/// but must never consume the singleton's staged/decode/attention evidence.
+pub(crate) fn validate_memory_recipe_context(
+    recipe: QwenEditArtifactRecipe,
+    context: &MemoryRunContext,
+) -> Result<()> {
+    if recipe == QwenEditArtifactRecipe::LightningWithUserAdapters
+        && context.selection.strategy != candle_gen::gen_core::MemoryStrategy::Resident
+    {
+        return Err(CandleError::Msg(
+            "qwen edit: Lightning plus user adapters is resident-only; optimized memory evidence belongs to the singleton built-in distill"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl QwenEditArtifactRecipe {
@@ -560,6 +578,7 @@ impl QwenEdit {
             !spec.adapters.is_empty(),
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
+        validate_memory_recipe_context(artifact_recipe, context)?;
 
         let mut model = spec.read_prepared_files_unchanged(|| {
             Self::load(&QwenEditPaths {
@@ -1000,6 +1019,21 @@ fn adapter_has_exact_receipt(
     Ok(())
 }
 
+fn validate_unique_adapter_paths(spec: &candle_gen::gen_core::LoadSpec) -> Result<()> {
+    let mut canonical_paths = BTreeSet::new();
+    for adapter in &spec.adapters {
+        let canonical =
+            std::fs::canonicalize(&adapter.path).unwrap_or_else(|_| adapter.path.clone());
+        if !canonical_paths.insert(canonical.clone()) {
+            return Err(CandleError::Msg(format!(
+                "qwen edit: adapter path appears more than once in the ordered stack: {}",
+                canonical.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn is_exact_lightning_path(path: &Path) -> bool {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     path_has_suffix(
@@ -1020,6 +1054,7 @@ pub(crate) fn validate_memory_artifact_recipe(
     spec.validate_prepared_file_pins()
         .map_err(|error| CandleError::Msg(error.to_string()))?;
     let _tier = exact_base_tier(spec)?;
+    validate_unique_adapter_paths(spec)?;
     for adapter in &spec.adapters {
         adapter_has_exact_receipt(spec, adapter)?;
     }
@@ -1187,6 +1222,7 @@ fn validate_memory_request(
     }
 
     let artifact_recipe = validate_memory_artifact_recipe(spec)?;
+    validate_memory_recipe_context(artifact_recipe, context)?;
     let lightning_route = artifact_recipe.is_lightning();
     if req.lightning != lightning_route {
         return Err(CandleError::Msg(format!(
@@ -1543,6 +1579,19 @@ mod tests {
             validate_memory_artifact_recipe(&unprepared_user).unwrap(),
             QwenEditArtifactRecipe::UserAdapters
         );
+        let mut duplicate_users = plain.clone();
+        duplicate_users.adapters.push(AdapterSpec::new(
+            user_path.clone(),
+            0.75,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        duplicate_users.adapters.push(AdapterSpec::new(
+            user_path,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        duplicate_users.prepare_file_sources().unwrap();
+        assert!(validate_memory_artifact_recipe(&duplicate_users).is_err());
     }
 
     #[test]
@@ -1586,6 +1635,76 @@ mod tests {
             validate_memory_artifact_recipe(&user_on_lightning).unwrap(),
             QwenEditArtifactRecipe::LightningWithUserAdapters
         );
+        let composite_contract = crate::memory_strategy::weights_free_memory_strategy_contract(
+            "qwen_image_edit",
+            &user_on_lightning,
+        )
+        .unwrap();
+        for strategy in [
+            candle_gen::gen_core::MemoryStrategy::Resident,
+            candle_gen::gen_core::MemoryStrategy::StagedResidency,
+            candle_gen::gen_core::MemoryStrategy::BoundedDecode,
+            candle_gen::gen_core::MemoryStrategy::BoundedAttention,
+            candle_gen::gen_core::MemoryStrategy::BoundedTransformerResidency,
+        ] {
+            let mut composite_context = candle_gen::gen_core::standard_memory_behavior_context(
+                &composite_contract,
+                candle_gen::gen_core::MemoryStrategy::Resident,
+                candle_gen::gen_core::MemoryNumericTier {
+                    precision: candle_gen::gen_core::Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+                candle_gen::gen_core::MemoryBehaviorRoute {
+                    mode: candle_gen::gen_core::MemoryMode::Edit,
+                    reference_count: 1,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: Some("lora".to_owned()),
+                },
+            )
+            .unwrap();
+            composite_context.selection.strategy = strategy;
+            let memory = composite_contract.generation_memory(&composite_context.selection);
+            let request = QwenEditRequest {
+                steps: 4,
+                guidance: 1.0,
+                lightning: true,
+                stage_residency: memory.unwrap_or_default().stage_residency,
+                memory,
+                ..Default::default()
+            };
+            let safety = crate::memory_strategy::registered_safety_check(
+                &user_on_lightning,
+                &composite_contract,
+                &composite_context,
+            );
+            let begin = crate::memory_strategy::registered_begin_request(
+                "qwen_image_edit",
+                &user_on_lightning,
+                &composite_contract,
+                &composite_context,
+            );
+            let request_result = validate_memory_request(
+                &composite_context,
+                &composite_contract,
+                &user_on_lightning,
+                &request,
+                1,
+            );
+            if strategy == candle_gen::gen_core::MemoryStrategy::Resident {
+                assert_eq!(safety, candle_gen::gen_core::MemorySafetyDecision::Accept);
+                assert!(begin.is_ok());
+                assert!(request_result.is_ok());
+            } else {
+                assert!(matches!(
+                    safety,
+                    candle_gen::gen_core::MemorySafetyDecision::Reject { .. }
+                ));
+                assert!(begin.is_err());
+                assert!(request_result.is_err());
+            }
+        }
         let changed_bytes = user_on_lightning.clone();
         std::fs::write(&user_path, b"changed-user-adapter").unwrap();
         assert!(validate_memory_artifact_recipe(&changed_bytes).is_err());
