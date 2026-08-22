@@ -260,6 +260,7 @@ fn render_measured_id(
     };
     let record = MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
+            model_family: "z-image".to_owned(),
             resolved_route: model_id.to_owned(),
             backend: MemoryBackend::Mlx,
             tier: MemoryNumericTier {
@@ -269,6 +270,7 @@ fn render_measured_id(
             },
             load_shape: contract_spec.load_shape,
             mode: MemoryMode::TextToImage,
+            reference_shape: MemoryReferenceShape::None,
             overlay: None,
             geometry: MemoryGeometry {
                 width: req.width,
@@ -277,6 +279,7 @@ fn render_measured_id(
                 frames: 1,
                 reference_count: 0,
             },
+            frames_per_second: None,
             strategy,
             engaged_composition: contract.engaged_composition(strategy),
             parameters: MemoryStrategyParameters::default(),
@@ -702,6 +705,7 @@ fn placeholder_record(pixels: &[u8]) -> MemoryEvidenceLogRecord {
     );
     MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
+            model_family: "z-image".to_owned(),
             resolved_route: "z_image_turbo".to_owned(),
             backend: MemoryBackend::Mlx,
             tier: MemoryNumericTier {
@@ -711,6 +715,7 @@ fn placeholder_record(pixels: &[u8]) -> MemoryEvidenceLogRecord {
             },
             load_shape: spec.load_shape,
             mode: MemoryMode::TextToImage,
+            reference_shape: MemoryReferenceShape::None,
             overlay: None,
             geometry: MemoryGeometry {
                 width: 2,
@@ -719,6 +724,7 @@ fn placeholder_record(pixels: &[u8]) -> MemoryEvidenceLogRecord {
                 frames: 1,
                 reference_count: 0,
             },
+            frames_per_second: None,
             strategy: MemoryStrategy::Resident,
             engaged_composition: vec![MemoryStrategy::Resident],
             parameters: MemoryStrategyParameters::default(),
