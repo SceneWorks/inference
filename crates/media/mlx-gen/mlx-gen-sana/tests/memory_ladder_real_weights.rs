@@ -101,8 +101,9 @@ use std::path::PathBuf;
 use mlx_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, MemoryBackend,
     MemoryCalibrationIdentity, MemoryEvidenceKey, MemoryEvidenceLogRecord, MemoryGeometry,
-    MemoryMode, MemoryNumericTier, MemoryParityContract, MemoryParityResult, MemoryStrategy,
-    MemoryStrategyParameters, MemoryStrategySupport, Progress, TransformerComponent,
+    MemoryMode, MemoryNumericTier, MemoryParityContract, MemoryParityResult, MemoryReferenceShape,
+    MemoryStrategy, MemoryStrategyParameters, MemoryStrategySupport, Progress,
+    TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
