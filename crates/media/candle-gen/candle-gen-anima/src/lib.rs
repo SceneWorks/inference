@@ -233,6 +233,7 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
             frames: request.frames.unwrap_or(1),
             reference_count: request.image_reference_count(),
         };
+        let phases_present = request.phases.is_some();
         let has_phases = request
             .phases
             .as_ref()
@@ -240,6 +241,7 @@ impl gen_core::MemoryRequestScope for AnimaMemoryScope {
         if geometry != self.geometry
             || !request.conditioning.is_empty()
             || request.use_pid != self.use_pid
+            || phases_present != self.has_phases
             || has_phases != self.has_phases
         {
             return Err(gen_core::Error::Unsupported(
@@ -425,7 +427,7 @@ impl Generator for Anima {
             .as_ref()
             .map_or(gen_core::MemorySafetyDecision::Accept, |contract| {
                 memory_strategy::loaded_safety_check(
-                    !self.adapters.is_empty(),
+                    gen_core::adapter_stack_identity(&self.adapters).as_deref(),
                     self.memory_tier,
                     contract,
                     context,
@@ -1088,6 +1090,9 @@ mod tests {
             adapters: Vec::new(),
         }]);
         assert!(scope.configure_request(&mut phases).is_err());
+        let mut empty_phases = exact();
+        empty_phases.phases = Some(Vec::new());
+        assert!(scope.configure_request(&mut empty_phases).is_err());
         let mut conditioning = exact();
         conditioning
             .conditioning

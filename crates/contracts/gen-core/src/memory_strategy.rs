@@ -799,6 +799,30 @@ pub fn adapter_stack_resident_bytes(
     })
 }
 
+/// Exact ordered identity of the load-time adapter stack used by provider request handshakes.
+///
+/// The digest binds every adapter's native path representation, LoRA/LoKr kind, and exact IEEE-754
+/// scale bits. It deliberately does not inspect mutable file contents: callers that require byte
+/// identity must prepare/pin those files separately before constructing the [`AdapterSpec`].
+pub fn adapter_stack_identity(adapters: &[AdapterSpec]) -> Option<String> {
+    if adapters.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"gen-core-adapter-stack-v1");
+    for adapter in adapters {
+        let path = format!("{:?}", adapter.path.as_os_str());
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update([match adapter.kind {
+            crate::AdapterKind::Lora => 0,
+            crate::AdapterKind::Lokr => 1,
+        }]);
+        digest.update(adapter.scale.to_bits().to_le_bytes());
+    }
+    Some(format!("adapters:{:x}", digest.finalize()))
+}
+
 impl MemoryComponentKind {
     pub const fn is_auxiliary(self) -> bool {
         matches!(
@@ -3783,6 +3807,49 @@ mod tests {
             adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
             None
         );
+    }
+
+    #[test]
+    fn adapter_stack_identity_binds_order_path_kind_and_exact_scale() {
+        let first = AdapterSpec::new(
+            "/adapters/first.safetensors".into(),
+            1.0,
+            crate::AdapterKind::Lora,
+        );
+        let second = AdapterSpec::new(
+            "/adapters/second.safetensors".into(),
+            0.5,
+            crate::AdapterKind::Lokr,
+        );
+        let expected = adapter_stack_identity(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            adapter_stack_identity(&[first.clone(), second.clone()]),
+            Some(expected.clone())
+        );
+        assert_ne!(
+            adapter_stack_identity(&[second.clone(), first.clone()]),
+            Some(expected.clone())
+        );
+
+        let mut changed_path = first.clone();
+        changed_path.path = "/adapters/other.safetensors".into();
+        assert_ne!(
+            adapter_stack_identity(&[changed_path, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_kind = first.clone();
+        changed_kind.kind = crate::AdapterKind::Lokr;
+        assert_ne!(
+            adapter_stack_identity(&[changed_kind, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_scale = first;
+        changed_scale.scale = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert_ne!(
+            adapter_stack_identity(&[changed_scale, second]),
+            Some(expected)
+        );
+        assert_eq!(adapter_stack_identity(&[]), None);
     }
 
     fn mlx_backend() -> MemoryBackendRealization {

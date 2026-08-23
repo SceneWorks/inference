@@ -5,7 +5,7 @@
 //! (`{prefix}.llm_adapter.*`). We detect the root `{prefix}` from the checkpoint keys and build both
 //! from the same mmap'd VarBuilder with their respective sub-prefixes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::{self as cst, MmapedSafetensors};
@@ -78,9 +78,9 @@ pub fn dit_quant_tier(source: &WeightsSource, variant: Variant) -> Result<Option
     dit_path_quant_tier(&dit_path)
 }
 
-/// Header-only physical packed-tier detection. Every packed affine pair must agree on the bit width;
-/// a companion `config.json` may state its group size, otherwise the immutable Anima packing convention
-/// is the shared MLX group-64 format.
+/// Header-only physical packed-tier detection. Every packed affine triple must agree on the bit
+/// width and match the exact U32/F32/F32 group-64 representation consumed by Anima's loader. A
+/// companion `config.json` may attest that representation, but cannot redefine it.
 fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
     // Header-only mmap: reads tensor metadata without materializing any weight data.
     // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
@@ -113,33 +113,54 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
             ))
         })?
         .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
-    if group_size == 0 {
+    if group_size != candle_gen::quant::MLX_GROUP_SIZE {
         return Err(CandleError::Msg(format!(
-            "anima: packed config has zero group size in {}",
+            "anima: packed config group size {group_size} does not match the required group size {} in {}",
+            candle_gen::quant::MLX_GROUP_SIZE,
             config_path.display()
         )));
     }
 
+    let tensor_names = st
+        .tensors()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<HashSet<_>>();
     let mut tier = None;
-    for (key, scales) in st.tensors() {
+    for key in &tensor_names {
         let Some(base) = key.strip_suffix(".scales") else {
             continue;
         };
-        let weight = st.get(&format!("{base}.weight")).map_err(|_| {
+        let weight_key = format!("{base}.weight");
+        let biases_key = format!("{base}.biases");
+        let weight = st.get(&weight_key).map_err(|_| {
             CandleError::Msg(format!(
-                "anima: packed scale `{key}` has no companion `{base}.weight` in {}",
+                "anima: packed scale `{key}` has no companion `{weight_key}` in {}",
+                dit_path.display()
+            ))
+        })?;
+        let scales = st.get(key)?;
+        let biases = st.get(&biases_key).map_err(|_| {
+            CandleError::Msg(format!(
+                "anima: packed scale `{key}` has no companion `{biases_key}` in {}",
                 dit_path.display()
             ))
         })?;
         let weight_shape = weight.shape();
         let scales_shape = scales.shape();
+        let biases_shape = biases.shape();
         if weight_shape.len() != 2
             || scales_shape.len() != 2
+            || biases_shape.len() != 2
             || weight_shape[0] != scales_shape[0]
+            || biases_shape != scales_shape
             || scales_shape[1] == 0
+            || weight.dtype() != DType::U32.into()
+            || scales.dtype() != DType::F32.into()
+            || biases.dtype() != DType::F32.into()
         {
             return Err(CandleError::Msg(format!(
-                "anima: malformed packed pair `{base}` in {}",
+                "anima: malformed packed affine triple `{base}` (expected U32 weight plus shape-matched F32 scales/biases) in {}",
                 dit_path.display()
             )));
         }
@@ -201,6 +222,36 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
                 )));
             }
         }
+    }
+    for key in &tensor_names {
+        if let Some(base) = key.strip_suffix(".biases") {
+            if !tensor_names.contains(&format!("{base}.weight"))
+                || !tensor_names.contains(&format!("{base}.scales"))
+            {
+                return Err(CandleError::Msg(format!(
+                    "anima: orphan packed bias `{key}` in {}",
+                    dit_path.display()
+                )));
+            }
+        }
+        if let Some(base) = key.strip_suffix(".weight") {
+            if st.get(key)?.dtype() == DType::U32.into()
+                && (!tensor_names.contains(&format!("{base}.scales"))
+                    || !tensor_names.contains(&format!("{base}.biases")))
+            {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed weight `{key}` is missing its scales/biases sidecars in {}",
+                    dit_path.display()
+                )));
+            }
+        }
+    }
+    if packed_config.is_some() && tier.is_none() {
+        return Err(CandleError::Msg(format!(
+            "anima: packed config {} has no valid packed affine triples in {}",
+            config_path.display(),
+            dit_path.display()
+        )));
     }
     Ok(tier)
 }
@@ -429,6 +480,46 @@ mod tests {
         path
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn write_packed_fixture(
+        root: &Path,
+        name: &str,
+        columns: usize,
+        config_bits: Option<u8>,
+        group_size: usize,
+        weight_dtype: DType,
+        scales_dtype: DType,
+        biases: Option<(DType, usize)>,
+    ) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("anima.safetensors");
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "net.x_embedder.proj.1.weight".to_owned(),
+            Tensor::zeros((2, columns), weight_dtype, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "net.x_embedder.proj.1.scales".to_owned(),
+            Tensor::zeros((2, 1), scales_dtype, &Device::Cpu).unwrap(),
+        );
+        if let Some((dtype, bias_columns)) = biases {
+            tensors.insert(
+                "net.x_embedder.proj.1.biases".to_owned(),
+                Tensor::zeros((2, bias_columns), dtype, &Device::Cpu).unwrap(),
+            );
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        if let Some(bits) = config_bits {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":{group_size}}}}}"#),
+            )
+            .unwrap();
+        }
+        path
+    }
+
     #[test]
     fn detect_dit_prefix_covers_both_roots() {
         let dir_tmp = tempfile::tempdir().unwrap();
@@ -458,27 +549,16 @@ mod tests {
     fn packed_header_derives_exact_bit_width_and_rejects_config_lies() {
         let temp = tempfile::tempdir().unwrap();
         let write_packed = |name: &str, columns: usize, config_bits: Option<u8>| {
-            let dir = temp.path().join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("anima.safetensors");
-            let mut tensors = HashMap::new();
-            tensors.insert(
-                "net.x_embedder.proj.1.weight".to_owned(),
-                Tensor::zeros((2, columns), DType::U32, &Device::Cpu).unwrap(),
-            );
-            tensors.insert(
-                "net.x_embedder.proj.1.scales".to_owned(),
-                Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
-            );
-            candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
-            if let Some(bits) = config_bits {
-                std::fs::write(
-                    dir.join("config.json"),
-                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
-                )
-                .unwrap();
-            }
-            path
+            write_packed_fixture(
+                temp.path(),
+                name,
+                columns,
+                config_bits,
+                64,
+                DType::U32,
+                DType::F32,
+                Some((DType::F32, 1)),
+            )
         };
         assert_eq!(
             dit_path_quant_tier(&write_packed("q4", 8, Some(4))).unwrap(),
@@ -492,5 +572,62 @@ mod tests {
             dit_path_quant_tier(&write_packed("lying-config", 8, Some(8))).is_err(),
             "config Q8 must not relabel physical Q4 codes"
         );
+    }
+
+    #[test]
+    fn packed_header_rejects_non_production_groups_and_malformed_triples() {
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = |name, group, weight_dtype, scales_dtype, biases| {
+            write_packed_fixture(
+                temp.path(),
+                name,
+                8,
+                Some(4),
+                group,
+                weight_dtype,
+                scales_dtype,
+                biases,
+            )
+        };
+        assert!(dit_path_quant_tier(&malformed(
+            "group32",
+            32,
+            DType::U32,
+            DType::F32,
+            Some((DType::F32, 1)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "dense-weight",
+            64,
+            DType::F32,
+            DType::F32,
+            Some((DType::F32, 1)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "missing-biases",
+            64,
+            DType::U32,
+            DType::F32,
+            None,
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "bias-shape",
+            64,
+            DType::U32,
+            DType::F32,
+            Some((DType::F32, 2)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "bias-dtype",
+            64,
+            DType::U32,
+            DType::F32,
+            Some((DType::BF16, 1)),
+        ))
+        .is_err());
     }
 }

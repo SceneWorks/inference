@@ -113,7 +113,7 @@ pub use license::{
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
 pub use memory_strategy::{
-    adapter_stack_resident_bytes, default_memory_strategy_safety_check,
+    adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
     standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
     MemoryAssetFacts, MemoryBackend, MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget,

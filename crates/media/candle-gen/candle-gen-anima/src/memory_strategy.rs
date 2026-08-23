@@ -100,7 +100,12 @@ pub fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     match resolved_numeric_tier(spec, spec.quantize) {
-        Ok(tier) => loaded_safety_check(!spec.adapters.is_empty(), tier, contract, context),
+        Ok(tier) => loaded_safety_check(
+            gen_core::adapter_stack_identity(&spec.adapters).as_deref(),
+            tier,
+            contract,
+            context,
+        ),
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
         },
@@ -108,35 +113,37 @@ pub fn safety_check(
 }
 
 pub fn loaded_safety_check(
-    has_adapters: bool,
+    expected_overlay: Option<&str>,
     loaded_tier: MemoryNumericTier,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let staged = contract.engages(context.selection.strategy, MemoryStrategy::StagedResidency);
     let route_gate = || {
-        if !staged {
-            return Ok(());
+        if context.mode != MemoryMode::TextToImage
+            || context.geometry.reference_count != 0
+            || context.has_reference
+            || context.use_pid
+            || context.has_phases
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: memory admission is only valid for the exact single-phase text_to_image route",
+                contract.provider_id
+            )));
         }
-        if has_adapters {
+        if context.overlay.as_deref() != expected_overlay {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: memory overlay {:?} does not match the loaded adapter stack {:?}",
+                contract.provider_id, context.overlay, expected_overlay
+            )));
+        }
+        if staged && expected_overlay.is_some() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: staged residency refuses LoRA/LoKr overlays because their conditioner and DiT loads are one atomic artifact",
                 contract.provider_id
             )));
         }
-        if context.mode == MemoryMode::TextToImage
-            && context.geometry.reference_count == 0
-            && !context.use_pid
-            && !context.has_phases
-            && context.overlay.is_none()
-        {
-            Ok(())
-        } else {
-            Err(gen_core::Error::Unsupported(format!(
-                "{}: staged memory is only valid for the exact text_to_image/no-overlay route",
-                contract.provider_id
-            )))
-        }
+        Ok(())
     };
     gen_core::standard_memory_strategy_safety_check(
         contract,
@@ -250,6 +257,7 @@ mod tests {
             AdapterKind::Lora,
         ));
         let adapter_contract = contract("anima_base", &spec).unwrap();
+        let lora_overlay = gen_core::adapter_stack_identity(&spec.adapters).unwrap();
         assert!(matches!(
             adapter_contract
                 .capability(MemoryStrategy::StagedResidency)
@@ -270,7 +278,7 @@ mod tests {
                 reference_count: 0,
                 use_pid: false,
                 has_phases: false,
-                overlay: Some("lora:overlay".to_owned()),
+                overlay: Some(lora_overlay.clone()),
             },
         )
         .unwrap();
@@ -280,10 +288,28 @@ mod tests {
         );
 
         spec.adapters[0].kind = AdapterKind::Lokr;
+        let lokr_overlay = gen_core::adapter_stack_identity(&spec.adapters).unwrap();
+        let mut lokr_resident = resident.clone();
+        lokr_resident.overlay = Some(lokr_overlay.clone());
         assert_eq!(
-            safety_check(&spec, &adapter_contract, &resident),
+            safety_check(&spec, &adapter_contract, &lokr_resident),
             MemorySafetyDecision::Accept
         );
+        assert!(matches!(
+            safety_check(&spec, &adapter_contract, &resident),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        spec.adapters[0].scale = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert!(matches!(
+            safety_check(&spec, &adapter_contract, &lokr_resident),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        spec.adapters[0].scale = 1.0;
+        spec.adapters[0].path = "/anima/other.safetensors".into();
+        assert!(matches!(
+            safety_check(&spec, &adapter_contract, &lokr_resident),
+            MemorySafetyDecision::Reject { .. }
+        ));
 
         let plain = LoadSpec::new(WeightsSource::Dir("/anima".into()));
         let plain_contract = contract("anima_base", &plain).unwrap();
