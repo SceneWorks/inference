@@ -102,7 +102,7 @@ pub const PROVIDER_IDS: [&str; 2] = [RENDERER_ID, FULL_ID];
 /// one-frame still-image route it actually executes instead of claiming `has_phases`. Versioning the
 /// *declaration* key rather than [`MEMORY_CALIBRATION_FINGERPRINT`] keeps the (still unminted)
 /// production identity from being restamped by a route correction.
-const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v2";
+const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v3";
 
 /// The production calibration identity, minted once a cell has real-weight evidence behind it.
 ///
@@ -136,7 +136,7 @@ pub const R2V_REFERENCE_SEAL_DOMAIN: &str = "bernini-r2v-request-seal-v1";
 
 fn is_reference_receipt_axis(axis: &str) -> bool {
     axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)
-        .is_some_and(|suffix| suffix.starts_with(":backend-mlx:count-"))
+        .is_some_and(|suffix| suffix.starts_with(":backend-mlx:source-preprocess-"))
 }
 
 fn reference_receipt_has_video(axis: &str) -> bool {
@@ -144,12 +144,69 @@ fn reference_receipt_has_video(axis: &str) -> bool {
         .is_some_and(|(_, suffix)| suffix.contains(":video-1:"))
 }
 
-fn rv2v_receipt_matches_context(axis: &str, context: &MemoryRunContext) -> bool {
-    let Ok(video_tokens) = packed_source_tokens(
-        context.geometry.frames as usize,
-        context.geometry.width,
-        context.geometry.height,
-    ) else {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePreprocess {
+    RendererOutput,
+    FullVae,
+}
+
+fn source_preprocess(provider_id: &str) -> CoreResult<SourcePreprocess> {
+    match provider_id {
+        RENDERER_ID => Ok(SourcePreprocess::RendererOutput),
+        FULL_ID => Ok(SourcePreprocess::FullVae),
+        _ => Err(CoreError::Unsupported(format!(
+            "unknown Bernini provider {provider_id}"
+        ))),
+    }
+}
+
+fn source_preprocess_axis(provider_id: &str) -> CoreResult<&'static str> {
+    match source_preprocess(provider_id)? {
+        SourcePreprocess::RendererOutput => Ok("source-preprocess-renderer-output-v1"),
+        SourcePreprocess::FullVae => Ok("source-preprocess-full-vae624-v1"),
+    }
+}
+
+fn source_vae_dims(provider_id: &str, width: u32, height: u32) -> CoreResult<(u32, u32)> {
+    match source_preprocess(provider_id)? {
+        SourcePreprocess::RendererOutput => Ok((width, height)),
+        SourcePreprocess::FullVae => {
+            let (width, height) = crate::vae_preprocess::resize_dims(
+                i64::from(width),
+                i64::from(height),
+                crate::vae_preprocess::VAE_MAX_SIZE,
+                crate::vae_preprocess::VAE_MIN_SIZE,
+                crate::vae_preprocess::VAE_STRIDE,
+            );
+            Ok((width as u32, height as u32))
+        }
+    }
+}
+
+fn image_source_vae_dims(
+    provider_id: &str,
+    output_width: u32,
+    output_height: u32,
+    image_width: u32,
+    image_height: u32,
+) -> CoreResult<(u32, u32)> {
+    match source_preprocess(provider_id)? {
+        SourcePreprocess::RendererOutput => {
+            source_vae_dims(provider_id, output_width, output_height)
+        }
+        SourcePreprocess::FullVae => source_vae_dims(provider_id, image_width, image_height),
+    }
+}
+
+fn rv2v_receipt_matches_context(provider_id: &str, axis: &str, context: &MemoryRunContext) -> bool {
+    let Ok((vae_width, vae_height)) =
+        source_vae_dims(provider_id, context.geometry.width, context.geometry.height)
+    else {
+        return false;
+    };
+    let Ok(video_tokens) =
+        packed_source_tokens(context.geometry.frames as usize, vae_width, vae_height)
+    else {
         return false;
     };
     let latent_frames = (context.geometry.frames - 1)
@@ -161,8 +218,8 @@ fn rv2v_receipt_matches_context(axis: &str, context: &MemoryRunContext) -> bool 
         context.geometry.width,
         context.geometry.height,
         latent_frames,
-        context.geometry.width / 8,
-        context.geometry.height / 8,
+        vae_width / 8,
+        vae_height / 8,
     );
     let Some((declared_total, token_surface)) = axis
         .split_once(":packed-source-tokens-")
@@ -185,7 +242,8 @@ fn rv2v_receipt_matches_context(axis: &str, context: &MemoryRunContext) -> bool 
                 .ok()
         })
         .collect();
-    axis.matches("video-1:").count() == 1
+    axis.contains(source_preprocess_axis(provider_id).unwrap_or_default())
+        && axis.matches("video-1:").count() == 1
         && axis.contains(&video_marker)
         && tokens.len() == context.geometry.reference_count as usize
         && tokens
@@ -290,8 +348,9 @@ fn r2v_sources(
 /// Bind the content-independent memory shape separately from the request-only byte seal. The two
 /// axes travel together to provider safety, but only the shape axis is eligible for fitted-curve
 /// lookup. This is recomputed at configure so post-admission content mutation is rejected.
-pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> {
+pub fn r2v_reference_receipt(provider_id: &str, request: &GenerationRequest) -> CoreResult<String> {
     let (clip, images) = r2v_sources(request)?;
+    let preprocess_axis = source_preprocess_axis(provider_id)?;
     let has_video = clip.is_some();
     let mut request_seal = Sha256::new();
     request_seal.update(R2V_REFERENCE_SEAL_DOMAIN.as_bytes());
@@ -307,7 +366,8 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
             request_seal.update(frame.height.to_le_bytes());
             request_seal.update(&frame.pixels);
         }
-        let tokens = packed_source_tokens(clip.frames.len(), request.width, request.height)?;
+        let (vae_width, vae_height) = source_vae_dims(provider_id, request.width, request.height)?;
+        let tokens = packed_source_tokens(clip.frames.len(), vae_width, vae_height)?;
         packed_tokens = packed_tokens.checked_add(tokens).ok_or_else(|| {
             CoreError::Unsupported("bernini combined source-token count overflow".into())
         })?;
@@ -321,8 +381,8 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
             request.width,
             request.height,
             latent_frames,
-            request.width / 8,
-            request.height / 8
+            vae_width / 8,
+            vae_height / 8
         ));
     }
     for (index, image) in images.iter().enumerate() {
@@ -344,18 +404,18 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
             3136,
             50176,
         );
-        let (vae_w, vae_h) = crate::vae_preprocess::resize_dims(
-            i64::from(image.width),
-            i64::from(image.height),
-            crate::vae_preprocess::VAE_MAX_SIZE,
-            crate::vae_preprocess::VAE_MIN_SIZE,
-            crate::vae_preprocess::VAE_STRIDE,
-        );
+        let (vae_w, vae_h) = image_source_vae_dims(
+            provider_id,
+            request.width,
+            request.height,
+            image.width,
+            image.height,
+        )?;
         request_seal.update(image.width.to_le_bytes());
         request_seal.update(image.height.to_le_bytes());
         request_seal.update(&image.pixels);
         if has_video {
-            let tokens = packed_source_tokens(1, vae_w as u32, vae_h as u32)?;
+            let tokens = packed_source_tokens(1, vae_w, vae_h)?;
             packed_tokens = packed_tokens.checked_add(tokens).ok_or_else(|| {
                 CoreError::Unsupported("bernini combined source-token count overflow".into())
             })?;
@@ -372,7 +432,7 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
     }
     let packed_surface = has_video.then(|| format!("packed-source-tokens-{packed_tokens}:"));
     Ok(format!(
-        "{R2V_REFERENCE_RECEIPT_DOMAIN}:backend-mlx:count-{}:{}{}+{R2V_REFERENCE_SEAL_DOMAIN}-{:x}",
+        "{R2V_REFERENCE_RECEIPT_DOMAIN}:backend-mlx:{preprocess_axis}:count-{}:{}{}+{R2V_REFERENCE_SEAL_DOMAIN}-{:x}",
         images.len(),
         packed_surface.as_deref().unwrap_or_default(),
         entries.join("|"),
@@ -382,7 +442,8 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
 
 fn receipt_count(axis: &str) -> Option<u32> {
     axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)?
-        .strip_prefix(":backend-mlx:count-")?
+        .split_once(":count-")?
+        .1
         .split_once(':')?
         .0
         .parse()
@@ -816,7 +877,9 @@ pub(crate) fn safety_check(
             && (reference_axis.and_then(receipt_count)
                 != Some(context.geometry.reference_count - 1)
                 || !receipt_has_video
-                || !reference_axis.is_some_and(|axis| rv2v_receipt_matches_context(axis, context))
+                || !reference_axis.is_some_and(|axis| {
+                    rv2v_receipt_matches_context(&contract.provider_id, axis, context)
+                })
                 || seal_axis.is_none()
                 || exact_receipt.is_none())
         {
@@ -1207,16 +1270,53 @@ pub(crate) fn registered_valid_fixture(
     r2v_request.prompt = "weights-free bernini r2v memory behavior".to_owned();
     r2v_request.video_mode = Some("r2v".to_owned());
     r2v_request.conditioning = vec![mlx_gen::gen_core::Conditioning::MultiReference { images }];
-    let reference_axis = r2v_reference_receipt(&r2v_request)?;
+    let reference_axis = r2v_reference_receipt(&contract.provider_id, &r2v_request)?;
     let mut r2v_context = fixture.context.clone();
     r2v_context.mode = MemoryMode::Other("reference_to_video".to_owned());
     r2v_context.geometry.reference_count = 2;
     r2v_context.overlay = Some(format!("provider_video_mode:r2v+{reference_axis}"));
+    let mut rv2v_request = r2v_request.clone();
+    rv2v_request.prompt = "weights-free bernini rv2v memory behavior".to_owned();
+    rv2v_request.video_mode = Some("rv2v".to_owned());
+    rv2v_request.width = 848;
+    rv2v_request.height = 480;
+    rv2v_request.frames = Some(45);
+    let clip_frame = mlx_gen::gen_core::Image {
+        width: rv2v_request.width,
+        height: rv2v_request.height,
+        pixels: vec![3; rv2v_request.width as usize * rv2v_request.height as usize * 3],
+    };
+    let mut conditioning = std::mem::take(&mut rv2v_request.conditioning);
+    let images = match conditioning.pop() {
+        Some(mlx_gen::gen_core::Conditioning::MultiReference { images })
+            if conditioning.is_empty() =>
+        {
+            images
+        }
+        _ => unreachable!("R2V fixture has one MultiReference"),
+    };
+    rv2v_request.conditioning = vec![
+        mlx_gen::gen_core::Conditioning::VideoClip {
+            frames: vec![clip_frame; 45],
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        mlx_gen::gen_core::Conditioning::MultiReference { images },
+    ];
+    let rv2v_reference_axis = r2v_reference_receipt(&contract.provider_id, &rv2v_request)?;
+    let mut rv2v_context = fixture.context.clone();
+    rv2v_context.mode = MemoryMode::Other("reference_video_to_video".to_owned());
+    rv2v_context.geometry.reference_count = 3;
+    rv2v_context.overlay = Some(format!("provider_video_mode:rv2v+{rv2v_reference_axis}"));
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
+        },
+        MemoryBehaviorFixture {
+            context: rv2v_context,
+            request: rv2v_request,
         },
     ])
 }
@@ -1347,6 +1447,7 @@ fn begin_with_cleanup(
         .flatten();
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+        provider_id,
         route,
         expected_reference_receipt,
     })))
@@ -1391,7 +1492,10 @@ fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()
     Ok(())
 }
 
-fn validate_reference_to_video_request(request: &GenerationRequest) -> CoreResult<String> {
+fn validate_reference_to_video_request(
+    provider_id: &str,
+    request: &GenerationRequest,
+) -> CoreResult<String> {
     if request.phases.is_some() {
         return Err(CoreError::Unsupported(
             "bernini r2v memory scope does not implement multi-phase denoise requests".to_owned(),
@@ -1423,10 +1527,13 @@ fn validate_reference_to_video_request(request: &GenerationRequest) -> CoreResul
             "bernini r2v memory scope requires images only".to_owned(),
         ));
     }
-    r2v_reference_receipt(request)
+    r2v_reference_receipt(provider_id, request)
 }
 
-fn validate_reference_video_to_video_request(request: &GenerationRequest) -> CoreResult<String> {
+fn validate_reference_video_to_video_request(
+    provider_id: &str,
+    request: &GenerationRequest,
+) -> CoreResult<String> {
     if request.phases.is_some()
         || request.video_mode.as_deref() != Some("rv2v")
         || request.fps.unwrap_or(16) != 16
@@ -1448,7 +1555,7 @@ fn validate_reference_video_to_video_request(request: &GenerationRequest) -> Cor
         ));
     }
     validate_geometry(request.width, request.height)?;
-    r2v_reference_receipt(request)
+    r2v_reference_receipt(provider_id, request)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1460,6 +1567,7 @@ enum BerniniMemoryRoute {
 
 struct BerniniMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
+    provider_id: &'static str,
     route: BerniniMemoryRoute,
     expected_reference_receipt: Option<String>,
 }
@@ -1469,7 +1577,7 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
         match self.route {
             BerniniMemoryRoute::Clip => validate_video_to_video_request(request)?,
             BerniniMemoryRoute::Images => {
-                let actual = validate_reference_to_video_request(request)?;
+                let actual = validate_reference_to_video_request(self.provider_id, request)?;
                 if self.expected_reference_receipt.as_deref() != Some(actual.as_str()) {
                     return Err(CoreError::Unsupported(
                         "bernini r2v references changed after admission".to_owned(),
@@ -1477,7 +1585,7 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
                 }
             }
             BerniniMemoryRoute::ClipAndImages => {
-                let actual = validate_reference_video_to_video_request(request)?;
+                let actual = validate_reference_video_to_video_request(self.provider_id, request)?;
                 if self.expected_reference_receipt.as_deref() != Some(actual.as_str()) {
                     return Err(CoreError::Unsupported(
                         "bernini rv2v sources changed after admission".to_owned(),
@@ -2424,18 +2532,23 @@ mod tests {
     #[test]
     fn r2v_receipt_binds_order_bytes_and_mlx_effective_shapes() {
         let request = r2v_request();
-        let receipt = r2v_reference_receipt(&request).expect("exact receipt");
+        let receipt = r2v_reference_receipt(FULL_ID, &request).expect("exact receipt");
         assert_eq!(
             receipt,
-            "bernini-r2v-references-v2:backend-mlx:count-2:0:native-640x360;vit-280x168;vae-624x352|1:native-360x640;vit-168x280;vae-352x624+bernini-r2v-request-seal-v1-cd11cf62ec83e85860e1790538062a88b39ae384d2956fd1dc54c0e45d6fa8f5"
+            "bernini-r2v-references-v2:backend-mlx:source-preprocess-full-vae624-v1:count-2:0:native-640x360;vit-280x168;vae-624x352|1:native-360x640;vit-168x280;vae-352x624+bernini-r2v-request-seal-v1-cd11cf62ec83e85860e1790538062a88b39ae384d2956fd1dc54c0e45d6fa8f5"
         );
+        let renderer_receipt =
+            r2v_reference_receipt(RENDERER_ID, &request).expect("renderer receipt");
+        assert!(renderer_receipt.contains("source-preprocess-renderer-output-v1"));
+        assert!(renderer_receipt.contains("vae-848x480"));
+        assert_ne!(receipt, renderer_receipt);
 
         let mut reversed = request.clone();
         let [Conditioning::MultiReference { images }] = reversed.conditioning.as_mut_slice() else {
             unreachable!()
         };
         images.reverse();
-        assert_ne!(receipt, r2v_reference_receipt(&reversed).unwrap());
+        assert_ne!(receipt, r2v_reference_receipt(FULL_ID, &reversed).unwrap());
 
         let mut duplicate = request;
         let [Conditioning::MultiReference { images }] = duplicate.conditioning.as_mut_slice()
@@ -2443,16 +2556,16 @@ mod tests {
             unreachable!()
         };
         images[1] = images[0].clone();
-        assert!(r2v_reference_receipt(&duplicate).is_ok());
+        assert!(r2v_reference_receipt(FULL_ID, &duplicate).is_ok());
 
         let mut crossed = r2v_request();
         crossed.conditioning.clear();
-        assert!(r2v_reference_receipt(&crossed).is_err());
+        assert!(r2v_reference_receipt(FULL_ID, &crossed).is_err());
         crossed.conditioning = vec![Conditioning::Reference {
             image: distinct_references(1).into_iter().next().unwrap(),
             strength: Some(1.0),
         }];
-        assert!(r2v_reference_receipt(&crossed).is_err());
+        assert!(r2v_reference_receipt(FULL_ID, &crossed).is_err());
     }
 
     #[test]
@@ -2467,9 +2580,9 @@ mod tests {
                     request.conditioning = vec![Conditioning::MultiReference {
                         images: distinct_references(count),
                     }];
-                    validate_reference_to_video_request(&request).unwrap_or_else(|error| {
-                        panic!("{count}/{width}x{height}/{frames}: {error}")
-                    });
+                    validate_reference_to_video_request(FULL_ID, &request).unwrap_or_else(
+                        |error| panic!("{count}/{width}x{height}/{frames}: {error}"),
+                    );
                 }
             }
         }
@@ -2478,20 +2591,25 @@ mod tests {
     #[test]
     fn rv2v_binds_the_composite_packed_surface_and_cannot_borrow_r2v_evidence() {
         let request = rv2v_request();
-        let receipt = r2v_reference_receipt(&request).expect("exact RV2V receipt");
-        assert!(receipt.contains("count-2:packed-source-tokens-20796:"));
-        assert!(receipt.contains("video-1:frames-45;native-848x480;vae-12x106x60;tokens-19080"));
-        assert!(receipt.contains("0:native-640x360;vit-280x168;vae-624x352;tokens-858"));
-
-        let r2v_receipt = r2v_reference_receipt(&r2v_request()).unwrap();
-        assert_ne!(receipt, r2v_receipt);
-        assert!(!r2v_receipt.contains("video-1"));
-        assert!(!r2v_receipt.contains("packed-source-tokens"));
-
         for quant in [None, Some(mlx_gen::Quant::Q4), Some(mlx_gen::Quant::Q8)] {
             let mut tier_spec = spec(LoadShape::DeferredMaterialization);
             tier_spec.quantize = quant;
             for provider_id in PROVIDER_IDS {
+                let receipt =
+                    r2v_reference_receipt(provider_id, &request).expect("exact RV2V receipt");
+                let (total, image_tokens, preprocess) = if provider_id == RENDERER_ID {
+                    (22_260, 1_590, "source-preprocess-renderer-output-v1")
+                } else {
+                    (12_012, 858, "source-preprocess-full-vae624-v1")
+                };
+                assert!(receipt.contains(&format!(
+                    "{preprocess}:count-2:packed-source-tokens-{total}:"
+                )));
+                assert!(receipt.contains(&format!(";tokens-{image_tokens}")));
+                let r2v_receipt = r2v_reference_receipt(provider_id, &r2v_request()).unwrap();
+                assert_ne!(receipt, r2v_receipt);
+                assert!(!r2v_receipt.contains("video-1"));
+                assert!(!r2v_receipt.contains("packed-source-tokens"));
                 let contract =
                     weights_free_memory_strategy_contract(provider_id, &tier_spec).unwrap();
                 for strategy in [
@@ -2512,6 +2630,21 @@ mod tests {
                         "{provider_id}/{quant:?}/{strategy:?}"
                     );
 
+                    let crossed_provider = if provider_id == RENDERER_ID {
+                        FULL_ID
+                    } else {
+                        RENDERER_ID
+                    };
+                    let mut crossed_provider_context = context.clone();
+                    crossed_provider_context.overlay = Some(format!(
+                        "provider_video_mode:rv2v+{}",
+                        r2v_reference_receipt(crossed_provider, &request).unwrap()
+                    ));
+                    assert!(matches!(
+                        safety_check(&tier_spec, &contract, &crossed_provider_context),
+                        MemorySafetyDecision::Reject { .. }
+                    ));
+
                     let mut crossed = context.clone();
                     crossed.geometry.reference_count = 2;
                     assert!(matches!(
@@ -2527,7 +2660,10 @@ mod tests {
                     ));
                     crossed = context.clone();
                     crossed.overlay = crossed.overlay.take().map(|overlay| {
-                        overlay.replace("packed-source-tokens-20796", "packed-source-tokens-20797")
+                        overlay.replace(
+                            &format!("packed-source-tokens-{total}"),
+                            &format!("packed-source-tokens-{}", total + 1),
+                        )
                     });
                     assert!(matches!(
                         safety_check(&tier_spec, &contract, &crossed),
@@ -2555,6 +2691,7 @@ mod tests {
         .context;
         context.mode = MemoryMode::Other("reference_video_to_video".to_owned());
         context.geometry.reference_count = 3;
+        let receipt = r2v_reference_receipt(FULL_ID, &request).unwrap();
         context.overlay = Some(format!("provider_video_mode:rv2v+{receipt}"));
         let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &context)
             .unwrap()
@@ -2593,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn every_implemented_mlx_rung_exposes_both_v2v_and_r2v_behavior() {
+    fn every_implemented_mlx_rung_exposes_v2v_r2v_and_rv2v_behavior() {
         let spec = spec(LoadShape::DeferredMaterialization);
         for provider_id in PROVIDER_IDS {
             let contract = contract(provider_id, LoadShape::DeferredMaterialization);
@@ -2603,14 +2740,24 @@ mod tests {
                 MemoryStrategy::BoundedTransformerResidency,
             ] {
                 let fixtures = registered_valid_fixture(&spec, &contract, strategy).unwrap();
-                assert_eq!(fixtures.len(), 2, "{provider_id}/{strategy:?}");
+                assert_eq!(fixtures.len(), 3, "{provider_id}/{strategy:?}");
                 assert_eq!(fixtures[0].context.mode.as_key(), "video_to_video");
                 assert_eq!(fixtures[1].context.mode.as_key(), "reference_to_video");
                 assert_eq!(fixtures[1].context.geometry.reference_count, 2);
                 assert_eq!(
+                    fixtures[2].context.mode.as_key(),
+                    "reference_video_to_video"
+                );
+                assert_eq!(fixtures[2].context.geometry.reference_count, 3);
+                assert_eq!(
                     safety_check(&spec, &contract, &fixtures[1].context),
                     MemorySafetyDecision::Accept,
                     "{provider_id}/{strategy:?}"
+                );
+                assert_eq!(
+                    safety_check(&spec, &contract, &fixtures[2].context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}/{strategy:?}/rv2v"
                 );
             }
         }
@@ -2625,7 +2772,7 @@ mod tests {
             .remove(1);
         let mut empty_phases = fixture.request.clone();
         empty_phases.phases = Some(Vec::new());
-        assert!(validate_reference_to_video_request(&empty_phases).is_err());
+        assert!(validate_reference_to_video_request(FULL_ID, &empty_phases).is_err());
         for outcome in [
             MemoryRunOutcome::Complete,
             MemoryRunOutcome::Canceled,
