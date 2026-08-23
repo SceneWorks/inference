@@ -1199,12 +1199,13 @@ pub fn registered_valid_fixtures(
         r2v_axes.push(adapter_axis);
     }
     r2v_context.overlay = Some(r2v_axes.join("+"));
+    let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
-            load_spec: fixture.load_spec.clone(),
+            load_spec,
         },
     ])
 }
