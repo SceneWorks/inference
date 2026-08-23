@@ -39,6 +39,7 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+pub mod i2v_memory_strategy;
 pub mod memory_strategy;
 pub mod model_vace;
 pub mod model_vace_fun;
@@ -827,6 +828,7 @@ pub struct WanGenerator {
     descriptor: ModelDescriptor,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
+    i2v_memory: Option<i2v_memory_strategy::PreparedWanI2vMemory>,
     root: PathBuf,
     device: Device,
     dit_source: DitSource,
@@ -1058,6 +1060,9 @@ impl Generator for WanGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         run_serialized_request(&self.lifecycle, || {
             let pipe = self.pipeline();
             // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
@@ -1085,13 +1090,19 @@ impl Generator for WanGenerator {
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref()
+        self.i2v_memory
+            .as_ref()
+            .map(|prepared| &prepared.contract)
+            .or(self.memory_strategy.as_ref())
     }
 
     fn memory_strategy_safety_check(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
+        if let Some(prepared) = &self.i2v_memory {
+            return i2v_memory_strategy::safety_check(prepared, context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
                 gen_core::MemorySafetyDecision::Accept
@@ -1110,6 +1121,9 @@ impl Generator for WanGenerator {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if let Some(prepared) = &self.i2v_memory {
+            return i2v_memory_strategy::begin_request(prepared, self.device.clone(), context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return Ok(None);
         };
@@ -1222,6 +1236,13 @@ fn build_generator_with_source(
     // generator merely because the provider crate is part of that platform's catalog.
     #[cfg(not(any(feature = "cuda", test)))]
     let (memory_strategy, memory_tier) = (None, None);
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(i2v_memory_strategy::prepare(spec, MODEL_ID)?)
+    } else {
+        None
+    };
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
@@ -1229,6 +1250,7 @@ fn build_generator_with_source(
         descriptor: descriptor(),
         memory_strategy,
         memory_tier,
+        i2v_memory,
         root,
         device,
         dit_source,

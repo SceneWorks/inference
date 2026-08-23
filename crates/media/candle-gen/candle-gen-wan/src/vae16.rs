@@ -538,11 +538,38 @@ impl WanVae16 {
     }
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
+    }
+
+    /// Request-selected upper bound for the spatial tile. The ordinary free-aware planner remains
+    /// authoritative when `tile_cap` is absent; a selected cap can only shrink its tile.
+    pub fn decode_budgeted_with_cancel_and_tile_cap(
+        &self,
+        z: &Tensor,
+        cancel: &CancelFlag,
+        tile_cap: Option<u32>,
+    ) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
         let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
         let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
         let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
-        match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
+        let mut plan = auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)?;
+        if let Some(cap) = tile_cap {
+            let cap = i32::try_from(cap).map_err(|_| {
+                candle_gen::CandleError::Msg("Wan z16 tile cap exceeds i32".to_owned())
+            })?;
+            let tile = plan
+                .and_then(|config| config.spatial.map(|spatial| spatial.tile_px))
+                .map_or(cap, |existing| existing.min(cap));
+            plan = Some(TilingConfig {
+                spatial: Some(SpatialTiling {
+                    tile_px: tile,
+                    overlap_px: 64,
+                }),
+                temporal: None,
+            });
+        }
+        match plan {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
         }
