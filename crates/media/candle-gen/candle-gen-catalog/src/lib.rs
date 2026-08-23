@@ -125,6 +125,8 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
 pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     let registry = register_providers(ProviderRegistryBuilder::new());
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_boogu::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
@@ -940,14 +942,15 @@ mod preview_advertising {
             dir: "candle-gen-boogu",
             register: candle_gen_boogu::register_providers,
             denoise: Denoise::Shared,
-            // sc-17218's inventory. Base, Turbo's curated/img2img lane, and Edit each drive one
-            // hooked flow-sampler site. Turbo's default route owns a four-step DMD loop and emits
-            // directly at the top of each iteration, before prediction and re-noise. No dark site:
-            // every user-reachable denoise lane now has a live sink seam.
+            // sc-17218's resident inventory plus sc-20787's exact staged twin. Base, Turbo's
+            // curated/img2img lane, and Edit each drive one hooked flow-sampler site per residency
+            // path. Turbo's default route owns one direct four-step DMD loop per residency path and
+            // emits before prediction and re-noise. No dark site: every user-reachable denoise lane
+            // has a live sink seam.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
-                hooked: 3,
-                direct: 1,
+                hooked: 6,
+                direct: 2,
                 dark: &[],
             }],
         },
@@ -3369,6 +3372,11 @@ mod preview_advertising {
     }
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
+        MemoryRouteCrate {
+            dir: "candle-gen-boogu",
+            register_providers: candle_gen_boogu::register_providers,
+            register_surfaces: Some(candle_gen_boogu::register_memory_contract_surfaces),
+        },
         MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,

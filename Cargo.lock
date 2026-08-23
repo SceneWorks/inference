@@ -491,6 +491,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
