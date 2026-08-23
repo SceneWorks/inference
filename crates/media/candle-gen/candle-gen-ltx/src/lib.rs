@@ -387,8 +387,9 @@ impl Pipeline {
         Ok(vae.encode(&video)?)
     }
 
-    /// Resolve and VAE-encode replace-latent inputs: a `Reference` is I2V at frame zero; explicit
-    /// keyframes cover FLF and arbitrary latent-frame placement.
+    /// Resolve and VAE-encode replace-latent inputs: a `Reference` is I2V at frame zero; the
+    /// replace_person `MultiReference` carrier is an ordered 1–4 contact sheet at frame zero; and
+    /// explicit keyframes cover FLF and arbitrary latent-frame placement.
     fn build_keyframes(
         &self,
         req: &GenerationRequest,
@@ -424,6 +425,20 @@ impl Pipeline {
                     frame_idx: Self::latent_index(*frame_idx, latent_frames, "keyframe")?,
                     strength: *strength,
                 }),
+                Conditioning::MultiReference { images } => {
+                    // SC-20776: the LTX IC-LoRA has one image-latent identity carrier. Compose
+                    // all ordered references before encoding so the public 1–4 surface does not
+                    // collapse to the first character on Candle.
+                    let composite = conditioning::compose_ordered_character_references(
+                        images, req.width, req.height,
+                    )
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                    out.push(EncodedKeyframe {
+                        latent: self.encode_image(vae, &composite, width, height)?,
+                        frame_idx: 0,
+                        strength: 1.0,
+                    });
+                }
                 _ => {}
             }
         }
@@ -924,11 +939,20 @@ impl Generator for LtxGenerator {
             Ok(())
         };
         let mut reference_count = 0usize;
+        let mut multi_references: Option<&[Image]> = None;
         let mut control_clip_count = 0usize;
         let mut appended_frames = 0usize;
         for entry in &req.conditioning {
             match entry {
                 Conditioning::Reference { .. } => reference_count += 1,
+                Conditioning::MultiReference { images } => {
+                    if multi_references.replace(images.as_slice()).is_some() {
+                        return Err(gen_core::Error::Msg(
+                            "ltx: replace_person accepts exactly one ordered MultiReference carrier"
+                                .into(),
+                        ));
+                    }
+                }
                 Conditioning::Keyframe { frame_idx, .. } => resolve_idx(*frame_idx, "keyframe")?,
                 Conditioning::VideoClip {
                     frames, frame_idx, ..
@@ -957,6 +981,43 @@ impl Generator for LtxGenerator {
             return Err(gen_core::Error::Msg(
                 "ltx: exactly one ControlClip can be applied per request".into(),
             ));
+        }
+        let replace_person = control_clip_count == 1 || multi_references.is_some();
+        if replace_person {
+            if control_clip_count != 1 {
+                return Err(gen_core::Error::Msg(
+                    "ltx: replace_person requires exactly one ControlClip".into(),
+                ));
+            }
+            let Some(images) = multi_references else {
+                return Err(gen_core::Error::Msg(
+                    "ltx: replace_person requires exactly one ordered MultiReference carrier"
+                        .into(),
+                ));
+            };
+            if reference_count != 0
+                || req.conditioning.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        Conditioning::Keyframe { .. } | Conditioning::VideoClip { .. }
+                    )
+                })
+            {
+                return Err(gen_core::Error::Msg(
+                    "ltx: replace_person cannot be mixed with Reference, Keyframe, or VideoClip conditioning"
+                        .into(),
+                ));
+            }
+            conditioning::compose_ordered_character_references(images, req.width, req.height)
+                .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+            if let Some(control) = req.control_clip() {
+                if control.start_frame != 0 {
+                    return Err(gen_core::Error::Msg(format!(
+                        "ltx: replace_person ControlClip must start at latent frame 0 (got {})",
+                        control.start_frame
+                    )));
+                }
+            }
         }
         let tokens = (t_lat + appended_frames) * h_lat * w_lat;
         let max_tokens = config::max_latent_tokens();
@@ -1027,7 +1088,7 @@ impl Generator for LtxGenerator {
 }
 
 /// LTX-2.3 distilled video descriptor — two-stage rectified-flow (no CFG / negative prompt;
-/// guidance is distilled in) with image/keyframe/IC-LoRA clip conditioning. The denoise step count is
+/// guidance is distilled in) with image/keyframe/ordered-replace-person/IC-LoRA clip conditioning. The denoise step count is
 /// FIXED at [`NATIVE_STEPS`] (the baked
 /// `STAGE1_SIGMAS` schedule); stage two always runs its fixed three-step `STAGE2_SIGMAS` refinement.
 /// An explicit non-native `req.steps` is rejected in `validate` rather than silently ignored (sc-9027 /
@@ -1046,6 +1107,7 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             conditioning: vec![
                 ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
                 ConditioningKind::Keyframe,
                 ConditioningKind::VideoClip,
                 ConditioningKind::ControlClip,
@@ -1643,6 +1705,7 @@ mod tests {
             d.capabilities.conditioning,
             [
                 ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
                 ConditioningKind::Keyframe,
                 ConditioningKind::VideoClip,
                 ConditioningKind::ControlClip,
@@ -1710,13 +1773,18 @@ mod tests {
                     strength: 0.75,
                 },
             ],
-            vec![Conditioning::ControlClip {
-                frames: vec![image.clone()],
-                mask: vec![mask.clone()],
-                masking_strength: 0.9,
-                start_frame: 0,
-                mode: gen_core::ReplacementMode::FaceOnly,
-            }],
+            vec![
+                Conditioning::ControlClip {
+                    frames: vec![image.clone()],
+                    mask: vec![mask.clone()],
+                    masking_strength: 0.9,
+                    start_frame: 0,
+                    mode: gen_core::ReplacementMode::FaceOnly,
+                },
+                Conditioning::MultiReference {
+                    images: vec![image.clone(), image.clone(), image.clone(), image.clone()],
+                },
+            ],
         ] {
             assert!(generator
                 .validate(&GenerationRequest {
@@ -1724,6 +1792,28 @@ mod tests {
                     ..base.clone()
                 })
                 .is_ok());
+        }
+        for reference_count in 1..=4 {
+            assert!(
+                generator
+                    .validate(&GenerationRequest {
+                        conditioning: vec![
+                            Conditioning::ControlClip {
+                                frames: vec![image.clone()],
+                                mask: vec![mask.clone()],
+                                masking_strength: 0.9,
+                                start_frame: 0,
+                                mode: gen_core::ReplacementMode::FaceOnly,
+                            },
+                            Conditioning::MultiReference {
+                                images: vec![image.clone(); reference_count],
+                            },
+                        ],
+                        ..base.clone()
+                    })
+                    .is_ok(),
+                "{reference_count} ordered references must be admitted"
+            );
         }
     }
 
@@ -1773,16 +1863,16 @@ mod tests {
                 ..base.clone()
             },
             GenerationRequest {
-                conditioning: vec![control.clone(), control],
+                conditioning: vec![control.clone(), control.clone()],
                 ..base.clone()
             },
             GenerationRequest {
                 sampler: Some("heun".into()),
                 conditioning: vec![Conditioning::Reference {
-                    image,
+                    image: image.clone(),
                     strength: Some(1.0),
                 }],
-                ..base
+                ..base.clone()
             },
         ];
         for request in cases {
@@ -1790,6 +1880,38 @@ mod tests {
                 generator.validate(&request).is_err(),
                 "must reject {request:?}"
             );
+        }
+
+        // SC-20776: all malformed/crossed replace-person requests fail in `validate`, before the
+        // lazy provider ever constructs VAE/Gemma/AvDiT components.
+        for conditioning in [
+            vec![control.clone()],
+            vec![Conditioning::MultiReference {
+                images: vec![image.clone()],
+            }],
+            vec![
+                control.clone(),
+                Conditioning::Reference {
+                    image: image.clone(),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![image.clone()],
+                },
+            ],
+            vec![
+                control.clone(),
+                Conditioning::MultiReference {
+                    images: vec![image.clone(); 5],
+                },
+            ],
+        ] {
+            assert!(generator
+                .validate(&GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                })
+                .is_err());
         }
     }
 

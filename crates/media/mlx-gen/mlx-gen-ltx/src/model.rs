@@ -236,10 +236,13 @@ pub fn descriptor() -> ModelDescriptor {
             // produced (sc-2684). Q4/Q8-of-everything is a sibling slice.
             supports_negative_prompt: false,
             // Reference = single-image I2V (sc-2685); Keyframe = first_last_frame / multi-keyframe
-            // (replace-latent, epic 3040); VideoClip = extend_clip / video_bridge (IC-LoRA
-            // keyframe-append — requires an IC-LoRA adapter via `spec.adapters`).
+            // (replace-latent, epic 3040); `MultiReference` is the ordered 1–4 identity carrier
+            // for replace_person (composited to the provider-native one-latent IC-LoRA input);
+            // VideoClip = extend_clip / video_bridge (IC-LoRA keyframe-append — requires an
+            // IC-LoRA adapter via `spec.adapters`).
             conditioning: vec![
                 ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
                 ConditioningKind::Keyframe,
                 ConditioningKind::VideoClip,
                 ConditioningKind::ControlClip,
@@ -910,6 +913,24 @@ impl Ltx {
             mlx_rs::transforms::eval([&s1, &s2])?;
             out.push((s1, s2, IMAGE_FRAME_IDX, strength));
         }
+        if let Some(images) = req.conditioning.iter().find_map(|entry| match entry {
+            Conditioning::MultiReference { images } => Some(images.as_slice()),
+            _ => None,
+        }) {
+            // SC-20776: LTX's native IC-LoRA has exactly one frame-zero image-latent carrier.
+            // Keep every ordered identity reference physically present by composing the closed
+            // 1–4 surface before either VAE encode; do not accept it merely in the descriptor.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let composite = crate::conditioning::compose_ordered_character_references(
+                images, req.width, req.height,
+            )?;
+            let s1 = self.encode_conditioning(&composite, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(&composite, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, IMAGE_FRAME_IDX, 1.0));
+        }
         for kf in req.keyframes() {
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
@@ -1172,9 +1193,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         Ok(())
     };
 
-    // Apply-or-reject at the weight-free boundary. The render path consumes one Reference and one
-    // ControlClip; accepting more here would silently discard later entries after the ~24 GB staged
-    // text phase. Clip emptiness, mask parity, and target-grid bounds are equally request-only facts.
+    // Apply-or-reject at the weight-free boundary. Plain I2V consumes one `Reference`; the closed
+    // replace_person composite is exactly one ControlClip + one 1–4 image MultiReference carrier.
+    // Anything crossed is refused before the ~24 GB staged text phase, not silently discarded.
     let reference_count = req
         .conditioning
         .iter()
@@ -1183,6 +1204,19 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if reference_count > 1 {
         return Err(Error::Msg(
             "ltx_2_3: multiple reference images are not supported (single-image I2V only)".into(),
+        ));
+    }
+    let multi_references: Vec<&[Image]> = req
+        .conditioning
+        .iter()
+        .filter_map(|c| match c {
+            Conditioning::MultiReference { images } => Some(images.as_slice()),
+            _ => None,
+        })
+        .collect();
+    if multi_references.len() > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: replace_person accepts exactly one ordered MultiReference carrier".into(),
         ));
     }
     let control_clip_count = req
@@ -1194,6 +1228,36 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         return Err(Error::Msg(
             "ltx_2_3: at most one ControlClip can be applied per request".into(),
         ));
+    }
+    let replace_person = control_clip_count == 1 || !multi_references.is_empty();
+    if replace_person {
+        if control_clip_count != 1 {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person requires exactly one ControlClip".into(),
+            ));
+        }
+        let Some(images) = multi_references.first().copied() else {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person requires exactly one ordered MultiReference carrier"
+                    .into(),
+            ));
+        };
+        if reference_count != 0
+            || req.conditioning.iter().any(|c| {
+                matches!(
+                    c,
+                    Conditioning::Keyframe { .. } | Conditioning::VideoClip { .. }
+                )
+            })
+        {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person cannot be mixed with Reference, Keyframe, or VideoClip conditioning"
+                    .into(),
+            ));
+        }
+        // This also verifies every RGB buffer and dimensions before model construction. The render
+        // recomputes the same deterministic contact sheet for the VAE input.
+        crate::conditioning::compose_ordered_character_references(images, req.width, req.height)?;
     }
     // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
     // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
@@ -1258,6 +1322,11 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                     )));
                 }
                 resolve_latent_index("replace_person", *start_frame)?;
+                if *start_frame != 0 {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_3: replace_person ControlClip must start at latent frame 0 (got {start_frame})"
+                    )));
+                }
                 check_strength("control clip masking", *masking_strength)?;
             }
             _ => {}
@@ -2000,15 +2069,63 @@ mod tests {
         let err = validate_request(&caps, &two).unwrap_err().to_string();
         assert!(err.contains("multiple reference images"), "{err}");
 
-        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
-        // than silently discard the second after text encoding.
         let control = Conditioning::ControlClip {
             frames: vec![img.clone()],
-            mask: vec![img],
+            mask: vec![img.clone()],
             masking_strength: 0.8,
             start_frame: 0,
             mode: mlx_gen::ReplacementMode::FaceOnly,
         };
+        // The full 1–4 ordered replace-person surface is admitted before weights load.
+        for reference_count in 1..=4 {
+            assert!(validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning: vec![
+                        control.clone(),
+                        Conditioning::MultiReference {
+                            images: vec![img.clone(); reference_count],
+                        },
+                    ],
+                    ..base.clone()
+                }
+            )
+            .is_ok());
+        }
+        for conditioning in [
+            vec![control.clone()],
+            vec![Conditioning::MultiReference {
+                images: vec![img.clone()],
+            }],
+            vec![
+                control.clone(),
+                Conditioning::Reference {
+                    image: img.clone(),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![img.clone()],
+                },
+            ],
+            vec![
+                control.clone(),
+                Conditioning::MultiReference {
+                    images: vec![img.clone(); 5],
+                },
+            ],
+        ] {
+            assert!(validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                }
+            )
+            .is_err());
+        }
+
+        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
+        // than silently discard the second after text encoding.
         let err = validate_request(
             &caps,
             &GenerationRequest {
@@ -2068,29 +2185,42 @@ mod tests {
         }]);
         assert!(err.contains("clip latent frame index -8"), "{err}");
 
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![],
-            mask: vec![],
-            masking_strength: 1.0,
-            start_frame: 0,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![],
+                mask: vec![],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference {
+                images: vec![img.clone()],
+            },
+        ]);
         assert!(err.contains("control clip is empty"), "{err}");
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![img.clone()],
-            mask: vec![],
-            masking_strength: 1.0,
-            start_frame: 0,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![img.clone()],
+                mask: vec![],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference {
+                images: vec![img.clone()],
+            },
+        ]);
         assert!(err.contains("frame count 1 != mask count 0"), "{err}");
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![img.clone()],
-            mask: vec![img],
-            masking_strength: 1.0,
-            start_frame: 7,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![img.clone()],
+                mask: vec![img.clone()],
+                masking_strength: 1.0,
+                start_frame: 7,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference { images: vec![img] },
+        ]);
         assert!(err.contains("replace_person latent frame index 7"), "{err}");
     }
 
