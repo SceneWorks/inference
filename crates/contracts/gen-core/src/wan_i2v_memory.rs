@@ -14,12 +14,12 @@ use crate::{
     AdapterKind, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
     MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategySupport, MoeExpert, OffloadPolicy, Precision, Quant,
-    ResidentRequestMemory, WeightsSource,
+    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemorySelection,
+    MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
+    MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
 
-pub const RECEIPT_VERSION: &str = "wan-i2v-structural-v1";
+pub const RECEIPT_VERSION: &str = "wan-i2v-structural-v2";
 pub const LIGHTNING_REPOSITORY: &str = "lightx2v/Wan2.2-Lightning";
 pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
@@ -773,16 +773,18 @@ fn adapter_receipts(
                 adapter.path.display()
             )));
         }
-        if packed
-            && crate::weightsmeta::keys_contain_loha(
-                headers.iter().map(|header| header.name.as_str()),
-            )
-        {
+        let has_lokr_keys = crate::weightsmeta::keys_contain_lokr(
+            headers.iter().map(|header| header.name.as_str()),
+        );
+        let has_loha_keys = crate::weightsmeta::keys_contain_loha(
+            headers.iter().map(|header| header.name.as_str()),
+        );
+        if packed && has_loha_keys {
             return Err(crate::Error::Unsupported(
                 "LoHa cannot be admitted on a packed Wan q4/q8 tier; select bf16".to_owned(),
             ));
         }
-        let source_bytes = headers.into_iter().try_fold(0_u64, |sum, header| {
+        let source_bytes = headers.iter().try_fold(0_u64, |sum, header| {
             sum.checked_add(header.data_bytes)
                 .ok_or_else(|| crate::Error::Msg("Wan adapter byte total overflow".to_owned()))
         })?;
@@ -816,11 +818,16 @@ fn adapter_receipts(
         let digest = sha256_file(&adapter.path)?;
         let kind = if lightning_role(&adapter.path).is_some_and(|(_, exact)| exact) {
             "lightning_lora"
+        } else if adapter.kind == AdapterKind::Lokr || has_lokr_keys {
+            "lokr"
+        } else if has_loha_keys {
+            // Wan's execution adapters classify third-party LyCORIS LoHa from `hada_*` tensor
+            // keys because the shared AdapterKind predates LoHa and has no LoHa variant. The
+            // physical receipt must use that same classification rather than relabeling an
+            // accepted dense LoHa file as LoRA.
+            "loha"
         } else {
-            match adapter.kind {
-                AdapterKind::Lora => "lora",
-                AdapterKind::Lokr => "lokr",
-            }
+            "lora"
         };
         let expert = match adapter.moe_expert {
             None => "shared",
@@ -1299,18 +1306,69 @@ pub fn validate_request(
     Ok(())
 }
 
-pub fn request_evidence_revision(
+fn update_optional_u32(hash: &mut Sha256, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_le_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+/// Stable digest of the complete selected execution carrier.
+///
+/// Keep every field explicit: `None` and `Some(0)` are distinct, and fields not currently supported
+/// by Wan remain identity-bearing so a future contract cannot add one without silently reusing an
+/// older receipt format.
+fn selection_receipt_digest(selection: &MemorySelection) -> String {
+    let parameters = selection.parameters;
+    let mut hash = Sha256::new();
+    hash.update(b"wan-i2v-selection-v1");
+    hash.update([selection.strategy as u8]);
+    update_optional_u32(&mut hash, parameters.decode_tile_edge);
+    update_optional_u32(&mut hash, parameters.decode_overlap);
+    update_optional_u32(&mut hash, parameters.attention_chunk_size);
+    update_optional_u32(&mut hash, parameters.transformer_window_size);
+    match parameters.transformer_window_component {
+        Some(component) => {
+            hash.update([1]);
+            hash.update([component as u8]);
+        }
+        None => hash.update([0]),
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn validate_selection(
+    prepared: &PreparedWanI2vMemory,
+    selection: &MemorySelection,
+) -> crate::Result<()> {
+    if selection.tier != prepared.tier {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: selected tier does not match the sealed physical tier",
+            prepared.route.provider_id()
+        )));
+    }
+    prepared.contract.validate_selection(selection)
+}
+
+fn request_evidence_revision_for_selection(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
+    selection: &MemorySelection,
 ) -> crate::Result<String> {
     validate_request(prepared, request)?;
+    validate_selection(prepared, selection)?;
     let image = reference(request)?;
+    let selection_receipt = selection_receipt_digest(selection);
     let mut hash = Sha256::new();
     hash.update(RECEIPT_VERSION.as_bytes());
     hash.update(prepared.artifact_identity.as_bytes());
     hash.update(prepared.adapter_identity.as_bytes());
     hash.update(prepared.backend.key().as_bytes());
     hash.update(prepared.route.provider_id().as_bytes());
+    hash.update(selection_receipt.as_bytes());
     hash.update(request.width.to_le_bytes());
     hash.update(request.height.to_le_bytes());
     hash.update(request.frames.unwrap().to_le_bytes());
@@ -1332,7 +1390,7 @@ pub fn request_evidence_revision(
     hash.update(image.height.to_le_bytes());
     hash.update(Sha256::digest(&image.pixels));
     Ok(format!(
-        "{RECEIPT_VERSION}:{}:{:x}",
+        "{RECEIPT_VERSION}:{}:{selection_receipt}:{:x}",
         prepared.artifact_identity,
         hash.finalize()
     ))
@@ -1344,7 +1402,11 @@ pub fn validate_context(
 ) -> crate::Result<()> {
     prepared.ensure_unchanged()?;
     let geometry = context.geometry;
-    let prefix = format!("{RECEIPT_VERSION}:{}:", prepared.artifact_identity);
+    let selection_receipt = selection_receipt_digest(&context.selection);
+    let prefix = format!(
+        "{RECEIPT_VERSION}:{}:{selection_receipt}:",
+        prepared.artifact_identity
+    );
     let rate_ok = prepared.route.accepts_rate(
         if prepared.route == WanI2vRoute::I2v14b {
             16
@@ -1385,6 +1447,86 @@ pub fn validate_context(
         MemorySafetyDecision::Accept => Ok(()),
         MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
     }
+}
+
+/// Reconstruct the exact selection carried by an executing request and verify that no request
+/// control was added, dropped, or relabeled after admission.
+pub fn selection_from_request(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<MemorySelection> {
+    let memory = request.memory.ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "{}: admitted Wan I2V request is missing its explicit memory carrier",
+            prepared.route.provider_id()
+        ))
+    })?;
+    let strategy = if memory.stream_transformer_blocks {
+        MemoryStrategy::BoundedTransformerResidency
+    } else if memory.chunk_attention {
+        MemoryStrategy::BoundedAttention
+    } else if memory.tile_vae_decode {
+        MemoryStrategy::BoundedDecode
+    } else if memory.stage_residency {
+        MemoryStrategy::StagedResidency
+    } else {
+        MemoryStrategy::Resident
+    };
+    let selection = MemorySelection {
+        strategy,
+        parameters: MemoryStrategyParameters {
+            decode_tile_edge: memory.decode_tile_edge,
+            decode_overlap: memory.decode_overlap,
+            attention_chunk_size: memory.attention_chunk_size,
+            transformer_window_size: memory.transformer_window_size,
+            transformer_window_component: memory.transformer_window_component,
+        },
+        tier: prepared.tier,
+    };
+    validate_selection(prepared, &selection)?;
+    if prepared.contract.generation_memory(&selection) != Some(memory) {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request memory controls do not match the selected Wan I2V rung",
+            prepared.route.provider_id()
+        )));
+    }
+    Ok(selection)
+}
+
+/// Provider-facing receipt minting after admission has installed the selected memory carrier.
+/// Retaining this two-argument surface keeps paired callers source-compatible while making the
+/// request's exact carrier authoritative for strategy/parameter identity.
+pub fn request_evidence_revision(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<String> {
+    let selection = selection_from_request(prepared, request)?;
+    request_evidence_revision_for_selection(prepared, request, &selection)
+}
+
+/// Configure-boundary validation: the request must carry the same exact rung/parameters as the
+/// admitted context, and the full selection-bound request receipt must still match byte-for-byte.
+pub fn validate_request_evidence(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+    admitted_selection: &MemorySelection,
+    admitted_evidence: &str,
+) -> crate::Result<String> {
+    let request_selection = selection_from_request(prepared, request)?;
+    if request_selection != *admitted_selection {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request rung/parameters crossed after admission",
+            prepared.route.provider_id()
+        )));
+    }
+    let actual = request_evidence_revision_for_selection(prepared, request, admitted_selection)?;
+    if actual != admitted_evidence {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: request axes crossed after admission",
+            prepared.route.provider_id()
+        )));
+    }
+    Ok(actual)
 }
 
 pub fn geometry_from_request(request: &GenerationRequest) -> MemoryGeometry {
@@ -1698,21 +1840,77 @@ mod tests {
         }
     }
 
+    fn selection(prepared: &PreparedWanI2vMemory, strategy: MemoryStrategy) -> MemorySelection {
+        MemorySelection {
+            strategy,
+            parameters: if strategy == MemoryStrategy::BoundedDecode {
+                MemoryStrategyParameters {
+                    decode_tile_edge: Some(192),
+                    decode_overlap: Some(64),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
+            tier: prepared.tier,
+        }
+    }
+
+    fn context(
+        prepared: &PreparedWanI2vMemory,
+        request: &GenerationRequest,
+        selection: MemorySelection,
+        evidence_revision: String,
+    ) -> MemoryRunContext {
+        MemoryRunContext {
+            selection,
+            optimization_authority: if selection.strategy.is_optimized() {
+                crate::MemoryOptimizationAuthority::Estimated
+            } else {
+                crate::MemoryOptimizationAuthority::Resident
+            },
+            calibration_abi: crate::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: String::new(),
+            load_shape: prepared.contract.load_shape,
+            mode: crate::MemoryMode::Other("image_to_video".to_owned()),
+            has_reference: true,
+            use_pid: false,
+            has_phases: false,
+            geometry: geometry_from_request(request),
+            overlay: Some(prepared.adapter_identity.clone()),
+            budget: crate::MemoryBudget {
+                total_bytes: u64::MAX,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1,
+            cache_state: crate::MemoryCacheState::Cold,
+            evidence_revision,
+        }
+    }
+
     #[test]
     fn request_identity_binds_reference_geometry_rate_seed_schedule_and_singular_carrier() {
         let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
         let prepared =
             PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
-        let baseline = request_evidence_revision(&prepared, &request(WanI2vRoute::Ti2v5b)).unwrap();
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let baseline = request_evidence_revision_for_selection(
+            &prepared,
+            &request(WanI2vRoute::Ti2v5b),
+            &resident,
+        )
+        .unwrap();
         let mut crossed = request(WanI2vRoute::Ti2v5b);
         crossed.seed = Some(18);
         assert_ne!(
             baseline,
-            request_evidence_revision(&prepared, &crossed).unwrap()
+            request_evidence_revision_for_selection(&prepared, &crossed, &resident).unwrap()
         );
         let mut crossed = request(WanI2vRoute::Ti2v5b);
         crossed.conditioning.push(crossed.conditioning[0].clone());
-        assert!(request_evidence_revision(&prepared, &crossed).is_err());
+        assert!(request_evidence_revision_for_selection(&prepared, &crossed, &resident).is_err());
         for (width, height) in [(832, 480), (1280, 704), (704, 1280)] {
             let mut accepted = request(WanI2vRoute::Ti2v5b);
             (accepted.width, accepted.height) = (width, height);
@@ -1721,6 +1919,104 @@ mod tests {
         let mut off_menu = request(WanI2vRoute::Ti2v5b);
         (off_menu.width, off_menu.height) = (480, 832);
         assert!(validate_request(&prepared, &off_menu).is_err());
+    }
+
+    #[test]
+    fn selection_receipt_binds_strategy_and_every_parameter_field() {
+        let tier = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        };
+        let baseline = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier,
+        };
+        let mut variants = Vec::new();
+        let mut changed = baseline;
+        changed.strategy = MemoryStrategy::StagedResidency;
+        variants.push(changed);
+        let setters: &[fn(&mut MemoryStrategyParameters)] = &[
+            |parameters| parameters.decode_tile_edge = Some(192),
+            |parameters| parameters.decode_overlap = Some(64),
+            |parameters| parameters.attention_chunk_size = Some(1024),
+            |parameters| parameters.transformer_window_size = Some(2),
+            |parameters| {
+                parameters.transformer_window_component =
+                    Some(crate::TransformerComponent::TextEncoder)
+            },
+        ];
+        for setter in setters {
+            let mut changed = baseline;
+            setter(&mut changed.parameters);
+            variants.push(changed);
+        }
+        let baseline_digest = selection_receipt_digest(&baseline);
+        let digests = variants
+            .iter()
+            .map(selection_receipt_digest)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(digests.len(), variants.len());
+        assert!(digests.iter().all(|digest| digest != &baseline_digest));
+    }
+
+    #[test]
+    fn provider_and_configure_boundaries_reject_crossed_strategy_or_decode_parameters() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let request = request(WanI2vRoute::Ti2v5b);
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let resident_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &resident).unwrap();
+        let resident_context = context(&prepared, &request, resident, resident_evidence.clone());
+        assert!(validate_context(&prepared, &resident_context).is_ok());
+
+        let staged = selection(&prepared, MemoryStrategy::StagedResidency);
+        let mut crossed_context = resident_context.clone();
+        crossed_context.selection = staged;
+        crossed_context.optimization_authority = crate::MemoryOptimizationAuthority::Estimated;
+        assert!(validate_context(&prepared, &crossed_context).is_err());
+
+        let staged_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &staged).unwrap();
+        let staged_context = context(&prepared, &request, staged, staged_evidence.clone());
+        assert!(validate_context(&prepared, &staged_context).is_ok());
+        let mut staged_request = request.clone();
+        staged_request.memory = prepared.contract.generation_memory(&staged);
+        assert_eq!(
+            validate_request_evidence(&prepared, &staged_request, &staged, &staged_evidence,)
+                .unwrap(),
+            staged_evidence
+        );
+
+        let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+        let bounded_evidence =
+            request_evidence_revision_for_selection(&prepared, &request, &bounded).unwrap();
+        let mut crossed_parameters = bounded;
+        crossed_parameters.parameters.decode_tile_edge = Some(256);
+        let mut crossed_context = context(
+            &prepared,
+            &request,
+            crossed_parameters,
+            bounded_evidence.clone(),
+        );
+        assert!(validate_context(&prepared, &crossed_context).is_err());
+        crossed_context.evidence_revision =
+            request_evidence_revision_for_selection(&prepared, &request, &crossed_parameters)
+                .unwrap();
+        assert!(validate_context(&prepared, &crossed_context).is_ok());
+
+        let mut crossed_request = request;
+        crossed_request.memory = prepared.contract.generation_memory(&crossed_parameters);
+        assert!(validate_request_evidence(
+            &prepared,
+            &crossed_request,
+            &bounded,
+            &bounded_evidence,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1764,6 +2060,17 @@ mod tests {
         );
 
         let loha = make_adapter(tmp.path(), "loha.safetensors", "block.hada_w1_a");
+        let (_dense_loha_tmp, dense_loha_fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);
+        let mut dense_loha =
+            LoadSpec::new(dense_loha_fixture.weights.clone()).with_resolved_route("wan2_2_i2v_14b");
+        dense_loha.adapters = vec![AdapterSpec::new(loha.clone(), 1.0, AdapterKind::Lora)];
+        prepare_load_spec(&mut dense_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
+        let dense_loha =
+            PreparedWanI2vMemory::prepare(&dense_loha, WanI2vBackend::Mlx, "wan2_2_i2v_14b")
+                .unwrap();
+        assert_eq!(dense_loha.adapters[0].kind, "loha");
+        assert_eq!(dense_loha.adapters[0].persistent_bytes, 0);
+
         let (_tmp, packed_loha_fixture) = mlx_fixture(WanI2vRoute::I2v14b, Some(Quant::Q4));
         let mut packed_loha = LoadSpec::new(packed_loha_fixture.weights.clone())
             .with_resolved_route("wan2_2_i2v_14b");

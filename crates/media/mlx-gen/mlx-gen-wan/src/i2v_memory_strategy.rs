@@ -126,6 +126,7 @@ pub fn safety_check(
 struct WanI2vRequestScope {
     core: mlx_gen::request_scope::MlxRequestScopeCore,
     prepared: PreparedWanI2vMemory,
+    selection: gen_core::MemorySelection,
     evidence_revision: String,
     armed: bool,
 }
@@ -140,13 +141,12 @@ impl Drop for WanI2vRequestScope {
 
 impl MemoryRequestScope for WanI2vRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        let actual = request_evidence_revision(&self.prepared, request)?;
-        if actual != self.evidence_revision {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: request axes crossed after admission",
-                self.prepared.route.provider_id()
-            )));
-        }
+        let actual = gen_core::wan_i2v_memory::validate_request_evidence(
+            &self.prepared,
+            request,
+            &self.selection,
+            &self.evidence_revision,
+        )?;
         self.core.configure_request(request)?;
         ACTIVE_EVIDENCE.with(|active| {
             if active.borrow().is_some() {
@@ -224,6 +224,7 @@ pub fn begin_request<'a>(
     Ok(Some(Box::new(WanI2vRequestScope {
         core: mlx_gen::request_scope::MlxRequestScopeCore::new(config),
         prepared: prepared.clone(),
+        selection: context.selection,
         evidence_revision: context.evidence_revision.clone(),
         armed: false,
     })))
