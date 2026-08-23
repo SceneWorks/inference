@@ -25,6 +25,96 @@ pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
 pub const DECODE_TILE_EDGES: &[u32] = &[192, 256, 384];
 pub const DECODE_OVERLAPS: &[u32] = &[64];
+/// Immutable source receipt carried beside assembled Wan-VACE artifacts.  VACE repositories ship
+/// the control transformer only; the UMT5, z16 VAE and tokenizer are separate upstream sources.
+pub const VACE_SOURCE_RECEIPT_FILE: &str = "wan-vace-source-receipt.json";
+const VACE_SOURCE_RECEIPT_VERSION: &str = "wan-vace-source-receipt-v1";
+const WAN21_T2V_REPOSITORY: &str = "Wan-AI/Wan2.1-T2V-14B-Diffusers";
+const WAN21_T2V_REVISION: &str = "38ec498cb3208fb688890f8cc7e94ede2cbd7f68";
+const UMT5_REPOSITORY: &str = "google/umt5-xxl";
+const UMT5_REVISION: &str = "66cb9e7e85526fe440a945569e42c72fb6cbc0ad";
+
+fn vace_source_receipt(backend: WanI2vBackend) -> serde_json::Value {
+    let (transformer_repository, transformer_revision) = match backend {
+        WanI2vBackend::Mlx => (
+            "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+            "ec4d2cb062b548996b179d493fdd05340de702a1",
+        ),
+        WanI2vBackend::Candle => (
+            "Wan-AI/Wan2.1-VACE-14B-diffusers",
+            "db79b90c60bbb45ceec9e41b9d5a4df934538ac4",
+        ),
+    };
+    serde_json::json!({
+        "version": VACE_SOURCE_RECEIPT_VERSION,
+        "backend": backend.key(),
+        "components": [
+            {
+                "component": "transformer",
+                "repository": transformer_repository,
+                "revision": transformer_revision,
+                "sourcePath": "transformer"
+            },
+            {
+                "component": "t5_encoder",
+                "repository": WAN21_T2V_REPOSITORY,
+                "revision": WAN21_T2V_REVISION,
+                "sourcePath": "text_encoder"
+            },
+            {
+                "component": "vae",
+                "repository": WAN21_T2V_REPOSITORY,
+                "revision": WAN21_T2V_REVISION,
+                "sourcePath": "vae"
+            },
+            {
+                "component": "tokenizer",
+                "repository": UMT5_REPOSITORY,
+                "revision": UMT5_REVISION,
+                "sourcePath": "tokenizer.json"
+            }
+        ]
+    })
+}
+
+/// Materialize the fixed provenance receipt once when the worker assembles or resolves the
+/// artifact.  A pre-existing divergent receipt is a supply-chain error, never a value to replace.
+pub fn ensure_wan_vace_source_receipt(root: &Path, backend: WanI2vBackend) -> crate::Result<()> {
+    let expected = serde_json::to_vec_pretty(&vace_source_receipt(backend)).map_err(|error| {
+        crate::Error::Unsupported(format!("wan_vace: cannot encode source receipt: {error}"))
+    })?;
+    let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+    match std::fs::read(&path) {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err(crate::Error::Unsupported(format!(
+            "wan_vace: immutable source receipt at {} does not match the selected backend",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, expected)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn vace_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crate::Result<String> {
+    let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan_vace: invalid source receipt {}: {error}",
+                path.display()
+            ))
+        })?;
+    if actual != vace_source_receipt(backend) {
+        return Err(crate::Error::Unsupported(format!(
+            "wan_vace: source receipt {} does not name the exact immutable transformer/T5/VAE/tokenizer origins",
+            path.display()
+        )));
+    }
+    sha256_file(&path)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WanI2vRoute {
@@ -255,40 +345,6 @@ fn repository_policy(
             "unsupported-packed-tier",
         ),
     }
-}
-
-fn vace_artifact_revision(root: &Path) -> crate::Result<String> {
-    let tensors = walk_safetensors(root)?;
-    let mut structural = [
-        "transformer/config.json",
-        "text_encoder/config.json",
-        "vae/config.json",
-        "tokenizer/tokenizer.json",
-        "t5_encoder.safetensors",
-        "vae.safetensors",
-        "tokenizer.json",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .filter(|relative| root.join(relative).is_file())
-    .collect::<Vec<_>>();
-    structural.sort();
-    if tensors.is_empty() || structural.is_empty() {
-        return Err(crate::Error::Unsupported(
-            "wan_vace: empty artifact inventory".to_owned(),
-        ));
-    }
-    let mut hash = Sha256::new();
-    hash.update(b"wan-vace-composed-artifact-v1");
-    for relative in tensors {
-        hash.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
-        hash.update(std::fs::metadata(root.join(relative))?.len().to_le_bytes());
-    }
-    for relative in structural {
-        hash.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
-        hash.update(sha256_file(&root.join(relative))?.as_bytes());
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn repo_dir(repository: &str) -> String {
@@ -553,6 +609,7 @@ fn structural_files(
                 PathBuf::from("tokenizer/tokenizer.json"),
             ],
         };
+        files.push(PathBuf::from(VACE_SOURCE_RECEIPT_FILE));
         fn collect_indexes(root: &Path, at: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
             for entry in std::fs::read_dir(at)? {
                 let path = entry?.path();
@@ -1131,6 +1188,7 @@ fn validate_load_spec<'a>(spec: &'a LoadSpec, provider_id: &str) -> crate::Resul
         )));
     }
     crate::reject_unknown_components(spec, &[], provider_id)?;
+    spec.validate_load_shape_declaration()?;
     Ok(root)
 }
 
@@ -1160,7 +1218,7 @@ pub fn prepare_load_spec(
     if route != WanI2vRoute::Vace {
         repository_revision(&root, repository, revision, tier, backend)?;
     } else {
-        vace_artifact_revision(&root)?;
+        vace_source_receipt_revision(&root, backend)?;
     }
     let inventory = match backend {
         WanI2vBackend::Mlx => validate_mlx_inventory(&root, route)?,
@@ -1204,7 +1262,7 @@ impl PreparedWanI2vMemory {
         spec.validate_prepared_file_pins()?;
         let (repository, expected_revision) = repository_policy(backend, route, tier);
         let revision = if route == WanI2vRoute::Vace {
-            vace_artifact_revision(root)?
+            vace_source_receipt_revision(root, backend)?
         } else {
             repository_revision(root, repository, expected_revision, tier, backend)?
         };
@@ -2324,6 +2382,14 @@ mod tests {
         }
         let mut spec = LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route("wan_vace");
         spec.quantize = quant;
+        ensure_wan_vace_source_receipt(
+            match &spec.weights {
+                WeightsSource::Dir(root) => root,
+                _ => unreachable!(),
+            },
+            backend,
+        )
+        .unwrap();
         prepare_load_spec(&mut spec, backend, "wan_vace").unwrap();
         (tmp, spec)
     }
@@ -2396,6 +2462,10 @@ mod tests {
                 let (_tmp, spec) = vace_fixture(backend, quant);
                 let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
                 assert_eq!(prepared.tier.quant, quant);
+                assert_eq!(
+                    prepared.contract.load_shape,
+                    crate::LoadShape::DeferredMaterialization
+                );
                 assert_eq!(prepared.revision.len(), 64);
                 let contract = request_contract(&prepared, &vace_extend_request()).unwrap();
                 for strategy in MemoryStrategy::ALL {
@@ -2427,6 +2497,48 @@ mod tests {
                 assert!(validate_context(&prepared, &staged_context).is_err());
             }
         }
+    }
+
+    #[test]
+    fn vace_lazy_load_shape_is_declared_at_preparation_and_rejects_crossed_reuse() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            let (_tmp, mut spec) = vace_fixture(backend, None);
+            assert_eq!(spec.load_shape, crate::LoadShape::DeferredMaterialization);
+            assert_eq!(
+                spec.load_shape_declaration_result,
+                crate::LoadShapeDeclarationResult::Applied
+            );
+            let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+            assert_eq!(
+                prepared.contract.load_shape,
+                crate::LoadShape::DeferredMaterialization
+            );
+
+            // A warmed provider may reuse only the same declared shape.  Mutating the
+            // cached spec after preparation cannot relabel lazy VACE as eager.
+            spec.load_shape = crate::LoadShape::EagerMaterialization;
+            assert!(PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").is_err());
+        }
+    }
+
+    #[test]
+    fn vace_requires_the_exact_immutable_source_receipt() {
+        let (_tmp, mut spec) = vace_fixture(WanI2vBackend::Mlx, None);
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(root.join(VACE_SOURCE_RECEIPT_FILE)).unwrap();
+        assert!(prepare_load_spec(&mut spec, WanI2vBackend::Mlx, "wan_vace").is_err());
+
+        ensure_wan_vace_source_receipt(&root, WanI2vBackend::Mlx).unwrap();
+        let path = root.join(VACE_SOURCE_RECEIPT_FILE);
+        let mut crossed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        crossed["components"][0]["revision"] =
+            serde_json::json!("0000000000000000000000000000000000000000");
+        std::fs::write(path, serde_json::to_vec(&crossed).unwrap()).unwrap();
+        assert!(prepare_load_spec(&mut spec, WanI2vBackend::Mlx, "wan_vace").is_err());
     }
 
     #[test]
