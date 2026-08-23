@@ -287,6 +287,18 @@ fn dequant_plain_int8_tensorwise_with_evaluation(
 /// same architecture coverage/shape validation and transformer assembly as the published snapshot.
 /// `cfg` comes from the resident base snapshot because the single file has no `config.json`.
 pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
+    normalized_native_weights_with_receipt(dit_file).map(|(weights, _)| weights)
+}
+
+/// [`normalized_native_weights`], additionally returning the logical-weight receipt of the read.
+/// `None` means the file took the bespoke plain-int8 descriptor arm, which is not the codec seam.
+///
+/// Callers that want the receipt take it from here rather than from the process-global slot: the
+/// global's `reset → load → read` window is not atomic, so two observers in one test binary can
+/// clobber each other's observation.
+pub(crate) fn normalized_native_weights_with_receipt(
+    dit_file: &Path,
+) -> Result<(Weights, Option<mlx_gen::gen_core::LogicalWeightReceipt>)> {
     normalized_native_weights_with_materializer(dit_file, |weights| {
         #[cfg(test)]
         run_native_materialize_test_hook(NativeMaterializeTestStage::Before, weights)?;
@@ -331,22 +343,41 @@ fn run_native_materialize_test_hook(
 /// loader consumes only its accessed window under a separate pin guard; eagerly evaluating here
 /// would retain the full DiT and invalidate that implementation's residency bound.
 pub(crate) fn normalized_native_weights_lazy(dit_file: &Path) -> Result<Weights> {
+    normalized_native_weights_lazy_with_receipt(dit_file).map(|(weights, _)| weights)
+}
+
+/// [`normalized_native_weights_lazy`], additionally returning the receipt of the read.
+pub(crate) fn normalized_native_weights_lazy_with_receipt(
+    dit_file: &Path,
+) -> Result<(Weights, Option<mlx_gen::gen_core::LogicalWeightReceipt>)> {
     normalized_native_weights_with_options(dit_file, false, |_| Ok(()))
 }
 
 fn normalized_native_weights_with_materializer(
     dit_file: &Path,
     materialize: impl FnOnce(&Weights) -> Result<()>,
-) -> Result<Weights> {
+) -> Result<(Weights, Option<mlx_gen::gen_core::LogicalWeightReceipt>)> {
     normalized_native_weights_with_options(dit_file, true, materialize)
 }
 
 /// The receipt of the most recent native-file read that went through the mapped logical-weight
 /// reader on this process (sc-20634). Diagnostics only: the loader's correctness does not depend
-/// on it, but SceneWorks' parity checks and this crate's tests read it to prove a dense bf16 file
-/// was consumed through the codec seam and what the codec left resident.
+/// on it, but SceneWorks' parity checks read it to prove a dense bf16 file was consumed through
+/// the codec seam and what the codec left resident.
+///
+/// `reset → load → read` across a process-global slot is not atomic. Anything that observes this
+/// slot — rather than taking the receipt straight off
+/// [`normalized_native_weights_with_receipt`] / [`normalized_native_weights_lazy_with_receipt`],
+/// which is what every in-crate test does — must hold [`RECEIPT_LOCK`] across the whole window, or
+/// a concurrently running observer's reset can clear the observation. That invariant is pinned by
+/// `every_process_global_receipt_observation_is_serialized`.
 static LAST_NATIVE_FILE_RECEIPT: std::sync::Mutex<Option<mlx_gen::gen_core::LogicalWeightReceipt>> =
     std::sync::Mutex::new(None);
+
+/// Serializes the `reset → load → read` window of every observer of the process-global receipt
+/// slot. See [`LAST_NATIVE_FILE_RECEIPT`].
+#[cfg(test)]
+pub(crate) static RECEIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn last_native_file_receipt() -> Option<mlx_gen::gen_core::LogicalWeightReceipt> {
     LAST_NATIVE_FILE_RECEIPT
@@ -384,7 +415,7 @@ fn normalized_native_weights_with_options(
     dit_file: &Path,
     eager: bool,
     materialize: impl FnOnce(&Weights) -> Result<()>,
-) -> Result<Weights> {
+) -> Result<(Weights, Option<mlx_gen::gen_core::LogicalWeightReceipt>)> {
     if native_file_carries_plain_int8_convention(dit_file)? {
         let native =
             dequant_plain_int8_tensorwise_with_evaluation(Weights::from_file(dit_file)?, eager)?;
@@ -393,7 +424,7 @@ fn normalized_native_weights_with_options(
         // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized
         // map while the caller's `PinnedWeightsFile::read_unchanged` guard still spans this function.
         materialize(&remapped)?;
-        return Ok(remapped);
+        return Ok((remapped, None));
     }
 
     // Dense path (sc-20634): the adapter's key mapping + the registered dense-bf16 codec. The plan
@@ -427,8 +458,8 @@ fn normalized_native_weights_with_options(
         // the canonical logical form, so apply it here (lazily, under the caller's pin guard).
         crate::native_remap::normalize_modulation_tables(&mut weights)?;
     }
-    record_native_file_receipt(receipt);
-    Ok(weights)
+    record_native_file_receipt(receipt.clone());
+    Ok((weights, Some(receipt)))
 }
 
 pub fn load_transformer_from_native_file(
@@ -744,8 +775,7 @@ mod tests {
                 ),
             ],
         );
-        reset_native_file_receipt();
-        let normalized = normalized_native_weights(&source).unwrap();
+        let (normalized, receipt) = normalized_native_weights_with_receipt(&source).unwrap();
         let mut keys: Vec<&str> = normalized.keys().collect();
         keys.sort_unstable();
         assert_eq!(
@@ -768,7 +798,7 @@ mod tests {
             mlx_gen::weights::to_f32(normalized.require("img_in.weight").unwrap()).unwrap();
         assert_eq!(weight.as_slice::<f32>(), [0.25, -2.0]);
 
-        let receipt = last_native_file_receipt().expect("the dense path records its receipt");
+        let receipt = receipt.expect("the dense path returns its receipt");
         assert_eq!(
             receipt.mapping_id,
             crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID
@@ -790,15 +820,14 @@ mod tests {
         assert_eq!(receipt.resident_bytes(), 32);
 
         // The deferred (block-stream / bounded) entry keeps payloads lazy and says so.
-        reset_native_file_receipt();
-        let lazy = normalized_native_weights_lazy(&source).unwrap();
+        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&source).unwrap();
         assert_eq!(
             lazy.require("transformer_blocks.0.scale_shift_table")
                 .unwrap()
                 .shape(),
             [6, 2]
         );
-        let receipt = last_native_file_receipt().expect("the deferred path records its receipt");
+        let receipt = receipt.expect("the deferred path returns its receipt");
         assert_eq!(
             receipt.materialization,
             mlx_gen::gen_core::LogicalReadMaterialization::Deferred
@@ -830,8 +859,7 @@ mod tests {
                 ),
             ],
         );
-        reset_native_file_receipt();
-        let error = normalized_native_weights(&fp8)
+        let error = normalized_native_weights_with_receipt(&fp8)
             .err()
             .expect("fp8 must refuse")
             .to_string();
@@ -841,10 +869,7 @@ mod tests {
                 && error.contains("no checkpoint codec is registered"),
             "{error}"
         );
-        assert!(
-            last_native_file_receipt().is_none(),
-            "a refused plan must not leave a receipt behind"
-        );
+        // A refusal returns no receipt at all: there is nothing to leave behind for anyone else.
 
         let foreign = dir.path().join("foreign-native.safetensors");
         write_native_safetensors(
@@ -893,8 +918,8 @@ mod tests {
                 ),
             ],
         );
-        reset_native_file_receipt();
-        let dequantized = normalized_native_weights(&int8).unwrap();
+        let (dequantized, descriptor_receipt) =
+            normalized_native_weights_with_receipt(&int8).unwrap();
         let projection = mlx_gen::weights::to_f32(
             dequantized
                 .require("transformer_blocks.0.attn.to_q.weight")
@@ -903,9 +928,37 @@ mod tests {
         .unwrap();
         assert_eq!(projection.as_slice::<f32>(), [1.0, -1.0]);
         assert!(
-            last_native_file_receipt().is_none(),
+            descriptor_receipt.is_none(),
             "the descriptor arm is not the codec seam yet and must not claim a codec receipt"
         );
+    }
+
+    /// sc-20634 review: `LAST_NATIVE_FILE_RECEIPT` is process-global and its
+    /// `reset → load → read` window is not atomic, so two tests observing it concurrently in this
+    /// binary can clear or overwrite each other's observation. Every in-crate test now takes the
+    /// receipt straight off the read (`*_with_receipt`); anything that still touches the global
+    /// must hold `RECEIPT_LOCK` across the whole window. Pin that so a future test cannot
+    /// reintroduce the race by reaching for `reset_native_file_receipt()` on its own.
+    #[test]
+    fn every_process_global_receipt_observation_is_serialized() {
+        for (file, source) in [
+            ("loader.rs", include_str!("loader.rs")),
+            ("model.rs", include_str!("model.rs")),
+        ] {
+            let body = source
+                .split_once("mod tests {")
+                .map_or(source, |(_, tests)| tests);
+            let resets = body.matches("reset_native_file_receipt()").count();
+            let reads = body.matches("last_native_file_receipt()").count();
+            let guards = body.matches("RECEIPT_LOCK").count();
+            assert!(
+                guards >= resets.max(reads),
+                "{file}: {resets} reset(s) and {reads} read(s) of the process-global receipt but \
+                 only {guards} RECEIPT_LOCK acquisition(s) — every observer must hold the lock \
+                 across its reset → load → read window, or take the receipt from \
+                 `normalized_native_weights_with_receipt` instead"
+            );
+        }
     }
 
     /// Real-weight check of the dense walking-skeleton input (sc-20634): the community
@@ -950,10 +1003,10 @@ mod tests {
             .logical_keys()
             .any(|key| key == "transformer_blocks.0.attn.to_q.weight"));
 
-        reset_native_file_receipt();
-        let lazy = normalized_native_weights_lazy(&dit).expect("deferred read through the seam");
+        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
+            .expect("deferred read through the seam");
         assert!(lazy.get("img_in.weight").is_some());
-        let receipt = last_native_file_receipt().expect("receipt recorded");
+        let receipt = receipt.expect("receipt returned");
         assert_eq!(
             receipt.mapping_id,
             crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID

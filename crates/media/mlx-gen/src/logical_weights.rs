@@ -180,6 +180,20 @@ fn decode(tensor: &LogicalTensorPlan, array: Array) -> Result<Array> {
             )))
         }
     };
+    // Shape before dtype: planning and reading are two separate opens of the file, so a same-key
+    // same-dtype tensor whose SHAPE changed in between would otherwise decode silently and be
+    // handed to a model expecting the planned geometry. The plan's shape is the contract.
+    let planned_shape: Vec<i32> = tensor.shape.iter().map(|dim| *dim as i32).collect();
+    if array.shape() != planned_shape {
+        return Err(Error::Msg(format!(
+            "codec {}: tensor {:?} was planned with shape {:?} but the backend loaded shape {:?}; \
+             the file changed between planning and reading",
+            tensor.codec_id,
+            tensor.physical_key,
+            tensor.shape,
+            array.shape()
+        )));
+    }
     if array.dtype() != expected {
         return Err(Error::Msg(format!(
             "codec {}: tensor {:?} was planned as {} but the backend loaded {:?}",
@@ -580,5 +594,49 @@ mod tests {
             error.to_string().contains("planned as dense-bf16"),
             "{error}"
         );
+    }
+
+    /// sc-20634 review: planning and reading are two separate opens, so a same-key same-dtype
+    /// tensor whose SHAPE changed in between must refuse instead of loading silently. The plan's
+    /// dtype still matches here, so only the shape check can catch it.
+    #[test]
+    fn dense_codec_refuses_a_substituted_shape() {
+        let dir = fixture_dir();
+        let path = dir.path().join("reshaped.safetensors");
+        // On disk: 2 bf16 elements. Planned: the same key, the same dense-bf16 encoding, shape [1].
+        write_safetensors(
+            &path,
+            &[("model.w", "BF16", &[2], vec![0x00, 0x3f, 0x00, 0x40])],
+        );
+        let plan = LogicalWeightPlan {
+            mapping_id: "strip-model-test",
+            tensors: vec![LogicalTensorPlan {
+                logical_key: "w".to_owned(),
+                physical_key: "model.w".to_owned(),
+                encoding: WeightEncoding::DenseBf16,
+                shape: vec![1],
+                source_bytes: 2,
+                codec_id: DENSE_BF16_CODEC.codec_id,
+            }],
+            source_bytes: 2,
+        };
+        let error = read_logical_weights(&path, &plan, LogicalReadMode::Deferred)
+            .err()
+            .expect("a shape substitution must refuse");
+        let error = error.to_string();
+        assert!(
+            error.contains("planned with shape [1]")
+                && error.contains("loaded shape [2]")
+                && error.contains("\"model.w\""),
+            "{error}"
+        );
+
+        // The matching shape is accepted, so the refusal is about the substitution, not the fixture.
+        let mut matching = plan.clone();
+        matching.tensors[0].shape = vec![2];
+        matching.tensors[0].source_bytes = 4;
+        matching.source_bytes = 4;
+        read_logical_weights(&path, &matching, LogicalReadMode::Deferred)
+            .expect("the planned shape loads");
     }
 }

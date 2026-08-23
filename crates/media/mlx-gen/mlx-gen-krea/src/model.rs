@@ -2938,6 +2938,12 @@ mod tests {
              shallow depth of field",
         );
 
+        // The whole-generator entry has no way to hand the receipt back, so this test observes the
+        // process-global slot. `reset → load → read` is not atomic, so hold the lock across all
+        // three (sc-20634 review); `every_process_global_receipt_observation_is_serialized` pins it.
+        let _receipt_guard = crate::loader::RECEIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::loader::reset_native_file_receipt();
         let generator = load_from_native_dit_file(&dit, &base, &[], descriptor())
             .expect("native single-file load through the logical-weight reader");
