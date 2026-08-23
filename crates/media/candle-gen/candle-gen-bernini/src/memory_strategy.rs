@@ -1015,7 +1015,7 @@ pub fn registered_safety_check(
     safety_check(contract, tier(spec), context)
 }
 
-fn validate_request(
+pub(crate) fn validate_request(
     request: &GenerationRequest,
     route: BerniniMemoryRoute,
 ) -> gen_core::Result<Option<String>> {
@@ -1064,7 +1064,7 @@ fn validate_request(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BerniniMemoryRoute {
+pub(crate) enum BerniniMemoryRoute {
     VideoToVideo,
     ReferenceToVideo,
 }
@@ -1204,6 +1204,7 @@ pub fn registered_valid_fixtures(
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
+            load_spec: fixture.load_spec.clone(),
         },
     ])
 }

@@ -696,7 +696,12 @@ impl Generator for Bernini {
         // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
         // surface share the provider but retain separate, fail-closed request identities.
         if req.frames == Some(1) || req.memory.is_some() {
-            crate::memory_strategy::validate_request(req)?;
+            let route = if req.video_mode.as_deref() == Some("r2v") {
+                crate::memory_strategy::BerniniMemoryRoute::ReferenceToVideo
+            } else {
+                crate::memory_strategy::BerniniMemoryRoute::VideoToVideo
+            };
+            crate::memory_strategy::validate_request(req, route)?;
         }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
