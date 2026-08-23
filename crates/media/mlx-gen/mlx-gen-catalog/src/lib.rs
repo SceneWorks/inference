@@ -138,13 +138,16 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
-/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
-/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
-/// from the requested quantization field.
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Bernini
+/// validates its paired planner/renderer packed manifests and headers; Wan validates TI2V-5B's
+/// immutable packed surface. Other routes return `None` rather than synthesizing a tier.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
 ) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    if let Some(tier) = mlx_gen_bernini::resolved_video_memory_numeric_tier(provider_id, spec)? {
+        return Ok(Some(tier));
+    }
     mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
 }
 
@@ -268,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+    fn selected_video_memory_apis_stay_provider_owned() {
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
         for provider in [
             "unknown",
@@ -287,6 +290,7 @@ mod tests {
                 None
             );
         }
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
     }
 
     #[test]

@@ -38,9 +38,15 @@ const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-v2v-v1";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
-/// Cross-repository receipt domain for Bernini's ordered Candle reference-to-video image set.
-pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-candle-v1";
+/// Content-independent memory-evidence identity and request-only byte-seal domains.
+pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-v2";
+pub const R2V_REFERENCE_SEAL_DOMAIN: &str = "bernini-r2v-request-seal-v1";
 pub const ADAPTER_RECEIPT_AXIS_DOMAIN: &str = "bernini-adapter-receipt-v1";
+
+fn is_reference_receipt_axis(axis: &str) -> bool {
+    axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)
+        .is_some_and(|suffix| suffix.starts_with(":backend-candle:count-"))
+}
 
 /// Opaque overlay-axis projection of the complete load receipt retained on the contract. The full
 /// receipt remains inspectable on `MemoryResidentComponent`; the request identity carries its hash
@@ -73,10 +79,11 @@ fn r2v_images(request: &GenerationRequest) -> gen_core::Result<&[gen_core::Image
     Ok(images)
 }
 
-/// Seal ordered image bytes plus the Candle ViT and VAE preprocessing geometry they produce.
+/// Bind content-independent memory shapes separately from the request-only ordered byte seal.
 pub fn r2v_reference_receipt(request: &GenerationRequest) -> gen_core::Result<String> {
     let images = r2v_images(request)?;
-    let mut seen = BTreeSet::new();
+    let mut request_seal = Sha256::new();
+    request_seal.update(R2V_REFERENCE_SEAL_DOMAIN.as_bytes());
     let mut entries = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
         let expected_pixels = u64::from(image.width)
@@ -90,17 +97,6 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> gen_core::Result<St
                 image.pixels.len()
             )));
         }
-        let mut digest = Sha256::new();
-        digest.update(R2V_REFERENCE_RECEIPT_DOMAIN.as_bytes());
-        digest.update(image.width.to_le_bytes());
-        digest.update(image.height.to_le_bytes());
-        digest.update(&image.pixels);
-        let digest = format!("{:x}", digest.finalize());
-        if !seen.insert(digest.clone()) {
-            return Err(gen_core::Error::Unsupported(
-                "Bernini Candle r2v requires distinct ordered reference images".into(),
-            ));
-        }
         let (vit_h, vit_w) = crate::vit_preprocess::smart_resize(
             i64::from(image.height),
             i64::from(image.width),
@@ -108,25 +104,44 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> gen_core::Result<St
             3136,
             50176,
         );
+        request_seal.update(image.width.to_le_bytes());
+        request_seal.update(image.height.to_le_bytes());
+        request_seal.update(&image.pixels);
         entries.push(format!(
-            "{index}:native-{}x{};vit-{}x{};vae-{}x{};sha256-{digest}",
+            "{index}:native-{}x{};vit-{}x{};vae-{}x{}",
             image.width, image.height, vit_w, vit_h, request.width, request.height
         ));
     }
     Ok(format!(
-        "{R2V_REFERENCE_RECEIPT_DOMAIN}:count-{}:{}",
+        "{R2V_REFERENCE_RECEIPT_DOMAIN}:backend-candle:count-{}:{}+{R2V_REFERENCE_SEAL_DOMAIN}-{:x}",
         images.len(),
-        entries.join("|")
+        entries.join("|"),
+        request_seal.finalize()
     ))
 }
 
 fn receipt_count(axis: &str) -> Option<u32> {
     axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)?
-        .strip_prefix(":count-")?
+        .strip_prefix(":backend-candle:count-")?
         .split_once(':')?
         .0
         .parse()
         .ok()
+}
+
+fn reference_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
+    let axes = overlay?.split('+').collect::<Vec<_>>();
+    let evidence = axes
+        .iter()
+        .copied()
+        .filter(|axis| is_reference_receipt_axis(axis))
+        .collect::<Vec<_>>();
+    let seals = axes
+        .iter()
+        .copied()
+        .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+        .collect::<Vec<_>>();
+    (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
 
 fn tier(spec: &LoadSpec) -> MemoryNumericTier {
@@ -912,16 +927,23 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
     let reference_axis = axes
         .iter()
         .copied()
-        .find(|axis| axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN));
+        .find(|axis| is_reference_receipt_axis(axis));
+    let seal_axis = axes
+        .iter()
+        .copied()
+        .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN));
+    let exact_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
     if mode == "reference_to_video"
-        && reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+        && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+            || seal_axis.is_none()
+            || exact_receipt.is_none())
     {
         return Err(gen_core::Error::Unsupported(format!(
             "{} requires an ordered Candle receipt for all {} R2V references",
             contract.provider_id, context.geometry.reference_count
         )));
     }
-    if mode == "video_to_video" && reference_axis.is_some() {
+    if mode == "video_to_video" && (reference_axis.is_some() || seal_axis.is_some()) {
         return Err(gen_core::Error::Unsupported(
             "Bernini V2V cannot carry an R2V reference receipt".into(),
         ));
@@ -939,7 +961,8 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
     }
     if axes.iter().any(|axis| {
         *axis != expected_provider_mode
-            && !axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN)
+            && !is_reference_receipt_axis(axis)
+            && !axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN)
             && Some(*axis) != expected_adapter_axis.as_deref()
     }) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -996,6 +1019,12 @@ fn validate_request(
     request: &GenerationRequest,
     route: BerniniMemoryRoute,
 ) -> gen_core::Result<Option<String>> {
+    if request.phases.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "Bernini Candle memory scope does not implement multi-phase denoise requests"
+                .to_owned(),
+        ));
+    }
     if request.fps.unwrap_or(Defaults::FPS) != Defaults::FPS
         || request.count != 1
         || !matches!(request.frames, Some(45 | 61 | 77))
@@ -1210,12 +1239,7 @@ pub fn begin_request(
             )))
         }
     };
-    let expected_reference_receipt = context.overlay.as_deref().and_then(|overlay| {
-        overlay
-            .split('+')
-            .find(|axis| axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN))
-            .map(str::to_owned)
-    });
+    let expected_reference_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
     let mut geometry = context.geometry;
     if route == BerniniMemoryRoute::VideoToVideo {
         geometry.reference_count = 0;
@@ -1649,7 +1673,7 @@ mod tests {
         let receipt = r2v_reference_receipt(&request).unwrap();
         assert_eq!(
             receipt,
-            "bernini-r2v-references-candle-v1:count-2:0:native-640x360;vit-280x168;vae-848x480;sha256-5bdf7fc62714f39b6b79861f79f4e50a948114e4d683d4c75476fbac783c2120|1:native-360x640;vit-168x280;vae-848x480;sha256-f9496ae0e80c29da2d8f78c49465125d8caa9f3f89756c8432e53a5f0cd300c5"
+            "bernini-r2v-references-v2:backend-candle:count-2:0:native-640x360;vit-280x168;vae-848x480|1:native-360x640;vit-168x280;vae-848x480+bernini-r2v-request-seal-v1-cd11cf62ec83e85860e1790538062a88b39ae384d2956fd1dc54c0e45d6fa8f5"
         );
 
         let mut reversed = request.clone();
@@ -1665,7 +1689,7 @@ mod tests {
             unreachable!()
         };
         images[1] = images[0].clone();
-        assert!(r2v_reference_receipt(&duplicate).is_err());
+        assert!(r2v_reference_receipt(&duplicate).is_ok());
 
         let mut crossed = r2v_request();
         crossed.conditioning.clear();
@@ -1742,6 +1766,9 @@ mod tests {
         let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode)
             .unwrap()
             .remove(1);
+        let mut empty_phases = fixture.request.clone();
+        empty_phases.phases = Some(Vec::new());
+        assert!(validate_request(&empty_phases, BerniniMemoryRoute::ReferenceToVideo).is_err());
         let mut crossed = fixture.request.clone();
         crossed.video_mode = Some("v2v".to_owned());
         assert!(validate_request(&crossed, BerniniMemoryRoute::ReferenceToVideo).is_err());
@@ -1749,7 +1776,7 @@ mod tests {
         let mut scope = begin_request(&contract, tier(&spec), Device::Cpu, &fixture.context)
             .unwrap()
             .expect("scope");
-        let mut mutated = fixture.request;
+        let mut mutated = fixture.request.clone();
         let [Conditioning::MultiReference { images }] = mutated.conditioning.as_mut_slice() else {
             unreachable!()
         };
@@ -1758,6 +1785,21 @@ mod tests {
         scope
             .finish(MemoryRunOutcome::Error {
                 message: "crossed references".to_owned(),
+            })
+            .unwrap();
+
+        let mut scope = begin_request(&contract, tier(&spec), Device::Cpu, &fixture.context)
+            .unwrap()
+            .expect("scope");
+        let mut phased = fixture.request;
+        phased.phases = Some(vec![gen_core::GenerationPhase {
+            steps: 1,
+            ..Default::default()
+        }]);
+        assert!(scope.configure_request(&mut phased).is_err());
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: "crossed phases".to_owned(),
             })
             .unwrap();
     }

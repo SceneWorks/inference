@@ -83,7 +83,7 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
 use mlx_gen_wan::config::WanModelConfig;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// The full Bernini pipeline — the provider the SceneWorks `bernini_image` catalog entry resolves to.
 pub const FULL_ID: &str = crate::bernini::MODEL_ID;
@@ -130,8 +130,14 @@ pub const DECODE_OVERLAP: u32 = 64;
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
 
-/// Cross-repository receipt domain for Bernini's ordered reference-to-video image set.
-pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-mlx-v1";
+/// Content-independent memory-evidence identity and request-only byte-seal domains.
+pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-v2";
+pub const R2V_REFERENCE_SEAL_DOMAIN: &str = "bernini-r2v-request-seal-v1";
+
+fn is_reference_receipt_axis(axis: &str) -> bool {
+    axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)
+        .is_some_and(|suffix| suffix.starts_with(":backend-mlx:count-"))
+}
 
 fn r2v_images(request: &GenerationRequest) -> CoreResult<&[mlx_gen::gen_core::Image]> {
     let [mlx_gen::gen_core::Conditioning::MultiReference { images }] =
@@ -151,12 +157,13 @@ fn r2v_images(request: &GenerationRequest) -> CoreResult<&[mlx_gen::gen_core::Im
     Ok(images)
 }
 
-/// Seal the exact ordered image bytes and the MLX planner/VAE preprocessing geometry they produce.
-/// This is recomputed again by the request scope, so a worker identity cannot authorize different
-/// references at generation time.
+/// Bind the content-independent memory shape separately from the request-only byte seal. The two
+/// axes travel together to provider safety, but only the shape axis is eligible for fitted-curve
+/// lookup. This is recomputed at configure so post-admission content mutation is rejected.
 pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> {
     let images = r2v_images(request)?;
-    let mut seen = BTreeSet::new();
+    let mut request_seal = Sha256::new();
+    request_seal.update(R2V_REFERENCE_SEAL_DOMAIN.as_bytes());
     let mut entries = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
         let expected_pixels = u64::from(image.width)
@@ -169,17 +176,6 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
                 "bernini r2v reference {index} has {} RGB bytes, expected {expected_pixels}",
                 image.pixels.len()
             )));
-        }
-        let mut digest = Sha256::new();
-        digest.update(R2V_REFERENCE_RECEIPT_DOMAIN.as_bytes());
-        digest.update(image.width.to_le_bytes());
-        digest.update(image.height.to_le_bytes());
-        digest.update(&image.pixels);
-        let digest = format!("{:x}", digest.finalize());
-        if !seen.insert(digest.clone()) {
-            return Err(CoreError::Unsupported(
-                "bernini r2v requires distinct ordered reference images".to_owned(),
-            ));
         }
         let (vit_h, vit_w) = crate::vit_preprocess::smart_resize(
             i64::from(image.height),
@@ -195,25 +191,44 @@ pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> 
             crate::vae_preprocess::VAE_MIN_SIZE,
             crate::vae_preprocess::VAE_STRIDE,
         );
+        request_seal.update(image.width.to_le_bytes());
+        request_seal.update(image.height.to_le_bytes());
+        request_seal.update(&image.pixels);
         entries.push(format!(
-            "{index}:native-{}x{};vit-{}x{};vae-{}x{};sha256-{digest}",
+            "{index}:native-{}x{};vit-{}x{};vae-{}x{}",
             image.width, image.height, vit_w, vit_h, vae_w, vae_h
         ));
     }
     Ok(format!(
-        "{R2V_REFERENCE_RECEIPT_DOMAIN}:count-{}:{}",
+        "{R2V_REFERENCE_RECEIPT_DOMAIN}:backend-mlx:count-{}:{}+{R2V_REFERENCE_SEAL_DOMAIN}-{:x}",
         images.len(),
-        entries.join("|")
+        entries.join("|"),
+        request_seal.finalize()
     ))
 }
 
 fn receipt_count(axis: &str) -> Option<u32> {
     axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)?
-        .strip_prefix(":count-")?
+        .strip_prefix(":backend-mlx:count-")?
         .split_once(':')?
         .0
         .parse()
         .ok()
+}
+
+fn reference_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
+    let axes = overlay?.split('+').collect::<Vec<_>>();
+    let evidence = axes
+        .iter()
+        .copied()
+        .filter(|axis| is_reference_receipt_axis(axis))
+        .collect::<Vec<_>>();
+    let seals = axes
+        .iter()
+        .copied()
+        .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+        .collect::<Vec<_>>();
+    (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
 
 /// Rung 3 — the shared constrained score budget. Bernini does not invent its own.
@@ -603,22 +618,31 @@ pub(crate) fn safety_check(
         let reference_axis = axes
             .iter()
             .copied()
-            .find(|axis| axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN));
+            .find(|axis| is_reference_receipt_axis(axis));
+        let seal_axis = axes
+            .iter()
+            .copied()
+            .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN));
+        let exact_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
         if mode == "reference_to_video"
-            && reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+            && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+                || seal_axis.is_none()
+                || exact_receipt.is_none())
         {
             return Err(CoreError::Unsupported(format!(
                 "{}: Bernini r2v memory evidence requires an ordered MLX reference receipt for all {} images",
                 contract.provider_id, context.geometry.reference_count
             )));
         }
-        if mode == "video_to_video" && reference_axis.is_some() {
+        if mode == "video_to_video" && (reference_axis.is_some() || seal_axis.is_some()) {
             return Err(CoreError::Unsupported(
                 "bernini V2V cannot carry an R2V image receipt".to_owned(),
             ));
         }
         if axes.iter().any(|axis| {
-            *axis != expected_provider_mode && !axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN)
+            *axis != expected_provider_mode
+                && !is_reference_receipt_axis(axis)
+                && !axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN)
         }) {
             return Err(CoreError::Unsupported(
                 "bernini MLX memory evidence contains an unknown or crossed overlay axis"
@@ -703,25 +727,227 @@ pub(crate) fn safety_check(
         }
         Ok(())
     };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    let loaded_tier = if contract.provider_id != FULL_ID
+        || contract
+            .calibration
+            .as_ref()
+            .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION)
+    {
+        fixture_tier(spec)
+    } else {
+        match resolved_numeric_tier(spec) {
+            Ok(tier) => tier,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    };
+    standard_memory_strategy_safety_check(contract, context, Some(loaded_tier), Some(&route_gate))
 }
 
-/// The numeric tier this generator actually runs.
-///
-/// Every shipped Bernini tier is **pre-packed** — `config.json` carries a `quantization` block and
-/// the loader packed-detects off the on-disk `.scales` — so `LoadSpec::quantize` records the resolved
-/// tier rather than a load-time transform request.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+fn fixture_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
         component_precision_floors: &[],
     }
+}
+
+fn quant_manifest(path: &std::path::Path) -> CoreResult<Option<(i32, usize)>> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "bernini numeric tier cannot read {}: {error}",
+            path.display()
+        ))
+    })?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "bernini numeric tier cannot parse {}: {error}",
+            path.display()
+        ))
+    })?;
+    let Some(quant) = json.get("quantization") else {
+        return Ok(None);
+    };
+    if quant.is_null() {
+        return Ok(None);
+    }
+    let bits = quant.get("bits").and_then(serde_json::Value::as_i64);
+    let group = quant.get("group_size").and_then(serde_json::Value::as_u64);
+    let (Some(bits @ (4 | 8)), Some(64)) = (bits, group) else {
+        return Err(CoreError::Unsupported(format!(
+            "bernini numeric tier requires an exact q4/q8 group-64 quantization manifest in {}",
+            path.display()
+        )));
+    };
+    Ok(Some((bits as i32, 64)))
+}
+
+fn packed_header_bits(path: &std::path::Path, group_size: usize) -> CoreResult<Option<i32>> {
+    use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype};
+
+    let headers = safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<BTreeMap<_, _>>();
+    let packed_bases = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .collect::<Vec<_>>();
+    if packed_bases.is_empty() {
+        if headers
+            .iter()
+            .any(|header| header.name.ends_with(".weight") && header.dtype == Dtype::U32)
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini numeric tier found U32 weights without packed scale headers in {}",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    }
+    for header in headers
+        .iter()
+        .filter(|header| header.name.ends_with(".weight") && header.dtype == Dtype::U32)
+    {
+        let base = header
+            .name
+            .strip_suffix(".weight")
+            .expect("filtered weight suffix");
+        if !by_name.contains_key(format!("{base}.scales").as_str())
+            || !by_name.contains_key(format!("{base}.biases").as_str())
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini numeric tier found unpaired packed weight {} in {}",
+                header.name,
+                path.display()
+            )));
+        }
+    }
+
+    let mut exact_bits = None;
+    for base in packed_bases {
+        let weight_name = format!("{base}.weight");
+        let scale_name = format!("{base}.scales");
+        let bias_name = format!("{base}.biases");
+        let weight = by_name.get(weight_name.as_str()).ok_or_else(|| {
+            CoreError::Unsupported(format!("{scale_name} has no packed {weight_name}"))
+        })?;
+        let scales = by_name
+            .get(scale_name.as_str())
+            .expect("base came from scales");
+        let biases = by_name.get(bias_name.as_str()).ok_or_else(|| {
+            CoreError::Unsupported(format!("{scale_name} has no packed {bias_name}"))
+        })?;
+        let ([weight_out, words], [scale_out, groups], [bias_out, bias_groups]) = (
+            weight.shape.as_slice(),
+            scales.shape.as_slice(),
+            biases.shape.as_slice(),
+        ) else {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} must be rank two"
+            )));
+        };
+        if weight.dtype != Dtype::U32
+            || scales.dtype != Dtype::BF16
+            || biases.dtype != Dtype::BF16
+            || weight_out != scale_out
+            || scale_out != bias_out
+            || groups != bias_groups
+            || *groups == 0
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} has crossed dtype or shape companions"
+            )));
+        }
+        let input = groups.checked_mul(group_size).ok_or_else(|| {
+            CoreError::Unsupported(format!("bernini packed header {base} input overflow"))
+        })?;
+        let numerator = words.checked_mul(32).ok_or_else(|| {
+            CoreError::Unsupported(format!("bernini packed header {base} bit-width overflow"))
+        })?;
+        if numerator % input != 0 {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} does not encode an integral bit width"
+            )));
+        }
+        let bits = i32::try_from(numerator / input).map_err(|_| {
+            CoreError::Unsupported(format!("bernini packed header {base} bit width overflow"))
+        })?;
+        if !matches!(bits, 4 | 8) || exact_bits.is_some_and(|current| current != bits) {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {} mixes or declares unsupported {bits}-bit weights",
+                path.display()
+            )));
+        }
+        exact_bits = Some(bits);
+    }
+    Ok(exact_bits)
+}
+
+/// Resolve the numeric tier actually carried by the immutable Bernini snapshot. Prepacked tiers
+/// require matching renderer/planner manifests and matching packed safetensors headers; legacy
+/// dense snapshots retain the explicit load-time quantization behavior.
+pub fn resolved_numeric_tier(spec: &LoadSpec) -> CoreResult<MemoryNumericTier> {
+    let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "bernini numeric tier requires a checkpoint directory".to_owned(),
+        ));
+    };
+    let renderer_manifest = quant_manifest(&root.join("config.json"))?;
+    let planner_manifest = quant_manifest(&root.join("qwen2_5_vl_config.json"))?;
+    if renderer_manifest != planner_manifest {
+        return Err(CoreError::Unsupported(
+            "bernini renderer and planner quantization manifests disagree".to_owned(),
+        ));
+    }
+    let files = [
+        root.join("high_noise_model.safetensors"),
+        root.join("low_noise_model.safetensors"),
+        root.join("qwen2_5_vl.safetensors"),
+    ];
+    let header_bits = files
+        .iter()
+        .map(|path| packed_header_bits(path, 64))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let resolved_quant = match renderer_manifest {
+        Some((bits, 64)) => {
+            if spec.quantize.is_some() {
+                return Err(CoreError::Unsupported(
+                    "bernini prepacked tiers must not request a second load-time quantization"
+                        .to_owned(),
+                ));
+            }
+            if header_bits.iter().any(|actual| *actual != Some(bits)) {
+                return Err(CoreError::Unsupported(format!(
+                    "bernini q{bits} manifest disagrees with packed renderer/planner headers"
+                )));
+            }
+            Some(match bits {
+                4 => mlx_gen::Quant::Q4,
+                8 => mlx_gen::Quant::Q8,
+                _ => unreachable!("manifest validator accepts q4/q8 only"),
+            })
+        }
+        None => {
+            if header_bits.iter().any(Option::is_some) {
+                return Err(CoreError::Unsupported(
+                    "bernini dense manifest disagrees with packed renderer/planner headers"
+                        .to_owned(),
+                ));
+            }
+            spec.quantize
+        }
+        Some(_) => unreachable!("manifest validator accepts group 64 only"),
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant: resolved_quant,
+        component_precision_floors: &[],
+    })
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -740,7 +966,7 @@ pub(crate) fn registered_valid_fixture(
     let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        fixture_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::Other("video_to_video".to_owned()),
             reference_count: 1,
@@ -892,12 +1118,7 @@ fn begin_with_cleanup(
             )))
         }
     };
-    let expected_reference_receipt = context.overlay.as_deref().and_then(|overlay| {
-        overlay
-            .split('+')
-            .find(|axis| axis.starts_with(R2V_REFERENCE_RECEIPT_DOMAIN))
-            .map(str::to_owned)
-    });
+    let expected_reference_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
     // VideoClip is a temporal carrier and therefore maps to zero image references in the shared
     // core. MultiReference is flattened and stays equal to the exact 1-8 image count.
     let mut core_geometry = context.geometry;
@@ -937,6 +1158,11 @@ fn begin_with_cleanup(
 }
 
 fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()> {
+    if request.phases.is_some() {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope does not implement multi-phase denoise requests".to_owned(),
+        ));
+    }
     if request.video_mode.as_deref() != Some("v2v") {
         return Err(CoreError::Unsupported(
             "bernini memory scope requires video_mode=v2v".to_owned(),
@@ -971,6 +1197,11 @@ fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()
 }
 
 fn validate_reference_to_video_request(request: &GenerationRequest) -> CoreResult<String> {
+    if request.phases.is_some() {
+        return Err(CoreError::Unsupported(
+            "bernini r2v memory scope does not implement multi-phase denoise requests".to_owned(),
+        ));
+    }
     if request.video_mode.as_deref() != Some("r2v") {
         return Err(CoreError::Unsupported(
             "bernini r2v memory scope requires video_mode=r2v".to_owned(),
@@ -1810,13 +2041,128 @@ mod tests {
             .collect()
     }
 
+    fn write_tier_file(path: &std::path::Path, bits: Option<i32>) {
+        let mut tensors = serde_json::Map::new();
+        let mut offset = 0_u64;
+        let mut insert = |name: &str, dtype: &str, shape: &[usize], bytes: u64| {
+            tensors.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        };
+        match bits {
+            Some(bits @ (4 | 8)) => {
+                let words = usize::try_from(bits).unwrap() * 64 / 32;
+                insert("block.weight", "U32", &[2, words], (2 * words * 4) as u64);
+                insert("block.scales", "BF16", &[2, 1], 4);
+                insert("block.biases", "BF16", &[2, 1], 4);
+            }
+            None => insert("block.weight", "BF16", &[2, 64], 256),
+            Some(bits) => panic!("unsupported fixture q{bits}"),
+        }
+        let mut header = serde_json::to_vec(&tensors).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + usize::try_from(offset).unwrap(), 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn tier_snapshot(bits: Option<i32>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let quantization = bits.map(|bits| {
+            serde_json::json!({
+                "bits": bits,
+                "group_size": 64,
+            })
+        });
+        let config = serde_json::json!({ "quantization": quantization });
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            root.path().join("qwen2_5_vl_config.json"),
+            config.to_string(),
+        )
+        .unwrap();
+        for name in [
+            "high_noise_model.safetensors",
+            "low_noise_model.safetensors",
+            "qwen2_5_vl.safetensors",
+        ] {
+            write_tier_file(&root.path().join(name), bits);
+        }
+        root
+    }
+
+    #[test]
+    fn provider_owned_tier_resolver_reads_q4_q8_and_bf16_headers() {
+        for (bits, expected) in [
+            (Some(4), Some(mlx_gen::Quant::Q4)),
+            (Some(8), Some(mlx_gen::Quant::Q8)),
+            (None, None),
+        ] {
+            let root = tier_snapshot(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            let tier = resolved_numeric_tier(&spec).unwrap();
+            assert_eq!(tier.quant, expected, "fixture q{bits:?}");
+            assert_eq!(
+                crate::resolved_video_memory_numeric_tier(FULL_ID, &spec)
+                    .unwrap()
+                    .unwrap(),
+                tier
+            );
+
+            let production = memory_strategy_contract(FULL_ID, &spec).unwrap();
+            let declaration = weights_free_memory_strategy_contract(FULL_ID, &spec).unwrap();
+            let mut context =
+                registered_valid_fixture(&spec, &declaration, MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .remove(0)
+                    .context;
+            context.selection.tier = tier;
+            context.optimization_authority =
+                mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated;
+            assert_eq!(
+                safety_check(&spec, &production, &context),
+                MemorySafetyDecision::Accept,
+                "provider safety must admit the resolved q{bits:?} tier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_owned_tier_resolver_rejects_manifest_header_disagreement() {
+        let root = tier_snapshot(Some(4));
+        write_tier_file(&root.path().join("qwen2_5_vl.safetensors"), Some(8));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert!(resolved_numeric_tier(&spec).is_err());
+
+        let root = tier_snapshot(Some(4));
+        let crossed = serde_json::json!({
+            "quantization": { "bits": 8, "group_size": 64 }
+        });
+        std::fs::write(
+            root.path().join("qwen2_5_vl_config.json"),
+            crossed.to_string(),
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert!(resolved_numeric_tier(&spec).is_err());
+    }
+
     #[test]
     fn r2v_receipt_binds_order_bytes_and_mlx_effective_shapes() {
         let request = r2v_request();
         let receipt = r2v_reference_receipt(&request).expect("exact receipt");
         assert_eq!(
             receipt,
-            "bernini-r2v-references-mlx-v1:count-2:0:native-640x360;vit-280x168;vae-624x352;sha256-08f7799b7050c59262c63194761800f52bfab061e84d947119e73447cf3ee4c4|1:native-360x640;vit-168x280;vae-352x624;sha256-ddfffcf24ec18d8c764ce45021fc37c3e248f7ae9bf183d57b5fe50ec26c19de"
+            "bernini-r2v-references-v2:backend-mlx:count-2:0:native-640x360;vit-280x168;vae-624x352|1:native-360x640;vit-168x280;vae-352x624+bernini-r2v-request-seal-v1-cd11cf62ec83e85860e1790538062a88b39ae384d2956fd1dc54c0e45d6fa8f5"
         );
 
         let mut reversed = request.clone();
@@ -1832,7 +2178,7 @@ mod tests {
             unreachable!()
         };
         images[1] = images[0].clone();
-        assert!(r2v_reference_receipt(&duplicate).is_err());
+        assert!(r2v_reference_receipt(&duplicate).is_ok());
 
         let mut crossed = r2v_request();
         crossed.conditioning.clear();
@@ -1895,6 +2241,9 @@ mod tests {
         let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
             .unwrap()
             .remove(1);
+        let mut empty_phases = fixture.request.clone();
+        empty_phases.phases = Some(Vec::new());
+        assert!(validate_reference_to_video_request(&empty_phases).is_err());
         for outcome in [
             MemoryRunOutcome::Complete,
             MemoryRunOutcome::Canceled,
@@ -1917,7 +2266,7 @@ mod tests {
         let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &fixture.context)
             .unwrap()
             .expect("scope");
-        let mut mutated = fixture.request;
+        let mut mutated = fixture.request.clone();
         let [Conditioning::MultiReference { images }] = mutated.conditioning.as_mut_slice() else {
             unreachable!()
         };
@@ -1926,6 +2275,21 @@ mod tests {
         scope
             .finish(MemoryRunOutcome::Error {
                 message: "crossed references".to_owned(),
+            })
+            .unwrap();
+
+        let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &fixture.context)
+            .unwrap()
+            .expect("scope");
+        let mut phased = fixture.request;
+        phased.phases = Some(vec![mlx_gen::gen_core::GenerationPhase {
+            steps: 1,
+            ..Default::default()
+        }]);
+        assert!(scope.configure_request(&mut phased).is_err());
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: "crossed phases".to_owned(),
             })
             .unwrap();
     }
