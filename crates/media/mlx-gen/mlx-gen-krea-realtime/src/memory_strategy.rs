@@ -1,4 +1,4 @@
-//! Provider-owned resident memory facts for Krea Realtime I2V (SC-20770).
+//! Provider-owned resident memory facts for Krea Realtime I2V/V2V (SC-20770/SC-20771).
 //!
 //! Krea's currently selectable ladder is intentionally resident-only. The bounded causal cache,
 //! automatic VAE tiling, and loader staging are unconditional implementation details, not request
@@ -30,7 +30,12 @@ const TOKENIZER: &str = "tokenizer.json";
 const VAE: &str = "vae.safetensors";
 const DIT: &str = "dit.safetensors";
 const TRANSFORMER: &str = "transformer";
-const FINGERPRINT_PREFIX: &str = "krea-realtime-i2v-resident-v2";
+/// Cross-repository ABI domain used by the provider and the SceneWorks worker when sealing the
+/// same direct-file/adapter receipt. Keep this public so paired fixtures can name the authoritative
+/// provider spelling instead of reviving an I2V-only predecessor.
+pub const ARTIFACT_RECEIPT_DOMAIN: &str = "krea-realtime-video-resident-v3";
+/// Cross-repository ABI domain for the request envelope carrying that artifact receipt.
+pub const REQUEST_RECEIPT_DOMAIN: &str = "provider-resident-video-request-v3";
 pub const CANONICAL_REPOSITORY: &str = "SceneWorks/krea-realtime-14b-mlx";
 pub const CANONICAL_REVISION: &str = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626";
 const PACKED_FILES: &[&str] = &[CONFIG, DIT, TEXT_ENCODER, TOKENIZER, VAE];
@@ -372,7 +377,7 @@ fn canonical_artifact_identity_for_source(
     let mut direct = required_direct_files(root, resolved_tier)?;
     direct.sort();
     let mut digest = Sha256::new();
-    digest.update(FINGERPRINT_PREFIX.as_bytes());
+    digest.update(ARTIFACT_RECEIPT_DOMAIN.as_bytes());
     digest.update(repository.as_bytes());
     digest.update(revision.as_bytes());
     digest.update(resolved_tier.as_bytes());
@@ -541,9 +546,22 @@ pub(crate) fn safety_check(
             reason: format!("{MODEL_ID}: resident artifact receipt no longer resolves"),
         };
     };
+    let (mode, shape) = match context.mode.as_key() {
+        "image_to_video" => ("image_to_video", "image"),
+        "video_to_video" => ("video_to_video", "video_clip"),
+        _ => {
+            return MemorySafetyDecision::Reject {
+                reason: format!("{MODEL_ID}: crossed resident request mode"),
+            }
+        }
+    };
+    let sealed_request_prefix =
+        format!("{REQUEST_RECEIPT_DOMAIN}:{MODEL_ID}:mode={mode}:shape={shape}:");
     if &expected != contract
-        || context.mode.as_key() != "image_to_video"
         || context.geometry.reference_count != 1
+        || !context
+            .evidence_revision
+            .starts_with(&sealed_request_prefix)
         || canonical_artifact_identity(spec).is_err()
     {
         return MemorySafetyDecision::Reject {
@@ -667,6 +685,23 @@ mod tests {
         (temp, LoadSpec::new(WeightsSource::Dir(root)))
     }
 
+    /// Byte-for-byte twin of the SceneWorks worker's sealed q8 fixture. This deliberately does not
+    /// call the provider fixture helper: both sides must independently reproduce the same receipt.
+    fn worker_sealed_fixture() -> (tempfile::TempDir, LoadSpec) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        std::fs::write(
+            root.join(CONFIG),
+            br#"{"quantization":{"bits":8},"denoising_step_list":[1000,937,833,625,0]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(TOKENIZER), b"{}").unwrap();
+        tensor(&root.join(TEXT_ENCODER), 101, 101);
+        tensor(&root.join(DIT), 401, 401_u64 as u8);
+        tensor(&root.join(VAE), 211, 211);
+        (temp, LoadSpec::new(WeightsSource::Dir(root)))
+    }
+
     #[test]
     fn q4_q8_and_bf16_publish_nonzero_differentiated_exact_facts() {
         let (_q4_root, q4_spec) = fixture("q4", 400);
@@ -781,5 +816,117 @@ mod tests {
         std::fs::remove_file(root.join("extra.json")).unwrap();
         std::fs::remove_file(root.join(VAE)).unwrap();
         assert!(canonical_artifact_identity(&spec).is_err());
+    }
+
+    fn resident_context(
+        mode: &str,
+        shape: &str,
+        artifact: &str,
+        quant: Option<Quant>,
+    ) -> MemoryRunContext {
+        MemoryRunContext {
+            selection: mlx_gen::gen_core::MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier: mlx_gen::gen_core::MemoryNumericTier {
+                    precision: mlx_gen::Precision::Bf16,
+                    quant,
+                    component_precision_floors: &[],
+                },
+            },
+            optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Resident,
+            calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_fingerprint: String::new(),
+            load_shape: mlx_gen::gen_core::LoadShape::EagerMaterialization,
+            mode: mlx_gen::gen_core::MemoryMode::Other(mode.to_owned()),
+            has_reference: true,
+            use_pid: false,
+            has_phases: false,
+            geometry: mlx_gen::gen_core::MemoryGeometry {
+                width: 832,
+                height: 480,
+                batch: 1,
+                frames: 45,
+                reference_count: 1,
+            },
+            overlay: None,
+            budget: mlx_gen::gen_core::MemoryBudget {
+                total_bytes: 1 << 30,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 713,
+            cache_state: mlx_gen::gen_core::MemoryCacheState::Cold,
+            evidence_revision: format!(
+                "provider-resident-video-request-v3:{MODEL_ID}:mode={mode}:shape={shape}:sourceFrames=45:strength=3eb33333:nativeCadence=true:artifact={artifact}:adapter=none:digest"
+            ),
+        }
+    }
+
+    #[test]
+    fn safety_accepts_exact_i2v_and_v2v_receipts_and_rejects_crossed_mode_shape() {
+        for (tier, bytes, quant) in [
+            ("q4", 400, Some(Quant::Q4)),
+            ("q8", 800, Some(Quant::Q8)),
+            ("bf16", 1_600, None),
+        ] {
+            let (_root, spec) = fixture(tier, bytes);
+            let contract = memory_strategy_contract(&spec).unwrap();
+            let artifact = canonical_artifact_identity(&spec).unwrap();
+            for (mode, shape) in [
+                ("image_to_video", "image"),
+                ("video_to_video", "video_clip"),
+            ] {
+                let context = resident_context(mode, shape, &artifact, quant);
+                assert!(matches!(
+                    safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Accept
+                ));
+                assert!(matches!(
+                    loaded_safety_check(&spec, &contract, &artifact, &context),
+                    MemorySafetyDecision::Accept
+                ));
+            }
+        }
+        let (_root, spec) = fixture("q4", 400);
+        let contract = memory_strategy_contract(&spec).unwrap();
+        let artifact = canonical_artifact_identity(&spec).unwrap();
+        let crossed = resident_context("video_to_video", "image", &artifact, Some(Quant::Q4));
+        assert!(matches!(
+            safety_check(&spec, &contract, &crossed),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        let mut crossed =
+            resident_context("video_to_video", "video_clip", &artifact, Some(Quant::Q4));
+        crossed.geometry.reference_count = 2;
+        assert!(matches!(
+            safety_check(&spec, &contract, &crossed),
+            MemorySafetyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn worker_sealed_v3_artifact_receipt_is_provider_accepted() {
+        const WORKER_SEALED_ARTIFACT: &str =
+            "59024c46ca617e4a45071e685bbefcea282cad6e2e41c0ab909a78e1dff77e7c";
+        let (_root, spec) = worker_sealed_fixture();
+        let contract = memory_strategy_contract(&spec).unwrap();
+        let artifact = canonical_artifact_identity(&spec).unwrap();
+        assert_eq!(artifact, WORKER_SEALED_ARTIFACT);
+        let context = resident_context(
+            "video_to_video",
+            "video_clip",
+            WORKER_SEALED_ARTIFACT,
+            Some(Quant::Q8),
+        );
+        assert!(matches!(
+            safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        ));
+        assert!(matches!(
+            loaded_safety_check(&spec, &contract, WORKER_SEALED_ARTIFACT, &context),
+            MemorySafetyDecision::Accept
+        ));
     }
 }
