@@ -892,6 +892,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         job = workflow["jobs"]["macos-metal"]
         self.assertEqual(job["env"].get("CARGO_PROFILE_DEV_DEBUG"), "line-tables-only")
         self.assertEqual(job["env"].get("CARGO_PROFILE_TEST_DEBUG"), "line-tables-only")
+        # Build-override debuginfo must equal the profile debuginfo, or Clippy, the test run and
+        # the bundle profiles each get their own pmetal-mlx-sys OUT_DIR (three libmlx cmake
+        # builds per cold job) — see the env comment in the workflow.
+        self.assertEqual(job["env"].get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"), "line-tables-only")
+        self.assertEqual(job["env"].get("CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG"), "line-tables-only")
         steps = job["steps"]
         names = [step.get("name") for step in steps]
         for step in steps:

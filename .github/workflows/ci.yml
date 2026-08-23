@@ -550,6 +550,17 @@ jobs:
       # the `Disk after ...` probes below are the evidence that it is no longer needed.
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      # Build-override debuginfo MUST match the profile debuginfo above, or this lane still
+      # builds libmlx three times per cold job. Measured locally 2026-08-23 (unit graphs +
+      # `-vv` OUT_DIR hashes): with the cargo default (build scripts/proc-macros at debug=0),
+      # `cargo build` lets bindgen's host-side `bitflags` share the target-side dev unit while
+      # `cargo check`/`clippy` and `cargo test` give it a separate build-override unit — so the
+      # bindgen → build-script → `pmetal-mlx-sys` metadata hash differs per command and each
+      # step gets its own OUT_DIR and its own ≈6 min cmake build of libmlx. With build-override
+      # aligned, Clippy, the `--lib --tests` run, and the LLM+audio bundle all resolve to ONE
+      # OUT_DIR (only the LLM-only bundle still differs, via `syn` feature unification).
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
