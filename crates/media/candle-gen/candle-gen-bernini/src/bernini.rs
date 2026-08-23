@@ -986,11 +986,14 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors the packing order).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V uses the trained source/reference/first-image triplet; extra images interpolate
+        // across ids 1..=3, matching its admission receipt.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Tensor, f64)> = src_videos
             .iter()
             .enumerate()
@@ -1022,11 +1025,7 @@ impl Bernini {
             ];
             let high = BVitExpert::build(&comps.high, streams4)?;
             let low = BVitExpert::build(&comps.low, streams4)?;
-            let pf = PackedForward::new(
-                dit_cfg,
-                self.knobs.max_trained_src_id,
-                self.knobs.interpolate_src_id,
-            );
+            let pf = PackedForward::new(dit_cfg, trained_sources, self.knobs.interpolate_src_id);
             let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
             let shift = req
                 .scheduler_shift
