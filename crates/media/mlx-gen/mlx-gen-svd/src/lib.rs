@@ -14,6 +14,7 @@
 pub mod config;
 pub mod embeddings;
 pub mod image_encoder;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
@@ -52,7 +53,9 @@ pub fn vae_tiling_unmodelled_reason(provider_id: &str) -> Option<&'static str> {
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit MLX SVD provider catalog.
