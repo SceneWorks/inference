@@ -3383,6 +3383,7 @@ mod preview_advertising {
             dir: "candle-gen-anima",
             register_providers: candle_gen_anima::register_providers,
             register_surfaces: Some(candle_gen_anima::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-bernini",
