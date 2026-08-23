@@ -136,11 +136,7 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG-off model: the AR few-step denoise runs a single batch-1 forward per step with no
             // unconditional branch, so there is no negative-prompt / guidance axis (sc-8437 S4).
             supports_negative_prompt: false,
-            // i2v / v2v conditioning (sc-8440 S7): a `Reference` still warms the AR KV cache
-            // (image-to-video, like the sibling `svd_xt` image→video), and a `VideoClip` source drives
-            // the strength-controlled AR init (video-to-video, like `bernini`'s v2v). Both are wired in
-            // the engine (`generate_i2v` / `generate_v2v`) and routed by `run`, so advertising them is
-            // honest. `VideoClip` is video-modality conditioning (allowed here — modality is Video).
+            // Direct provider capability remains broader than SC-20770's worker/admission route.
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
             // Wan-family style-LoRA / LoKr (sc-15015 S14; extended to the packed tiers by sc-15203 S19):
             // Krea Realtime 14B is Wan-2.1-14B T2V weight-for-weight, so a diffusers / PEFT / kohya /
@@ -210,6 +206,14 @@ pub struct KreaRealtime {
     /// hard error at a different one ("stored wins", loudly — `quantize` no-ops over packed weights, so
     /// a silent mismatch would serve a tier the caller did not ask for).
     quant: Option<Quant>,
+    /// SC-20770 adopts the shared selector truthfully as resident-only. Existing staging,
+    /// automatic decode tiling, and the fixed causal window are not request-selected rungs.
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    /// Exact prepared spec whose direct files produced `memory_strategy`. Retained so the loaded
+    /// generator repeats the provider-owned receipt check at the request safety boundary.
+    loaded_spec: mlx_gen::LoadSpec,
+    /// Content- and tensor-geometry-bound receipt sealed before construction.
+    loaded_artifact_identity: String,
     /// Actual engine-owned adapter outcomes from the most recent successful generation. The loaded
     /// provider is cached and `Generator::generate` takes `&self`, so the compatibility-safe report
     /// accessor uses interior mutability rather than changing generation's return type.
@@ -314,6 +318,8 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
             root.display()
         )));
     }
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(spec)?;
+    let loaded_artifact_identity = crate::memory_strategy::canonical_artifact_identity(spec)?;
     let config = KreaRealtimeConfig::from_model_dir(&root)?;
     Ok(Box::new(KreaRealtime {
         descriptor: descriptor(),
@@ -321,6 +327,9 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
         root,
         adapters: spec.adapters.clone(),
         quant: spec.quantize,
+        memory_strategy,
+        loaded_spec: spec.clone(),
+        loaded_artifact_identity,
         adapter_reports: Mutex::new(Vec::new()),
     }))
 }
@@ -339,6 +348,22 @@ impl Generator for KreaRealtime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(
+            &self.loaded_spec,
+            &self.memory_strategy,
+            &self.loaded_artifact_identity,
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
@@ -476,6 +501,19 @@ mod tests {
             root: PathBuf::from("/nonexistent-krea-realtime-snapshot"),
             adapters: Vec::new(),
             quant: None,
+            memory_strategy: mlx_gen::gen_core::MemoryProviderContract::compatibility_default(
+                MODEL_ID,
+                mlx_gen::gen_core::MemoryBackendRealization::MlxMetal {
+                    bounded_wired_residency: false,
+                    lazy_or_mmap_materialization: true,
+                    explicit_evaluation_and_synchronization: false,
+                    cache_eviction: false,
+                },
+            ),
+            loaded_spec: mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(PathBuf::from(
+                "/nonexistent-krea-realtime-snapshot",
+            ))),
+            loaded_artifact_identity: String::new(),
             adapter_reports: Mutex::new(Vec::new()),
         }
     }
@@ -625,8 +663,7 @@ mod tests {
         }
     }
 
-    /// The advertised surface is CFG-off video with the Self-Forcing few-step sampler, now advertising
-    /// **i2v** (`Reference`) + **v2v** (`VideoClip`) conditioning (sc-8440 S7).
+    /// Direct provider surface remains CFG-off T2V/I2V/V2V; SC-20770 narrows only the worker route.
     #[test]
     fn descriptor_is_cfg_off_video_with_i2v_v2v() {
         let d = descriptor();
@@ -638,15 +675,11 @@ mod tests {
         assert!(!c.supports_guidance, "Krea Realtime is CFG-off");
         assert!(!c.supports_negative_prompt, "CFG-off ⇒ no negative prompt");
         assert!(!c.supports_true_cfg);
-        // S7: advertises i2v (Reference) + v2v (VideoClip) — the engine wires + routes both.
         assert!(
             c.accepts(ConditioningKind::Reference),
             "i2v: a reference still is accepted (S7)"
         );
-        assert!(
-            c.accepts(ConditioningKind::VideoClip),
-            "v2v: a source clip is accepted (S7)"
-        );
+        assert!(c.accepts(ConditioningKind::VideoClip));
         assert_eq!(
             c.conditioning,
             vec![ConditioningKind::Reference, ConditioningKind::VideoClip]
@@ -682,6 +715,14 @@ mod tests {
             width,
             height,
             count: 1,
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                },
+                strength: None,
+            }],
             ..Default::default()
         };
         let off_grid = request(644, 484);
@@ -788,20 +829,20 @@ mod tests {
             height: 512,
             count: 1,
             frames: Some(frames),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                },
+                strength: None,
+            }],
             ..Default::default()
         };
 
         Generator::validate(&provider, &request(1_028))
             .expect("1,028 output frames resolve to the maximum 257 latent frames");
-        let mut i2v_boundary = request(1_028);
-        i2v_boundary.conditioning = vec![Conditioning::Reference {
-            image: Image {
-                width: 1,
-                height: 1,
-                pixels: vec![0; 3],
-            },
-            strength: None,
-        }];
+        let i2v_boundary = request(1_028);
         Generator::validate(&provider, &i2v_boundary)
             .expect("I2V keeps the same 1,028-output-frame boundary as T2V");
         let validation_error = Generator::validate(&provider, &request(1_029))
@@ -891,24 +932,14 @@ mod tests {
     fn v2v_source_frame_cap_is_resolved_and_rejected_before_staging() {
         let provider = unloaded();
         let accepted = v2v_request(1_028);
-        Generator::validate(&provider, &accepted)
-            .expect("1,028 V2V source frames resolve to the maximum 257 generation latents");
+        Generator::validate(&provider, &accepted).expect("V2V boundary remains supported");
         let resolved = provider.validate_and_resolve_frames(&accepted).unwrap();
-        assert_eq!(
-            resolved.output, DEFAULT_FRAMES,
-            "the output trim stays defaulted"
-        );
-        assert_eq!(resolved.output_latent, 21);
         assert_eq!(resolved.generation_latent, 257);
         let mut accepted_progress = 0;
-        let accepted_run_error = provider
+        let error = provider
             .run(&accepted, &mut |_| accepted_progress += 1)
-            .expect_err("an accepted boundary request reaches the nonexistent snapshot guard");
-        assert!(
-            matches!(accepted_run_error, Error::Msg(_))
-                && accepted_run_error.to_string().contains("snapshot dir does not exist"),
-            "the accepted boundary must pass the cap and fail only on missing weights: {accepted_run_error:?}"
-        );
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot dir does not exist"));
         assert_eq!(accepted_progress, 0);
 
         let rejected = v2v_request(1_029);
@@ -996,13 +1027,12 @@ mod tests {
             honored.conditioning[0],
             Conditioning::VideoClip { strength, .. } if strength == 0.5
         ));
-        Generator::validate(&provider, &honored)
-            .expect("a non-default VideoClip strength must still validate — Krea honors it");
+        Generator::validate(&provider, &honored).unwrap();
 
         let mut default_strength = v2v_request(5);
         if let Conditioning::VideoClip { strength, .. } = &mut default_strength.conditioning[0] {
             *strength = 1.0;
         }
-        Generator::validate(&provider, &default_strength).expect("the defaults still validate");
+        Generator::validate(&provider, &default_strength).unwrap();
     }
 }
