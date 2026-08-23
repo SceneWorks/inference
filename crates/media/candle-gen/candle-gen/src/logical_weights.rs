@@ -18,8 +18,9 @@
 //!   fp8 cast kernels and its CPU/CUDA `to_dtype` covers E4M3 only, while the reference functions
 //!   cover every row identically on every lane.
 //! * **Native path** (`fp8-e4m3-scalar-v1` only): where the layout + hardware contract of the
-//!   cuBLASLt fp8 leg holds — a CUDA device at the sm_89 floor (`CublasLt::meets_sm89_floor`,
-//!   locked decision 7), a rank-2 E4M3 weight, and no `full_precision_matrix_mult` flag — the
+//!   cuBLASLt fp8 leg holds — a CUDA device at the sm_89 floor
+//!   (`CublasLt::meets_fp8_floor`, via [`crate::quant::FP8_COMPUTE_CAP_FLOOR`]; locked
+//!   decision 7), a rank-2 E4M3 weight, and no `full_precision_matrix_mult` flag — the
 //!   [`CandleFp8Residency`] policy plans `Packed` residency and the reader keeps the stored
 //!   `F8E4M3` codes + f32 scale resident ([`LogicalTensor::PackedFp8E4M3`]), the exact operands
 //!   `CublasLt::matmul_fp8` consumes. E5M2 has no weight-side GEMM leg here and MXFP8 has no
@@ -140,6 +141,13 @@ impl CodecResidencyPolicy for CandleFp8Residency {
     }
 }
 
+/// The locked-decision-7 sm_89 predicate, applied to a plan-time `Device`.
+///
+/// The threshold is **not** re-derived here: the capability is read off the device and handed to
+/// [`crate::quant::compute_cap_meets_fp8_floor`], the same predicate
+/// `CublasLt::meets_fp8_floor` (`cfg(cuda)`, hence unlinked here) applies to a
+/// bound handle. Planning cannot go through the handle itself — `CublasLt::new` allocates the
+/// handle's 32 MiB workspace, and residency is decided before any GEMM exists.
 #[cfg(feature = "cuda")]
 fn cuda_meets_sm89_floor(device: &Device) -> bool {
     use crate::candle_core::cuda::cudarc::driver::sys::CUdevice_attribute as Attr;
@@ -154,7 +162,7 @@ fn cuda_meets_sm89_floor(device: &Device) -> bool {
     ) else {
         return false;
     };
-    (major, minor) >= (8, 9)
+    crate::quant::compute_cap_meets_fp8_floor((major, minor))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -209,16 +217,28 @@ pub enum LogicalTensor {
 }
 
 impl LogicalTensor {
-    /// Bytes this tensor keeps resident, measured from the actual representation.
+    /// Bytes this tensor keeps resident, measured from the actual representation — the reader's
+    /// **only** definition of resident cost (see [`read_logical_weights`]).
+    ///
+    /// The packed variant counts its retained scales here because it owns them: they survive the
+    /// decode as `f32` values on this struct, not as file rows. That is what makes the receipt an
+    /// independent measurement of the plan's `Packed` pricing (stored bytes on the tensor row,
+    /// `weight_scale`/`input_scale` on their companion rows) rather than a copy of it.
     pub fn resident_bytes(&self) -> u64 {
+        /// One retained `f32` scale.
+        const SCALE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
         match self {
             Self::Dense(tensor) => (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64,
             Self::PackedFp8E4M3 {
                 codes, input_scale, ..
             } => {
                 (codes.elem_count() * codes.dtype().size_in_bytes()) as u64
-                    + 4
-                    + if input_scale.is_some() { 4 } else { 0 }
+                    + SCALE_BYTES
+                    + if input_scale.is_some() {
+                        SCALE_BYTES
+                    } else {
+                        0
+                    }
             }
         }
     }
@@ -309,18 +329,15 @@ pub fn read_logical_weights(
             });
         report.tensor_count += 1;
         report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
-        // Measured from the decoded representation. The packed variant's scale bytes are measured
-        // on the companion rows below (the plan puts them there), so subtract nothing here: the
-        // Dense arm measures the tensor, the packed arm measures its codes only.
-        let measured = match &decoded {
-            LogicalTensor::Dense(dense) => {
-                (dense.elem_count() * dense.dtype().size_in_bytes()) as u64
-            }
-            LogicalTensor::PackedFp8E4M3 { codes, .. } => {
-                (codes.elem_count() * codes.dtype().size_in_bytes()) as u64
-            }
-        };
-        report.resident_bytes = report.resident_bytes.saturating_add(measured);
+        // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] reads it
+        // off the decoded value itself — including the scale companions a packed load retained,
+        // which the packed variant *owns* (it holds them as f32 values, not as file rows). The
+        // companion loop below therefore attributes source bytes only. Reading the retained half
+        // back off `plan.companions` would make `receipt == plan` self-referential on exactly the
+        // packed row the pair exists to cross-check.
+        report.resident_bytes = report
+            .resident_bytes
+            .saturating_add(decoded.resident_bytes());
         tensors.insert(tensor.logical_key.clone(), decoded);
     }
     for companion in &plan.companions {
@@ -329,9 +346,6 @@ pub fn read_logical_weights(
         };
         if let Some(report) = residency.get_mut(codec_id) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-            report.resident_bytes = report
-                .resident_bytes
-                .saturating_add(companion.resident_bytes);
         }
     }
     Ok(LogicalWeights {
@@ -578,6 +592,77 @@ mod tests {
             .expect("fixture dir")
     }
 
+    /// sc-20385 review: gen-core's own 256-code sweeps check `fp8_e4m3fn_to_f32` against a
+    /// `spec_e4m3fn` helper written from the same OCP bit fields in the same file — a
+    /// transliteration, so the two share any misreading of the table. `float8::F8E4M3` is a
+    /// third-party implementation of the same standard; agreeing with it on all 256 codes is
+    /// independent evidence. E5M2 gets the same treatment (its existing second oracle is the
+    /// binary16-top-byte identity, which is genuinely independent, so this is belt and braces).
+    ///
+    /// NaN is compared by class: E4M3FN has no infinities and two NaN codes (`0x7F`, `0xFF`).
+    #[test]
+    fn fp8_references_agree_with_the_float8_crate_on_all_256_codes() {
+        for code in 0..=u8::MAX {
+            let ours = gen_core::fp8_e4m3fn_to_f32(code);
+            let theirs = float8::F8E4M3::from_bits(code).to_f32();
+            assert_eq!(
+                ours.is_nan(),
+                theirs.is_nan(),
+                "e4m3 code {code:#04x}: NaN class disagrees ({ours} vs {theirs})"
+            );
+            if !ours.is_nan() {
+                assert_eq!(
+                    ours.to_bits(),
+                    theirs.to_bits(),
+                    "e4m3 code {code:#04x}: {ours} vs {theirs}"
+                );
+            }
+
+            let ours = gen_core::fp8_e5m2_to_f32(code);
+            let theirs = float8::F8E5M2::from_bits(code).to_f32();
+            assert_eq!(
+                ours.is_nan(),
+                theirs.is_nan(),
+                "e5m2 code {code:#04x}: NaN class disagrees ({ours} vs {theirs})"
+            );
+            if !ours.is_nan() {
+                assert_eq!(
+                    ours.to_bits(),
+                    theirs.to_bits(),
+                    "e5m2 code {code:#04x}: {ours} vs {theirs}"
+                );
+            }
+        }
+        // The sweep is only meaningful if the oracle actually distinguishes codes.
+        assert_eq!(float8::F8E4M3::from_bits(0x38).to_f32(), 1.0);
+        assert_eq!(float8::F8E5M2::from_bits(0x3C).to_f32(), 1.0);
+    }
+
+    /// sc-20385 review: the residency policy must not re-derive the locked-decision-7 sm_89
+    /// threshold. `CublasLt::meets_fp8_floor` and `CandleFp8Residency::probe`'s device predicate
+    /// both go through this one function, so the grid below pins the single definition. (The
+    /// `probe` side is `cfg(cuda)`; the shared predicate is not, so this runs on every lane.)
+    #[test]
+    fn the_eight_bit_track_floor_has_one_definition_at_sm89() {
+        assert_eq!(crate::quant::FP8_COMPUTE_CAP_FLOOR, (8, 9));
+        for (cap, expected) in [
+            ((7, 5), false),
+            ((8, 0), false),
+            ((8, 6), false),
+            ((8, 8), false),
+            ((8, 9), true),
+            ((8, 10), true),
+            ((9, 0), true),
+            ((12, 0), true),
+        ] {
+            assert_eq!(
+                crate::quant::compute_cap_meets_fp8_floor(cap),
+                expected,
+                "compute capability {cap:?}"
+            );
+        }
+    }
+
     /// Write a minimal safetensors file from `(name, dtype, shape, little-endian payload)` rows.
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], Vec<u8>)]) {
         let mut header_entries = Vec::new();
@@ -736,10 +821,23 @@ mod tests {
         assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
     }
 
-    /// Golden: `mxfp8-v1` with a declared logical shape [5, 40] inside stored [32, 64] — padding
+    /// Golden: `mxfp8-v1` with a declared logical shape [37, 70] inside stored [64, 96] — padding
     /// rows, a non-block-aligned column tail, poison in the padding, swizzled scales.
+    ///
+    /// Run for **both** on-disk spellings of the block-scale companion. `F8_E8M0` is what ComfyUI
+    /// actually writes (`torch.float8_e8m0fnu`) and is the case that matters here: candle reads
+    /// through `MmapedSafetensors` — the `safetensors` crate's parser, not gen-core's header
+    /// reader — so a fixture that only ever stored `U8` proved nothing about the real dtype
+    /// surviving that second parser. `U8` stays covered because re-serialized checkpoints in the
+    /// wild carry the scales that way.
     #[test]
     fn mxfp8_golden_unswizzles_unpads_and_decodes_exactly() {
+        for scale_dtype in ["F8_E8M0", "U8"] {
+            mxfp8_golden_case(scale_dtype);
+        }
+    }
+
+    fn mxfp8_golden_case(scale_dtype: &str) {
         struct DeclaredShape;
         impl LogicalKeyMapping for DeclaredShape {
             fn mapping_id(&self) -> &'static str {
@@ -753,7 +851,7 @@ mod tests {
             }
         }
         let dir = fixture_dir();
-        let path = dir.path().join("mxfp8.safetensors");
+        let path = dir.path().join(format!("mxfp8-{scale_dtype}.safetensors"));
         // 64 rows exercises BOTH 32-row halves of a 128-row swizzle tile; 96 columns = 3 blocks,
         // so the swizzled scale matrix carries a padded fourth column; logical [37, 70] leaves a
         // non-block-aligned column tail (70 = 2 full blocks + 6) and 27 padded rows.
@@ -777,7 +875,12 @@ mod tests {
             &path,
             &[
                 ("model.v.weight", "F8_E4M3", &stored, values.clone()),
-                ("model.v.weight_scale", "U8", &scale_shape, scales.clone()),
+                (
+                    "model.v.weight_scale",
+                    scale_dtype,
+                    &scale_shape,
+                    scales.clone(),
+                ),
                 (
                     "model.v.comfy_quant",
                     "U8",
@@ -786,22 +889,31 @@ mod tests {
                 ),
             ],
         );
-        let plan =
-            plan_logical_weights(&path, &DeclaredShape, &CandleFp8Residency::DENSE).expect("plan");
-        assert_eq!(plan.codec_ids(), ["mxfp8-v1"]);
-        assert_eq!(plan.tensors[0].shape, vec![37, 70]);
-        let weights = read_logical_weights(&path, &plan, &Device::Cpu).expect("read");
+        let plan = plan_logical_weights(&path, &DeclaredShape, &CandleFp8Residency::DENSE)
+            .unwrap_or_else(|error| panic!("plan ({scale_dtype} scales): {error}"));
+        assert_eq!(plan.codec_ids(), ["mxfp8-v1"], "{scale_dtype}");
+        assert_eq!(plan.tensors[0].shape, vec![37, 70], "{scale_dtype}");
+        let weights = read_logical_weights(&path, &plan, &Device::Cpu)
+            .unwrap_or_else(|error| panic!("read ({scale_dtype} scales): {error}"));
         let mut expected = Vec::new();
         gen_core::decode_mxfp8(&values, &scales, stored, [37, 70], &mut expected).unwrap();
         let expected: Vec<f32> = expected.into_iter().map(to_bf16).collect();
         let got = dense_f32(&weights, "v.weight");
-        assert_eq!(got, expected);
+        assert_eq!(got, expected, "{scale_dtype}");
         assert!(
             got.iter().all(|value| value.is_finite() && *value < 400.0),
-            "poison from the padding region leaked into the logical tensor"
+            "poison from the padding region leaked into the logical tensor ({scale_dtype})"
         );
-        assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
-        assert_eq!(weights.receipt.resident_bytes(), 37 * 70 * 2);
+        assert_eq!(
+            weights.receipt.resident_bytes(),
+            plan.resident_bytes(),
+            "{scale_dtype}"
+        );
+        assert_eq!(
+            weights.receipt.resident_bytes(),
+            37 * 70 * 2,
+            "{scale_dtype}"
+        );
     }
 
     /// The int8 per-row row plus a mixed file: dense bf16 + e4m3 + int8 dispatch per layer.
@@ -968,8 +1080,32 @@ mod tests {
             };
             assert!(error.contains("no CUDA fp8 leg"), "{error}");
         }
-        // On a CUDA build the packed read keeps F8E4M3 codes + scales resident; exercised by the
-        // windows-cuda lane (this lane's CPU device cannot hold F8E4M3 GEMM operands).
+        // On a CUDA build the packed read keeps F8E4M3 codes + scales resident; the read itself is
+        // exercised by the windows-cuda lane (this lane's CPU device cannot hold F8E4M3 GEMM
+        // operands). The *accounting* the receipt would then report is not cuda-gated, so pin it
+        // here against the plan rows above: the receipt measures the retained scales off the
+        // decoded value, so this number is derived independently of `plan.companions`.
+        let codes = Tensor::zeros((2, 4), DType::F8E4M3, &Device::Cpu).expect("codes");
+        assert_eq!(
+            LogicalTensor::PackedFp8E4M3 {
+                codes: codes.clone(),
+                weight_scale: 1.0,
+                input_scale: None,
+            }
+            .resident_bytes(),
+            8 + 4,
+            "packed codes + the retained weight_scale"
+        );
+        assert_eq!(
+            LogicalTensor::PackedFp8E4M3 {
+                codes,
+                weight_scale: 1.0,
+                input_scale: Some(0.5),
+            }
+            .resident_bytes(),
+            8 + 4 + 4,
+            "a retained input_scale is priced too"
+        );
     }
 
     #[test]

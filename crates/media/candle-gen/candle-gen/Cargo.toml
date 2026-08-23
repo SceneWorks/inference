@@ -63,3 +63,10 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
 [dev-dependencies]
 # Self-removing fixture roots for the training-driver tests (sc-17704).
 tempfile = { workspace = true }
+# An INDEPENDENT E4M3FN/E5M2 oracle for the sc-20385 codec sweeps. The `gen_core` reference decoders
+# and gen-core's own spec functions are both written from the OCP bit fields, so cross-checking one
+# against the other only proves the transliteration is faithful, not that the table is right. This
+# is a third-party implementation of the same standard, so a shared misreading shows up as a
+# disagreement. Unconditional (not behind `cuda`) so the sweep runs on every lane; already in
+# Cargo.lock at 0.7.0 as candle-core's own dependency, so this pulls in no new crate.
+float8 = "0.7"

@@ -133,6 +133,21 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
     Ok(PerChannelInt8Weight { q, scale })
 }
 
+/// **Locked-decision-7 8-bit floor**, as a `(major, minor)` compute capability: the whole 8-bit
+/// track (fp8 E4M3 *and* int8 IGEMM, which the hardware would allow at 8.0) is gated at sm_89.
+///
+/// The one definition of the threshold. `CublasLt::meets_fp8_floor` applies it to a bound handle's
+/// capability; callers that only have a `candle_core::Device` — the logical-weight residency policy
+/// decides packed-vs-dense at *plan* time, long before any GEMM handle exists, and building one
+/// would allocate the handle's 32 MiB workspace — read the capability off the device and apply it
+/// here. Neither re-spells `(8, 9)`.
+pub const FP8_COMPUTE_CAP_FLOOR: (i32, i32) = (8, 9);
+
+/// Whether a `(major, minor)` compute capability meets [`FP8_COMPUTE_CAP_FLOOR`].
+pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
+    cap >= FP8_COMPUTE_CAP_FLOOR
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -245,10 +260,10 @@ mod cuda_impl {
         }
 
         /// True iff the device meets the sc-9299 sm_89 floor (fp8 needs 8.9; int8 IGEMM 8.0, but the
-        /// whole 8-bit track is floored at 8.9 per locked-decision-7).
+        /// whole 8-bit track is floored at 8.9 per locked-decision-7). The threshold itself lives in
+        /// [`super::FP8_COMPUTE_CAP_FLOOR`] so the plan-time residency policy shares it.
         pub fn meets_fp8_floor(&self) -> Result<bool> {
-            let (maj, min) = self.compute_cap()?;
-            Ok(maj > 8 || (maj == 8 && min >= 9))
+            Ok(super::compute_cap_meets_fp8_floor(self.compute_cap()?))
         }
 
         /// True iff the device can run the NVFP4 block-scaled FP4 GEMM (sc-11039). The master-gate

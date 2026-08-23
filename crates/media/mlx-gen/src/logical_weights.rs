@@ -489,11 +489,21 @@ fn measure_residency(
         };
         if let Some(report) = by_codec.get_mut(codec_id) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-            // MLX consumes every companion (dense residency); a retained companion would be priced
-            // here if a packed policy ever lands on this backend.
-            report.resident_bytes = report
-                .resident_bytes
-                .saturating_add(companion.resident_bytes);
+            // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
+            // this seam — so every companion is consumed by its decode and retains nothing. Adding
+            // the plan's own number in would make the receipt a *copy* of the plan on exactly the
+            // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
+            // packed policy ever reaches this backend, the read refuses rather than silently
+            // agreeing with a residency it never measured.
+            if companion.resident_bytes != 0 {
+                return Err(Error::Msg(format!(
+                    "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
+                     this backend decodes every codec through its dense fallback and measures no \
+                     retained companion; replan with a dense residency policy, or teach \
+                     `measure_residency` to measure the retained form",
+                    companion.physical_key, companion.resident_bytes
+                )));
+            }
         }
     }
     Ok(by_codec.into_values().collect())
@@ -817,7 +827,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{bf16_bytes, write_safetensors};
     use super::*;
-    use gen_core::checkpoint_codec::{PlannedResidency, ResidencyMode};
+    use gen_core::checkpoint_codec::{
+        CompanionRole, CompanionTensorPlan, PlannedResidency, ResidencyMode,
+    };
 
     struct StripModel;
 
@@ -1570,6 +1582,7 @@ mod tests {
                 shape: vec![1],
                 source_bytes: 4,
                 codec_id: DENSE_BF16_CODEC.codec_id,
+                resident_encoding: WeightEncoding::DenseBf16,
                 codec: TensorCodecSpec::Dense,
                 residency: PlannedResidency {
                     mode: ResidencyMode::Dense,
@@ -1585,6 +1598,78 @@ mod tests {
         assert!(
             error.to_string().contains("planned as dense-bf16"),
             "{error}"
+        );
+    }
+
+    /// sc-20385 review: `measure_residency` used to add the plan's own `companion.resident_bytes`
+    /// into the measured total, so `receipt == plan` was a copy of the plan on that row rather than
+    /// a cross-check of it. This backend plans dense only and retains no companion, so the honest
+    /// form is to assert the invariant: a plan claiming a retained companion refuses.
+    #[test]
+    fn a_plan_that_retains_a_companion_refuses_because_this_backend_measures_none() {
+        let dir = fixture_dir();
+        let path = dir.path().join("retained-companion.safetensors");
+        write_safetensors(
+            &path,
+            &[
+                ("model.w", "BF16", &[1], bf16_bytes(&[1.0])),
+                (
+                    "model.w.weight_scale",
+                    "F32",
+                    &[],
+                    1.0_f32.to_le_bytes().to_vec(),
+                ),
+            ],
+        );
+        let plan = LogicalWeightPlan {
+            mapping_id: "strip-model-test",
+            tensors: vec![LogicalTensorPlan {
+                logical_key: "w".to_owned(),
+                physical_key: "model.w".to_owned(),
+                encoding: WeightEncoding::DenseBf16,
+                shape: vec![1],
+                source_bytes: 2,
+                codec_id: DENSE_BF16_CODEC.codec_id,
+                resident_encoding: WeightEncoding::DenseBf16,
+                codec: TensorCodecSpec::Dense,
+                residency: PlannedResidency {
+                    mode: ResidencyMode::Dense,
+                    resident_bytes: 2,
+                },
+            }],
+            companions: vec![CompanionTensorPlan {
+                physical_key: "model.w.weight_scale".to_owned(),
+                role: CompanionRole::WeightScale,
+                owner_physical_key: "model.w".to_owned(),
+                source_bytes: 4,
+                // A packed policy's answer — which this backend never produces and never measures.
+                resident_bytes: 4,
+            }],
+            source_bytes: 6,
+        };
+        let mut materialize = |weights: &mut Weights| weights.materialize();
+        let error = read_logical_weights(&path, &plan, LogicalReadMode::Eager(&mut materialize))
+            .err()
+            .expect("a retained companion must refuse, not be echoed back as measured");
+        let error = error.to_string();
+        assert!(
+            error.contains("planned to retain 4 resident bytes")
+                && error.contains("model.w.weight_scale"),
+            "{error}"
+        );
+
+        // The same fixture with the companion consumed reads fine, so the refusal is about the
+        // retained bytes and not about the companion's presence.
+        let mut consumed = plan.clone();
+        consumed.companions[0].resident_bytes = 0;
+        let mut materialize = |weights: &mut Weights| weights.materialize();
+        let weights =
+            read_logical_weights(&path, &consumed, LogicalReadMode::Eager(&mut materialize))
+                .expect("a consumed companion reads");
+        assert_eq!(
+            weights.receipt.resident_bytes(),
+            consumed.resident_bytes(),
+            "receipt and plan agree once nothing is retained"
         );
     }
 
@@ -1609,6 +1694,7 @@ mod tests {
                 shape: vec![1],
                 source_bytes: 2,
                 codec_id: DENSE_BF16_CODEC.codec_id,
+                resident_encoding: WeightEncoding::DenseBf16,
                 codec: TensorCodecSpec::Dense,
                 residency: PlannedResidency {
                     mode: ResidencyMode::Dense,

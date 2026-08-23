@@ -358,6 +358,23 @@ pub trait LogicalKeyMapping {
 }
 
 /// The identity mapping for checkpoints already stored under canonical keys.
+///
+/// # Not for undescribed-fp8 imports
+///
+/// This mapping accepts **every** on-disk key as a logical weight. That is safe for a checkpoint
+/// whose scale companions follow the `{layer}.weight_scale` / `{layer}.input_scale` /
+/// `{layer}.comfy_quant` suffixes this contract recognises — those are claimed as companions before
+/// the mapping is consulted. It is **not** safe for an fp8 checkpoint carrying an *unknown*
+/// scale convention (a different suffix, an inline `scale_weight`, a sidecar naming scheme): the
+/// compiler would not recognise the scale tensor as a companion, `logical_key` would accept it as
+/// an ordinary weight, and — because an undescribed fp8 tensor plans as
+/// [`FP8_E4M3_SCALAR_CODEC`] at [`ScalarScaleSource::Unit`] — the layer's real weights would
+/// decode at **unit scale**, silently wrong rather than refused.
+///
+/// So a provider importing undescribed fp8 must supply an adapter-owned [`LogicalKeyMapping`] that
+/// knows its family's key surface (and refuses keys it does not recognise), not this one. The
+/// orphan-companion check catches only the suffixes named above; an unknown convention's scale
+/// tensor is invisible to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdentityKeyMapping;
 
@@ -492,6 +509,12 @@ pub struct LogicalTensorPlan {
     /// Bytes the weight tensor occupies in the source file (companions not included).
     pub source_bytes: u64,
     pub codec_id: &'static str,
+    /// What this tensor's codec row leaves resident after its **dense fallback** — copied from the
+    /// registered [`CheckpointCodecRegistration::resident_encoding`] at compile time, when the
+    /// registry row is in hand. Pricing consumers read it here rather than re-finding the row by
+    /// id, so a codec registered outside the built-in const tables prices from its own declaration
+    /// instead of silently falling back to the tensor's *stored* encoding.
+    pub resident_encoding: WeightEncoding,
     pub codec: TensorCodecSpec,
     pub residency: PlannedResidency,
 }
@@ -606,10 +629,7 @@ impl LogicalWeightPlan {
             .map(|tensor| {
                 let (dtype, shape) = match tensor.residency.mode {
                     ResidencyMode::Dense => (
-                        match self
-                            .codec_row_resident_encoding(tensor.codec_id)
-                            .unwrap_or(tensor.encoding)
-                        {
+                        match tensor.resident_encoding {
                             WeightEncoding::DenseBf16 => Dtype::BF16,
                             WeightEncoding::DenseF16 => Dtype::F16,
                             WeightEncoding::DenseF32 => Dtype::F32,
@@ -649,14 +669,6 @@ impl LogicalWeightPlan {
                 }
             })
             .collect()
-    }
-
-    fn codec_row_resident_encoding(&self, codec_id: &str) -> Option<WeightEncoding> {
-        [DENSE_CODECS, COMFY_QUANT_CODECS]
-            .into_iter()
-            .flatten()
-            .find(|codec| codec.codec_id == codec_id)
-            .map(|codec| codec.resident_encoding)
     }
 }
 
@@ -1280,7 +1292,21 @@ pub fn compile_logical_weight_plan(
                     );
                     let input_scale_key = format!("{base}{INPUT_SCALE_SUFFIX}");
                     if let Some(input_header) = by_name.get(input_scale_key.as_str()) {
-                        consume_companion(input_header, CompanionRole::InputScale, &header.name, 0);
+                        // Same rule as the ScalarFp8 arm: a packed-native load keeps the activation
+                        // scale resident, a dense decode consumes it. Pricing it at zero
+                        // unconditionally would under-report a packed MXFP8 row. (Only the MXFP8
+                        // half of this arm can get here — the companion-surface check above refuses
+                        // an `input_scale` on an `int8_tensorwise` layer by format.)
+                        let retained = match mode {
+                            ResidencyMode::Packed => input_header.data_bytes,
+                            ResidencyMode::Dense => 0,
+                        };
+                        consume_companion(
+                            input_header,
+                            CompanionRole::InputScale,
+                            &header.name,
+                            retained,
+                        );
                     }
                 }
             }
@@ -1293,6 +1319,7 @@ pub fn compile_logical_weight_plan(
             shape: logical_shape,
             source_bytes: header.data_bytes,
             codec_id: codec.codec_id,
+            resident_encoding: codec.resident_encoding,
             codec: codec_spec,
             residency: PlannedResidency {
                 mode,
@@ -1609,7 +1636,10 @@ mod tests {
 
     #[test]
     fn every_safetensors_dtype_classifies_to_exactly_one_encoding_with_its_width() {
-        for (dtype, encoding, width) in [
+        // The per-variant expectation table. Iterating `Dtype::ALL` below (rather than this table)
+        // is what makes a newly added `Dtype` variant fail here instead of silently classifying to
+        // `None`: an unlisted variant has no expectation and the lookup panics by name.
+        let expected: BTreeMap<Dtype, (WeightEncoding, u64)> = [
             (Dtype::BOOL, WeightEncoding::Bool, 1),
             (Dtype::U8, WeightEncoding::UInt8, 1),
             (Dtype::I8, WeightEncoding::Int8, 1),
@@ -1625,7 +1655,25 @@ mod tests {
             (Dtype::F64, WeightEncoding::DenseF64, 8),
             (Dtype::I64, WeightEncoding::Int64, 8),
             (Dtype::U64, WeightEncoding::UInt64, 8),
-        ] {
+        ]
+        .into_iter()
+        .map(|(dtype, encoding, width)| (dtype, (encoding, width)))
+        .collect();
+
+        for &dtype in Dtype::ALL {
+            // E8M0 is a companion-only dtype: never a weight element encoding. It is the one
+            // deliberate `None`, and it is named here rather than left as an unlisted gap.
+            if dtype == Dtype::F8_E8M0 {
+                assert_eq!(WeightEncoding::from_dtype(dtype), None, "{dtype:?}");
+                continue;
+            }
+            let &(encoding, width) = expected.get(&dtype).unwrap_or_else(|| {
+                panic!(
+                    "{dtype:?} is a `Dtype` variant with no expectation in this test: classify it \
+                     to a `WeightEncoding` (or add it to the E8M0 companion-only exemption) \
+                     instead of letting it fall to `None` unnoticed"
+                )
+            });
             assert_eq!(
                 WeightEncoding::from_dtype(dtype),
                 Some(encoding),
@@ -1633,8 +1681,8 @@ mod tests {
             );
             assert_eq!(encoding.element_bytes(), width, "{encoding:?}");
         }
-        // E8M0 is a companion-only dtype: never a weight element encoding.
-        assert_eq!(WeightEncoding::from_dtype(Dtype::F8_E8M0), None);
+        // Every expectation was reached: the table has no rows `Dtype::ALL` cannot name.
+        assert_eq!(expected.len() + 1, Dtype::ALL.len());
     }
 
     #[test]
@@ -1824,6 +1872,99 @@ mod tests {
         let mut file: Vec<&str> = headers.iter().map(|header| header.name.as_str()).collect();
         file.sort_unstable();
         assert_eq!(all, file);
+    }
+
+    /// sc-20385 review: the shared MXFP8 / int8-per-row companion arm recorded `input_scale` at
+    /// **zero** resident bytes unconditionally, while the ScalarFp8 arm branched on the residency
+    /// mode, so a packed MXFP8 row under-priced its retained activation scale. Both arms now use
+    /// the same `match mode` rule.
+    ///
+    /// Only the MXFP8 half of that arm can actually carry an `input_scale`: the companion-surface
+    /// check refuses one on an `int8_tensorwise` layer by format (asserted below), so the int8 row
+    /// here contributes its `weight_scale` only.
+    #[test]
+    fn packed_mxfp8_rows_retain_their_input_scale_companion() {
+        struct PackEverything;
+        impl CodecResidencyPolicy for PackEverything {
+            fn residency(
+                &self,
+                _codec: &CheckpointCodecRegistration,
+                _spec: &TensorCodecSpec,
+                _stored_shape: &[usize],
+            ) -> ResidencyMode {
+                ResidencyMode::Packed
+            }
+        }
+        // Both codec rows that share the arm; the MXFP8 one carries the activation scale.
+        let mut headers = vec![
+            header("model.o.weight", Dtype::I8, &[4, 8]),
+            header("model.o.weight_scale", Dtype::F32, &[4]),
+            header("model.o.comfy_quant", Dtype::U8, &[1]),
+            header("model.v.weight", Dtype::F8_E4M3, &[32, 64]),
+            header("model.v.weight_scale", Dtype::U8, &[128, 4]),
+            header("model.v.input_scale", Dtype::F32, &[1]),
+            header("model.v.comfy_quant", Dtype::U8, &[1]),
+        ];
+        let mut descriptors = BTreeMap::new();
+        for (key, json) in [
+            (
+                "model.o.comfy_quant",
+                r#"{"format": "int8_tensorwise", "per_row": true}"#,
+            ),
+            ("model.v.comfy_quant", r#"{"format": "mxfp8"}"#),
+        ] {
+            let (mut blob_header, payload) = descriptor_blob(json);
+            blob_header.name = key.to_owned();
+            *headers
+                .iter_mut()
+                .find(|header| header.name == key)
+                .unwrap() = blob_header;
+            descriptors.insert(key.to_owned(), payload);
+        }
+
+        let packed = compile_logical_weight_plan(
+            &headers,
+            &descriptors,
+            &StripPrefix,
+            &full(),
+            &PackEverything,
+        )
+        .unwrap();
+        let companion = |plan: &LogicalWeightPlan, key: &str| {
+            plan.companions
+                .iter()
+                .find(|companion| companion.physical_key == key)
+                .unwrap()
+                .resident_bytes
+        };
+        // Retained at its stored width — 4 bytes, not zero.
+        assert_eq!(companion(&packed, "model.v.input_scale"), 4);
+        // And the weight scales alongside it, so the input-scale row is the only thing this
+        // fixture could be getting wrong.
+        assert_eq!(companion(&packed, "model.o.weight_scale"), 16);
+        assert_eq!(companion(&packed, "model.v.weight_scale"), 512);
+        // The plan total accounts for every retained byte.
+        assert_eq!(packed.resident_bytes(), 32 + 16 + 32 * 64 + 512 + 4);
+
+        // Under the dense policy the same companion is consumed, so the assertion above is about
+        // the packed branch, not about the fixture always pricing scales.
+        let dense = compile(&headers, &descriptors, &StripPrefix, &full()).unwrap();
+        assert_eq!(companion(&dense, "model.v.input_scale"), 0);
+
+        // The int8 half of the shared arm cannot reach the branch at all: an `input_scale` on an
+        // `int8_tensorwise` layer is refused by format before residency is decided.
+        let mut with_int8_input_scale = headers.clone();
+        with_int8_input_scale.push(header("model.o.input_scale", Dtype::F32, &[]));
+        assert!(matches!(
+            compile(
+                &with_int8_input_scale,
+                &descriptors,
+                &StripPrefix,
+                &full()
+            ),
+            Err(LogicalWeightPlanError::UnexpectedCompanion { physical_key, .. })
+                if physical_key == "model.o.input_scale"
+        ));
     }
 
     /// A packed-selecting policy prices packed layers at stored + retained scales, EXCEPT layers
@@ -2248,5 +2389,42 @@ mod tests {
         // The header sum is the plan's resident bytes (all companions consumed under dense).
         let sum: u64 = resident.iter().map(|header| header.data_bytes).sum();
         assert_eq!(sum, plan.resident_bytes());
+    }
+
+    /// sc-20385 review: `resident_tensor_headers` used to re-find the codec row by scanning the two
+    /// hardcoded const tables and, when the scan missed, fell back to the tensor's **stored**
+    /// encoding. A codec registered outside those tables therefore synthesized a pricing header
+    /// whose dtype contradicted its own `data_bytes` — and the dtype is what the Q4/Q8 projections
+    /// read. The plan now carries `resident_encoding` from the registry row it compiled against.
+    #[test]
+    fn a_codec_outside_the_const_tables_prices_from_its_own_resident_encoding() {
+        // Stored int8, dense fallback f32: divergent from the stored encoding (Int8) *and* from
+        // every built-in row (`int8-per-row-v1` leaves bf16), so neither the const scan nor the
+        // stored-encoding fallback can accidentally produce the right answer.
+        const SYNTHETIC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+            codec_id: "synthetic-int8-to-f32-v1",
+            stored: &[StoredTensorFormat::undescribed(WeightEncoding::Int8)],
+            resident_encoding: WeightEncoding::DenseF32,
+        };
+        let registry =
+            CheckpointCodecRegistry::new(DENSE_CODECS.iter().copied().chain([SYNTHETIC])).unwrap();
+        let headers = [header("model.w.weight", Dtype::I8, &[4, 8])];
+        let plan = compile(&headers, &no_descriptors(), &StripPrefix, &registry).unwrap();
+        let tensor = &plan.tensors[0];
+        assert_eq!(tensor.codec_id, SYNTHETIC.codec_id);
+        assert_eq!(tensor.resident_encoding, WeightEncoding::DenseF32);
+        assert_eq!(tensor.residency.resident_bytes, 4 * 8 * 4);
+
+        let resident = plan.resident_tensor_headers();
+        assert_eq!(resident.len(), 1);
+        assert_eq!(resident[0].dtype, Dtype::F32);
+        // The synthesized header must be internally consistent: dtype width × logical elements is
+        // the byte count it reports. The old const scan produced I8 here against 128 bytes.
+        let elements: usize = resident[0].shape.iter().product();
+        assert_eq!(
+            (elements * resident[0].dtype.size()) as u64,
+            resident[0].data_bytes
+        );
+        assert_eq!(resident[0].data_bytes, 4 * 8 * 4);
     }
 }

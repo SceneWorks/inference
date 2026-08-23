@@ -7,8 +7,9 @@
 //! consumed by prompt conditioning; it is evidence input only and never grants production
 //! calibration by itself.
 
-use mlx_gen::gen_core::weightsmeta::Dtype;
-use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
+use mlx_gen::gen_core::weightsmeta::{
+    safetensors_path_tensor_headers, Dtype, SafetensorsTensorHeader,
+};
 use mlx_gen::gen_core::{Error as CoreError, Result as CoreResult};
 use mlx_gen::{LoadSpec, OffloadPolicy, Precision, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
