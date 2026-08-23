@@ -14,7 +14,7 @@ use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, Result,
+    MemoryStrategy, MemoryStructuralResidentEvidence, Result,
 };
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
@@ -37,6 +37,12 @@ pub trait Generator {
     /// The loaded provider's memory-strategy contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
+        None
+    }
+
+    /// Load-exact structural evidence for a deliberately narrow estimate-backed Resident route.
+    /// This never substitutes for measured calibration and is absent by default.
+    fn structural_resident_evidence(&self) -> Option<&MemoryStructuralResidentEvidence> {
         None
     }
 
@@ -927,6 +933,23 @@ pub struct ControlClipRef<'a> {
     pub mode: ReplacementMode,
 }
 
+/// Exact SCAIL-2 public animation carrier: one character image, its paired color mask, and one
+/// driving clip with a one-to-one frame/mask sequence. The three physical conditioning entries are
+/// one conceptual character reference for memory-evidence geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct Scail2AnimationConditioningRef<'a> {
+    pub character: &'a Image,
+    pub character_mask: &'a Image,
+    pub driving_frames: &'a [Image],
+    pub driving_masks: &'a [Image],
+}
+
+impl Scail2AnimationConditioningRef<'_> {
+    pub const fn reference_count(&self) -> u32 {
+        1
+    }
+}
+
 impl GenerationRequest {
     /// Number of image-conditioning inputs represented by this request for memory-evidence
     /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
@@ -946,6 +969,19 @@ impl GenerationRequest {
             };
             count.saturating_add(increment)
         })
+    }
+
+    /// Conceptual reference count used by memory evidence and request scopes. SCAIL-2's physical
+    /// `Reference + Mask + ControlClip` list describes one character identity, not two images (or
+    /// three generic conditioning entries); every other carrier retains the generic image count.
+    pub fn memory_reference_count(&self) -> u32 {
+        if self.video_mode.as_deref() == Some("animation")
+            && self.scail2_animation_conditioning().is_ok()
+        {
+            1
+        } else {
+            self.image_reference_count()
+        }
     }
 
     /// The first request-supplied `Option<f32>` knob that is **non-finite** (NaN / ±Inf), returned as
@@ -1319,6 +1355,51 @@ impl GenerationRequest {
                 mode: *mode,
             }),
             _ => None,
+        })
+    }
+
+    /// Parse the exact ordered SCAIL-2 animation carrier. This deliberately does not infer the
+    /// route from `conditioning.len() == 3`: every position and field is typed and crossed shapes
+    /// fail closed before a provider configures or loads tensors.
+    pub fn scail2_animation_conditioning(
+        &self,
+    ) -> crate::Result<Scail2AnimationConditioningRef<'_>> {
+        let [Conditioning::Reference {
+            image: character,
+            strength: None,
+        }, Conditioning::Mask {
+            image: character_mask,
+        }, Conditioning::ControlClip {
+            frames,
+            mask: driving_masks,
+            masking_strength,
+            start_frame,
+            mode,
+        }] = self.conditioning.as_slice()
+        else {
+            return Err(Error::Unsupported(
+                "scail2 animation requires exactly ordered Reference(strength unset), Mask, and ControlClip conditioning"
+                    .to_owned(),
+            ));
+        };
+        if frames.is_empty() || driving_masks.len() != frames.len() {
+            return Err(Error::Unsupported(format!(
+                "scail2 animation requires one driving mask per non-empty driving frame ({} frames, {} masks)",
+                frames.len(),
+                driving_masks.len()
+            )));
+        }
+        if *masking_strength != 1.0 || *start_frame != 0 || *mode != ReplacementMode::default() {
+            return Err(Error::Unsupported(
+                "scail2 animation ControlClip requires masking_strength=1, start_frame=0, and full-person mode"
+                    .to_owned(),
+            ));
+        }
+        Ok(Scail2AnimationConditioningRef {
+            character,
+            character_mask,
+            driving_frames: frames,
+            driving_masks,
         })
     }
 
@@ -3241,6 +3322,54 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    #[test]
+    fn scail2_typed_carrier_is_one_reference_and_rejects_crossed_shapes() {
+        let exact = GenerationRequest {
+            video_mode: Some("animation".to_owned()),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(2, 2),
+                    strength: None,
+                },
+                Conditioning::Mask { image: img(2, 2) },
+                Conditioning::ControlClip {
+                    frames: vec![img(2, 2), img(2, 2)],
+                    mask: vec![img(2, 2), img(2, 2)],
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: ReplacementMode::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let carrier = exact.scail2_animation_conditioning().unwrap();
+        assert_eq!(carrier.reference_count(), 1);
+        assert_eq!(exact.memory_reference_count(), 1);
+        assert_eq!(
+            exact.image_reference_count(),
+            2,
+            "physical Mask remains visible generically"
+        );
+
+        let mut extra = exact.clone();
+        extra.conditioning.push(Conditioning::Reference {
+            image: img(2, 2),
+            strength: None,
+        });
+        assert!(extra.scail2_animation_conditioning().is_err());
+
+        let mut mismatched = exact.clone();
+        let Conditioning::ControlClip { mask, .. } = &mut mismatched.conditioning[2] else {
+            unreachable!()
+        };
+        mask.pop();
+        assert!(mismatched.scail2_animation_conditioning().is_err());
+
+        let mut replacement = exact;
+        replacement.video_mode = Some("replacement".to_owned());
+        assert_eq!(replacement.memory_reference_count(), 2);
     }
 
     #[test]

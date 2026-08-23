@@ -36,6 +36,7 @@ pub mod adapters;
 pub mod clip;
 pub mod config;
 pub mod generate;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
@@ -84,7 +85,9 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Scail2 provider catalog.

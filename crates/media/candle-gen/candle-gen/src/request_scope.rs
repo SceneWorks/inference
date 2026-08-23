@@ -153,7 +153,7 @@ impl MemoryRequestScope for CandleRequestScopeCore {
             || request.count == 0
             || request.count > self.config.geometry.batch
             || request.frames.unwrap_or(self.config.default_frames) != self.config.geometry.frames
-            || request.image_reference_count() != self.config.geometry.reference_count
+            || request.memory_reference_count() != self.config.geometry.reference_count
         {
             return Err(Error::Unsupported(format!(
                 "{}: request geometry {}x{}x{} frames={} references={} does not fit admitted {}x{}x{} frames={} references={}",
@@ -162,7 +162,7 @@ impl MemoryRequestScope for CandleRequestScopeCore {
                 request.height,
                 request.count,
                 request.frames.unwrap_or(self.config.default_frames),
-                request.image_reference_count(),
+                request.memory_reference_count(),
                 self.config.geometry.width,
                 self.config.geometry.height,
                 self.config.geometry.batch,
