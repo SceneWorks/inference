@@ -1352,6 +1352,22 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
         .iter()
         .copied()
         .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN));
+    let reference_axis_count = axes
+        .iter()
+        .filter(|axis| is_reference_receipt_axis(axis))
+        .count();
+    let seal_axis_count = axes
+        .iter()
+        .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+        .count();
+    let mv2v_axis_count = axes
+        .iter()
+        .filter(|axis| is_mv2v_receipt_axis(axis))
+        .count();
+    let mv2v_seal_count = axes
+        .iter()
+        .filter(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
+        .count();
     let receipt_has_video = reference_axis.is_some_and(reference_receipt_has_video);
     if mode == "reference_to_video"
         && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
@@ -1385,8 +1401,13 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
         ));
     }
     if mode == "multi_video_to_video"
-        && (mv2v_axis.is_none()
+        && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
+            || mv2v_axis.is_none()
             || mv2v_seal.is_none()
+            || mv2v_axis_count != 1
+            || mv2v_seal_count != 1
+            || reference_axis_count != 0
+            || seal_axis_count != 0
             || !mv2v_axis.is_some_and(|axis| {
                 axis.contains(&format!(":count-{}:", context.geometry.reference_count))
                     && axis.matches("video-").count() == context.geometry.reference_count as usize
@@ -1582,7 +1603,10 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
         overlap: u32,
         mut geometry: gen_core::MemoryGeometry,
     ) -> gen_core::Result<()> {
-        if self.route == BerniniMemoryRoute::Clip {
+        if matches!(
+            self.route,
+            BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+        ) {
             geometry.reference_count = 0;
         } else if self.route == BerniniMemoryRoute::ClipAndImages {
             geometry.reference_count = geometry.reference_count.saturating_sub(1);
@@ -1798,7 +1822,10 @@ pub fn begin_request(
     };
     let expected_reference_receipt = source_receipt_from_overlay(context.overlay.as_deref());
     let mut geometry = context.geometry;
-    if route == BerniniMemoryRoute::Clip {
+    if matches!(
+        route,
+        BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+    ) {
         geometry.reference_count = 0;
     } else if route == BerniniMemoryRoute::ClipAndImages {
         geometry.reference_count = geometry.reference_count.saturating_sub(1);
@@ -2549,6 +2576,72 @@ mod tests {
                 scope.enter_phase(MemoryPhase::Conditioning).unwrap();
                 scope.leave_phase(MemoryPhase::Conditioning).unwrap();
                 scope.finish(outcome).unwrap();
+            }
+
+            let mut scope =
+                begin_request(&contract, tier(&spec), Device::Cpu, &fixtures[3].context)
+                    .unwrap()
+                    .expect("MV2V scope");
+            let mut request = fixtures[3].request.clone();
+            scope.configure_request(&mut request).unwrap();
+            let parameters = fixtures[3].context.selection.parameters;
+            scope
+                .configure_decode(
+                    parameters.decode_tile_edge.unwrap(),
+                    parameters.decode_overlap.unwrap(),
+                    fixtures[3].context.geometry,
+                )
+                .unwrap();
+            scope.finish(MemoryRunOutcome::Complete).unwrap();
+        }
+    }
+
+    #[test]
+    fn candle_mv2v_safety_rejects_duplicate_crossed_and_malformed_source_axes_before_scope() {
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/missing".into()));
+        for provider_id in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            let fixtures =
+                registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
+            let exact = fixtures[3].context.clone();
+            assert_eq!(
+                safety_check(&contract, tier(&spec), &exact),
+                MemorySafetyDecision::Accept,
+                "{provider_id}: exact MV2V context"
+            );
+            let overlay = exact.overlay.clone().unwrap();
+            let mv2v_axis = overlay
+                .split('+')
+                .find(|axis| is_mv2v_receipt_axis(axis))
+                .unwrap();
+            let mv2v_seal = overlay
+                .split('+')
+                .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
+                .unwrap();
+            let r2v_overlay = fixtures[1].context.overlay.as_deref().unwrap();
+            let r2v_axis = r2v_overlay
+                .split('+')
+                .find(|axis| is_reference_receipt_axis(axis))
+                .unwrap();
+            let r2v_seal = r2v_overlay
+                .split('+')
+                .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+                .unwrap();
+
+            for invalid_overlay in [
+                format!("{overlay}+{mv2v_axis}"),
+                format!("{overlay}+{mv2v_seal}"),
+                format!("{overlay}+{r2v_axis}+{r2v_seal}"),
+                format!(
+                    "provider_video_mode:mv2v+{MV2V_RECEIPT_DOMAIN}:backend-candle:malformed+{MV2V_SEAL_DOMAIN}-bad"
+                ),
+            ] {
+                let mut crossed = exact.clone();
+                crossed.overlay = Some(invalid_overlay);
+                assert!(matches!(
+                    safety_check(&contract, tier(&spec), &crossed),
+                    MemorySafetyDecision::Reject { .. }
+                ));
             }
         }
     }

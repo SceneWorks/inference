@@ -1012,6 +1012,22 @@ pub(crate) fn safety_check(
             .iter()
             .copied()
             .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN));
+        let reference_axis_count = axes
+            .iter()
+            .filter(|axis| is_reference_receipt_axis(axis))
+            .count();
+        let seal_axis_count = axes
+            .iter()
+            .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+            .count();
+        let mv2v_axis_count = axes
+            .iter()
+            .filter(|axis| is_mv2v_receipt_axis(axis))
+            .count();
+        let mv2v_seal_count = axes
+            .iter()
+            .filter(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
+            .count();
         let receipt_has_video = reference_axis.is_some_and(reference_receipt_has_video);
         if mode == "reference_to_video"
             && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
@@ -1046,8 +1062,13 @@ pub(crate) fn safety_check(
             ));
         }
         if mode == "multi_video_to_video"
-            && (mv2v_axis.is_none()
+            && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
+                || mv2v_axis.is_none()
                 || mv2v_seal.is_none()
+                || mv2v_axis_count != 1
+                || mv2v_seal_count != 1
+                || reference_axis_count != 0
+                || seal_axis_count != 0
                 || !mv2v_axis.is_some_and(|axis| {
                     axis.contains(&format!(":count-{}:", context.geometry.reference_count))
                         && axis.matches("video-").count()
@@ -1614,7 +1635,10 @@ fn begin_with_cleanup(
     // VideoClip is a temporal carrier and therefore maps to zero image references in the shared
     // core. MultiReference is flattened and stays equal to the exact 1-8 image count.
     let mut core_geometry = context.geometry;
-    if route == BerniniMemoryRoute::Clip {
+    if matches!(
+        route,
+        BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+    ) {
         core_geometry.reference_count = 0;
     } else if route == BerniniMemoryRoute::ClipAndImages {
         core_geometry.reference_count = core_geometry.reference_count.saturating_sub(1);
@@ -1835,7 +1859,10 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
         overlap: u32,
         mut geometry: MemoryGeometry,
     ) -> CoreResult<()> {
-        if self.route == BerniniMemoryRoute::Clip {
+        if matches!(
+            self.route,
+            BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+        ) {
             geometry.reference_count = 0;
         } else if self.route == BerniniMemoryRoute::ClipAndImages {
             geometry.reference_count = geometry.reference_count.saturating_sub(1);
@@ -3035,6 +3062,56 @@ mod tests {
                     MemorySafetyDecision::Accept,
                     "{provider_id}/{strategy:?}/mv2v"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn mv2v_safety_rejects_duplicate_crossed_and_malformed_source_axes_before_scope() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        for provider_id in PROVIDER_IDS {
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            let fixtures =
+                registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
+            let exact = fixtures[3].context.clone();
+            assert_eq!(
+                safety_check(&spec, &contract, &exact),
+                MemorySafetyDecision::Accept,
+                "{provider_id}: exact MV2V context"
+            );
+            let overlay = exact.overlay.clone().unwrap();
+            let mv2v_axis = overlay
+                .split('+')
+                .find(|axis| is_mv2v_receipt_axis(axis))
+                .unwrap();
+            let mv2v_seal = overlay
+                .split('+')
+                .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
+                .unwrap();
+            let r2v_overlay = fixtures[1].context.overlay.as_deref().unwrap();
+            let r2v_axis = r2v_overlay
+                .split('+')
+                .find(|axis| is_reference_receipt_axis(axis))
+                .unwrap();
+            let r2v_seal = r2v_overlay
+                .split('+')
+                .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+                .unwrap();
+
+            for invalid_overlay in [
+                format!("{overlay}+{mv2v_axis}"),
+                format!("{overlay}+{mv2v_seal}"),
+                format!("{overlay}+{r2v_axis}+{r2v_seal}"),
+                format!(
+                    "provider_video_mode:mv2v+{MV2V_RECEIPT_DOMAIN}:backend-mlx:malformed+{MV2V_SEAL_DOMAIN}-bad"
+                ),
+            ] {
+                let mut crossed = exact.clone();
+                crossed.overlay = Some(invalid_overlay);
+                assert!(matches!(
+                    safety_check(&spec, &contract, &crossed),
+                    MemorySafetyDecision::Reject { .. }
+                ));
             }
         }
     }
