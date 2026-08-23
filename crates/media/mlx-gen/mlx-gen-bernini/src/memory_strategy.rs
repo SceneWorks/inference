@@ -1308,17 +1308,18 @@ pub(crate) fn registered_valid_fixture(
     rv2v_context.mode = MemoryMode::Other("reference_video_to_video".to_owned());
     rv2v_context.geometry.reference_count = 3;
     rv2v_context.overlay = Some(format!("provider_video_mode:rv2v+{rv2v_reference_axis}"));
+    let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
-            load_spec: None,
+            load_spec,
         },
     ])
 }
