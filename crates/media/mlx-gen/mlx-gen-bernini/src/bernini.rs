@@ -954,11 +954,15 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors `PackedForward::build_combos`/packing_vae).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V is trained with its mandatory source-video/reference-video/first-image triplet;
+        // extra images interpolate over that three-source range. Keep this execution schedule in
+        // lockstep with the request receipt used for admission evidence.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Array, f64)> = src_videos
             .iter()
             .enumerate()
@@ -1038,7 +1042,7 @@ impl Bernini {
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
                 cfg.patch_size,
-                self.knobs.max_trained_src_id,
+                trained_sources,
                 self.knobs.interpolate_src_id,
             );
             let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
