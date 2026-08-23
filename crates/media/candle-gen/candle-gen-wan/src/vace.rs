@@ -16,15 +16,16 @@
 //! bf16; VACE follows it).
 
 use candle_gen::candle_core::{DType, Device, Error as CoreError, Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{CancelFlag, GenerationRequest};
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::WanVaceConfig;
 use crate::model_vace::ProviderVae;
 use crate::pipeline::cfg;
+use crate::quant::QLinear;
 use crate::scheduler::{FlowScheduler, Sampler};
-use crate::transformer::{linear, ln_no_affine, timestep_sinusoid, Block};
+use crate::transformer::{ln_no_affine, timestep_sinusoid, Block};
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
 const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
@@ -56,23 +57,23 @@ fn load_patch_conv(
 /// main noisy-latent tokens into the control stream once) and `proj_out` (every block — emits the
 /// per-layer hint). Diffusers `WanVACETransformerBlock`.
 struct VaceBlock {
-    proj_in: Option<Linear>,
+    proj_in: Option<QLinear>,
     core: Block,
-    proj_out: Linear,
+    proj_out: QLinear,
 }
 
 impl VaceBlock {
     fn new(cfg: &WanVaceConfig, vb: VarBuilder, has_proj_in: bool) -> Result<Self> {
         let dim = cfg.base.dim;
         let proj_in = if has_proj_in {
-            Some(linear(dim, dim, vb.pp("proj_in"))?)
+            Some(QLinear::linear_detect(dim, dim, &vb, "proj_in", true)?)
         } else {
             None
         };
         Ok(Self {
             proj_in,
             core: Block::new(&cfg.base, vb.clone())?,
-            proj_out: linear(dim, dim, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect(dim, dim, &vb, "proj_out", true)?,
         })
     }
 
@@ -105,15 +106,15 @@ pub struct WanVaceTransformer {
     patch_b: Tensor,
     vace_patch_w: Tensor, // vace_patch_embedding (96→dim)
     vace_patch_b: Tensor,
-    text_l1: Linear,
-    text_l2: Linear,
-    time_l1: Linear,
-    time_l2: Linear,
-    time_proj: Linear,
+    text_l1: QLinear,
+    text_l2: QLinear,
+    time_l1: QLinear,
+    time_l2: QLinear,
+    time_proj: QLinear,
     blocks: Vec<Block>,
     vace_blocks: Vec<VaceBlock>,
     scale_shift_table: Tensor, // head [1,2,dim] f32
-    proj_out: Linear,          // head proj
+    proj_out: QLinear,         // head proj
     cfg: WanVaceConfig,
     device: Device,
     dtype: DType,
@@ -136,11 +137,13 @@ impl WanVaceTransformer {
         )?;
 
         let ce = vb.pp("condition_embedder");
-        let text_l1 = linear(base.text_dim, dim, ce.pp("text_embedder").pp("linear_1"))?;
-        let text_l2 = linear(dim, dim, ce.pp("text_embedder").pp("linear_2"))?;
-        let time_l1 = linear(base.freq_dim, dim, ce.pp("time_embedder").pp("linear_1"))?;
-        let time_l2 = linear(dim, dim, ce.pp("time_embedder").pp("linear_2"))?;
-        let time_proj = linear(dim, 6 * dim, ce.pp("time_proj"))?;
+        let text_l1 =
+            QLinear::linear_detect(base.text_dim, dim, &ce, "text_embedder.linear_1", true)?;
+        let text_l2 = QLinear::linear_detect(dim, dim, &ce, "text_embedder.linear_2", true)?;
+        let time_l1 =
+            QLinear::linear_detect(base.freq_dim, dim, &ce, "time_embedder.linear_1", true)?;
+        let time_l2 = QLinear::linear_detect(dim, dim, &ce, "time_embedder.linear_2", true)?;
+        let time_proj = QLinear::linear_detect(dim, 6 * dim, &ce, "time_proj", true)?;
 
         let mut blocks = Vec::with_capacity(base.num_layers);
         for i in 0..base.num_layers {
@@ -154,7 +157,8 @@ impl WanVaceTransformer {
             vace_blocks.push(VaceBlock::new(cfg, vb.pp("vace_blocks").pp(j), j == 0)?);
         }
 
-        let proj_out = linear(dim, base.out_channels * pt * ph * pw, vb.pp("proj_out"))?;
+        let proj_out =
+            QLinear::linear_detect(dim, base.out_channels * pt * ph * pw, &vb, "proj_out", true)?;
         let scale_shift_table = vb
             .get((1, 2, dim), "scale_shift_table")?
             .to_dtype(DType::F32)?;
@@ -337,6 +341,26 @@ impl WanVaceTransformer {
             }
         }
         self.head(&x, &temb, grid)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
+    fn all_projections_packed(&self) -> bool {
+        self.text_l1.is_packed()
+            && self.text_l2.is_packed()
+            && self.time_l1.is_packed()
+            && self.time_l2.is_packed()
+            && self.time_proj.is_packed()
+            && self.proj_out.is_packed()
+            && self
+                .blocks
+                .iter()
+                .all(crate::transformer::Block::all_projections_packed)
+            && self.vace_blocks.iter().all(|block| {
+                block.proj_in.as_ref().map_or(true, QLinear::is_packed)
+                    && block.proj_out.is_packed()
+                    && block.core.all_projections_packed()
+            })
     }
 
     pub fn device(&self) -> &Device {
@@ -589,9 +613,231 @@ pub fn denoise_vace_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TransformerConfig;
+    use crate::rope::WanRope;
+    use candle_gen::candle_core::safetensors::MmapedSafetensors;
+    use std::collections::HashMap;
 
     fn dev() -> Device {
         Device::Cpu
+    }
+
+    /// A one-main-block / one-VACE-block configuration whose every linear width is a real MLX
+    /// group-64 multiple. It lets this test exercise the actual VACE transformer dispatch without
+    /// staging a 14B checkpoint.
+    fn tiny_packed_cfg() -> WanVaceConfig {
+        WanVaceConfig {
+            base: TransformerConfig {
+                in_channels: 16,
+                out_channels: 16,
+                num_layers: 1,
+                num_heads: 1,
+                head_dim: 64,
+                dim: 64,
+                ffn_dim: 64,
+                freq_dim: 64,
+                text_dim: 64,
+                patch: (1, 2, 2),
+                eps: 1e-6,
+                rope_theta: 10_000.0,
+                rope_max_seq_len: 16,
+            },
+            vace_layers: vec![0],
+            vace_in_channels: 96,
+        }
+    }
+
+    fn put_dense(map: &mut HashMap<String, Tensor>, name: &str, shape: &[usize], dev: &Device) {
+        map.insert(
+            name.to_owned(),
+            Tensor::zeros(shape, DType::F32, dev).unwrap(),
+        );
+    }
+
+    fn put_packed(
+        map: &mut HashMap<String, Tensor>,
+        name: &str,
+        out: usize,
+        input: usize,
+        bits: i32,
+        dev: &Device,
+    ) {
+        assert_eq!(input % crate::quant::GROUP_SIZE, 0);
+        let packed_cols = match bits {
+            4 => input / 8,
+            8 => input / 4,
+            _ => panic!("test supports q4/q8 only"),
+        };
+        map.insert(
+            format!("{name}.weight"),
+            Tensor::zeros((out, packed_cols), DType::U32, dev).unwrap(),
+        );
+        map.insert(
+            format!("{name}.scales"),
+            Tensor::ones((out, input / crate::quant::GROUP_SIZE), DType::F32, dev).unwrap(),
+        );
+        map.insert(
+            format!("{name}.biases"),
+            Tensor::zeros((out, input / crate::quant::GROUP_SIZE), DType::F32, dev).unwrap(),
+        );
+        put_dense(map, &format!("{name}.bias"), &[out], dev);
+    }
+
+    fn put_block(
+        map: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &TransformerConfig,
+        bits: i32,
+        dev: &Device,
+    ) {
+        let d = cfg.dim;
+        put_dense(map, &format!("{prefix}.scale_shift_table"), &[1, 6, d], dev);
+        for attn in ["attn1", "attn2"] {
+            for projection in ["to_q", "to_k", "to_v", "to_out.0"] {
+                put_packed(
+                    map,
+                    &format!("{prefix}.{attn}.{projection}"),
+                    d,
+                    d,
+                    bits,
+                    dev,
+                );
+            }
+            put_dense(map, &format!("{prefix}.{attn}.norm_q.weight"), &[d], dev);
+            put_dense(map, &format!("{prefix}.{attn}.norm_k.weight"), &[d], dev);
+        }
+        put_dense(map, &format!("{prefix}.norm2.weight"), &[d], dev);
+        put_dense(map, &format!("{prefix}.norm2.bias"), &[d], dev);
+        put_packed(
+            map,
+            &format!("{prefix}.ffn.net.0.proj"),
+            cfg.ffn_dim,
+            d,
+            bits,
+            dev,
+        );
+        put_packed(
+            map,
+            &format!("{prefix}.ffn.net.2"),
+            d,
+            cfg.ffn_dim,
+            bits,
+            dev,
+        );
+    }
+
+    fn tiny_packed_transformer(bits: i32) -> (WanVaceTransformer, WanVaceConfig) {
+        let dev = Device::Cpu;
+        let cfg = tiny_packed_cfg();
+        let base = &cfg.base;
+        let mut map = HashMap::new();
+        put_dense(
+            &mut map,
+            "patch_embedding.weight",
+            &[base.dim, base.in_channels, 1, 2, 2],
+            &dev,
+        );
+        put_dense(&mut map, "patch_embedding.bias", &[base.dim], &dev);
+        put_dense(
+            &mut map,
+            "vace_patch_embedding.weight",
+            &[base.dim, cfg.vace_in_channels, 1, 2, 2],
+            &dev,
+        );
+        put_dense(&mut map, "vace_patch_embedding.bias", &[base.dim], &dev);
+        put_packed(
+            &mut map,
+            "condition_embedder.text_embedder.linear_1",
+            base.dim,
+            base.text_dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "condition_embedder.text_embedder.linear_2",
+            base.dim,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "condition_embedder.time_embedder.linear_1",
+            base.dim,
+            base.freq_dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "condition_embedder.time_embedder.linear_2",
+            base.dim,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "condition_embedder.time_proj",
+            6 * base.dim,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_block(&mut map, "blocks.0", base, bits, &dev);
+        put_block(&mut map, "vace_blocks.0", base, bits, &dev);
+        put_packed(
+            &mut map,
+            "vace_blocks.0.proj_in",
+            base.dim,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "vace_blocks.0.proj_out",
+            base.dim,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_packed(
+            &mut map,
+            "proj_out",
+            base.out_channels * 4,
+            base.dim,
+            bits,
+            &dev,
+        );
+        put_dense(&mut map, "scale_shift_table", &[1, 2, base.dim], &dev);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(format!("vace-q{bits}.safetensors"));
+        candle_gen::candle_core::safetensors::save(&map, &path).unwrap();
+        // Use the same mmap-backed safetensors route as a hosted expert, not a dense `VarMap` fixture.
+        let mapped = unsafe { MmapedSafetensors::new(&path) }.unwrap();
+        let vb = VarBuilder::from_backend(Box::new(mapped), DType::F32, dev);
+        (WanVaceTransformer::new(&cfg, vb).unwrap(), cfg)
+    }
+
+    #[test]
+    fn q4_and_q8_tiers_dispatch_every_vace_projection_through_packed_qlinear() {
+        for bits in [4, 8] {
+            let (transformer, cfg) = tiny_packed_transformer(bits);
+            assert!(transformer.all_projections_packed(), "q{bits}");
+            let dev = Device::Cpu;
+            let latents = Tensor::zeros((1, 16, 1, 2, 2), DType::F32, &dev).unwrap();
+            let control = Tensor::zeros((1, 96, 1, 2, 2), DType::F32, &dev).unwrap();
+            let control_emb = transformer.embed_control(&control, 1).unwrap();
+            let context = Tensor::zeros((1, 1, cfg.base.dim), DType::F32, &dev).unwrap();
+            let (cos, sin) = WanRope::new(&cfg.base).cos_sin(1, 1, 1, &dev).unwrap();
+            let out = transformer
+                .forward_cached(&latents, 500.0, &control_emb, &context, &[1.0], &cos, &sin)
+                .unwrap();
+            assert_eq!(out.dims(), &[1, 16, 1, 2, 2]);
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! This is **video+audio**: the video-stack DiT, the Gemma-3-12B text encoder, the video connector,
 //! and the video VAE decoder, plus the synchronized-audio stack (audio text head + connector, the
 //! dual-modal AV DiT, the audio VAE decoder, and the vocoder — sc-5495) are all consumed. The 2-stage
-//! latent upsampler, prompt-enhance, and fp8/on-the-fly quant are deferred to follow-up stories.
+//! learned latent upsampler and its second distilled refinement pass are consumed by the provider.
 //! I2V/keyframes/IC-LoRA clips and inference LoRA/PEFT-LoKr are wired by the package pipeline.
 
 /// Registry id (the distilled 22B text-to-video model).
@@ -33,7 +33,7 @@ pub const DEFAULT_FPS: u32 = 24;
 pub const DEFAULT_FRAMES: u32 = 49;
 /// Default pixel width/height (multiples of `SPATIAL_SCALE`).
 pub const DEFAULT_WIDTH: u32 = 704;
-pub const DEFAULT_HEIGHT: u32 = 480;
+pub const DEFAULT_HEIGHT: u32 = 512;
 
 /// Gemma prompt token budget (left-padded). The connector replaces the left-pad slots with its
 /// learnable registers, so this caps the real-token context fed to the DiT cross-attention.
@@ -64,13 +64,18 @@ pub fn max_latent_tokens() -> usize {
     MAX_LATENT_TOKENS
 }
 
-/// Distilled single-stage rectified-flow sigma schedule (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps:
-/// σ goes 1.0 → 0.0, a complete generation). The 2-stage refinement (upsample + re-noise + the
-/// `STAGE2` sigmas) is deferred to a follow-up; stage-1 alone at the target resolution is a full,
-/// coherent render. The distilled model bakes guidance in → **no CFG**.
+/// Half-resolution stage-one rectified-flow schedule (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps:
+/// σ goes 1.0 → 0.0). Its denoised latent is VAE-denormalized, transformed by the learned 2×
+/// upsampler, re-normalized and freshly re-noised for [`STAGE2_SIGMAS`] at full resolution. The
+/// distilled model bakes guidance in → **no CFG**.
 pub const STAGE1_SIGMAS: [f32; 9] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
 ];
+
+/// The learned-upsampled full-resolution refinement schedule.  It is intentionally
+/// separate from `NATIVE_STEPS`: the public distilled stage-one contract remains
+/// eight steps while an Eros render executes 8 + 3 learned refinement steps.
+pub const STAGE2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 
 /// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`). This is
 /// the ONLY step count the distilled model supports — the σ waypoints are baked into training, so an
@@ -78,6 +83,18 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
 /// runs this many steps unconditionally; [`crate::descriptor`]'s `validate` rejects any other explicit
 /// `req.steps` rather than silently ignoring it (sc-9027 / F-043).
 pub const NATIVE_STEPS: u32 = STAGE1_SIGMAS.len() as u32 - 1;
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    #[test]
+    fn stage_two_is_exactly_three_refinement_steps() {
+        assert_eq!(STAGE2_SIGMAS, [0.909375, 0.725, 0.421875, 0.0]);
+        assert_eq!(STAGE2_SIGMAS.len() - 1, 3);
+        assert_eq!(NATIVE_STEPS, 8);
+    }
+}
 
 /// The LTX-2.3 video DiT (`AVTransformer3DModel`, video stack) dimensions.
 #[derive(Clone, Debug)]

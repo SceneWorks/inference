@@ -239,10 +239,47 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
+  # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
+  # like the real checkpoint it stands in for and then leave it unwritten, which is free on APFS and
+  # ext4 but allocates every cluster on NTFS unless the file is flagged sparse first. The assertions
+  # that pin the flag are therefore `#[cfg(windows)]`, and before this lane NOTHING executed them:
+  # `contracts` runs on ubuntu-latest, where those blocks compile out, and `windows-cuda-check`
+  # builds its test binaries with `--no-run`. A regression that made every multi-GB fixture allocate
+  # its full length again -- the failure that filled the Windows CUDA box's system drive twice and
+  # ended a candle-worker run with StorageFull, os error 112 -- was green on every automatic lane.
+  #
+  # Deliberately HOSTED windows-latest, not the self-hosted `[windows, cuda]` pair. The testkit
+  # links no tensor library and no CUDA (see its Cargo.toml), so it builds cold in well under a
+  # minute of hosted time, and the four self-hosted runners stay free for work that needs a GPU box.
+  # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
+  # resource in this repo to run a test that needs nothing but a filesystem.
+  contracts-windows:
+    name: contracts testkit (Windows)
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` -- see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
+      # package set. This lane is here only for the assertions that need a real NTFS volume.
+      - name: Test contracts testkit on NTFS
+        run: cargo test --locked -p sceneworks-gen-core-testkit
+
   # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
   # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
   # steps, with the same commands and the same step names, and all four are gated on the same
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
+  #
+  # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
+  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
+  # either; see the notes on those steps.)
   #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
@@ -339,9 +376,101 @@ jobs:
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
         # crashes lld with SIGBUS. That was observed even with the Clippy tree already reclaimed, so
         # moving Clippy to its own runner does not lift it.
+        #
+        # `--lib` here is deliberate for these three groups and is NOT the sc-19447 defect:
+        #   * candle-llm's `conformance` target already executes in `candle-cpu-conformance`;
+        #   * `candle-audio*`'s integration targets are named one by one in that same job's SA3
+        #     step, a choice `scripts/tests/test_sa3_ci_target_coverage.py` polices — widening
+        #     them to `--tests` here would link SA3's real-weight-only binaries for zero cases and
+        #     silently make that guard redundant;
+        #   * runtime-cpu has no `tests/` directory at all.
+        # `candle-gen*` moved to its own invocation below because it was the group that had no
+        # `--tests` runner anywhere.
         run: >-
           cargo test --locked --lib -j 1
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p 'candle-audio*' -p runtime-cpu
+      # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
+      # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
+      # under all-target Clippy without running them, `windows-cuda-check` compiles them
+      # `--no-run`, `macos-metal` Clippies candle without testing it, and the only `--tests` runner
+      # for the family is the `workflow_dispatch`-only `windows-cuda` job. An entire epic's
+      # candle-side parity evidence therefore compiled green and was never evaluated.
+      #
+      # `--tests` over the whole `candle-gen*` glob rather than a curated `--test` list, which is
+      # the shape the sibling `macos-metal` job already uses for `mlx-gen*`. A curated list would
+      # need ~25 separate invocations and would rot the moment a target is added — the exact drift
+      # `test_sa3_ci_target_coverage.py` exists to catch on the audio side. The glob cannot drift,
+      # and `scripts/tests/test_candle_gen_ci_target_coverage.py` pins that it stays a glob that
+      # covers every crate carrying weight-free cases.
+      #
+      # Weight-bound cases stay out of this lane by ONE of two mechanisms, and only these two are
+      # trustworthy: `#[ignore]` (libtest reports `ignored`) or a file-level `#![cfg(feature =
+      # "cuda")]` (the target compiles to an empty binary). They stay reachable from the manual
+      # `windows-cuda` dispatch and from `real-weights.yml`, which is the deliberate split — see
+      # sc-19447 for the per-target classification and for the real-weight targets no lane names.
+      #
+      # A THIRD mechanism existed and was NOT trustworthy: 14 cases carried neither marker and
+      # instead printed `SKIP` and `return`ed when their guard was unsatisfied. libtest reports
+      # those as **passed**. Widening this step to `--tests` would therefore have converted "never
+      # evaluated" into "reported as evaluated" — the exact defect class sc-19447 exists to remove,
+      # laundered rather than fixed.
+      #
+      # THE 14 WERE NOT ONE KIND, and sc-19447 converted all of them to `#[ignore]` as though they
+      # were. THE REAL SPLIT IS 13 + 1:
+      #   * 13 are ENV-GATED and weight-bound — `candle-gen-flux2`'s `vae_encode_parity` and all
+      #     eleven `candle-gen-lens` `*_parity` targets (12 files; `encoder_quant_parity` carries
+      #     two such cases and factors its guard into a helper, so a body-only reading of the
+      #     sources undercounts). For these, `#[ignore]` is right: their weights are not on any
+      #     runner, so no lane should run them, and `real-weights.yml` opts in explicitly.
+      #   * 1 is DEVICE-GATED and weight-free, and it was LANE-REACHABLE: `candle-gen`'s
+      #     `cuda_quant_smoke::cuda_qmatmul_matches_cpu`, the sole canary for the sc-7544 silent-
+      #     zeros GGUF QMatMul regression. It gates on `default_device().is_cuda()`, not on an env
+      #     var, and the `windows-cuda` job below runs `--features cuda` with **no `-- --ignored`**
+      #     — so `#[ignore]` did not park it beside the weight-bound twelve, it SILENCED it on the
+      #     one lane that has ever executed it. It is `#![cfg(feature = "cuda")]` now: excluded
+      #     from this lane by the second trustworthy mechanism above (empty binary on
+      #     `ubuntu-latest`), and executed rather than `ignored` under `--features cuda`. Do not
+      #     re-`#[ignore]` it — see that file's module header.
+      #
+      # `scripts/tests/test_candle_gen_ci_target_coverage.py` refuses to count a self-skipping
+      # case as weight-free coverage and fails on any new one, so the class cannot re-enter
+      # silently. sd3's `reference_manifests_are_consistent_if_present` is deliberately NOT in that
+      # set: its references are committed to the repo, so it really does assert on every run.
+      #
+      # `-j 1` is carried over from the step above for the same lld/SIGBUS reason, and matters more
+      # here: this invocation links ~176 additional test binaries. `--lib` is redundant next to
+      # `--tests` (cargo's `--tests` already selects the lib's own test target — verified: both
+      # forms produce the same 210 binaries) and is kept only so this reads identically to the
+      # `macos-metal` invocation it is modelled on.
+      #
+      # MEASURED COST, so the widening is a deliberate choice rather than a silent one (sc-19447
+      # AC1). The number that governs is the HOSTED one; a local aarch64 figure understates it by
+      # roughly 5x and must not be quoted as the budget.
+      #
+      # HOSTED LINUX (ubuntu-latest, this job, wall-clock from the Actions API):
+      #   before  run 32328255786  main @f17c8254   job 528s   `Test Candle packages` 466s
+      #   after   run 32383334859  PR   @9ff4cecb3  job 1304s  `Test Candle packages` 261s
+      #                                                        + this step             999s
+      #   => +776s (+12m56s) on the job, a 2.47x increase. Run 32376222131 (@d308b185f) logged
+      #      1011s for this same step independently, so 999s is not a one-off.
+      #   Compare the JOB totals, not the steps: `Test Candle packages` also moved (466s -> 261s)
+      #   and no cause for that has been established — a main push saves the rust-cache while a PR
+      #   only restores it, so the two runs did not start from the same warmth. Attributing the
+      #   step-level delta to this change would be a guess; the job total is what was measured.
+      #
+      # LOCAL aarch64 (warm deps, only `candle-gen*` rebuilt, same `-j 1` / `RUST_TEST_THREADS=1`):
+      #   ~+2m43s. Recorded only to show the two do not agree — do NOT budget from it.
+      #
+      # WALL CLOCK vs RUNNER MINUTES — these are different costs and only one of them is free:
+      #   * Wall clock: unaffected. `macos-metal` (3391s in run 32383334859, with the `CI gate` job
+      #     starting 4s after it) is the binding constraint; this job now finishes ~40m before it.
+      #   * Runner minutes: ~13 additional minutes of hosted Linux on EVERY candle-touching PR.
+      #     That is the real price, it is paid per push, and it is the first thing to re-measure
+      #     (or to split across runners) if the candle lane's cost is ever questioned.
+      - name: Test Candle gen packages and integration targets
+        run: >-
+          cargo test --locked --lib --tests -j 1
+          -p 'candle-gen*'
 
   candle-cpu-conformance:
     name: Candle CPU conformance + SA3 gates (Linux)
@@ -922,6 +1051,7 @@ jobs:
       - format
       - workspace
       - contracts
+      - contracts-windows
       - candle-cpu-lint
       - candle-cpu-test
       - candle-cpu-conformance

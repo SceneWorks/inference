@@ -123,24 +123,35 @@
 //!
 //! | arm | tier | resident | window 1 | ratio |
 //! | --- | --- | ---: | ---: | ---: |
-//! | text encoder | bf16 | 53.07 GB | 5.81 GB | **9.13x** |
+//! | text encoder | bf16 (dense) | 53.07 GB | 4.50 GB | **11.79x** |
+//! | text encoder | q8 | 26.98 GB | 1.43 GB | **18.88x** |
+//! | text encoder | q4 | 14.43 GB | 0.80 GB | **18.13x** |
 //! | DiT | bf16 | 39.58 GB | 1.90 GB | **20.82x** |
 //! | DiT | q8 | 21.64 GB | 1.58 GB | **13.73x** |
 //! | DiT | q4 | 12.00 GB | 1.36 GB | **8.85x** |
 //!
-//! Output was **bit-identical** at every window on every arm and tier, so nothing is traded. Both
-//! resident figures reproduce this module's own stage constants from a different harness —
-//! [`CONDITIONING_STAGE_PEAK_BYTES`] and [`DENOISE_RESIDENT_BF16_BYTES`] — which is what makes them
-//! attributable to a component rather than to a process-wide mark.
+//! Output is **bit-identical** (`0.000e0` relative max-abs) at every window on every arm and tier,
+//! so nothing is traded. Both resident figures reproduce this module's own stage constants from a
+//! different harness — [`CONDITIONING_STAGE_PEAK_BYTES`] and [`DENOISE_RESIDENT_BF16_BYTES`] —
+//! which is what makes them attributable to a component rather than to a process-wide mark.
+//!
+//! **What "bit-identical" now rests on, and what it used to rest on (sc-17153).** The claim was
+//! previously made from the dense arm alone, which is the one encoder no tiered render loads; the
+//! packed tiers' windowed output was compared against nothing. Both packed arms are now measured
+//! and both are bit-identical, so the claim is true of the encoders that ship — but it is a
+//! statement about *measured runs*, not a property the path guarantees: see
+//! [`TRANSFORMER_WINDOW_SIZE`]'s fault note for an observed all-zero windowed context that no
+//! memory assertion in this rung can see.
 //!
 //! Three things that declaration decides deliberately:
 //!
 //! * **[`TransformerComponent::Both`], not `Dit`.** The conditioning stage is still the taller of
 //!   the two at every tier even after sc-19120's packed encoder, and declaring the DiT alone would
-//!   leave it with no lever at all. The TE arm is the larger absolute saving — 47.26 GB against the
+//!   leave it with no lever at all. The TE arm is the larger absolute saving — 48.57 GB against the
 //!   DiT's 37.68 GB at bf16.
-//! * **A singleton window domain.** [`TRANSFORMER_WINDOW_SIZE`] is `1` because the parameter is
-//!   *measured inert* above it, not because 1 is a safe default. See that constant.
+//! * **A singleton window domain.** [`TRANSFORMER_WINDOW_SIZE`] is `1` because 1 is the *measured
+//!   residency floor* on every tier, not because the parameter is inert above it (it is not — the
+//!   packed tiers spread 2.17-3.12x) and not because 1 is a safe default. See that constant.
 //! * **Rung 4 does not depend on rung 3.** Its sole shared prerequisite is the load shape
 //!   (`BOUNDED_TRANSFORMER_RESIDENCY_REQUIRES`), not rung 1 and not rung 3 — so sc-18661's
 //!   `StructurallyNotApplicable` verdict, which satisfies prerequisite edges vacuously, introduces
@@ -158,7 +169,9 @@
 //!
 //! * **`TransformerSubStack`, not `Transformer`.** The projections are *inside*
 //!   `asset_facts.transformer_bytes`; declaring them as a whole transformer would charge 26 GB
-//!   twice. They are not auxiliary either, so `overlay_bytes` stays 0.
+//!   twice. They are not auxiliary either, so they contribute nothing to `overlay_bytes` — which
+//!   carries the configured LoRA stack and only that (sc-18650), and is 0 on a render with no
+//!   adapter.
 //! * **`residency`, not `default_engagement_exclusions`.** That list excludes a *rung* from
 //!   cost-order engagement; it cannot remove bytes from a formula, and there is no rung here to
 //!   exclude. `bounded_by` is `None` for the same reason — the drop is unconditional on the shipped
@@ -170,11 +183,11 @@
 
 use mlx_gen::gen_core::{
     safetensors_path_bytes, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
+    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
+    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
+    MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, ResidentRequestMemory,
     TransformerComponent, WeightsSource,
@@ -461,32 +474,110 @@ fn resolved_load_shape(spec: &LoadSpec) -> LoadShape {
 /// The **only** transformer window size this provider admits: one block or layer at a time.
 ///
 /// **The singleton is the finding, not a placeholder** — the same shape rung 2's
-/// [`DECODE_TILE_EDGE`] has, for its own separate reason.
+/// [`DECODE_TILE_EDGE`] has, for its own separate reason. What makes it the right point is that
+/// **1 is the measured residency floor**, not that the parameter is inert.
 ///
-/// `mlx_gen::block_residency::run_windowed`'s `apply` releases each block as soon as it is consumed
-/// rather than at the end of the window, so even a 50-block all-covering plan holds one block at a
-/// time and the plan's window never sets the residency. Measured on the real encoder across
-/// `[1, 5, 10, 50]`: a **1.09x** spread across the whole range, against **9.13x below resident** —
-/// the run-to-run noise (~1 GB) is larger than the spread across window sizes.
+/// # The inertness claim was wrong, and it was wrong because it was measured on one tier (sc-17153)
 ///
-/// Publishing `[1, 5, 10, 50]` would advertise a lever whose other values do nothing, which is the
-/// inert-parameter defect this epic keeps refusing. SC-15448's rung-4 survey recorded the same
-/// window-inert-above-1 behaviour on another family; this reproduces it independently.
+/// This constant used to say the window parameter is *measured inert* above 1, citing a **1.09x**
+/// spread across `[1, 5, 10, 50]`. That spread was taken on the **dense** encoder, where a single
+/// Qwen3 layer's f32 upcast dominates the peak at every window size and flattens the curve
+/// (re-measured: 1.39x). It does not describe the encoder a shipped tiered render loads. Measured
+/// on the packed tiers, per window, on real weights:
+///
+/// | tier | resident | window 1 | window 5 | window 10 | window 50 | spread |
+/// | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+/// | `bf16` (dense) | 53.07 GB | **4.50 GB** | 6.24 GB | 6.24 GB | 6.24 GB | 1.39x |
+/// | `q8` | 26.98 GB | **1.43 GB** | 2.65 GB | 2.78 GB | 3.10 GB | 2.17x |
+/// | `q4` | 14.43 GB | **0.80 GB** | 1.78 GB | 1.95 GB | 1.87 GB | 2.45x |
+///
+/// The packed spread runs 2.17-3.12x across runs (sc-17153's terminal campaign independently
+/// measured 3.12x on `q4`), so the parameter is a **real lever** on every encoder a tiered render
+/// uses, and the retired `< 2.0` spread assertion in `tests/block_window_real.rs` was asserting
+/// something false about them.
+///
+/// What holds on **every encoder tier measured**, with a wide margin, is that window 1 is the
+/// minimum: 4.50 GB against 6.24 (dense), 1.43 against 2.65-3.10 (`q8`), 0.80 against 1.78-1.95
+/// (`q4`). The curve above 1 is not strictly monotonic — `q4` runs 1.78 -> 1.95 -> 1.87 across
+/// windows 5/10/50, so the ordering *among the larger windows* is counter noise — but the floor is
+/// separated from all of them by 1.9x or more. That is what justifies publishing the singleton:
+/// `[1]` is the cheapest point of a real curve, and the other values would advertise a lever that
+/// trades memory *away*.
+///
+/// `tests/block_window_real.rs::measure_te_arm` asserts the floor (with the harness's 256 MiB / 5 %
+/// margin, not as a strict ordering) and bounds the spread, on **both TE arms**. The DiT arm is
+/// deliberately not covered by that claim: it measures resident against window 1 only, so whether
+/// 1 is *its* floor is unmeasured — see [`RUNG4_DIT_MEASURED_PEAKS`].
+///
+/// # ⚠ The DENSE encoder has been observed returning an all-zero context — UNFIXED
+///
+/// Five sightings in ~32 real-weight forwards on this hardware (sc-17153): identical shapes, clean
+/// exit, no Metal diagnostic, `max = 0.0` where the correct answer is `1.55e4`. What the sightings
+/// have in common is now specific enough to be actionable:
+///
+/// * **Every sighting is the `bf16` dense encoder.** Zero sightings across ~14 `q4` / `q8` arms.
+/// * **It is NOT windowing.** Three sightings were *resident* forwards, two windowed — including
+///   two resident ones after this module's loader fix, on a path that never goes near
+///   `from_dir_deferred`. Rung 4 neither causes it nor is exposed to it more than the resident
+///   path is, and the loader fix neither introduced nor removed it.
+/// * **It is NOT the window size.** Reversing the order of `[1, 5, 10, 50]` moved the zero from
+///   window 1 to window 50.
+/// * **It IS the second multi-gigabyte encoder load in one process, reading cold.** Four of the
+///   five fit exactly that: two dense resident loads that followed the packed arm in the same test
+///   binary (167.2 s and 166.9 s cold — both zero), against two that were the *first* load in
+///   their process (156.0 s and 72.6 s cold — both correct), and twelve warm loads at any position
+///   (all correct). The two windowed sightings are the same shape: a window that followed a 53 GB
+///   resident load in the same process. The one outlier was a 2-layer probe taken while ~20
+///   compilers were running.
+///
+/// The mechanism is below this crate and is **unattributed**; nothing here claims to have removed
+/// it. Two things this crate does about it:
+///
+/// 1. `tests/block_window_real.rs` compares the context against a reference on every arm and
+///    refuses a degenerate reference — that assertion caught sightings four and five live. The peak
+///    counter reads *lower* when the work does not happen, so no memory assertion in this rung can
+///    see it, and neither can a norm, a cosine or a checksum.
+/// 2. That file now **requires** each arm to be its own process invocation, which is what its own
+///    module text had always claimed and what `--test-threads=1` does not provide.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 /// **The TE arm** (sc-18662, AC3), measured on the real Qwen3-VL-32B tap by
 /// `tests/block_window_real.rs`: resident bytes, and the window-1 floor.
 ///
-/// 53.07 GB -> 5.81 GB, a **9.13x** reduction and the single largest memory change this rung
+/// 53.07 GB -> 4.50 GB, an **11.79x** reduction and the single largest memory change this rung
 /// produces on this model. The resident figure independently reproduces
 /// [`CONDITIONING_STAGE_PEAK_BYTES`]'s 53.07 GB from a different harness, which is what makes it
 /// attributable to the encoder rather than to a process-wide mark.
 ///
 /// Output was **bit-identical** (`0.000e0` relative max-abs) at every window size, so nothing is
-/// traded for it.
+/// traded for it — but read the fault note on [`TRANSFORMER_WINDOW_SIZE`] before treating
+/// "bit-identical" as a property of the path rather than of the runs that were measured.
+///
+/// # The windowed figure moved with the mlx-rs pin (sc-17153): 5.81 GB -> 4.50 GB
+///
+/// `RUNG4_TE_WINDOWED_PEAK_BYTES` was declared at `5_814_845_376`. It does not reproduce: eight
+/// runs on real weights land at `4_501_440_448` B ± ~0.5 MB, 1.31 GB (22.6 %) below the declared
+/// value and far outside `common::assert_declared_peak_constant`'s bound — which is the
+/// per-constant absolute bound sc-17153 introduced precisely so a stale member of a pair could not
+/// hide inside a quotient. The resident member is unchanged and reproduces to 2.4 MB, so this was
+/// exactly the *single-member* drift a ratio band cancels.
+///
+/// **The cause is the MLX pin, not this crate.** `git diff` from the sc-18662 measurement
+/// (`19efeb265`) to the current tree over `src/text_encoder/`, `src/block_stream.rs` and the
+/// harness is doc- and comment-only — nothing in the crate accounts for a 22.6 % drop. What moved
+/// is `Cargo.toml`'s mlx-rs revision, `932beb4e6` -> **`7151a9b27`**, in `dfd76b5ae`
+/// ("fix(mlx): preserve global VAE normalization in tiled decode", sc-19753). So:
+///
+/// * this figure is **pinned to mlx-rs `7151a9b27`**, and an MLX pin bump is the event that should
+///   be expected to move it again — when it does, the assertion will red with a *stale constant*
+///   message, and the pin is the first thing to check rather than this crate's loaders;
+/// * it also independently rules out the alternative reading, that 4.50 GB is what a *degenerate*
+///   (all-zero) run happens to peak at. It is not: the zero-output runs peak lower still, and
+///   `tests/block_window_real.rs` compares output before it records a cell, so no run that
+///   produced zeros can contribute a peak to this constant.
 pub const RUNG4_TE_RESIDENT_PEAK_BYTES: u64 = 53_074_721_216;
 /// The TE arm at [`TRANSFORMER_WINDOW_SIZE`]. See [`RUNG4_TE_RESIDENT_PEAK_BYTES`].
-pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 5_814_845_376;
+pub const RUNG4_TE_WINDOWED_PEAK_BYTES: u64 = 4_501_440_448;
 
 /// **The DiT arm**, per tier: `(tier, resident_peak_bytes, window_1_peak_bytes)`.
 ///
@@ -531,8 +622,20 @@ pub const RUNG4_DIT_MEASURED_PEAKS: [(&str, u64, u64); 3] = [
 /// 2.03 GB, decode **5.80 GB** — so the request is decode-bound, which is what the phase
 /// envelope's `max(TE, DiT, decode)` arithmetic predicted (5.77 GB) before the request ran.
 ///
-/// Held to a ±25% band by the harness rather than to the byte — the peak counter carries ~1 GB of
-/// run-to-run spread on this machine.
+/// **Graded to ±290 MB, not to a ±25% band** (sc-17153). `tests/streamed_generate_real.rs` puts
+/// this constant through `common::assert_declared_peak_constant`, whose tolerance is the larger of
+/// 256 MiB and 5 % of the declared value — 5 % wins here, at 290_218_452 B. That grader replaced the
+/// `|measured/declared − 1| < 0.25` ratio band, which was multiplicatively asymmetric and, on a
+/// quotient of two constants, blind to pair-proportional drift.
+///
+/// The retired "~1 GB of run-to-run spread on this machine" figure was **retracted** with it: it was
+/// not reproduced on either arm of the sc-17153 terminal campaign (the q4 DiT windowed peak came
+/// back bit-identical across two runs, its resident peak moved 0.36 %). Do not size a new bound
+/// from it. The grading is TIGHTER than the retired comment claimed, so a red here is a real drift
+/// or a pin bump — `assert_declared_peak_constant`'s own docs carry the two limits of the bound.
+///
+/// Only graded when the run is q4 DiT **and** q4 packed TE, the conditions this figure was captured
+/// under; the harness prints that it asserted nothing when either differs.
 pub const RUNG4_REQUEST_PEAK_Q4_BYTES: u64 = 5_804_369_044;
 
 /// The stage-ordered lifecycle every MiniMax-H3 render runs.
@@ -560,10 +663,20 @@ struct ComponentBytes {
     adaln: u64,
     video_vae: u64,
     audio_vae: u64,
+    /// Load-exact bytes of the configured LoRA stack, held **resident for the whole render**
+    /// (sc-18650).
+    ///
+    /// [`crate::adapters`]'s declared strategy is a *forward-time residual* over
+    /// `mlx_gen::adapters::AdaptableLinear` — "never a merged weight", on **every** quant tier,
+    /// because a packed leaf cannot absorb a bf16 delta without dequantizing and quant tier is a
+    /// creative choice in this product. The factors are therefore still resident at the last denoise
+    /// step, which makes [`AdapterResidencyMode::Additive`] the honest mode: `Folded` would declare
+    /// zero and under-declare the floor, exactly the failure the text-encoder note below records.
+    overlay: u64,
 }
 
 impl ComponentBytes {
-    fn resolve(spec: &LoadSpec) -> Self {
+    fn resolve(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Self> {
         let root = match &spec.weights {
             WeightsSource::Dir(root) => root.clone(),
             WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
@@ -588,13 +701,26 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(TEXT_ENCODER_COMPONENT),
         };
-        Self {
+        // Fails closed rather than guessing: an additive stack whose file cannot be sized would
+        // otherwise be charged 0, and a zero overlay on a render that holds 300 MB of factors is an
+        // under-declaration in the OOM direction. The shared helper is the same one ltx uses.
+        let Some(overlay) = mlx_gen::gen_core::adapter_stack_resident_bytes(
+            &spec.adapters,
+            AdapterResidencyMode::Additive,
+        ) else {
+            return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID}: every configured adapter must have a non-zero load-exact safetensors \
+                 size before the memory contract can declare its resident overlay"
+            )));
+        };
+        Ok(Self {
             text_encoder: safetensors_path_bytes(text_encoder),
             dit: dit_bytes,
             adaln: resolved_adaln_bytes(&dit, dit_bytes),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
-        }
+            overlay,
+        })
     }
 
     /// The declaration-only footprint: no filesystem, no resolved tier, and therefore the
@@ -606,6 +732,7 @@ impl ComponentBytes {
             adaln: ADALN_EVICTED_BYTES,
             video_vae: 0,
             audio_vae: 0,
+            overlay: 0,
         }
     }
 
@@ -763,6 +890,11 @@ fn strategies(streamable: bool) -> Vec<MemoryStrategyCapability> {
                 // a resident load genuinely does not have it. Not `StructurallyNotApplicable`: a
                 // 50-block DiT and a 50-layer transformer encoder are exactly the components this
                 // rung optimizes, and both are measured to bound ~9x.
+                //
+                // sc-18650: `streamable` is **not** the load shape alone — a configured adapter
+                // makes it false too, because a windowed block is rebuilt from the staged tier and
+                // would drop the factors. See [`streamable`] for why that gate cannot live in
+                // `route_gate`.
                 MemoryStrategy::BoundedTransformerResidency if streamable => {
                     MemoryStrategySupport::Implemented
                 }
@@ -840,8 +972,33 @@ fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
     }
 }
 
-fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryProviderContract {
-    let streamable = load_shape == LoadShape::DeferredMaterialization;
+/// Rung 4's prerequisites, both of them, resolved from the spec.
+///
+/// **The deferred load shape is necessary but not sufficient** (sc-18650). A configured adapter is
+/// the second gate, and it belongs *here* rather than only in the render: `route_gate` cannot enforce
+/// it, because [`MemoryRunContext`] carries no adapter axis at all — a selection is geometry, tier
+/// and parameters, and the adapter list is a property of the *load*. So the only place the two can
+/// be made to agree is the declaration.
+///
+/// Without this clause the contract published rung 4 `Implemented` for an adapter-carrying deferred
+/// load, `validate_selection` admitted it, the request scope opened, and
+/// `MemoryProviderContract::generation_memory` set `stream_transformer_blocks` from that engagement —
+/// whereupon `crate::model::MiniMaxH3::requested_transformer_window` refused the very selection the
+/// contract had just promised. Declaring `Missing` closes the loop at its head instead.
+///
+/// The refusal it mirrors is not a caprice: a window rebuilds each block from the staged tier per
+/// step, so a forward-time residual adapter would be dropped from every windowed block. Both
+/// precedents this provider mirrors gate on the same thing — `mlx-gen-wan`'s adapter residency mode
+/// and `mlx-gen-ltx`'s overlay legs.
+pub fn streamable(spec: &LoadSpec) -> bool {
+    resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
+}
+
+fn build_contract(
+    components: &ComponentBytes,
+    load_shape: LoadShape,
+    streamable: bool,
+) -> MemoryProviderContract {
     MemoryProviderContract {
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -922,18 +1079,46 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
         // an estimate built from it charges 26 GB the runtime does not hold.
         formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases: phases(),
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::FrameCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                // sc-18660. The decode phase's scratch is a function of the tile area, not the
-                // canvas area — one 256 px tile is decoded at a time regardless of canvas. The
-                // variable is declared because the phase expression needs it; its coefficient is
-                // calibration evidence and is NOT measured yet (see the sc-18660 notes).
-                MemoryFormulaVariable::DecodeTileArea,
-            ],
-            resident_components: vec![adaln_component(components.adaln)],
+            variables: {
+                let mut variables = vec![
+                    MemoryFormulaVariable::AssetBytes,
+                    MemoryFormulaVariable::PixelCount,
+                    MemoryFormulaVariable::FrameCount,
+                    MemoryFormulaVariable::ConditioningTokenCount,
+                    // sc-18660. The decode phase's scratch is a function of the tile area, not the
+                    // canvas area — one 256 px tile is decoded at a time regardless of canvas. The
+                    // variable is declared because the phase expression needs it; its coefficient is
+                    // calibration evidence and is NOT measured yet (see the sc-18660 notes).
+                    MemoryFormulaVariable::DecodeTileArea,
+                ];
+                // Declared **only when an adapter is configured** (sc-18650), so an ordinary load's
+                // formula is byte-for-byte the one this provider has always published and no
+                // existing calibration record is disturbed. `conformance_errors` requires this
+                // variable exactly when a typed auxiliary component is present, and the two are
+                // built from the same condition here so they cannot drift.
+                if components.overlay > 0 {
+                    variables.push(MemoryFormulaVariable::OverlayBytes);
+                }
+                variables
+            },
+            resident_components: {
+                let mut resident = vec![adaln_component(components.adaln)];
+                // The LoRA stack as a typed auxiliary component. `MemoryComponentKind::AdapterStack`
+                // is the ltx spelling for the same forward-time-residual install, and
+                // `WholeRender` is literal here: `crate::model::load_task_dit` installs the factors
+                // onto the task's DiT before the first step and nothing releases them until the DiT
+                // itself goes at the end of denoise.
+                if components.overlay > 0 {
+                    resident.push(MemoryResidentComponent {
+                        id: "adapter_stack".to_owned(),
+                        kind: MemoryComponentKind::AdapterStack,
+                        resident_bytes: components.overlay,
+                        bounded_by: None,
+                        residency: MemoryComponentResidency::WholeRender,
+                    });
+                }
+                resident
+            },
         },
         // The calibration identity carries the RESOLVED shape, not the resident default: a
         // deferred load's peaks are a different curve from a resident load's, and an evidence
@@ -947,9 +1132,21 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
             conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.decoder(),
-            // No auxiliary networks: MiniMax-H3 accepts no adapters, no ControlNet, no IP-adapter
-            // and no identity encoder (`reject_unknown_components` allows only `transformer`).
-            overlay_bytes: 0,
+            // **The configured LoRA stack, and nothing else** (sc-18650).
+            //
+            // This said "MiniMax-H3 accepts no adapters … `reject_unknown_components` allows only
+            // `transformer`" until this story. Both halves were false and had been since sc-18724
+            // landed adapter support on 2026-08-13: the descriptor declares `supports_lora: true`,
+            // `crate::model::load_task_dit` installs the published `lightx2v/Minimax-h3-Turbo`
+            // exports through `crate::adapters::apply_minimax_h3_adapters`, and
+            // `reject_unknown_components` is called with **two** components (`transformer` and
+            // `text_encoder`). The comment simply predated the feature, and while the contract went
+            // unpublished nothing read it.
+            //
+            // The rest of the sentence is still true and is what this field means: there is no
+            // ControlNet, no IP-adapter and no identity encoder on this family, so the LoRA stack is
+            // the only auxiliary residency there is.
+            overlay_bytes: components.overlay,
         },
         runtime: Default::default(),
     }
@@ -958,8 +1155,9 @@ fn build_contract(components: &ComponentBytes, load_shape: LoadShape) -> MemoryP
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
-        &ComponentBytes::resolve(spec),
+        &ComponentBytes::resolve(spec)?,
         resolved_load_shape(spec),
+        streamable(spec),
     ))
 }
 
@@ -971,6 +1169,7 @@ pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Memor
     Ok(build_contract(
         &ComponentBytes::weights_free(),
         resolved_load_shape(spec),
+        streamable(spec),
     ))
 }
 
@@ -1079,22 +1278,56 @@ fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Result<()> {
     Ok(())
 }
 
-/// The provider's real admission check, callable before any weight file is opened.
-pub fn safety_check(
-    spec: &LoadSpec,
+/// The numeric tier a spec loads at — the one immutable axis of a selection this provider varies.
+///
+/// The floor list is empty because every component is packed at the DiT's own tier: the packed text
+/// encoder tracks whatever `{base}.scales` it ships with rather than a declared per-component floor
+/// (see [`crate::model::TEXT_ENCODER_COMPONENT`]), and the two VAEs are dense on every tier.
+///
+/// Resolved in one place so the loaded route (`crate::model::load`, which captures this on the
+/// generator) and the registry's weights-free probe cannot end up grading against different tiers.
+pub fn numeric_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: spec.precision,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    }
+}
+
+/// The provider's real admission check for a **loaded** route, callable before any weight file is
+/// opened.
+///
+/// Takes the already-resolved tier rather than the spec because the loaded generator is the caller
+/// that matters: `Generator::memory_strategy_safety_check` holds a contract and a tier captured once
+/// at load (sc-18650), not the `LoadSpec` that produced them.
+pub fn safety_check_at_tier(
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        }),
+        Some(tier),
         Some(&|| route_gate(context)),
     )
+}
+
+/// The spec-taking admission check — the [`MEMORY_REGISTRATION`] entry point, which probes
+/// weights-free from a spec and so resolves the tier here rather than holding one.
+///
+/// **The bare name is load-bearing across backends.** `scripts/check-workspace.py` compares the two
+/// backends' `pub const` declarations as canonicalized *source text*, so `MEMORY_REGISTRATION` must
+/// spell its `safety_check` field identically here and in `candle-gen-minimax-h3` — which registers
+/// the shorthand `safety_check,` against its own spec-taking function of that name. Renaming this to
+/// the wan-style `registered_safety_check` reds that gate even though nothing about the registration
+/// actually changed; the loaded variant is [`safety_check_at_tier`] for that reason.
+pub fn safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    safety_check_at_tier(contract, numeric_tier(spec), context)
 }
 
 /// Weights-free executable fixtures for one implemented optimized rung — one per render route.
@@ -1110,11 +1343,7 @@ pub fn registered_fixture(
     {
         return Ok(Vec::new());
     }
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
+    let tier = numeric_tier(spec);
     routes()
         .into_iter()
         .map(|(mode, reference_count)| {
@@ -1149,12 +1378,12 @@ pub fn registered_fixture(
 }
 
 fn begin_request_with_cleanup(
-    spec: &LoadSpec,
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
     cleanup: mlx_gen::request_scope::MlxScopeCleanup,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
+    if let MemorySafetyDecision::Reject { reason } = safety_check_at_tier(contract, tier, context) {
         return Err(CoreError::Unsupported(reason));
     }
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
@@ -1196,22 +1425,26 @@ pub fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
-        spec,
         contract,
+        numeric_tier(spec),
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
 }
 
 /// Production entry point: terminal cleanup drains the MLX allocator cache.
+///
+/// This is what `Generator::begin_memory_strategy_request` calls on the loaded generator (sc-18650).
+/// Until that override existed the function was reachable from nothing: the macro-emitted
+/// `impl Generator` left the trait default in the vtable slot, so a shipped render opened no scope.
 pub fn begin_request(
-    spec: &LoadSpec,
     contract: &MemoryProviderContract,
+    tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> mlx_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
-        spec,
         contract,
+        tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::Device,
     )
@@ -2988,7 +3221,7 @@ mod tests {
             .parameters;
         // **`Both`, not `Dit`.** Declaring the DiT alone would leave the conditioning phase — the
         // taller stage at every tier — with no lever, which is what AC3 refuses. The TE arm is
-        // measured separately: 53.07 -> 5.81 GB.
+        // measured separately: 53.07 -> 4.50 GB (dense).
         assert_eq!(
             ranges.transformer_window_components,
             vec![TransformerComponent::Both]

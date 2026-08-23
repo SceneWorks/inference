@@ -1854,6 +1854,18 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
     // `MiniMaxH3::load` because this is the boundary that carries the typed `Error::Unsupported`.
     requested_tier(spec)?;
     reject_unread_slots(spec)?;
+    // **The adapter-file probe** (sc-18650), which refuses any configured adapter that cannot be
+    // sized — absent ones included, because the contract is cached here while the factors are
+    // installed per render in `MiniMaxH3::load_task_dit`, so an exact 0 at this instant is not an
+    // exact 0 for the render. `MiniMaxH3::load` runs it too, inside `contract_for` — this call is
+    // here for the same reason `requested_tier` is: that path returns `CandleError`, which has no
+    // `Unsupported` variant, so the refusal reaches a registry caller as an opaque `Msg` unless the
+    // typed check also runs at this boundary. It costs one `stat` per adapter.
+    //
+    // It is deliberately **after** the three knob refusals above: a LoKr staged at an unsizable path
+    // must still be named as LoKr, which is what the last arm of
+    // `an_unsizable_adapter_is_refused_at_the_registry_boundary_with_the_typed_error` asserts.
+    crate::memory_strategy::adapter_overlay_bytes(spec)?;
     Ok(Box::new(MiniMaxH3::load(spec)?))
 }
 
@@ -2660,19 +2672,37 @@ mod tests {
         root
     }
 
-    /// A `LoadSpec` adapter spec at `kind`, with the two model-specific knobs optional.
+    /// A `LoadSpec` adapter spec at `path` and `kind`, with the two model-specific knobs optional.
     fn adapter_spec(
+        path: PathBuf,
         kind: candle_gen::gen_core::AdapterKind,
         pass_scales: Option<Vec<f32>>,
         moe_expert: Option<candle_gen::gen_core::MoeExpert>,
     ) -> AdapterSpec {
         AdapterSpec {
-            path: PathBuf::from("/turbo.safetensors"),
+            path,
             scale: 1.0,
             kind,
             pass_scales,
             moe_expert,
         }
+    }
+
+    /// A **real** sparse `.safetensors` adapter beside the staged snapshot, at roughly the published
+    /// `lightx2v/Minimax-h3-Turbo` export's size.
+    ///
+    /// The tests below used to name an absent `/turbo.safetensors`, because retention and knob
+    /// refusal need no real file. Since sc-18650 an adapter that cannot be sized is refused at
+    /// `load` — see `crate::memory_strategy::adapter_overlay_bytes` — so they stage one. Nothing
+    /// about what they assert changes: the file is never opened at load, only `stat`ed, and it is a
+    /// sibling of the component dirs rather than inside one, so no component's bytes move.
+    fn staged_adapter(tmp: &tempfile::TempDir) -> PathBuf {
+        let path = tmp.path().join("turbo.safetensors");
+        std::fs::File::create(&path)
+            .expect("adapter file")
+            .set_len(636_512_768)
+            .expect("sparse adapter");
+        path
     }
 
     /// **A staged LoRA is CARRIED to the render, not dropped and not refused** (sc-18728).
@@ -2692,6 +2722,7 @@ mod tests {
         assert!(bare.adapters().is_empty());
 
         let spec = LoadSpec::new(WeightsSource::Dir(root)).with_adapters(vec![adapter_spec(
+            staged_adapter(&tmp),
             candle_gen::gen_core::AdapterKind::Lora,
             None,
             None,
@@ -2721,21 +2752,30 @@ mod tests {
         use candle_gen::gen_core::{AdapterKind, MoeExpert};
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
+        let lora = staged_adapter(&tmp);
         let with =
             |a: AdapterSpec| LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![a]);
 
         // Control: a plain LoRA with neither knob set loads.
-        load(&with(adapter_spec(AdapterKind::Lora, None, None)))
-            .expect("the plain LoRA control must load — otherwise the arms prove nothing");
+        load(&with(adapter_spec(
+            lora.clone(),
+            AdapterKind::Lora,
+            None,
+            None,
+        )))
+        .expect("the plain LoRA control must load — otherwise the arms prove nothing");
 
         for (spec, needle) in [
-            (adapter_spec(AdapterKind::Lokr, None, None), "LoKr"),
             (
-                adapter_spec(AdapterKind::Lora, Some(vec![1.0, 0.5]), None),
+                adapter_spec(lora.clone(), AdapterKind::Lokr, None, None),
+                "LoKr",
+            ),
+            (
+                adapter_spec(lora.clone(), AdapterKind::Lora, Some(vec![1.0, 0.5]), None),
                 "pass_scales",
             ),
             (
-                adapter_spec(AdapterKind::Lora, None, Some(MoeExpert::High)),
+                adapter_spec(lora.clone(), AdapterKind::Lora, None, Some(MoeExpert::High)),
                 "MoE expert",
             ),
         ] {
@@ -2754,6 +2794,94 @@ mod tests {
                 "the refusal must name the knob it refused; wanted {needle:?}, got {msg}"
             );
         }
+    }
+
+    /// **The registry boundary carries the adapter-sizing refusal with its TYPED error** (sc-18650).
+    ///
+    /// `MiniMaxH3::load` runs the same probe inside `contract_for`, but that path returns
+    /// `CandleError`, which has no `Unsupported` variant — so without the call in [`load`] a registry
+    /// caller gets an opaque `Msg`. The same reason `requested_tier` is run at both boundaries.
+    ///
+    /// Both unsizable shapes are refused: a file that is really there and cannot be sized
+    /// (`crate::adapters` reads safetensors out of a file's bytes whatever it is named, so a `.bin`
+    /// export would install and be charged nothing), and one that is **absent** — exact-0 there holds
+    /// only at the probe instant, while the contract is cached at load and the factors are installed
+    /// per render.
+    ///
+    /// The last arm pins the **ordering** against the knob refusals, which is the guard that moved
+    /// here when `lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually` started
+    /// staging a real file: a LoKr at an unsizable path must still be named as LoKr, not answered
+    /// with the sizing message.
+    #[test]
+    fn an_unsizable_adapter_is_refused_at_the_registry_boundary_with_the_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = staged_root(&tmp);
+        let refusal = |spec: LoadSpec| -> candle_gen::gen_core::Error {
+            // `Box<dyn Generator>` is not `Debug`, so `expect_err` is unavailable.
+            match load(&spec) {
+                Ok(_) => panic!("an adapter that cannot be sized must be refused"),
+                Err(e) => e,
+            }
+        };
+        let with =
+            |a: AdapterSpec| LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![a]);
+
+        // Control: a real, sizable adapter loads — otherwise the arms below prove nothing.
+        load(&with(adapter_spec(
+            staged_adapter(&tmp),
+            candle_gen::gen_core::AdapterKind::Lora,
+            None,
+            None,
+        )))
+        .expect("a sizable adapter must load");
+
+        let misnamed = tmp.path().join("turbo.bin");
+        std::fs::File::create(&misnamed)
+            .unwrap()
+            .set_len(636_512_768)
+            .unwrap();
+        for (spec, needle) in [
+            (
+                adapter_spec(
+                    misnamed,
+                    candle_gen::gen_core::AdapterKind::Lora,
+                    None,
+                    None,
+                ),
+                "turbo.bin",
+            ),
+            (
+                adapter_spec(
+                    PathBuf::from("/turbo.safetensors"),
+                    candle_gen::gen_core::AdapterKind::Lora,
+                    None,
+                    None,
+                ),
+                "/turbo.safetensors",
+            ),
+        ] {
+            let err = refusal(with(spec));
+            assert!(
+                matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+                "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(needle),
+                "the refusal must name the adapter it could not size; wanted {needle:?}, got {err}"
+            );
+        }
+
+        // The sizing probe runs AFTER the knob refusals, so an unsizable LoKr is still named LoKr.
+        let err = refusal(with(adapter_spec(
+            PathBuf::from("/turbo.safetensors"),
+            candle_gen::gen_core::AdapterKind::Lokr,
+            None,
+            None,
+        )));
+        assert!(
+            err.to_string().contains("LoKr"),
+            "the kind refusal must win over the sizing refusal: {err}"
+        );
     }
 
     /// A solid RGB image of the given extent, for the reference-request fixtures.

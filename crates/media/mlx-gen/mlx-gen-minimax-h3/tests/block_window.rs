@@ -448,3 +448,47 @@ fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
     let err = deferred.forward(&ids, &mask).unwrap_err().to_string();
     assert!(err.contains("set_block_window"), "{err}");
 }
+
+/// **`from_dir_deferred` must MATERIALIZE the token table, not merely map it** (sc-17153).
+///
+/// [`MiniMaxH3TextEncoder::nbytes`] documents itself as "device bytes this encoder holds" and states
+/// the contract this asserts: `get_active_memory` after a forced materialization must land within a
+/// small margin of it. Under a deferred load there was no forced materialization —
+/// `mlx_gen::quant::embedding` hands back a lazily-mapped handle and the constructor dropped its
+/// `Weights` map on the next line — so the encoder reported 1.556 GB of residency on the real
+/// component while MLX's active memory was **0 B**, and the table was instead read part-way through
+/// the first bounded window.
+///
+/// This is the CI-runnable half of that claim: `encoder.rs`'s `materialize_weights()` call is
+/// labelled LOAD-BEARING, and deleting it leaves every other test in this crate green.
+#[test]
+fn a_deferred_te_holds_its_token_table_when_the_constructor_returns() {
+    use mlx_gen_minimax_h3::text_encoder::MiniMaxH3TextEncoder;
+
+    let staged = tempfile::tempdir().unwrap();
+    std::fs::copy(common::TE_FIXTURE, staged.path().join("model.safetensors")).unwrap();
+    std::fs::write(staged.path().join("config.json"), "{}").unwrap();
+    let cfg = common::te_fixture_config();
+
+    mlx_rs::memory::clear_cache();
+    let before = mlx_rs::memory::get_active_memory();
+    let te =
+        MiniMaxH3TextEncoder::from_dir_deferred(staged.path(), "language_model", &cfg).unwrap();
+    let charged = mlx_rs::memory::get_active_memory().saturating_sub(before);
+
+    // Premise: the residency being claimed is the token table alone — no layer is resident, so
+    // `nbytes()` is exactly what the constructor promises to be holding.
+    assert_eq!(te.resident_layers(), 0);
+    assert!(
+        te.nbytes() > 0,
+        "premise: the fixture's token table has bytes to hold"
+    );
+    assert!(
+        charged >= te.nbytes(),
+        "a deferred encoder reported {} B of residency but only {charged} B became active across \
+         the constructor — the token table is still an unevaluated lazily-mapped handle, so \
+         `nbytes()` is over-reporting and the read it stands for will land inside the first \
+         bounded window instead",
+        te.nbytes()
+    );
+}

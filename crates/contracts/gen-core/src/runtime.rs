@@ -26,6 +26,11 @@ pub const BASE_SNAPSHOT_COMPONENT: &str = "base_snapshot";
 /// alternate decoder; an absent entry preserves the provider's native decoder exactly.
 pub const VAE_COMPONENT: &str = "vae";
 
+/// Optional learned two-stage LTX latent upscaler. Providers may also resolve
+/// the canonical co-located `upsampler.safetensors`, so this is not an
+/// unconditional descriptor requirement.
+pub const LTX_SPATIAL_UPSCALER_COMPONENT: &str = "spatial_upscaler";
+
 /// Optional in-place ComfyUI text-encoder file paired with a single-file DiT.
 pub const COMFYUI_TEXT_ENCODER_COMPONENT: &str = "comfyui_text_encoder";
 
@@ -2011,38 +2016,41 @@ mod tests {
         let writer = std::thread::spawn(move || {
             writer_entered.wait();
             let replacement = writer_file.with_extension("replacement");
-            std::fs::write(&replacement, vec![0xa5; 128 * 1024])
-                .expect("write replacement beside source");
-            #[cfg(unix)]
-            std::fs::rename(replacement, writer_file).expect("atomically replace during read");
-            #[cfg(not(unix))]
-            {
-                let bytes = std::fs::read(replacement).expect("read replacement fixture");
-                std::fs::write(writer_file, bytes).expect("overwrite source during read");
-            }
+            // A replacing rename on every platform, so the reader below keeps consuming the original
+            // object everywhere: an in-place overwrite would feed it the replacement's bytes off
+            // Unix, and could not run at all against a source the caller had mapped.
+            let swapped = std::fs::write(&replacement, vec![0xa5; 128 * 1024])
+                .and_then(|()| std::fs::rename(replacement, writer_file));
+            // Release the reader whatever the swap did: returning ahead of this barrier strands it
+            // there and hangs the test binary. The outcome is asserted on `join` instead.
             writer_done.wait();
+            swapped
         });
 
-        let error = pinned
-            .read_unchanged::<_, crate::Error>(|path| {
-                // Open and consume part of the original payload before allowing replacement. The
-                // remainder is then read from the already-open original inode, proving the post-read
-                // check—not a pre-open race—is what rejects the mixed-provenance operation.
-                let mut source = std::fs::File::open(path)?;
-                let mut bytes = vec![0; 4096];
-                source.read_exact(&mut bytes)?;
-                assert!(bytes.iter().all(|byte| *byte == 0x5a));
-                consumed_first_chunk.wait();
-                replacement_done.wait();
-                source.read_to_end(&mut bytes)?;
-                assert_eq!(bytes.len(), original.len());
-                #[cfg(unix)]
-                assert!(bytes.iter().all(|byte| *byte == 0x5a));
-                Ok(bytes)
-            })
+        let outcome = pinned.read_unchanged::<_, crate::Error>(|path| {
+            // Open and consume part of the original payload before allowing replacement. The
+            // remainder is then read from the already-open original file object — which the
+            // replacing rename unlinks but does not disturb — proving the post-read check, not a
+            // pre-open race, is what rejects the mixed-provenance operation.
+            let mut source = std::fs::File::open(path)?;
+            let mut bytes = vec![0; 4096];
+            source.read_exact(&mut bytes)?;
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            consumed_first_chunk.wait();
+            replacement_done.wait();
+            source.read_to_end(&mut bytes)?;
+            assert_eq!(bytes.len(), original.len());
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            Ok(bytes)
+        });
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("replace the pinned source mid-read");
+
+        let error = outcome
             .expect_err("a replacement between the two checks must fail")
             .to_string();
-        writer.join().expect("writer thread");
         assert!(error.contains("changed after load"), "got: {error}");
     }
 
@@ -2545,15 +2553,22 @@ mod tests {
         let writer_selected = selected.clone();
         let writer = std::thread::spawn(move || {
             writer_start.wait();
-            std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
-            std::fs::rename(staged_a, &writer_selected)
-                .expect("replace selected path with a recreated A link");
+            let rebound = std::fs::rename(staged_b, &writer_selected)
+                .and_then(|()| std::fs::rename(staged_a, &writer_selected));
+            // Release the main thread whatever the rebinding did. It is parked on `mutation_done`
+            // below, so a writer that panics — or returns — ahead of this barrier strands it there
+            // and hangs the whole test binary; the outcome is asserted on `join` instead, so a
+            // failed rebinding reads as a red test naming the error.
             writer_done.wait();
+            rebound
         });
 
         start_mutation.wait();
         mutation_done.wait();
-        writer.join().expect("writer thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("rebind the selected path through B back to a recreated A");
         assert_eq!(
             std::fs::read(&selected).expect("read final selected target"),
             b"same-size-a",
@@ -2641,15 +2656,21 @@ mod tests {
             let writer_selected = selected.clone();
             let writer = std::thread::spawn(move || {
                 writer_start.wait();
-                std::fs::rename(staged_b, &writer_selected).expect("rebind selected path to B");
-                std::fs::rename(staged_a, &writer_selected)
-                    .expect("replace selected path with a recreated A link");
+                let rebound = std::fs::rename(staged_b, &writer_selected)
+                    .and_then(|()| std::fs::rename(staged_a, &writer_selected));
+                // Release the main thread whatever the rebinding did; see the sibling test above.
+                // Returning ahead of this barrier strands the main thread on it and hangs the test
+                // binary. The outcome is asserted on `join` instead.
                 writer_done.wait();
+                rebound
             });
 
             start_mutation.wait();
             mutation_done.wait();
-            writer.join().expect("writer thread");
+            writer
+                .join()
+                .expect("writer thread")
+                .expect("rebind the selected path through B back to a recreated A");
             assert_eq!(
                 std::fs::read(&selected).expect("read final selected target"),
                 b"same-size-a"

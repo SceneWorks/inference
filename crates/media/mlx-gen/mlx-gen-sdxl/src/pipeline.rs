@@ -1224,6 +1224,7 @@ pub(crate) fn render_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::{AlphaSchedule, LightningSampler};
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
     /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a
@@ -1284,5 +1285,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("zero dimension"), "unexpected error: {e}");
+    }
+
+    /// The acceleration change must not be a validation-only admission. This CPU-only test crosses
+    /// the narrow production seam used by `UNet2DConditionModel::forward_planned` to inject a real
+    /// [`ControlResiduals::mid`] tensor, then hands the resulting prediction to the actual
+    /// [`LightningSampler`]. A live residual must move the next latent; absent and zero residuals
+    /// must be exact identities. It therefore fails if the production injection seam drops its
+    /// `control` argument, while needing neither SDXL weights nor accelerator hardware.
+    #[test]
+    fn production_control_injection_materially_changes_lightning_step() {
+        let schedule = AlphaSchedule::scaled_linear(1_000, 0.00085, 0.012);
+        let sampler = LightningSampler::new(&schedule, 1_000, 4, mlx_rs::Dtype::Float16);
+        let latents = Array::from_slice(&[1.0f32, -2.0], &[1, 2]);
+        let plain_epsilon = Array::from_slice(&[0.25f32, -0.5], &[1, 2]);
+        let live = ControlResiduals {
+            down: vec![Array::from_slice(&[0.125f32, -0.25], &[1, 2])],
+            mid: Array::from_slice(&[0.75f32, 0.25], &[1, 2]),
+        };
+        let zero = ControlResiduals {
+            down: vec![Array::from_slice(&[0.0f32, 0.0], &[1, 2])],
+            mid: Array::from_slice(&[0.0f32, 0.0], &[1, 2]),
+        };
+
+        let base_skip = Array::from_slice(&[2.0f32, -1.0], &[1, 2]);
+        let mut absent_skip = vec![base_skip.clone()];
+        crate::unet::inject_control_down_residuals(&mut absent_skip, None).unwrap();
+        let mut zero_skip = vec![base_skip.clone()];
+        crate::unet::inject_control_down_residuals(&mut zero_skip, Some(&zero)).unwrap();
+        let mut controlled_skip = vec![base_skip.clone()];
+        crate::unet::inject_control_down_residuals(&mut controlled_skip, Some(&live)).unwrap();
+        assert_eq!(
+            base_skip.as_slice::<f32>(),
+            absent_skip[0].as_slice::<f32>()
+        );
+        assert_eq!(base_skip.as_slice::<f32>(), zero_skip[0].as_slice::<f32>());
+        assert_ne!(
+            base_skip.as_slice::<f32>(),
+            controlled_skip[0].as_slice::<f32>(),
+            "a nonzero ControlNet down residual must alter the U-Net skip stream"
+        );
+
+        let absent_epsilon =
+            crate::unet::inject_control_mid_residual(plain_epsilon.clone(), None).unwrap();
+        let zero_epsilon =
+            crate::unet::inject_control_mid_residual(plain_epsilon.clone(), Some(&zero)).unwrap();
+        let controlled_epsilon =
+            crate::unet::inject_control_mid_residual(plain_epsilon.clone(), Some(&live)).unwrap();
+
+        let plain = sampler.step(&plain_epsilon, &latents, 0).unwrap();
+        let absent = sampler.step(&absent_epsilon, &latents, 0).unwrap();
+        let zero = sampler.step(&zero_epsilon, &latents, 0).unwrap();
+        let controlled = sampler.step(&controlled_epsilon, &latents, 0).unwrap();
+        assert_eq!(plain.as_slice::<f32>(), absent.as_slice::<f32>());
+        assert_eq!(plain.as_slice::<f32>(), zero.as_slice::<f32>());
+        assert_ne!(
+            plain.as_slice::<f32>(),
+            controlled.as_slice::<f32>(),
+            "a nonzero ControlNet residual must alter the Lightning trajectory"
+        );
     }
 }
