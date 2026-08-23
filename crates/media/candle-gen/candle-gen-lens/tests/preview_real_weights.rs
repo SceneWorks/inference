@@ -22,7 +22,7 @@
 //! LENS_PREVIEW_VAE=...\models--SceneWorks--Lens\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! LENS_FLUX2_FIT_VAE=...\models--black-forest-labs--FLUX.2-klein-9B\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! LENS_PREVIEW_ARTIFACT_DIR=E:\out\sc-16955 \
-//!   cargo test -p candle-gen-lens --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-lens --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

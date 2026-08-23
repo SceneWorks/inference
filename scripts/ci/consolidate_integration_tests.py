@@ -11,8 +11,9 @@ sibling `tests/<name>.rs` as `#[path = "<name>.rs"] mod <name>;`. Test files sta
 they are; cases are addressed as `<name>::<case>` (`cargo test --test integration --
 <name>::` replaces the old `--test <name>`).
 
-Shared fixtures: a `tests/common/mod.rs` is declared ONCE in `tests/main.rs` (`mod common;`)
-and the test files say `use crate::common;` where they used to say `mod common;` -- a
+Shared fixtures: every `tests/<dir>/mod.rs` directory module (`common`, `rung4_support`, ...) is
+declared ONCE in `tests/main.rs` (`mod <dir>;`) and the test files say `use crate::<dir>;`
+where they used to say `mod <dir>;` -- a
 per-file `mod common;` inside a `#[path]`-loaded module would resolve to
 `tests/<name>/common.rs`, and `#[path = "common/mod.rs"]` per file trips
 `clippy::duplicate_mod`. Anything else shared (e.g. a `#[path]` include of another crate's
@@ -88,10 +89,29 @@ def shared_block(crate_dir: Path) -> str:
     return "\n"
 
 
+def shared_dir_modules(crate_dir: Path) -> list[str]:
+    """`tests/<dir>/mod.rs` directory modules (e.g. `common`, `rung4_support`), declared once.
+
+    Fixture directories without a `mod.rs` (`tests/fixtures/`, `tests/parity/`) are data, not
+    modules, and are not declared.
+    """
+    return sorted(
+        d.name
+        for d in test_dir(crate_dir).iterdir()
+        if d.is_dir() and (d / "mod.rs").exists() and IDENT.match(d.name)
+    )
+
+
 def render_main(crate_dir: Path) -> str:
     lines = [HEADER, "\n", SHARED_BEGIN, shared_block(crate_dir), SHARED_END, "\n"]
-    if (test_dir(crate_dir) / "common" / "mod.rs").exists():
-        lines.append("\nmod common;\n")
+    for shared in shared_dir_modules(crate_dir):
+        # A shared module is compiled even when every module that uses it is `#![cfg]`'d out on
+        # this lane (e.g. cuda-only users on Linux), so its items must be allowed to be dead --
+        # unless the module already allows that itself, in which case repeating it here trips
+        # `clippy::duplicated_attributes`.
+        text = (test_dir(crate_dir) / shared / "mod.rs").read_text(encoding="utf-8")
+        allow = "" if "#![allow(dead_code)]" in text else "#[allow(dead_code)]\n"
+        lines.append(f"\n{allow}mod {shared};\n")
     for path in sibling_test_files(crate_dir):
         lines.append(f'\n#[path = "{path.name}"]\nmod {path.stem};\n')
     return "".join(lines)

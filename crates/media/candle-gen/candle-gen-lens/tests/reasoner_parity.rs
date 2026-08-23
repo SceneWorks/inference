@@ -15,7 +15,7 @@
 //!   LENS_SNAPSHOT_DIR     — the `microsoft/Lens-Turbo` snapshot root (tokenizer/ + text_encoder/)
 //!   LENS_REASONER_GOLDENS — lens_reasoner_golden.safetensors (default: .scratch/lens-reasoner-goldens/…)
 //! Run with the `cuda` feature:
-//!   cargo test -p candle-gen-lens --features cuda --test reasoner_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration reasoner_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::VarBuilder;

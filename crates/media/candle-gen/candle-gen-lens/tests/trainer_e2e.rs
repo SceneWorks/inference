@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! set LENS_BASE_SNAPSHOT=C:\Users\…\models--microsoft--Lens\snapshots\<hash>
-//! cargo test -p candle-gen-lens --features cuda --release --test trainer_e2e -- --ignored --nocapture --test-threads=1
+//! cargo test -p candle-gen-lens --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! What it proves:

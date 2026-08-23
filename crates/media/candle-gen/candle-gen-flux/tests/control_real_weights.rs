@@ -18,7 +18,7 @@
 //! set FLUX1_CTRL_IMAGE=...\pose.ppm                  # the control hint (P6 PPM)
 //! set FLUX1_CTRL_KIND=pose                           # pose | canny | depth
 //! set FLUX1_CTRL_OUT=...\out                         # output dir
-//! cargo test -p candle-gen-flux --features cuda --release --test control_real_weights -- --ignored --nocapture
+//! cargo test -p candle-gen-flux --features cuda --release --test integration control_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};

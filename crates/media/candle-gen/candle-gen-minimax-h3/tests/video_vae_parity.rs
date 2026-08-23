@@ -37,7 +37,7 @@
 //! diverges by orders of magnitude, which the mutation tests at the bottom confirm by measuring and
 //! PRINTING how far each perturbation actually moves the decode.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 

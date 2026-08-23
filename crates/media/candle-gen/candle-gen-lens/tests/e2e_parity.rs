@@ -16,7 +16,7 @@
 //!   LENS_SNAPSHOT_DIR — the `microsoft/Lens-Turbo` snapshot root (tokenizer/ text_encoder/ …)
 //!   LENS_E2E_GOLDENS  — lens_e2e_golden.safetensors (default: .scratch/lens-e2e-goldens/…)
 //! Run with the `cuda` feature:
-//!   cargo test -p candle-gen-lens --features cuda --test e2e_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration e2e_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen_lens::text::LensTokenizer;

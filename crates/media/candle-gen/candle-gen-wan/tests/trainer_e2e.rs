@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! set WAN_T2V_14B_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-T2V-A14B-Diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-wan --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-wan --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 //!
 //! What it proves:

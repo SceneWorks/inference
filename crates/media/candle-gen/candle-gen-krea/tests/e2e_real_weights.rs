@@ -7,7 +7,7 @@
 //! `#[ignore]` — needs the real snapshot (~12 B params; bf16 ≈ 24 GB resident). Run on the Windows GPU:
 //! ```sh
 //! KREA_TURBO_DIR=D:\models\Krea-2-Turbo \
-//!   cargo test -p candle-gen-krea --release --features cuda --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration e2e_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::collections::HashMap;
