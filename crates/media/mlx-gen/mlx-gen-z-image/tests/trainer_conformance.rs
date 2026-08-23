@@ -6,7 +6,7 @@
 //! trainer will be held to identically. `#[ignore]` because it needs the real
 //! `Tongyi-MAI/Z-Image-Turbo` weights (`ZIMAGE_SNAPSHOT` or the HF cache); run on the self-hosted
 //! Apple-Silicon runner or a populated dev box:
-//!   cargo test -p mlx-gen-z-image --release --test trainer_conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration trainer_conformance:: -- --ignored --nocapture
 //!
 //! `trainer_conformance` constructs a fresh trainer per train()-invoking check (the cancellation
 //! paths + the progress run), because `train` is `&mut self` and the trainer is effectively
@@ -18,7 +18,7 @@ use std::path::Path;
 use gen_core_testkit::TrainerProfile;
 use mlx_gen::{LoadSpec, TrainingItem, WeightsSource};
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir` (mirrors the trainer e2e dataset).

@@ -16,7 +16,7 @@
 //! ChatGLM3-6B + SDXL U-Net + VAE fixture to run it default-green.
 //!
 //!   KOLORS_SNAPSHOT=<Kolors-diffusers dir> [KOLORS_CONTROLNET=<Kolors-ControlNet-Pose dir>] \
-//!     cargo test -p mlx-gen-kolors --release --test cfg_off_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-kolors --release --test integration cfg_off_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -8,7 +8,7 @@
 //! MAGE_SNAPSHOT=<dense flat microsoft/Mage-Flow-Base snapshot> \
 //! MAGE_TIER_ROOT=<the generated variant tier tree, holding bf16/ q8/ q4/> \
 //! MAGE_COMPONENTS_ROOT=<the generated shared components tree, holding bf16/ q8/ q4/> \
-//!   cargo test --locked -p mlx-gen-mage --test prequantize_real_weights -- --ignored --nocapture
+//!   cargo test --locked -p mlx-gen-mage --test integration prequantize_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! `MAGE_TIER_ROOT` / `MAGE_COMPONENTS_ROOT` are produced by `examples/mage_prequant.rs`.

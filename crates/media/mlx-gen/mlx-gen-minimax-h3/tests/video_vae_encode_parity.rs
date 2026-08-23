@@ -26,7 +26,7 @@
 //! So every golden below is dumped at `T = 5` or `T = 17` with a canvas that really does span two
 //! tiles, and the degenerate cases are asserted to be degenerate rather than assumed to be.
 
-mod common;
+use crate::common;
 
 use common::{
     assert_parity, encode_fixture_config, encode_fixture_tiles, rel, std_dev, ENCODE_FIXTURE,

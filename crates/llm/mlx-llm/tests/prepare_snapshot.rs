@@ -2,7 +2,7 @@ use core_llm::{LoadSpec, Message, PrepareSpec, Quantize, Sampling, TextLlmReques
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::{load_for_model, prepare_snapshot};
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_a_guarded_entry, Fixture};
 
 const PROMPT: &str = "The capital of France is";

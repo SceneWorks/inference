@@ -13,7 +13,7 @@
 //! cancel lands during the single monolithic `eval`) and `Err(Canceled)` under the fix.
 //!
 //! Real-weight + Metal + timing, so `#[ignore]`d. Run:
-//! `cargo test -p mlx-gen-lens --test encoder_cancel -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-lens --test integration encoder_cancel:: -- --ignored --nocapture`
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

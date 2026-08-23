@@ -8,7 +8,7 @@
 //! LLM linears + both renderer experts are quantized; the vision tower (group-64-misaligned linears),
 //! connector, and clip_diff flow head are kept dense.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test quant_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration quant_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

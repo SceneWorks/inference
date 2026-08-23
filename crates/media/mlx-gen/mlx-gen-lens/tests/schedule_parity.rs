@@ -5,7 +5,7 @@
 //! (b) the per-step transformer timesteps, (c) a single flow-match Euler `step`, and (d) the
 //! norm-rescaled CFG — all near-bit (f32).
 //!
-//! Run: `cargo test -p mlx-gen-lens --test schedule_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration schedule_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};

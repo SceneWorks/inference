@@ -13,7 +13,7 @@ use mlx_gen_krea::Krea2Transformer;
 use mlx_rs::ops::{all_close, multiply, sqrt, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
-mod common;
+use crate::common;
 
 use common::{
     tiny_dit_config, SHARED_FIXTURE_DIT_AXES_DIMS_ROPE, SHARED_FIXTURE_DIT_EPS,

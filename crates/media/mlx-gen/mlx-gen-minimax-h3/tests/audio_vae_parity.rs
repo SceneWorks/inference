@@ -40,7 +40,7 @@
 //! `upsample_matches_the_reference_sample_for_sample` at 1e-5 is what catches a regression back to
 //! the built-in.
 
-mod common;
+use crate::common;
 
 use common::{audio_fixture_config, to_nlc, AUDIO_FIXTURE};
 

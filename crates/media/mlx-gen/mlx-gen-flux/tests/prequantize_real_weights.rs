@@ -8,7 +8,7 @@
 //! already-packed weights — the property under test.
 //!
 //! `#[ignore]`d — needs a real `black-forest-labs/FLUX.1-dev` snapshot. Run with:
-//!   cargo test -p mlx-gen-flux --release --test prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs: SC8670_SRC (source snapshot dir; default first HF-cache FLUX.1-dev snapshot),
 //! SC8670_OUT (tier output dir), SC8670_BITS (4 default / 8), SC8670_KEEP (retain the built tier).
@@ -25,7 +25,7 @@ fn flux_dev_snapshot() -> Option<PathBuf> {
 /// Build-only harness for producing **hostable** tiers (epic 8506 rollout): pack a tier from a FLUX.1
 /// snapshot into `SC8670_OUT` and keep it — no load/generate. Run per tier:
 ///   SC8670_SRC=<snap> SC8670_OUT=<staging/q4> SC8670_BITS=4 \
-///     cargo test -p mlx-gen-flux --release --test prequantize_real_weights -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-flux --release --test integration -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set SC8670_SRC/OUT/BITS"]
 fn build_tier_only() {

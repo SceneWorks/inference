@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_DIT=<tier>/transformer SCENEWORKS_GPU_ID=mlx \
-//!   cargo test -p mlx-gen-minimax-h3 --test bounded_attention_real -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration bounded_attention_real:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!
@@ -67,7 +67,7 @@
 //! consequently the tier on which an activation-side rung has its best chance, and a null result
 //! there bounds the other two from above.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::time::Instant;

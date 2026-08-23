@@ -13,7 +13,7 @@
 //! 2. **Merge seam** — the core [`AdaptableLinear::merge_dense_delta`] seam reproduces `W + δ`
 //!    bit-for-bit (same backend), i.e. it is a true weight merge, not a forward-time residual.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test distill_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration distill_parity:: -- --nocapture`
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;

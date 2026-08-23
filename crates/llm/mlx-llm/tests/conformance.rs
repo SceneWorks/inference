@@ -16,7 +16,7 @@ use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::{load_for_model, LlamaProvider};
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_self_removing, Fixture};
 
 const VOCAB: usize = 32;

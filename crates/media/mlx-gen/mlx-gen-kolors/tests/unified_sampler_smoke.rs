@@ -14,9 +14,9 @@
 //! `#[ignore]`d — needs the real `Kwai-Kolors/Kolors-diffusers` snapshot (env `KOLORS_SNAPSHOT` or the
 //! HF cache):
 //!   KOLORS_SNAPSHOT=/path/to/Kolors-diffusers \
-//!     cargo test -p mlx-gen-kolors --release --test unified_sampler_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-kolors --release --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_kolors::MODEL_ID;

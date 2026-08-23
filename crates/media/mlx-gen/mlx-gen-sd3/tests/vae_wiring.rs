@@ -196,7 +196,7 @@ fn load_missing_dir_errors() {
 /// encode→decode a real image-shaped tensor and assert the 8× spatial / 16-ch contract holds on the
 /// production checkpoint. Run with the snapshot's `vae/` dir, e.g.:
 ///   SD3_VAE_DIR=/path/to/stable-diffusion-3.5-large/vae \
-///     cargo test -p mlx-gen-sd3 --release --test vae_wiring sd3_vae_real_weights -- --ignored --nocapture
+///     cargo test -p mlx-gen-sd3 --release --test integration vae_wiring::sd3_vae_real_weights -- --ignored --nocapture
 ///
 /// FOLLOW-UP (sc-7863 note): a numeric A/B vs the diffusers SD3 `AutoencoderKL` (cosine vs a dumped
 /// reference latent/decode) is the next gate; it needs a golden dumped from the reference pipeline.

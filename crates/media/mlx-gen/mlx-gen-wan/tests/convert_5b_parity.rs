@@ -7,7 +7,7 @@
 //! (825 bf16), `t5_encoder.safetensors` (242 bf16), and `vae.safetensors` (196 f32) reproduce the
 //! golden byte-for-byte, with `config.json` semantically equal. Peak RSS ~30 GB (the f32 transformer).
 //!
-//! Run with: `cargo test -p mlx-gen-wan --test convert_5b_parity -- --ignored --nocapture`
+//! Run with: `cargo test -p mlx-gen-wan --test integration convert_5b_parity:: -- --ignored --nocapture`
 //! Override paths with `WAN_TI2V_5B_DIR` (golden) / `WAN_5B_CKPT` (native checkpoint dir).
 
 use std::collections::BTreeSet;
@@ -127,7 +127,7 @@ fn ti2v_5b_convert_matches_golden() {
 /// emits everything else: `model.safetensors` bf16, `t5_encoder.safetensors` bf16, `vae.safetensors`
 /// f32, `config.json`). Tokenizer source: the already-cached I2V-A14B bf16 snapshot (same UMT5).
 ///
-///   cargo test -p mlx-gen-wan --release --test convert_5b_parity ti2v_5b_materialize -- --ignored --nocapture
+///   cargo test -p mlx-gen-wan --release --test integration convert_5b_parity::ti2v_5b_materialize -- --ignored --nocapture
 #[test]
 #[ignore = "one-shot: writes ~/.cache/mlx-gen-models/wan_2_2_ti2v_5b_mlx_bf16 (needs the native HF checkpoint)"]
 fn ti2v_5b_materialize_bf16_snapshot() {

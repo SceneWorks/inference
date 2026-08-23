@@ -2,14 +2,14 @@
 //!
 //! `#[ignore]`d — needs a `Kwai-Kolors/Kolors-diffusers` snapshot (`KOLORS_SNAPSHOT`, else the HF
 //! cache; the materialized `tokenizer/tokenizer.json` must be present) and Metal. Run:
-//!   cargo test -p mlx-gen-kolors --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SD3 / SANA / Lens A/Bs: (1) `Sequential` peaks LOWER than `Resident` because
 //! the 6B ChatGLM3 encoder is dropped (+ `clear_cache()`) before the U-Net + VAE materialize, and (2)
 //! the output is BYTE-IDENTICAL. A repeat-job check confirms nothing stays resident across jobs.
 //! `KOLORS_SEQ_STEPS` / `KOLORS_SEQ_SIZE` tune the probe.
 
-mod common;
+use crate::common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};

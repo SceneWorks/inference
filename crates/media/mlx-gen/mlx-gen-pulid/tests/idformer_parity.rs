@@ -6,7 +6,7 @@
 //! cos≈1.0 is the structural-correctness signal.
 //!
 //! Run:
-//!   cargo test -p mlx-gen-pulid --release --test idformer_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pulid --release --test integration idformer_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_pulid::idformer::{IdFormer, IdFormerConfig};

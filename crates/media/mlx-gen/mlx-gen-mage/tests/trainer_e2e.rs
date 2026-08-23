@@ -4,7 +4,7 @@
 //! `#[ignore]`d — needs the real `microsoft/Mage-Flow-Base` snapshot in `MAGE_BASE_SNAPSHOT`. Run
 //! (this Mac can run MLX GPU):
 //!   MAGE_BASE_SNAPSHOT=/path/to/Mage-Flow-Base \
-//!     cargo test -p mlx-gen-mage --release --test trainer_e2e -- --ignored --nocapture
+//!     cargo test -p mlx-gen-mage --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→cache→train→save lifecycle: a tiny captioned PNG dataset is Mage-VAE /
 //! Qwen3-VL encoded and cached, AdamW training drives the rectified flow-match loss down, and a PEFT

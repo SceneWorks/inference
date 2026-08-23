@@ -19,7 +19,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo test -p mlx-gen-krea --release --test control_decode_tiling_real_weights -- \
+//! cargo test -p mlx-gen-krea --release --test integration control_decode_tiling_real_weights:: -- \
 //!   --ignored --nocapture
 //! ```
 

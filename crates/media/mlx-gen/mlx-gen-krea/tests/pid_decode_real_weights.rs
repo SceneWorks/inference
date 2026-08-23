@@ -10,7 +10,7 @@
 //! `gemma-2-2b-it` snapshot dir (env `PID_GEMMA_DIR`, else the HF cache).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-krea --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-krea --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

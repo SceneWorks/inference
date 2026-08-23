@@ -11,7 +11,7 @@
 //!
 //! Run:
 //!   SANA_DCAE_WEIGHTS=/path/vae/diffusion_pytorch_model.safetensors \
-//!   cargo test -p mlx-gen-sana --test encode_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sana --test integration encode_parity:: -- --ignored --nocapture
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

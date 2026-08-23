@@ -6,7 +6,7 @@
 //! Run:
 //!   SAM3_WEIGHTS=.../model.safetensors \
 //!   SAM3_DETR_FIXTURE=scripts/spikes/sam3_oracle/detr_fixture.safetensors \
-//!     cargo test -p mlx-gen-sam3 --release --test detr_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam3 --release --test integration detr_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3Detector, Sam3DetrConfig};

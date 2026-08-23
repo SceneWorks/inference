@@ -10,7 +10,7 @@
 //!     (sc-5446).
 //!
 //! Run the real-weight smoke on macOS against the assembled snapshot:
-//! `cargo test -p mlx-gen-scail2 --test generate_smoke -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-scail2 --test integration generate_smoke:: -- --ignored --nocapture`
 //! (env: `SCAIL2_SNAPSHOT_DIR`, `SCAIL2_SMOKE_SIZE`=256, `SCAIL2_SMOKE_FRAMES`=13,
 //! `SCAIL2_SMOKE_STEPS`=8).
 

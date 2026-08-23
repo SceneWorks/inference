@@ -2,7 +2,7 @@
 //! `black-forest-labs/FLUX.2-dev` snapshot (~60 GB DiT + ~45 GB TE); assembles a pre-quantized Q4
 //! snapshot in TMPDIR (shared with the other dev real-weight tests):
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test dev_adapter_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration dev_adapter_real_weights:: -- --ignored --nocapture
 //!
 //! LoRA/LoKr fall out of the family-agnostic adapter engine (sc-2343) onto the dev `Flux2Transformer`
 //! exactly as they did for klein (sc-2646) — the key→module map is config-driven, so the wider/deeper
@@ -25,8 +25,7 @@ use mlx_gen::{
 use mlx_gen_flux2::{load_transformer_dev, quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 use mlx_rs::Array;
 
-#[path = "../../tests/support/atomic_cache.rs"]
-mod atomic_cache;
+use crate::atomic_cache;
 
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;
