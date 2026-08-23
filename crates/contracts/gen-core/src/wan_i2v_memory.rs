@@ -19,7 +19,7 @@ use crate::{
     MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
 
-pub const RECEIPT_VERSION: &str = "wan-video-structural-v3";
+pub const RECEIPT_VERSION: &str = "wan-video-structural-v4";
 pub const LIGHTNING_REPOSITORY: &str = "lightx2v/Wan2.2-Lightning";
 pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
@@ -178,6 +178,7 @@ pub enum WanPublicMode {
     ImageToVideo,
     FirstLastFrame,
     ExtendClip,
+    VideoBridge,
 }
 
 impl WanPublicMode {
@@ -186,6 +187,7 @@ impl WanPublicMode {
             Self::ImageToVideo => "image_to_video",
             Self::FirstLastFrame => "first_last_frame",
             Self::ExtendClip => "extend_clip",
+            Self::VideoBridge => "video_bridge",
         }
     }
 }
@@ -1452,7 +1454,7 @@ fn contract(
                 support: if matches!(
                     strategy,
                     MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
-                ) || (route != WanI2vRoute::Vace
+                ) || ((route != WanI2vRoute::Vace || backend == WanI2vBackend::Mlx)
                     && strategy == MemoryStrategy::StagedResidency)
                 {
                     MemoryStrategySupport::Implemented
@@ -1604,6 +1606,15 @@ fn extend_keyframe(request: &GenerationRequest) -> crate::Result<crate::Keyframe
     })
 }
 
+fn bridge_keyframes(request: &GenerationRequest) -> crate::Result<[crate::KeyframeRef<'_>; 2]> {
+    first_last_keyframes(request).map_err(|_| {
+        crate::Error::Unsupported(
+            "Wan video_bridge fallback requires exactly two ordered fitted RGB8 Keyframes at 0/-1"
+                .to_owned(),
+        )
+    })
+}
+
 fn extend_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
     if request.conditioning.len() != 1 {
         return Err(crate::Error::Unsupported(
@@ -1636,6 +1647,48 @@ fn extend_control_clip(request: &GenerationRequest) -> crate::Result<crate::Cont
     Ok(clip)
 }
 
+fn bridge_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
+    let clip = extend_control_clip(request).map_err(|_| {
+        crate::Error::Unsupported(
+            "Wan VACE video_bridge requires one full output ControlClip with a fitted mask"
+                .to_owned(),
+        )
+    })?;
+    // A bridge owns two immutable source boundaries and generates only the middle.  ControlClip
+    // follows the VACE replacement convention: black keeps an anchor; white regenerates.  Require
+    // a non-empty left tail and right head (which may be asymmetric), plus an all-neutral generated
+    // gap, so an arbitrary edit control cannot masquerade as a bridge carrier.
+    let is_uniform = |image: &crate::Image, value| image.pixels.iter().all(|&pixel| pixel == value);
+    let left_anchor_len = clip
+        .mask
+        .iter()
+        .take_while(|mask| is_uniform(mask, 0))
+        .count();
+    let right_anchor_len = clip
+        .mask
+        .iter()
+        .rev()
+        .take_while(|mask| is_uniform(mask, 0))
+        .count();
+    let gap_end = clip.frames.len().saturating_sub(right_anchor_len);
+    if left_anchor_len == 0
+        || right_anchor_len == 0
+        || left_anchor_len >= gap_end
+        || !clip.mask[left_anchor_len..gap_end]
+            .iter()
+            .all(|mask| is_uniform(mask, 255))
+        || !clip.frames[left_anchor_len..gap_end]
+            .iter()
+            .all(|frame| is_uniform(frame, 0))
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE video_bridge requires black left-tail/right-head anchors and a white-mask neutral generated gap"
+                .to_owned(),
+        ));
+    }
+    Ok(clip)
+}
+
 fn request_mode(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
@@ -1659,6 +1712,16 @@ fn request_mode(
             extend_control_clip(request)?;
             Ok(WanPublicMode::ExtendClip)
         }
+        Some("video_bridge")
+            if prepared.route == WanI2vRoute::Ti2v5b && prepared.backend == WanI2vBackend::Mlx =>
+        {
+            bridge_keyframes(request)?;
+            Ok(WanPublicMode::VideoBridge)
+        }
+        Some("video_bridge") if prepared.route == WanI2vRoute::Vace => {
+            bridge_control_clip(request)?;
+            Ok(WanPublicMode::VideoBridge)
+        }
         _ => Err(crate::Error::Unsupported(format!(
             "{}: request is neither exact public I2V nor first_last_frame",
             prepared.route.provider_id()
@@ -1673,6 +1736,8 @@ fn request_contract_for_mode(
     let mut contract = prepared.contract.clone();
     if (mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx)
         || mode == WanPublicMode::ExtendClip
+        || (mode == WanPublicMode::VideoBridge
+            && (prepared.route == WanI2vRoute::Ti2v5b || prepared.backend == WanI2vBackend::Candle))
     {
         let staged = contract
             .strategies
@@ -1700,6 +1765,13 @@ pub fn contract_for_mode_key(
                     && prepared.backend == WanI2vBackend::Mlx) =>
         {
             WanPublicMode::ExtendClip
+        }
+        "video_bridge"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::VideoBridge
         }
         _ => {
             return Err(crate::Error::Unsupported(format!(
@@ -1761,10 +1833,15 @@ pub fn validate_request(
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
             WanI2vRoute::I2v14b => false,
         },
+        WanPublicMode::VideoBridge => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
+            WanI2vRoute::I2v14b => false,
+        },
     };
     let sampler_ok = match mode {
         WanPublicMode::ImageToVideo => true,
-        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip => {
+        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => {
             match request.sampler.as_deref() {
                 None | Some("uni_pc" | "euler") => true,
                 Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
@@ -1774,7 +1851,7 @@ pub fn validate_request(
     };
     let boundary_axes_ok = !matches!(
         mode,
-        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip
+        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip | WanPublicMode::VideoBridge
     ) || (request.strength.is_none()
         && request.true_cfg.is_none()
         && request.timestep_to_start_cfg.is_none()
@@ -1961,6 +2038,30 @@ fn request_evidence_revision_for_selection(
                 hash.update(Sha256::digest(&mask.pixels));
             }
         }
+        WanPublicMode::VideoBridge if prepared.route == WanI2vRoute::Ti2v5b => {
+            for (role, keyframe) in ["left-tail", "right-head"]
+                .into_iter()
+                .zip(bridge_keyframes(request)?)
+            {
+                hash.update(role.as_bytes());
+                hash.update(keyframe.frame_idx.to_le_bytes());
+                hash.update(keyframe.strength.to_bits().to_le_bytes());
+                hash.update(keyframe.image.width.to_le_bytes());
+                hash.update(keyframe.image.height.to_le_bytes());
+                hash.update(Sha256::digest(&keyframe.image.pixels));
+            }
+        }
+        WanPublicMode::VideoBridge => {
+            let clip = bridge_control_clip(request)?;
+            hash.update(b"vace-bridge-control-clip");
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+        }
     }
     Ok(format!(
         "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:{:x}",
@@ -1987,6 +2088,13 @@ pub fn validate_context(
                     && prepared.backend == WanI2vBackend::Mlx) =>
         {
             WanPublicMode::ExtendClip
+        }
+        "video_bridge"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::VideoBridge
         }
         _ => {
             return Err(crate::Error::Unsupported(format!(
@@ -2026,16 +2134,37 @@ pub fn validate_context(
             WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
             WanI2vRoute::I2v14b => false,
         },
+        WanPublicMode::VideoBridge => match prepared.route {
+            WanI2vRoute::Ti2v5b => {
+                prepared.route.accepts_first_last_rate(16, geometry.frames)
+                    || prepared.route.accepts_first_last_rate(24, geometry.frames)
+            }
+            WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
+            WanI2vRoute::I2v14b => false,
+        },
     };
     let carrier_ok = match mode {
         WanPublicMode::ImageToVideo => geometry.reference_count == 1,
         WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
         WanPublicMode::ExtendClip => geometry.reference_count == 1,
+        WanPublicMode::VideoBridge => geometry.reference_count == 0,
     };
     let selection_ok = match mode {
-        WanPublicMode::ExtendClip => matches!(
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge
+            if mode == WanPublicMode::ExtendClip
+                || prepared.route == WanI2vRoute::Ti2v5b
+                || prepared.backend == WanI2vBackend::Candle =>
+        {
+            matches!(
+                context.selection.strategy,
+                MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+            )
+        }
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => matches!(
             context.selection.strategy,
-            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
         ),
         WanPublicMode::FirstLastFrame if prepared.backend == WanI2vBackend::Mlx => matches!(
             context.selection.strategy,
@@ -2051,7 +2180,7 @@ pub fn validate_context(
     if !selection_ok
         || geometry.batch != 1
         || !carrier_ok
-        || !context.has_reference
+        || (context.has_reference != (mode != WanPublicMode::VideoBridge))
         || !prepared
             .route
             .public_geometries()
@@ -2166,7 +2295,11 @@ pub fn geometry_from_request(request: &GenerationRequest) -> MemoryGeometry {
         height: request.height,
         batch: request.count,
         frames: request.frames.unwrap_or_default(),
-        reference_count: request.conditioning.len() as u32,
+        // Clip carriers are execution inputs, not semantic image references.  In particular a
+        // bridge has two endpoint carriers but zero conceptual references, so it cannot borrow
+        // a still-image/FLF memory row merely because it has conditioning entries.
+        reference_count: u32::from(request.video_mode.as_deref() != Some("video_bridge"))
+            * request.conditioning.len() as u32,
     }
 }
 
@@ -2446,6 +2579,153 @@ mod tests {
                 strength: 0.75,
             }],
             ..Default::default()
+        }
+    }
+
+    fn bridge_keyframes_request() -> GenerationRequest {
+        let mut request = ti2v_extend_request();
+        request.prompt = "bridge the two clip boundaries".to_owned();
+        request.video_mode = Some("video_bridge".to_owned());
+        request.conditioning = vec![
+            Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![31; 832 * 480 * 3],
+                },
+                frame_idx: 0,
+                strength: 0.25,
+            },
+            Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![73; 832 * 480 * 3],
+                },
+                frame_idx: -1,
+                strength: 0.75,
+            },
+        ];
+        request
+    }
+
+    fn vace_bridge_request() -> GenerationRequest {
+        let mut request = vace_extend_request();
+        request.prompt = "bridge the two source clips through a neutral gap".to_owned();
+        request.video_mode = Some("video_bridge".to_owned());
+        if let Conditioning::ControlClip { frames, mask, .. } = &mut request.conditioning[0] {
+            frames[..1].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![11; 832 * 480 * 3],
+            });
+            frames[1..42].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![0; 832 * 480 * 3],
+            });
+            frames[42..].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![89; 832 * 480 * 3],
+            });
+            mask[..1].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![0; 832 * 480 * 3],
+            });
+            mask[1..42].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![255; 832 * 480 * 3],
+            });
+            mask[42..].fill(Image {
+                width: 832,
+                height: 480,
+                pixels: vec![0; 832 * 480 * 3],
+            });
+        }
+        request
+    }
+
+    #[test]
+    fn video_bridge_is_zero_reference_with_sealed_vace_and_keyframe_carriers() {
+        for (backend, quant) in [
+            (WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vBackend::Mlx, None),
+            (WanI2vBackend::Candle, None),
+        ] {
+            let (_tmp, spec) = vace_fixture(backend, quant);
+            let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+            let mut request = vace_bridge_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                ) || (backend == WanI2vBackend::Mlx
+                    && strategy == MemoryStrategy::StagedResidency);
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            let strategy = if backend == WanI2vBackend::Mlx {
+                MemoryStrategy::StagedResidency
+            } else {
+                MemoryStrategy::BoundedDecode
+            };
+            let selection = selection(&prepared, strategy);
+            request.memory = contract.generation_memory(&selection);
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            let mut run_context = context(&prepared, &request, selection, receipt.clone());
+            run_context.has_reference = false;
+            assert_eq!(run_context.geometry.reference_count, 0);
+            assert!(validate_context(&prepared, &run_context).is_ok());
+            if let Conditioning::ControlClip { mask, .. } = &mut request.conditioning[0] {
+                mask[1].pixels[0] ^= 1;
+            }
+            assert!(request_evidence_revision(&prepared, &request).is_err());
+        }
+
+        for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+            let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, quant);
+            let prepared = PreparedWanI2vMemory::prepare(
+                &spec,
+                WanI2vBackend::Mlx,
+                WanI2vRoute::Ti2v5b.provider_id(),
+            )
+            .unwrap();
+            let mut request = bridge_keyframes_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                );
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            let selection = selection(&prepared, MemoryStrategy::BoundedDecode);
+            request.memory = contract.generation_memory(&selection);
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            let mut run_context = context(&prepared, &request, selection, receipt.clone());
+            run_context.has_reference = false;
+            assert_eq!(run_context.geometry.reference_count, 0);
+            assert!(validate_context(&prepared, &run_context).is_ok());
+            request.conditioning.swap(0, 1);
+            assert!(request_evidence_revision(&prepared, &request).is_err());
         }
     }
 
@@ -2833,11 +3113,12 @@ mod tests {
                 match request.video_mode.as_deref() {
                     Some("image_to_video") => "image_to_video",
                     Some("extend_clip") => "extend_clip",
+                    Some("video_bridge") => "video_bridge",
                     _ => "first_last_frame",
                 }
                 .to_owned(),
             ),
-            has_reference: true,
+            has_reference: request.video_mode.as_deref() != Some("video_bridge"),
             use_pid: false,
             has_phases: false,
             geometry: geometry_from_request(request),
