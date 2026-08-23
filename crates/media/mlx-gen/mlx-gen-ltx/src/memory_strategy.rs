@@ -256,7 +256,7 @@ fn production_asset_declaration(
     };
 
     // The conditioning phase includes the canonical dense Gemma snapshot, the LTX connector, the
-    // request-scoped VAE encoder used by I2V, and the optional uncensored Gemma artifact when that
+    // request-scoped VAE encoder used by I2V / ordered first-last keyframes, and the optional uncensored Gemma artifact when that
     // exact overlay is loaded. The encoder is released after its fitted image latents materialize;
     // keeping it in this phase floor accounts its widest instant without carrying it into denoise.
     let conditioning_bytes = checked_sum(
@@ -448,6 +448,7 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
             .filter(|axis| {
                 !axis.starts_with("provider_video_mode:")
                     && !axis.starts_with("reference:image:")
+                    && !axis.starts_with("keyframe:")
                     && axis != &"enhancer:standard"
             })
             .map(str::to_owned)
@@ -464,6 +465,13 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
 
 fn reference_axis(width: u32, height: u32) -> String {
     format!("reference:image:{width}x{height}:strength:{I2V_STRENGTH_BITS:08x}")
+}
+
+fn first_last_axes(width: u32, height: u32) -> [String; 2] {
+    [
+        format!("keyframe:first:image:{width}x{height}:frame:0:strength:{I2V_STRENGTH_BITS:08x}"),
+        format!("keyframe:last:image:{width}x{height}:frame:-1:strength:{I2V_STRENGTH_BITS:08x}"),
+    ]
 }
 
 fn admitted_reference_axis(overlay: Option<&str>) -> Option<&str> {
@@ -712,9 +720,12 @@ pub(crate) fn safety_check(
         let i2v = context.mode.as_key() == "image_to_video"
             && context.geometry.reference_count == 1
             && context.has_reference;
-        if (!t2v && !i2v) || context.use_pid || context.has_phases {
+        let first_last = context.mode.as_key() == "first_last_frame"
+            && context.geometry.reference_count == 2
+            && context.has_reference;
+        if (!t2v && !i2v && !first_last) || context.use_pid || context.has_phases {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: memory admission requires exact text_to_video/no-reference or image_to_video/one-reference identity without PiD/phases"
+                "ltx_2_3: memory admission requires exact text_to_video/no-reference, image_to_video/one-reference, or first_last_frame/two-keyframe identity without PiD/phases"
                     .into(),
             ));
         }
@@ -745,6 +756,23 @@ pub(crate) fn safety_check(
                 "ltx_2_3: image_to_video admission requires the exact fitted image shape and fixed strength receipt"
                     .into(),
             ));
+        }
+        if first_last {
+            let expected = first_last_axes(geometry.width, geometry.height).join("+");
+            let actual = context
+                .overlay
+                .as_deref()
+                .into_iter()
+                .flat_map(|value| value.split('+'))
+                .filter(|axis| axis.starts_with("keyframe:"))
+                .collect::<Vec<_>>()
+                .join("+");
+            if actual != expected {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: first_last_frame admission requires the exact ordered fitted first/last keyframe receipt"
+                        .into(),
+                ));
+            }
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
@@ -845,7 +873,52 @@ pub(crate) fn registered_valid_fixtures(
         },
         strength: Some(1.0),
     }];
-    Ok(vec![t2v, i2v])
+    let first_last_receipt = first_last_axes(768, 512).join("+");
+    let first_last_overlay = match route_overlay(spec) {
+        Some(load) => format!("{load}+{first_last_receipt}"),
+        None => first_last_receipt,
+    };
+    let mut first_last_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("first_last_frame".into()),
+            reference_count: 2,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(first_last_overlay),
+        },
+    )?;
+    first_last_context.geometry.width = 768;
+    first_last_context.geometry.height = 512;
+    first_last_context.geometry.frames = 153;
+    let mut first_last = MemoryBehaviorFixture::new(first_last_context);
+    first_last.request.width = 768;
+    first_last.request.height = 512;
+    first_last.request.frames = Some(153);
+    first_last.request.fps = Some(25);
+    first_last.request.conditioning = vec![
+        gen_core::Conditioning::Keyframe {
+            image: gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3],
+            },
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        gen_core::Conditioning::Keyframe {
+            image: gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3],
+            },
+            frame_idx: -1,
+            strength: 1.0,
+        },
+    ];
+    Ok(vec![t2v, i2v, first_last])
 }
 
 fn begin_with_cleanup(
@@ -895,41 +968,53 @@ impl LtxMemoryRequestScope {
         admitted_overlay: Option<&str>,
         admitted_mode: &str,
     ) -> gen_core::Result<()> {
-        let mut reference = None;
-        for conditioning in &request.conditioning {
-            let gen_core::Conditioning::Reference { image, strength } = conditioning else {
-                return Err(gen_core::Error::Unsupported(
-                    "ltx_2_3: this memory route accepts only the single fitted image Reference carrier"
-                        .into(),
-                ));
-            };
-            if reference.is_some() {
-                return Err(gen_core::Error::Unsupported(
-                    "ltx_2_3: image_to_video memory admission requires exactly one Reference"
-                        .into(),
-                ));
+        let fitted = |image: &gen_core::Image, strength: f32| {
+            image.width == request.width
+                && image.height == request.height
+                && strength.to_bits() == I2V_STRENGTH_BITS
+        };
+        let reference = match request.conditioning.as_slice() {
+            [gen_core::Conditioning::Reference { image, strength }]
+                if fitted(image, strength.or(request.strength).unwrap_or(1.0)) =>
+            {
+                Some(reference_axis(image.width, image.height))
             }
-            if image.width != request.width || image.height != request.height {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "ltx_2_3: fitted reference shape {}x{} does not match output {}x{}",
-                    image.width, image.height, request.width, request.height
-                )));
+            _ => None,
+        };
+        let first_last = match request.conditioning.as_slice() {
+            [gen_core::Conditioning::Keyframe {
+                image: first,
+                frame_idx: 0,
+                strength: first_strength,
+            }, gen_core::Conditioning::Keyframe {
+                image: last,
+                frame_idx: -1,
+                strength: last_strength,
+            }] if fitted(first, *first_strength) && fitted(last, *last_strength) => {
+                Some(first_last_axes(first.width, first.height).join("+"))
             }
-            let strength = strength.or(request.strength).unwrap_or(1.0);
-            if strength.to_bits() != I2V_STRENGTH_BITS {
-                return Err(gen_core::Error::Unsupported(
-                    "ltx_2_3: image_to_video memory admission requires fixed strength 1.0".into(),
-                ));
-            }
-            reference = Some(reference_axis(image.width, image.height));
-        }
-        match (admitted_mode, reference.as_deref()) {
-            ("text_to_video", None) => {}
-            ("image_to_video", Some(actual))
+            _ => None,
+        };
+        match (admitted_mode, reference.as_deref(), first_last.as_deref()) {
+            ("text_to_video", None, None) => {}
+            ("image_to_video", Some(actual), None)
                 if Some(actual) == admitted_reference_axis(admitted_overlay) => {}
-            ("image_to_video", None) => {
+            ("image_to_video", None, None) => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: image_to_video admission requires one fitted Reference".into(),
+                ));
+            }
+            ("first_last_frame", None, Some(actual))
+                if admitted_overlay
+                    .into_iter()
+                    .flat_map(|overlay| overlay.split('+'))
+                    .filter(|axis| axis.starts_with("keyframe:"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+                    == actual => {}
+            ("first_last_frame", None, None) => {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: first_last_frame admission requires ordered fitted Keyframes at 0 and -1 with fixed strength 1.0".into(),
                 ));
             }
             _ => {
@@ -1309,6 +1394,32 @@ mod tests {
     }
 
     #[test]
+    fn first_last_fixture_binds_ordered_two_keyframe_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "first_last_frame")
+            .unwrap();
+        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        let mut accepted = fixture.request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+        assert!(accepted.memory.unwrap().stage_residency);
+
+        let mut crossed = fixture.request;
+        crossed.conditioning.swap(0, 1);
+        let error = scope
+            .configure_request(&mut crossed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ordered fitted Keyframes"), "{error}");
+        assert_eq!(crossed.memory, None);
+    }
+
+    #[test]
     fn calibrated_scope_binds_empty_t2v_request_and_exact_fps_frame_pair_before_controls() {
         let (mut scope, request) = calibrated_t2v_scope_and_request();
         let mut accepted = request.clone();
@@ -1350,16 +1461,25 @@ mod tests {
                 mode: ReplacementMode::FaceOnly,
             },
         ] {
+            let expected_reference_count =
+                u32::from(matches!(conditioning, Conditioning::Keyframe { .. }));
             let mut temporal_conditioning = GenerationRequest {
                 conditioning: vec![conditioning],
                 ..request.clone()
             };
-            assert_eq!(temporal_conditioning.image_reference_count(), 0);
+            assert_eq!(
+                temporal_conditioning.image_reference_count(),
+                expected_reference_count
+            );
             let error = scope
                 .configure_request(&mut temporal_conditioning)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("accepts only the single fitted image Reference carrier"));
+            assert!(
+                error.contains("request mode/reference receipt crossed")
+                    || error.contains("accepts only the single fitted image Reference carrier"),
+                "{error}"
+            );
             assert_eq!(temporal_conditioning.memory, None);
         }
 

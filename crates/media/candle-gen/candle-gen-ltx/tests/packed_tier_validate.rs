@@ -215,6 +215,104 @@ fn packed_q4_i2v_memory_route_renders() {
     assert_frame_coherent(&frames[0], "q4-i2v#0");
 }
 
+/// SC-20773's ordered first/last-frame counterpart. The provider VAE-encodes both keyframes at
+/// both LTX stages, so this proves the four-encode carrier and selected bounded decode run through
+/// the actual packed q4 CUDA loader rather than only the weights-free admission fixture.
+#[test]
+#[ignore = "needs LTX_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
+fn packed_q4_first_last_memory_route_renders() {
+    let dir = std::env::var("LTX_PACKED_Q4")
+        .expect("set LTX_PACKED_Q4 to the packed q4 tier subdirectory");
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(dir)));
+    spec.quantize = Some(Quant::Q4);
+    let generator = candle_gen_ltx::provider_registry()
+        .unwrap()
+        .load("ltx_2_3_distilled", &spec)
+        .expect("ltx q4 generator");
+    let contract = generator
+        .memory_strategy_contract()
+        .expect("the exact q4 split artifact publishes its first-last memory contract");
+    let mut context = candle_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        MemoryStrategy::BoundedDecode,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("first_last_frame".into()),
+            reference_count: 2,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(
+                "keyframe:first:image:768x512:frame:0:strength:3f800000+keyframe:last:image:768x512:frame:-1:strength:3f800000".into(),
+            ),
+        },
+    )
+    .expect("q4 first-last bounded decode selection");
+    context.geometry.width = 768;
+    context.geometry.height = 512;
+    context.geometry.frames = 97;
+
+    let first = Image {
+        width: 768,
+        height: 512,
+        pixels: vec![96; 768 * 512 * 3],
+    };
+    let last = Image {
+        width: 768,
+        height: 512,
+        pixels: vec![160; 768 * 512 * 3],
+    };
+    let mut request = GenerationRequest {
+        prompt: "a red fox crossing a snowy clearing, slow dolly shot".into(),
+        width: 768,
+        height: 512,
+        count: 1,
+        seed: Some(42),
+        frames: Some(97),
+        fps: Some(24),
+        sampler: Some("euler".into()),
+        conditioning: vec![
+            candle_gen::gen_core::Conditioning::Keyframe {
+                image: first,
+                frame_idx: 0,
+                strength: 1.0,
+            },
+            candle_gen::gen_core::Conditioning::Keyframe {
+                image: last,
+                frame_idx: -1,
+                strength: 1.0,
+            },
+        ],
+        ..Default::default()
+    };
+    {
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("q4 first-last admission")
+            .expect("memory scope");
+        scope
+            .configure_request(&mut request)
+            .expect("bind request controls");
+        scope
+            .finish(MemoryRunOutcome::Complete)
+            .expect("scope cleanup");
+    }
+    let mut on_progress = |_p: Progress| {};
+    let output = generator
+        .generate(&request, &mut on_progress)
+        .expect("q4 first-last render with selected bounded decode");
+    let GenerationOutput::Video { frames, fps, .. } = output else {
+        panic!("expected video");
+    };
+    assert_eq!(fps, 24);
+    assert_eq!(frames.len(), 97);
+    assert_frame_coherent(&frames[0], "q4-first-last#0");
+    assert_frame_coherent(frames.last().expect("last frame"), "q4-first-last#last");
+}
+
 /// The q8 packed tier renders a coherent short video (double-quant Q8_0 path); only runs when the q8
 /// tier is present locally.
 #[test]

@@ -1,8 +1,10 @@
-//! Request-scoped memory admission for the released Candle/CUDA LTX q4 I2V tier (SC-20772).
+//! Request-scoped memory admission for the released Candle/CUDA LTX q4 I2V and first/last-frame
+//! tiers (SC-20772, SC-20773).
 //!
 //! This is intentionally a narrow contract: it is the split `q4/` tier that this provider loads
-//! through `tier::TierPaths`, with one fitted image reference at strength 1.0.  Dense and q8
-//! snapshots remain usable as historical generator routes, but cannot borrow this q4 evidence.
+//! through `tier::TierPaths`, with either one fitted I2V image reference or two ordered fitted
+//! first/last keyframes at strength 1.0. Dense and q8 snapshots remain usable as historical
+//! generator routes, but cannot borrow this q4 evidence.
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
@@ -41,6 +43,13 @@ fn reference_axis(width: u32, height: u32) -> String {
     format!("reference:image:{width}x{height}:strength:{STRENGTH_BITS:08x}")
 }
 
+fn first_last_axes(width: u32, height: u32) -> [String; 2] {
+    [
+        format!("keyframe:first:image:{width}x{height}:frame:0:strength:{STRENGTH_BITS:08x}"),
+        format!("keyframe:last:image:{width}x{height}:frame:-1:strength:{STRENGTH_BITS:08x}"),
+    ]
+}
+
 fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(gen_core::Error::Unsupported(format!(
@@ -62,7 +71,7 @@ fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
         || !spec.components.is_empty()
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: calibrated q4 I2V admission requires the plain split q4 tier without load overlays"
+            "{MODEL_ID}: calibrated q4 I2V/first-last admission requires the plain split q4 tier without load overlays"
         )));
     }
     let gemma = spec.text_encoder.as_ref().map(|source| match source {
@@ -254,13 +263,16 @@ fn route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
-    if context.mode.as_key() != "image_to_video"
-        || context.geometry.reference_count != 1
-        || !context.has_reference
-        || context.use_pid
-        || context.has_phases
-    {
-        return Err(gen_core::Error::Unsupported(format!("{MODEL_ID}: q4 memory admission requires image_to_video with exactly one Reference and no PiD/phases")));
+    let i2v = context.mode.as_key() == "image_to_video"
+        && context.geometry.reference_count == 1
+        && context.has_reference;
+    let first_last = context.mode.as_key() == "first_last_frame"
+        && context.geometry.reference_count == 2
+        && context.has_reference;
+    if (!i2v && !first_last) || context.use_pid || context.has_phases {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: q4 memory admission requires image_to_video/one Reference or first_last_frame/two ordered Keyframes without PiD/phases"
+        )));
     }
     let geometry = context.geometry;
     if geometry.batch != 1
@@ -268,13 +280,17 @@ fn route_gate(
         || !SHIPPED_FRAMES.contains(&geometry.frames)
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: unsupported q4 I2V geometry"
+            "{MODEL_ID}: unsupported q4 I2V/first-last geometry"
         )));
     }
-    let reference = reference_axis(geometry.width, geometry.height);
-    if context.overlay.as_deref() != Some(reference.as_str()) {
+    let expected_overlay = if i2v {
+        reference_axis(geometry.width, geometry.height)
+    } else {
+        first_last_axes(geometry.width, geometry.height).join("+")
+    };
+    if context.overlay.as_deref() != Some(expected_overlay.as_str()) {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: q4 I2V admission requires the exact fitted reference receipt"
+            "{MODEL_ID}: q4 admission requires the exact fitted ordered conditioning receipt"
         )));
     }
     if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
@@ -323,28 +339,43 @@ fn registered_safety_check(
 struct LtxMemoryScope {
     inner: candle_gen::request_scope::CandleRequestScopeCore,
     admitted: gen_core::MemoryGeometry,
+    admitted_mode: String,
 }
 impl MemoryRequestScope for LtxMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        if request.conditioning.len() != 1 {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: q4 I2V admission requires exactly one Reference"
-            )));
-        }
-        let gen_core::Conditioning::Reference { image, strength } = &request.conditioning[0] else {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: q4 I2V admission accepts only a Reference"
-            )));
+        let fitted = |image: &gen_core::Image, strength: f32| {
+            image.width == request.width
+                && image.height == request.height
+                && strength.to_bits() == STRENGTH_BITS
         };
-        if image.width != request.width
-            || image.height != request.height
-            || strength.unwrap_or(1.0).to_bits() != STRENGTH_BITS
+        let exact_conditioning = match self.admitted_mode.as_str() {
+            "image_to_video" => match request.conditioning.as_slice() {
+                [gen_core::Conditioning::Reference { image, strength }] => {
+                    fitted(image, strength.unwrap_or(1.0))
+                }
+                _ => false,
+            },
+            "first_last_frame" => match request.conditioning.as_slice() {
+                [gen_core::Conditioning::Keyframe {
+                    image: first,
+                    frame_idx: 0,
+                    strength: first_strength,
+                }, gen_core::Conditioning::Keyframe {
+                    image: last,
+                    frame_idx: -1,
+                    strength: last_strength,
+                }] => fitted(first, *first_strength) && fitted(last, *last_strength),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !exact_conditioning
             || request.fps.is_none_or(|fps| {
                 !frame_count_matches_fps(fps, request.frames.unwrap_or(DEFAULT_FRAMES))
             })
         {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: request crossed the admitted image/FPS/strength identity"
+                "{MODEL_ID}: request crossed the admitted conditioning/FPS/strength identity"
             )));
         }
         self.inner.configure_request(request)
@@ -400,6 +431,7 @@ fn begin(
     Ok(Some(Box::new(LtxMemoryScope {
         inner: candle_gen::request_scope::CandleRequestScopeCore::new(config),
         admitted: context.geometry,
+        admitted_mode: context.mode.as_key().to_owned(),
     })))
 }
 
@@ -466,8 +498,52 @@ fn registered_valid_fixtures(
         },
         strength: Some(1.0),
     }];
+    let mut first_last_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("first_last_frame".into()),
+            reference_count: 2,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(first_last_axes(768, 512).join("+")),
+        },
+    )?;
+    first_last_context.geometry.width = 768;
+    first_last_context.geometry.height = 512;
+    first_last_context.geometry.frames = 153;
+    let mut first_last = MemoryBehaviorFixture::new(first_last_context);
+    first_last.request.width = 768;
+    first_last.request.height = 512;
+    first_last.request.frames = Some(153);
+    first_last.request.fps = Some(25);
+    first_last.request.conditioning = vec![
+        gen_core::Conditioning::Keyframe {
+            image: gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3],
+            },
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        gen_core::Conditioning::Keyframe {
+            image: gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3],
+            },
+            frame_idx: -1,
+            strength: 1.0,
+        },
+    ];
     let _ = spec;
-    Ok(vec![fixture])
+    Ok(vec![fixture, first_last])
 }
 
 fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {
@@ -621,5 +697,37 @@ mod tests {
             safety_check(&contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn first_last_fixture_binds_ordered_two_keyframe_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "first_last_frame")
+            .unwrap();
+        assert!(matches!(
+            safety_check(&contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        let mut scope = begin(&contract, Device::Cpu, &fixture.context)
+            .unwrap()
+            .unwrap();
+        let mut request = fixture.request.clone();
+        scope.configure_request(&mut request).unwrap();
+
+        let mut crossed = fixture.request;
+        crossed.conditioning.swap(0, 1);
+        let error = scope
+            .configure_request(&mut crossed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("conditioning/FPS/strength identity"),
+            "{error}"
+        );
+        assert_eq!(crossed.memory, None);
     }
 }

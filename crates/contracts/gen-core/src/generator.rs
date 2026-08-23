@@ -930,11 +930,13 @@ pub struct ControlClipRef<'a> {
 impl GenerationRequest {
     /// Number of image-conditioning inputs represented by this request for memory-evidence
     /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
-    /// carriers each contribute one. Temporal keyframes and clips are covered by the frame axis.
+    /// carriers each contribute one. A keyframe is a distinct image input even though its placement
+    /// is temporal; clips remain represented by the frame axis.
     pub fn image_reference_count(&self) -> u32 {
         self.conditioning.iter().fold(0_u32, |count, conditioning| {
             let increment = match conditioning {
                 Conditioning::Reference { .. }
+                | Conditioning::Keyframe { .. }
                 | Conditioning::Control { .. }
                 | Conditioning::Depth { .. }
                 | Conditioning::Mask { .. } => 1,
