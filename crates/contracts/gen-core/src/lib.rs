@@ -46,6 +46,7 @@ pub mod transcribe;
 pub mod transform;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
+pub mod wan_i2v_memory;
 pub mod weightsmeta;
 
 pub use approximation::{
@@ -130,10 +131,11 @@ pub use memory_strategy::{
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
     MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategyEngagementExclusion, MemoryStrategyParameters,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWarmRunSemantics,
-    MemoryWindowMaterialization, ResidentRequestMemory, TransformerComponent,
-    MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION,
-    MEMORY_EVIDENCE_V1_PREFIX,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryStructuralResidentEvidence,
+    MemoryStructuralResidentRequestIdentity, MemoryWarmRunSemantics, MemoryWindowMaterialization,
+    ResidentRequestMemory, TransformerComponent, MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI,
+    MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
+    MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
 pub use registry::{
     candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
