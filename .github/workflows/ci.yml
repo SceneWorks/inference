@@ -634,6 +634,26 @@ jobs:
         run: |
           rustup show
           rustup component add clippy
+      - name: Fetch prebuilt MLX (sc-21382)
+        # pmetal-mlx-sys's cmake build of libmlx is ≈6 min on this runner on every cache miss
+        # (plus a network fetch of MLX). The SceneWorks/mlx-rs fork publishes that build per
+        # commit (`prebuilt-<sha12>` releases, cell = target × deployment target × Debug/Release);
+        # scripts/fetch-prebuilt-mlx.sh picks the asset for the rev pinned in Cargo.lock and this
+        # job's MACOSX_DEPLOYMENT_TARGET, and build.rs links it from PMETAL_MLX_PREBUILT_DIR only
+        # after checking the manifest against its own key -- a mismatch FAILS the build. The one
+        # failure tolerated here is "no prebuilt published for this rev yet" (exit 1), which is
+        # exactly the case where building from source is right; it is surfaced as a workflow
+        # annotation so a rev bump that forgot to publish is visible. Anything else is an error.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -763,6 +783,20 @@ jobs:
           xcrun metal --version
           rustc --version
           cargo --version
+      - name: Fetch prebuilt MLX (sc-21382)
+        # Same contract as the `macos-metal` step of this name; this lane's cell is 26.2/Debug and
+        # the self-hosted runner keeps the extracted tarball in ~/.cache/pmetal/prebuilt across
+        # runs, so after the first fetch this is a no-op.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
       # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
       # cache step). `macos-nax` is manual and never runs on `main`, so a main-only save would leave
       # it nothing to restore; it also contributed no entry to the 2026-08-15 cache inventory. Do
