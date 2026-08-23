@@ -743,9 +743,26 @@ mod tests {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         assert!(load(&file).is_err());
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        // `/snap` exists on Ubuntu hosts, which accidentally turns this weights-free loader
+        // fixture into a physical-receipt probe. Use a guaranteed-missing path with the exact
+        // Ideogram bf16 repository/revision/tier and provider identity instead.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(format!(
+                "models--SceneWorks--{}",
+                memory_strategy::BF16_REPOSITORY
+            ))
+            .join("snapshots")
+            .join(memory_strategy::BF16_REVISION)
+            .join("bf16");
+        let lora = LoadSpec::new(WeightsSource::Dir(root))
+            .with_resolved_route(MODEL_ID)
+            .with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
         assert!(load(&lora).is_ok());
     }
 }
