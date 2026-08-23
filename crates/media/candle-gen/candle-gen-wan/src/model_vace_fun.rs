@@ -675,7 +675,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            supported_quants: &[Quant::Q4, Quant::Q8],
+            // The public Candle route is the immutable dense bf16 VACE-Fun snapshot.
+            // Do not advertise dormant packed tiers: they have no provider receipt.
+            supported_quants: &[],
             supports_sequential_offload: true,
             ..Default::default()
         },
@@ -705,10 +707,16 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     };
     let tier = VaceFunTierPaths::detect(&root)?;
     if let Some(tier) = &tier {
+        // Preserve structural validation so malformed packed layouts fail deterministically;
+        // a valid packed layout is still not an admitted public Candle artifact.
         tier.validate_requested_quant(spec.quantize)?;
-    } else if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "wan2_2_vace_fun_14b accepts Q4/Q8 only from a complete hosted split packed tier; on-the-fly quantization is not supported".into(),
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; packed tiers are not a supported provider artifact".into(),
+        ));
+    }
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; quantized tiers are not supported".into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
