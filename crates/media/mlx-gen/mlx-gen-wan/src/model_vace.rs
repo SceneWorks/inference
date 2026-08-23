@@ -267,7 +267,11 @@ fn vace_decode_tail(
             prep.width, prep.height
         )));
     }
-    let tiling = auto_tiling_budgeted_z16(out_height, out_width, out_frames)?;
+    let tiling = if req.memory.is_some_and(|memory| memory.tile_vae_decode) {
+        crate::i2v_memory_strategy::decode_tiling(req, prep.width, prep.height, out_frames as u32)?
+    } else {
+        auto_tiling_budgeted_z16(out_height, out_width, out_frames)?
+    };
     let frames_u8 = {
         let w = Weights::from_file(root.join("vae.safetensors"))?;
         let vae = ProviderVae::from_weights(&w)?;
@@ -339,6 +343,7 @@ pub struct WanVace {
     /// [`WanVace::generate`] **before** `from_weights` + quantize (the fork order). Empty for a plain
     /// load — the no-adapter path is byte-identical to pre-sc-3439.
     adapters: Vec<AdapterSpec>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVace {
@@ -400,12 +405,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let config = WanVaceConfig::from_model_dir(&root)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_VACE).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVace {
         descriptor: descriptor_vace(),
         config,
         root,
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
+        i2v_memory,
     }))
 }
 
@@ -425,10 +438,50 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
 
 // F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
 // (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
-mlx_gen::impl_generator!(WanVace {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, &s.config, req),
-    generate: generate_impl,
-});
+impl Generator for WanVace {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_vace_clip(&self.descriptor, MODEL_ID_VACE, &self.config, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "wan_vace loaded route has no sealed memory contract".to_owned(),
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        match &self.i2v_memory {
+            Some(prepared) => crate::i2v_memory_strategy::begin_request(prepared, context),
+            None => Ok(None),
+        }
+    }
+}
 
 impl WanVace {
     /// The VACE pipeline (port of diffusers `WanVACEPipeline.__call__`): stage the phases to bound
@@ -442,6 +495,9 @@ impl WanVace {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let base = &self.config.base;
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,

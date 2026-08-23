@@ -30,6 +30,7 @@ pub const DECODE_OVERLAPS: &[u32] = &[64];
 pub enum WanI2vRoute {
     Ti2v5b,
     I2v14b,
+    Vace,
 }
 
 impl WanI2vRoute {
@@ -37,6 +38,7 @@ impl WanI2vRoute {
         match provider_id {
             "wan2_2_ti2v_5b" => Ok(Self::Ti2v5b),
             "wan2_2_i2v_14b" => Ok(Self::I2v14b),
+            "wan_vace" => Ok(Self::Vace),
             _ => Err(crate::Error::Unsupported(format!(
                 "{provider_id}: not a Wan I2V memory route"
             ))),
@@ -47,6 +49,7 @@ impl WanI2vRoute {
         match self {
             Self::Ti2v5b => "wan2_2_ti2v_5b",
             Self::I2v14b => "wan2_2_i2v_14b",
+            Self::Vace => "wan_vace",
         }
     }
 
@@ -54,6 +57,7 @@ impl WanI2vRoute {
         match self {
             Self::Ti2v5b => &[(832, 480), (1280, 704), (704, 1280)],
             Self::I2v14b => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
+            Self::Vace => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
         }
     }
 
@@ -65,6 +69,7 @@ impl WanI2vRoute {
                 _ => false,
             },
             Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
+            Self::Vace => fps == 16 && [45, 61, 77].contains(&frames),
         }
     }
 
@@ -82,6 +87,7 @@ impl WanI2vRoute {
 pub enum WanPublicMode {
     ImageToVideo,
     FirstLastFrame,
+    ExtendClip,
 }
 
 impl WanPublicMode {
@@ -89,6 +95,7 @@ impl WanPublicMode {
         match self {
             Self::ImageToVideo => "image_to_video",
             Self::FirstLastFrame => "first_last_frame",
+            Self::ExtendClip => "extend_clip",
         }
     }
 }
@@ -236,7 +243,52 @@ fn repository_policy(
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             "596658fd9ca6b7b71d5057529bbf319ecbc61d74",
         ),
+        (WanI2vBackend::Mlx, WanI2vRoute::Vace, _) => (
+            "Wan-AI/Wan2.1-VACE-1.3B-diffusers+shared-wan-components",
+            "artifact-receipt",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::Vace, None) => {
+            ("Wan-AI/Wan2.1-VACE-14B-diffusers", "artifact-receipt")
+        }
+        (WanI2vBackend::Candle, WanI2vRoute::Vace, Some(_)) => (
+            "Wan-AI/Wan2.1-VACE-14B-diffusers",
+            "unsupported-packed-tier",
+        ),
     }
+}
+
+fn vace_artifact_revision(root: &Path) -> crate::Result<String> {
+    let tensors = walk_safetensors(root)?;
+    let mut structural = [
+        "transformer/config.json",
+        "text_encoder/config.json",
+        "vae/config.json",
+        "tokenizer/tokenizer.json",
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+        "tokenizer.json",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .filter(|relative| root.join(relative).is_file())
+    .collect::<Vec<_>>();
+    structural.sort();
+    if tensors.is_empty() || structural.is_empty() {
+        return Err(crate::Error::Unsupported(
+            "wan_vace: empty artifact inventory".to_owned(),
+        ));
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"wan-vace-composed-artifact-v1");
+    for relative in tensors {
+        hash.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hash.update(std::fs::metadata(root.join(relative))?.len().to_le_bytes());
+    }
+    for relative in structural {
+        hash.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hash.update(sha256_file(&root.join(relative))?.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn repo_dir(repository: &str) -> String {
@@ -327,6 +379,38 @@ fn walk_safetensors(root: &Path) -> crate::Result<Vec<PathBuf>> {
 }
 
 fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
+    if route == WanI2vRoute::Vace {
+        for required in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            if !root.join(required).is_file() {
+                return Err(crate::Error::Unsupported(format!(
+                    "wan_vace: missing required MLX component {required}"
+                )));
+            }
+        }
+        if !root.join("transformer/config.json").is_file() {
+            return Err(crate::Error::Unsupported(
+                "wan_vace: missing transformer/config.json".to_owned(),
+            ));
+        }
+        let actual = walk_safetensors(root)?;
+        let has_transformer = actual.iter().any(|relative| {
+            relative == Path::new("model.safetensors")
+                || relative.starts_with(Path::new("transformer"))
+        });
+        if !has_transformer
+            || !actual.contains(&PathBuf::from("t5_encoder.safetensors"))
+            || !actual.contains(&PathBuf::from("vae.safetensors"))
+        {
+            return Err(crate::Error::Unsupported(
+                "wan_vace: incomplete MLX transformer/T5/VAE tensor inventory".to_owned(),
+            ));
+        }
+        return Ok(actual);
+    }
     let expected: &[&str] = match route {
         WanI2vRoute::Ti2v5b => &[
             "model.safetensors",
@@ -339,6 +423,7 @@ fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<
             "t5_encoder.safetensors",
             "vae.safetensors",
         ],
+        WanI2vRoute::Vace => unreachable!("handled above"),
     };
     for required in ["config.json", "tokenizer.json"] {
         if !root.join(required).is_file() {
@@ -422,7 +507,8 @@ fn validate_component_inventory(root: &Path, component: &str) -> crate::Result<V
 }
 
 fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
-    if !root.join("model_index.json").is_file() || !root.join("tokenizer/tokenizer.json").is_file()
+    if !root.join("tokenizer/tokenizer.json").is_file()
+        || (route != WanI2vRoute::Vace && !root.join("model_index.json").is_file())
     {
         return Err(crate::Error::Unsupported(format!(
             "{}: incomplete Candle model/tokenizer inventory",
@@ -432,6 +518,7 @@ fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<V
     let components: &[&str] = match route {
         WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
         WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+        WanI2vRoute::Vace => &["text_encoder", "transformer", "vae"],
     };
     let mut inventory = Vec::new();
     for component in components {
@@ -453,6 +540,45 @@ fn structural_files(
     backend: WanI2vBackend,
     route: WanI2vRoute,
 ) -> crate::Result<Vec<PathBuf>> {
+    if route == WanI2vRoute::Vace {
+        let mut files = match backend {
+            WanI2vBackend::Mlx => vec![
+                PathBuf::from("transformer/config.json"),
+                PathBuf::from("tokenizer.json"),
+            ],
+            WanI2vBackend::Candle => vec![
+                PathBuf::from("transformer/config.json"),
+                PathBuf::from("text_encoder/config.json"),
+                PathBuf::from("vae/config.json"),
+                PathBuf::from("tokenizer/tokenizer.json"),
+            ],
+        };
+        fn collect_indexes(root: &Path, at: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
+            for entry in std::fs::read_dir(at)? {
+                let path = entry?.path();
+                if std::fs::metadata(&path)?.is_dir() {
+                    collect_indexes(root, &path, files)?;
+                } else if path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+                {
+                    files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+                }
+            }
+            Ok(())
+        }
+        collect_indexes(root, root, &mut files)?;
+        files.sort();
+        files.dedup();
+        if let Some(missing) = files.iter().find(|relative| !root.join(relative).is_file()) {
+            return Err(crate::Error::Unsupported(format!(
+                "missing Wan VACE structural file {}",
+                missing.display()
+            )));
+        }
+        return Ok(files);
+    }
     let mut files = match backend {
         WanI2vBackend::Mlx => vec![
             PathBuf::from("config.json"),
@@ -462,6 +588,7 @@ fn structural_files(
             let components: &[&str] = match route {
                 WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
                 WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+                WanI2vRoute::Vace => unreachable!("handled above"),
             };
             let mut paths = vec![
                 PathBuf::from("model_index.json"),
@@ -500,6 +627,7 @@ fn structural_files(
             let components: &[&str] = match route {
                 WanI2vRoute::Ti2v5b => &["transformer"],
                 WanI2vRoute::I2v14b => &["transformer", "transformer_2"],
+                WanI2vRoute::Vace => unreachable!("handled above"),
             };
             for component in components {
                 let marker = PathBuf::from(component).join("quantize_config.json");
@@ -756,6 +884,12 @@ fn physical_resident_bytes(
     tier: MemoryNumericTier,
     phase: MemoryPhase,
 ) -> crate::Result<u64> {
+    if route == WanI2vRoute::Vace {
+        // VACE's public q4/q8 tiers are selected at load but materialized from the sealed dense
+        // diffusers transformer after adapter folding. Charge the complete dense construction
+        // surface rather than pretending the on-disk artifact is prepacked.
+        return projected_dense_bytes(path, 2);
+    }
     match (phase, tier.quant) {
         (MemoryPhase::Denoise, Some(quant)) => packed_transformer_bytes(path, quant, backend),
         (MemoryPhase::Decode, _) => projected_dense_bytes(
@@ -775,7 +909,8 @@ fn adapter_receipts(
     route: WanI2vRoute,
     tier: MemoryNumericTier,
 ) -> crate::Result<(Vec<WanAdapterReceipt>, String, u64, Vec<SealedFile>)> {
-    let packed = tier.quant.is_some();
+    let packed = tier.quant.is_some() && route != WanI2vRoute::Vace;
+    let vace_quantized = tier.quant.is_some() && route == WanI2vRoute::Vace;
     let mut receipts = Vec::new();
     let mut files = Vec::new();
     let mut identity = Sha256::new();
@@ -788,7 +923,8 @@ fn adapter_receipts(
                 route.provider_id()
             )));
         }
-        if route == WanI2vRoute::Ti2v5b && adapter.moe_expert.is_some() {
+        if matches!(route, WanI2vRoute::Ti2v5b | WanI2vRoute::Vace) && adapter.moe_expert.is_some()
+        {
             return Err(crate::Error::Unsupported(
                 "Wan TI2V-5B accepts shared adapters only".to_owned(),
             ));
@@ -829,6 +965,9 @@ fn adapter_receipts(
             source_bytes
                 .checked_mul(multiplicity)
                 .ok_or_else(|| crate::Error::Msg("Wan adapter residency overflow".to_owned()))?
+        } else if vace_quantized {
+            // The source factors coexist with the dense map during merge-before-quantize.
+            source_bytes
         } else {
             0
         };
@@ -863,6 +1002,8 @@ fn adapter_receipts(
         };
         let realization = if packed {
             "packed_additive_factors"
+        } else if vace_quantized {
+            "dense_folded_then_quantized"
         } else {
             "dense_folded"
         };
@@ -941,7 +1082,7 @@ fn validate_lightning_recipe(spec: &LoadSpec, route: WanI2vRoute) -> crate::Resu
             lightning_role(&adapter.path).map(|role| (index, adapter, role))
         })
         .collect::<Vec<_>>();
-    if route == WanI2vRoute::Ti2v5b && !roles.is_empty() {
+    if matches!(route, WanI2vRoute::Ti2v5b | WanI2vRoute::Vace) && !roles.is_empty() {
         return Err(crate::Error::Unsupported(
             "TI2V-5B cannot use the A14B Lightning pair".to_owned(),
         ));
@@ -1000,9 +1141,21 @@ pub fn prepare_load_spec(
 ) -> crate::Result<()> {
     let route = WanI2vRoute::for_provider(provider_id)?;
     let tier = tier(spec, backend)?;
+    if route == WanI2vRoute::Vace
+        && backend == WanI2vBackend::Candle
+        && (tier.quant.is_some() || !spec.adapters.is_empty())
+    {
+        return Err(crate::Error::Unsupported(
+            "candle wan_vace memory route is dense bf16 without adapters".to_owned(),
+        ));
+    }
     let root = validate_load_spec(spec, provider_id)?.to_path_buf();
     let (repository, revision) = repository_policy(backend, route, tier);
-    repository_revision(&root, repository, revision, tier, backend)?;
+    if route != WanI2vRoute::Vace {
+        repository_revision(&root, repository, revision, tier, backend)?;
+    } else {
+        vace_artifact_revision(&root)?;
+    }
     let inventory = match backend {
         WanI2vBackend::Mlx => validate_mlx_inventory(&root, route)?,
         WanI2vBackend::Candle => validate_candle_inventory(&root, route)?,
@@ -1033,10 +1186,22 @@ impl PreparedWanI2vMemory {
     ) -> crate::Result<Self> {
         let route = WanI2vRoute::for_provider(provider_id)?;
         let tier = tier(spec, backend)?;
+        if route == WanI2vRoute::Vace
+            && backend == WanI2vBackend::Candle
+            && (tier.quant.is_some() || !spec.adapters.is_empty())
+        {
+            return Err(crate::Error::Unsupported(
+                "candle wan_vace memory route is dense bf16 without adapters".to_owned(),
+            ));
+        }
         let root = validate_load_spec(spec, provider_id)?;
         spec.validate_prepared_file_pins()?;
         let (repository, expected_revision) = repository_policy(backend, route, tier);
-        let revision = repository_revision(root, repository, expected_revision, tier, backend)?;
+        let revision = if route == WanI2vRoute::Vace {
+            vace_artifact_revision(root)?
+        } else {
+            repository_revision(root, repository, expected_revision, tier, backend)?
+        };
         let inventory = match backend {
             WanI2vBackend::Mlx => validate_mlx_inventory(root, route)?,
             WanI2vBackend::Candle => validate_candle_inventory(root, route)?,
@@ -1135,7 +1300,7 @@ impl PreparedWanI2vMemory {
         identity.update(adapter_identity.as_bytes());
         let artifact_identity = format!("{:x}", identity.finalize());
         files.extend(adapter_files);
-        let contract = contract(provider_id, backend, spec, facts);
+        let contract = contract(provider_id, route, backend, spec, facts);
         let prepared = Self {
             contract,
             artifact_identity,
@@ -1203,6 +1368,7 @@ impl PreparedWanI2vMemory {
 
 fn contract(
     provider_id: &str,
+    route: WanI2vRoute,
     backend: WanI2vBackend,
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
@@ -1221,10 +1387,10 @@ fn contract(
                 strategy,
                 support: if matches!(
                     strategy,
-                    MemoryStrategy::Resident
-                        | MemoryStrategy::StagedResidency
-                        | MemoryStrategy::BoundedDecode
-                ) {
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                ) || (route != WanI2vRoute::Vace
+                    && strategy == MemoryStrategy::StagedResidency)
+                {
                     MemoryStrategySupport::Implemented
                 } else {
                     MemoryStrategySupport::Missing
@@ -1344,6 +1510,68 @@ fn first_last_keyframes(request: &GenerationRequest) -> crate::Result<[crate::Ke
     ])
 }
 
+fn extend_keyframe(request: &GenerationRequest) -> crate::Result<crate::KeyframeRef<'_>> {
+    let [Conditioning::Keyframe {
+        image,
+        frame_idx,
+        strength,
+    }] = request.conditioning.as_slice()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan public extend_clip fallback requires exactly one boundary Keyframe".to_owned(),
+        ));
+    };
+    if *frame_idx != 0
+        || !strength.is_finite()
+        || !(0.0..=1.0).contains(strength)
+        || !valid_rgb8_image(image)
+        || image.width != request.width
+        || image.height != request.height
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan public extend_clip fallback requires one fitted RGB8 Keyframe at frame 0"
+                .to_owned(),
+        ));
+    }
+    Ok(crate::KeyframeRef {
+        image,
+        frame_idx: *frame_idx,
+        strength: *strength,
+    })
+}
+
+fn extend_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
+    if request.conditioning.len() != 1 {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE extend_clip requires exactly one ControlClip".to_owned(),
+        ));
+    }
+    let clip = request.control_clip().ok_or_else(|| {
+        crate::Error::Unsupported(
+            "Wan VACE extend_clip requires exactly one ControlClip".to_owned(),
+        )
+    })?;
+    let exact_image = |image: &crate::Image| {
+        valid_rgb8_image(image) && image.width == request.width && image.height == request.height
+    };
+    if clip.frames.len() != request.frames.unwrap_or_default() as usize
+        || clip.frames.len() != clip.mask.len()
+        || clip.frames.is_empty()
+        || !clip.frames.iter().all(exact_image)
+        || !clip.mask.iter().all(exact_image)
+        || !clip.masking_strength.is_finite()
+        || clip.masking_strength.to_bits() != 1.0_f32.to_bits()
+        || clip.start_frame != 0
+        || clip.mode != crate::ReplacementMode::default()
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan VACE extend_clip ControlClip left the exact output-sized carrier envelope"
+                .to_owned(),
+        ));
+    }
+    Ok(clip)
+}
+
 fn request_mode(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
@@ -1357,6 +1585,16 @@ fn request_mode(
             first_last_keyframes(request)?;
             Ok(WanPublicMode::FirstLastFrame)
         }
+        Some("extend_clip")
+            if prepared.route == WanI2vRoute::Ti2v5b && prepared.backend == WanI2vBackend::Mlx =>
+        {
+            extend_keyframe(request)?;
+            Ok(WanPublicMode::ExtendClip)
+        }
+        Some("extend_clip") if prepared.route == WanI2vRoute::Vace => {
+            extend_control_clip(request)?;
+            Ok(WanPublicMode::ExtendClip)
+        }
         _ => Err(crate::Error::Unsupported(format!(
             "{}: request is neither exact public I2V nor first_last_frame",
             prepared.route.provider_id()
@@ -1369,7 +1607,9 @@ fn request_contract_for_mode(
     mode: WanPublicMode,
 ) -> MemoryProviderContract {
     let mut contract = prepared.contract.clone();
-    if mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx {
+    if (mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx)
+        || mode == WanPublicMode::ExtendClip
+    {
         let staged = contract
             .strategies
             .iter_mut()
@@ -1390,6 +1630,13 @@ pub fn contract_for_mode_key(
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
         }
+        "extend_clip"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::ExtendClip
+        }
         _ => {
             return Err(crate::Error::Unsupported(format!(
                 "{}: unsupported Wan memory mode {mode}",
@@ -1400,9 +1647,10 @@ pub fn contract_for_mode_key(
     Ok(request_contract_for_mode(prepared, mode))
 }
 
-/// The request-specific ladder. MLX first/last-frame generation exposes only Resident and
-/// BoundedDecode; Candle additionally retains StagedResidency because its request-selected
-/// Sequential renderer is operationally distinct from Resident.
+/// The request-specific ladder. Extend-clip exposes only Resident and BoundedDecode on both
+/// backends. MLX first/last-frame does the same; Candle first/last-frame additionally retains
+/// StagedResidency because its request-selected Sequential renderer is operationally distinct from
+/// Resident.
 pub fn request_contract(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
@@ -1444,31 +1692,44 @@ pub fn validate_request(
     let exact_rate = match mode {
         WanPublicMode::ImageToVideo => prepared.route.accepts_rate(fps, frames),
         WanPublicMode::FirstLastFrame => prepared.route.accepts_first_last_rate(fps, frames),
+        WanPublicMode::ExtendClip => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
+            WanI2vRoute::I2v14b => false,
+        },
     };
     let sampler_ok = match mode {
         WanPublicMode::ImageToVideo => true,
-        WanPublicMode::FirstLastFrame => match request.sampler.as_deref() {
-            None | Some("uni_pc" | "euler") => true,
-            Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
-            Some(_) => false,
-        },
+        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip => {
+            match request.sampler.as_deref() {
+                None | Some("uni_pc" | "euler") => true,
+                Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
+                Some(_) => false,
+            }
+        }
     };
-    let flf_axes_ok = mode != WanPublicMode::FirstLastFrame
-        || (request.strength.is_none()
-            && request.true_cfg.is_none()
-            && request.timestep_to_start_cfg.is_none()
-            && request.guidance_method.is_none()
-            && request.guidance_eta.is_none()
-            && request.guidance_momentum.is_none()
-            && request.guidance_norm_threshold.is_none()
-            && request.control_scale.is_none()
-            && request.text_style_gain.is_none()
-            && request.image_guidance.is_none()
-            && request.duration.is_none()
-            && request.trim_first_frames.is_none()
-            && request.softness.is_none()
-            && request.pid_capture_sigma.is_none()
-            && request.approximation.is_none());
+    let boundary_axes_ok = !matches!(
+        mode,
+        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip
+    ) || (request.strength.is_none()
+        && request.true_cfg.is_none()
+        && request.timestep_to_start_cfg.is_none()
+        && request.guidance_method.is_none()
+        && request.guidance_eta.is_none()
+        && request.guidance_momentum.is_none()
+        && request.guidance_norm_threshold.is_none()
+        && (request.control_scale.is_none()
+            || (prepared.route == WanI2vRoute::Vace
+                && request
+                    .control_scale
+                    .is_some_and(|value| value.is_finite() && value >= 0.0)))
+        && request.text_style_gain.is_none()
+        && request.image_guidance.is_none()
+        && request.duration.is_none()
+        && request.trim_first_frames.is_none()
+        && request.softness.is_none()
+        && request.pid_capture_sigma.is_none()
+        && request.approximation.is_none());
     if request.count != 1
         || !prepared
             .route
@@ -1487,7 +1748,7 @@ pub fn validate_request(
         || unsupported_svd
         || !lightning_sampling
         || !sampler_ok
-        || !flf_axes_ok
+        || !boundary_axes_ok
     {
         return Err(crate::Error::Unsupported(format!(
             "{}: request left the exact public {} envelope",
@@ -1593,6 +1854,7 @@ fn request_evidence_revision_for_selection(
     update_optional_str(&mut hash, request.negative_prompt.as_deref());
     update_optional_f32(&mut hash, request.guidance);
     update_optional_str(&mut hash, request.sampler.as_deref());
+    update_optional_f32(&mut hash, request.control_scale);
     hash.update(NATIVE_SCHEDULE.as_bytes());
     match mode {
         WanPublicMode::ImageToVideo => {
@@ -1615,6 +1877,26 @@ fn request_evidence_revision_for_selection(
                 hash.update(Sha256::digest(&keyframe.image.pixels));
             }
         }
+        WanPublicMode::ExtendClip if prepared.route == WanI2vRoute::Ti2v5b => {
+            let keyframe = extend_keyframe(request)?;
+            hash.update(b"boundary-keyframe");
+            hash.update(keyframe.frame_idx.to_le_bytes());
+            hash.update(keyframe.strength.to_bits().to_le_bytes());
+            hash.update(keyframe.image.width.to_le_bytes());
+            hash.update(keyframe.image.height.to_le_bytes());
+            hash.update(Sha256::digest(&keyframe.image.pixels));
+        }
+        WanPublicMode::ExtendClip => {
+            let clip = extend_control_clip(request)?;
+            hash.update(b"vace-control-clip");
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+        }
     }
     Ok(format!(
         "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:{:x}",
@@ -1634,6 +1916,13 @@ pub fn validate_context(
         "image_to_video" => WanPublicMode::ImageToVideo,
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
+        }
+        "extend_clip"
+            if prepared.route == WanI2vRoute::Vace
+                || (prepared.route == WanI2vRoute::Ti2v5b
+                    && prepared.backend == WanI2vBackend::Mlx) =>
+        {
+            WanPublicMode::ExtendClip
         }
         _ => {
             return Err(crate::Error::Unsupported(format!(
@@ -1665,15 +1954,38 @@ pub fn validate_context(
             prepared.route.accepts_first_last_rate(16, geometry.frames)
                 || prepared.route.accepts_first_last_rate(24, geometry.frames)
         }
+        WanPublicMode::ExtendClip => match prepared.route {
+            WanI2vRoute::Ti2v5b => {
+                prepared.route.accepts_first_last_rate(16, geometry.frames)
+                    || prepared.route.accepts_first_last_rate(24, geometry.frames)
+            }
+            WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
+            WanI2vRoute::I2v14b => false,
+        },
     };
     let carrier_ok = match mode {
         WanPublicMode::ImageToVideo => geometry.reference_count == 1,
         WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
+        WanPublicMode::ExtendClip => geometry.reference_count == 1,
     };
-    if !matches!(
-        context.selection.strategy,
-        MemoryStrategy::Resident | MemoryStrategy::StagedResidency | MemoryStrategy::BoundedDecode
-    ) || geometry.batch != 1
+    let selection_ok = match mode {
+        WanPublicMode::ExtendClip => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+        ),
+        WanPublicMode::FirstLastFrame if prepared.backend == WanI2vBackend::Mlx => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+        ),
+        WanPublicMode::ImageToVideo | WanPublicMode::FirstLastFrame => matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
+        ),
+    };
+    if !selection_ok
+        || geometry.batch != 1
         || !carrier_ok
         || !context.has_reference
         || !prepared
@@ -1882,6 +2194,7 @@ mod tests {
                 ("t5_encoder.safetensors", 7),
                 ("vae.safetensors", 5),
             ],
+            WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
         };
         for &(name, logical) in files {
             if quant.is_some() && name.contains("model") {
@@ -1927,6 +2240,7 @@ mod tests {
         let components: &[&str] = match route {
             WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
             WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+            WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
         };
         for (index, component) in components.iter().enumerate() {
             std::fs::create_dir_all(root.join(component)).unwrap();
@@ -1966,6 +2280,240 @@ mod tests {
         spec.quantize = quant;
         prepare_load_spec(&mut spec, WanI2vBackend::Candle, route.provider_id()).unwrap();
         (tmp, spec)
+    }
+
+    fn vace_fixture(backend: WanI2vBackend, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vace");
+        match backend {
+            WanI2vBackend::Mlx => {
+                std::fs::create_dir_all(root.join("transformer")).unwrap();
+                std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+                std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+                write_safetensors(
+                    &root.join("transformer/model.safetensors"),
+                    &[("blocks.0.self_attn.to_q.weight", "BF16", &[8, 8])],
+                );
+                write_safetensors(
+                    &root.join("t5_encoder.safetensors"),
+                    &[("weight", "BF16", &[4, 4])],
+                );
+                write_safetensors(
+                    &root.join("vae.safetensors"),
+                    &[("weight", "BF16", &[4, 4])],
+                );
+            }
+            WanI2vBackend::Candle => {
+                for component in ["transformer", "text_encoder", "vae"] {
+                    std::fs::create_dir_all(root.join(component)).unwrap();
+                    std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
+                    write_safetensors(
+                        &root.join(component).join("model.safetensors"),
+                        &[("weight", "BF16", &[4, 4])],
+                    );
+                }
+                std::fs::create_dir_all(root.join("tokenizer")).unwrap();
+                std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+            }
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route("wan_vace");
+        spec.quantize = quant;
+        prepare_load_spec(&mut spec, backend, "wan_vace").unwrap();
+        (tmp, spec)
+    }
+
+    fn vace_extend_request() -> GenerationRequest {
+        let image = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![17; 832 * 480 * 3],
+        };
+        GenerationRequest {
+            prompt: "continue the source motion".to_owned(),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(29),
+            steps: Some(50),
+            guidance: Some(5.0),
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("extend_clip".to_owned()),
+            control_scale: Some(1.0),
+            conditioning: vec![Conditioning::ControlClip {
+                frames: vec![image.clone(); 45],
+                mask: vec![image; 45],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: crate::ReplacementMode::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn ti2v_extend_request() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "continue from the exact source boundary".to_owned(),
+            negative_prompt: Some("camera cut".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(31),
+            steps: Some(20),
+            guidance: Some(5.0),
+            frames: Some(61),
+            fps: Some(16),
+            video_mode: Some("extend_clip".to_owned()),
+            conditioning: vec![Conditioning::Keyframe {
+                image: Image {
+                    width: 832,
+                    height: 480,
+                    pixels: vec![23; 832 * 480 * 3],
+                },
+                frame_idx: 0,
+                strength: 0.75,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vace_extend_seals_all_mlx_tiers_and_dense_candle_with_only_resident_and_decode() {
+        for (backend, quants) in [
+            (
+                WanI2vBackend::Mlx,
+                vec![Some(Quant::Q4), Some(Quant::Q8), None],
+            ),
+            (WanI2vBackend::Candle, vec![None]),
+        ] {
+            for quant in quants {
+                let (_tmp, spec) = vace_fixture(backend, quant);
+                let prepared = PreparedWanI2vMemory::prepare(&spec, backend, "wan_vace").unwrap();
+                assert_eq!(prepared.tier.quant, quant);
+                assert_eq!(prepared.revision.len(), 64);
+                let contract = request_contract(&prepared, &vace_extend_request()).unwrap();
+                for strategy in MemoryStrategy::ALL {
+                    let expected = matches!(
+                        strategy,
+                        MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                    );
+                    assert_eq!(
+                        contract.capability(strategy).unwrap().support,
+                        if expected {
+                            MemoryStrategySupport::Implemented
+                        } else {
+                            MemoryStrategySupport::Missing
+                        }
+                    );
+                }
+                let mut request = vace_extend_request();
+                let resident = selection(&prepared, MemoryStrategy::Resident);
+                request.memory = contract.generation_memory(&resident);
+                let evidence =
+                    request_evidence_revision_for_selection(&prepared, &request, &resident)
+                        .unwrap();
+                let staged_context = context(
+                    &prepared,
+                    &request,
+                    selection(&prepared, MemoryStrategy::StagedResidency),
+                    evidence,
+                );
+                assert!(validate_context(&prepared, &staged_context).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn vace_extend_binds_control_pixels_masks_scale_and_exact_carrier() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Mlx, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").unwrap();
+        let mut request = vace_extend_request();
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: prepared.tier,
+        };
+        request.memory = request_contract(&prepared, &request)
+            .unwrap()
+            .generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        if let Conditioning::ControlClip { frames, .. } = &mut request.conditioning[0] {
+            frames[0].pixels[0] ^= 1;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        if let Conditioning::ControlClip { frames, mask, .. } = &mut request.conditioning[0] {
+            frames[0].pixels[0] ^= 1;
+            mask[0].pixels[0] ^= 1;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        });
+        assert!(validate_request(&prepared, &request).is_err());
+    }
+
+    #[test]
+    fn ti2v_extend_is_an_mlx_only_single_boundary_keyframe_with_the_exact_frame_menu() {
+        for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+            let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, quant);
+            let prepared = PreparedWanI2vMemory::prepare(
+                &spec,
+                WanI2vBackend::Mlx,
+                WanI2vRoute::Ti2v5b.provider_id(),
+            )
+            .unwrap();
+            let mut request = ti2v_extend_request();
+            let contract = request_contract(&prepared, &request).unwrap();
+            for strategy in MemoryStrategy::ALL {
+                let expected = matches!(
+                    strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                );
+                assert_eq!(
+                    contract.capability(strategy).unwrap().support,
+                    if expected {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+                );
+            }
+            request.memory =
+                contract.generation_memory(&selection(&prepared, MemoryStrategy::Resident));
+            let receipt = request_evidence_revision(&prepared, &request).unwrap();
+            if let Conditioning::Keyframe {
+                image, strength, ..
+            } = &mut request.conditioning[0]
+            {
+                image.pixels[0] ^= 1;
+                *strength = 0.5;
+            }
+            assert_ne!(
+                request_evidence_revision(&prepared, &request).unwrap(),
+                receipt
+            );
+        }
+
+        let (_tmp, spec) = candle_fixture(WanI2vRoute::Ti2v5b, None);
+        let prepared = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Candle,
+            WanI2vRoute::Ti2v5b.provider_id(),
+        )
+        .unwrap();
+        assert!(validate_request(&prepared, &ti2v_extend_request()).is_err());
     }
 
     #[test]
@@ -2071,6 +2619,7 @@ mod tests {
         let (width, height, frames, fps, steps, guidance) = match route {
             WanI2vRoute::Ti2v5b => (832, 480, 121, 24, 20, Some(5.0)),
             WanI2vRoute::I2v14b => (1280, 720, 77, 16, 40, None),
+            WanI2vRoute::Vace => panic!("use a dedicated VACE request"),
         };
         GenerationRequest {
             prompt: "animate the still".to_owned(),
@@ -2163,10 +2712,10 @@ mod tests {
             calibration_fingerprint: String::new(),
             load_shape: prepared.contract.load_shape,
             mode: crate::MemoryMode::Other(
-                if request.video_mode.as_deref() == Some("image_to_video") {
-                    "image_to_video"
-                } else {
-                    "first_last_frame"
+                match request.video_mode.as_deref() {
+                    Some("image_to_video") => "image_to_video",
+                    Some("extend_clip") => "extend_clip",
+                    _ => "first_last_frame",
                 }
                 .to_owned(),
             ),
