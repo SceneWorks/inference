@@ -146,23 +146,20 @@ pub fn register_providers(
     let registry = registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
         .register_generator(bernini::FULL_REGISTRATION);
-    register_memory_contract_surfaces(registry)
+    #[cfg(any(feature = "cuda", test))]
+    let registry = memory_strategy::register_memory_strategy(registry)
+        .register_memory_behavior(memory_strategy::RENDERER_MEMORY_BEHAVIOR)
+        .register_memory_behavior(memory_strategy::FULL_MEMORY_BEHAVIOR);
+    registry
 }
 
-/// Register the weights-free Bernini memory surface on CPU hosts and the executable behavior on
-/// CUDA hosts. The public still-image route resolves to the full `bernini` provider, not the
-/// renderer-only compatibility id.
+/// Register Bernini's weights-free memory-contract declarations in the catalog-only registry.
 pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
-            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
-            provider_id: bernini::MODEL_ID,
-            contract: memory_strategy::weights_free_contract,
-        })
+    // The non-CUDA catalog still needs the provider-owned registration callbacks as well as the
+    // weights-free fixtures; the callbacks fail closed until terminal CUDA evidence exists.
+    memory_strategy::register_memory_strategy(registry)
 }
 
 /// Build the complete explicit Candle Bernini provider catalog.
