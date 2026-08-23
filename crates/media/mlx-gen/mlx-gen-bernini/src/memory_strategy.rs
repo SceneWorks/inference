@@ -119,7 +119,7 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "bernini-image-q4-mlx-dual-expe
 /// The floor is geometric rather than measured: a tile must exceed twice the overlap by at least one
 /// latent cell or successive tiles do not advance, which puts the smallest admissible edge at
 /// `2 * DECODE_OVERLAP + 8 = 136`. 256 is the first published multiple comfortably above it.
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 
 /// The default edge when a request enables rung 2 without naming one.
 pub const DECODE_TILE_EDGE: u32 = 512;
