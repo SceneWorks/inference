@@ -3372,6 +3372,11 @@ mod preview_advertising {
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
         MemoryRouteCrate {
+            dir: "candle-gen-bernini",
+            register_providers: candle_gen_bernini::register_providers,
+            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
@@ -3407,6 +3412,11 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
+            dir: "candle-gen-sensenova",
+            register_providers: candle_gen_sensenova::register_providers,
+            register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-wan",
             register_providers: candle_gen_wan::register_providers,
             register_surfaces: None,
@@ -3415,11 +3425,6 @@ mod preview_advertising {
             dir: "candle-gen-z-image",
             register_providers: candle_gen_z_image::register_providers,
             register_surfaces: Some(candle_gen_z_image::register_memory_contract_surfaces),
-        },
-        MemoryRouteCrate {
-            dir: "candle-gen-bernini",
-            register_providers: candle_gen_bernini::register_providers,
-            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
         },
     ];
 
@@ -3533,12 +3538,21 @@ mod preview_advertising {
         let mut expected_ids = BTreeSet::new();
         for owner in MEMORY_ROUTE_CRATES {
             let mut builder = (owner.register_providers)(ProviderRegistryBuilder::new());
-            // Mirror `memory_contract_surface_registry`: the weights-free surfaces are appended only
-            // off CUDA, because on a CUDA build `register_providers` already carries the same ids and
-            // registering both would be a duplicate.
+            // Mirror `memory_contract_surface_registry`: append weights-free surfaces off CUDA only
+            // when `register_providers` does not already carry them. Most Candle image routes add
+            // their memory surface only on CUDA; SenseNova publishes the same surface on every
+            // platform, so registering it twice would be a duplicate.
             if !cfg!(feature = "cuda") {
                 if let Some(register) = owner.register_surfaces {
-                    builder = register(builder);
+                    let provider_ids = (owner.register_providers)(ProviderRegistryBuilder::new())
+                        .build()
+                        .unwrap_or_else(|error| panic!("{}: {error}", owner.dir))
+                        .memory_strategy_registrations()
+                        .map(|registration| registration.provider_id)
+                        .collect::<BTreeSet<_>>();
+                    if provider_ids.is_empty() {
+                        builder = register(builder);
+                    }
                 }
             }
             let ids = builder

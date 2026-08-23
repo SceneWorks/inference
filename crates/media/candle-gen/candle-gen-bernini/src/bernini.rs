@@ -693,6 +693,11 @@ impl Generator for Bernini {
         // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
         // them off the request and dropping them.
         reject_unimplemented_video_clip_knobs(id, req)?;
+        // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
+        // surface share the provider but retain separate, fail-closed request identities.
+        if req.frames == Some(1) || req.memory.is_some() {
+            crate::memory_strategy::validate_request(req)?;
+        }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
         let has_video = req
