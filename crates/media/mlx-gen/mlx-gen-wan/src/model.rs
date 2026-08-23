@@ -106,6 +106,11 @@ fn dense_decode_tiling(
 ) -> Result<Option<mlx_gen::TilingConfig>> {
     match mlx_gen::diagnostics::benchmark_decode_control() {
         Some(control) => Ok(Some(control.tiling_config())),
+        None if request.video_mode.as_deref() == Some("image_to_video")
+            && request.memory.is_some() =>
+        {
+            crate::i2v_memory_strategy::decode_tiling(request, width, height, out_frames)
+        }
         None => crate::memory_strategy::decode_tiling(request, width, height, out_frames),
     }
 }
@@ -356,6 +361,8 @@ pub struct Wan {
     /// route. Other supported Wan loads remain available but deliberately publish no contract.
     memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
     memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
+    /// Exact provider-owned public-I2V artifact and adapter receipt, when the caller prepared one.
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl Wan {
@@ -459,6 +466,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let (memory_strategy, memory_tier) = memory
         .map(|(contract, tier)| (Some(contract), Some(tier)))
         .unwrap_or((None, None));
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan {
         descriptor: descriptor(),
         config,
@@ -468,6 +482,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         offload_policy: spec.offload_policy,
         memory_strategy,
         memory_tier,
+        i2v_memory,
     }))
 }
 
@@ -492,13 +507,19 @@ impl Generator for Wan {
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref()
+        self.i2v_memory
+            .as_ref()
+            .map(|prepared| &prepared.contract)
+            .or(self.memory_strategy.as_ref())
     }
 
     fn memory_strategy_safety_check(
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,
     ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        if let Some(prepared) = &self.i2v_memory {
+            return crate::i2v_memory_strategy::safety_check(prepared, context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
                 mlx_gen::gen_core::MemorySafetyDecision::Accept
@@ -518,6 +539,9 @@ impl Generator for Wan {
         context: &mlx_gen::gen_core::MemoryRunContext,
     ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
     {
+        if let Some(prepared) = &self.i2v_memory {
+            return crate::i2v_memory_strategy::begin_request(prepared, context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return Ok(None);
         };
@@ -621,6 +645,10 @@ impl Wan {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)
+                .map_err(Error::from)?;
+        }
         // The resolved approximate-capability plan (sc-18322). `validate` already ran the same
         // resolution at the shared floor, so this cannot fail here; resolving again is how the route
         // dispatch below gets a plan without re-reading the request and re-deriving a policy.
@@ -640,7 +668,8 @@ impl Wan {
         // freed UMT5 TE / VAE-encoder don't linger in MLX's buffer cache (RSS / wired footprint) through
         // the denoise + decode that follow. `Resident` (default) leaves the cache warm — the
         // byte-identical pre-offload path (residency/lifetime change only, numerics untouched).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -1041,6 +1070,8 @@ pub struct Wan14b {
     /// peak to ~one expert. Advertised via `supports_sequential_offload` so the worker's fit-gate can
     /// select it under a memory ceiling. Captured from [`LoadSpec::offload_policy`] at load.
     offload_policy: OffloadPolicy,
+    /// Exact provider-owned public-I2V artifact and adapter receipt. Absent on direct T2V loads.
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl Wan14b {
@@ -1370,13 +1401,63 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        i2v_memory: None,
     }))
 }
 
-mlx_gen::impl_generator!(Wan14b {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for Wan14b {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, request: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(request).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(request, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || {
+                if context.selection.strategy == mlx_gen::gen_core::MemoryStrategy::Resident {
+                    mlx_gen::gen_core::MemorySafetyDecision::Accept
+                } else {
+                    mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                        reason: format!(
+                            "{} has no prepared I2V memory receipt",
+                            self.descriptor.id
+                        ),
+                    }
+                }
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        match &self.i2v_memory {
+            Some(prepared) => crate::i2v_memory_strategy::begin_request(prepared, context),
+            None => Ok(None),
+        }
+    }
+}
 
 impl Wan14b {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -1459,6 +1540,10 @@ impl Wan14b {
         // Reject anything outside the advertised surface before doing expensive work — in particular
         // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)
+                .map_err(Error::from)?;
+        }
         // Every A14B route is an expert-swap route: the trajectory changes transformers at the
         // boundary, so a retained trunk residual or a rotation phase captured under the high-noise
         // expert is meaningless under the low-noise one (and retaining it would keep the outgoing
@@ -1478,7 +1563,8 @@ impl Wan14b {
         // Sequential offload (epic 12732, sc-12736): free the UMT5 TE / VAE off-GPU during denoise and
         // hold only the ACTIVE MoE expert resident (the expert swap). `Resident` (default) is the
         // byte-identical pre-swap path (both experts co-resident, no per-stage `clear_cache`).
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // --- Resolve request knobs against config defaults ---
         let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
@@ -1757,7 +1843,17 @@ impl Wan14b {
         let out_frames = lat[1] * A14bProviderVae::VAE_TILING.temporal_scale;
         let out_height = lat[2] * A14bProviderVae::VAE_TILING.spatial_scale;
         let out_width = lat[3] * A14bProviderVae::VAE_TILING.spatial_scale;
-        let tiling = auto_tiling_budgeted_z16(out_height, out_width, out_frames)?;
+        let tiling = if req.video_mode.as_deref() == Some("image_to_video") && req.memory.is_some()
+        {
+            crate::i2v_memory_strategy::decode_tiling(
+                req,
+                out_width as u32,
+                out_height as u32,
+                out_frames as u32,
+            )?
+        } else {
+            auto_tiling_budgeted_z16(out_height, out_width, out_frames)?
+        };
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = A14bProviderVae::from_weights(&w)?;
@@ -2115,6 +2211,13 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let quant = resolve_load_time_quant(MODEL_ID_I2V_14B, &config, spec.quantize)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_I2V_14B)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_I2V_14B).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan14b {
         descriptor: descriptor_i2v_14b(),
         config,
@@ -2122,6 +2225,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
+        i2v_memory,
     }))
 }
 
@@ -2300,6 +2404,7 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
         };
         let reference = |strength: Option<f32>| Conditioning::Reference {
             image: dummy_image(),
@@ -2583,6 +2688,7 @@ mod tests {
             offload_policy: OffloadPolicy::Resident,
             memory_strategy: None,
             memory_tier: None,
+            i2v_memory: None,
         }
     }
 
@@ -2594,6 +2700,7 @@ mod tests {
             adapters: vec![],
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
         }
     }
 
@@ -3052,6 +3159,7 @@ mod tests {
             offload_policy: OffloadPolicy::Resident,
             memory_strategy: None,
             memory_tier: None,
+            i2v_memory: None,
         }
     }
 
@@ -3069,6 +3177,7 @@ mod tests {
             adapters,
             quant: None,
             offload_policy: OffloadPolicy::Resident,
+            i2v_memory: None,
         }
     }
 

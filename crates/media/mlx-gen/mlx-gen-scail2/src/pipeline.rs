@@ -37,6 +37,16 @@ const DEFAULT_FPS: u32 = 16;
 /// SceneWorks/engine model id. A still image is `num_frames == 1`.
 pub const MODEL_ID: &str = "scail2_14b";
 
+/// Direct, behavior-bearing files in every canonical `SceneWorks/scail2-mlx` tier.
+pub const SHARED_TIER_FILES: &[&str] = &[
+    "config.json",
+    "dit.safetensors",
+    "t5_encoder.safetensors",
+    "tokenizer.json",
+    "clip.safetensors",
+    "vae.safetensors",
+];
+
 /// Stable identity + advertised capabilities for SCAIL-2 (Wan2.1-14B I2V end-to-end character
 /// animation: reference image + driving video + color-coded masks → animated/identity-replaced video;
 /// plain single-scale CFG; packed-token conditioning + per-source RoPE + CLIP image cross-attn).
@@ -67,7 +77,6 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
-                ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
             // Inference LoRA (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
@@ -107,6 +116,7 @@ pub struct Scail2 {
     /// Inference LoRA(s) from [`LoadSpec::adapters`] (the Bias-Aware DPO / lightx2v lightning LoRA,
     /// sc-5451) — installed onto the DiT as forward-time residuals in [`crate::generate::generate`].
     adapters: Vec<AdapterSpec>,
+    memory_strategy: Option<crate::memory_strategy::PreparedMemory>,
 }
 
 /// Load SCAIL-2 from a converted MLX snapshot directory (`dit.safetensors` + `config.json` +
@@ -127,13 +137,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             root.display()
         )));
     }
+    let memory_strategy = crate::memory_strategy::PreparedMemory::prepare(spec)?;
     let config = Scail2Config::from_model_dir(&root)?;
+    memory_strategy.ensure_unchanged(&spec.adapters)?;
     Ok(Box::new(Scail2 {
         descriptor: descriptor(),
         config,
         root,
         quant: spec.quantize,
         adapters: spec.adapters.clone(),
+        memory_strategy: Some(memory_strategy),
     }))
 }
 
@@ -141,11 +154,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 // `gen_core::Result`.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
-mlx_gen::impl_generator!(Scail2 {
-    validate: |s, req| {
-        s.descriptor
+impl Generator for Scail2 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        if self.memory_strategy.is_some() {
+            crate::memory_strategy::validate_generation_request(req)?;
+        }
+        self.descriptor
             .capabilities
-            .validate_request(s.descriptor.id, req)?;
+            .validate_request(self.descriptor.id, req)?;
         // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
         // silently dropping them. Runs on BOTH seams (`impl_generator!`'s `generate` does not call
         // `validate`), same as the geometry gate below.
@@ -157,11 +177,66 @@ mlx_gen::impl_generator!(Scail2 {
         // not attached yet. `None` only when the sentinel has nothing to resolve against, which `run`
         // reports as its own missing-ControlClip error rather than as a geometry one.
         resolve_pre_flight_size(req).map_or(Ok(()), |(w, h)| {
-            reject_unrenderable_geometry(&s.descriptor.capabilities, req, w, h)
+            Ok(reject_unrenderable_geometry(
+                &self.descriptor.capabilities,
+                req,
+                w,
+                h,
+            )?)
         })
-    },
-    generate: run,
-});
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        let output = self.run(req, on_progress)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        Ok(output)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref().map(|memory| &memory.contract)
+    }
+
+    fn structural_resident_evidence(
+        &self,
+    ) -> Option<&mlx_gen::gen_core::MemoryStructuralResidentEvidence> {
+        self.memory_strategy
+            .as_ref()
+            .map(|memory| &memory.structural_evidence)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory_strategy.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{MODEL_ID}: legacy snapshot has no public memory evidence"),
+            },
+            |memory| crate::memory_strategy::safety_check(memory, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let Some(memory) = &self.memory_strategy else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(memory, context)
+    }
+}
 
 /// The geometry the pipeline will actually render: the request's `width`/`height` where non-zero,
 /// else the driving clip's first frame (SCAIL-2's "match the driving video" convention). Per axis,
@@ -519,7 +594,7 @@ impl Scail2 {
             additional: Vec::new(),
             driving_frames: driving.frames,
             driving_masks: driving.mask,
-            replace_flag: req.video_mode.as_deref() == Some("replacement"),
+            replace_flag: replace_flag_for_request(req),
             seed: req.seed.unwrap_or_else(default_seed),
             steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
             shift: req.scheduler_shift.unwrap_or(DEFAULT_SHIFT),
@@ -543,10 +618,32 @@ impl Scail2 {
     }
 }
 
+/// SCAIL-2's provider mode is the engine's cross-identity switch. Legacy requests that predate the
+/// explicit mode remain animation; the memory-backed public surface validates the only two accepted
+/// values before this mapping is reached.
+fn replace_flag_for_request(req: &GenerationRequest) -> bool {
+    req.video_mode.as_deref() == Some("replacement")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::ReplacementMode;
+
+    #[test]
+    fn provider_mode_selects_the_exact_engine_replace_flag() {
+        for (mode, expected) in [
+            (Some("animation"), false),
+            (Some("replacement"), true),
+            (None, false),
+        ] {
+            let request = GenerationRequest {
+                video_mode: mode.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");
+        }
+    }
 
     /// **sc-18317 — the declared execution domains are exactly the ones this provider consumes.**
     ///
@@ -628,6 +725,7 @@ mod tests {
             root: PathBuf::from("/nonexistent-scail2-snapshot"),
             quant: None,
             adapters: Vec::new(),
+            memory_strategy: None,
         }
     }
 

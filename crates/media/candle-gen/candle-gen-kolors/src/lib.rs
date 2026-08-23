@@ -24,6 +24,7 @@ mod chatglm3;
 // CFG-batched-encode / curated-σ-prior blocks that were copy-pasted across the three entry points.
 mod common;
 mod config;
+pub mod memory_strategy;
 mod pipeline;
 // Per-step latent preview wiring (epic 16948, sc-16954). No coefficients of its own — Kolors shares
 // the SDXL four-channel latent space (one byte-identical VAE file, `scaling_factor` 0.13025) and
@@ -86,6 +87,12 @@ pub struct KolorsGenerator {
     pid_spec: Option<PidWeights>,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Components>>,
+    /// Serializes cache eviction and staged component lifetimes.  A staged request is authoritative:
+    /// it first retires any warm resident set and cannot repopulate it.
+    lifecycle: Mutex<()>,
+    memory_contract: gen_core::MemoryProviderContract,
+    load_seal: Option<memory_strategy::KolorsLoadSeal>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 impl KolorsGenerator {
@@ -97,9 +104,78 @@ impl KolorsGenerator {
     }
 }
 
+fn evict_warm_for_staged<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    candle_gen::lock_recover(slot).take()
+}
+
+fn release_warm_after_synchronize<T>(device: &Device, component: T) -> gen_core::Result<()> {
+    device.synchronize().map_err(gen_core::Error::backend)?;
+    drop(component);
+    Ok(())
+}
+
 impl Generator for KolorsGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let tier = match &self.load_seal {
+            Some(seal) => match seal.ensure_unchanged() {
+                Ok(()) => seal.tier(),
+                Err(error) => {
+                    self.memory_admission.clear_approval();
+                    return gen_core::MemorySafetyDecision::Reject {
+                        reason: error.to_string(),
+                    };
+                }
+            },
+            None => {
+                self.memory_admission.clear_approval();
+                return gen_core::MemorySafetyDecision::Reject {
+                    reason: "kolors: physical load seal is unavailable".into(),
+                };
+            }
+        };
+        match memory_strategy::validate_context(&self.memory_contract, context, tier) {
+            Ok(()) => match self.memory_admission.approve(context) {
+                Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                Err(error) => gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            Err(error) => {
+                self.memory_admission.clear_approval();
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let seal = self.load_seal.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported("kolors: physical load seal is unavailable".into())
+        })?;
+        seal.ensure_unchanged()?;
+        let tier = seal.tier();
+        memory_strategy::validate_context(&self.memory_contract, context, tier)?;
+        Ok(Some(Box::new(memory_strategy::KolorsMemoryScope::new(
+            self.device.clone(),
+            &self.memory_contract,
+            context,
+            self.memory_admission.clone(),
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -156,14 +232,37 @@ impl Generator for KolorsGenerator {
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+        self.memory_admission.consume_for_generate(req)?;
+        if let Some(seal) = &self.load_seal {
+            seal.ensure_unchanged()?;
+        }
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        let memory = req.memory.unwrap_or_default();
+        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
+            return Err(gen_core::Error::Unsupported(
+                "kolors: Decode, Attention, and Transformer memory strategies are Missing".into(),
+            ));
+        }
         let pipe = Pipeline::load(
             &self.root,
             &self.device,
             self.pid_spec.clone(),
             self.adapters.clone(),
-        );
-        let components = self.components(&pipe)?;
-        let images = pipe.render(req, &components, on_progress)?;
+        )
+        .with_load_seal(self.load_seal.clone());
+        let images = if memory.stage_residency {
+            if let Some(warm) = evict_warm_for_staged(&self.components) {
+                release_warm_after_synchronize(&self.device, warm)?;
+            } else {
+                self.device
+                    .synchronize()
+                    .map_err(gen_core::Error::backend)?;
+            }
+            pipe.render_staged(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -197,6 +296,19 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let (load_seal, memory_contract) = if root.exists() {
+        let seal = memory_strategy::KolorsLoadSeal::capture_load(
+            &root,
+            &spec.adapters,
+            spec.pid.as_ref(),
+        )?;
+        let contract = seal.contract().clone();
+        (Some(seal), contract)
+    } else {
+        // Registry/catalog introspection intentionally permits a missing lazy root. It cannot begin
+        // an admitted request: physical-tier and receipt validation both require the real source.
+        (None, memory_strategy::provider_contract())
+    };
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         root,
@@ -207,6 +319,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         pid_spec: spec.pid.clone(),
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        memory_contract,
+        load_seal,
+        memory_admission: memory_strategy::AdmissionRegistry::new(),
     }))
 }
 

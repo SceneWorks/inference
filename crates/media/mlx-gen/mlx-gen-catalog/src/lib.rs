@@ -682,13 +682,13 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 51);
+        assert_eq!(registry.memory_strategy_registrations().len(), 53);
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert_eq!(resident_only, vec!["krea_realtime_14b"]);
+        assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b", "svd_xt"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
         // joined them in the sc-17137 sync, and FLUX.2 Dev Control has its exact fixture): these
@@ -696,8 +696,9 @@ mod tests {
         // classifies a strategy as Missing. Two video providers publish narrower, truthful
         // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
         // half; TI2V-5B admits only a BF16 Resident/Eager load, so it witnesses one selector per
-        // tier. Spelling the sum out this way keeps a future provider's narrowing visible in the
-        // diff rather than folded into a single total.
+        // tier. SVD is instead covered by the separate resident-only witness assertion above.
+        // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
+        // rather than folded into a single total.
         assert_eq!(surfaces.len(), 48 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
