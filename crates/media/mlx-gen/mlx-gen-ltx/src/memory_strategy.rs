@@ -449,6 +449,7 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
                 !axis.starts_with("provider_video_mode:")
                     && !axis.starts_with("reference:image:")
                     && !axis.starts_with("keyframe:")
+                    && !axis.starts_with("clip:append:")
                     && axis != &"enhancer:standard"
             })
             .map(str::to_owned)
@@ -472,6 +473,10 @@ fn first_last_axes(width: u32, height: u32) -> [String; 2] {
         format!("keyframe:first:image:{width}x{height}:frame:0:strength:{I2V_STRENGTH_BITS:08x}"),
         format!("keyframe:last:image:{width}x{height}:frame:-1:strength:{I2V_STRENGTH_BITS:08x}"),
     ]
+}
+
+fn extend_clip_axis(frames: u32, width: u32, height: u32) -> String {
+    format!("clip:append:frames:{frames}:image:{width}x{height}:frame:0:strength:{I2V_STRENGTH_BITS:08x}")
 }
 
 fn admitted_reference_axis(overlay: Option<&str>) -> Option<&str> {
@@ -723,7 +728,10 @@ pub(crate) fn safety_check(
         let first_last = context.mode.as_key() == "first_last_frame"
             && context.geometry.reference_count == 2
             && context.has_reference;
-        if (!t2v && !i2v && !first_last) || context.use_pid || context.has_phases {
+        let extend = context.mode.as_key() == "extend_clip"
+            && context.geometry.reference_count == 0
+            && !context.has_reference;
+        if (!t2v && !i2v && !first_last && !extend) || context.use_pid || context.has_phases {
             return Err(gen_core::Error::Unsupported(
                 "ltx_2_3: memory admission requires exact text_to_video/no-reference, image_to_video/one-reference, or first_last_frame/two-keyframe identity without PiD/phases"
                     .into(),
@@ -773,6 +781,19 @@ pub(crate) fn safety_check(
                         .into(),
                 ));
             }
+        }
+        if extend
+            && context
+                .overlay
+                .as_deref()
+                .into_iter()
+                .flat_map(|v| v.split('+'))
+                .filter(|a| a.starts_with("clip:append:"))
+                .collect::<Vec<_>>()
+                .join("+")
+                != extend_clip_axis(geometry.frames, geometry.width, geometry.height)
+        {
+            return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires the exact single IC-LoRA appended-clip receipt".into()));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
@@ -918,7 +939,39 @@ pub(crate) fn registered_valid_fixtures(
             strength: 1.0,
         },
     ];
-    Ok(vec![t2v, i2v, first_last])
+    let mut extend_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("extend_clip".into()),
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(extend_clip_axis(153, 768, 512)),
+        },
+    )?;
+    extend_context.geometry.width = 768;
+    extend_context.geometry.height = 512;
+    extend_context.geometry.frames = 153;
+    let mut extend = MemoryBehaviorFixture::new(extend_context);
+    extend.request.width = 768;
+    extend.request.height = 512;
+    extend.request.frames = Some(153);
+    extend.request.fps = Some(25);
+    extend.request.conditioning = vec![gen_core::Conditioning::VideoClip {
+        frames: vec![
+            gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3]
+            };
+            153
+        ],
+        frame_idx: 0,
+        strength: 1.0,
+    }];
+    Ok(vec![t2v, i2v, first_last, extend])
 }
 
 fn begin_with_cleanup(
@@ -995,16 +1048,35 @@ impl LtxMemoryRequestScope {
             }
             _ => None,
         };
-        match (admitted_mode, reference.as_deref(), first_last.as_deref()) {
-            ("text_to_video", None, None) => {}
-            ("image_to_video", Some(actual), None)
+        let extend = match request.conditioning.as_slice() {
+            [gen_core::Conditioning::VideoClip {
+                frames,
+                frame_idx: 0,
+                strength,
+            }] if frames.len() == request.frames.unwrap_or(0) as usize
+                && *strength == 1.0
+                && frames.iter().all(|image| {
+                    image.width == request.width && image.height == request.height
+                }) =>
+            {
+                Some(extend_clip_axis(
+                    request.frames.unwrap_or(0),
+                    request.width,
+                    request.height,
+                ))
+            }
+            _ => None,
+        };
+        match (admitted_mode, reference.as_deref(), first_last.as_deref(), extend.as_deref()) {
+            ("text_to_video", None, None, None) => {}
+            ("image_to_video", Some(actual), None, None)
                 if Some(actual) == admitted_reference_axis(admitted_overlay) => {}
-            ("image_to_video", None, None) => {
+            ("image_to_video", None, None, None) => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: image_to_video admission requires one fitted Reference".into(),
                 ));
             }
-            ("first_last_frame", None, Some(actual))
+            ("first_last_frame", None, Some(actual), None)
                 if admitted_overlay
                     .into_iter()
                     .flat_map(|overlay| overlay.split('+'))
@@ -1012,11 +1084,13 @@ impl LtxMemoryRequestScope {
                     .collect::<Vec<_>>()
                     .join("+")
                     == actual => {}
-            ("first_last_frame", None, None) => {
+            ("first_last_frame", None, None, None) => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: first_last_frame admission requires ordered fitted Keyframes at 0 and -1 with fixed strength 1.0".into(),
                 ));
             }
+            ("extend_clip", None, None, Some(actual)) if admitted_overlay.into_iter().flat_map(|overlay| overlay.split('+')).filter(|axis| axis.starts_with("clip:append:")).collect::<Vec<_>>().join("+") == actual => {}
+            ("extend_clip", None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires one fitted IC-LoRA VideoClip at frame 0 with strength 1.0".into())),
             _ => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: request mode/reference receipt crossed the admitted memory identity"

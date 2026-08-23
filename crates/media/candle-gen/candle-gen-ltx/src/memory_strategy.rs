@@ -49,6 +49,11 @@ fn first_last_axes(width: u32, height: u32) -> [String; 2] {
         format!("keyframe:last:image:{width}x{height}:frame:-1:strength:{STRENGTH_BITS:08x}"),
     ]
 }
+fn extend_clip_axis(frames: u32, width: u32, height: u32) -> String {
+    format!(
+        "clip:append:frames:{frames}:image:{width}x{height}:frame:0:strength:{STRENGTH_BITS:08x}"
+    )
+}
 
 fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
     let WeightsSource::Dir(root) = &spec.weights else {
@@ -269,7 +274,10 @@ fn route_gate(
     let first_last = context.mode.as_key() == "first_last_frame"
         && context.geometry.reference_count == 2
         && context.has_reference;
-    if (!i2v && !first_last) || context.use_pid || context.has_phases {
+    let extend = context.mode.as_key() == "extend_clip"
+        && context.geometry.reference_count == 0
+        && !context.has_reference;
+    if (!i2v && !first_last && !extend) || context.use_pid || context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_ID}: q4 memory admission requires image_to_video/one Reference or first_last_frame/two ordered Keyframes without PiD/phases"
         )));
@@ -285,8 +293,10 @@ fn route_gate(
     }
     let expected_overlay = if i2v {
         reference_axis(geometry.width, geometry.height)
-    } else {
+    } else if first_last {
         first_last_axes(geometry.width, geometry.height).join("+")
+    } else {
+        extend_clip_axis(geometry.frames, geometry.width, geometry.height)
     };
     if context.overlay.as_deref() != Some(expected_overlay.as_str()) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -365,6 +375,18 @@ impl MemoryRequestScope for LtxMemoryScope {
                     frame_idx: -1,
                     strength: last_strength,
                 }] => fitted(first, *first_strength) && fitted(last, *last_strength),
+                _ => false,
+            },
+            "extend_clip" => match request.conditioning.as_slice() {
+                [gen_core::Conditioning::VideoClip {
+                    frames,
+                    frame_idx: 0,
+                    strength,
+                }] if frames.len() == request.frames.unwrap_or(0) as usize && *strength == 1.0 => {
+                    frames
+                        .iter()
+                        .all(|image| image.width == request.width && image.height == request.height)
+                }
                 _ => false,
             },
             _ => false,
@@ -543,7 +565,43 @@ fn registered_valid_fixtures(
         },
     ];
     let _ = spec;
-    Ok(vec![fixture, first_last])
+    let mut extend_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("extend_clip".into()),
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(extend_clip_axis(153, 768, 512)),
+        },
+    )?;
+    extend_context.geometry.width = 768;
+    extend_context.geometry.height = 512;
+    extend_context.geometry.frames = 153;
+    let mut extend = MemoryBehaviorFixture::new(extend_context);
+    extend.request.width = 768;
+    extend.request.height = 512;
+    extend.request.frames = Some(153);
+    extend.request.fps = Some(25);
+    extend.request.conditioning = vec![gen_core::Conditioning::VideoClip {
+        frames: vec![
+            gen_core::Image {
+                width: 768,
+                height: 512,
+                pixels: vec![0; 768 * 512 * 3]
+            };
+            153
+        ],
+        frame_idx: 0,
+        strength: 1.0,
+    }];
+    Ok(vec![fixture, first_last, extend])
 }
 
 fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {
