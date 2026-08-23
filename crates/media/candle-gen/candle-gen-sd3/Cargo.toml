@@ -33,6 +33,8 @@ rand_distr = { workspace = true }
 # Read trained adapter `.safetensors` + the diffusers `config.json` for the DiT/VAE at load.
 safetensors = "0.7"
 serde_json = { workspace = true }
+# Admission seals hash the immutable snapshot inventory and ordered additive adapters.
+sha2 = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
@@ -63,5 +65,4 @@ candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # SD3.5 16-channel RGB fit is grounded in tensor bytes (repo / revision / SHA-256), not in a matching
 # Rust type name — which matters more here than anywhere else, because this crate shares
 # `z_image::vae::AutoEncoderKL` with a family whose latent space turns out to be a different one.
-# Test-only; nothing in the engine hashes weights.
-sha2 = { workspace = true }
+# The production memory receipt hashes the same files; tests share that dependency.

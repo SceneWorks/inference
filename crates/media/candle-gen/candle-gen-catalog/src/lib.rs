@@ -149,6 +149,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_sd3::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
@@ -1263,19 +1265,16 @@ mod preview_advertising {
             dir: "candle-gen-sd3",
             register: candle_gen_sd3::register_providers,
             denoise: Denoise::Shared,
-            // sc-16958's inventory, and the first in this table that is simply the plain shape: ONE
-            // hooked `run_flow_sampler` site, in `pipeline.rs`'s `render_core`, which is the only
-            // shared-driver call the whole crate contains. It carries all SIX user-reachable lanes —
-            // the three registered descriptors each reached through txt2img and through
-            // img2img / `Reference` — because the img2img fork blends its reference into `x_t` and
-            // shortens the σ schedule before the driver call rather than opening a second one.
+            // Two hooked `run_flow_sampler` sites: the warm Resident `render_core` and the
+            // request-local Staged denoise phase. Each carries all six route/mode lanes (three
+            // descriptors x T2I/I2I) through the same schedule, CFG, seed, and preview contract.
             // No dark site: `load_variant` refuses control / IP-adapter overlays, so this crate ships
             // no descriptor-less render lane, and it has no trainer. No direct emission either —
             // `preview.rs` holds only the reused epic-16624 16-channel fit and a layout check, since
             // SD3.5's running latent is already the `[1, C, h, w]` contract with nothing to unpack.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
-                hooked: 1,
+                hooked: 2,
                 direct: 0,
                 dark: &[],
             }],
@@ -3469,6 +3468,11 @@ mod preview_advertising {
             register_providers: candle_gen_scail2::register_providers,
             register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
             resident_only_on_cpu: true,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sd3",
+            register_providers: candle_gen_sd3::register_providers,
+            register_surfaces: Some(candle_gen_sd3::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
             dir: "candle-gen-sensenova",
