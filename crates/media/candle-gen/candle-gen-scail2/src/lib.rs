@@ -85,8 +85,20 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    let registry = registry.register_generator(pipeline::REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = register_memory_contract_surfaces(registry);
     registry
-        .register_generator(pipeline::REGISTRATION)
+}
+
+/// Add SCAIL-2's Resident-only memory registration without constructing weights.
+///
+/// CUDA builds receive it through [`register_providers`]; CPU catalog conformance composes this
+/// same declaration explicitly so it can exercise the provider's public contract without CUDA.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
