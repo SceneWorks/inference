@@ -113,6 +113,7 @@ pub(crate) struct Pipeline {
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
     adapters: Vec<AdapterSpec>,
+    load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
 }
 
 /// Kolors' two UNet deltas vs stock SDXL, both auto-present in the checkpoint: the `add_embedding` MLP
@@ -221,7 +222,24 @@ impl Pipeline {
             device: device.clone(),
             pid_spec,
             adapters,
+            load_seal: None,
         }
+    }
+
+    pub(crate) fn with_load_seal(
+        mut self,
+        seal: Option<crate::memory_strategy::KolorsLoadSeal>,
+    ) -> Self {
+        self.load_seal = seal;
+        self
+    }
+
+    fn ensure_load_seal(&self) -> Result<()> {
+        if let Some(seal) = &self.load_seal {
+            seal.ensure_unchanged()
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Load the four heavy components from the Kolors-diffusers snapshot (`tokenizer/`, `text_encoder/`
@@ -255,6 +273,7 @@ impl Pipeline {
     /// requests use this independently so the 6B text tower is released before
     /// the UNet phase is opened.
     fn load_conditioner(&self) -> Result<(KolorsTokenizer, ChatGlmModel)> {
+        self.ensure_load_seal()?;
         let tokenizer = KolorsTokenizer::from_dir(self.root.join("tokenizer"))?;
 
         // ChatGLM3-6B text encoder. The four GLM projections packed-detect on their `.scales` sibling
@@ -272,6 +291,7 @@ impl Pipeline {
 
     /// Materialize only the denoise phase, preserving the packed/dense fork.
     fn load_unet(&self) -> Result<KolorsUnet> {
+        self.ensure_load_seal()?;
         // UNet: a packed MLX tier (a `quantization` block in `unet/config.json`) builds the vendored,
         // packed-detecting SDXL UNet + the two Kolors deltas straight from the packed parts; a dense
         // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression).
@@ -337,6 +357,7 @@ impl Pipeline {
     /// Materialize only the native F32 SDXL VAE decode phase.  bf16 snapshots
     /// intentionally still execute this exact F32 recipe.
     fn load_vae(&self) -> Result<AutoEncoderKL> {
+        self.ensure_load_seal()?;
         Ok(AutoEncoderKL::new(
             self.f32_vb(&self.root.join("vae"))?,
             3,
@@ -346,6 +367,7 @@ impl Pipeline {
     }
 
     fn load_pid(&self) -> Result<Option<Arc<PidEngine>>> {
+        self.ensure_load_seal()?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
         Ok(match self.pid_spec.as_ref() {
@@ -365,6 +387,7 @@ impl Pipeline {
     }
 
     fn load_vae_encoder(&self) -> Result<VaeMomentsEncoder> {
+        self.ensure_load_seal()?;
         Ok(VaeMomentsEncoder::new(
             self.f32_vb(&self.root.join("vae"))?,
             VAE_SCALE,

@@ -205,6 +205,7 @@ pub struct KolorsControl {
     memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
     admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
     source_root: PathBuf,
+    load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
 }
 
 impl KolorsControl {
@@ -212,7 +213,7 @@ impl KolorsControl {
     /// Kolors `ControlNetModel` (encoder copy + its own `encoder_hid_proj`). No IP-Adapter K/V is
     /// installed — the control branch is the only conditioning overlay.
     pub fn load(paths: &KolorsControlPaths) -> Result<Self> {
-        Self::load_internal(paths, None, None, None)
+        Self::load_internal(paths, None, None, None, None)
     }
 
     pub fn load_with_memory_context(
@@ -224,8 +225,9 @@ impl KolorsControl {
                 "kolors-control: PiD admission requires load_with_memory_context_and_pid".into(),
             ));
         }
-        let contract = crate::memory_strategy::provider_contract_for_control(paths, None)
+        let seal = crate::memory_strategy::KolorsLoadSeal::capture_control(paths, None)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let contract = seal.contract().clone();
         crate::memory_strategy::validate_bespoke_context(
             &contract,
             &paths.kolors_base,
@@ -234,7 +236,7 @@ impl KolorsControl {
             context.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        Self::load_internal(paths, None, Some(contract), Some(context))
+        Self::load_internal(paths, None, Some(contract), Some(context), Some(seal))
     }
 
     pub fn load_with_memory_context_and_pid(
@@ -242,8 +244,9 @@ impl KolorsControl {
         pid: Option<&PidWeights>,
         context: candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract_for_control(paths, pid)
+        let seal = crate::memory_strategy::KolorsLoadSeal::capture_control(paths, pid)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let contract = seal.contract().clone();
         crate::memory_strategy::validate_bespoke_context(
             &contract,
             &paths.kolors_base,
@@ -252,7 +255,13 @@ impl KolorsControl {
             pid.is_some(),
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        Self::load_internal(paths, pid.cloned(), Some(contract), Some(context))
+        Self::load_internal(
+            paths,
+            pid.cloned(),
+            Some(contract),
+            Some(context),
+            Some(seal),
+        )
     }
 
     fn load_internal(
@@ -260,6 +269,7 @@ impl KolorsControl {
         pid_spec: Option<PidWeights>,
         memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
         admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+        load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
     ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let staged = admitted_context.as_ref().is_some_and(|context| {
@@ -268,10 +278,25 @@ impl KolorsControl {
         let resident = if staged {
             None
         } else {
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let conditioning = Self::load_conditioning_phase(paths, &device)?;
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let denoise = Self::load_denoise_phase(paths, &device)?;
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let decode = Self::load_decode_phase(paths, pid_spec.as_ref(), &device)?;
             Some(ControlResident {
-                conditioning: Self::load_conditioning_phase(paths, &device)?,
-                denoise: Self::load_denoise_phase(paths, &device)?,
-                decode: Self::load_decode_phase(paths, pid_spec.as_ref(), &device)?,
+                conditioning,
+                denoise,
+                decode,
             })
         };
         Ok(Self {
@@ -282,6 +307,7 @@ impl KolorsControl {
             memory_contract,
             admitted_context,
             source_root: paths.kolors_base.clone(),
+            load_seal,
         })
     }
 
@@ -475,6 +501,11 @@ impl KolorsControl {
             req.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
+        self.load_seal
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-control: missing artifact seal".into()))?
+            .ensure_unchanged()
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         let result = if context.selection.strategy
             == candle_gen::gen_core::MemoryStrategy::StagedResidency
         {
@@ -668,7 +699,14 @@ impl KolorsControl {
         let use_guide = req.guidance > 1.0;
 
         let conditioning = SynchronizedPhase::new(
-            Self::load_conditioning_phase(&self.paths, &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_conditioning_phase(&self.paths, &self.device)?
+            },
             self.device.clone(),
         );
         let (context, pooled, batch) = common::cfg_batch_context(
@@ -685,7 +723,14 @@ impl KolorsControl {
             return Err(CandleError::Canceled);
         }
         let denoise = SynchronizedPhase::new(
-            Self::load_denoise_phase(&self.paths, &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_denoise_phase(&self.paths, &self.device)?
+            },
             self.device.clone(),
         );
         let projected = denoise.encoder_hid_proj.forward(&context)?;
@@ -787,7 +832,14 @@ impl KolorsControl {
             return Err(CandleError::Canceled);
         }
         let decode = SynchronizedPhase::new(
-            Self::load_decode_phase(&self.paths, self.pid_spec.as_ref(), &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_decode_phase(&self.paths, self.pid_spec.as_ref(), &self.device)?
+            },
             self.device.clone(),
         );
         on_progress(Progress::Decoding);

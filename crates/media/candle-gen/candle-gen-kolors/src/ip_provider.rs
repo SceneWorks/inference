@@ -193,6 +193,7 @@ pub struct IpAdapterKolors {
     memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
     admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
     source_root: PathBuf,
+    load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
 }
 
 impl IpAdapterKolors {
@@ -200,15 +201,16 @@ impl IpAdapterKolors {
     /// CLIP ViT-L/14-336 image encoder + the IP-Adapter-Plus Resampler, installing the decoupled-cross-
     /// attn K/V pairs into the UNet.
     pub fn load(paths: &IpAdapterKolorsPaths) -> Result<Self> {
-        Self::load_internal(paths, None, None)
+        Self::load_internal(paths, None, None, None)
     }
 
     pub fn load_with_memory_context(
         paths: &IpAdapterKolorsPaths,
         context: candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract_for_ip(paths)
+        let seal = crate::memory_strategy::KolorsLoadSeal::capture_ip(paths)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let contract = seal.contract().clone();
         crate::memory_strategy::validate_bespoke_context(
             &contract,
             &paths.kolors_base,
@@ -217,13 +219,14 @@ impl IpAdapterKolors {
             false,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        Self::load_internal(paths, Some(contract), Some(context))
+        Self::load_internal(paths, Some(contract), Some(context), Some(seal))
     }
 
     fn load_internal(
         paths: &IpAdapterKolorsPaths,
         memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
         admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+        load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
     ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let staged = admitted_context.as_ref().is_some_and(|context| {
@@ -232,8 +235,20 @@ impl IpAdapterKolors {
         let resident = if staged {
             None
         } else {
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
             let conditioning = Self::load_conditioning_phase(paths, &device)?;
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
             let denoise = Self::load_denoise_phase(paths, &device)?;
+            if let Some(seal) = &load_seal {
+                seal.ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
             let vae = Self::load_vae(paths, &device)?;
             Some(IpResident {
                 conditioning,
@@ -249,6 +264,7 @@ impl IpAdapterKolors {
             memory_contract,
             admitted_context,
             source_root: paths.kolors_base.clone(),
+            load_seal,
         })
     }
 
@@ -379,6 +395,11 @@ impl IpAdapterKolors {
             false,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
+        self.load_seal
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-ip: missing artifact seal".into()))?
+            .ensure_unchanged()
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         let result = if context.selection.strategy
             == candle_gen::gen_core::MemoryStrategy::StagedResidency
         {
@@ -549,7 +570,14 @@ impl IpAdapterKolors {
         let use_guide = req.guidance > 1.0;
 
         let conditioning = SynchronizedPhase::new(
-            Self::load_conditioning_phase(&self.paths, &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_conditioning_phase(&self.paths, &self.device)?
+            },
             self.device.clone(),
         );
         let (context, pooled, batch) = common::cfg_batch_context(
@@ -567,7 +595,14 @@ impl IpAdapterKolors {
             return Err(CandleError::Canceled);
         }
         let mut denoise = SynchronizedPhase::new(
-            Self::load_denoise_phase(&self.paths, &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_denoise_phase(&self.paths, &self.device)?
+            },
             self.device.clone(),
         );
         let projected = denoise.encoder_hid_proj.forward(&context)?;
@@ -647,7 +682,14 @@ impl IpAdapterKolors {
             return Err(CandleError::Canceled);
         }
         let vae = SynchronizedPhase::new(
-            Self::load_vae(&self.paths, &self.device)?,
+            {
+                self.load_seal
+                    .as_ref()
+                    .expect("admitted staged route has a load seal")
+                    .ensure_unchanged()
+                    .map_err(|error| CandleError::Msg(error.to_string()))?;
+                Self::load_vae(&self.paths, &self.device)?
+            },
             self.device.clone(),
         );
         on_progress(Progress::Decoding);
