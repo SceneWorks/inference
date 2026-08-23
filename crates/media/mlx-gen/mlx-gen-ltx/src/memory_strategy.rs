@@ -39,10 +39,26 @@ use crate::gemma::GemmaQuant;
 
 /// Contract/execution identity introduced by SC-19109. The earlier SC-18808 capture predates this
 /// shared-contract carrier and therefore cannot be reused as if its calibration semantics matched.
-pub const CALIBRATION_FINGERPRINT: &str = "sc-19109-ltx-2-3-mlx-memory-ladder-v1";
-const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-19109-ltx-2-3-mlx-registry-behavior-v1";
+pub const CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-memory-ladder-v2";
+const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-registry-behavior-v2";
 
 pub const DECODE_OVERLAP: u32 = 64;
+
+const SHIPPED_GEOMETRIES: &[(u32, u32)] =
+    &[(768, 512), (512, 768), (640, 640), (1280, 704), (704, 1280)];
+const SHIPPED_FRAME_COUNTS: &[u32] = &[
+    97, 121, 145, 153, 177, 193, 201, 241, 249, 289, 297, 361, 377, 449,
+];
+const I2V_STRENGTH_BITS: u32 = 1.0_f32.to_bits();
+
+fn frame_count_matches_fps(fps: u32, frames: u32) -> bool {
+    match fps {
+        24 => [97, 145, 193, 241, 289, 361].contains(&frames),
+        25 => [97, 153, 201, 249, 297, 377].contains(&frames),
+        30 => [121, 177, 241, 297, 361, 449].contains(&frames),
+        _ => false,
+    }
+}
 
 fn decode_tile_edges() -> Vec<u32> {
     crate::pipeline::LTX_VAE_SPATIAL_PX
@@ -239,10 +255,10 @@ fn production_asset_declaration(
         ));
     };
 
-    // The conditioning phase includes the canonical dense Gemma snapshot, the LTX connector, and
-    // the optional uncensored Gemma artifact when that exact overlay is loaded. Standard prompt
-    // enhancement reuses the canonical Gemma; its autoregressive working set is bounded by the
-    // request-scope MAX_ENHANCE_TOKENS ceiling.
+    // The conditioning phase includes the canonical dense Gemma snapshot, the LTX connector, the
+    // request-scoped VAE encoder used by I2V, and the optional uncensored Gemma artifact when that
+    // exact overlay is loaded. The encoder is released after its fitted image latents materialize;
+    // keeping it in this phase floor accounts its widest instant without carrying it into denoise.
     let conditioning_bytes = checked_sum(
         "conditioning",
         [
@@ -255,6 +271,11 @@ fn production_asset_declaration(
                 &root.join("connector.safetensors"),
                 "connector",
                 ResidentProjection::Bfloat16,
+            )?,
+            required_projected_safetensors_bytes(
+                &root.join("vae_encoder.safetensors"),
+                "video VAE encoder",
+                ResidentProjection::Float32,
             )?,
             uncensored_enhancer_resident_bytes(spec)?,
         ],
@@ -278,8 +299,7 @@ fn production_asset_declaration(
         ],
     )?;
 
-    // Pure T2V never materializes vae_encoder.safetensors: the provider retains only its path and
-    // opens it lazily for image-conditioned routes, which this calibrated contract rejects.
+    // The decoder phase excludes the request-scoped encoder charged above.
     let decoder_bytes = checked_sum(
         "decode",
         [
@@ -426,7 +446,9 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
             .into_iter()
             .flat_map(|value| value.split('+'))
             .filter(|axis| {
-                !axis.starts_with("provider_video_mode:") && axis != &"enhancer:standard"
+                !axis.starts_with("provider_video_mode:")
+                    && !axis.starts_with("reference:image:")
+                    && axis != &"enhancer:standard"
             })
             .map(str::to_owned)
             .collect::<Vec<_>>()
@@ -438,6 +460,17 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
         return false;
     }
     load_axes(actual) == load_axes(expected)
+}
+
+fn reference_axis(width: u32, height: u32) -> String {
+    format!("reference:image:{width}x{height}:strength:{I2V_STRENGTH_BITS:08x}")
+}
+
+fn admitted_reference_axis(overlay: Option<&str>) -> Option<&str> {
+    overlay
+        .into_iter()
+        .flat_map(|value| value.split('+'))
+        .find(|axis| axis.starts_with("reference:image:"))
 }
 
 fn strategies() -> Vec<MemoryStrategyCapability> {
@@ -673,13 +706,15 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
-        if context.mode.as_key() != "text_to_video"
-            || context.geometry.reference_count != 0
-            || context.has_reference
-            || context.use_pid
-        {
+        let t2v = context.mode.as_key() == "text_to_video"
+            && context.geometry.reference_count == 0
+            && !context.has_reference;
+        let i2v = context.mode.as_key() == "image_to_video"
+            && context.geometry.reference_count == 1
+            && context.has_reference;
+        if (!t2v && !i2v) || context.use_pid || context.has_phases {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route is reference-free text_to_video without PiD"
+                "ltx_2_3: memory admission requires exact text_to_video/no-reference or image_to_video/one-reference identity without PiD/phases"
                     .into(),
             ));
         }
@@ -691,17 +726,25 @@ pub(crate) fn safety_check(
         }
         let geometry = context.geometry;
         if geometry.batch != 1
-            || !(crate::model::MIN_SIZE..=crate::model::MAX_SIZE).contains(&geometry.width)
-            || !(crate::model::MIN_SIZE..=crate::model::MAX_SIZE).contains(&geometry.height)
-            || !geometry.width.is_multiple_of(crate::SIZE_MULTIPLE)
-            || !geometry.height.is_multiple_of(crate::SIZE_MULTIPLE)
-            || !(1..=crate::model::MAX_FRAMES).contains(&geometry.frames)
-            || !(geometry.frames - 1).is_multiple_of(8)
+            || !SHIPPED_GEOMETRIES.contains(&(geometry.width, geometry.height))
+            || !SHIPPED_FRAME_COUNTS.contains(&geometry.frames)
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "ltx_2_3: unsupported memory geometry {}x{}x{} frames={}",
                 geometry.width, geometry.height, geometry.batch, geometry.frames
             )));
+        }
+        let reference = admitted_reference_axis(context.overlay.as_deref());
+        if t2v && reference.is_some() {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: text_to_video admission cannot carry an image reference receipt".into(),
+            ));
+        }
+        if i2v && reference != Some(reference_axis(geometry.width, geometry.height).as_str()) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: image_to_video admission requires the exact fitted image shape and fixed strength receipt"
+                    .into(),
+            ));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
@@ -748,7 +791,7 @@ pub(crate) fn registered_valid_fixtures(
         return Ok(Vec::new());
     }
     let tier = registered_tier(spec, contract).map_err(gen_core::Error::from)?;
-    let context = gen_core::standard_memory_behavior_context(
+    let mut t2v_context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
         tier,
@@ -760,7 +803,49 @@ pub(crate) fn registered_valid_fixtures(
             overlay: route_overlay(spec),
         },
     )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    t2v_context.geometry.width = 768;
+    t2v_context.geometry.height = 512;
+    t2v_context.geometry.frames = 153;
+    let mut t2v = MemoryBehaviorFixture::new(t2v_context);
+    t2v.request.width = 768;
+    t2v.request.height = 512;
+    t2v.request.frames = Some(153);
+    t2v.request.fps = Some(25);
+
+    let reference_receipt = reference_axis(768, 512);
+    let i2v_overlay = match route_overlay(spec) {
+        Some(load) => format!("{load}+{reference_receipt}"),
+        None => reference_receipt,
+    };
+    let mut i2v_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("image_to_video".into()),
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(i2v_overlay),
+        },
+    )?;
+    i2v_context.geometry.width = 768;
+    i2v_context.geometry.height = 512;
+    i2v_context.geometry.frames = 153;
+    let mut i2v = MemoryBehaviorFixture::new(i2v_context);
+    i2v.request.width = 768;
+    i2v.request.height = 512;
+    i2v.request.frames = Some(153);
+    i2v.request.fps = Some(25);
+    i2v.request.conditioning = vec![gen_core::Conditioning::Reference {
+        image: gen_core::Image {
+            width: 768,
+            height: 512,
+            pixels: vec![0; 768 * 512 * 3],
+        },
+        strength: Some(1.0),
+    }];
+    Ok(vec![t2v, i2v])
 }
 
 fn begin_with_cleanup(
@@ -788,6 +873,7 @@ fn begin_with_cleanup(
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
         expected_overlay: expected_overlay.map(str::to_owned),
         admitted_overlay: context.overlay.clone(),
+        admitted_mode: context.mode.as_key().to_owned(),
     })))
 }
 
@@ -799,6 +885,7 @@ struct LtxMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
     expected_overlay: Option<String>,
     admitted_overlay: Option<String>,
+    admitted_mode: String,
 }
 
 impl LtxMemoryRequestScope {
@@ -806,11 +893,51 @@ impl LtxMemoryRequestScope {
         request: &GenerationRequest,
         expected_overlay: Option<&str>,
         admitted_overlay: Option<&str>,
+        admitted_mode: &str,
     ) -> gen_core::Result<()> {
-        if !request.conditioning.is_empty() {
-            return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route requires empty conditioning".into(),
-            ));
+        let mut reference = None;
+        for conditioning in &request.conditioning {
+            let gen_core::Conditioning::Reference { image, strength } = conditioning else {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: this memory route accepts only the single fitted image Reference carrier"
+                        .into(),
+                ));
+            };
+            if reference.is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: image_to_video memory admission requires exactly one Reference"
+                        .into(),
+                ));
+            }
+            if image.width != request.width || image.height != request.height {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ltx_2_3: fitted reference shape {}x{} does not match output {}x{}",
+                    image.width, image.height, request.width, request.height
+                )));
+            }
+            let strength = strength.or(request.strength).unwrap_or(1.0);
+            if strength.to_bits() != I2V_STRENGTH_BITS {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: image_to_video memory admission requires fixed strength 1.0".into(),
+                ));
+            }
+            reference = Some(reference_axis(image.width, image.height));
+        }
+        match (admitted_mode, reference.as_deref()) {
+            ("text_to_video", None) => {}
+            ("image_to_video", Some(actual))
+                if Some(actual) == admitted_reference_axis(admitted_overlay) => {}
+            ("image_to_video", None) => {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: image_to_video admission requires one fitted Reference".into(),
+                ));
+            }
+            _ => {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: request mode/reference receipt crossed the admitted memory identity"
+                        .into(),
+                ));
+            }
         }
         // These controls are part of the exact request identity.  They are safe to carry through
         // a future variant-specific evidence cell; they must not be silently erased or borrow the
@@ -870,6 +997,24 @@ impl LtxMemoryRequestScope {
                 "ltx_2_3: calibrated memory route requires public fps 24, 25, or 30, got {fps}"
             )));
         }
+        if !SHIPPED_GEOMETRIES.contains(&(request.width, request.height))
+            || !frame_count_matches_fps(fps, request.frames.unwrap_or(1))
+        {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: request geometry/frame count is outside the shipped LTX ladder".into(),
+            ));
+        }
+        if request
+            .sampler
+            .as_deref()
+            .is_some_and(|sampler| sampler != "euler")
+            || request.scheduler.is_some()
+        {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: conditioned memory admission preserves the native Euler/fixed schedule"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -880,6 +1025,7 @@ impl MemoryRequestScope for LtxMemoryRequestScope {
             request,
             self.expected_overlay.as_deref(),
             self.admitted_overlay.as_deref(),
+            &self.admitted_mode,
         )?;
         self.inner.configure_request(request)
     }
@@ -1153,7 +1299,8 @@ mod tests {
         let contract = weights_free_memory_strategy_contract(&spec).unwrap();
         let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
             .unwrap()
-            .pop()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "text_to_video")
             .unwrap();
         let scope = registered_begin_request(&spec, &contract, &fixture.context)
             .unwrap()
@@ -1162,16 +1309,22 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_scope_binds_empty_t2v_request_and_fps_envelope_before_installing_controls() {
+    fn calibrated_scope_binds_empty_t2v_request_and_exact_fps_frame_pair_before_controls() {
         let (mut scope, request) = calibrated_t2v_scope_and_request();
-        for fps in [None, Some(24), Some(25), Some(30)] {
-            let mut accepted = GenerationRequest {
-                fps,
-                ..request.clone()
-            };
-            scope.configure_request(&mut accepted).unwrap();
-            assert!(accepted.memory.unwrap().stage_residency);
-        }
+        let mut accepted = request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+        assert!(accepted.memory.unwrap().stage_residency);
+
+        let mut crossed_pair = GenerationRequest {
+            fps: Some(24),
+            ..request.clone()
+        };
+        let error = scope
+            .configure_request(&mut crossed_pair)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the shipped LTX ladder"));
+        assert_eq!(crossed_pair.memory, None);
 
         let image = Image {
             width: 1,
@@ -1206,7 +1359,7 @@ mod tests {
                 .configure_request(&mut temporal_conditioning)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("requires empty conditioning"));
+            assert!(error.contains("accepts only the single fitted image Reference carrier"));
             assert_eq!(temporal_conditioning.memory, None);
         }
 
@@ -1241,7 +1394,8 @@ mod tests {
             MemoryStrategy::StagedResidency,
         )
         .unwrap()
-        .pop()
+        .into_iter()
+        .find(|fixture| fixture.context.mode.as_key() == "text_to_video")
         .unwrap();
         let mut enhancer_scope = registered_begin_request(
             &enhancer_spec,
@@ -1290,7 +1444,8 @@ mod tests {
             MemoryStrategy::StagedResidency,
         )
         .unwrap()
-        .pop()
+        .into_iter()
+        .find(|fixture| fixture.context.mode.as_key() == "text_to_video")
         .unwrap()
         .context;
         standard_context.overlay = Some("enhancer:standard".into());
@@ -1336,7 +1491,8 @@ mod tests {
             MemoryStrategy::StagedResidency,
         )
         .unwrap()
-        .pop()
+        .into_iter()
+        .find(|fixture| fixture.context.mode.as_key() == "text_to_video")
         .unwrap()
         .context;
         no_audio_context.overlay = Some("provider_video_mode:no_audio".into());
@@ -1394,6 +1550,116 @@ mod tests {
             .unwrap();
         let mut after_finish = request;
         assert!(scope.configure_request(&mut after_finish).is_err());
+    }
+
+    #[test]
+    fn calibrated_i2v_scope_binds_fitted_reference_strength_schedule_and_frame_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "image_to_video")
+            .unwrap();
+        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+
+        let mut accepted = fixture.request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+        assert!(accepted.memory.unwrap().stage_residency);
+
+        let reference = fixture.request.conditioning[0].clone();
+        for (mut crossed, expected) in [
+            (
+                GenerationRequest {
+                    conditioning: Vec::new(),
+                    ..fixture.request.clone()
+                },
+                "requires one fitted Reference",
+            ),
+            (
+                GenerationRequest {
+                    conditioning: vec![reference.clone(), reference.clone()],
+                    ..fixture.request.clone()
+                },
+                "requires exactly one Reference",
+            ),
+            (
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: Image {
+                            width: 512,
+                            height: 768,
+                            pixels: vec![0; 512 * 768 * 3],
+                        },
+                        strength: Some(1.0),
+                    }],
+                    ..fixture.request.clone()
+                },
+                "fitted reference shape",
+            ),
+            (
+                GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: Image {
+                            width: 768,
+                            height: 512,
+                            pixels: vec![0; 768 * 512 * 3],
+                        },
+                        strength: Some(0.5),
+                    }],
+                    ..fixture.request.clone()
+                },
+                "requires fixed strength 1.0",
+            ),
+            (
+                GenerationRequest {
+                    fps: Some(24),
+                    ..fixture.request.clone()
+                },
+                "outside the shipped LTX ladder",
+            ),
+            (
+                GenerationRequest {
+                    sampler: Some("heun".into()),
+                    ..fixture.request.clone()
+                },
+                "native Euler/fixed schedule",
+            ),
+            (
+                GenerationRequest {
+                    scheduler: Some("linear".into()),
+                    ..fixture.request.clone()
+                },
+                "native Euler/fixed schedule",
+            ),
+        ] {
+            let error = scope
+                .configure_request(&mut crossed)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected refusal: {error}");
+            assert_eq!(crossed.memory, None);
+        }
+
+        let (mut t2v_scope, mut crossed_i2v) = calibrated_t2v_scope_and_request();
+        crossed_i2v.conditioning = fixture.request.conditioning.clone();
+        let error = t2v_scope
+            .configure_request(&mut crossed_i2v)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("crossed the admitted memory identity"));
+
+        let mut crossed_t2v = GenerationRequest {
+            conditioning: Vec::new(),
+            ..fixture.request
+        };
+        let error = scope
+            .configure_request(&mut crossed_t2v)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires one fitted Reference"));
     }
 
     #[test]

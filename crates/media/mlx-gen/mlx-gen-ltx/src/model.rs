@@ -671,9 +671,20 @@ impl Ltx {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // Materialize every conditioned latent inside one encoder-residency scope. The VAE encoder
+        // is request-only: once these arrays are forced, no denoise or decode operation needs its
+        // weights. Release it on success, cancellation, and error before the 48-block AvDiT loads.
+        let conditioned = (|| {
+            let keyframes = self.build_keyframes(req)?;
+            let clips = self.build_clips(req)?;
+            Ok::<_, Error>((keyframes, clips))
+        })();
+        if self.vae.release_encoder() {
+            mlx_rs::memory::clear_cache();
+        }
+        let (kf_owned, clip_owned) = conditioned?;
         // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
         // I2V = a single `Reference` at frame 0; first_last_frame / multi-keyframe = `Keyframe`s.
-        let kf_owned = self.build_keyframes(req)?;
         let keyframes: Vec<StageKeyframe> = kf_owned
             .iter()
             .map(|(s1, s2, idx, strength)| StageKeyframe {
@@ -685,7 +696,6 @@ impl Ltx {
             .collect();
         // In-context clips (extend_clip / video_bridge) — VAE-encoded at stage-1 resolution, appended
         // as IC-LoRA conditioning tokens in stage 1 only.
-        let clip_owned = self.build_clips(req)?;
         let clips: Vec<StageClip> = clip_owned
             .iter()
             .map(|(s1, idx, strength)| StageClip {
