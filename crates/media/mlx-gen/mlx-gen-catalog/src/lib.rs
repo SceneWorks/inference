@@ -682,13 +682,13 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 50);
+        assert_eq!(registry.memory_strategy_registrations().len(), 51);
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert!(resident_only.is_empty());
+        assert_eq!(resident_only, ["krea_realtime_14b"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
         // joined them in the sc-17137 sync, and FLUX.2 Dev Control now has its exact fixture): these
