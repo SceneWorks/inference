@@ -950,7 +950,7 @@ mod tests {
                 let warm_loads = Arc::clone(&warm_loads);
                 move |_| {
                     warm_loads.fetch_add(1, Ordering::SeqCst);
-                    events.lock().unwrap().push("warm-load");
+                    candle_gen::lock_recover(&events).push("warm-load");
                     Ok::<_, candle_gen::CandleError>((10u8, 20u16))
                 }
             },
@@ -960,7 +960,7 @@ mod tests {
                 move |_, cancel| {
                     candle_gen::check_cancel(cancel)?;
                     text_loads.fetch_add(1, Ordering::SeqCst);
-                    events.lock().unwrap().push("text-load");
+                    candle_gen::lock_recover(&events).push("text-load");
                     Ok::<_, candle_gen::CandleError>(30u8)
                 }
             },
@@ -970,7 +970,7 @@ mod tests {
                 move |_, _, cancel| {
                     candle_gen::check_cancel(cancel)?;
                     heavy_loads.fetch_add(1, Ordering::SeqCst);
-                    events.lock().unwrap().push("heavy-load");
+                    candle_gen::lock_recover(&events).push("heavy-load");
                     Ok::<_, candle_gen::CandleError>(40u16)
                 }
             },
@@ -983,7 +983,7 @@ mod tests {
                 false,
                 &mut |_| {},
                 |text| {
-                    events.lock().unwrap().push("encode");
+                    candle_gen::lock_recover(&events).push("encode");
                     if fail_encode {
                         Err(candle_gen::CandleError::Msg(
                             "synthetic encode failure".to_owned(),
@@ -993,11 +993,11 @@ mod tests {
                     }
                 },
                 |_| {
-                    events.lock().unwrap().push("synchronize");
+                    candle_gen::lock_recover(&events).push("synchronize");
                     Ok(())
                 },
                 |heavy, text, _| {
-                    events.lock().unwrap().push("render");
+                    candle_gen::lock_recover(&events).push("render");
                     Ok::<_, candle_gen::CandleError>(u32::from(*heavy) + u32::from(text))
                 },
             )
@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(text_loads.load(Ordering::SeqCst), 1);
         assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
         assert_eq!(
-            *events.lock().unwrap(),
+            *candle_gen::lock_recover(&events),
             [
                 "warm-load",
                 "encode",
