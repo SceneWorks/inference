@@ -717,7 +717,7 @@ pub(crate) fn begin_request<'a>(
         },
     )?;
     config.default_frames = context.geometry.frames;
-    *memory.active_context.lock().expect("SCAIL active context") = Some(context.clone());
+    *candle_gen::lock_recover(&memory.active_context) = Some(context.clone());
     Ok(Some(Box::new(Scail2MemoryScope {
         inner: Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
             config,
