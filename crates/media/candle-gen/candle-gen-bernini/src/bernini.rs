@@ -589,6 +589,9 @@ pub struct Bernini {
     device: Device,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
+    loaded_spec: LoadSpec,
 }
 
 impl Bernini {
@@ -597,12 +600,27 @@ impl Bernini {
     /// both mmap + upload ~50 GB (F-097).
     fn components(&self) -> CResult<Arc<RendererComponents>> {
         candle_gen::cached(&self.components, || {
-            Ok(Arc::new(RendererComponents::load(
-                &self.root,
-                &self.device,
-                MODEL_ID,
-                &self.adapters,
-            )?))
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let components =
+                RendererComponents::load(&self.root, &self.device, MODEL_ID, &self.adapters)?;
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            Ok(Arc::new(components))
         })
     }
 }
@@ -629,6 +647,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         knobs,
@@ -636,6 +662,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        memory_strategy,
+        memory_tier,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -664,6 +693,11 @@ impl Generator for Bernini {
         // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
         // them off the request and dropping them.
         reject_unimplemented_video_clip_knobs(id, req)?;
+        // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
+        // surface share the provider but retain separate, fail-closed request identities.
+        if req.frames == Some(1) || req.memory.is_some() {
+            crate::memory_strategy::validate_public_request(req)?;
+        }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
         let has_video = req
@@ -694,6 +728,30 @@ impl Generator for Bernini {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         Ok(self.generate_impl(req, on_progress)?)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -933,11 +991,14 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors the packing order).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V uses the trained source/reference/first-image triplet; extra images interpolate
+        // across ids 1..=3, matching its admission receipt.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Tensor, f64)> = src_videos
             .iter()
             .enumerate()
@@ -969,11 +1030,7 @@ impl Bernini {
             ];
             let high = BVitExpert::build(&comps.high, streams4)?;
             let low = BVitExpert::build(&comps.low, streams4)?;
-            let pf = PackedForward::new(
-                dit_cfg,
-                self.knobs.max_trained_src_id,
-                self.knobs.interpolate_src_id,
-            );
+            let pf = PackedForward::new(dit_cfg, trained_sources, self.knobs.interpolate_src_id);
             let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
             let shift = req
                 .scheduler_shift
@@ -1008,7 +1065,9 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let decoded = vae.decode_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
+        let decoded =
+            vae.decode_budgeted_with_cancel_and_tile_cap(&latents, &req.cancel, decode_cap)?;
         let images_out = frames_to_images(&decoded)?;
 
         if frames == 1 {

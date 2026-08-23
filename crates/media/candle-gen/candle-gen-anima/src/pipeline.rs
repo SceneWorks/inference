@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::config::{Variant, LATENT_TEMPORAL_AXIS, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
-use crate::loader::AnimaComponents;
+use crate::loader::{AnimaComponents, AnimaConditioningComponents, AnimaRenderComponents};
 
 /// Anima's default flow solver: the recommended **ER-SDE-3** (`er_sde`, sc-10519), matching the MLX
 /// lane. The workspace `gen-core` is pinned to `441ecec` (mlx-gen PR #673's CI-green head), which
@@ -97,26 +97,31 @@ impl AnimaPipeline {
     /// Encode a prompt to the DiT's `encoder_hidden_states` `[1, 512, 1024]`: Qwen3 `last_hidden_state`
     /// → **mask-multiply** (VERIFIED trap) → `AnimaTextConditioner`.
     pub fn encode_prompt(&self, prompt: &str) -> Result<Tensor> {
-        let c = &self.components;
-        let dtype = c.dtype;
-        let (qwen_ids, qwen_mask) = c.tokenizers.encode_qwen(prompt)?;
-        let s = qwen_ids.len();
-        let ids_u32: Vec<u32> = qwen_ids.iter().map(|&i| i as u32).collect();
-        let input_ids = Tensor::from_vec(ids_u32, (1, s), &self.device)?;
-        let source = c.text_encoder.forward(&input_ids, dtype)?; // [1, S, 1024]
+        encode_prompt_components(&self.components, &self.device, prompt)
+    }
 
-        // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
-        // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
-        // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
-        let mask_f: Vec<f32> = qwen_mask.iter().map(|&m| m as f32).collect();
-        let mask = Tensor::from_vec(mask_f, (1, s, 1), &self.device)?.to_dtype(dtype)?;
-        let source = source.broadcast_mul(&mask)?;
+    /// Render from already-materialized conditioning.  This is the shared tail for resident and
+    /// staged residency; retaining it in one function pins identical seed, sigma schedule, CFG,
+    /// preview, and decode behavior across both paths.
+    pub fn render_encoded(
+        render: &impl RenderComponents,
+        device: &Device,
+        cond: Tensor,
+        uncond: Option<Tensor>,
+        opts: &GenOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        render_encoded_components(render, device, cond, uncond, opts, cancel, on_progress)
+    }
 
-        let t5_ids = c.tokenizers.encode_t5(prompt)?;
-        let st = t5_ids.len();
-        let t5_u32: Vec<u32> = t5_ids.iter().map(|&i| i as u32).collect();
-        let target_ids = Tensor::from_vec(t5_u32, (1, st), &self.device)?;
-        c.conditioner.forward(&source, &target_ids, dtype)
+    /// Encode with the conditioning-only staged phase.
+    pub fn encode_staged(
+        conditioning: &AnimaConditioningComponents,
+        device: &Device,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        encode_prompt_components(conditioning, device, prompt)
     }
 
     /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
@@ -130,7 +135,6 @@ impl AnimaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let dtype = self.components.dtype;
         let cond = self.encode_prompt(prompt)?;
         let uncond = if variant.uses_cfg() {
             Some(self.encode_prompt(negative)?)
@@ -138,66 +142,180 @@ impl AnimaPipeline {
             None
         };
 
-        let sigmas = anima_sigmas(opts.steps);
-        // Keep the initial latent in **f32** — the sampler integrates in f32 (`predict` returns the
-        // velocity as f32; the VAE is loaded + decodes in f32), and the DiT casts its input to the
-        // compute dtype internally (`CosmosDiT::forward`). Casting the noise to `dtype` here is a no-op
-        // on the CPU/f32 parity lane but yields a **bf16** latent on the GPU lanes, so the sampler's
-        // `x + (σ_next − σ)·v` add mixes a bf16 `x` with an f32 `v` → "dtype mismatch in add" on the
-        // very first step. This never fired on the CPU-only goldens; it only bites on real CUDA/Metal
-        // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
-        let noise = create_noise(opts.seed, opts.width, opts.height, &self.device)?;
-        let guidance = opts.guidance as f64;
-        let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
-
-        let dit = &self.components.dit;
-        // The DiT is a **standard flow denoiser**: it predicts the flow velocity `v ≈ ε − x0` and
-        // embeds the **raw σ** as its timestep. So `run_flow_sampler` (`TimestepConvention::Sigma`,
-        // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
-        let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
-            let s = Tensor::from_vec(vec![sigma], (1,), &self.device)?;
-            let v_cond = dit.forward(x, &s, &cond, dtype)?;
-            let v = match &uncond {
-                // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
-                Some(u) => {
-                    let v_u = dit.forward(x, &s, u, dtype)?;
-                    (&v_u + ((v_cond - &v_u)? * guidance)?)?
-                }
-                None => v_cond,
-            };
-            // Integrate in f32 (the reference keeps latents f32).
-            Ok(v.to_dtype(DType::F32)?)
-        };
-
-        // Per-step latent preview (epic 16948, sc-16953). Opting in is the sc-16949 projector hook
-        // and nothing else: the driver owns frame numbering, multi-eval dedup and the
-        // swallow-on-failure contract, so this loop is unchanged and an inert sink costs one branch
-        // per evaluation. The running latent is the 5-D Cosmos `[1, 16, 1, H/8, W/8]` — the projector
-        // drops the same length-1 temporal axis the decode tail below squeezes, then applies the
-        // reused QwenVae fit. Built here, per driver call, so a batched request's second image starts
-        // a fresh trajectory at frame 1. CFG (when `uncond` is `Some`) runs entirely inside `predict`
-        // and returns one combined velocity, so no unconditional half ever becomes the running latent.
-        let preview = crate::preview::hook(&opts.preview);
-
-        let latent = candle_gen::run_flow_sampler(
-            sampler,
-            TimestepConvention::Sigma,
-            &sigmas,
-            noise,
-            opts.seed,
+        Self::render_encoded(
+            &self.components,
+            &self.device,
+            cond,
+            uncond,
+            opts,
             cancel,
             on_progress,
-            Some(&preview),
-            predict,
-        )?;
-
-        on_progress(Progress::Decoding);
-        // The Cosmos latent is 5-D `[1,16,1,H/8,W/8]`; the QwenVae decode is NCHW — drop the length-1
-        // temporal axis. VAE applies the baked latents_mean/std de-norm → `[1,3,H,W]` f32 in `[-1,1]`.
-        let latent_nchw = latent.squeeze(LATENT_TEMPORAL_AXIS)?;
-        let decoded = self.components.vae.decode(&latent_nchw)?;
-        to_image(&decoded)
+        )
     }
+}
+
+trait ConditioningComponents {
+    fn conditioner(&self) -> &crate::conditioner::AnimaTextConditioner;
+    fn text_encoder(&self) -> &crate::text_encoder::AnimaQwen3;
+    fn tokenizers(&self) -> &crate::tokenizer::AnimaTokenizers;
+    fn dtype(&self) -> DType;
+}
+
+pub trait RenderComponents {
+    fn dit(&self) -> &crate::transformer::CosmosDiT;
+    fn vae(&self) -> &crate::vae::QwenVae;
+    fn dtype(&self) -> DType;
+}
+
+impl RenderComponents for AnimaComponents {
+    fn dit(&self) -> &crate::transformer::CosmosDiT {
+        &self.dit
+    }
+    fn vae(&self) -> &crate::vae::QwenVae {
+        &self.vae
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+impl RenderComponents for AnimaRenderComponents {
+    fn dit(&self) -> &crate::transformer::CosmosDiT {
+        &self.dit
+    }
+    fn vae(&self) -> &crate::vae::QwenVae {
+        &self.vae
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+impl ConditioningComponents for AnimaComponents {
+    fn conditioner(&self) -> &crate::conditioner::AnimaTextConditioner {
+        &self.conditioner
+    }
+    fn text_encoder(&self) -> &crate::text_encoder::AnimaQwen3 {
+        &self.text_encoder
+    }
+    fn tokenizers(&self) -> &crate::tokenizer::AnimaTokenizers {
+        &self.tokenizers
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+impl ConditioningComponents for AnimaConditioningComponents {
+    fn conditioner(&self) -> &crate::conditioner::AnimaTextConditioner {
+        &self.conditioner
+    }
+    fn text_encoder(&self) -> &crate::text_encoder::AnimaQwen3 {
+        &self.text_encoder
+    }
+    fn tokenizers(&self) -> &crate::tokenizer::AnimaTokenizers {
+        &self.tokenizers
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+fn encode_prompt_components(
+    c: &impl ConditioningComponents,
+    device: &Device,
+    prompt: &str,
+) -> Result<Tensor> {
+    let dtype = c.dtype();
+    let (qwen_ids, qwen_mask) = c.tokenizers().encode_qwen(prompt)?;
+    let s = qwen_ids.len();
+    let ids_u32: Vec<u32> = qwen_ids.iter().map(|&i| i as u32).collect();
+    let input_ids = Tensor::from_vec(ids_u32, (1, s), device)?;
+    let source = c.text_encoder().forward(&input_ids, dtype)?; // [1, S, 1024]
+
+    // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
+    // tokens) — the flagged trap. Batch-1 real prompts have an all-ones mask (no-op); the empty
+    // uncond prompt's single token (mask 0) is zeroed so the conditioner cross-attn contributes 0.
+    let mask_f: Vec<f32> = qwen_mask.iter().map(|&m| m as f32).collect();
+    let mask = Tensor::from_vec(mask_f, (1, s, 1), device)?.to_dtype(dtype)?;
+    let source = source.broadcast_mul(&mask)?;
+
+    let t5_ids = c.tokenizers().encode_t5(prompt)?;
+    let st = t5_ids.len();
+    let t5_u32: Vec<u32> = t5_ids.iter().map(|&i| i as u32).collect();
+    let target_ids = Tensor::from_vec(t5_u32, (1, st), device)?;
+    c.conditioner().forward(&source, &target_ids, dtype)
+}
+
+fn render_encoded_components(
+    render: &impl RenderComponents,
+    device: &Device,
+    cond: Tensor,
+    uncond: Option<Tensor>,
+    opts: &GenOptions,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Image> {
+    let dtype = render.dtype();
+    let sigmas = anima_sigmas(opts.steps);
+    // Keep the initial latent in **f32** — the sampler integrates in f32 (`predict` returns the
+    // velocity as f32; the VAE is loaded + decodes in f32), and the DiT casts its input to the
+    // compute dtype internally (`CosmosDiT::forward`). Casting the noise to `dtype` here is a no-op
+    // on the CPU/f32 parity lane but yields a **bf16** latent on the GPU lanes, so the sampler's
+    // `x + (σ_next − σ)·v` add mixes a bf16 `x` with an f32 `v` → "dtype mismatch in add" on the
+    // very first step. This never fired on the CPU-only goldens; it only bites on real CUDA/Metal
+    // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
+    let noise = create_noise(opts.seed, opts.width, opts.height, device)?;
+    let guidance = opts.guidance as f64;
+    let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
+
+    let dit = render.dit();
+    // The DiT is a **standard flow denoiser**: it predicts the flow velocity `v ≈ ε − x0` and
+    // embeds the **raw σ** as its timestep. So `run_flow_sampler` (`TimestepConvention::Sigma`,
+    // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
+    let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
+        let s = Tensor::from_vec(vec![sigma], (1,), device)?;
+        let v_cond = dit.forward(x, &s, &cond, dtype)?;
+        let v = match &uncond {
+            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
+            Some(u) => {
+                let v_u = dit.forward(x, &s, u, dtype)?;
+                (&v_u + ((v_cond - &v_u)? * guidance)?)?
+            }
+            None => v_cond,
+        };
+        // Integrate in f32 (the reference keeps latents f32).
+        Ok(v.to_dtype(DType::F32)?)
+    };
+
+    // Per-step latent preview (epic 16948, sc-16953). Opting in is the sc-16949 projector hook
+    // and nothing else: the driver owns frame numbering, multi-eval dedup and the
+    // swallow-on-failure contract, so this loop is unchanged and an inert sink costs one branch
+    // per evaluation. The running latent is the 5-D Cosmos `[1, 16, 1, H/8, W/8]` — the projector
+    // drops the same length-1 temporal axis the decode tail below squeezes, then applies the
+    // reused QwenVae fit. Built here, per driver call, so a batched request's second image starts
+    // a fresh trajectory at frame 1. CFG (when `uncond` is `Some`) runs entirely inside `predict`
+    // and returns one combined velocity, so no unconditional half ever becomes the running latent.
+    let preview = crate::preview::hook(&opts.preview);
+
+    let latent = candle_gen::run_flow_sampler(
+        sampler,
+        TimestepConvention::Sigma,
+        &sigmas,
+        noise,
+        opts.seed,
+        cancel,
+        on_progress,
+        Some(&preview),
+        predict,
+    )?;
+
+    on_progress(Progress::Decoding);
+    // The Cosmos latent is 5-D `[1,16,1,H/8,W/8]`; the QwenVae decode is NCHW — drop the length-1
+    // temporal axis. VAE applies the baked latents_mean/std de-norm → `[1,3,H,W]` f32 in `[-1,1]`.
+    let latent_nchw = latent.squeeze(LATENT_TEMPORAL_AXIS)?;
+    let decoded = render.vae().decode(&latent_nchw)?;
+    to_image(&decoded)
 }
 
 /// `[1, 3, H, W]` in `[-1, 1]` → an 8-bit RGB [`Image`].

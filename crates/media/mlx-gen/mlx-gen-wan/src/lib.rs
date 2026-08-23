@@ -55,6 +55,7 @@ pub mod chunk;
 pub mod config;
 pub mod convert;
 pub mod feature_cache;
+pub mod i2v_memory_strategy;
 pub mod memory_strategy;
 pub mod model;
 pub mod model_vace;
