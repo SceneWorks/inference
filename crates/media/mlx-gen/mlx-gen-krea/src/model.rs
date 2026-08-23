@@ -2903,6 +2903,104 @@ mod tests {
         );
     }
 
+    /// Real-weight fixed-seed render of a community dense Krea 2 DiT through the native single-file
+    /// entrypoint (sc-20634) — on this revision that means the mapped logical-weight reader + dense
+    /// codec table. Prints the pixel sha256 (and saves a PNG-free raw RGB dump) so it can be
+    /// compared with the SceneWorks parity lane's `legacy_pixel_sha256.txt` rendered on the pinned
+    /// revision: same file, same base, same request ⇒ the two revisions must agree byte for byte.
+    /// `KREA_EXPECTED_PIXEL_SHA256`, when set, is asserted.
+    ///
+    /// ```text
+    /// KREA_NATIVE_DIT=$HOME/models/kreamania_variant5.safetensors \
+    /// KREA_TURBO_DIR=<hub>/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
+    /// KREA_EXPECTED_PIXEL_SHA256=<sha from the SceneWorks lane> \
+    /// cargo test -p mlx-gen-krea --lib variant5_native_file_render_fixed_seed_sha -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real weights + Metal: set KREA_NATIVE_DIT and KREA_TURBO_DIR"]
+    fn variant5_native_file_render_fixed_seed_sha() {
+        use sha2::{Digest, Sha256};
+
+        let env_or =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_owned());
+        let dit = std::path::PathBuf::from(
+            std::env::var("KREA_NATIVE_DIT").expect("set KREA_NATIVE_DIT"),
+        );
+        let base =
+            std::path::PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
+        let steps: u32 = env_or("KREA_STEPS", "2").parse().expect("KREA_STEPS");
+        let width: u32 = env_or("KREA_W", "512").parse().expect("KREA_W");
+        let height: u32 = env_or("KREA_H", "512").parse().expect("KREA_H");
+        let seed: u64 = env_or("KREA_SEED", "42").parse().expect("KREA_SEED");
+        let prompt = env_or(
+            "KREA_PROMPT",
+            "a photorealistic portrait of a red fox sitting in a sunlit autumn forest, sharp focus, \
+             shallow depth of field",
+        );
+
+        // The whole-generator entry has no way to hand the receipt back, so this test observes the
+        // process-global slot. `reset → load → read` is not atomic, so hold the lock across all
+        // three (sc-20634 review); `every_process_global_receipt_observation_is_serialized` pins it.
+        let _receipt_guard = crate::loader::RECEIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::loader::reset_native_file_receipt();
+        let generator = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .expect("native single-file load through the logical-weight reader");
+        let receipt = crate::loader::last_native_file_receipt()
+            .expect("the dense native load records its logical-weight receipt");
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Materialized,
+            "a resident load materializes through the reader"
+        );
+        assert!(receipt.tensor_count > 0);
+        assert_eq!(
+            receipt.resident_bytes(),
+            receipt.source_bytes,
+            "dense pass-through codecs leave exactly the source bytes resident"
+        );
+        let request = GenerationRequest {
+            prompt,
+            width,
+            height,
+            count: 1,
+            seed: Some(seed),
+            steps: Some(steps),
+            guidance: None,
+            ..Default::default()
+        };
+        let output = generator
+            .generate(&request, &mut |_| {})
+            .expect("fixed-seed render");
+        let image = match output {
+            GenerationOutput::Images(mut images) => images.pop().expect("one image"),
+            other => panic!("expected Images, got {other:?}"),
+        };
+        assert_eq!((image.width, image.height), (width, height));
+        let sha = format!("{:x}", Sha256::digest(&image.pixels));
+        eprintln!(
+            "RESULT provider=krea_2_turbo source=native-file geometry={width}x{height} steps={steps} \
+             seed={seed} pixel_sha256={sha} receipt_tensors={} receipt_source_bytes={} \
+             receipt_resident_bytes={} codecs={:?}",
+            receipt.tensor_count,
+            receipt.source_bytes,
+            receipt.resident_bytes(),
+            receipt
+                .residency
+                .iter()
+                .map(|report| (report.codec_id, report.tensor_count))
+                .collect::<Vec<_>>()
+        );
+        if let Ok(expected) = std::env::var("KREA_EXPECTED_PIXEL_SHA256") {
+            assert_eq!(
+                sha,
+                expected.trim(),
+                "render differs from the pixel sha rendered on the pinned revision"
+            );
+        }
+    }
+
     #[test]
     fn load_accepts_quant_spec_but_fails_on_missing_weights() {
         for q in [Quant::Q4, Quant::Q8] {

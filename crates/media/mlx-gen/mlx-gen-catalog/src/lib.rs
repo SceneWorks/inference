@@ -81,7 +81,12 @@ pub fn benchmark_toggle_capabilities(provider_id: &str) -> Option<&'static [&'st
 }
 
 /// Add every provider shipped by the MLX media platform to an explicit registry builder.
+///
+/// The engine's checkpoint codec table is registered here, exactly once, before any family crate:
+/// codecs are engine-level (sc-20634), so no family `register_providers` may register one, and the
+/// builder refuses a duplicate row outright.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    let registry = mlx_gen::logical_weights::register_checkpoint_codecs(registry);
     let registry = mlx_gen_anima::register_providers(registry);
     let registry = mlx_gen_bernini::register_providers(registry);
     let registry = mlx_gen_boogu::register_providers(registry);
@@ -390,6 +395,68 @@ mod tests {
             registry.imported_models().copied().collect::<Vec<_>>(),
             expected_legacy_projection,
             "the legacy catalog surface must be the exact pre-registry compatibility projection"
+        );
+    }
+
+    #[test]
+    fn checkpoint_codecs_register_once_and_every_row_has_an_engine_implementation() {
+        use mlx_gen::logical_weights::{BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS};
+
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<_> = registry.checkpoint_codecs().codecs().copied().collect();
+        assert_eq!(
+            registered, BASELINE_CODECS,
+            "the composed MLX catalog must carry the engine codec table exactly once, no family \
+             crate may add or repeat a row"
+        );
+        let mut registered_ids: Vec<&str> = registered.iter().map(|codec| codec.codec_id).collect();
+        registered_ids.sort_unstable();
+        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS.to_vec();
+        implemented.sort_unstable();
+        assert_eq!(
+            registered_ids, implemented,
+            "every registered codec row needs a decode implementation and vice versa"
+        );
+        // The portable dense bf16 codec is what the Krea 2 dense walking skeleton reads through.
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(mlx_gen::gen_core::WeightEncoding::DenseBf16)
+            .is_some());
+    }
+
+    #[test]
+    fn krea_adapter_canonical_mappings_are_backed_by_real_mapping_implementations() {
+        use mlx_gen::gen_core::{IdentityKeyMapping, LogicalKeyMapping, KREA_2_CHECKPOINT_ADAPTER};
+
+        let registry = super::provider_registry().unwrap();
+        let krea = registry
+            .checkpoint_adapters()
+            .find(|adapter| adapter.adapter_id == KREA_2_CHECKPOINT_ADAPTER.adapter_id)
+            .expect("the Krea 2 adapter is registered");
+        let implementations: &[&dyn LogicalKeyMapping] = &[
+            &mlx_gen_krea::KreaNativeToDiffusersMapping,
+            &IdentityKeyMapping,
+        ];
+        for mapping in krea.canonical_mappings {
+            assert!(
+                implementations
+                    .iter()
+                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id),
+                "registry mapping id {:?} for dialect {:?} has no implementation",
+                mapping.mapping_id,
+                mapping.dialect
+            );
+        }
+        // And the native mapping really is the remap the provider loads through.
+        assert_eq!(
+            mlx_gen_krea::KreaNativeToDiffusersMapping
+                .logical_key("model.diffusion_model.blocks.0.attn.wq.weight")
+                .as_deref(),
+            Some("transformer_blocks.0.attn.to_q.weight")
+        );
+        assert_eq!(
+            mlx_gen_krea::KreaNativeToDiffusersMapping.logical_key("foreign.weight"),
+            None
         );
     }
 
