@@ -629,7 +629,51 @@ fn registered_valid_fixtures(
         frame_idx: 0,
         strength: 1.0,
     }];
-    Ok(vec![fixture, first_last, extend])
+    let mut bridge_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("video_bridge".into()),
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(bridge_clip_axes(153, 768, 512).join("+")),
+        },
+    )?;
+    bridge_context.geometry.width = 768;
+    bridge_context.geometry.height = 512;
+    bridge_context.geometry.frames = 153;
+    let mut bridge = MemoryBehaviorFixture::new(bridge_context);
+    bridge.request.width = 768;
+    bridge.request.height = 512;
+    bridge.request.frames = Some(153);
+    bridge.request.fps = Some(25);
+    let clip = vec![
+        gen_core::Image {
+            width: 768,
+            height: 512,
+            pixels: vec![0; 768 * 512 * 3]
+        };
+        153
+    ];
+    bridge.request.conditioning = vec![
+        gen_core::Conditioning::VideoClip {
+            frames: clip.clone(),
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        gen_core::Conditioning::VideoClip {
+            frames: clip,
+            frame_idx: -1,
+            strength: 1.0,
+        },
+    ];
+    Ok(vec![fixture, first_last, extend, bridge])
 }
 
 fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {

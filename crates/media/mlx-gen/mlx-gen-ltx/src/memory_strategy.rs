@@ -998,7 +998,47 @@ pub(crate) fn registered_valid_fixtures(
         frame_idx: 0,
         strength: 1.0,
     }];
-    Ok(vec![t2v, i2v, first_last, extend])
+    let mut bridge_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("video_bridge".into()),
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(bridge_clip_axes(153, 768, 512).join("+")),
+        },
+    )?;
+    bridge_context.geometry.width = 768;
+    bridge_context.geometry.height = 512;
+    bridge_context.geometry.frames = 153;
+    let mut bridge = MemoryBehaviorFixture::new(bridge_context);
+    bridge.request.width = 768;
+    bridge.request.height = 512;
+    bridge.request.frames = Some(153);
+    bridge.request.fps = Some(25);
+    let clip = vec![
+        gen_core::Image {
+            width: 768,
+            height: 512,
+            pixels: vec![0; 768 * 512 * 3]
+        };
+        153
+    ];
+    bridge.request.conditioning = vec![
+        gen_core::Conditioning::VideoClip {
+            frames: clip.clone(),
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        gen_core::Conditioning::VideoClip {
+            frames: clip,
+            frame_idx: -1,
+            strength: 1.0,
+        },
+    ];
+    Ok(vec![t2v, i2v, first_last, extend, bridge])
 }
 
 fn begin_with_cleanup(
@@ -1094,16 +1134,40 @@ impl LtxMemoryRequestScope {
             }
             _ => None,
         };
-        match (admitted_mode, reference.as_deref(), first_last.as_deref(), extend.as_deref()) {
-            ("text_to_video", None, None, None) => {}
-            ("image_to_video", Some(actual), None, None)
+        let bridge = match request.conditioning.as_slice() {
+            [gen_core::Conditioning::VideoClip {
+                frames: left,
+                frame_idx: 0,
+                strength: left_strength,
+            }, gen_core::Conditioning::VideoClip {
+                frames: right,
+                frame_idx: -1,
+                strength: right_strength,
+            }] if left.len() == request.frames.unwrap_or(0) as usize
+                && right.len() == left.len()
+                && *left_strength == 1.0
+                && *right_strength == 1.0
+                && left.iter().chain(right).all(|image| {
+                    image.width == request.width && image.height == request.height
+                }) =>
+            {
+                Some(
+                    bridge_clip_axes(request.frames.unwrap_or(0), request.width, request.height)
+                        .join("+"),
+                )
+            }
+            _ => None,
+        };
+        match (admitted_mode, reference.as_deref(), first_last.as_deref(), extend.as_deref(), bridge.as_deref()) {
+            ("text_to_video", None, None, None, None) => {}
+            ("image_to_video", Some(actual), None, None, None)
                 if Some(actual) == admitted_reference_axis(admitted_overlay) => {}
-            ("image_to_video", None, None, None) => {
+            ("image_to_video", None, None, None, None) => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: image_to_video admission requires one fitted Reference".into(),
                 ));
             }
-            ("first_last_frame", None, Some(actual), None)
+            ("first_last_frame", None, Some(actual), None, None)
                 if admitted_overlay
                     .into_iter()
                     .flat_map(|overlay| overlay.split('+'))
@@ -1111,13 +1175,15 @@ impl LtxMemoryRequestScope {
                     .collect::<Vec<_>>()
                     .join("+")
                     == actual => {}
-            ("first_last_frame", None, None, None) => {
+            ("first_last_frame", None, None, None, None) => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: first_last_frame admission requires ordered fitted Keyframes at 0 and -1 with fixed strength 1.0".into(),
                 ));
             }
-            ("extend_clip", None, None, Some(actual)) if admitted_overlay.into_iter().flat_map(|overlay| overlay.split('+')).filter(|axis| axis.starts_with("clip:append:")).collect::<Vec<_>>().join("+") == actual => {}
-            ("extend_clip", None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires one fitted IC-LoRA VideoClip at frame 0 with strength 1.0".into())),
+            ("extend_clip", None, None, Some(actual), None) if admitted_overlay.into_iter().flat_map(|overlay| overlay.split('+')).filter(|axis| axis.starts_with("clip:append:")).collect::<Vec<_>>().join("+") == actual => {}
+            ("extend_clip", None, None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires one fitted IC-LoRA VideoClip at frame 0 with strength 1.0".into())),
+            ("video_bridge", None, None, None, Some(actual)) if admitted_overlay.into_iter().flat_map(|overlay| overlay.split('+')).filter(|axis| axis.starts_with("clip:append:")).collect::<Vec<_>>().join("+") == actual => {},
+            ("video_bridge", None, None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: video_bridge admission requires ordered fitted IC-LoRA clips at 0 and -1 with strength 1.0".into())),
             _ => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: request mode/reference receipt crossed the admitted memory identity"
