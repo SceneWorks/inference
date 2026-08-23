@@ -31,7 +31,7 @@
 //! ```sh
 //! SENSENOVA_PREVIEW_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sensenova-u1-8b-mlx\snapshots\<rev>\q8 \
 //! SENSENOVA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16960 \
-//!   cargo test -p candle-gen-sensenova --release --features cuda --test fit_preview_rgb \
+//!   cargo test -p candle-gen-sensenova --release --features cuda --test integration fit_preview_rgb:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

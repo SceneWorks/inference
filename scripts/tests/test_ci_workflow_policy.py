@@ -1786,12 +1786,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("CANDLE_MAGE_SNAPSHOT: ${{ vars.CANDLE_MAGE_SNAPSHOT }}", workflow)
         self.assertIn(
             "cargo test --locked --release -p candle-gen-mage --features cuda "
-            "--test real_parity -- --ignored --nocapture",
+            "--test integration real_parity:: -- --ignored --nocapture",
             workflow,
         )
         self.assertIn(
             "cargo test --locked --release -p candle-gen-mage --features cuda "
-            "--test cuda_1024 -- --ignored --nocapture",
+            "--test integration cuda_1024:: -- --ignored --nocapture",
             workflow,
         )
         self.assertIn('set "MAGE_CONFORMANCE_FAILED=0"', workflow)
@@ -1801,8 +1801,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn("for %%T in (q4 q8 bf16) do (", workflow)
         self.assertIn(
-            "--test quant_real_weights "
-            "registered_tier_matches_independent_oracle_and_vram_budget "
+            "--test integration "
+            "quant_real_weights::registered_tier_matches_independent_oracle_and_vram_budget "
             "-- --ignored --nocapture || set \"MAGE_CONFORMANCE_FAILED=1\"",
             workflow,
         )
@@ -1815,7 +1815,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         candle_rust_acceptance = workflow.index(
             "cargo test --locked --release -p candle-gen-mage --features cuda "
-            "--test real_parity"
+            "--test integration real_parity::"
         )
         self.assertLess(transferred_verify, candle_rust_acceptance)
         self.assertIn(WINDOWS_MAGE_LOCK, workflow)

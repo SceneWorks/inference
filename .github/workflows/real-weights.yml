@@ -5860,7 +5860,7 @@ jobs:
           for %%R in (resident staged attention blocks) do (
             set "MAGE_MEMORY_RUNG=%%R"
             set "MAGE_MEMORY_OUT=%RUNNER_TEMP%\mage-memory-%%R.rgb"
-            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test memory_ladder_real_weights representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
+            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test integration memory_ladder_real_weights::representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
           )
       - name: Upload Mage rung outputs
         if: always()
@@ -6099,13 +6099,13 @@ jobs:
         run: |
           call "%VCVARS%"
           set "MAGE_CONFORMANCE_FAILED=0"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked -p candle-gen-z-image --features cuda --test integration conformance::z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration real_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration cuda_1024:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration edit_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           for %%T in (q4 q8 bf16) do (
             set "MAGE_QUANT_TIER=%%T"
-            cargo test --locked --release -p candle-gen-mage --features cuda --test quant_real_weights registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+            cargo test --locked --release -p candle-gen-mage --features cuda --test integration quant_real_weights::registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           )
           if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1
 
@@ -6184,11 +6184,11 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib edit_validate::real_weight_edit -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib ip_validate::real_weight_ip_adapter -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test trainer_e2e sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration trainer_e2e::sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
 
   candle-mmaudio:
     name: Candle mmaudio real weights (CUDA)
@@ -6547,7 +6547,7 @@ jobs:
 
           :run_one
           set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
@@ -6584,7 +6584,7 @@ jobs:
 
           :run_one
           set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
@@ -6683,7 +6683,7 @@ jobs:
           rem so this selection is checked to name a test that still EXISTS and is still `#[ignore]`d.
           set "name=minimax_h3_vram_bf16"
           set "log=%RUNNER_TEMP%\minimax-h3-vram-bf16.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test vram_probe %name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           rem The machine-parseable datum is the whole point of the run; a green step that produced

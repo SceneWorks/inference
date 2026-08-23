@@ -13,7 +13,7 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::KreaTextEncoder;
 
-mod common;
+use crate::common;
 
 use common::{tiny_te_config, SHARED_FIXTURE_TE_HIDDEN_SIZE};
 

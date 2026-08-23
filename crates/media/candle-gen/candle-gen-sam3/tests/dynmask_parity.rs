@@ -4,7 +4,7 @@
 //! (`mlx-gen/scripts/spikes/sam3_oracle/dump_dynmask_fixture.py`). `#[ignore]` until weights + fixture
 //! are staged (sc-6248). Run:
 //!   SAM3_WEIGHTS=<snapshot> SAM3_DYNMASK_FIXTURE=<dynmask_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test dynmask_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration dynmask_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

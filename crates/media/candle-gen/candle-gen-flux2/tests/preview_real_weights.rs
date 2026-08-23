@@ -32,7 +32,7 @@
 //! FLUX2_F32_VAE=...\models--black-forest-labs--FLUX.2-dev\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! FLUX2_BOOGU_VAE=...\models--Boogu--Boogu-Image-0.1-Turbo\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! FLUX2_PREVIEW_ARTIFACT_DIR=E:\out\sc-16955 \
-//!   cargo test -p candle-gen-flux2 --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-flux2 --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

@@ -18,7 +18,7 @@
 //!                      lens_adapter_golden.safetensors + lens_lora_adapter.safetensors +
 //!                      lens_lokr_adapter.safetensors (run scripts/dump_lens_adapter_golden.py)
 //! Run with the `cuda` feature (absolute paths — cargo test cwd is the crate dir):
-//!   cargo test -p candle-gen-lens --features cuda --test adapter_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration adapter_parity:: -- --nocapture
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

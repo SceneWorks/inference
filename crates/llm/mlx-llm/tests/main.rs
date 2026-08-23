@@ -11,6 +11,7 @@
 // --- shared modules (hand-maintained; preserved by regen) ---
 // --- generated modules (do not edit) ---
 
+#[allow(dead_code)]
 mod common;
 
 #[path = "batch.rs"]

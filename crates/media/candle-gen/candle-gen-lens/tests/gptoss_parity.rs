@@ -10,7 +10,7 @@
 //!   LENS_TEXT_ENCODER_DIR — the Lens `text_encoder` snapshot dir (config.json + model-*.safetensors)
 //!   LENS_GOLDENS          — gptoss_goldens.safetensors (default: .scratch/gptoss-goldens/…)
 //! Run with the `cuda` feature:
-//!   cargo test -p candle-gen-lens --features cuda --test gptoss_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration gptoss_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;

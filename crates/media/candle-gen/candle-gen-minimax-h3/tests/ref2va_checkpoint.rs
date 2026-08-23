@@ -48,7 +48,7 @@
 //! `model.rs`'s `every_heavy_component_is_released_before_the_next_one_is_mapped` covers the
 //! release ordering of whichever partition it picked.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 use std::path::Path;

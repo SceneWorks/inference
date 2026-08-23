@@ -4,7 +4,7 @@
 //! (`vae_txt_vit` / `_wapg` / `rv2v_wapg` / `r2v_wapg`). Pure elementwise + a single-scalar projection
 //! per delta, so this matches to the f32 floor. CPU, weight-free.
 
-mod common;
+use crate::common;
 
 use common::{
     errors, flat_f32, Golden, SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA,

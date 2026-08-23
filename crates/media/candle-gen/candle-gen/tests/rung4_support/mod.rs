@@ -12,6 +12,10 @@
 //! into each binary from one source file, which satisfies both. (The *driver-level* probe did move
 //! into the crate, at `candle_gen::cuda_mempool`, because `cuda` alone gates it.)
 
+// sc-21386: this module is declared once by the generated `tests/main.rs`, not by its three
+// users; all of them are `#![cfg(feature = "cuda")]` files, so the gate the parents used to supply
+// now lives here. Without it the CPU lanes compile `cuda_mempool`/`cudarc` paths and fail.
+#![cfg(feature = "cuda")]
 #![allow(dead_code)]
 
 use std::collections::HashMap;
