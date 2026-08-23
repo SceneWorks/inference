@@ -24,8 +24,12 @@ pub const BASE_REVISION: &str = "ac0da2ff55fbe434795be0dce883042e4d49e2fc";
 pub const SPRINT_REPOSITORY: &str = "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers";
 pub const SPRINT_REVISION: &str = "19683c58b7ea290e55cedd8950ae1d86ada7ef96";
 pub const REQUEST_EVIDENCE_REVISION: &str = "sana-candle-dense-request-contract-v1";
-pub const DECODE_TILE_EDGE: u32 = 512;
-pub const DECODE_OVERLAP: u32 = 128;
+// The released DC-AE bounded-decode domain is 192 px with one 48 px blend cell.
+// Candle executes this exact singleton through `DcAeDecoder::decode_with`; unlike MLX it does
+// not expose the larger measured menu, so publishing any additional edge here would advertise an
+// unsupported request shape.
+pub const DECODE_TILE_EDGE: u32 = 192;
+pub const DECODE_OVERLAP: u32 = 48;
 pub const ATTENTION_CHUNK_SIZES: &[u32] = &[4_194_304, 2_097_152, 1_048_576];
 pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 5, 10];
 pub const TRANSFORMER_BLOCKS: u32 = 20;
