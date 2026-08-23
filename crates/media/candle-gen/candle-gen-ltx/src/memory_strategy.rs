@@ -54,6 +54,9 @@ fn extend_clip_axis(frames: u32, width: u32, height: u32) -> String {
         "clip:append:frames:{frames}:image:{width}x{height}:frame:0:strength:{STRENGTH_BITS:08x}"
     )
 }
+fn bridge_clip_axes(frames: u32, width: u32, height: u32) -> [String; 2] {
+    [extend_clip_axis(frames, width, height), format!("clip:append:frames:{frames}:image:{width}x{height}:frame:-1:strength:{STRENGTH_BITS:08x}")]
+}
 
 fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
     let WeightsSource::Dir(root) = &spec.weights else {
@@ -277,7 +280,10 @@ fn route_gate(
     let extend = context.mode.as_key() == "extend_clip"
         && context.geometry.reference_count == 0
         && !context.has_reference;
-    if (!i2v && !first_last && !extend) || context.use_pid || context.has_phases {
+    let bridge = context.mode.as_key() == "video_bridge"
+        && context.geometry.reference_count == 0
+        && !context.has_reference;
+    if (!i2v && !first_last && !extend && !bridge) || context.use_pid || context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_ID}: q4 memory admission requires image_to_video/one Reference or first_last_frame/two ordered Keyframes without PiD/phases"
         )));
@@ -295,8 +301,10 @@ fn route_gate(
         reference_axis(geometry.width, geometry.height)
     } else if first_last {
         first_last_axes(geometry.width, geometry.height).join("+")
-    } else {
+    } else if extend {
         extend_clip_axis(geometry.frames, geometry.width, geometry.height)
+    } else {
+        bridge_clip_axes(geometry.frames, geometry.width, geometry.height).join("+")
     };
     if context.overlay.as_deref() != Some(expected_overlay.as_str()) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -385,6 +393,26 @@ impl MemoryRequestScope for LtxMemoryScope {
                 }] if frames.len() == request.frames.unwrap_or(0) as usize && *strength == 1.0 => {
                     frames
                         .iter()
+                        .all(|image| image.width == request.width && image.height == request.height)
+                }
+                _ => false,
+            },
+            "video_bridge" => match request.conditioning.as_slice() {
+                [gen_core::Conditioning::VideoClip {
+                    frames: left,
+                    frame_idx: 0,
+                    strength: left_strength,
+                }, gen_core::Conditioning::VideoClip {
+                    frames: right,
+                    frame_idx: -1,
+                    strength: right_strength,
+                }] if left.len() == request.frames.unwrap_or(0) as usize
+                    && right.len() == left.len()
+                    && *left_strength == 1.0
+                    && *right_strength == 1.0 =>
+                {
+                    left.iter()
+                        .chain(right)
                         .all(|image| image.width == request.width && image.height == request.height)
                 }
                 _ => false,

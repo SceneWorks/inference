@@ -478,6 +478,9 @@ fn first_last_axes(width: u32, height: u32) -> [String; 2] {
 fn extend_clip_axis(frames: u32, width: u32, height: u32) -> String {
     format!("clip:append:frames:{frames}:image:{width}x{height}:frame:0:strength:{I2V_STRENGTH_BITS:08x}")
 }
+fn bridge_clip_axes(frames: u32, width: u32, height: u32) -> [String; 2] {
+    [extend_clip_axis(frames, width, height), format!("clip:append:frames:{frames}:image:{width}x{height}:frame:-1:strength:{I2V_STRENGTH_BITS:08x}")]
+}
 
 fn admitted_reference_axis(overlay: Option<&str>) -> Option<&str> {
     overlay
@@ -731,7 +734,13 @@ pub(crate) fn safety_check(
         let extend = context.mode.as_key() == "extend_clip"
             && context.geometry.reference_count == 0
             && !context.has_reference;
-        if (!t2v && !i2v && !first_last && !extend) || context.use_pid || context.has_phases {
+        let bridge = context.mode.as_key() == "video_bridge"
+            && context.geometry.reference_count == 0
+            && !context.has_reference;
+        if (!t2v && !i2v && !first_last && !extend && !bridge)
+            || context.use_pid
+            || context.has_phases
+        {
             return Err(gen_core::Error::Unsupported(
                 "ltx_2_3: memory admission requires exact text_to_video/no-reference, image_to_video/one-reference, or first_last_frame/two-keyframe identity without PiD/phases"
                     .into(),
@@ -794,6 +803,24 @@ pub(crate) fn safety_check(
                 != extend_clip_axis(geometry.frames, geometry.width, geometry.height)
         {
             return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires the exact single IC-LoRA appended-clip receipt".into()));
+        }
+        if bridge {
+            let actual = context
+                .overlay
+                .as_deref()
+                .into_iter()
+                .flat_map(|v| v.split('+'))
+                .filter(|a| a.starts_with("clip:append:"))
+                .collect::<Vec<_>>()
+                .join("+");
+            if actual
+                != bridge_clip_axes(geometry.frames, geometry.width, geometry.height).join("+")
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: video_bridge admission requires exact ordered IC-LoRA clip endpoints"
+                        .into(),
+                ));
+            }
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
