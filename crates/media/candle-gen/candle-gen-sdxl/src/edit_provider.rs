@@ -29,7 +29,9 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, LoadSpec, MemoryRunContext, PreviewSink, Progress, WeightsSource,
+};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -40,11 +42,11 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::conditioning::SdxlConditioner;
-use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
+use crate::denoise::{decode_image_with_tiling, text_time_ids, SPATIAL_SCALE};
 use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae, load_sdxl_vae_encoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{SdxlVaeDecoder, PID_BACKBONE};
+use crate::{SdxlArtifactSeal, SdxlVaeDecoder, PID_BACKBONE};
 
 /// The edit compute dtype — fp16, matching the production SDXL path (the f16-stable VAE + UNet).
 const DTYPE: DType = DType::F16;
@@ -158,6 +160,7 @@ pub struct SdxlEdit {
     /// registered SDXL provider — no edit-specific PiD checkpoint.
     pid: Option<PidEngine>,
     device: Device,
+    memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
 }
 
 impl SdxlEdit {
@@ -185,7 +188,25 @@ impl SdxlEdit {
             sampler: EulerAncestralSampler::sdxl(),
             pid: None,
             device,
+            memory_admission: None,
         })
+    }
+
+    /// Load under an exact pre-load selector decision. The spec is independently sealed again here
+    /// and retained through every lazy/forward-time file use; crossed paths or context are refused
+    /// before any tensor construction.
+    pub fn load_admitted(
+        paths: &SdxlEditPaths,
+        spec: &LoadSpec,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        crate::memory_strategy::validate_edit_spec(paths, spec)?;
+        let seal = SdxlArtifactSeal::capture(spec)?;
+        crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
+        crate::memory_strategy::validate_bespoke_context(&context)?;
+        let mut model = Self::load(paths)?;
+        model.memory_admission = Some((seal, context));
+        Ok(model)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). `pid` is the same
@@ -252,6 +273,26 @@ impl SdxlEdit {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let memory = if let Some((seal, context)) = &self.memory_admission {
+            seal.ensure_unchanged()?;
+            crate::memory_strategy::validate_bespoke_request(
+                seal,
+                context,
+                req.width,
+                req.height,
+                1,
+                req.use_pid,
+                if mask.is_some() {
+                    "image_inpaint"
+                } else {
+                    "edit"
+                },
+            )?;
+            seal.contract().generation_memory(&context.selection)
+        } else {
+            None
+        };
+        let _attention = crate::enter_attention_memory(memory);
         if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
             return Err(CandleError::Msg(format!(
                 "sdxl edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -308,7 +349,10 @@ impl SdxlEdit {
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
+        let tiling = memory
+            .map(|memory| memory.tile_vae_decode)
+            .unwrap_or_else(crate::vae_tiling_enabled);
+        decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the

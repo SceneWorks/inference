@@ -165,13 +165,23 @@ pub fn decode_image(
     pid: Option<&dyn LatentDecoder>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
+    decode_image_with_tiling(vae, latents, pid, cancel, crate::vae_tiling_enabled())
+}
+
+pub fn decode_image_with_tiling(
+    vae: &SdxlVaeDecoder,
+    latents: &Tensor,
+    pid: Option<&dyn LatentDecoder>,
+    cancel: Option<&CancelFlag>,
+    tiling_enabled: bool,
+) -> Result<Image> {
     let native = SdxlLatentDecoder::new(vae);
     let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
     if cancel.is_some_and(CancelFlag::is_cancelled) {
         return Err(CandleError::Canceled);
     }
     candle_gen::ensure_decoder_compatible(Some(&candle_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
-    let img = if crate::vae_tiling_enabled() {
+    let img = if tiling_enabled {
         decoder.decode_tiled(latents, &sdxl_tiling_config(), cancel)?
     } else {
         decoder.decode(latents)?

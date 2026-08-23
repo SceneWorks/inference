@@ -22,12 +22,12 @@ use candle_gen::{CandleError, Result};
 
 use crate::conditioning::SdxlConditioner;
 use crate::denoise::{
-    decode_image, denoise_curated, seeded_sigma_prior, text_time_ids, ControlContext,
+    decode_image_with_tiling, denoise_curated, seeded_sigma_prior, text_time_ids, ControlContext,
 };
 use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae};
 use crate::pipeline::{lightning_policy, sdxl_alpha_schedule, SdxlComponents};
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
-use crate::{descriptor, SdxlVaeDecoder, MODEL_ID, SIZE_MULTIPLE};
+use crate::{descriptor, SdxlArtifactSeal, SdxlVaeDecoder, MODEL_ID, SIZE_MULTIPLE};
 
 const DTYPE: DType = DType::F16;
 const DEFAULT_STEPS: usize = 30;
@@ -67,6 +67,8 @@ pub(super) struct SdxlControlGenerator {
     adapters: Vec<gen_core::AdapterSpec>,
     file_pin_spec: LoadSpec,
     components: Mutex<Option<ControlComponents>>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+    artifact_seal: Option<SdxlArtifactSeal>,
 }
 
 impl SdxlControlGenerator {
@@ -74,6 +76,7 @@ impl SdxlControlGenerator {
         spec: &LoadSpec,
         component_paths: SdxlComponents,
         device: Device,
+        artifact_seal: Option<SdxlArtifactSeal>,
     ) -> gen_core::Result<Self> {
         let root = match &spec.weights {
             WeightsSource::Dir(root) => root.clone(),
@@ -102,6 +105,7 @@ impl SdxlControlGenerator {
         );
         controls.extend(spec.extra_controls.iter().cloned());
 
+        let memory_contract = artifact_seal.as_ref().map(|seal| seal.contract().clone());
         Ok(Self {
             descriptor: control_descriptor(),
             root,
@@ -111,6 +115,8 @@ impl SdxlControlGenerator {
             adapters: spec.adapters.clone(),
             file_pin_spec: spec.clone(),
             components: Mutex::new(None),
+            memory_contract,
+            artifact_seal,
         })
     }
 
@@ -181,6 +187,38 @@ impl Generator for SdxlControlGenerator {
         &self.descriptor
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(contract, context, self.artifact_seal.as_ref())
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        let seal = self.artifact_seal.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported("sdxl control: authoritative contract has no seal".into())
+        })?;
+        crate::memory_strategy::validate_context(contract, context, seal)?;
+        Ok(Some(Box::new(crate::memory_strategy::request_scope(
+            self.device.clone(),
+            contract,
+            context,
+        )?)))
+    }
+
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         self.descriptor
             .capabilities
@@ -237,6 +275,22 @@ impl Generator for SdxlControlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
+        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
+        struct Clear<'a>(&'a Mutex<Option<ControlComponents>>, bool);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    candle_gen::lock_recover(self.0).take();
+                }
+            }
+        }
+        if staged {
+            candle_gen::lock_recover(&self.components).take();
+        }
+        let _clear = Clear(&self.components, staged);
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
@@ -254,6 +308,9 @@ impl Generator for SdxlControlGenerator {
 
         // Text runs before the cached heavy graph so dual CLIP never overlaps the UNet/ControlNet/VAE
         // allocation.  This matches the normal SDXL generator's staged residency contract.
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let conditioner = self.file_pin_spec.read_prepared_files_unchanged(|| {
             SdxlConditioner::load(
                 &self.root,
@@ -266,6 +323,9 @@ impl Generator for SdxlControlGenerator {
         let (conditioning, pooled) = conditioner.encode(&req.prompt, negative, cfg_on)?;
         drop(conditioner);
 
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let components = self.components()?;
         let time_ids = text_time_ids(if cfg_on { 2 } else { 1 }, &self.device, DTYPE)?;
         let contexts = controls
@@ -291,67 +351,78 @@ impl Generator for SdxlControlGenerator {
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
         let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            if req.cancel.is_cancelled() {
-                return Err(gen_core::Error::Canceled);
+        crate::with_request_attention_budget(req, || -> gen_core::Result<()> {
+            for index in 0..req.count {
+                if req.cancel.is_cancelled() {
+                    return Err(gen_core::Error::Canceled);
+                }
+                let image_seed = seed.wrapping_add(index as u64);
+                let latents = if lightning {
+                    denoise_lightning_control(
+                        &components.unet,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        &contexts,
+                        image_seed,
+                        req.width,
+                        req.height,
+                        &self.device,
+                        steps,
+                        &req.cancel,
+                        on_progress,
+                        &req.preview,
+                    )?
+                } else {
+                    let schedule = sdxl_alpha_schedule()?;
+                    let sampling = DiscreteModelSampling::sdxl(&schedule);
+                    let native = schedule_sigmas(Scheduler::Normal, &sampling, steps);
+                    let sigmas = candle_gen::resolve_schedule(
+                        req.scheduler.as_deref(),
+                        &sampling,
+                        steps,
+                        &native,
+                    );
+                    let preview = crate::preview::ve_hook(&req.preview);
+                    let latents = seeded_sigma_prior(
+                        image_seed,
+                        req.width,
+                        req.height,
+                        sigmas[0],
+                        &self.device,
+                    )?;
+                    denoise_curated(
+                        &components.unet,
+                        req.sampler.as_deref().or(Some("ddim")),
+                        &sampling,
+                        &sigmas,
+                        latents,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        guidance,
+                        DTYPE,
+                        image_seed,
+                        &req.cancel,
+                        on_progress,
+                        Some(&preview),
+                        &contexts,
+                        &conditioning,
+                    )?
+                };
+                on_progress(Progress::Decoding);
+                images.push(decode_image_with_tiling(
+                    &components.vae,
+                    &latents,
+                    None,
+                    Some(&req.cancel),
+                    req.memory
+                        .map(|memory| memory.tile_vae_decode)
+                        .unwrap_or_else(crate::vae_tiling_enabled),
+                )?);
             }
-            let image_seed = seed.wrapping_add(index as u64);
-            let latents = if lightning {
-                denoise_lightning_control(
-                    &components.unet,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    &contexts,
-                    image_seed,
-                    req.width,
-                    req.height,
-                    &self.device,
-                    steps,
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                )?
-            } else {
-                let schedule = sdxl_alpha_schedule()?;
-                let sampling = DiscreteModelSampling::sdxl(&schedule);
-                let native = schedule_sigmas(Scheduler::Normal, &sampling, steps);
-                let sigmas = candle_gen::resolve_schedule(
-                    req.scheduler.as_deref(),
-                    &sampling,
-                    steps,
-                    &native,
-                );
-                let preview = crate::preview::ve_hook(&req.preview);
-                let latents =
-                    seeded_sigma_prior(image_seed, req.width, req.height, sigmas[0], &self.device)?;
-                denoise_curated(
-                    &components.unet,
-                    req.sampler.as_deref().or(Some("ddim")),
-                    &sampling,
-                    &sigmas,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    guidance,
-                    DTYPE,
-                    image_seed,
-                    &req.cancel,
-                    on_progress,
-                    Some(&preview),
-                    &contexts,
-                    &conditioning,
-                )?
-            };
-            on_progress(Progress::Decoding);
-            images.push(decode_image(
-                &components.vae,
-                &latents,
-                None,
-                Some(&req.cancel),
-            )?);
-        }
+            Ok(())
+        })?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -525,6 +596,7 @@ mod tests {
             &spec(),
             SdxlComponents::from_spec(&spec(), MODEL_ID).unwrap(),
             Device::Cpu,
+            None,
         )
         .unwrap();
         let request = GenerationRequest {
@@ -559,6 +631,7 @@ mod tests {
             &spec(),
             SdxlComponents::from_spec(&spec(), MODEL_ID).unwrap(),
             Device::Cpu,
+            None,
         )
         .unwrap();
         let base = GenerationRequest {

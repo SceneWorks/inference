@@ -41,6 +41,7 @@
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
 mod control_provider;
+mod memory_strategy;
 mod pipeline;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
@@ -97,9 +98,9 @@ pub mod preview;
 // IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
 pub mod denoise;
 pub use denoise::{
-    decode_image, denoise_curated, denoise_ip_control, denoise_ip_multi_control,
-    preprocess_control_image, seeded_prior, seeded_sigma_prior, text_time_ids, ControlContext,
-    Denoiser,
+    decode_image, decode_image_with_tiling, denoise_curated, denoise_ip_control,
+    denoise_ip_multi_control, preprocess_control_image, seeded_prior, seeded_sigma_prior,
+    text_time_ids, ControlContext, Denoiser,
 };
 
 // Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long prompt
@@ -206,6 +207,11 @@ use pipeline::{Components, Pipeline, SdxlComponents};
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
 
+pub use memory_strategy::{
+    provider_contract_for_spec, resolved_numeric_tier, SdxlArtifactSeal, REQUEST_EVIDENCE_REVISION,
+    SDXL_ROUTES,
+};
+
 /// SDXL works in latent space at /8: both dims must be multiples of 8. Exposed as the pinned-engine
 /// stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
 /// `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const cannot drift
@@ -297,6 +303,8 @@ pub struct SdxlGenerator {
     /// Real load-time affine fold for an imported fused checkpoint. Snapshot directories select
     /// their packed tier on disk and leave this unset.
     quant: Option<Quant>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+    artifact_seal: Option<SdxlArtifactSeal>,
 }
 
 impl SdxlGenerator {
@@ -345,6 +353,47 @@ impl SdxlGenerator {
 impl Generator for SdxlGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return gen_core::default_memory_strategy_safety_check(
+                &gen_core::MemoryProviderContract::compatibility_default(
+                    MODEL_ID,
+                    memory_strategy::backend(),
+                ),
+                context,
+            );
+        };
+        memory_strategy::safety_check(contract, context, self.artifact_seal.as_ref())
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        let seal = self.artifact_seal.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "sdxl: authoritative memory contract has no artifact seal".into(),
+            )
+        })?;
+        seal.ensure_unchanged()?;
+        memory_strategy::validate_context(contract, context, seal)?;
+        Ok(Some(Box::new(memory_strategy::request_scope(
+            self.device.clone(),
+            contract,
+            context,
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -400,6 +449,11 @@ impl Generator for SdxlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
+        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
+        let _staged_guard = staged.then(|| StagedCacheGuard::new(&self.components));
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
         // request's latent dims; the heavy UNet/VAE come from the cache.
@@ -420,19 +474,86 @@ impl Generator for SdxlGenerator {
         // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
         // time, so the footprint stays under the denoise-time peak.
         let negative = req.negative_prompt.as_deref().unwrap_or("");
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let tokenizers = self.tokenizers()?;
         let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let components = self.components(&pipe)?;
-        let images = pipe.render(
-            req,
-            &text_embeddings,
-            &components.unet,
-            &components.vae,
-            components.pid.as_deref(),
-            on_progress,
-        )?;
+        let images = with_request_attention_budget(req, || {
+            pipe.render(
+                req,
+                &text_embeddings,
+                &components.unet,
+                &components.vae,
+                components.pid.as_deref(),
+                on_progress,
+            )
+        })?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+struct StagedCacheGuard<'a> {
+    components: &'a Mutex<Option<(bool, Components)>>,
+}
+
+impl<'a> StagedCacheGuard<'a> {
+    fn new(components: &'a Mutex<Option<(bool, Components)>>) -> Self {
+        candle_gen::lock_recover(components).take();
+        Self { components }
+    }
+}
+
+impl Drop for StagedCacheGuard<'_> {
+    fn drop(&mut self) {
+        candle_gen::lock_recover(self.components).take();
+    }
+}
+
+thread_local! {
+    static REQUEST_ATTENTION_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(candle_gen::ATTN_SCORES_BUDGET) };
+}
+
+pub(crate) fn request_attention_budget() -> usize {
+    REQUEST_ATTENTION_BUDGET.get()
+}
+
+fn with_request_attention_budget<T>(request: &GenerationRequest, f: impl FnOnce() -> T) -> T {
+    with_attention_memory(request.memory, f)
+}
+
+pub(crate) fn with_attention_memory<T>(
+    memory: Option<gen_core::GenerationMemory>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = enter_attention_memory(memory);
+    f()
+}
+
+pub(crate) struct AttentionMemoryGuard(usize);
+
+impl Drop for AttentionMemoryGuard {
+    fn drop(&mut self) {
+        REQUEST_ATTENTION_BUDGET.set(self.0);
+    }
+}
+
+pub(crate) fn enter_attention_memory(
+    memory: Option<gen_core::GenerationMemory>,
+) -> AttentionMemoryGuard {
+    let previous = REQUEST_ATTENTION_BUDGET.get();
+    let selected = memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map(|budget| budget as usize)
+        .unwrap_or(candle_gen::ATTN_SCORES_BUDGET);
+    REQUEST_ATTENTION_BUDGET.set(selected);
+    AttentionMemoryGuard(previous)
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
@@ -546,6 +667,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
     // fused checkpoint.
     let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
+    let authoritative_seal = if spec.resolved_route.is_some() {
+        Some(SdxlArtifactSeal::capture(spec)?)
+    } else {
+        None
+    };
     // A ControlNet changes the graph: route it through the vendored SDXL stack that carries the
     // add-embedding and residual-injection seams.  Do not let the historical txt2img pipeline
     // accept an overlay it would never read.
@@ -554,6 +680,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             spec,
             component_paths,
             candle_gen::default_device()?,
+            authoritative_seal,
         )?));
     }
     if !spec.extra_controls.is_empty() {
@@ -574,6 +701,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "{MODEL_ID}: imported fused checkpoints support Q4/Q8 affine tiers, not NVFP4"
         )));
     }
+    let (memory_contract, artifact_seal) = if let Some(seal) = authoritative_seal {
+        (Some(seal.contract().clone()), Some(seal))
+    } else {
+        (None, None)
+    };
     let (root, ldm, ldm_source_pin) = match &spec.weights {
         WeightsSource::Dir(p) => (p.clone(), None, None),
         WeightsSource::File(file) => {
@@ -614,6 +746,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ldm,
         _ldm_source_pin: ldm_source_pin,
         file_pin_spec: spec.clone(),
+        memory_contract,
+        artifact_seal,
     }))
 }
 
@@ -629,10 +763,24 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(REGISTRATION)
+        .register_memory_strategy(memory_strategy::memory_registration())
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
         .register_imported_model(gen_core::ImportedModelRegistration {
             family: "sdxl",
             source: gen_core::ImportedModelSource::FusedCheckpoint,
             operation: gen_core::ImportedModelOperation::Generate,
+            provider_id: MODEL_ID,
+            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+            inherit_adapters: true,
+        })
+        .register_imported_model(gen_core::ImportedModelRegistration {
+            family: "sdxl",
+            source: gen_core::ImportedModelSource::FusedCheckpoint,
+            operation: gen_core::ImportedModelOperation::Edit,
             provider_id: MODEL_ID,
             required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
             inherit_adapters: true,

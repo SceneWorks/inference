@@ -250,7 +250,7 @@ impl CrossAttention {
                 &value,
                 self.scale,
                 |s| nn::ops::softmax(s, D::Minus1),
-                candle_gen::ATTN_SCORES_BUDGET,
+                crate::request_attention_budget(),
             )?
             .to_dtype(in_dtype)?
         };
