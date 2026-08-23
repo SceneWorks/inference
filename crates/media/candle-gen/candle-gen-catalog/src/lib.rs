@@ -3444,6 +3444,7 @@ mod preview_advertising {
             dir: "candle-gen-ltx",
             register_providers: candle_gen_ltx::register_providers,
             register_surfaces: Some(candle_gen_ltx::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-mage",
@@ -3473,6 +3474,7 @@ mod preview_advertising {
             dir: "candle-gen-sd3",
             register_providers: candle_gen_sd3::register_providers,
             register_surfaces: Some(candle_gen_sd3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-sensenova",
