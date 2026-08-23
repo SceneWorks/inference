@@ -1647,6 +1647,11 @@ fn extend_control_clip(request: &GenerationRequest) -> crate::Result<crate::Cont
     Ok(clip)
 }
 
+/// The raw RGB value the Wan-VACE builder writes into a white-mask bridge gap.  The engine maps
+/// this mid-gray value to approximately zero before denoising; black is an anchor-mask value, not
+/// neutral generated content.
+const WAN_VACE_BRIDGE_NEUTRAL_RGB: u8 = 128;
+
 fn bridge_control_clip(request: &GenerationRequest) -> crate::Result<crate::ControlClipRef<'_>> {
     let clip = extend_control_clip(request).map_err(|_| {
         crate::Error::Unsupported(
@@ -1679,7 +1684,7 @@ fn bridge_control_clip(request: &GenerationRequest) -> crate::Result<crate::Cont
             .all(|mask| is_uniform(mask, 255))
         || !clip.frames[left_anchor_len..gap_end]
             .iter()
-            .all(|frame| is_uniform(frame, 0))
+            .all(|frame| is_uniform(frame, WAN_VACE_BRIDGE_NEUTRAL_RGB))
     {
         return Err(crate::Error::Unsupported(
             "Wan VACE video_bridge requires black left-tail/right-head anchors and a white-mask neutral generated gap"
@@ -2619,10 +2624,13 @@ mod tests {
                 height: 480,
                 pixels: vec![11; 832 * 480 * 3],
             });
+            // This is the exact mid-gray that SceneWorks' production
+            // `build_extend_bridge_vace_conditioning` writes for its generated span.  Do not use
+            // black here: black is reserved for the anchor-mask polarity.
             frames[1..42].fill(Image {
                 width: 832,
                 height: 480,
-                pixels: vec![0; 832 * 480 * 3],
+                pixels: vec![WAN_VACE_BRIDGE_NEUTRAL_RGB; 832 * 480 * 3],
             });
             frames[42..].fill(Image {
                 width: 832,
@@ -2646,6 +2654,28 @@ mod tests {
             });
         }
         request
+    }
+
+    #[test]
+    fn vace_bridge_admission_requires_the_production_mid_gray_generated_gap() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Mlx, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").unwrap();
+        let request = vace_bridge_request();
+        assert_eq!(
+            validate_request(&prepared, &request).unwrap(),
+            WanPublicMode::VideoBridge,
+            "the production builder's raw RGB 128 gap must be admitted before normalization"
+        );
+
+        let mut black_gap = request;
+        if let Conditioning::ControlClip { frames, .. } = &mut black_gap.conditioning[0] {
+            frames[1].pixels.fill(0);
+        }
+        assert!(
+            validate_request(&prepared, &black_gap).is_err(),
+            "black is not a neutral generated gap and must not be admitted as one"
+        );
     }
 
     #[test]
