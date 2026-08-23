@@ -235,19 +235,70 @@ pub(crate) fn contract_for_loaded(
 fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     // The fixture shares every identity gate except physical-file inspection; catalog conformance
     // cannot depend on weights being installed on the compiler host.
-    if spec.quantize != Some(Quant::Q4)
-        || spec.load_shape != LoadShape::EagerMaterialization
-        || spec.precision != Precision::Bf16
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: fixture is q4/eager/bf16 only"
-        )));
-    }
+    let spec = weights_free_behavior_spec(spec);
     build_contract(
-        spec,
+        &spec,
         MemoryAssetFacts::default(),
         STATIC_CALIBRATION_FINGERPRINT,
     )
+}
+
+fn weights_free_behavior_spec(spec: &LoadSpec) -> LoadSpec {
+    let mut exact = spec.clone();
+    exact.weights = WeightsSource::Dir("registry/ltx-2-3-distilled/q4".into());
+    exact.resolved_route = Some(MODEL_ID.to_owned());
+    exact.precision = Precision::Bf16;
+    exact.quantize = Some(Quant::Q4);
+    exact.load_shape = LoadShape::EagerMaterialization;
+    exact
+}
+
+fn validate_weights_free_behavior_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    if spec.resolved_route.as_deref() != Some(MODEL_ID)
+        || spec.quantize != Some(Quant::Q4)
+        || spec.load_shape != LoadShape::EagerMaterialization
+        || spec.precision != Precision::Bf16
+        || !matches!(spec.weights, WeightsSource::Dir(_))
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || !spec.adapters.is_empty()
+        || !spec.components.is_empty()
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: registry fixture requires the exact plain q4/eager/bf16 route"
+        )));
+    }
+    Ok(())
+}
+
+fn registered_contract_identity(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<()> {
+    let expected = if contract.asset_facts == MemoryAssetFacts::default()
+        && contract
+            .calibration
+            .as_ref()
+            .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION_FINGERPRINT)
+    {
+        validate_weights_free_behavior_spec(spec)?;
+        build_contract(
+            spec,
+            MemoryAssetFacts::default(),
+            STATIC_CALIBRATION_FINGERPRINT,
+        )?
+    } else {
+        memory_strategy_contract(spec)?
+    };
+    if expected != *contract {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: caller contract differs from the exact loaded or registry witness"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
@@ -341,14 +392,9 @@ fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    if memory_strategy_contract(spec).is_err()
-        && contract
-            .calibration
-            .as_ref()
-            .is_some_and(|value| value.fingerprint != STATIC_CALIBRATION_FINGERPRINT)
-    {
+    if let Err(error) = registered_contract_identity(spec, contract) {
         return MemorySafetyDecision::Reject {
-            reason: format!("{MODEL_ID}: loaded q4 receipt no longer matches the memory contract"),
+            reason: error.to_string(),
         };
     }
     safety_check(contract, context)
@@ -490,16 +536,7 @@ fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if memory_strategy_contract(spec).is_err()
-        && contract
-            .calibration
-            .as_ref()
-            .is_some_and(|value| value.fingerprint != STATIC_CALIBRATION_FINGERPRINT)
-    {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: loaded q4 receipt no longer matches the memory contract"
-        )));
-    }
+    registered_contract_identity(spec, contract)?;
     begin(contract, Device::Cpu, context)
 }
 
@@ -516,6 +553,7 @@ fn registered_valid_fixtures(
     {
         return Ok(Vec::new());
     }
+    let exact_spec = weights_free_behavior_spec(spec);
     let mut context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -673,7 +711,10 @@ fn registered_valid_fixtures(
             strength: 1.0,
         },
     ];
-    Ok(vec![fixture, first_last, extend, bridge])
+    Ok(vec![fixture, first_last, extend, bridge]
+        .into_iter()
+        .map(|fixture| fixture.with_load_spec(exact_spec.clone()))
+        .collect())
 }
 
 fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {
@@ -746,6 +787,32 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/weights/ltx/q4".into()));
         spec.quantize = Some(Quant::Q4);
         spec
+    }
+
+    #[test]
+    fn catalog_fixture_normalizes_and_binds_the_exact_q4_route() {
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = weights_free_contract(&generic).unwrap();
+        let fixture = registered_valid_fixtures(&generic, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let exact = fixture
+            .load_spec
+            .as_ref()
+            .expect("provider-owned load spec");
+        assert_eq!(exact.resolved_route.as_deref(), Some(MODEL_ID));
+        assert_eq!(exact.quantize, Some(Quant::Q4));
+        assert_eq!(exact.load_shape, LoadShape::EagerMaterialization);
+        assert!(matches!(
+            registered_safety_check(exact, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        assert!(matches!(
+            registered_safety_check(&generic, &contract, &fixture.context),
+            MemorySafetyDecision::Reject { .. }
+        ));
     }
 
     #[test]

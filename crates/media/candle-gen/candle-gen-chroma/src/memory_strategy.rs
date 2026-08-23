@@ -16,7 +16,7 @@ use candle_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1210,6 +1210,15 @@ pub(crate) fn validate_context(
     context: &MemoryRunContext,
     tier: Option<Quant>,
 ) -> gen_core::Result<()> {
+    if contract.calibration.is_none()
+        && (context.calibration_abi != 0
+            || !context.calibration_fingerprint.is_empty()
+            || context.load_shape != contract.load_shape)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: structural-estimate handshake crossed ABI, fingerprint, or load shape"
+        )));
+    }
     if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -1623,7 +1632,7 @@ pub(crate) fn registered_begin_request(
     )?)))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1635,12 +1644,13 @@ pub(crate) fn registered_valid_fixture(
     if strategy != MemoryStrategy::StagedResidency {
         return Ok(Vec::new());
     }
+    let exact_spec = weights_free_behavior_spec(&contract.provider_id, spec)?;
     let context = estimated_behavior_context(
         contract,
         strategy,
         MemoryNumericTier {
             precision: Precision::Bf16,
-            quant: physical_tier_hint(spec),
+            quant: physical_tier_hint(&exact_spec),
             component_precision_floors: &[],
         },
         MemoryBehaviorRoute {
@@ -1651,10 +1661,38 @@ pub(crate) fn registered_valid_fixture(
             overlay: None,
         },
     )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    Ok(vec![
+        MemoryBehaviorFixture::new(context).with_load_spec(exact_spec)
+    ])
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
+fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
+    let route = route_identity(provider_id)?;
+    let tier = match physical_tier_hint(spec) {
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        None => "bf16",
+        Some(Quant::Nvfp4) => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no NVFP4 turnkey".into(),
+            ))
+        }
+    };
+    let mut exact = spec.clone();
+    exact.weights = WeightsSource::Dir(
+        PathBuf::from(format!("models--SceneWorks--{}", route.repository))
+            .join("snapshots")
+            .join(route.revision)
+            .join(tier),
+    );
+    exact.resolved_route = Some(provider_id.to_owned());
+    exact.precision = Precision::Bf16;
+    exact.quantize = None;
+    Ok(exact)
+}
+
+#[cfg(any(feature = "cuda", test))]
 fn estimated_behavior_context(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
@@ -1783,6 +1821,34 @@ mod tests {
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec.offload_policy = OffloadPolicy::Sequential;
         spec
+    }
+
+    #[test]
+    fn registry_behavior_fixtures_bind_each_exact_route_and_estimate_handshake() {
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for route in ROUTES {
+            let contract = weights_free_contract(route.provider, &generic).unwrap();
+            let fixture =
+                registered_valid_fixture(&generic, &contract, MemoryStrategy::StagedResidency)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            let exact = fixture
+                .load_spec
+                .as_ref()
+                .expect("provider-owned load spec");
+            assert_eq!(exact.resolved_route.as_deref(), Some(route.provider));
+            assert!(matches!(
+                registered_safety_check(exact, &contract, &fixture.context),
+                MemorySafetyDecision::Accept
+            ));
+            let mut crossed = fixture.context.clone();
+            crossed.calibration_fingerprint = "forged".into();
+            assert!(matches!(
+                registered_safety_check(exact, &contract, &crossed),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
     }
 
     #[test]

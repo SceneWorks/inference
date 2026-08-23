@@ -17,7 +17,7 @@ use candle_gen::gen_core::{
     MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization, Precision,
     Quant, TransformerComponent, WeightsSource,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1106,6 +1106,10 @@ pub(crate) fn weights_free_contract(
     let mut normalized = spec.clone();
     normalized.resolved_route = Some(provider_id.to_owned());
     normalized.quantize = None;
+    // The exhaustive registry witness must make rung four executable. Physical and surface
+    // contracts preserve their actual load shape; this weights-free catalog fixture selects the
+    // provider's deferred block-materialization route deliberately.
+    normalized.load_shape = gen_core::LoadShape::DeferredMaterialization;
     Ok(build_contract(
         provider_id,
         &normalized,
@@ -1348,7 +1352,10 @@ fn validate_route(
     let has_turbo = identities
         .iter()
         .any(|identity| identity.starts_with(TURBO_ADAPTER_PREFIX));
-    if (provider_id == MODEL_ID_TURBO) != has_turbo {
+    let weights_free_witness = contract.asset_facts == MemoryAssetFacts::default();
+    if (provider_id == MODEL_ID_TURBO) != has_turbo
+        && !(weights_free_witness && provider_id == MODEL_ID_TURBO && !has_turbo)
+    {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: Turbo mandatory adapter identity is absent or crossed"
         )));
@@ -1362,6 +1369,15 @@ pub(crate) fn validate_context(
     context: &MemoryRunContext,
     tier: Option<Quant>,
 ) -> gen_core::Result<()> {
+    if contract.calibration.is_none()
+        && (context.calibration_abi != 0
+            || !context.calibration_fingerprint.is_empty()
+            || context.load_shape != contract.load_shape)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: structural-estimate handshake crossed ABI, fingerprint, or load shape"
+        )));
+    }
     if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -1421,8 +1437,11 @@ fn registered_tier_and_contract(
         unreachable!("validated")
     };
     let route = route_identity(provider_id, root)?;
-    validate_snapshot_binding(root, route)?;
     if contract.asset_facts == MemoryAssetFacts::default() {
+        // The registry witness has no installed files to canonicalize, but it still carries and
+        // validates the exact provider/repository/revision/tier suffix. Physical contracts take
+        // the stronger canonical-path branch below.
+        validate_snapshot_path(root, route)?;
         let expected = weights_free_contract(provider_id, spec)?;
         if expected != *contract {
             return Err(gen_core::Error::Unsupported(format!(
@@ -1431,6 +1450,7 @@ fn registered_tier_and_contract(
         }
         Ok(physical_tier_hint(spec))
     } else {
+        validate_snapshot_binding(root, route)?;
         let receipt = IdeogramLoadReceipt::capture(provider_id, spec)?;
         let expected = contract_from_receipt(provider_id, spec, &receipt);
         if expected != *contract {
@@ -1822,15 +1842,24 @@ pub(crate) fn registered_begin_request(
     )?)))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<MemoryBehaviorFixture>> {
-    if strategy != MemoryStrategy::StagedResidency {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
         return Ok(Vec::new());
     }
+    let exact_spec = weights_free_behavior_spec(&contract.provider_id, spec)?;
+    let tier = physical_tier_hint(&exact_spec);
     for route in [
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
@@ -1866,19 +1895,44 @@ pub(crate) fn registered_valid_fixture(
             strategy,
             MemoryNumericTier {
                 precision: Precision::Bf16,
-                quant: physical_tier_hint(spec),
+                quant: tier,
                 component_precision_floors: &[],
             },
             route,
         )?;
         if validate_route(&contract.provider_id, contract, &context).is_ok() {
-            return Ok(vec![MemoryBehaviorFixture::new(context)]);
+            return Ok(vec![
+                MemoryBehaviorFixture::new(context).with_load_spec(exact_spec)
+            ]);
         }
     }
     Ok(Vec::new())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
+fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
+    if !matches!(provider_id, MODEL_ID | MODEL_ID_TURBO) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "unknown Ideogram provider {provider_id}"
+        )));
+    }
+    // The catalog-wide probe starts from a generic directory. Bind its positive control to the
+    // exact dense route; packed q4/q8 routes are exercised by the surface registry.
+    let mut exact = spec.clone();
+    exact.weights = WeightsSource::Dir(
+        PathBuf::from(format!("models--SceneWorks--{BF16_REPOSITORY}"))
+            .join("snapshots")
+            .join(BF16_REVISION)
+            .join("bf16"),
+    );
+    exact.resolved_route = Some(provider_id.to_owned());
+    exact.precision = Precision::Bf16;
+    exact.quantize = None;
+    exact.load_shape = gen_core::LoadShape::DeferredMaterialization;
+    Ok(exact)
+}
+
+#[cfg(any(feature = "cuda", test))]
 fn estimated_behavior_context(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
@@ -2045,6 +2099,40 @@ mod tests {
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec.offload_policy = OffloadPolicy::Sequential;
         spec
+    }
+
+    #[test]
+    fn registry_behavior_fixtures_cover_every_rung_on_exact_dense_routes() {
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            let contract = weights_free_contract(provider, &generic).unwrap();
+            for strategy in MemoryStrategy::ALL
+                .into_iter()
+                .filter(|strategy| strategy.is_optimized())
+            {
+                let fixture = registered_valid_fixture(&generic, &contract, strategy)
+                    .unwrap()
+                    .pop()
+                    .unwrap_or_else(|| panic!("{provider} lacks {strategy:?} fixture"));
+                let exact = fixture
+                    .load_spec
+                    .as_ref()
+                    .expect("provider-owned load spec");
+                assert_eq!(exact.resolved_route.as_deref(), Some(provider));
+                assert_eq!(physical_tier_hint(exact), None);
+                let decision = registered_safety_check(exact, &contract, &fixture.context);
+                assert!(
+                    matches!(decision, MemorySafetyDecision::Accept),
+                    "{provider}:{strategy:?}: {decision:?}"
+                );
+                let mut crossed = fixture.context.clone();
+                crossed.calibration_abi = gen_core::MEMORY_CALIBRATION_ABI;
+                assert!(matches!(
+                    registered_safety_check(exact, &contract, &crossed),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+            }
+        }
     }
 
     fn context(

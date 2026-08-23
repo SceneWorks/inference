@@ -744,6 +744,15 @@ fn validate_route(
     numeric: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
+    if contract.calibration.is_none()
+        && (context.calibration_abi != 0
+            || !context.calibration_fingerprint.is_empty()
+            || context.load_shape != contract.load_shape)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider}: structural-estimate handshake crossed ABI, fingerprint, or load shape"
+        )));
+    }
     let route = Route::for_provider(provider)?;
     let refs = context.geometry.reference_count;
     let valid_mode = match route {
@@ -2047,6 +2056,28 @@ mod tests {
                         registered_safety_check(&exact, &contract, &context),
                         MemorySafetyDecision::Accept
                     );
+                    for mutation in ["abi", "fingerprint", "shape"] {
+                        let mut crossed = context.clone();
+                        match mutation {
+                            "abi" => crossed.calibration_abi = gen_core::MEMORY_CALIBRATION_ABI,
+                            "fingerprint" => crossed.calibration_fingerprint = "forged".to_owned(),
+                            "shape" => {
+                                crossed.load_shape = match crossed.load_shape {
+                                    gen_core::LoadShape::EagerMaterialization => {
+                                        gen_core::LoadShape::DeferredMaterialization
+                                    }
+                                    gen_core::LoadShape::DeferredMaterialization => {
+                                        gen_core::LoadShape::EagerMaterialization
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(matches!(
+                            registered_safety_check(&exact, &contract, &crossed),
+                            MemorySafetyDecision::Reject { .. }
+                        ));
+                    }
                     let mut crossed_tier = context.clone();
                     crossed_tier.selection.tier.quant = match quant {
                         None => Some(Quant::Q8),

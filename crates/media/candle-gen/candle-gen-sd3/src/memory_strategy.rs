@@ -16,7 +16,7 @@ use candle_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1035,6 +1035,16 @@ pub fn validate_context(
     context: &MemoryRunContext,
     tier: Option<Quant>,
 ) -> gen_core::Result<()> {
+    if contract.calibration.is_none()
+        && (context.calibration_abi != 0
+            || !context.calibration_fingerprint.is_empty()
+            || context.load_shape != contract.load_shape)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: structural-estimate handshake crossed ABI, fingerprint, or load shape",
+            route.provider_id()
+        )));
+    }
     if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -1492,7 +1502,7 @@ pub fn registered_begin_request(
     )?)))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1502,7 +1512,8 @@ pub fn registered_valid_fixture(
         return Ok(Vec::new());
     }
     let route = Sd35Route::from_provider(&contract.provider_id)?;
-    let tier = physical_tier_hint(spec);
+    let exact_spec = weights_free_behavior_spec(route, spec)?;
+    let tier = physical_tier_hint(&exact_spec);
     [
         MemoryBehaviorRoute {
             mode: MemoryMode::TextToImage,
@@ -1558,9 +1569,34 @@ pub fn registered_valid_fixture(
             evidence_revision: REQUEST_EVIDENCE_REVISION.into(),
         };
         validate_context(route, contract, &context, tier)?;
-        Ok(MemoryBehaviorFixture::new(context))
+        Ok(MemoryBehaviorFixture::new(context).with_load_spec(exact_spec.clone()))
     })
     .collect()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn weights_free_behavior_spec(route: Sd35Route, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
+    let tier = match physical_tier_hint(spec) {
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        None => "bf16",
+        Some(Quant::Nvfp4) => {
+            return Err(gen_core::Error::Unsupported(
+                "SD3.5 has no NVFP4 tier".into(),
+            ))
+        }
+    };
+    let mut exact = spec.clone();
+    exact.weights = WeightsSource::Dir(
+        PathBuf::from(format!("models--SceneWorks--{}", route.repository()))
+            .join("snapshots")
+            .join(route.revision())
+            .join(tier),
+    );
+    exact.resolved_route = Some(route.provider_id().to_owned());
+    exact.precision = Precision::Bf16;
+    exact.quantize = None;
+    Ok(exact)
 }
 
 #[cfg(test)]
@@ -1706,6 +1742,34 @@ mod tests {
             .with_adapters(adapters);
         spec.precision = Precision::Bf16;
         spec
+    }
+
+    #[test]
+    fn registry_behavior_fixtures_bind_each_exact_route_and_estimate_handshake() {
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for route in [Sd35Route::Large, Sd35Route::LargeTurbo, Sd35Route::Medium] {
+            let contract = weights_free_contract(route.provider_id(), &generic).unwrap();
+            for fixture in
+                registered_valid_fixture(&generic, &contract, MemoryStrategy::StagedResidency)
+                    .unwrap()
+            {
+                let exact = fixture
+                    .load_spec
+                    .as_ref()
+                    .expect("provider-owned load spec");
+                assert_eq!(exact.resolved_route.as_deref(), Some(route.provider_id()));
+                assert!(matches!(
+                    registered_safety_check(exact, &contract, &fixture.context),
+                    MemorySafetyDecision::Accept
+                ));
+                let mut crossed = fixture.context.clone();
+                crossed.load_shape = LoadShape::DeferredMaterialization;
+                assert!(matches!(
+                    registered_safety_check(exact, &contract, &crossed),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+            }
+        }
     }
 
     fn context(receipt: &Sd35LoadReceipt, mode: MemoryMode) -> MemoryRunContext {

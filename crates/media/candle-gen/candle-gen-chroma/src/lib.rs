@@ -621,19 +621,39 @@ mod tests {
     #[test]
     fn load_accepts_adapters_and_rejects_unwired_quant_and_single_file() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
-        for load in [load_hd, load_base, load_flash] {
-            let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-                AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-            ]);
+        let temp = tempfile::tempdir().unwrap();
+        for (route, load) in memory_strategy::ROUTES
+            .iter()
+            .zip([load_hd, load_base, load_flash])
+        {
+            // `/snap` exists on Ubuntu hosts, which accidentally turns this weights-free loader
+            // fixture into a physical-receipt probe. Use a guaranteed-missing path that still
+            // carries the exact repository/revision/tier and resolved provider identity.
+            let root = temp
+                .path()
+                .join(format!("models--SceneWorks--{}", route.repository))
+                .join("snapshots")
+                .join(route.revision)
+                .join("bf16");
+            let lora = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_resolved_route(route.provider)
+                .with_adapters(vec![AdapterSpec::new(
+                    "/lora.safetensors".into(),
+                    1.0,
+                    AdapterKind::Lora,
+                )]);
             assert!(load(&lora).is_ok());
 
-            let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+            let quant = LoadSpec::new(WeightsSource::Dir(root))
+                .with_resolved_route(route.provider)
+                .with_quant(Quant::Q8);
             assert!(matches!(
                 load(&quant).err().expect("err"),
                 gen_core::Error::Unsupported(_)
             ));
 
-            let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()));
+            let single = LoadSpec::new(WeightsSource::File("/x.safetensors".into()))
+                .with_resolved_route(route.provider);
             let err = load(&single).err().expect("err").to_string();
             assert!(err.contains("snapshot directory"), "got: {err}");
         }
