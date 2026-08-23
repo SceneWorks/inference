@@ -1000,11 +1000,22 @@ mod tests {
     }
 
     /// Real-weight check of the KreaMania fp8 shape (sc-20385): the plain `fp8_e4m3fn` cast of the
-    /// community Krea 2 DiT (the published V1/V2 fp8 variants are this cast — every tensor
-    /// `F8_E4M3`, no scale companions, no descriptors) plans entirely onto the scalar fp8 codec at
-    /// unit scale through the Krea native mapping, prices its dense bf16 residency at exactly twice
-    /// the stored bytes, and its deferred read goes through the codec seam with a recorded receipt.
+    /// community Krea 2 DiT — every fp8 tensor `F8_E4M3`, no scale companions, no descriptors —
+    /// plans onto the scalar fp8 codec at **unit scale** through the Krea native mapping and its
+    /// deferred read goes through the codec seam with a recorded receipt.
     /// Header plus a lazy open: no GPU render. `KREA_NATIVE_DIT_FP8` points at the file.
+    ///
+    /// The real artifact for this shape is `kreamania_variant7_fp8` (430 tensors: 265 `F8_E4M3`
+    /// + 158 BF16 + 7 F32, no companions, no `__metadata__`).
+    ///
+    /// **This is NOT what the published V1/V2 fp8 artifacts are.** An earlier revision of this
+    /// comment claimed they were; reading their headers disproved it. `kreamania_variant1_fp8` and
+    /// `kreamania_variant2_fp8` are descriptor-gated **scaled** fp8: 942 tensors carrying 256
+    /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values (not 1.0),
+    /// and 256 `.comfy_quant` descriptors — 160 `{"format": "float8_e4m3fn"}` plus 96
+    /// `{"format": "float8_e4m3fn", "full_precision_matrix_mult": true}` — with the other 174
+    /// tensors left BF16. They exercise the companion-scale and forced-dense paths this test does
+    /// not; `kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm` covers them.
     #[test]
     #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8 to a plain fp8_e4m3fn Krea 2 DiT"]
     fn kreamania_fp8_cast_plans_as_scalar_fp8_through_the_codec_seam() {
@@ -1018,24 +1029,54 @@ mod tests {
             &crate::native_remap::KreaNativeToDiffusersMapping,
         )
         .expect("the fp8 cast plans through the Krea native mapping");
-        assert_eq!(plan.codec_ids(), ["fp8-e4m3-scalar-v1"]);
+        // ComfyUI's UNETLoader cast converts the big linear weights and leaves norms/biases alone,
+        // so a real plain-cast checkpoint is fp8 MIXED with dense rows — it is not fp8 throughout.
+        // (An earlier revision asserted a single codec id and `2 * declared` residency here; that
+        // was true of the locally produced surrogate, which cast every tensor, and false of every
+        // real artifact.)
+        assert!(
+            plan.codec_ids().contains(&"fp8-e4m3-scalar-v1"),
+            "{:?}",
+            plan.codec_ids()
+        );
         assert!(plan.companions.is_empty(), "a plain cast has no companions");
         let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
         assert_eq!(plan.tensor_count(), headers.len());
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared);
+
+        // Every fp8 layer is at UNIT scale — the defining property of the plain cast, and what
+        // separates it from the published V1/V2 scaled artifacts.
+        let fp8: Vec<_> = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "fp8-e4m3-scalar-v1")
+            .collect();
+        assert!(!fp8.is_empty(), "the fixture must carry fp8 layers");
+        assert!(
+            fp8.iter().all(|tensor| matches!(
+                &tensor.codec,
+                mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
+                    scale: mlx_gen::gen_core::ScalarScaleSource::Unit,
+                    ..
+                }
+            )),
+            "a plain cast carries no scale companion, so every layer plans at unit scale"
+        );
+        // Residency: fp8 layers double (→ bf16), dense rows keep their stored bytes. Summing the
+        // two is the real relationship the blanket `2 * declared` was standing in for.
+        let fp8_source: u64 = fp8.iter().map(|tensor| tensor.source_bytes).sum();
+        let dense_source: u64 = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id != "fp8-e4m3-scalar-v1")
+            .map(|tensor| tensor.source_bytes)
+            .sum();
         assert_eq!(
             plan.resident_bytes(),
-            2 * declared,
-            "fp8 → bf16 dense residency prices at twice the stored bytes"
+            2 * fp8_source + dense_source,
+            "fp8 → bf16 doubles; dense rows are byte-preserving"
         );
-        assert!(plan.tensors.iter().all(|tensor| matches!(
-            &tensor.codec,
-            mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
-                scale: mlx_gen::gen_core::ScalarScaleSource::Unit,
-                ..
-            }
-        )));
         let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
             .expect("deferred read through the seam");
         assert!(lazy.get("img_in.weight").is_some());
@@ -1101,6 +1142,92 @@ mod tests {
             "RESULT kreamania-int8 tensors={} int8_layers={int8_layers} source_bytes={} \
              resident_bytes={}",
             plan.tensor_count(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
+    /// Real-weight check of the **published KreaMania V1/V2 fp8** artifacts (sc-20385 AC3): these
+    /// are descriptor-gated **scaled** fp8, not the plain cast — 942 tensors carrying 256
+    /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values, and 256
+    /// `.comfy_quant` descriptors, of which **96 set `full_precision_matrix_mult`**, with the
+    /// remaining 174 tensors left BF16.
+    ///
+    /// So one file exercises three things the plain cast cannot: `ScalarScaleSource::Companion`
+    /// (never `Unit`), the `full_precision_matrix_mult` forced-dense rule, and mixed per-layer
+    /// dispatch against dense bf16 — on the real published artifact.
+    /// `KREA_NATIVE_DIT_FP8_SCALED` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8"]
+    fn kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_FP8_SCALED") else {
+            panic!("set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8 DiT");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping,
+        )
+        .expect("the published scaled fp8 artifact plans through the Krea native mapping");
+
+        assert_eq!(plan.tensor_count(), 430);
+        assert_eq!(plan.codec_ids(), ["dense-bf16-v1", "fp8-e4m3-scalar-v1"]);
+        let fp8: Vec<_> = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "fp8-e4m3-scalar-v1")
+            .collect();
+        assert_eq!(fp8.len(), 256, "256 scaled fp8 projections");
+
+        // Every fp8 layer takes its scale from a companion — NOT the plain cast's unit scale.
+        // This is the assertion the plain-cast test cannot make.
+        assert!(
+            fp8.iter().all(|tensor| matches!(
+                &tensor.codec,
+                mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
+                    scale: mlx_gen::gen_core::ScalarScaleSource::Companion { .. },
+                    ..
+                }
+            )),
+            "a published V1/V2 layer must never plan at unit scale"
+        );
+        let fpmm = fp8
+            .iter()
+            .filter(|tensor| tensor.codec.full_precision_matrix_mult())
+            .count();
+        assert_eq!(fpmm, 96, "96 layers declare full_precision_matrix_mult");
+        // NOTE: asserting these layers plan *dense* would be vacuous here — MLX plans under
+        // `DenseResidencyPolicy`, so every layer is dense whether or not the flag is honored
+        // (verified: deleting the fpmm-forces-dense rule in the compiler leaves this test green).
+        // The flag's residency consequence is tested where a packed policy exists, in gen-core's
+        // `packed_policy_prices_stored_bytes_plus_scales_and_honors_full_precision_layers`. What
+        // this assertion is worth on the real artifact is that the descriptor parse recovered the
+        // flag from 96 of 256 real `.comfy_quant` payloads at all.
+
+        // 256 weight_scale + 256 comfy_quant, every one consumed; every data byte accounted for.
+        assert_eq!(plan.companions.len(), 256 * 2);
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+
+        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
+            .expect("deferred read through the seam");
+        assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
+        assert!(
+            lazy.keys()
+                .all(|key| !key.ends_with(".comfy_quant") && !key.ends_with(".weight_scale")),
+            "companions are consumed, never remapped"
+        );
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-scaled-fp8 tensors={} fp8={} fpmm={fpmm} source_bytes={} \
+             resident_bytes={}",
+            plan.tensor_count(),
+            fp8.len(),
             plan.source_bytes,
             plan.resident_bytes()
         );
