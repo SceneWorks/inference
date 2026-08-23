@@ -880,22 +880,49 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
         return shell
 
-    def test_macos_metal_reclaims_broad_test_artifacts_before_bundle_profiles(self) -> None:
+    def test_macos_metal_builds_one_target_generation_without_cargo_clean(self) -> None:
+        # Until 2026-08-23 this lane ran `cargo clean` twice mid-job because the full-debuginfo test
+        # graph grew `target/` to 35 GB. Each clean discarded the cache-restored `pmetal-mlx-sys`
+        # output, so libmlx was rebuilt from cmake four times per job (~24 of 61 minutes against
+        # 6.7 minutes of test execution). The fix is line-tables-only debuginfo for the dev and
+        # test profiles; with it the four cargo invocations share one `target/` generation. Pin
+        # both halves: the env that makes the single generation fit, and the absence of the cleans
+        # that would throw it away again.
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        steps = workflow["jobs"]["macos-metal"]["steps"]
+        job = workflow["jobs"]["macos-metal"]
+        self.assertEqual(job["env"].get("CARGO_PROFILE_DEV_DEBUG"), "line-tables-only")
+        self.assertEqual(job["env"].get("CARGO_PROFILE_TEST_DEBUG"), "line-tables-only")
+        steps = job["steps"]
         names = [step.get("name") for step in steps]
-        pre_test_reclaim = "Reclaim Clippy and rustdoc artifacts before linking MLX tests"
-        reclaim = "Reclaim broad MLX test artifacts before bundle profiles"
-        self.assertEqual(names.count(pre_test_reclaim), 1)
+        for step in steps:
+            run = step.get("run")
+            if run is None:
+                continue
+            self.assertNotIn(
+                "cargo clean",
+                run,
+                f"macos-metal step {step.get('name')!r} runs `cargo clean`: that discards the "
+                "restored pmetal-mlx-sys build and reintroduces a full libmlx cmake rebuild",
+            )
+        # The cargo steps must all see the same target/ in this order so the bundle profiles and
+        # the Candle Metal Clippy reuse the test step's dependency and native-build artifacts.
+        order = [
+            "Cache Cargo and MLX native build",
+            "Clippy MLX packages",
+            "Rustdoc macOS MLX packages",
+            "Test MLX packages",
+            "Test LLM-only macOS bundle",
+            "Test LLM+audio macOS bundle",
+            "Clippy Candle Metal packages",
+        ]
+        indices = [names.index(name) for name in order]
+        self.assertEqual(indices, sorted(indices))
+        # The image-payload prune still runs, but in the background: inline it was 3.6 minutes on
+        # the critical path. It must start before the cache restore so the I/O overlaps the build.
+        reclaim = "Reclaim runner disk (background)"
         self.assertEqual(names.count(reclaim), 1)
-        self.assertLess(names.index("Rustdoc macOS MLX packages"), names.index(pre_test_reclaim))
-        self.assertLess(names.index(pre_test_reclaim), names.index("Test MLX packages"))
-        self.assertLess(names.index("Test MLX packages"), names.index(reclaim))
-        self.assertLess(names.index(reclaim), names.index("Test LLM-only macOS bundle"))
-        self.assertLess(names.index(reclaim), names.index("Test LLM+audio macOS bundle"))
-        self.assertLess(names.index(reclaim), names.index("Clippy Candle Metal packages"))
-        self.assertEqual(steps[names.index(pre_test_reclaim)]["run"], "cargo clean")
-        self.assertEqual(steps[names.index(reclaim)]["run"], "cargo clean")
+        self.assertLess(names.index(reclaim), names.index("Cache Cargo and MLX native build"))
+        self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
