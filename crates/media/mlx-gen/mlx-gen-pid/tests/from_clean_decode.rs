@@ -7,7 +7,7 @@
 //! Decodes the small (512→2048²) latent by default; set `PID_DECODE_NATIVE=1` for the full 1024→4096².
 //!
 //! ```sh
-//! cargo test -p mlx-gen-pid --release --test from_clean_decode -- --ignored --nocapture
+//! cargo test -p mlx-gen-pid --release --test integration from_clean_decode:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::decoder::LatentDecoder;

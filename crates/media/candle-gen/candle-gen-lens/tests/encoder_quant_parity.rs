@@ -14,7 +14,7 @@
 //!
 //! Gated on env vars; skips cleanly when unset. Run with the `cuda` feature, single-threaded so the
 //! two encoders load sequentially (not 2× resident at once):
-//!   cargo test -p candle-gen-lens --features cuda --test encoder_quant_parity -- --nocapture --test-threads=1
+//!   cargo test -p candle-gen-lens --features cuda --test integration encoder_quant_parity:: -- --nocapture --test-threads=1
 //!   LENS_TEXT_ENCODER_DIR — the Lens `text_encoder` snapshot dir (config.json + model-*.safetensors)
 //!   LENS_GOLDENS          — gptoss_goldens.safetensors (default: .scratch/gptoss-goldens/…)
 

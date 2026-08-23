@@ -6,7 +6,7 @@
 //! (the standard load-time-quant gate across the codebase; no torch reference needed). `#[ignore]`d —
 //! needs the golden + the ~8 GB bf16 transformer snapshot.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test dit_quant_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration dit_quant_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};

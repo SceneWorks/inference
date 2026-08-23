@@ -5,7 +5,7 @@
 //! ```sh
 //! SC16634_ID=sd3_5_large SC16634_ROUTE=txt2img SC16634_SNAPSHOT=/path/to/snapshot \
 //! SC16634_ARTIFACT_DIR=/path/to/artifacts \
-//!   cargo test --release -p mlx-gen-sd3 --test preview_real_weights -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-sd3 --test integration preview_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! Accepted evidence pins official SD3.5-Large revision

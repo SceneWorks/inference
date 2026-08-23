@@ -9,7 +9,7 @@
 //! ```sh
 //! SD3_PREVIEW_SNAPSHOT=/path/to/stable-diffusion-3.5-large \
 //! SD3_PREVIEW_ARTIFACT_DIR=/path/to/artifacts \
-//!   cargo test --release -p mlx-gen-sd3 --test fit_preview_rgb -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-sd3 --test integration fit_preview_rgb:: -- --ignored --nocapture
 //! ```
 
 use std::fmt::Write as _;

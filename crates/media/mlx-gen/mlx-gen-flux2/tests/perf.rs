@@ -10,8 +10,8 @@
 //!
 //! Run it (klein-9b from the HF cache, or point at a snapshot):
 //! ```text
-//! cargo test --release -p mlx-gen-flux2 --test perf -- --ignored --nocapture
-//! MLX_GEN_FLUX2_SNAPSHOT=<snapshot> cargo test --release -p mlx-gen-flux2 --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-flux2 --test integration perf:: -- --ignored --nocapture
+//! MLX_GEN_FLUX2_SNAPSHOT=<snapshot> cargo test --release -p mlx-gen-flux2 --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `FLUX2_PERF_WIDTH` / `FLUX2_PERF_HEIGHT` (default 1024×1024).
 

@@ -36,7 +36,7 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::{input_ids, QuantSpec, Weights};
 use mlx_llm::provider::eos_token_ids;
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_a_guarded_entry, Fixture};
 
 const PROMPT: &str = "The capital of France is";

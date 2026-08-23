@@ -7,7 +7,7 @@
 //! per-step Euler integration is exercised by the unified `candle_gen::run_flow_sampler` tests
 //! (epic 7114). Gated on the golden file existing (it needs the lens-venv to dump):
 //!   LENS_SCHEDULE_GOLDENS — lens_schedule_golden.safetensors (default: .scratch/lens-schedule-goldens/…)
-//! Run:  cargo test -p candle-gen-lens --test schedule_parity -- --nocapture
+//! Run:  cargo test -p candle-gen-lens --test integration schedule_parity:: -- --nocapture
 
 use candle_gen::candle_core::{Device, Result, Tensor};
 use candle_gen_lens::schedule::{cfg_rescale, lens_sigmas};

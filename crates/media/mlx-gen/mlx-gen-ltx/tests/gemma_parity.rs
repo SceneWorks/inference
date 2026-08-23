@@ -10,7 +10,7 @@
 //!    `LTX_GEMMA_DIR=… tools/dump_ltx_gemma_golden.py`, and this gates the Rust `GemmaLinear::Quant`
 //!    consumption (the reference `apply_quantization` path) end-to-end through all 48 layers.
 //!
-//! Run: `cargo test -p mlx-gen-ltx --test gemma_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-ltx --test integration gemma_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;

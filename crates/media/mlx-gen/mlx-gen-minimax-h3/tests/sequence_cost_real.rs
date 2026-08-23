@@ -5,7 +5,7 @@
 //! they run without `MINIMAX_H3_SNAPSHOT`:
 //!
 //! ```sh
-//! cargo test -p mlx-gen-minimax-h3 --test sequence_cost_real -- --ignored --nocapture \
+//! cargo test -p mlx-gen-minimax-h3 --test integration sequence_cost_real:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!

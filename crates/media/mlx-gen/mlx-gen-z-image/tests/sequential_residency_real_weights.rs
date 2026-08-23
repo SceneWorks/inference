@@ -1,7 +1,7 @@
 //! sc-10839 (epic 10834 Phase 1): the `Sequential` component-residency A/B on real Z-Image weights.
 //!
 //! `#[ignore]`d — needs a real Z-Image-Turbo snapshot (`ZIMAGE_SNAPSHOT`, else the HF cache). Run:
-//!   cargo test -p mlx-gen-z-image --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SDXL A/B (see that file), with one adjudicated amendment (sc-18149):
 //! (1) `Sequential` peaks LOWER than `Resident` because the Qwen text encoder is dropped
@@ -44,7 +44,7 @@
 //! the artifacts alone. Set `ZIMAGE_AB_RENDER_OUT` to also dump viewable PPMs (each leg plus an
 //! 8x-amplified diff) for adjudication with eyes on the renders.
 
-mod common;
+use crate::common;
 
 use common::snapshot;
 use mlx_gen::gen_core::{

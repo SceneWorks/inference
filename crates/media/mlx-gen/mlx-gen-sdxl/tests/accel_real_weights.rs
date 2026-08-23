@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the acceleration LoRAs in the HF cache:
 //!   latent-consistency/lcm-lora-sdxl, ByteDance/SDXL-Lightning, ByteDance/Hyper-SD.
-//!   cargo test -p mlx-gen-sdxl --release --test accel_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration accel_real_weights:: -- --ignored --nocapture
 //!
 //! Two gates:
 //! - `few_step_renders_are_coherent` (acceptance): load SDXL + each accel LoRA, render at the locked
@@ -17,7 +17,7 @@
 //!   px>8 vs the torch image (from `dump_sdxl_accel_golden.py render`). Interpreted against the
 //!   ancestral baseline torch↔MLX gap, also printed.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

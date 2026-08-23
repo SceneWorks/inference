@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache and the
 //! golden produced by `tools/dump_z_image_golden.py` (gitignored, local). Run with:
-//!   cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration e2e_real_weights:: -- --ignored --nocapture
 //!
 //! The stage tests validate each pipeline stage on real bf16 weights against the fork's
 //! intermediates; the final test drives the **public** `load(id, spec).generate(req)` API and
@@ -31,8 +31,7 @@ const Q4_GOLDEN: &str = concat!(
     "/../tools/golden/z_image_q4_golden.safetensors"
 );
 
-/// Locate the Z-Image-Turbo snapshot dir (env override, else the HF cache).
-mod common;
+use crate::common;
 use common::snapshot;
 
 /// Peak-relative error `max|a-b| / max|b|` — the meaningful metric for high-dynamic-range

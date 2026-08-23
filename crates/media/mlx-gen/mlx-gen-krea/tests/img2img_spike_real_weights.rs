@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/q8 \
-//!   cargo test -p mlx-gen-krea --release --test img2img_spike_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration img2img_spike_real_weights:: -- --ignored --nocapture
 //! ```
 //! (With no env, auto-resolves the newest cached `SceneWorks/krea-2-turbo-mlx` q8 turnkey.) PNGs +
 //! a `SUMMARY` table land in `/tmp/krea_img2img_spike`.

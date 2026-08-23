@@ -5,7 +5,7 @@
 //! `#[ignore]` — needs the Base snapshot (`vae/`) + the golden (`tools/dump_boogu_vae_golden.py`):
 //!   BOOGU_BASE_DIR=<snapshot> BOOGU_VAE_GOLDEN=<...>/boogu_vae.safetensors \
 //!     CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test vae_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration vae_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

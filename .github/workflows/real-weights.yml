@@ -364,8 +364,8 @@ jobs:
 
             # Gate 1 — conversion faithfulness: the published pack must be BIT-identical to the
             # in-app load-time pack, or the shipped tier and a dense-source render diverge.
-            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
-              packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+            cargo test --locked --release -p mlx-gen-chroma --test integration \
+              auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
               --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-identity.log"
             sed -n 's/^.*SC16462_IDENTITY //p' "$RUNNER_TEMP/chroma-q$bits-identity.log" \
               >> "$RUNNER_TEMP/chroma-sc16462-identity.jsonl"
@@ -375,8 +375,8 @@ jobs:
             # actually smaller. Deliberately NO pixel-identity threshold against the bf16-auxiliary
             # render: packing the text encoder to the selected tier is supposed to move the
             # conditioning, and gating on identity would only pass by not doing the work.
-            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_tier_comparison \
-              compare_auxiliary_widths -- --ignored --exact --nocapture --test-threads=1 \
+            cargo test --locked --release -p mlx-gen-chroma --test integration \
+              auxiliary_tier_comparison::compare_auxiliary_widths -- --ignored --exact --nocapture --test-threads=1 \
               | tee "$RUNNER_TEMP/chroma-q$bits-comparison.log"
             sed -n 's/^.*auxiliaries @ //p' "$RUNNER_TEMP/chroma-q$bits-comparison.log" \
               >> "$RUNNER_TEMP/chroma-sc16462-comparison.jsonl"
@@ -521,8 +521,8 @@ jobs:
             SC16462_BASELINE="$CHROMA_SNAPSHOT/q$bits" \
             SC16462_OUT="$CHROMA_BUILT/q$bits" \
             SC16462_MODEL="$CHROMA_MODEL" \
-              cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
-                packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+              cargo test --locked --release -p mlx-gen-chroma --test integration \
+                auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
                 --test-threads=1
             cp -R "$CHROMA_BUILT/q$bits/identity-q$bits" "$CHROMA_PACKED/q$bits"
             diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
@@ -808,7 +808,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-kolors \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -920,7 +920,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-sdxl \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -1016,7 +1016,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-chroma-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-chroma \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -1206,8 +1206,8 @@ jobs:
             # `--exact` AFTER `--`: it is a libtest flag, and libtest is also what consumes
             # `--ignored`. The filter itself is cargo's positional test-name argument.
             out="$(cargo test --locked --release -p mlx-gen-chroma \
-              --test memory_ladder_real_weights \
-              "$name" -- --exact --ignored --test-threads=1 --nocapture 2>&1 \
+              --test integration \
+              memory_ladder_real_weights::"$name" -- --exact --ignored --test-threads=1 --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/chroma-ladder-$name.log" /dev/stderr)"
             echo "::endgroup::"
             # A rename, a typo, or a lost `#[ignore]` all produce "0 passed" and exit 0. This is
@@ -1282,7 +1282,7 @@ jobs:
       - name: Run Mage request-memory lifecycle
         run: >-
           cargo test --locked --release -p mlx-gen-mage
-          --test request_memory_scope_real_weights -- --ignored --nocapture
+          --test integration request_memory_scope_real_weights:: -- --ignored --nocapture
 
   # sc-18249: the SANA tiled-decode drift ceiling (`DECODE_TILING_MEAN_ABS_U8 = 6.0`) was enforced
   # only by `#[ignore]` real-weight tests no workflow referenced — the exact sc-17250 shape: a
@@ -1377,16 +1377,16 @@ jobs:
           # carry). Per invocation rather than aggregate, so one invocation matching two tests
           # can never cover for the other matching none.
           out="$(cargo test --locked --release -p mlx-gen-sana \
-            --test memory_ladder_real_weights \
-            the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            memory_ladder_real_weights::the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$SANA_DRIFT_LOG" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::the resample test did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
             exit 1
           fi
           out="$(cargo test --locked --release -p mlx-gen-sana \
-            --test memory_ladder_real_weights \
-            the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            memory_ladder_real_weights::the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee -a "$SANA_DRIFT_LOG" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::the domain sweep did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
@@ -1513,8 +1513,8 @@ jobs:
           mkdir -p "$MEMORY_EVIDENCE_OUTPUT_DIR"
           set -o pipefail
           cargo test --locked --release -p mlx-gen-z-image \
-            --test sequential_residency_real_weights \
-            sequential_bounds_peak_within_declared_decode_drift -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            sequential_residency_real_weights::sequential_bounds_peak_within_declared_decode_drift -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$MEMORY_EVIDENCE_LOG"
           python3.12 scripts/release/verify_model_snapshot.py \
             --model z-image-turbo \
@@ -1598,8 +1598,8 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "$MLX_LLM_QWEN3_MODEL"
       - name: Run representative conformance
         run: |
-          cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture
-          cargo test --locked -p mlx-llm --test conformance real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p mlx-llm --test integration conformance::real_model_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p mlx-llm --test integration conformance::real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
 
   # sc-17250: the 16 GB JoyCaption snapshot was maintained on a runner for a year while NO workflow
   # ran the four `#[ignore]` tests it backs — golden-token VLM parity that was protecting nothing.
@@ -1681,8 +1681,8 @@ jobs:
           run_one() {
             local name="$1"
             local out
-            out="$(cargo test --locked --release -p mlx-llm --test joycaption \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            out="$(cargo test --locked --release -p mlx-llm --test integration \
+              joycaption::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -1806,8 +1806,8 @@ jobs:
         run: |
           set -o pipefail
           out="$(SDXL_SNAPSHOT="$SDXL_N1_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-sdxl --test vae_real_weights \
-            native_decode_seam_is_byte_exact_to_pre_seam_engine \
+            cargo test --locked --release -p mlx-gen-sdxl --test integration \
+            vae_real_weights::native_decode_seam_is_byte_exact_to_pre_seam_engine \
             -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
       - name: Derive immutable Mage oracle cache key
@@ -2023,8 +2023,8 @@ jobs:
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       - name: Run provider conformance
         run: >-
-          cargo test --locked -p mlx-gen-z-image --test conformance
-          z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked -p mlx-gen-z-image --test integration
+          conformance::z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-17739 — the first real-weight gate `mlx-gen-lens` has ever had. Run as TWO cargo
       # invocations, deliberately: each conformance run holds a ~21 GiB model resident across ~8
       # renders, and running both ids in one process was SIGKILLed on the dev Mac. Separate processes
@@ -2033,12 +2033,12 @@ jobs:
       # covers the guided `[pos; neg]` path. Both resolve from the one snapshot.
       - name: Run Lens provider conformance (turbo — the CFG-off default path)
         run: >-
-          cargo test --locked --release -p mlx-gen-lens --test conformance
-          lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked --release -p mlx-gen-lens --test integration
+          conformance::lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
       - name: Run Lens provider conformance (base — the guided path)
         run: >-
-          cargo test --locked --release -p mlx-gen-lens --test conformance
-          lens_base_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked --release -p mlx-gen-lens --test integration
+          conformance::lens_base_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-14038 DoD gate — the ONLY automatic run of the Qwen3-VL text-encoder parity suite. It
       # needs both the 8.875 GB `text_encoder/` component and the CPU-dumped boundary golden,
       # neither of which the PR lanes have. It also carries the self-invalidating assertion that
@@ -2046,11 +2046,11 @@ jobs:
       # numerically (today it cannot, so `verify_text_config` guards that instead).
       - name: Run Mage-Flow text-encoder parity
         run: >-
-          cargo test --locked --release -p mlx-gen-mage --test te_parity_real_weights
+          cargo test --locked --release -p mlx-gen-mage --test integration te_parity_real_weights::
           -- --ignored --nocapture
       - name: Run Mage-VAE all-geometry parity
         run: >-
-          cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
+          cargo test --locked --release -p mlx-gen-mage --test integration vae_decode_real_weights::
           -- --ignored --nocapture
       # SC-15507: one loaded provider executes A -> B -> A request scopes, observes cancellation at
       # Mage's terminal post-trace check, injects an error outcome after real work, and proves both
@@ -2062,21 +2062,21 @@ jobs:
           MAGE_REQUEST_SCOPE_QUANT: bf16
         run: >-
           cargo test --locked --release -p mlx-gen-mage
-          --test request_memory_scope_real_weights -- --ignored --nocapture
+          --test integration request_memory_scope_real_weights:: -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
         run: |
           status=0
           MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            cargo test --locked --release -p mlx-gen-mage --test integration edit_real_weights:: \
             -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_BASE_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_base_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+            cargo test --locked --release -p mlx-gen-mage --test integration \
+            edit_real_weights::fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_TURBO_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_turbo_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+            cargo test --locked --release -p mlx-gen-mage --test integration \
+            edit_real_weights::fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           exit "$status"
       - name: Atomically promote the verified Mage manifests into this runner's operator seed
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
@@ -2369,8 +2369,8 @@ jobs:
         run: |
           set -o pipefail
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-qwen-image --test vae_real_weights \
-            native_decode_seam_is_byte_exact_and_precancelled \
+            cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+            vae_real_weights::native_decode_seam_is_byte_exact_and_precancelled \
             -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
       # EVERY step below selects by NAME with `--exact` and asserts the run count. All three halves of
@@ -2404,8 +2404,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_CONTROL_WEIGHTS="$QWEN_CONTROL_UNION_SNAPSHOT/bf16/model.safetensors" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test control_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              control_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2421,8 +2421,8 @@ jobs:
           run_one() {
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test unified_sampler_smoke \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              unified_sampler_smoke::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2443,8 +2443,8 @@ jobs:
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
               QWEN_CONTROL_WEIGHTS="$QWEN_CONTROL_UNION_SNAPSHOT/bf16/model.safetensors" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test sequential_residency_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              sequential_residency_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2463,8 +2463,8 @@ jobs:
           name=bounded_window_is_distinct_from_the_unbounded_stream_control
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/q8" QWEN_RUNG4_TIER=q8 \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test block_residency_real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            block_residency_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2483,8 +2483,8 @@ jobs:
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test lightning_render_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              lightning_render_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2520,8 +2520,8 @@ jobs:
           name=edit_generate_is_deterministic_rust
           out="$(QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test edit_real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            edit_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2550,8 +2550,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test adapter_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              adapter_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2591,8 +2591,8 @@ jobs:
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
             QWEN_LIGHTNING_SNAPSHOT="$QWEN_LIGHTNING_SNAPSHOT" \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test fit_preview_rgb \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            fit_preview_rgb::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2628,8 +2628,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test perf \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              perf::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2710,8 +2710,8 @@ jobs:
               PID_QWEN_SAFETENSORS="$PID_QWEN_SNAPSHOT/pid_qwenimage_2kto4k.safetensors" \
               PID_GEMMA_DIR="$PID_GEMMA_SNAPSHOT" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test pid_decode_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              pid_decode_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2728,8 +2728,8 @@ jobs:
             out="$(PID_FLUX_SAFETENSORS="$PID_FLUX_SNAPSHOT/pid_flux_2kto4k.safetensors" \
               PID_GEMMA_DIR="$PID_GEMMA_SNAPSHOT" \
               cargo test --locked --release -p mlx-gen-flux \
-              --test pid_decode_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              pid_decode_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2798,8 +2798,8 @@ jobs:
           set -o pipefail
           name=dump_runb_latents
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-qwen-image --test dump_runb_latents \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+            dump_runb_latents::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2918,7 +2918,7 @@ jobs:
         run: |
           set -o pipefail
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test integration generate_smoke:: \
             -- --ignored --nocapture --test-threads 1 \
             --skip kv_cache_residency_at_the_production_geometry \
             --skip long_clip_coherence_under_the_bounded_window \
@@ -2951,8 +2951,8 @@ jobs:
                 "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             else
               out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-                cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+                cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+                generate_smoke::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             fi
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
@@ -2987,8 +2987,8 @@ jobs:
             out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
               KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors" \
               KREA_DISTILL_LORA="$KREA_DISTILL_LORA_SNAPSHOT/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors" \
-              cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+              style_lora_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -3283,8 +3283,8 @@ jobs:
           # run whose measured cells someone needs to read. Extraction and upload are separate `always()`
           # steps for the same reason.
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-            "$name" -- --exact --ignored --nocapture 2>&1 \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+            generate_smoke::"$name" -- --exact --ignored --nocapture 2>&1 \
             | tee "$RUNNER_TEMP/s18-sweep.log" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
@@ -3578,8 +3578,8 @@ jobs:
           set -o pipefail
           run_one() {
             local name="$1" out
-            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -3605,8 +3605,8 @@ jobs:
           set -o pipefail
           run_one() {
             local name="$1" out
-            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -3637,8 +3637,8 @@ jobs:
           set -o pipefail
           run_one() {
             local name="$1" out
-            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test staged_residency \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              staged_residency::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -3689,8 +3689,8 @@ jobs:
         run: |
           set -o pipefail
           name=real_weight_decode_matches_the_official_diffusers_vae
-          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -3726,8 +3726,8 @@ jobs:
         run: |
           set -o pipefail
           name=real_weight_encode_matches_the_official_diffusers_vae
-          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -3764,8 +3764,8 @@ jobs:
         run: |
           set -o pipefail
           name=real_weight_te_context_matches_the_official_conditioner
-          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -5860,7 +5860,7 @@ jobs:
           for %%R in (resident staged attention blocks) do (
             set "MAGE_MEMORY_RUNG=%%R"
             set "MAGE_MEMORY_OUT=%RUNNER_TEMP%\mage-memory-%%R.rgb"
-            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test memory_ladder_real_weights representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
+            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test integration memory_ladder_real_weights::representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
           )
       - name: Upload Mage rung outputs
         if: always()
@@ -6099,13 +6099,13 @@ jobs:
         run: |
           call "%VCVARS%"
           set "MAGE_CONFORMANCE_FAILED=0"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked -p candle-gen-z-image --features cuda --test integration conformance::z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration real_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration cuda_1024:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration edit_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           for %%T in (q4 q8 bf16) do (
             set "MAGE_QUANT_TIER=%%T"
-            cargo test --locked --release -p candle-gen-mage --features cuda --test quant_real_weights registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+            cargo test --locked --release -p candle-gen-mage --features cuda --test integration quant_real_weights::registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           )
           if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1
 
@@ -6184,11 +6184,11 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib edit_validate::real_weight_edit -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib ip_validate::real_weight_ip_adapter -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test trainer_e2e sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration trainer_e2e::sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
 
   candle-mmaudio:
     name: Candle mmaudio real weights (CUDA)
@@ -6547,7 +6547,7 @@ jobs:
 
           :run_one
           set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
@@ -6584,7 +6584,7 @@ jobs:
 
           :run_one
           set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test real_weights %~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
@@ -6683,7 +6683,7 @@ jobs:
           rem so this selection is checked to name a test that still EXISTS and is still `#[ignore]`d.
           set "name=minimax_h3_vram_bf16"
           set "log=%RUNNER_TEMP%\minimax-h3-vram-bf16.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test vram_probe %name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           rem The machine-parseable datum is the whole point of the run; a green step that produced

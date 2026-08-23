@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! set SDXL_SNAPSHOT=C:\Users\…\models--stabilityai--stable-diffusion-xl-base-1.0\snapshots\<hash>
-//! cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-sdxl --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 //!
 //! ## SDXL parity (sc-3677)
@@ -93,7 +93,7 @@ fn sdxl_conformance() {
 ///
 /// ```text
 /// set REALVISXL_SNAPSHOT=C:\Users\…\models--SG161222--RealVisXL_V5.0\snapshots\<hash>
-/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored
+/// cargo test -p candle-gen-sdxl --features cuda --release --test integration conformance:: -- --ignored
 /// ```
 #[test]
 #[ignore = "needs REALVISXL_SNAPSHOT (a RealVisXL_V5.0 diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
@@ -126,7 +126,7 @@ fn realvisxl_conformance() {
 ///
 /// ```text
 /// set REALVISXL_LIGHTNING_SNAPSHOT=C:\Users\…\models--…--RealVisXL-Lightning\snapshots\<hash>
-/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored realvisxl_lightning_render
+/// cargo test -p candle-gen-sdxl --features cuda --release --test integration -- --ignored conformance::realvisxl_lightning_render
 /// ```
 #[test]
 #[ignore = "needs REALVISXL_LIGHTNING_SNAPSHOT (a distilled Lightning snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
@@ -207,7 +207,7 @@ fn realvisxl_lightning_render() {
 ///
 /// ```text
 /// set SDXL_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sdxl-base-mlx\snapshots\<hash>\q4
-/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored sdxl_cfg_off
+/// cargo test -p candle-gen-sdxl --features cuda --release --test integration -- --ignored conformance::sdxl_cfg_off
 /// ```
 #[test]
 #[ignore = "needs SDXL_SNAPSHOT (a diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]
@@ -322,7 +322,7 @@ const SHORT_PREFIX: &str = "a highly detailed cinematic portrait of a weathered 
 ///
 /// ```text
 /// set SDXL_SNAPSHOT=E:\huggingface\hub\models--stabilityai--stable-diffusion-xl-base-1.0\snapshots\<hash>
-/// cargo test -p candle-gen-sdxl --features cuda --release --test conformance -- --ignored sdxl_long_prompt
+/// cargo test -p candle-gen-sdxl --features cuda --release --test integration -- --ignored conformance::sdxl_long_prompt
 /// ```
 #[test]
 #[ignore = "needs SDXL_SNAPSHOT (a diffusers snapshot dir) + a CUDA GPU; run with --features cuda --ignored"]

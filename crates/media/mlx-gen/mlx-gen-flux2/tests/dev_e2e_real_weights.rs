@@ -1,7 +1,7 @@
 //! sc-2365: FLUX.2-**dev** end-to-end txt2img on real weights. `#[ignore]`d — needs the real
 //! `black-forest-labs/FLUX.2-dev` snapshot (~60 GB DiT + ~45 GB TE):
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test dev_e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration dev_e2e_real_weights:: -- --ignored --nocapture
 //!
 //! Proves the whole dev vertical end to end: assemble a pre-quantized Q4 snapshot (sc-5917 convert
 //! for DiT + TE, VAE/tokenizer symlinked from the source), load it through the registry
@@ -22,8 +22,7 @@ use mlx_gen::media::Image;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_flux2::{quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 
-#[path = "../../tests/support/atomic_cache.rs"]
-mod atomic_cache;
+use crate::atomic_cache;
 
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;

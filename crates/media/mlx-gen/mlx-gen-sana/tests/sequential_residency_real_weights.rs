@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs a real `Sana_1600M_1024px_diffusers`-shaped snapshot (`SANA_PIPELINE_WEIGHTS`).
 //! Run:
 //!   SANA_PIPELINE_WEIGHTS=/path/Sana_1600M_1024px_diffusers \
-//!     cargo test -p mlx-gen-sana --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sana --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SDXL / Z-Image A/Bs: (1) `Sequential` peaks LOWER than `Resident` because the
 //! Gemma-2 CHI text encoder is dropped (+ `clear_cache()`) before the Linear-DiT trunk + DC-AE

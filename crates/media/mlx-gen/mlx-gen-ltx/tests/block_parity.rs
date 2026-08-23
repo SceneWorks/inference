@@ -7,7 +7,7 @@
 //! "divergence is not rounding": f32 dequant is bit-identical, so the only gap is SDPA/matmul
 //! summation ordering (shared mlx ops → tight).
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test block_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration block_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract};
 use mlx_rs::Array;

@@ -9,7 +9,7 @@
 //!    checks `prompt_embeds` + both attention masks reproduce `mochi_te_golden.safetensors`.
 //!
 //! Run the real-weight gate:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test te_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration te_parity:: -- --ignored --nocapture`
 
 use mlx_gen::tokenizer::to_arrays;
 use mlx_gen::weights::Weights;

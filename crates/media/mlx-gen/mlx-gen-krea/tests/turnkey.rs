@@ -11,7 +11,7 @@
 //!   KREA_ASM_BITS=8|4                    (defaults to 8 — the ship default)
 //! e.g. assemble Q8 + verify:
 //!   KREA_TURBO_DIR=<snapshot> KREA_ASM_OUT=~/krea-2-turbo-mlx KREA_ASM_BITS=8 \
-//!     cargo test -p mlx-gen-krea --release --test turnkey assemble_turnkey_loads -- --ignored --nocapture
+//!     cargo test -p mlx-gen-krea --release --test integration turnkey::assemble_turnkey_loads -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 

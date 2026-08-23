@@ -6,7 +6,7 @@
 //! (`tools/dump_ideogram4_te_golden.py`). Run:
 //!   tools/dump_ideogram4_te_golden.py   # writes tools/golden/ideogram4_te.safetensors
 //!   CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-ideogram --test te_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration te_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

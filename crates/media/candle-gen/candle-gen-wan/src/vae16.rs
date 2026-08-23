@@ -1108,7 +1108,7 @@ mod budget_tests {
     /// peak-VRAM anchors (RTX PRO 6000 Blackwell, sm_120, f32, real Wan2.2-T2V-A14B z16 weights) it was
     /// fit from — `estimated ≥ measured` for every anchor (never under-predict ⇒ the selector never OKs
     /// a tile / single-pass that OOMs), and not absurdly over (≤ 2.5×). Regenerate the tiled anchors with
-    /// `cargo test -p candle-gen-wan --features cuda --release --test vae16_decode_sweep -- --ignored
+    /// `cargo test -p candle-gen-wan --features cuda --release --test integration vae16_decode_sweep:: -- --ignored
     /// --nocapture` after a decoder or candle-allocator change.
     #[test]
     fn wan_z16_decode_peak_matches_cuda_anchors() {

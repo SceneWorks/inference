@@ -5,7 +5,7 @@
 //! `.safetensors` whose blocks are keyed `layers.<n>.…` (measured against `SceneWorks/z-image-turbo-mlx`
 //! q4), then:
 //!   MLX_GEN_BLOCK_WEIGHTS=/path/to/transformer/model.safetensors \
-//!     cargo test -p mlx-gen --release --test block_residency_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen --release --test integration block_residency_real_weights:: -- --ignored --nocapture
 //!
 //! The path is supplied, never derived: inference does not resolve HF caches itself — the caller owns
 //! artifact resolution and hands down a concrete path. `scripts/check-workspace.py` enforces that.

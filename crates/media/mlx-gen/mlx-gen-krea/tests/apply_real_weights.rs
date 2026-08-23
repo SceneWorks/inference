@@ -15,7 +15,7 @@
 //! ```sh
 //! KREA_RAW_DIR=/path/to/models--krea--Krea-2-Raw/snapshots/<rev> \
 //! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
-//!   cargo test -p mlx-gen-krea --release --test apply_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration apply_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

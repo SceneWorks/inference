@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! SCAIL2_SNAPSHOT_DIR=/path/to/scail2-mlx \
-//!   cargo test -p mlx-gen-scail2 --release --test vae_decode_tiling_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-scail2 --release --test integration vae_decode_tiling_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

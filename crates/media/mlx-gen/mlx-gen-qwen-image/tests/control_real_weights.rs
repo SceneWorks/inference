@@ -27,7 +27,7 @@
 //! pose effect end-to-end on real weights.
 //!
 //! Run (the scale gates load the ~40 GB base transformer):
-//!   cargo test -p mlx-gen-qwen-image --release --test control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration control_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

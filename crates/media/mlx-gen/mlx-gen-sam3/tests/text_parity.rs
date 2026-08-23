@@ -6,7 +6,7 @@
 //!   SAM3_WEIGHTS=.../model.safetensors \
 //!   SAM3_TEXT_FIXTURE=scripts/spikes/sam3_oracle/text_fixture.safetensors \
 //!   SAM3_TOKENIZER=.../tokenizer.json \
-//!     cargo test -p mlx-gen-sam3 --release --test text_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam3 --release --test integration text_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3TextConfig, Sam3TextEncoder, Sam3Tokenizer};

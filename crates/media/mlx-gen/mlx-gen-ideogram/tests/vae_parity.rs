@@ -4,7 +4,7 @@
 //!
 //! `#[ignore]` — needs the converted snapshot + the golden (`tools/dump_ideogram4_vae_golden.py`):
 //!   CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-ideogram --test vae_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration vae_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

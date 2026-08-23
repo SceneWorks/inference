@@ -6,7 +6,7 @@
 //! reference's condition ids. Greedy argmax on the understanding path is robust, so a long agreeing
 //! prefix is expected (a late bf16-vs-f32 near-tie flip is tolerated).
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test vqa_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration vqa_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

@@ -5,7 +5,7 @@
 //! and this gates the whole-forward composition on the tiny seeded S5 weights, in CI, no real
 //! checkpoint).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MLX_GEN_FLUX_SNAPSHOT=/path/to/FLUX.1-schnell/snapshot \
-//!   cargo test -p mlx-gen-flux --release --test ip_generate_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux --release --test integration ip_generate_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! This is the engine-side structural acceptance for sc-3624 (the torch A/B numeric parity is the

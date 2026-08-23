@@ -13,7 +13,7 @@ use candle_gen_krea::transformer::block::{SingleStreamBlock, TextFusionTransform
 use candle_gen_krea::transformer::rope::RopeTables;
 use candle_gen_krea::Krea2Transformer;
 
-mod common;
+use crate::common;
 
 use common::{
     tiny_dit_config, SHARED_FIXTURE_DIT_AXES_DIMS_ROPE, SHARED_FIXTURE_DIT_EPS,

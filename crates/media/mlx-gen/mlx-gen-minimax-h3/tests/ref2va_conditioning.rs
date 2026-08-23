@@ -37,7 +37,7 @@
 //! `JointVelocity` standing in for the DiT. Checkpoint selection and the two-checkpoint memory
 //! property are gated separately, on real weights, by `ref2va_checkpoint.rs`.
 
-mod common;
+use crate::common;
 
 use common::{encode_fixture_config, rel, ENCODE_FIXTURE};
 

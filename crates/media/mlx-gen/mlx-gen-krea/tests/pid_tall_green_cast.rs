@@ -9,7 +9,7 @@
 //! bottom-vs-top excess. Both PNGs are written for visual inspection.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-krea --release --test pid_tall_green_cast -- --ignored --nocapture
+//! cargo test -p mlx-gen-krea --release --test integration pid_tall_green_cast:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

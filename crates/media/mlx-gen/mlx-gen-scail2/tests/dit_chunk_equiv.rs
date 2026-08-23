@@ -21,7 +21,7 @@
 //! the small sequence so every code path (chunk boundary, last-block remainder, eval-per-block) fires.
 //!
 //! `#[ignore]` because it reuses the locally-generated `dit_parity` fixtures (see that module's doc).
-//! Run with `cargo test -p mlx-gen-scail2 --test dit_chunk_equiv -- --ignored`.
+//! Run with `cargo test -p mlx-gen-scail2 --test integration dit_chunk_equiv:: -- --ignored`.
 
 use std::path::PathBuf;
 

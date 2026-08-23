@@ -4,7 +4,7 @@
 //! materializes a ~14 GiB transient in one shot — OOM/violet on 8 GB).
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` snapshot in the HF cache. Run with:
-//!   cargo test -p mlx-gen-z-image --release --test vae_tiling_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration vae_tiling_real_weights:: -- --ignored --nocapture
 //!
 //! The Z-Image VAE is a diffusers AutoencoderKL whose up-blocks + `conv_norm_out` use **GroupNorm**
 //! (spatially global statistics). Since SC-19753 the bounded path computes those statistics over the
@@ -20,7 +20,7 @@ use mlx_gen_z_image::{
 };
 use mlx_rs::{Array, Dtype};
 
-mod common;
+use crate::common;
 use common::snapshot_opt;
 
 fn bf16(a: &Array) -> Array {

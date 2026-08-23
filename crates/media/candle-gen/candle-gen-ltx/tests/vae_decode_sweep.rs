@@ -20,7 +20,7 @@
 //! set CUDA_VISIBLE_DEVICES=0
 //! set LTX_CKPT=C:\Users\…\models--Lightricks--LTX-2.3\snapshots\<h>\ltx-2.3-22b-distilled.safetensors
 //! set LTX_W=768& set LTX_H=768& set LTX_FRAMES=25
-//!   cargo test -p candle-gen-ltx --features cuda --release --test vae_decode_sweep -- --ignored --nocapture
+//!   cargo test -p candle-gen-ltx --features cuda --release --test integration vae_decode_sweep:: -- --ignored --nocapture
 //! # add LTX_TILE_PX=512 [LTX_OVERLAP_PX=64 LTX_TILE_FRAMES=.. LTX_OVERLAP_FRAMES=..] for a fixed-tile run
 //! # add LTX_BUDGETED=1 [LTX_VAE_BUDGET_GIB=48] to exercise the production budgeted selector
 //! # add LTX_GPU=0 to pick which GPU ordinal nvidia-smi samples (default 0; pair with CUDA_VISIBLE_DEVICES)

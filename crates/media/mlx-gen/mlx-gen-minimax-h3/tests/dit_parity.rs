@@ -31,7 +31,7 @@
 //! 1e-1 or above, i.e. ≥24× the floor. That margin is measured on every run rather than assumed,
 //! because a suite whose mutations sat near its own noise floor would be reporting jitter.
 
-mod common;
+use crate::common;
 
 use common::{
     assert_parity, cosine, dit_fixture_config, l2_norm, rel, std_dev, DIT_FIXTURE, DIT_LAYOUT,

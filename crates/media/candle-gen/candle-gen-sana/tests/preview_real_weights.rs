@@ -34,7 +34,7 @@
 //! SANA_BASE_SNAPSHOT=E:\huggingface\hub\models--Efficient-Large-Model--Sana_1600M_1024px_diffusers\snapshots\<rev> \
 //! SANA_SPRINT_SNAPSHOT=E:\huggingface\hub\models--Efficient-Large-Model--Sana_Sprint_1.6B_1024px_diffusers\snapshots\<rev> \
 //! SANA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16959 \
-//!   cargo test -p candle-gen-sana --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-sana --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

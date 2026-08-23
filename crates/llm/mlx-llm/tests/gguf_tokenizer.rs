@@ -28,7 +28,7 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::eos_token_ids;
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_a_guarded_entry, Fixture};
 
 /// A varied corpus exercising the pieces that distinguish a correct reconstruction from a vocab-only

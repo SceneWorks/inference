@@ -7,7 +7,7 @@
 //! `#[ignore]`d — needs the real FLUX.2-klein-9b snapshot + the goldens from
 //! `tools/dump_flux2_quant_golden.py` (run once per bit-width: `BITS=8` and `BITS=4`).
 //!   cd ~/repos/mflux && BITS=8 .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_quant_golden.py
-//!   cargo test -p mlx-gen-flux2 --release --test quant_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration quant_real_weights:: -- --ignored --nocapture
 //!
 //! Gates (honoring the sc-2532 false-green lesson — full path, not fed intermediates):
 //!  1. **packing byte-parity** — the loaded Q8/Q4 `wq`/`scales`/`biases` of three representative

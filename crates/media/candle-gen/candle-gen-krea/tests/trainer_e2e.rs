@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! set KREA_RAW_DIR=D:\models\Krea-2-Raw
-//! cargo test -p candle-gen-krea --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-krea --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 //!
 //! What it proves (the sc-7577 AC):

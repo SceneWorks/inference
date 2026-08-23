@@ -4,7 +4,7 @@
 //! or the HF cache), the real LoRA (`~/repos/test-files/zhibi_flux.safetensors`, env `FLUX_LORA`), and
 //! the goldens from `tools/dump_flux_lora_golden.py` (gitignored, local):
 //!   cd ~/Repos/mflux && .venv-0312/bin/python ~/Repos/mlx-gen/tools/dump_flux_lora_golden.py
-//!   cargo test -p mlx-gen-flux --test adapter_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux --test integration adapter_real_weights:: -- --ignored --nocapture
 //!
 //! Gates: (1) the key→module map resolves the FULL fork `FluxLoRAMapping` surface (joint + single
 //! blocks incl. the adaLN modulation linears) on the real module tree, and rejects off-surface; (2) the

@@ -7,7 +7,7 @@
 //!
 //! Run (the `#[ignore]`d gates only): `cd ~/repos/mflux && uv run python
 //! ~/repos/mlx-gen/tools/dump_qwen_image_edit_golden.py`, then
-//! `cargo test -p mlx-gen-qwen-image --release --test edit_real_weights -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-qwen-image --release --test integration edit_real_weights:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

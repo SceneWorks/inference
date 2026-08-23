@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the real FLUX.2-klein-9b snapshot (env `MLX_GEN_FLUX2_SNAPSHOT` or the HF
 //! cache) and the adapter goldens from `tools/dump_flux2_adapter_golden.py` (gitignored, local):
 //!   cd ~/repos/mflux && .venv/bin/python ~/repos/mlx-gen/tools/dump_flux2_adapter_golden.py
-//!   cargo test -p mlx-gen-flux2 --test adapter_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration adapter_real_weights:: -- --ignored --nocapture
 //!
 //! Gates: (1) the key→module map resolves the FULL fork `Flux2LoRAMapping` surface (globals + 8
 //! double × 12 + 24 single × 2) against the real module tree, and rejects off-surface; (2) the

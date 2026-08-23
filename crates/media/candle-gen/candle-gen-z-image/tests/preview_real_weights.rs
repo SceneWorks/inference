@@ -43,7 +43,7 @@
 //! ZIMAGE_PREVIEW_POSE=E:\out\sc-16957\pose.ppm \
 //! ZIMAGE_PREVIEW_EDIT_SOURCE=E:\out\sc-16957\source.ppm \
 //! ZIMAGE_PREVIEW_ARTIFACT_DIR=E:\out\sc-16957 \
-//!   cargo test -p candle-gen-z-image --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-z-image --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MLX_GEN_ZIMAGE_SNAPSHOT=<path to a Z-Image-Turbo snapshot, or its q4/q8 tier subdirectory> \
-//!   cargo test -p mlx-gen-z-image --release --test bounded_attention_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration bounded_attention_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! ## What this pins
@@ -48,7 +48,7 @@
 //! Every number printed here is what the story's evidence quotes; nothing is asserted as a saving
 //! that was not measured.
 
-mod common;
+use crate::common;
 
 use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::GenerationMemory;

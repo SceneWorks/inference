@@ -8,13 +8,13 @@
 //!
 //! `#[ignore]`d — needs the real `Kwai-Kolors/Kolors-diffusers` snapshot (or `KOLORS_SNAPSHOT`) with
 //! the materialized `tokenizer/tokenizer.json`. Run:
-//!   cargo test -p mlx-gen-kolors --release --test lora_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration lora_parity:: -- --ignored --nocapture
 //!
 //! Validated at **f32** (the SDXL merge dtype): `scale=0≡base` is byte-exact regardless of dtype
 //! (`w + 0·delta = w`), but f32 keeps the `scale=1` forward free of fp16 chaos so the effect read is
 //! clean. The merge surface is the registry's production **Complete** coverage.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
