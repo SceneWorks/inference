@@ -1577,7 +1577,7 @@ fn request_mode(
     request: &GenerationRequest,
 ) -> crate::Result<WanPublicMode> {
     match request.video_mode.as_deref() {
-        Some("image_to_video") => {
+        Some("image_to_video") if prepared.route != WanI2vRoute::Vace => {
             reference(request)?;
             Ok(WanPublicMode::ImageToVideo)
         }
@@ -1626,7 +1626,7 @@ pub fn contract_for_mode_key(
     mode: &str,
 ) -> crate::Result<MemoryProviderContract> {
     let mode = match mode {
-        "image_to_video" => WanPublicMode::ImageToVideo,
+        "image_to_video" if prepared.route != WanI2vRoute::Vace => WanPublicMode::ImageToVideo,
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
         }
