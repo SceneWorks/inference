@@ -176,6 +176,9 @@ pub struct IpAdapterKolors {
     ip_encoder: IpImageEncoder,
     vae: AutoEncoderKL,
     device: Device,
+    memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
+    admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+    source_root: PathBuf,
 }
 
 impl IpAdapterKolors {
@@ -183,6 +186,30 @@ impl IpAdapterKolors {
     /// CLIP ViT-L/14-336 image encoder + the IP-Adapter-Plus Resampler, installing the decoupled-cross-
     /// attn K/V pairs into the UNet.
     pub fn load(paths: &IpAdapterKolorsPaths) -> Result<Self> {
+        Self::load_internal(paths, None, None)
+    }
+
+    pub fn load_with_memory_context(
+        paths: &IpAdapterKolorsPaths,
+        context: candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract_for("candle_kolors_ipadapter");
+        crate::memory_strategy::validate_bespoke_context(
+            &contract,
+            &paths.kolors_base,
+            &context,
+            true,
+            false,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Self::load_internal(paths, Some(contract), Some(context))
+    }
+
+    fn load_internal(
+        paths: &IpAdapterKolorsPaths,
+        memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
+        admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+    ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let base = paths.kolors_base.as_path();
 
@@ -248,12 +275,66 @@ impl IpAdapterKolors {
             ip_encoder,
             vae,
             device,
+            memory_contract,
+            admitted_context,
+            source_root: paths.kolors_base.clone(),
         })
     }
 
     /// Reference-image T2I: condition the Kolors generation on `reference`'s CLIP-ViT-L/14-336 identity
     /// tokens at `req.ip_adapter_scale`, denoising with the Kolors leading-Euler sampler.
     pub fn generate(
+        &mut self,
+        req: &IpAdapterKolorsRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "kolors-ip: admitted model requires generate_with_memory_context".into(),
+            ));
+        }
+        self.generate_inner(req, reference, on_progress)
+    }
+
+    pub fn generate_with_memory_context(
+        &mut self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+        req: &IpAdapterKolorsRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self
+            .admitted_context
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-ip: missing admitted context".into()))?;
+        let contract = self
+            .memory_contract
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-ip: missing memory contract".into()))?;
+        if admitted != context {
+            return Err(CandleError::Msg(
+                "kolors-ip: request memory context changed after load".into(),
+            ));
+        }
+        crate::memory_strategy::validate_bespoke_context(
+            contract,
+            &self.source_root,
+            context,
+            true,
+            false,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let result = self.generate_inner(req, reference, on_progress);
+        let sync = self.device.synchronize().map_err(CandleError::Candle);
+        match (result, sync) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    fn generate_inner(
         &mut self,
         req: &IpAdapterKolorsRequest,
         reference: &Image,

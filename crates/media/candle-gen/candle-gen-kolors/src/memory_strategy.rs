@@ -17,8 +17,14 @@ pub const REQUEST_EVIDENCE_REVISION: &str = "kolors-candle-request-contract-v1";
 const CALIBRATION_FINGERPRINT: &str = "kolors-candle-staged-chatglm-unet-f32-vae-v1";
 
 pub fn provider_contract() -> MemoryProviderContract {
+    provider_contract_for(crate::MODEL_ID)
+}
+
+/// Bespoke IP-Adapter and ControlNet routes deliberately mint independent contracts; they may share
+/// a physical Kolors base but never a provider/evidence identity.
+pub fn provider_contract_for(provider_id: &str) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
-        crate::MODEL_ID,
+        provider_id,
         MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
@@ -166,6 +172,30 @@ pub fn validate_context(
         context,
         Some(tier),
         Some(&route),
+    ) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
+    }
+}
+
+pub fn validate_bespoke_context(
+    contract: &MemoryProviderContract,
+    root: &Path,
+    context: &MemoryRunContext,
+    require_reference: bool,
+    require_pid: bool,
+) -> gen_core::Result<()> {
+    if context.has_reference != require_reference || context.use_pid != require_pid {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: crossed bespoke reference/PiD receipt",
+            contract.provider_id
+        )));
+    }
+    match gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(physical_tier(root)?),
+        None,
     ) {
         MemorySafetyDecision::Accept => Ok(()),
         MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),

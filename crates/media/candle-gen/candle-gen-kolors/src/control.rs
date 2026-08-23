@@ -183,6 +183,9 @@ pub struct KolorsControl {
     /// Kolors composes the SDXL VAE, so it loads the `sdxl` student (same tag as the base Kolors provider).
     pid: Option<PidEngine>,
     device: Device,
+    memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
+    admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+    source_root: PathBuf,
 }
 
 impl KolorsControl {
@@ -190,6 +193,30 @@ impl KolorsControl {
     /// Kolors `ControlNetModel` (encoder copy + its own `encoder_hid_proj`). No IP-Adapter K/V is
     /// installed — the control branch is the only conditioning overlay.
     pub fn load(paths: &KolorsControlPaths) -> Result<Self> {
+        Self::load_internal(paths, None, None)
+    }
+
+    pub fn load_with_memory_context(
+        paths: &KolorsControlPaths,
+        context: candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract_for("candle_kolors_control");
+        crate::memory_strategy::validate_bespoke_context(
+            &contract,
+            &paths.kolors_base,
+            &context,
+            false,
+            context.use_pid,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Self::load_internal(paths, Some(contract), Some(context))
+    }
+
+    fn load_internal(
+        paths: &KolorsControlPaths,
+        memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
+        admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
+    ) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let base = paths.kolors_base.as_path();
 
@@ -247,6 +274,9 @@ impl KolorsControl {
             vae,
             pid: None,
             device,
+            memory_contract,
+            admitted_context,
+            source_root: paths.kolors_base.clone(),
         })
     }
 
@@ -287,6 +317,57 @@ impl KolorsControl {
     /// worker renders the skeleton; this embeds it once, then runs the control denoise (the control
     /// branch runs on both CFG passes).
     pub fn generate(
+        &self,
+        req: &KolorsControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "kolors-control: admitted model requires generate_with_memory_context".into(),
+            ));
+        }
+        self.generate_inner(req, skeleton, on_progress)
+    }
+
+    pub fn generate_with_memory_context(
+        &self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+        req: &KolorsControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self
+            .admitted_context
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-control: missing admitted context".into()))?;
+        let contract = self
+            .memory_contract
+            .as_ref()
+            .ok_or_else(|| CandleError::Msg("kolors-control: missing memory contract".into()))?;
+        if admitted != context {
+            return Err(CandleError::Msg(
+                "kolors-control: request memory context changed after load".into(),
+            ));
+        }
+        crate::memory_strategy::validate_bespoke_context(
+            contract,
+            &self.source_root,
+            context,
+            false,
+            req.use_pid,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let result = self.generate_inner(req, skeleton, on_progress);
+        let sync = self.device.synchronize().map_err(CandleError::Candle);
+        match (result, sync) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    fn generate_inner(
         &self,
         req: &KolorsControlRequest,
         skeleton: &Image,
