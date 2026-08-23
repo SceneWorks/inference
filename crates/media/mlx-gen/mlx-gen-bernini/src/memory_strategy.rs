@@ -3378,7 +3378,7 @@ mod tests {
                 MemoryStrategy::BoundedTransformerResidency,
             ] {
                 let fixtures = registered_valid_fixture(&spec, &contract, strategy).unwrap();
-                assert_eq!(fixtures.len(), 4, "{provider_id}/{strategy:?}");
+                assert_eq!(fixtures.len(), 5, "{provider_id}/{strategy:?}");
                 assert_eq!(fixtures[0].context.mode.as_key(), "video_to_video");
                 assert_eq!(fixtures[1].context.mode.as_key(), "reference_to_video");
                 assert_eq!(fixtures[1].context.geometry.reference_count, 2);

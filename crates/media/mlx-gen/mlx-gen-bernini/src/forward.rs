@@ -545,7 +545,9 @@ pub fn vit_one_step(
     streams: &VitStreams,
     g: &VitGuidanceParams,
 ) -> Result<Array> {
-    let wvae: Vec<(Array, f64)> = images.iter().chain(videos).cloned().collect();
+    // ADS2V receipts bind the trained source/reference clips before the ordered images.  Physical
+    // VAE packing must use that same videos-first sequence.
+    let wvae: Vec<(Array, f64)> = videos.iter().chain(images).cloned().collect();
     let shape = noisy.shape().to_vec();
     let b = |a: &Array| -> Result<Array> { Ok(a.expand_dims(0)?) }; // [16,T,H8,W8] -> [1,16,...]
     let unb = |a: Array| -> Result<Array> { Ok(a.reshape(&shape)?) }; // back to [16,T,H8,W8]

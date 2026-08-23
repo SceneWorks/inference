@@ -471,7 +471,9 @@ pub fn vit_one_step(
     g: &VitGuidanceParams,
     mbufs: &mut [MomentumBuffer],
 ) -> CResult<Tensor> {
-    let wvae: Vec<(Tensor, f64)> = images.iter().chain(videos).cloned().collect();
+    // ADS2V receipts bind source/reference clips before the ordered images; retain that exact
+    // videos-first sequence in the physical VAE pack.
+    let wvae: Vec<(Tensor, f64)> = videos.iter().chain(images).cloned().collect();
     let v = |sources: &[(Tensor, f64)], ctx: &Tensor| pf.velocity(dit, noisy, sources, t, ctx);
 
     match mode {
