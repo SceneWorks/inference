@@ -64,12 +64,35 @@
 //! What has **not** changed: there is still no fitted curve, no calibration identity and no behavior
 //! seam on this lane, so every optimized rung stays `Missing` and no tier makes anything new
 //! admissible. The tiers change what a render *costs*, not what this provider *claims*.
+//!
+//! # The configured LoRA stack is charged (sc-18650)
+//!
+//! `overlay_bytes` was the literal `0` from sc-18659 until this story, and — unlike the MLX
+//! sibling's identical defect, whose contract was still unpublished — **this one shipped**. sc-18724
+//! landed the adapter seam on 2026-08-13 and nothing brought the declaration with it, so a LoRA
+//! render's resident factors were charged nothing on a live path. They are now a typed
+//! [`MemoryComponentKind::AdapterStack`] at [`MemoryComponentResidency::WholeRender`], sized through
+//! the shared `adapter_stack_resident_bytes` at [`AdapterResidencyMode::Additive`] — see
+//! [`adapter_overlay_bytes`], which is also where the probe that makes the bytes *knowable* lives.
+//!
+//! **The probe fails closed on every configured adapter**, matching the MLX sibling: an adapter that
+//! is not on disk is refused at `load` rather than charged 0, and so is one that *is* there and
+//! cannot be sized. Charging an absent path 0 would have been exact only at the **probe instant** —
+//! the contract is computed once in `crate::model::MiniMaxH3::load` and cached, while the factors are
+//! installed per render in `crate::model::MiniMaxH3::load_task_dit`, so a path that appears between
+//! the two would put ~636 MB of resident factors behind a published `overlay_bytes: 0`. That is the
+//! defect this story exists to close, and refusing at `load` costs nothing a caller could have used:
+//! `read_adapter` stats the path first, so an adapter absent at load can never reach a *successful*
+//! render on this lane in any case. The declaration and the variable are both conditional on a
+//! non-zero overlay, so a render with **no** adapter configured publishes byte-for-byte the contract
+//! this provider always has.
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
-    safetensors_path_bytes, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    adapter_stack_resident_bytes, safetensors_path_bytes, AdapterResidencyMode, Error as CoreError,
+    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
@@ -200,6 +223,20 @@ pub const ADALN_MODULATION_TABLE_MAX_BYTES: u64 = 3_870_720_000;
 /// declaration by name rather than by matching on bytes. Shared spelling with the MLX sibling.
 pub const ADALN_COMPONENT_ID: &str = "dit_adaln_proj_stack";
 
+/// Contract-stable identity of the configured LoRA stack (sc-18650), declared only when one is
+/// configured. Published for the same reason [`ADALN_COMPONENT_ID`] is: a consumer finds the
+/// declaration by name rather than by matching on bytes.
+///
+/// **`pub` does not make it gate-protected, and the test is what pins the spelling.**
+/// `scripts/check-workspace.py`'s `RUST_PUB_CONST` sweep compares only names declared on *both*
+/// backends, and the MLX sibling inlines this literal at its component site rather than naming a
+/// constant — so this name is currently unpaired and the gate compares it against nothing.
+/// `the_configured_lora_stack_is_charged_as_a_typed_additive_overlay` therefore asserts the bare
+/// `"adapter_stack"` literal: asserting it against this constant would be tautological, since both
+/// sides of that comparison come from this declaration. Should the MLX lane ever declare the same
+/// name, the cross-backend gate picks the pair up with no further change here.
+pub const ADAPTER_STACK_COMPONENT_ID: &str = "adapter_stack";
+
 /// The load shape this loader actually has, pinned rather than mirrored from the spec.
 ///
 /// [`LoadShape::DeferredMaterialization`] means transformer blocks are materialized through a block
@@ -235,10 +272,13 @@ struct ComponentBytes {
     adaln: u64,
     video_vae: u64,
     audio_vae: u64,
+    /// Load-exact bytes of the configured LoRA stack, held **resident for the whole render**
+    /// (sc-18650). See [`adapter_overlay_bytes`], which resolves it.
+    overlay: u64,
 }
 
 impl ComponentBytes {
-    fn resolve(spec: &LoadSpec) -> Self {
+    fn resolve(spec: &LoadSpec) -> candle_gen::gen_core::Result<Self> {
         let root = match &spec.weights {
             WeightsSource::Dir(root) => root.clone(),
             WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
@@ -282,7 +322,7 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(crate::tier::TEXT_ENCODER_COMPONENT),
         };
-        Self {
+        Ok(Self {
             text_encoder: safetensors_path_bytes(text_encoder),
             dit,
             // Resolved against the partition that was actually charged, whichever of the two won the
@@ -291,7 +331,8 @@ impl ComponentBytes {
             adaln: resolved_adaln_bytes(&dit_dir, dit),
             video_vae: safetensors_path_bytes(root.join("vae")),
             audio_vae: safetensors_path_bytes(root.join("audio_vae")),
-        }
+            overlay: adapter_overlay_bytes(spec)?,
+        })
     }
 
     /// The two decoders are one contract field; H3 is the first family with two of them.
@@ -304,6 +345,69 @@ impl ComponentBytes {
             .saturating_add(self.dit)
             .saturating_add(self.decoder())
     }
+}
+
+/// **The adapter-file probe** — load-exact resident bytes of the configured LoRA stack (sc-18650).
+///
+/// Until this story `overlay_bytes` was the literal `0` and nothing in `load` had ever touched an
+/// adapter path, so the two facts propped each other up. Both were wrong, and unlike the MLX
+/// sibling's — whose contract was still unpublished — **this one shipped**:
+/// [`crate::model::descriptor`] declares `supports_lora: true`, and since sc-18724
+/// [`crate::model::MiniMaxH3::load_task_dit`] installs the published `lightx2v/Minimax-h3-Turbo`
+/// exports through [`crate::adapters::apply_minimax_h3_adapters`]. A LoRA render's factors were
+/// charged nothing on a live path.
+///
+/// [`AdapterResidencyMode::Additive`], not `Folded`, and that is read off this lane's own install
+/// rather than copied: [`crate::adapters`] declares a **forward-time residual** over
+/// [`crate::dit::layers::LinearNoBias`], "never a merged weight", deliberately tier-*blind* so it
+/// composes over a packed base too. Nothing is ever folded away, so the factors are still resident at
+/// the last denoise step. `Folded` would declare zero and re-open the same under-declaration under a
+/// typed name.
+///
+/// # Why an unsizable adapter is REFUSED rather than charged 0 — absent ones included
+///
+/// The shared helper returns `None` whenever any configured adapter sizes to zero, and this takes
+/// the flat `ok_or_else(Err)` — the MLX shape — for both of the ways that happens.
+///
+/// **An absent file.** Charging it 0 is exact only at the **probe instant**, and the probe instant is
+/// not the render. [`crate::model::MiniMaxH3::load`] computes this contract once and caches it;
+/// [`crate::model::MiniMaxH3::load_task_dit`] installs the factors per render, later. A path that is
+/// absent at load and present by the time a render maps its DiT installs the full stack behind a
+/// published `overlay_bytes: 0` — the exact under-declaration this story closes, and one no probe
+/// placed at load can *measure* its way out of. It can only refuse. That costs no working scenario:
+/// `candle_gen::train::merge::read_adapter` stats the path before it allocates, so an adapter absent
+/// at load has no successful render to protect — [`crate::adapters::apply_minimax_h3_adapters`] would
+/// have failed the render anyway, 20 minutes later and after the DiT was mapped. The MLX sibling
+/// refuses the same case in its own `load`, so this closes the lanes' one remaining divergence rather
+/// than opening one.
+///
+/// **A file that IS there and cannot be sized**, which needs no malformed input at all.
+/// `read_adapter` is extension-blind — it reads the bytes and parses safetensors out of the buffer —
+/// while `safetensors_path_bytes` gates on the `.safetensors` extension and skips dotfiles. So a
+/// perfectly loadable adapter named `turbo.bin`, `turbo.st` or `.turbo.safetensors` installs 312
+/// modules' worth of factors and sizes to **zero**: a live under-declaration in the OOM direction.
+///
+/// What remains, and is not closed here, is the narrower window in which a *sized* file is swapped
+/// for a larger one between load and render. No load-time probe can see that; it is the ordinary
+/// time-of-check/time-of-use residual every path that sizes a file before reading it carries.
+pub fn adapter_overlay_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
+    adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(|| {
+        CoreError::Unsupported(format!(
+            "{MODEL_ID}: every configured adapter must be on disk with a non-zero load-exact \
+             safetensors size before the memory contract can declare its resident overlay — {} \
+             sized to 0. An absent path is refused rather than charged 0 because the contract is \
+             built once at load while the factors are installed per render, so a file that appears \
+             in between would be resident against a zero declaration. A present one is refused \
+             because the render seam parses safetensors out of the file's bytes whatever it is \
+             named, while the shared sizer counts only non-hidden `.safetensors` — so an adapter \
+             named otherwise would load and be charged nothing. Stage it as `<name>.safetensors`.",
+            spec.adapters
+                .iter()
+                .map(|adapter| adapter.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })
 }
 
 /// The AdaLN sub-stack's resident bytes on a DiT whose resolved footprint is `dit_bytes`.
@@ -490,7 +594,9 @@ fn compute_dtype_bytes() -> u64 {
 ///
 /// * `kind` is [`MemoryComponentKind::TransformerSubStack`], not `Transformer`: these bytes are
 ///   already inside `asset_facts.transformer_bytes`, and a whole-transformer kind would charge them
-///   twice. They are not auxiliary either, so `overlay_bytes` stays 0.
+///   twice. They are not auxiliary either, so they contribute nothing to `overlay_bytes` — which
+///   carries the configured LoRA stack and only that (sc-18650), and is 0 on a render with no
+///   adapter.
 /// * `retained_bytes` makes the declaration **net**. The precompute keeps a modulation table in the
 ///   projections' place; declaring the gross figure claims a saving the runtime does not deliver.
 fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
@@ -665,8 +771,37 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         // bytes the runtime provably does not hold through the denoise steady state.
         formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases: vec![MemoryPhase::Denoise],
-            variables: vec![MemoryFormulaVariable::AssetBytes],
-            resident_components: vec![adaln_component(components.adaln)],
+            variables: {
+                let mut variables = vec![MemoryFormulaVariable::AssetBytes];
+                // Declared **only when an adapter is configured** (sc-18650), so an ordinary load's
+                // formula is byte-for-byte the one this provider has always published and no
+                // existing calibration record is disturbed. `conformance_errors` requires this
+                // variable exactly when a typed auxiliary component is present, and the two are
+                // built from the same condition here so they cannot drift.
+                if components.overlay > 0 {
+                    variables.push(MemoryFormulaVariable::OverlayBytes);
+                }
+                variables
+            },
+            resident_components: {
+                let mut resident = vec![adaln_component(components.adaln)];
+                // The LoRA stack as a typed auxiliary component, the spelling `mlx-gen-ltx` uses for
+                // the same forward-time-residual install. `WholeRender` is literal here:
+                // `crate::model::MiniMaxH3::load_task_dit` installs the factors onto the task's DiT
+                // before the first step and nothing releases them until the DiT itself goes at the
+                // end of denoise — see `crate::adapters`, where the residual is declared never to be
+                // folded on any tier.
+                if components.overlay > 0 {
+                    resident.push(MemoryResidentComponent {
+                        id: ADAPTER_STACK_COMPONENT_ID.to_owned(),
+                        kind: MemoryComponentKind::AdapterStack,
+                        resident_bytes: components.overlay,
+                        bounded_by: None,
+                        residency: MemoryComponentResidency::WholeRender,
+                    });
+                }
+                resident
+            },
         },
         // No fitted curve exists for this backend. `None` is the honest state, and it is load
         // bearing: it makes every optimized selection fail closed at admission.
@@ -676,7 +811,18 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.decoder(),
-            overlay_bytes: 0,
+            // **The configured LoRA stack, and nothing else** (sc-18650).
+            //
+            // This was the literal `0` until this story, and unlike the MLX sibling's the same
+            // mistake here was **live rather than latent**: this contract has been published since
+            // sc-18659, so a LoRA render's resident factors were charged zero on a shipped path.
+            // sc-18724 landed the adapter seam on 2026-08-13 and nothing brought the declaration
+            // with it.
+            //
+            // There is no ControlNet, no IP-adapter and no identity encoder on this family —
+            // `reject_unread_slots` refuses all three at the registry entry point — so the LoRA
+            // stack is the only auxiliary residency there is.
+            overlay_bytes: components.overlay,
         },
         runtime: Default::default(),
     }
@@ -684,7 +830,7 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
 
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> candle_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes::resolve(spec)))
+    Ok(build_contract(&ComponentBytes::resolve(spec)?))
 }
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts and no
@@ -702,6 +848,11 @@ pub fn weights_free_contract(
         adaln: ADALN_EVICTED_BYTES,
         video_vae: 0,
         audio_vae: 0,
+        // The declaration-only footprint charges no adapter, and the fixture specs
+        // (`candle_memory_contract_surface_specs`) carry none — so the fixture formula stays the
+        // no-adapter shape `fixture_contract_conforms_weights_free` compares against. Same choice
+        // the MLX sibling's `ComponentBytes::weights_free` makes.
+        overlay: 0,
     }))
 }
 
@@ -763,7 +914,7 @@ mod tests {
         MemoryMode, MemoryNumericTier, MemoryPhase, MemoryRunContext, MemorySelection,
         MemoryStrategyParameters, ProviderRegistryBuilder,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// One named, independently applied mutation of a known-good contract.
     type ContractMutation = (&'static str, Box<dyn Fn(&mut MemoryProviderContract)>);
@@ -788,11 +939,18 @@ mod tests {
 
     /// Sparse `.safetensors` shards of exact sizes. `safetensors_path_bytes` stats rather than
     /// parses, so this costs no disk and still exercises the real directory-name wiring.
+    ///
+    /// It costs no disk only because the shard is flagged first. These sizes are the real asset
+    /// facts — one `full_snapshot` nominally sums to ~210 GB — and NTFS allocates every byte of a
+    /// `set_len` on an unflagged file. `mark_sparse` must sit between the create and the `set_len`;
+    /// see its docs for why either side of that is silently wrong.
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).expect("component dir");
-            let file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            let path = dir.join("model.safetensors");
+            let file = std::fs::File::create(&path).expect("shard");
+            gen_core_testkit::mark_sparse(&path);
             file.set_len(*bytes).expect("sparse shard");
         }
     }
@@ -2069,6 +2227,200 @@ mod tests {
         assert!(
             ADALN_MODULATION_TABLE_MAX_BYTES < tiered.resident_components()[0].resident_bytes,
             "and it must stay clear of the floor where the eviction would exclude nothing"
+        );
+    }
+
+    // --- sc-18650: the configured LoRA stack is charged ------------------------------------------
+
+    /// A sparse `.safetensors` file of exactly `bytes`, and the LoRA spec that stages it.
+    fn lora_at(path: PathBuf) -> candle_gen::gen_core::AdapterSpec {
+        candle_gen::gen_core::AdapterSpec {
+            path,
+            scale: 1.0,
+            kind: candle_gen::gen_core::AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }
+    }
+
+    fn sparse_file(path: &Path, bytes: u64) -> PathBuf {
+        let file = std::fs::File::create(path).expect("adapter file");
+        file.set_len(bytes).expect("sparse adapter");
+        path.to_path_buf()
+    }
+
+    /// Roughly the published `lightx2v/Minimax-h3-Turbo` 8-step diffusers export — 624 bf16 factor
+    /// tensors. The exact figure does not matter; that it is *not zero* is the whole point.
+    const TURBO_LORA_BYTES: u64 = 636_512_768;
+
+    /// **A configured LoRA is charged as a typed, additive, whole-render overlay** (sc-18650).
+    ///
+    /// This lane published `overlay_bytes: 0` from sc-18659 until this story while
+    /// [`crate::model::descriptor`] declared `supports_lora: true` and sc-18724's seam installed the
+    /// factors — so a LoRA render's resident tensors were charged nothing on a **shipped** path.
+    /// [`MemoryComponentResidency::WholeRender`] rather than an eviction, and
+    /// [`AdapterResidencyMode::Additive`] rather than `Folded`, because [`crate::adapters`] installs
+    /// a forward-time residual that is never merged into the base on any tier.
+    ///
+    /// The no-adapter control at the top is what makes the arm attributable *and* is a guard in its
+    /// own right: the whole declaration is conditional on `overlay > 0` so that an ordinary render's
+    /// contract is byte-for-byte the one this provider has always published.
+    #[test]
+    fn the_configured_lora_stack_is_charged_as_a_typed_additive_overlay() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        let bare =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+
+        // Control: no adapter, and the contract is unmoved from its pre-sc-18650 shape.
+        assert_eq!(bare.asset_facts.overlay_bytes, 0);
+        assert_eq!(bare.auxiliary_resident_bytes(), 0);
+        assert_eq!(
+            bare.resident_components().len(),
+            1,
+            "the AdaLN sub-stack and nothing else"
+        );
+        assert!(!bare.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert!(
+            bare.conformance_errors().is_empty(),
+            "{:?}",
+            bare.conformance_errors()
+        );
+
+        let lora = sparse_file(&root.path().join("turbo.safetensors"), TURBO_LORA_BYTES);
+        let adapted = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_adapters(vec![lora_at(lora)]),
+        )
+        .expect("contract");
+
+        assert_eq!(
+            adapted.asset_facts.overlay_bytes, TURBO_LORA_BYTES,
+            "the forward-time residual factors are resident for the whole render, so their \
+             load-exact bytes are the overlay"
+        );
+        assert!(
+            adapted.formula.uses(MemoryFormulaVariable::OverlayBytes),
+            "a typed auxiliary component without the variable is a conformance error, and a \
+             non-zero overlay without the component is the other half of the same rule"
+        );
+        let stack = adapted
+            .resident_components()
+            .iter()
+            .find(|component| component.kind == MemoryComponentKind::AdapterStack)
+            .expect("the LoRA stack must be declared as a TYPED auxiliary component");
+        // The bare LITERAL, not [`ADAPTER_STACK_COMPONENT_ID`]. Asserting it against the constant
+        // would put this declaration on both sides of the comparison and pin nothing, and the
+        // cross-backend `pub const` gate cannot stand in for it: it compares only names declared on
+        // both backends, and the MLX sibling inlines this string. This is the only thing holding the
+        // two lanes to the same spelling.
+        assert_eq!(stack.id, "adapter_stack");
+        assert_eq!(ADAPTER_STACK_COMPONENT_ID, "adapter_stack");
+        assert_eq!(stack.resident_bytes, TURBO_LORA_BYTES);
+        assert_eq!(
+            stack.residency,
+            MemoryComponentResidency::WholeRender,
+            "never folded on any tier, so the factors live to the last denoise step"
+        );
+        assert_eq!(stack.bounded_by, None, "no rung bounds the adapter stack");
+        assert_eq!(adapted.auxiliary_resident_bytes(), TURBO_LORA_BYTES);
+        assert!(
+            adapted.conformance_errors().is_empty(),
+            "{:?}",
+            adapted.conformance_errors()
+        );
+
+        // The AdaLN sub-stack is untouched: it is inside `transformer_bytes` and is not auxiliary,
+        // so the two components must not contaminate each other.
+        assert_eq!(
+            adapted.evicted_component_bytes(),
+            bare.evicted_component_bytes()
+        );
+        assert_eq!(
+            adapted.asset_facts.base_bytes, bare.asset_facts.base_bytes,
+            "`base_bytes` must EXCLUDE the overlay — conformance refuses the double charge"
+        );
+    }
+
+    /// **An adapter that is not on disk is REFUSED, not charged an exact 0** (sc-18650).
+    ///
+    /// `0` for an absent path is exact only at the **probe instant**. The contract is computed once
+    /// in [`crate::model::MiniMaxH3::load`] and cached; the factors are installed per render, later,
+    /// in [`crate::model::MiniMaxH3::load_task_dit`] — so a path that is absent at load and present
+    /// by render time puts the whole stack resident behind a published `overlay_bytes: 0`, which is
+    /// the defect this story exists to close. It costs no working scenario: `read_adapter` stats
+    /// before it allocates, so an adapter absent at load has no successful render to protect.
+    ///
+    /// The no-adapter control is what keeps this attributable — an empty `spec.adapters` is a
+    /// different thing from a configured-but-absent one, and it must still publish the unmoved
+    /// contract.
+    #[test]
+    fn an_adapter_that_is_not_on_disk_is_refused_rather_than_charged_zero() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        // Control: NO adapter configured is not the same case, and still publishes cleanly.
+        let bare =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+        assert_eq!(bare.asset_facts.overlay_bytes, 0);
+
+        let err = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_adapters(vec![lora_at(PathBuf::from("/turbo.safetensors"))]),
+        )
+        .expect_err("an adapter configured but absent must be refused, not charged 0");
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("/turbo.safetensors"),
+            "the refusal must name the adapter it could not size: {err}"
+        );
+    }
+
+    /// **An adapter that IS on disk but sizes to zero fails closed** (sc-18650).
+    ///
+    /// The case that makes the probe a fail-closed check rather than a formality, and it needs no
+    /// malformed input at all. `candle_gen::train::merge::read_adapter` is **extension-blind** — it
+    /// reads the bytes and parses safetensors out of the buffer — while `safetensors_path_bytes`
+    /// counts only non-hidden `.safetensors`. So a perfectly loadable adapter named `turbo.bin`
+    /// installs all 312 modules' factors and would be charged **zero**: an under-declaration in the
+    /// OOM direction, on the live path.
+    #[test]
+    fn an_adapter_present_on_disk_but_unsizable_is_refused_rather_than_charged_zero() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        let misnamed = sparse_file(&root.path().join("turbo.bin"), TURBO_LORA_BYTES);
+        let err = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_adapters(vec![lora_at(misnamed)]),
+        )
+        .expect_err("an adapter that loads but cannot be sized must not be charged 0");
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("turbo.bin"),
+            "the refusal must name the file it could not size: {err}"
+        );
+
+        // ...and a hidden `.safetensors` is the same hole with a different spelling, held to the
+        // same two assertions: a bare `is_err()` would stay green if this leg regressed to an opaque
+        // `Msg`, or to a message that never named the file the caller has to go rename.
+        let hidden = sparse_file(&root.path().join(".turbo.safetensors"), TURBO_LORA_BYTES);
+        let err = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_adapters(vec![lora_at(hidden)]),
+        )
+        .expect_err("a hidden `.safetensors` loads and sizes to 0, so it must be refused too");
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Unsupported(_)),
+            "must be the contract-load-bearing Unsupported, not an opaque Msg: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(".turbo.safetensors"),
+            "the refusal must name the file it could not size: {err}"
         );
     }
 

@@ -1078,6 +1078,9 @@ mod tests {
         }
         let path = root.join("combined.safetensors");
         let mut output = std::fs::File::create(&path).unwrap();
+        // `data_len` is the encoder fixture's whole payload span, so this file is as big as the
+        // fixture it re-prefixes. Flag it between the create and the extend (see `mark_sparse`).
+        gen_core_testkit::mark_sparse(&path);
         output
             .write_all(&(encoded.len() as u64).to_le_bytes())
             .unwrap();

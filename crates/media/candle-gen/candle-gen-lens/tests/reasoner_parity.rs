@@ -34,6 +34,7 @@ fn ids(t: &Tensor) -> Result<Vec<u32>, AnyErr> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo snapshot root (LENS_SNAPSHOT_DIR) + goldens (LENS_REASONER_GOLDENS)"]
 fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
     let root = match std::env::var("LENS_SNAPSHOT_DIR") {
         Ok(d) => d,

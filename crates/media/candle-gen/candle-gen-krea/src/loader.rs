@@ -32,7 +32,7 @@ use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
     dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Linear,
-    PackedConfig, PackedWeightSidecars,
+    Nvfp4Tensor, PackedConfig, PackedWeightSidecars,
 };
 
 use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
@@ -88,6 +88,10 @@ pub struct Weights {
     /// either the weight or the activation. [`from_native_file`](Self::from_native_file) sets this
     /// only after validating every descriptor and per-row scale from the safetensors data section.
     plain_int8: bool,
+    /// True only for a native-keyed ComfyUI Kitchen NVFP4 checkpoint. Every U8 projection is
+    /// validated as an exact `{weight, weight_scale, weight_scale_2}` triplet before this flag is
+    /// set. This is distinct from the MLX affine [`packed`](Self::packed) tier and inline FP8.
+    native_nvfp4: bool,
     /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
     /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
     /// and the handle must be built at most once for the whole trunk, on first int8 projection.
@@ -186,6 +190,7 @@ impl Weights {
             native_prefix: String::new(),
             convrot: false,
             plain_int8: false,
+            native_nvfp4: false,
             int8: OnceLock::new(),
         })
     }
@@ -210,6 +215,7 @@ impl Weights {
             native_prefix: String::new(),
             convrot: false,
             plain_int8: false,
+            native_nvfp4: false,
             int8: OnceLock::new(),
         })
     }
@@ -238,6 +244,7 @@ impl Weights {
             native_prefix,
             convrot: true,
             plain_int8: false,
+            native_nvfp4: false,
             int8: OnceLock::new(),
         })
     }
@@ -277,6 +284,12 @@ impl Weights {
         let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         let native_prefix = detect_native_prefix(&st);
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
+        let native_nvfp4 = validate_native_nvfp4(&st)?;
+        if plain_int8 && native_nvfp4 {
+            return Err(Error::Msg(
+                "krea native checkpoint mixes plain int8 and NVFP4 projection formats".into(),
+            ));
+        }
         let result = Self {
             st,
             pinned_source: Some(pinned_source.clone()),
@@ -289,6 +302,7 @@ impl Weights {
             native_prefix,
             convrot: false,
             plain_int8,
+            native_nvfp4,
             int8: OnceLock::new(),
         };
         pinned_source
@@ -377,6 +391,24 @@ impl Weights {
         self.plain_int8
     }
 
+    /// Whether this native checkpoint carries prepacked ComfyUI Kitchen NVFP4 projection triplets.
+    pub fn is_native_nvfp4(&self) -> bool {
+        self.native_nvfp4
+    }
+
+    /// Number of validated NVFP4 projections in this checkpoint. Used by the exact native-key
+    /// surface validator to account for the two scale companions per packed model weight.
+    pub(crate) fn native_nvfp4_projection_count(&self) -> usize {
+        if !self.native_nvfp4 {
+            return 0;
+        }
+        self.st
+            .tensors()
+            .iter()
+            .filter(|(name, _)| name.ends_with(".weight_scale_2"))
+            .count()
+    }
+
     /// Whether this checkpoint is **native-mmdit-keyed** — its tensors are stored under the reference
     /// names, so `resolve` remaps every diffusers-key lookup to its native counterpart
     /// (sc-14022). True for BOTH the INT8-ConvRot export ([`from_convrot_file`](Self::from_convrot_file))
@@ -403,6 +435,57 @@ impl Weights {
         } else {
             name.to_string()
         }
+    }
+
+    /// True when `diffusers_weight` resolves to one of this file's validated packed NVFP4 weights.
+    fn is_native_nvfp4_weight(&self, diffusers_weight: &str) -> bool {
+        self.native_nvfp4
+            && self
+                .st
+                .get(&self.resolve(diffusers_weight))
+                .is_ok_and(|view| view.dtype() == ::safetensors::Dtype::U8)
+    }
+
+    /// Read one prepacked Kitchen NVFP4 triplet into Candle's canonical host container. The block
+    /// scales and global scale stay byte/numerically exact; [`Nvfp4Tensor::from_kitchen_parts`]
+    /// performs only Kitchen's high-even → Candle's low-even nibble swap.
+    fn get_native_nvfp4(&self, diffusers_weight: &str) -> Result<Nvfp4Tensor> {
+        let native_weight = self.resolve(diffusers_weight);
+        let weight = self.st.get(&native_weight)?;
+        if weight.dtype() != ::safetensors::Dtype::U8 {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{native_weight}` must be U8, got {:?}",
+                weight.dtype()
+            )));
+        }
+        let [rows, packed_cols] = weight.shape() else {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{native_weight}` must be rank-2 [out,in/2], got {:?}",
+                weight.shape()
+            )));
+        };
+        let base = native_weight.strip_suffix(".weight").ok_or_else(|| {
+            Error::Msg(format!("krea NVFP4: invalid weight key `{native_weight}`"))
+        })?;
+        let block_scale = self.st.get(&format!("{base}.weight_scale"))?;
+        let global_scale = self.st.get(&format!("{base}.weight_scale_2"))?;
+        let global_bytes: [u8; 4] = global_scale.data().try_into().map_err(|_| {
+            Error::Msg(format!(
+                "krea NVFP4: `{base}.weight_scale_2` must contain one F32 value"
+            ))
+        })?;
+        let cols = packed_cols.checked_mul(2).ok_or_else(|| {
+            Error::Msg(format!(
+                "krea NVFP4: logical column count overflows for `{native_weight}`"
+            ))
+        })?;
+        Nvfp4Tensor::from_kitchen_parts(
+            weight.data(),
+            block_scale.data(),
+            f32::from_le_bytes(global_bytes),
+            *rows,
+            cols,
+        )
     }
 
     /// Load `name` at the component dtype — from the `overlay` if present
@@ -570,10 +653,17 @@ impl Weights {
     /// for a ConvRot checkpoint). The overlay never changes a weight's shape, so the mmap is
     /// authoritative.
     pub fn shape(&self, name: &str) -> Option<Vec<usize>> {
-        self.st
-            .get(&self.resolve(name))
-            .ok()
-            .map(|v| v.shape().to_vec())
+        let view = self.st.get(&self.resolve(name)).ok()?;
+        if self.native_nvfp4
+            && name.ends_with(".weight")
+            && view.dtype() == ::safetensors::Dtype::U8
+        {
+            let [rows, packed_cols] = view.shape() else {
+                return Some(view.shape().to_vec());
+            };
+            return Some(vec![*rows, *packed_cols * 2]);
+        }
+        Some(view.shape().to_vec())
     }
 
     pub fn device(&self) -> &Device {
@@ -678,6 +768,147 @@ impl Weights {
         }
         self.get(weight_key)
     }
+}
+
+/// Validate the real data-section contract for a ComfyUI Kitchen NVFP4 checkpoint.
+///
+/// Kitchen does not emit per-layer `.comfy_quant` tensors for this converter; its safetensors
+/// metadata names the format, but the mmap API intentionally exposes only tensors. The triplet is
+/// nevertheless structurally unambiguous and stronger than trusting metadata: each quantized Linear
+/// must be U8 `[out,in/2]`, have an F8_E4M3 blocked scale buffer of the exact cuBLAS size, and one F32
+/// scalar second-level scale. Every U8 weight and every `_scale_2` must participate in exactly such a
+/// triplet. Inline FP8 has an F8 weight and no `_scale_2`, so it cannot enter this path.
+fn validate_native_nvfp4(st: &MmapedSafetensors) -> Result<bool> {
+    let tensors = st.tensors();
+    let u8_weights: Vec<String> = tensors
+        .iter()
+        .filter(|(name, view)| {
+            name.ends_with(".weight") && view.dtype() == ::safetensors::Dtype::U8
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let scale_2_keys: Vec<String> = tensors
+        .iter()
+        .filter(|(name, _)| name.ends_with(".weight_scale_2"))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if u8_weights.is_empty() && scale_2_keys.is_empty() {
+        return Ok(false);
+    }
+    if u8_weights.is_empty() || scale_2_keys.is_empty() {
+        return Err(Error::Msg(format!(
+            "krea NVFP4: found {} U8 projection weight(s) and {} `weight_scale_2` tensor(s); both surfaces must be present",
+            u8_weights.len(),
+            scale_2_keys.len()
+        )));
+    }
+
+    for weight_key in &u8_weights {
+        let base = weight_key.strip_suffix(".weight").expect("filtered suffix");
+        let weight = st.get(weight_key)?;
+        let [rows, packed_cols] = weight.shape() else {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{weight_key}` must be rank-2 [out,in/2], got {:?}",
+                weight.shape()
+            )));
+        };
+        let cols = packed_cols.checked_mul(2).ok_or_else(|| {
+            Error::Msg(format!(
+                "krea NVFP4: logical column count overflows for `{weight_key}`"
+            ))
+        })?;
+
+        let block_key = format!("{base}.weight_scale");
+        let block = st.get(&block_key).map_err(|_| {
+            Error::Msg(format!(
+                "krea NVFP4: `{weight_key}` is missing `{block_key}`"
+            ))
+        })?;
+        if block.dtype() != ::safetensors::Dtype::F8_E4M3 {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{block_key}` must be F8_E4M3, got {:?}",
+                block.dtype()
+            )));
+        }
+        if block
+            .data()
+            .iter()
+            .any(|byte| byte & 0x80 != 0 || byte & 0x7f == 0x7f)
+        {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{block_key}` contains a negative or NaN E4M3 scale"
+            )));
+        }
+
+        let global_key = format!("{base}.weight_scale_2");
+        let global = st.get(&global_key).map_err(|_| {
+            Error::Msg(format!(
+                "krea NVFP4: `{weight_key}` is missing `{global_key}`"
+            ))
+        })?;
+        if global.dtype() != ::safetensors::Dtype::F32 || !global.shape().is_empty() {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{global_key}` must be an F32 scalar, got {:?} {:?}",
+                global.dtype(),
+                global.shape()
+            )));
+        }
+        let global_bytes: [u8; 4] = global.data().try_into().map_err(|_| {
+            Error::Msg(format!(
+                "krea NVFP4: `{global_key}` must contain exactly one F32 value"
+            ))
+        })?;
+        let global_value = f32::from_le_bytes(global_bytes);
+        let weight_len = rows.checked_mul(cols / 2).ok_or_else(|| {
+            Error::Msg(format!(
+                "krea NVFP4: logical weight size overflows for `{weight_key}`"
+            ))
+        })?;
+        if *rows == 0
+            || cols == 0
+            || !rows.is_multiple_of(16)
+            || !cols.is_multiple_of(16)
+            || weight.data().len() != weight_len
+            || block.data().len() != Nvfp4Tensor::scale_tensor_len(*rows, cols)
+            || !global_value.is_finite()
+            || global_value < 0.0
+        {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: malformed triplet for `{weight_key}` (weight {:?}/{} bytes, block-scale {:?}/{} bytes, global {global_value})",
+                weight.shape(),
+                weight.data().len(),
+                block.shape(),
+                block.data().len()
+            )));
+        }
+    }
+
+    for scale_2_key in scale_2_keys {
+        let base = scale_2_key
+            .strip_suffix(".weight_scale_2")
+            .expect("filtered suffix");
+        let weight_key = format!("{base}.weight");
+        if !matches!(
+            st.get(&weight_key),
+            Ok(view) if view.dtype() == ::safetensors::Dtype::U8
+        ) {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{scale_2_key}` has no U8 `{weight_key}` companion"
+            )));
+        }
+    }
+    if u8_weights.len()
+        != tensors
+            .iter()
+            .filter(|(name, _)| name.ends_with(".weight_scale_2"))
+            .count()
+    {
+        return Err(Error::Msg(
+            "krea NVFP4: projection weights and second-level scales are not one-to-one".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Validate the real data-section contract for a non-rotated ComfyUI int8-tensorwise checkpoint.
@@ -1102,11 +1333,10 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
 ///
 /// Three outcomes, in order:
 ///
-/// 1. **NVFP4** (`plan.is_nvfp4()`): pack `{base}.weight` to NVFP4 and build an [`Nvfp4Linear`] at the
-///    activation precision the plan assigns this layer ([`DitPlan::act_for_layer`], which derives the
-///    [`crate::nvfp4_dit::LayerRole`] from the dotted key + the trunk's block count). Never fails on an
-///    ineligible device or shape — [`Nvfp4Linear`] resolves the `sm_120` capability gate itself and
-///    transparently serves dequant→bf16 (sc-11041), so this is safe to call on any backend.
+/// 1. **NVFP4** (`plan.is_nvfp4()`): consume a validated native Kitchen triplet directly when this
+///    projection is prepacked, otherwise pack `{base}.weight` from a dense NVFP4 validation tier.
+///    Kitchen's deliberately preserved BF16 projections stay BF16. The plan assigns activation
+///    precision by layer role; [`Nvfp4Linear`] resolves the `sm_120` capability gate.
 /// 2. **Probed baseline** (a probe attached, no NVFP4): the exact [`linear_detect`] leg, wrapped to
 ///    record its input activation's outlier sparsity. This is how the partition gate measures the
 ///    trunk's *unperturbed* real activations; the stamped precision is what the **shipping mixed policy
@@ -1150,12 +1380,25 @@ pub fn linear_detect_planned(
         )));
     }
     let act = plan.act_for_layer(base);
-    let weight = w.get(&format!("{base}.weight"))?;
     let dense_bias = if bias {
         Some(w.get(&format!("{base}.bias"))?)
     } else {
         None
     };
+    let weight_key = format!("{base}.weight");
+    if w.is_native_nvfp4() {
+        // Kitchen's Krea profile intentionally leaves sensitive first/last/time/text-fusion layers
+        // dense BF16. Preserve that producer decision instead of quantizing them during import.
+        if !w.is_native_nvfp4_weight(&weight_key) {
+            return Ok(QLinear::dense(linear(w, base, bias)?));
+        }
+        let packed = w.get_native_nvfp4(&weight_key)?;
+        let lin =
+            Nvfp4Linear::from_packed_in(packed, dense_bias, w.device(), act, plan.nvfp4_context())?;
+        return Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)));
+    }
+
+    let weight = w.get(&weight_key)?;
     let device = weight.device().clone();
     // sc-12274: build against the plan's ONE shared per-device cuBLASLt handle. `from_dense` would
     // construct a private handle here — and its eager 32 MiB workspace — for every one of the trunk's
@@ -1269,19 +1512,18 @@ mod tests {
         std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
     }
 
-    /// Replace `target` while a provider has the original file mapped. Unix can exercise the exact
-    /// production failure mode with an atomic rename: the open mmap keeps consuming the original
-    /// inode while the selected path names a new one. Other platforms overwrite an identically shaped
-    /// safetensors payload so the test remains compilable/runnable without relying on Unix rename
-    /// semantics; the retained fingerprint still has to reject that mutation.
-    fn replace_mapped_fixture(replacement: &Path, target: &Path) {
-        #[cfg(unix)]
-        std::fs::rename(replacement, target).expect("atomically replace mapped source");
-        #[cfg(not(unix))]
-        {
-            let bytes = std::fs::read(replacement).expect("read replacement fixture");
-            std::fs::write(target, bytes).expect("overwrite mapped source");
-        }
+    /// Replace `target` while a provider has the original file mapped, exercising the exact
+    /// production failure mode on every platform: the open mmap keeps consuming the original object
+    /// while the selected path comes to name a new one. A replacing rename is the only swap that can
+    /// do that — Windows refuses to truncate or write a file with an open mapped section
+    /// (ERROR_USER_MAPPED_FILE, 1224), so the read+write form this used off-Unix could only ever
+    /// fail. The retained fingerprint still rejects the swap on Windows, via the file id and change
+    /// time, which differ even when the two files share a size and mtime.
+    ///
+    /// Returns the outcome rather than asserting it: callers run this between two barriers, where an
+    /// early return would strand the reader on one and hang the test binary.
+    fn replace_mapped_fixture(replacement: &Path, target: &Path) -> std::io::Result<()> {
+        std::fs::rename(replacement, target)
     }
 
     /// The Krea File loader's guard must end only after Candle has copied the last requested tensor
@@ -1333,12 +1575,14 @@ mod tests {
         let writer_done = Arc::clone(&replacement_done);
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            replace_mapped_fixture(&writer_replacement, &writer_source);
+            let swapped = replace_mapped_fixture(&writer_replacement, &writer_source);
+            // Release the reader whatever the swap did; the outcome is asserted on `join` below.
             writer_done.wait();
+            swapped
         });
 
         let consumed = Arc::clone(&last_consumed);
-        let error = match weights.read_source_unchanged(|| {
+        let outcome = weights.read_source_unchanged(|| {
             let first = weights.get("phase.first")?.to_vec1::<f32>()?;
             assert!(first.iter().all(|value| *value == 0.25));
             first_consumed.wait();
@@ -1352,13 +1596,18 @@ mod tests {
             dev.synchronize()?;
             consumed.store(true, Ordering::SeqCst);
             Ok(())
-        }) {
+        });
+        writer
+            .join()
+            .expect("replacement writer")
+            .expect("replace the mapped source mid-read");
+
+        let error = match outcome {
             Ok(()) => {
                 panic!("replacement during materialization must invalidate the Krea file pin")
             }
             Err(error) => error.to_string(),
         };
-        writer.join().expect("replacement writer");
 
         assert!(
             last_consumed.load(Ordering::SeqCst),
@@ -2030,6 +2279,91 @@ mod tests {
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         ::safetensors::serialize_to_file(tensors, None, path).unwrap();
+    }
+
+    fn write_kitchen_nvfp4_native_file(path: &Path) {
+        let (rows, cols) = (128usize, 64usize);
+        let mut packed = vec![0u8; rows * cols / 2];
+        packed[0] = 0x12; // Kitchen hi-first: even code 1, odd code 2.
+        let mut block_scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
+        block_scales[Nvfp4Tensor::scale_offset_for(0, 0, rows)] = 0x38; // E4M3 1.0.
+        let global_scale = 2.0f32.to_le_bytes();
+        let dense = vec![0u8; 16 * 16 * 4];
+
+        let mut tensors = std::collections::BTreeMap::new();
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::U8,
+                vec![rows, cols / 2],
+                &packed,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::F8_E4M3,
+                vec![rows, cols / 16],
+                &block_scales,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "model.diffusion_model.blocks.0.attn.wq.weight_scale_2",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::F32,
+                vec![],
+                &global_scale,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "model.diffusion_model.first.weight",
+            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::F32, vec![16, 16], &dense)
+                .unwrap(),
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        ::safetensors::serialize_to_file(tensors, None, path).unwrap();
+    }
+
+    #[test]
+    fn kitchen_nvfp4_native_file_uses_prepacked_projection_and_preserves_dense_layers() -> Result<()>
+    {
+        let dev = Device::Cpu;
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+
+        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        assert!(w.uses_native_keys());
+        assert!(w.is_native_nvfp4());
+        assert!(!w.is_plain_int8());
+        assert!(!w.is_convrot());
+        assert_eq!(
+            w.shape("transformer_blocks.0.attn.to_q.weight"),
+            Some(vec![128, 64]),
+            "architecture validation must see the logical, not packed, shape"
+        );
+
+        let packed = w.get_native_nvfp4("transformer_blocks.0.attn.to_q.weight")?;
+        assert_eq!(
+            packed.packed[0], 0x21,
+            "Kitchen nibble order must be swapped"
+        );
+        let dense = packed.dequantize_to_vec();
+        assert_eq!(&dense[..2], &[1.0, 2.0]);
+
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+        let quantized = linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan)?;
+        assert!(quantized.nvfp4().is_some());
+
+        let preserved = linear_detect_planned(&w, "img_in", false, &plan)?;
+        assert!(
+            preserved.nvfp4().is_none(),
+            "Kitchen profile's dense BF16/F32 projections must not be requantized"
+        );
+        Ok(())
     }
 
     /// sc-14023: the non-rotated descriptor arm reconstructs exactly `codes * row_scale` through the

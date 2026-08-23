@@ -46,6 +46,7 @@ fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the Lens text_encoder snapshot (LENS_TEXT_ENCODER_DIR) + goldens (LENS_GOLDENS)"]
 fn gptoss_encoder_matches_torch_reference() -> Result<()> {
     let te_dir = match std::env::var("LENS_TEXT_ENCODER_DIR") {
         Ok(d) => d,
