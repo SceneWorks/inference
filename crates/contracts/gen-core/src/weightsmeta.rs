@@ -20,10 +20,146 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub use safetensors::Dtype;
 use safetensors::SafeTensors;
 
 use crate::{Error, Result};
+
+// =================================================================================================
+// Dtype — the stored element type of one safetensors tensor (gen-core owned; sc-20385).
+// =================================================================================================
+
+/// The stored element type of one safetensors tensor, as named by the file header's `dtype`
+/// string.
+///
+/// gen-core owns this enum (it was the pinned `safetensors 0.4` crate's `Dtype` until sc-20385) so
+/// the header reader can name dtypes that crate predates. The one that matters today is
+/// [`Dtype::F8_E8M0`]: ComfyUI serialises MXFP8 block scales as `torch.float8_e8m0fnu`, which
+/// safetensors writes as the `"F8_E8M0"` dtype string, and a parser that cannot name it rejects the
+/// whole checkpoint header. Variant names are the exact safetensors dtype strings, so every
+/// `Dtype::F8_E4M3`-style comparison in the tree is unchanged, and a dtype string outside this list
+/// is a typed header error naming the tensor — never a silent "unknown" classification.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Dtype {
+    BOOL,
+    U8,
+    I8,
+    F8_E5M2,
+    F8_E4M3,
+    /// OCP MX shared-exponent scale (`torch.float8_e8m0fnu`): one byte = a biased power-of-two
+    /// exponent. Only ever a *companion* (MXFP8 block scales), never a weight element type.
+    F8_E8M0,
+    I16,
+    U16,
+    F16,
+    BF16,
+    I32,
+    U32,
+    F32,
+    F64,
+    I64,
+    U64,
+}
+
+impl Dtype {
+    /// Every dtype this reader can name, in safetensors declaration order.
+    pub const ALL: &'static [Dtype] = &[
+        Dtype::BOOL,
+        Dtype::U8,
+        Dtype::I8,
+        Dtype::F8_E5M2,
+        Dtype::F8_E4M3,
+        Dtype::F8_E8M0,
+        Dtype::I16,
+        Dtype::U16,
+        Dtype::F16,
+        Dtype::BF16,
+        Dtype::I32,
+        Dtype::U32,
+        Dtype::F32,
+        Dtype::F64,
+        Dtype::I64,
+        Dtype::U64,
+    ];
+
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            Dtype::BOOL
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::F8_E5M2
+            | Dtype::F8_E4M3
+            | Dtype::F8_E8M0 => 1,
+            Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
+            Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
+            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+        }
+    }
+
+    /// The safetensors header dtype string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dtype::BOOL => "BOOL",
+            Dtype::U8 => "U8",
+            Dtype::I8 => "I8",
+            Dtype::F8_E5M2 => "F8_E5M2",
+            Dtype::F8_E4M3 => "F8_E4M3",
+            Dtype::F8_E8M0 => "F8_E8M0",
+            Dtype::I16 => "I16",
+            Dtype::U16 => "U16",
+            Dtype::F16 => "F16",
+            Dtype::BF16 => "BF16",
+            Dtype::I32 => "I32",
+            Dtype::U32 => "U32",
+            Dtype::F32 => "F32",
+            Dtype::F64 => "F64",
+            Dtype::I64 => "I64",
+            Dtype::U64 => "U64",
+        }
+    }
+
+    /// Parse a safetensors header dtype string; `None` for a string this reader cannot name.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|dtype| dtype.as_str() == name)
+    }
+}
+
+impl TryFrom<safetensors::Dtype> for Dtype {
+    type Error = Error;
+
+    fn try_from(dtype: safetensors::Dtype) -> Result<Self> {
+        Ok(match dtype {
+            safetensors::Dtype::BOOL => Dtype::BOOL,
+            safetensors::Dtype::U8 => Dtype::U8,
+            safetensors::Dtype::I8 => Dtype::I8,
+            safetensors::Dtype::F8_E5M2 => Dtype::F8_E5M2,
+            safetensors::Dtype::F8_E4M3 => Dtype::F8_E4M3,
+            safetensors::Dtype::I16 => Dtype::I16,
+            safetensors::Dtype::U16 => Dtype::U16,
+            safetensors::Dtype::F16 => Dtype::F16,
+            safetensors::Dtype::BF16 => Dtype::BF16,
+            safetensors::Dtype::I32 => Dtype::I32,
+            safetensors::Dtype::U32 => Dtype::U32,
+            safetensors::Dtype::F32 => Dtype::F32,
+            safetensors::Dtype::F64 => Dtype::F64,
+            safetensors::Dtype::I64 => Dtype::I64,
+            safetensors::Dtype::U64 => Dtype::U64,
+            // The pinned crate's enum is `#[non_exhaustive]`; a dtype a future release adds that
+            // this enum has not named must not be mis-priced as some other width. The only caller
+            // is `CheckpointMeta` (adapter-sized files); the header-only reader parses dtype strings
+            // itself and names its refusal per tensor.
+            other => {
+                return Err(Error::Msg(format!(
+                    "safetensors dtype {other:?} is not named by gen_core::weightsmeta::Dtype"
+                )))
+            }
+        })
+    }
+}
 
 /// True when `path`'s file name begins with `.` — a hidden entry that is never a weight shard.
 ///
@@ -125,11 +261,17 @@ impl CheckpointMeta {
         let data_base = 8 + n;
         let shard = self.buffers.len();
         for (key, info) in meta.tensors() {
+            let dtype = Dtype::try_from(info.dtype).map_err(|error| {
+                Error::Msg(format!(
+                    "safetensors tensor {key:?} in {}: {error}",
+                    path.display()
+                ))
+            })?;
             self.index.insert(
                 key,
                 TensorLoc {
                     shard,
-                    dtype: info.dtype,
+                    dtype,
                     shape: info.shape.clone(),
                     start: data_base + info.data_offsets.0,
                     end: data_base + info.data_offsets.1,
@@ -231,136 +373,12 @@ impl SafetensorsTensorHeader {
 pub fn safetensors_path_tensor_headers(
     path: impl AsRef<Path>,
 ) -> Result<Vec<SafetensorsTensorHeader>> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
     fn read_file(path: &Path) -> Result<Vec<SafetensorsTensorHeader>> {
-        let mut file = std::fs::File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut prefix = [0_u8; 8];
-        file.read_exact(&mut prefix)?;
-        let header_len = u64::from_le_bytes(prefix);
-        if header_len > MAX_HEADER_SIZE {
-            return Err(Error::Msg(format!(
-                "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
-                path.display()
-            )));
-        }
-        let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
-            Error::Msg(format!(
-                "safetensors header too large in {}",
-                path.display()
-            ))
-        })?;
-        if data_start > file_len {
-            return Err(Error::Msg(format!(
-                "safetensors header in {} extends past the file",
-                path.display()
-            )));
-        }
-        let header_len = usize::try_from(header_len).map_err(|_| {
-            Error::Msg(format!(
-                "safetensors header too large in {}",
-                path.display()
-            ))
-        })?;
-        let mut header = vec![0_u8; header_len];
-        file.read_exact(&mut header)?;
-        let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
-            .map_err(|error| {
-                Error::Msg(format!("safetensors header in {}: {error}", path.display()))
-            })?;
-        let available = file_len - data_start;
-        let mut tensors = json
+        Ok(safetensors_file_tensor_locations(path)?
+            .tensors
             .into_iter()
-            .filter(|(name, _)| name != "__metadata__")
-            .map(|(name, value)| {
-                let info: safetensors::tensor::TensorInfo =
-                    serde_json::from_value(value).map_err(|error| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                let (start, end) = info.data_offsets;
-                let end_u64 = u64::try_from(end).map_err(|_| {
-                    Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has an unrepresentable end offset",
-                        path.display()
-                    ))
-                })?;
-                if start > end || end_u64 > available {
-                    return Err(Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has invalid offsets [{start}, {end})",
-                        path.display()
-                    )));
-                }
-                let data_bytes = u64::try_from(end - start).map_err(|_| {
-                    Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has an unrepresentable byte length",
-                        path.display()
-                    ))
-                })?;
-                let element_count = info.shape.iter().try_fold(1_u64, |count, dimension| {
-                    let dimension = u64::try_from(*dimension).map_err(|_| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has an unrepresentable dimension",
-                            path.display()
-                        ))
-                    })?;
-                    count.checked_mul(dimension).ok_or_else(|| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has a shape product overflow",
-                            path.display()
-                        ))
-                    })
-                })?;
-                let expected_bytes = element_count
-                    .checked_mul(info.dtype.size() as u64)
-                    .ok_or_else(|| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has a byte-size overflow",
-                            path.display()
-                        ))
-                    })?;
-                if data_bytes != expected_bytes {
-                    return Err(Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
-                        path.display(), info.dtype, info.shape
-                    )));
-                }
-                Ok((
-                    start,
-                    end,
-                    SafetensorsTensorHeader {
-                        name,
-                        dtype: info.dtype,
-                        shape: info.shape,
-                        data_bytes,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        tensors.sort_by(|left, right| {
-            (left.0, left.1, left.2.name.as_str()).cmp(&(right.0, right.1, right.2.name.as_str()))
-        });
-        let mut expected_start = 0_usize;
-        for (start, end, header) in &tensors {
-            if *start != expected_start {
-                return Err(Error::Msg(format!(
-                    "safetensors tensor {:?} in {} starts at {start}, expected contiguous offset {expected_start}",
-                    header.name,
-                    path.display()
-                )));
-            }
-            expected_start = *end;
-        }
-        if u64::try_from(expected_start).ok() != Some(available) {
-            return Err(Error::Msg(format!(
-                "safetensors tensor payload in {} covers {expected_start} bytes but file contains {available}",
-                path.display()
-            )));
-        }
-        Ok(tensors.into_iter().map(|(_, _, header)| header).collect())
+            .map(|location| location.header)
+            .collect())
     }
 
     fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -405,6 +423,248 @@ pub fn safetensors_path_tensor_headers(
         }
     }
     Ok(tensors.into_values().collect())
+}
+
+/// One tensor's header plus where its payload starts in the file (absolute byte offset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetensorsTensorLocation {
+    pub header: SafetensorsTensorHeader,
+    /// Absolute file offset of the first payload byte (`8 + header_len + data_offsets.0`).
+    pub file_offset: u64,
+}
+
+/// The validated header of one safetensors **file**: every tensor's header and payload location,
+/// sorted by payload offset, plus the raw header JSON bytes and where the data region begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetensorsFileLayout {
+    /// The header JSON exactly as stored (space padding included), for readers that need to
+    /// re-present it (the MLX lazy loader rewrites fp8 dtypes to `U8` at identical byte length).
+    pub header_json: Vec<u8>,
+    /// Absolute offset of the data region (`8 + header_len`).
+    pub data_start: u64,
+    /// Total file length in bytes.
+    pub file_len: u64,
+    /// Tensors sorted by `(file_offset, name)`; the payload region is proven contiguous.
+    pub tensors: Vec<SafetensorsTensorLocation>,
+}
+
+/// The header-only validation every safetensors consumer in this workspace shares, on one file:
+/// parses the header JSON itself (so a dtype string the pinned `safetensors` crate predates — e.g.
+/// `F8_E8M0` — is named, not fatal), checks each tensor's shape × dtype width against its declared
+/// byte range, and proves the payload region is contiguous and exactly covers the file. Reads the
+/// header only; never a tensor payload.
+pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<SafetensorsFileLayout> {
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+            path.display()
+        )));
+    }
+    let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    if data_start > file_len {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} extends past the file",
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+        .map_err(|error| {
+            Error::Msg(format!("safetensors header in {}: {error}", path.display()))
+        })?;
+    let available = file_len - data_start;
+    let mut tensors = json
+        .into_iter()
+        .filter(|(name, _)| name != "__metadata__")
+        .map(|(name, value)| {
+            let object = value.as_object().ok_or_else(|| {
+                Error::Msg(format!(
+                    "safetensors tensor {name:?} in {}: header entry is not an object",
+                    path.display()
+                ))
+            })?;
+            let dtype_name = object
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing string `dtype`",
+                        path.display()
+                    ))
+                })?;
+            let dtype = Dtype::parse(dtype_name).ok_or_else(|| {
+                Error::Msg(format!(
+                    "safetensors tensor {name:?} in {}: unknown dtype {dtype_name:?}",
+                    path.display()
+                ))
+            })?;
+            let shape = object
+                .get("shape")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing array `shape`",
+                        path.display()
+                    ))
+                })?
+                .iter()
+                .map(|dimension| {
+                    dimension
+                        .as_u64()
+                        .and_then(|dimension| usize::try_from(dimension).ok())
+                        .ok_or_else(|| {
+                            Error::Msg(format!(
+                                "safetensors tensor {name:?} in {} has an unrepresentable dimension",
+                                path.display()
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<usize>>>()?;
+            let offsets = object
+                .get("data_offsets")
+                .and_then(serde_json::Value::as_array)
+                .filter(|offsets| offsets.len() == 2)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing two-element `data_offsets`",
+                        path.display()
+                    ))
+                })?;
+            let (start, end) = match (offsets[0].as_u64(), offsets[1].as_u64()) {
+                (Some(start), Some(end)) => (start, end),
+                _ => {
+                    return Err(Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has non-integer data offsets",
+                        path.display()
+                    )))
+                }
+            };
+            if start > end || end > available {
+                return Err(Error::Msg(format!(
+                    "safetensors tensor {name:?} in {} has invalid offsets [{start}, {end})",
+                    path.display()
+                )));
+            }
+            let data_bytes = end - start;
+            let element_count = shape.iter().try_fold(1_u64, |count, dimension| {
+                count.checked_mul(*dimension as u64).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has a shape product overflow",
+                        path.display()
+                    ))
+                })
+            })?;
+            let expected_bytes = element_count
+                .checked_mul(dtype.size() as u64)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has a byte-size overflow",
+                        path.display()
+                    ))
+                })?;
+            if data_bytes != expected_bytes {
+                return Err(Error::Msg(format!(
+                    "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
+                    path.display(), dtype, shape
+                )));
+            }
+            Ok(SafetensorsTensorLocation {
+                header: SafetensorsTensorHeader {
+                    name,
+                    dtype,
+                    shape,
+                    data_bytes,
+                },
+                file_offset: data_start + start,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tensors.sort_by(|left, right| {
+        (left.file_offset, left.header.name.as_str())
+            .cmp(&(right.file_offset, right.header.name.as_str()))
+    });
+    let mut expected_start = data_start;
+    for location in &tensors {
+        if location.file_offset != expected_start {
+            return Err(Error::Msg(format!(
+                "safetensors tensor {:?} in {} starts at {}, expected contiguous offset {}",
+                location.header.name,
+                path.display(),
+                location.file_offset - data_start,
+                expected_start - data_start
+            )));
+        }
+        expected_start = location.file_offset + location.header.data_bytes;
+    }
+    if expected_start != file_len {
+        return Err(Error::Msg(format!(
+            "safetensors tensor payload in {} covers {} bytes but file contains {available}",
+            path.display(),
+            expected_start - data_start
+        )));
+    }
+    Ok(SafetensorsFileLayout {
+        header_json: header,
+        data_start,
+        file_len,
+        tensors,
+    })
+}
+
+/// Read the raw payload bytes of the selected tensors from one safetensors file — nothing else is
+/// touched. Built for the *small* per-layer companions a codec plan needs before any backend array
+/// exists (ComfyUI `.comfy_quant` descriptor blobs); `max_bytes_each` bounds every selected payload
+/// so a mis-selected multi-gigabyte weight is a typed refusal, not a host-RAM surprise.
+pub fn read_safetensors_tensor_payloads(
+    path: impl AsRef<Path>,
+    mut select: impl FnMut(&SafetensorsTensorHeader) -> bool,
+    max_bytes_each: u64,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    use std::io::{Seek, SeekFrom};
+
+    let path = path.as_ref();
+    let layout = safetensors_file_tensor_locations(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let mut payloads = BTreeMap::new();
+    for location in layout.tensors {
+        if !select(&location.header) {
+            continue;
+        }
+        if location.header.data_bytes > max_bytes_each {
+            return Err(Error::Msg(format!(
+                "safetensors tensor {:?} in {} is {} bytes, above the {max_bytes_each}-byte \
+                 payload read limit",
+                location.header.name,
+                path.display(),
+                location.header.data_bytes
+            )));
+        }
+        let mut payload = vec![0_u8; location.header.data_bytes as usize];
+        file.seek(SeekFrom::Start(location.file_offset))?;
+        file.read_exact(&mut payload)?;
+        payloads.insert(location.header.name, payload);
+    }
+    Ok(payloads)
 }
 
 /// Sum the on-disk bytes of every `.safetensors` weight file under `dir` (recursively), **without
@@ -895,25 +1155,7 @@ mod tests {
     /// new safetensors dtype is classified deliberately instead of quietly inheriting `false`.
     #[test]
     fn is_float_admits_only_candle_cast_float_dtypes() {
-        const ALL_DTYPES: &[Dtype] = &[
-            Dtype::BOOL,
-            Dtype::U8,
-            Dtype::I8,
-            Dtype::F8_E5M2,
-            Dtype::F8_E4M3,
-            Dtype::I16,
-            Dtype::U16,
-            Dtype::F16,
-            Dtype::BF16,
-            Dtype::I32,
-            Dtype::U32,
-            Dtype::F32,
-            Dtype::F64,
-            Dtype::I64,
-            Dtype::U64,
-        ];
-
-        let admitted = ALL_DTYPES
+        let admitted = Dtype::ALL
             .iter()
             .copied()
             .filter(|dtype| {
@@ -1176,7 +1418,7 @@ mod tests {
         // Serialize a tiny safetensors file, reopen it through CheckpointMeta, and assert the header
         // view + byte slice round-trip without a tensor library.
         let data: Vec<u8> = (0u8..16).collect(); // 4×i32 = 16 bytes
-        let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let tv = StTensorView::new(safetensors::Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
         let tmp = fixture_dir("gencore_meta_");
@@ -1292,7 +1534,7 @@ mod tests {
     #[test]
     fn from_dir_skips_appledouble_sidecar() {
         let data: Vec<u8> = (0u8..16).collect();
-        let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let tv = StTensorView::new(safetensors::Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
         let tmp = fixture_dir("gencore_appledouble_");

@@ -153,6 +153,7 @@ pub use gen_core::tiling::VideoDecodeMemoryProfile;
 // ControlNet loads AND the FLUX-family IP-Adapter / PuLID EVA-CLIP towers all share. It had drifted into
 // `candle-gen-sdxl`, making that pipeline crate a de-facto commons crate that PuLID/FLUX pulled the whole
 // ~12k-LOC SDXL crate in for. Hoisted here; `candle-gen-sdxl::weights` re-exports it for compatibility.
+pub mod logical_weights;
 pub mod weights;
 pub use weights::Weights;
 

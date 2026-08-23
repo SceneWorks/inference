@@ -274,7 +274,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 #[cfg(test)]
 mod explicit_registry_tests {
     fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
@@ -392,7 +392,10 @@ mod explicit_registry_tests {
                 0
             };
             assert_eq!(footprint.text_encoder, language + vision, "{id}");
-            assert_eq!(footprint.dit, mlx_gen::safetensors_path_bytes(&dit), "{id}");
+            // sc-20385: the DiT is priced from the logical-weight plan -- a dense bf16 fixture's
+            // resident bytes are its tensor data bytes (the header is not resident), not the file
+            // length.
+            assert_eq!(footprint.dit, 2, "{id}");
             assert_eq!(
                 footprint.vae,
                 mlx_gen::safetensors_path_bytes(base.join("vae")),

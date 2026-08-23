@@ -1803,7 +1803,16 @@ pub(crate) fn component_footprint_for(
         }
         WeightsSource::File(dit) => Ok(mlx_gen::PerComponentBytes {
             text_encoder,
-            dit: mlx_gen::safetensors_path_bytes(dit),
+            // Priced from the logical-weight plan (sc-20385): a dense bf16 file prices at its
+            // stored bytes as before, while int8/fp8/mxfp8 layers price at their dense bf16
+            // resident form — the file bytes alone would under-report a quantized import by 2×.
+            // `None` quant: like the Dir arm, the footprint reports the pre-load-time-quant dense
+            // form; the memory-strategy contract prices `spec.quantize` for admission.
+            dit: crate::block_memory_strategy::native_dit_transformer_bytes(
+                provider_id,
+                dit,
+                None,
+            )?,
             vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
         }),
     }
@@ -1906,7 +1915,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
-        write_named_safetensors(path, "probe");
+        // A real native DiT key: since sc-20385 imported-file pricing and loading compile the
+        // logical-weight plan, so a foreign probe key would refuse where these fixtures expect a
+        // priceable file. Harmless for component fixtures (their keys are not planned).
+        write_named_safetensors(path, "model.diffusion_model.first.weight");
     }
 
     fn write_named_safetensors(path: &Path, tensor: &str) {
@@ -2955,10 +2967,17 @@ mod tests {
             "a resident load materializes through the reader"
         );
         assert!(receipt.tensor_count > 0);
+        // Measured residency equals the plan's prediction for whatever codec mix the file uses:
+        // a dense bf16 file leaves exactly its source bytes resident, an fp8 cast twice them.
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping,
+        )
+        .expect("the rendered file compiles a codec plan");
         assert_eq!(
             receipt.resident_bytes(),
-            receipt.source_bytes,
-            "dense pass-through codecs leave exactly the source bytes resident"
+            plan.resident_bytes(),
+            "measured residency must equal the plan's packed-vs-dense pricing"
         );
         let request = GenerationRequest {
             prompt,
