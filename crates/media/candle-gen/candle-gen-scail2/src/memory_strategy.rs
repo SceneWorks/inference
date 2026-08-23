@@ -407,10 +407,12 @@ fn validate_request_identity(
     request: &GenerationRequest,
 ) -> gen_core::Result<()> {
     let source_digest = structural_source_digest(&memory.structural_evidence, context)?.to_owned();
+    let mode = request.video_mode.as_deref().unwrap_or_default();
+    let carrier = request.scail2_animation_conditioning()?;
     let identity = gen_core::MemoryStructuralResidentRequestIdentity {
         source_digest,
-        mode: request.video_mode.clone().unwrap_or_default(),
-        carrier_shape: "character_animation".to_owned(),
+        mode: mode.to_owned(),
+        carrier_shape: carrier.identity_shape(mode)?,
         width: request.width,
         height: request.height,
         frames: request.frames.unwrap_or_default(),
@@ -609,7 +611,7 @@ fn validate_route(
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
     let geometry = context.geometry;
-    if context.mode.as_key() != "animation"
+    if !matches!(context.mode.as_key(), "animation" | "replacement")
         || geometry.batch != 1
         || geometry.reference_count != 1
         || !context.has_reference
@@ -624,7 +626,7 @@ fn validate_route(
         || context.selection.strategy != MemoryStrategy::Resident
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{PROVIDER_ID}: requires the exact one-character animation Resident route"
+            "{PROVIDER_ID}: requires the exact one-character animation/replacement Resident route"
         )));
     }
     match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
@@ -653,11 +655,17 @@ pub(crate) fn safety_check(
 pub(crate) fn validate_generation_request(request: &GenerationRequest) -> gen_core::Result<()> {
     let carrier = request.scail2_animation_conditioning()?;
     let frames = request.frames.unwrap_or_default();
-    if request.video_mode.as_deref() != Some("animation")
-        || !PUBLIC_BUCKETS.contains(&(request.width, request.height))
+    if !matches!(
+        request.video_mode.as_deref(),
+        Some("animation" | "replacement")
+    ) || !PUBLIC_BUCKETS.contains(&(request.width, request.height))
         || !PUBLIC_FRAMES.contains(&frames)
         || request.fps != Some(16)
         || u32::try_from(carrier.driving_frames.len()).unwrap_or(u32::MAX) != frames
+        || carrier
+            .driving_frames
+            .iter()
+            .any(|frame| (frame.width, frame.height) != (request.width, request.height))
         || request.count != 1
         || request.use_pid
         || request.phases.is_some()
@@ -666,7 +674,7 @@ pub(crate) fn validate_generation_request(request: &GenerationRequest) -> gen_co
             .is_some_and(|memory| memory != gen_core::GenerationMemory::default())
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{PROVIDER_ID}: request left the admitted animation envelope"
+            "{PROVIDER_ID}: request left the admitted animation/replacement envelope"
         )));
     }
     Ok(())
@@ -733,15 +741,15 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, GenerationRequest, Image, ReplacementMode};
 
-    fn image() -> Image {
+    fn image(width: u32, height: u32) -> Image {
         Image {
-            width: 2,
-            height: 2,
-            pixels: vec![0; 12],
+            width,
+            height,
+            pixels: Vec::new(),
         }
     }
 
-    fn request(width: u32, height: u32, frames: u32) -> GenerationRequest {
+    fn request(mode: &str, width: u32, height: u32, frames: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "dance".to_owned(),
             width,
@@ -749,16 +757,16 @@ mod tests {
             count: 1,
             frames: Some(frames),
             fps: Some(16),
-            video_mode: Some("animation".to_owned()),
+            video_mode: Some(mode.to_owned()),
             conditioning: vec![
                 Conditioning::Reference {
-                    image: image(),
+                    image: image(2, 2),
                     strength: None,
                 },
-                Conditioning::Mask { image: image() },
+                Conditioning::Mask { image: image(2, 2) },
                 Conditioning::ControlClip {
-                    frames: (0..frames).map(|_| image()).collect(),
-                    mask: (0..frames).map(|_| image()).collect(),
+                    frames: (0..frames).map(|_| image(width, height)).collect(),
+                    mask: (0..frames).map(|_| image(width, height)).collect(),
                     masking_strength: 1.0,
                     start_frame: 0,
                     mode: ReplacementMode::default(),
@@ -772,7 +780,9 @@ mod tests {
     fn public_cells_and_resident_only_contract_are_exact() {
         for &(width, height) in PUBLIC_BUCKETS {
             for &frames in PUBLIC_FRAMES {
-                validate_generation_request(&request(width, height, frames)).unwrap();
+                for mode in ["animation", "replacement"] {
+                    validate_generation_request(&request(mode, width, height, frames)).unwrap();
+                }
             }
         }
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/unread")));
@@ -789,18 +799,24 @@ mod tests {
 
     #[test]
     fn crossed_animation_axes_refuse_before_generation() {
-        let mut wrong = request(832, 480, 45);
+        let mut wrong = request("replacement", 832, 480, 45);
         wrong.fps = Some(24);
         assert!(validate_generation_request(&wrong).is_err());
-        let mut wrong = request(832, 480, 45);
-        wrong.video_mode = Some("replacement".to_owned());
+        let mut wrong = request("animation", 832, 480, 45);
+        wrong.video_mode = Some("other".to_owned());
         assert!(validate_generation_request(&wrong).is_err());
-        let mut wrong = request(832, 480, 45);
+        let mut wrong = request("replacement", 832, 480, 45);
         wrong
             .conditioning
-            .push(Conditioning::Mask { image: image() });
+            .push(Conditioning::Mask { image: image(2, 2) });
         assert!(validate_generation_request(&wrong).is_err());
-        assert!(validate_generation_request(&request(1024, 576, 45)).is_err());
+        let mut wrong = request("replacement", 832, 480, 45);
+        let Conditioning::ControlClip { frames, .. } = &mut wrong.conditioning[2] else {
+            unreachable!()
+        };
+        frames[0] = image(480, 832);
+        assert!(validate_generation_request(&wrong).is_err());
+        assert!(validate_generation_request(&request("replacement", 1024, 576, 45)).is_err());
     }
 
     fn write_tensor(path: &Path, name: &str, bytes: usize) {
@@ -919,10 +935,16 @@ mod tests {
             tier: prepared.tier,
         };
         let source_digest = format!("{:x}", Sha256::digest(b"character\0driving"));
+        let mode = request.video_mode.as_deref().unwrap();
+        let carrier_shape = request
+            .scail2_animation_conditioning()
+            .unwrap()
+            .identity_shape(mode)
+            .unwrap();
         let identity = gen_core::MemoryStructuralResidentRequestIdentity {
             source_digest,
-            mode: "animation".to_owned(),
-            carrier_shape: "character_animation".to_owned(),
+            mode: mode.to_owned(),
+            carrier_shape,
             width: request.width,
             height: request.height,
             frames: request.frames.unwrap(),
@@ -942,7 +964,7 @@ mod tests {
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: String::new(),
             load_shape: prepared.contract.load_shape,
-            mode: gen_core::MemoryMode::Other("animation".to_owned()),
+            mode: gen_core::MemoryMode::Other(mode.to_owned()),
             has_reference: true,
             use_pid: false,
             has_phases: false,
@@ -973,24 +995,27 @@ mod tests {
     fn candle_safety_begin_and_registration_bind_cold_warm_identity() {
         let (_temp, spec) = candle_fixture(Some("hybrid"));
         let prepared = PreparedMemory::prepare(&spec).unwrap();
-        let mut req = request(832, 480, 45);
-        req.seed = Some(44);
-        for cache_state in [
-            gen_core::MemoryCacheState::Cold,
-            gen_core::MemoryCacheState::Warm,
-        ] {
-            let context = admitted_context(&prepared, &req, cache_state);
-            assert_eq!(
-                safety_check(&prepared, &context),
-                MemorySafetyDecision::Accept
-            );
-            let mut scope = begin_request(&prepared, Device::Cpu, &context)
-                .unwrap()
-                .unwrap();
-            let mut exact = req.clone();
-            scope.configure_request(&mut exact).unwrap();
-            scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        for mode in ["animation", "replacement"] {
+            let mut req = request(mode, 832, 480, 45);
+            req.seed = Some(44);
+            for cache_state in [
+                gen_core::MemoryCacheState::Cold,
+                gen_core::MemoryCacheState::Warm,
+            ] {
+                let context = admitted_context(&prepared, &req, cache_state);
+                assert_eq!(
+                    safety_check(&prepared, &context),
+                    MemorySafetyDecision::Accept
+                );
+                let mut scope = begin_request(&prepared, Device::Cpu, &context)
+                    .unwrap()
+                    .unwrap();
+                let mut exact = req.clone();
+                scope.configure_request(&mut exact).unwrap();
+                scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+            }
         }
+        let req = request("replacement", 832, 480, 45);
         let context = admitted_context(&prepared, &req, gen_core::MemoryCacheState::Cold);
         let mut wrong_contract = prepared.contract.clone();
         wrong_contract.asset_facts.base_bytes += 1;

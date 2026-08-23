@@ -933,7 +933,7 @@ pub struct ControlClipRef<'a> {
     pub mode: ReplacementMode,
 }
 
-/// Exact SCAIL-2 public animation carrier: one character image, its paired color mask, and one
+/// Exact SCAIL-2 public animation/replacement carrier: one character image, its paired color mask, and one
 /// driving clip with a one-to-one frame/mask sequence. The three physical conditioning entries are
 /// one conceptual character reference for memory-evidence geometry.
 #[derive(Clone, Copy, Debug)]
@@ -947,6 +947,21 @@ pub struct Scail2AnimationConditioningRef<'a> {
 impl Scail2AnimationConditioningRef<'_> {
     pub const fn reference_count(&self) -> u32 {
         1
+    }
+
+    pub fn identity_shape(&self, mode: &str) -> crate::Result<String> {
+        let control = self
+            .driving_frames
+            .first()
+            .ok_or_else(|| Error::Unsupported("scail2 carrier has no driving frames".to_owned()))?;
+        Ok(format!(
+            "{mode}:reference:{}x{}:control:{}x{}x{}",
+            self.character.width,
+            self.character.height,
+            control.width,
+            control.height,
+            self.driving_frames.len()
+        ))
     }
 }
 
@@ -975,8 +990,10 @@ impl GenerationRequest {
     /// `Reference + Mask + ControlClip` list describes one character identity, not two images (or
     /// three generic conditioning entries); every other carrier retains the generic image count.
     pub fn memory_reference_count(&self) -> u32 {
-        if self.video_mode.as_deref() == Some("animation")
-            && self.scail2_animation_conditioning().is_ok()
+        if matches!(
+            self.video_mode.as_deref(),
+            Some("animation" | "replacement")
+        ) && self.scail2_animation_conditioning().is_ok()
         {
             1
         } else {
@@ -1358,7 +1375,7 @@ impl GenerationRequest {
         })
     }
 
-    /// Parse the exact ordered SCAIL-2 animation carrier. This deliberately does not infer the
+    /// Parse the exact ordered SCAIL-2 animation/replacement carrier. This deliberately does not infer the
     /// route from `conditioning.len() == 3`: every position and field is typed and crossed shapes
     /// fail closed before a provider configures or loads tensors.
     pub fn scail2_animation_conditioning(
@@ -1378,20 +1395,42 @@ impl GenerationRequest {
         }] = self.conditioning.as_slice()
         else {
             return Err(Error::Unsupported(
-                "scail2 animation requires exactly ordered Reference(strength unset), Mask, and ControlClip conditioning"
+                "scail2 requires exactly ordered Reference(strength unset), Mask, and ControlClip conditioning"
                     .to_owned(),
             ));
         };
         if frames.is_empty() || driving_masks.len() != frames.len() {
             return Err(Error::Unsupported(format!(
-                "scail2 animation requires one driving mask per non-empty driving frame ({} frames, {} masks)",
+                "scail2 requires one driving mask per non-empty driving frame ({} frames, {} masks)",
                 frames.len(),
                 driving_masks.len()
             )));
         }
         if *masking_strength != 1.0 || *start_frame != 0 || *mode != ReplacementMode::default() {
             return Err(Error::Unsupported(
-                "scail2 animation ControlClip requires masking_strength=1, start_frame=0, and full-person mode"
+                "scail2 ControlClip requires masking_strength=1, start_frame=0, and full-person mode"
+                    .to_owned(),
+            ));
+        }
+        if character.width == 0
+            || character.height == 0
+            || (character_mask.width, character_mask.height) != (character.width, character.height)
+        {
+            return Err(Error::Unsupported(
+                "scail2 requires a non-empty character image and an exact-shape character mask"
+                    .to_owned(),
+            ));
+        }
+        let control_shape = (frames[0].width, frames[0].height);
+        if control_shape.0 == 0
+            || control_shape.1 == 0
+            || frames.iter().zip(driving_masks).any(|(frame, mask)| {
+                (frame.width, frame.height) != control_shape
+                    || (mask.width, mask.height) != control_shape
+            })
+        {
+            return Err(Error::Unsupported(
+                "scail2 requires uniform non-empty driving frames with one exact-shape mask each"
                     .to_owned(),
             ));
         }
@@ -3369,7 +3408,12 @@ mod tests {
 
         let mut replacement = exact;
         replacement.video_mode = Some("replacement".to_owned());
-        assert_eq!(replacement.memory_reference_count(), 2);
+        assert_eq!(replacement.memory_reference_count(), 1);
+        let carrier = replacement.scail2_animation_conditioning().unwrap();
+        assert_eq!(
+            carrier.identity_shape("replacement").unwrap(),
+            "replacement:reference:2x2:control:2x2x2"
+        );
     }
 
     #[test]
