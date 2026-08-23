@@ -142,6 +142,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
     registry.build()
 }
 
@@ -3366,8 +3368,12 @@ mod preview_advertising {
         register_providers: fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder,
         /// `Some` for a crate that publishes weights-free contract surfaces on every platform.
         /// `None` marks a route reachable only through a CUDA-gated `register_providers` — the
-        /// asymmetry the old `24`/`23` registration pin used to encode.
+        /// asymmetry the old `24`/`23` registration pin used to encode, unless it publishes a
+        /// resident-only witness directly from `register_providers`.
         register_surfaces: Option<fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder>,
+        /// A resident-only route can be registered on every platform without publishing optimized
+        /// contract surfaces; this keeps that intentional asymmetry explicit.
+        resident_only_on_cpu: bool,
     }
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
@@ -3375,56 +3381,79 @@ mod preview_advertising {
             dir: "candle-gen-bernini",
             register_providers: candle_gen_bernini::register_providers,
             register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-flux2",
             register_providers: candle_gen_flux2::register_providers,
             register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-krea",
             register_providers: candle_gen_krea::register_providers,
             register_surfaces: Some(candle_gen_krea::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-lens",
             register_providers: candle_gen_lens::register_providers,
             register_surfaces: Some(candle_gen_lens::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-mage",
             register_providers: candle_gen_mage::register_providers,
             register_surfaces: Some(candle_gen_mage::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-minimax-h3",
             register_providers: candle_gen_minimax_h3::register_providers,
             register_surfaces: Some(candle_gen_minimax_h3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-scail2",
+            register_providers: candle_gen_scail2::register_providers,
+            register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-sensenova",
             register_providers: candle_gen_sensenova::register_providers,
             register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-svd",
+            register_providers: candle_gen_svd::register_providers,
+            register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",
             register_providers: candle_gen_wan::register_providers,
             register_surfaces: None,
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-z-image",
             register_providers: candle_gen_z_image::register_providers,
             register_surfaces: Some(candle_gen_z_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
     ];
 
@@ -3561,7 +3590,9 @@ mod preview_advertising {
                 .memory_strategy_registrations()
                 .map(|registration| registration.provider_id)
                 .collect::<BTreeSet<_>>();
-            let reachable = owner.register_surfaces.is_some() || cfg!(feature = "cuda");
+            let reachable = owner.register_surfaces.is_some()
+                || owner.resident_only_on_cpu
+                || cfg!(feature = "cuda");
             assert_eq!(
                 !ids.is_empty(),
                 reachable,
