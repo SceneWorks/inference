@@ -123,7 +123,6 @@ pub struct Scail2 {
 /// `Wan2.1_VAE.pth` + `umt5-xxl/` + the open-CLIP XLM-RoBERTa ViT-H/14 visual encoder), as published
 /// to `SceneWorks/scail2-mlx`.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let memory_strategy = crate::memory_strategy::PreparedMemory::prepare(spec)?;
     let root =
         match &spec.weights {
             WeightsSource::Dir(p) => p.clone(),
@@ -138,6 +137,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             root.display()
         )));
     }
+    let memory_strategy = crate::memory_strategy::PreparedMemory::prepare(spec)?;
     let config = Scail2Config::from_model_dir(&root)?;
     memory_strategy.ensure_unchanged(&spec.adapters)?;
     Ok(Box::new(Scail2 {

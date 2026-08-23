@@ -138,13 +138,17 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
-/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
-/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
-/// from the requested quantization field.
+/// Resolve a provider-owned, load-exact numeric tier for MLX video admission. Packed providers carry
+/// no load-time quant hint, so Krea and Wan must read their immutable snapshot surfaces here.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
 ) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    if provider_id == mlx_gen_krea_realtime::MODEL_ID {
+        return mlx_gen_krea_realtime::resolved_numeric_tier(spec)
+            .map(Some)
+            .map_err(|error| media::gen_core::Error::Msg(error.to_string()));
+    }
     mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
 }
 
@@ -673,13 +677,13 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 50);
+        assert_eq!(registry.memory_strategy_registrations().len(), 52);
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert!(resident_only.is_empty());
+        assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
         // joined them in the sc-17137 sync, and FLUX.2 Dev Control now has its exact fixture): these

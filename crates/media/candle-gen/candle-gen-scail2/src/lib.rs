@@ -88,6 +88,7 @@ pub fn register_providers(
     registry
         .register_generator(pipeline::REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle Scail2 provider catalog.

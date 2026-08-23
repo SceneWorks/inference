@@ -10,8 +10,8 @@ use mlx_gen::gen_core::{
     MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryStructuralResidentEvidence, Precision, Quant, ResidentRequestMemory, WeightsSource,
-    MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
+    MemoryStructuralResidentEvidence, Precision, Quant, ResidentOnlyMemoryContractRegistration,
+    ResidentRequestMemory, WeightsSource, MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
 use sha2::{Digest, Sha256};
 
@@ -652,6 +652,20 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
     PreparedMemory::prepare(spec).map(|prepared| prepared.contract)
 }
 
+/// Weights-free catalog witness for the sole shipped dense-bf16 Resident surface. Production loads
+/// still require the immutable canonical receipt in [`PreparedMemory::prepare`].
+fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    validate_load_spec(spec)?;
+    Ok(build_contract(spec, MemoryAssetFacts::default()))
+}
+
+fn resident_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::mlx_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.tier == gen_core::MemoryContractSurfaceTier::Bf16)
+        .collect()
+}
+
 fn validate_route(
     contract: &MemoryProviderContract,
     tier: MemoryNumericTier,
@@ -781,6 +795,13 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
         },
     },
 };
+
+pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
+    ResidentOnlyMemoryContractRegistration {
+        provider_id: PROVIDER_ID,
+        contract: weights_free_resident_contract,
+        surface_specs: resident_surface_specs,
+    };
 
 #[cfg(test)]
 mod tests {
