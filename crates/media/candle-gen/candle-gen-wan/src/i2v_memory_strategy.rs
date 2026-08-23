@@ -277,6 +277,14 @@ mod tests {
             guard.arm("flf-cancel-or-error".to_owned()).unwrap();
         }
         assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+
+        let panic = std::panic::catch_unwind(|| {
+            let mut guard = ActiveEvidenceGuard::default();
+            guard.arm("replace-person-panic".to_owned()).unwrap();
+            panic!("exercise request panic cleanup");
+        });
+        assert!(panic.is_err());
+        assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
     }
 
     #[test]

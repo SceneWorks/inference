@@ -277,5 +277,65 @@ mod tests {
             guard.arm("flf-cancel-or-error".to_owned()).unwrap();
         }
         assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+
+        let panic = std::panic::catch_unwind(|| {
+            let mut guard = ActiveEvidenceGuard::default();
+            guard.arm("replace-person-panic".to_owned()).unwrap();
+            panic!("exercise request panic cleanup");
+        });
+        assert!(panic.is_err());
+        assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+    }
+
+    #[test]
+    fn vace_fun_selected_staged_and_decode_controls_are_request_authoritative() {
+        let staged_request = GenerationRequest {
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(staged(&staged_request));
+        assert_eq!(
+            selected_strategy(&staged_request),
+            MemoryStrategy::StagedResidency
+        );
+
+        let decode_request = GenerationRequest {
+            memory: Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                tile_vae_decode: true,
+                decode_tile_edge: Some(192),
+                decode_overlap: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(staged(&decode_request));
+        assert_eq!(
+            selected_strategy(&decode_request),
+            MemoryStrategy::BoundedDecode
+        );
+        assert!(decode_tiling(&decode_request, 832, 480, 45)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn active_receipts_reject_same_thread_overlap_and_isolate_concurrent_threads() {
+        ACTIVE_EVIDENCE.with(|active| *active.borrow_mut() = None);
+        let mut first = ActiveEvidenceGuard::default();
+        first.arm("warm-request".to_owned()).unwrap();
+        let mut crossed = ActiveEvidenceGuard::default();
+        assert!(crossed.arm("crossed-request".to_owned()).is_err());
+        let concurrent = std::thread::spawn(|| {
+            let mut independent = ActiveEvidenceGuard::default();
+            independent.arm("concurrent-request".to_owned()).unwrap();
+            assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_some()));
+        });
+        concurrent.join().unwrap();
+        first.clear();
+        assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
     }
 }

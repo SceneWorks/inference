@@ -884,7 +884,8 @@ impl WanVaceFun {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
         let base = &self.config.base;
-        let sequential = self.offload_policy == OffloadPolicy::Sequential;
+        let sequential = self.offload_policy == OffloadPolicy::Sequential
+            || crate::i2v_memory_strategy::staged(req);
 
         // sc-4986 / sc-12459 (F-008) — fail fast (catchable) if the DiT-denoise stage won't fit,
         // BEFORE the UMT5 encode, the VAE conditioning encode, and the 27–54 GB dual-expert load.
@@ -1162,11 +1163,9 @@ mod tests {
     #[test]
     fn only_dual_expert_vace_advertises_sequential_offload() {
         assert!(!descriptor_vace().capabilities.supports_sequential_offload);
-        assert!(
-            descriptor_vace_fun()
-                .capabilities
-                .supports_sequential_offload
-        );
+        let fun = descriptor_vace_fun();
+        assert!(fun.capabilities.supports_sequential_offload);
+        assert_eq!(fun.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
     }
 
     #[test]

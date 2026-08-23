@@ -361,6 +361,7 @@ impl Pipeline {
         prepared: Prepared,
         vae: &WanVae16,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
+        decode_cap: Option<u32>,
     ) -> CResult<(Vec<Image>, u32)> {
         let t = prepared.latents.dim(2)?;
         let latents = if prepared.num_ref > 0 {
@@ -370,7 +371,7 @@ impl Pipeline {
         } else {
             prepared.latents
         };
-        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
+        let decoded = vae.decode_budgeted_with_cancel_and_tile_cap(&latents, cancel, decode_cap)?;
         Ok((frames_to_images(&decoded)?, prepared.fps))
     }
 }
@@ -534,6 +535,12 @@ impl Generator for WanVaceFunGenerator {
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(
+            self.offload,
+            self.i2v_memory.is_some(),
+            req,
+        );
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
         let pipeline = Pipeline::new(
             &self.root,
             &self.device,
@@ -542,7 +549,7 @@ impl Generator for WanVaceFunGenerator {
         );
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
-        let (mut prepared, resident_shared) = match self.offload {
+        let (mut prepared, resident_shared) = match effective_offload {
             OffloadPolicy::Resident => {
                 let shared = self.shared(&pipeline)?;
                 let prepared = pipeline.prepare(req, &shared)?;
@@ -561,7 +568,7 @@ impl Generator for WanVaceFunGenerator {
         let timesteps = (0..prepared.steps)
             .map(|step| scheduler.timestep(step))
             .collect::<Vec<_>>();
-        match self.offload {
+        match effective_offload {
             OffloadPolicy::Resident => {
                 let experts = self.experts(&pipeline)?;
                 let steps = prepared.steps;
@@ -648,7 +655,7 @@ impl Generator for WanVaceFunGenerator {
             }
         };
         on_progress(Progress::Decoding);
-        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel)?;
+        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
         Ok(GenerationOutput::Video {
             frames,
             fps,
@@ -1078,6 +1085,8 @@ mod tests {
 
     #[test]
     fn quantized_load_fails_closed_before_any_weight_or_adapter_load() {
+        assert!(descriptor().capabilities.supported_quants.is_empty());
+        assert!(descriptor().capabilities.supports_sequential_offload);
         let spec = LoadSpec::new(WeightsSource::Dir("/snapshot".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&spec).err().expect("quantized load must fail"),

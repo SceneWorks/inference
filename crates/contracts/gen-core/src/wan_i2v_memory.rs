@@ -28,7 +28,11 @@ pub const DECODE_OVERLAPS: &[u32] = &[64];
 /// Immutable source receipt carried beside assembled Wan-VACE artifacts.  VACE repositories ship
 /// the control transformer only; the UMT5, z16 VAE and tokenizer are separate upstream sources.
 pub const VACE_SOURCE_RECEIPT_FILE: &str = "wan-vace-source-receipt.json";
+pub const VACE_FUN_SOURCE_RECEIPT_FILE: &str = "wan-vace-fun-source-receipt.json";
 const VACE_SOURCE_RECEIPT_VERSION: &str = "wan-vace-source-receipt-v1";
+const VACE_FUN_SOURCE_RECEIPT_VERSION: &str = "wan-vace-fun-source-receipt-v1";
+const VACE_FUN_REPOSITORY: &str = "linoyts/Wan2.2-VACE-Fun-14B-diffusers";
+const VACE_FUN_REVISION: &str = "1abfb95801b7bd8f952083ebf80b93448ddb0ce4";
 const WAN21_T2V_REPOSITORY: &str = "Wan-AI/Wan2.1-T2V-14B-Diffusers";
 const WAN21_T2V_REVISION: &str = "38ec498cb3208fb688890f8cc7e94ede2cbd7f68";
 const UMT5_REPOSITORY: &str = "google/umt5-xxl";
@@ -77,6 +81,20 @@ fn vace_source_receipt(backend: WanI2vBackend) -> serde_json::Value {
     })
 }
 
+fn vace_fun_source_receipt(backend: WanI2vBackend) -> serde_json::Value {
+    serde_json::json!({
+        "version": VACE_FUN_SOURCE_RECEIPT_VERSION,
+        "backend": backend.key(),
+        "components": [
+            {"component":"high_expert","repository":VACE_FUN_REPOSITORY,"revision":VACE_FUN_REVISION,"sourcePath":"transformer"},
+            {"component":"low_expert","repository":VACE_FUN_REPOSITORY,"revision":VACE_FUN_REVISION,"sourcePath":"transformer_2"},
+            {"component":"t5_encoder","repository":WAN21_T2V_REPOSITORY,"revision":WAN21_T2V_REVISION,"sourcePath":"text_encoder"},
+            {"component":"vae","repository":WAN21_T2V_REPOSITORY,"revision":WAN21_T2V_REVISION,"sourcePath":"vae"},
+            {"component":"tokenizer","repository":UMT5_REPOSITORY,"revision":UMT5_REVISION,"sourcePath":"tokenizer.json"}
+        ]
+    })
+}
+
 /// Materialize the fixed provenance receipt once when the worker assembles or resolves the
 /// artifact.  A pre-existing divergent receipt is a supply-chain error, never a value to replace.
 pub fn ensure_wan_vace_source_receipt(root: &Path, backend: WanI2vBackend) -> crate::Result<()> {
@@ -88,6 +106,31 @@ pub fn ensure_wan_vace_source_receipt(root: &Path, backend: WanI2vBackend) -> cr
         Ok(actual) if actual == expected => Ok(()),
         Ok(_) => Err(crate::Error::Unsupported(format!(
             "wan_vace: immutable source receipt at {} does not match the selected backend",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&path, expected)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn ensure_wan_vace_fun_source_receipt(
+    root: &Path,
+    backend: WanI2vBackend,
+) -> crate::Result<()> {
+    let expected =
+        serde_json::to_vec_pretty(&vace_fun_source_receipt(backend)).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan2_2_vace_fun_14b: cannot encode source receipt: {error}"
+            ))
+        })?;
+    let path = root.join(VACE_FUN_SOURCE_RECEIPT_FILE);
+    match std::fs::read(&path) {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(_) => Err(crate::Error::Unsupported(format!(
+            "wan2_2_vace_fun_14b: immutable source receipt at {} does not match the selected backend",
             path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -116,11 +159,30 @@ fn vace_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crate::R
     sha256_file(&path)
 }
 
+fn vace_fun_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crate::Result<String> {
+    let path = root.join(VACE_FUN_SOURCE_RECEIPT_FILE);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            crate::Error::Unsupported(format!(
+                "wan2_2_vace_fun_14b: invalid source receipt {}: {error}",
+                path.display()
+            ))
+        })?;
+    if actual != vace_fun_source_receipt(backend) {
+        return Err(crate::Error::Unsupported(format!(
+            "wan2_2_vace_fun_14b: source receipt {} does not name the exact immutable experts/T5/VAE/tokenizer origins",
+            path.display()
+        )));
+    }
+    sha256_file(&path)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WanI2vRoute {
     Ti2v5b,
     I2v14b,
     Vace,
+    VaceFun,
 }
 
 impl WanI2vRoute {
@@ -129,6 +191,7 @@ impl WanI2vRoute {
             "wan2_2_ti2v_5b" => Ok(Self::Ti2v5b),
             "wan2_2_i2v_14b" => Ok(Self::I2v14b),
             "wan_vace" => Ok(Self::Vace),
+            "wan2_2_vace_fun_14b" => Ok(Self::VaceFun),
             _ => Err(crate::Error::Unsupported(format!(
                 "{provider_id}: not a Wan I2V memory route"
             ))),
@@ -140,6 +203,7 @@ impl WanI2vRoute {
             Self::Ti2v5b => "wan2_2_ti2v_5b",
             Self::I2v14b => "wan2_2_i2v_14b",
             Self::Vace => "wan_vace",
+            Self::VaceFun => "wan2_2_vace_fun_14b",
         }
     }
 
@@ -147,7 +211,7 @@ impl WanI2vRoute {
         match self {
             Self::Ti2v5b => &[(832, 480), (1280, 704), (704, 1280)],
             Self::I2v14b => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
-            Self::Vace => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
+            Self::Vace | Self::VaceFun => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
         }
     }
 
@@ -159,7 +223,7 @@ impl WanI2vRoute {
                 _ => false,
             },
             Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
-            Self::Vace => fps == 16 && [45, 61, 77].contains(&frames),
+            Self::Vace | Self::VaceFun => fps == 16 && [45, 61, 77].contains(&frames),
         }
     }
 
@@ -179,6 +243,7 @@ pub enum WanPublicMode {
     FirstLastFrame,
     ExtendClip,
     VideoBridge,
+    ReplacePerson,
 }
 
 impl WanPublicMode {
@@ -188,6 +253,7 @@ impl WanPublicMode {
             Self::FirstLastFrame => "first_last_frame",
             Self::ExtendClip => "extend_clip",
             Self::VideoBridge => "video_bridge",
+            Self::ReplacePerson => "replace_person",
         }
     }
 }
@@ -346,6 +412,16 @@ fn repository_policy(
             "Wan-AI/Wan2.1-VACE-14B-diffusers",
             "unsupported-packed-tier",
         ),
+        (WanI2vBackend::Mlx, WanI2vRoute::VaceFun, _) => (
+            "linoyts/Wan2.2-VACE-Fun-14B-diffusers+shared-wan-components",
+            "artifact-receipt",
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::VaceFun, None) => {
+            (VACE_FUN_REPOSITORY, "artifact-receipt")
+        }
+        (WanI2vBackend::Candle, WanI2vRoute::VaceFun, Some(_)) => {
+            (VACE_FUN_REPOSITORY, "unsupported-packed-tier")
+        }
     }
 }
 
@@ -437,7 +513,7 @@ fn walk_safetensors(root: &Path) -> crate::Result<Vec<PathBuf>> {
 }
 
 fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
-    if route == WanI2vRoute::Vace {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
         for required in [
             "t5_encoder.safetensors",
             "vae.safetensors",
@@ -454,12 +530,24 @@ fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<
                 "wan_vace: missing transformer/config.json".to_owned(),
             ));
         }
+        if route == WanI2vRoute::VaceFun && !root.join("transformer_2/config.json").is_file() {
+            return Err(crate::Error::Unsupported(
+                "wan2_2_vace_fun_14b: missing transformer_2/config.json".to_owned(),
+            ));
+        }
         let actual = walk_safetensors(root)?;
         let has_transformer = actual.iter().any(|relative| {
             relative == Path::new("model.safetensors")
+                || relative == Path::new("high_noise_model.safetensors")
                 || relative.starts_with(Path::new("transformer"))
         });
+        let has_low_expert = route != WanI2vRoute::VaceFun
+            || actual.iter().any(|relative| {
+                relative == Path::new("low_noise_model.safetensors")
+                    || relative.starts_with(Path::new("transformer_2"))
+            });
         if !has_transformer
+            || !has_low_expert
             || !actual.contains(&PathBuf::from("t5_encoder.safetensors"))
             || !actual.contains(&PathBuf::from("vae.safetensors"))
         {
@@ -482,6 +570,7 @@ fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<
             "vae.safetensors",
         ],
         WanI2vRoute::Vace => unreachable!("handled above"),
+        WanI2vRoute::VaceFun => unreachable!("handled above"),
     };
     for required in ["config.json", "tokenizer.json"] {
         if !root.join(required).is_file() {
@@ -566,7 +655,8 @@ fn validate_component_inventory(root: &Path, component: &str) -> crate::Result<V
 
 fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<PathBuf>> {
     if !root.join("tokenizer/tokenizer.json").is_file()
-        || (route != WanI2vRoute::Vace && !root.join("model_index.json").is_file())
+        || (!matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
+            && !root.join("model_index.json").is_file())
     {
         return Err(crate::Error::Unsupported(format!(
             "{}: incomplete Candle model/tokenizer inventory",
@@ -577,6 +667,7 @@ fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<V
         WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
         WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
         WanI2vRoute::Vace => &["text_encoder", "transformer", "vae"],
+        WanI2vRoute::VaceFun => &["text_encoder", "transformer", "transformer_2", "vae"],
     };
     let mut inventory = Vec::new();
     for component in components {
@@ -598,7 +689,7 @@ fn structural_files(
     backend: WanI2vBackend,
     route: WanI2vRoute,
 ) -> crate::Result<Vec<PathBuf>> {
-    if route == WanI2vRoute::Vace {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
         let mut files = match backend {
             WanI2vBackend::Mlx => vec![
                 PathBuf::from("transformer/config.json"),
@@ -611,7 +702,12 @@ fn structural_files(
                 PathBuf::from("tokenizer/tokenizer.json"),
             ],
         };
-        files.push(PathBuf::from(VACE_SOURCE_RECEIPT_FILE));
+        if route == WanI2vRoute::VaceFun {
+            files.push(PathBuf::from("transformer_2/config.json"));
+            files.push(PathBuf::from(VACE_FUN_SOURCE_RECEIPT_FILE));
+        } else {
+            files.push(PathBuf::from(VACE_SOURCE_RECEIPT_FILE));
+        }
         fn collect_indexes(root: &Path, at: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
             for entry in std::fs::read_dir(at)? {
                 let path = entry?.path();
@@ -648,6 +744,7 @@ fn structural_files(
                 WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
                 WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
                 WanI2vRoute::Vace => unreachable!("handled above"),
+                WanI2vRoute::VaceFun => unreachable!("handled above"),
             };
             let mut paths = vec![
                 PathBuf::from("model_index.json"),
@@ -687,6 +784,7 @@ fn structural_files(
                 WanI2vRoute::Ti2v5b => &["transformer"],
                 WanI2vRoute::I2v14b => &["transformer", "transformer_2"],
                 WanI2vRoute::Vace => unreachable!("handled above"),
+                WanI2vRoute::VaceFun => unreachable!("handled above"),
             };
             for component in components {
                 let marker = PathBuf::from(component).join("quantize_config.json");
@@ -943,7 +1041,7 @@ fn physical_resident_bytes(
     tier: MemoryNumericTier,
     phase: MemoryPhase,
 ) -> crate::Result<u64> {
-    if route == WanI2vRoute::Vace {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
         // VACE's public q4/q8 tiers are selected at load but materialized from the sealed dense
         // diffusers transformer after adapter folding. Charge the complete dense construction
         // surface rather than pretending the on-disk artifact is prepacked.
@@ -968,8 +1066,9 @@ fn adapter_receipts(
     route: WanI2vRoute,
     tier: MemoryNumericTier,
 ) -> crate::Result<(Vec<WanAdapterReceipt>, String, u64, Vec<SealedFile>)> {
-    let packed = tier.quant.is_some() && route != WanI2vRoute::Vace;
-    let vace_quantized = tier.quant.is_some() && route == WanI2vRoute::Vace;
+    let packed = tier.quant.is_some() && !matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun);
+    let vace_quantized =
+        tier.quant.is_some() && matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun);
     let mut receipts = Vec::new();
     let mut files = Vec::new();
     let mut identity = Sha256::new();
@@ -1015,7 +1114,9 @@ fn adapter_receipts(
                 "Wan adapter has zero tensor bytes".to_owned(),
             ));
         }
-        let multiplicity = if route == WanI2vRoute::I2v14b && adapter.moe_expert.is_none() {
+        let multiplicity = if matches!(route, WanI2vRoute::I2v14b | WanI2vRoute::VaceFun)
+            && adapter.moe_expert.is_none()
+        {
             2
         } else {
             1
@@ -1204,21 +1305,24 @@ pub fn prepare_load_spec(
     // Wan-VACE constructors retain only metadata; components are built lazily for the request
     // and the Candle cache warms its component bundle on first render.  Its receipt must not
     // claim eager bulk materialization merely because the generic LoadSpec default is eager.
-    if route == WanI2vRoute::Vace {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
         *spec = spec.clone().with_applied_load_shape_declaration();
     }
-    if route == WanI2vRoute::Vace
-        && backend == WanI2vBackend::Candle
-        && (tier.quant.is_some() || !spec.adapters.is_empty())
+    if backend == WanI2vBackend::Candle
+        && ((route == WanI2vRoute::Vace && (tier.quant.is_some() || !spec.adapters.is_empty()))
+            || (route == WanI2vRoute::VaceFun && tier.quant.is_some()))
     {
-        return Err(crate::Error::Unsupported(
-            "candle wan_vace memory route is dense bf16 without adapters".to_owned(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "candle {} does not admit the selected numeric tier or load recipe",
+            route.provider_id()
+        )));
     }
     let root = validate_load_spec(spec, provider_id)?.to_path_buf();
     let (repository, revision) = repository_policy(backend, route, tier);
-    if route != WanI2vRoute::Vace {
+    if !matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
         repository_revision(&root, repository, revision, tier, backend)?;
+    } else if route == WanI2vRoute::VaceFun {
+        vace_fun_source_receipt_revision(&root, backend)?;
     } else {
         vace_source_receipt_revision(&root, backend)?;
     }
@@ -1252,19 +1356,22 @@ impl PreparedWanI2vMemory {
     ) -> crate::Result<Self> {
         let route = WanI2vRoute::for_provider(provider_id)?;
         let tier = tier(spec, backend)?;
-        if route == WanI2vRoute::Vace
-            && backend == WanI2vBackend::Candle
-            && (tier.quant.is_some() || !spec.adapters.is_empty())
+        if backend == WanI2vBackend::Candle
+            && ((route == WanI2vRoute::Vace && (tier.quant.is_some() || !spec.adapters.is_empty()))
+                || (route == WanI2vRoute::VaceFun && tier.quant.is_some()))
         {
-            return Err(crate::Error::Unsupported(
-                "candle wan_vace memory route is dense bf16 without adapters".to_owned(),
-            ));
+            return Err(crate::Error::Unsupported(format!(
+                "candle {} does not admit the selected numeric tier or load recipe",
+                route.provider_id()
+            )));
         }
         let root = validate_load_spec(spec, provider_id)?;
         spec.validate_prepared_file_pins()?;
         let (repository, expected_revision) = repository_policy(backend, route, tier);
         let revision = if route == WanI2vRoute::Vace {
             vace_source_receipt_revision(root, backend)?
+        } else if route == WanI2vRoute::VaceFun {
+            vace_fun_source_receipt_revision(root, backend)?
         } else {
             repository_revision(root, repository, expected_revision, tier, backend)?
         };
@@ -1694,6 +1801,56 @@ fn bridge_control_clip(request: &GenerationRequest) -> crate::Result<crate::Cont
     Ok(clip)
 }
 
+fn replace_person_carrier(
+    request: &GenerationRequest,
+) -> crate::Result<(crate::ControlClipRef<'_>, Vec<&crate::Image>)> {
+    let Some((Conditioning::ControlClip { .. }, references)) = request.conditioning.split_first()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person requires ControlClip first, followed by ordered References"
+                .to_owned(),
+        ));
+    };
+    if !(1..=4).contains(&references.len()) {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person requires one to four ordered References".to_owned(),
+        ));
+    }
+    let clip = request.control_clip().ok_or_else(|| {
+        crate::Error::Unsupported("Wan replace_person requires exactly one ControlClip".to_owned())
+    })?;
+    let exact_output = |image: &crate::Image| {
+        valid_rgb8_image(image) && image.width == request.width && image.height == request.height
+    };
+    if clip.frames.len() != request.frames.unwrap_or_default() as usize
+        || clip.frames.len() != clip.mask.len()
+        || clip.frames.is_empty()
+        || !clip.frames.iter().all(exact_output)
+        || !clip.mask.iter().all(exact_output)
+        || !clip.masking_strength.is_finite()
+        || !(0.0..=1.0).contains(&clip.masking_strength)
+        || clip.start_frame != 0
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan replace_person ControlClip must be RGB8 output geometry for every output frame with an equal RGB8 mask and finite masking strength"
+                .to_owned(),
+        ));
+    }
+    let references = references
+        .iter()
+        .map(|conditioning| match conditioning {
+            Conditioning::Reference { image, strength: None } if valid_rgb8_image(image) => {
+                Ok(image)
+            }
+            _ => Err(crate::Error::Unsupported(
+                "Wan replace_person references must be ordered approved RGB8 References without per-reference strength"
+                    .to_owned(),
+            )),
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok((clip, references))
+}
+
 fn request_mode(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
@@ -1727,6 +1884,17 @@ fn request_mode(
             bridge_control_clip(request)?;
             Ok(WanPublicMode::VideoBridge)
         }
+        Some(mode)
+            if mode
+                .strip_prefix("replace_person@")
+                .is_some_and(|identity| {
+                    identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) =>
+        {
+            replace_person_carrier(request)?;
+            Ok(WanPublicMode::ReplacePerson)
+        }
         _ => Err(crate::Error::Unsupported(format!(
             "{}: request is neither exact public I2V nor first_last_frame",
             prepared.route.provider_id()
@@ -1741,8 +1909,8 @@ fn request_contract_for_mode(
     let mut contract = prepared.contract.clone();
     if (mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx)
         || mode == WanPublicMode::ExtendClip
-        || (mode == WanPublicMode::VideoBridge
-            && (prepared.route == WanI2vRoute::Ti2v5b || prepared.backend == WanI2vBackend::Candle))
+        || mode == WanPublicMode::VideoBridge
+        || (mode == WanPublicMode::ReplacePerson && prepared.route == WanI2vRoute::Vace)
     {
         let staged = contract
             .strategies
@@ -1777,6 +1945,9 @@ pub fn contract_for_mode_key(
                     && prepared.backend == WanI2vBackend::Mlx) =>
         {
             WanPublicMode::VideoBridge
+        }
+        "replace_person" if matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) => {
+            WanPublicMode::ReplacePerson
         }
         _ => {
             return Err(crate::Error::Unsupported(format!(
@@ -1837,26 +2008,36 @@ pub fn validate_request(
             WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
             WanI2vRoute::I2v14b => false,
+            WanI2vRoute::VaceFun => false,
         },
         WanPublicMode::VideoBridge => match prepared.route {
             WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
             WanI2vRoute::I2v14b => false,
+            WanI2vRoute::VaceFun => false,
         },
+        WanPublicMode::ReplacePerson => {
+            matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
+                && prepared.route.accepts_rate(fps, frames)
+        }
     };
     let sampler_ok = match mode {
         WanPublicMode::ImageToVideo => true,
-        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => {
-            match request.sampler.as_deref() {
-                None | Some("uni_pc" | "euler") => true,
-                Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
-                Some(_) => false,
-            }
-        }
+        WanPublicMode::FirstLastFrame
+        | WanPublicMode::ExtendClip
+        | WanPublicMode::VideoBridge
+        | WanPublicMode::ReplacePerson => match request.sampler.as_deref() {
+            None | Some("uni_pc" | "euler") => true,
+            Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
+            Some(_) => false,
+        },
     };
     let boundary_axes_ok = !matches!(
         mode,
-        WanPublicMode::FirstLastFrame | WanPublicMode::ExtendClip | WanPublicMode::VideoBridge
+        WanPublicMode::FirstLastFrame
+            | WanPublicMode::ExtendClip
+            | WanPublicMode::VideoBridge
+            | WanPublicMode::ReplacePerson
     ) || (request.strength.is_none()
         && request.true_cfg.is_none()
         && request.timestep_to_start_cfg.is_none()
@@ -1865,7 +2046,7 @@ pub fn validate_request(
         && request.guidance_momentum.is_none()
         && request.guidance_norm_threshold.is_none()
         && (request.control_scale.is_none()
-            || (prepared.route == WanI2vRoute::Vace
+            || (matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
                 && request
                     .control_scale
                     .is_some_and(|value| value.is_finite() && value >= 0.0)))
@@ -2001,6 +2182,7 @@ fn request_evidence_revision_for_selection(
     update_optional_f32(&mut hash, request.guidance);
     update_optional_str(&mut hash, request.sampler.as_deref());
     update_optional_f32(&mut hash, request.control_scale);
+    update_optional_str(&mut hash, request.video_mode.as_deref());
     hash.update(NATIVE_SCHEDULE.as_bytes());
     match mode {
         WanPublicMode::ImageToVideo => {
@@ -2067,6 +2249,24 @@ fn request_evidence_revision_for_selection(
                 hash.update(Sha256::digest(&mask.pixels));
             }
         }
+        WanPublicMode::ReplacePerson => {
+            let (clip, references) = replace_person_carrier(request)?;
+            hash.update(b"vace-replace-person-control-clip");
+            hash.update([clip.mode as u8]);
+            hash.update(clip.masking_strength.to_bits().to_le_bytes());
+            hash.update(clip.start_frame.to_le_bytes());
+            for (index, (frame, mask)) in clip.frames.iter().zip(clip.mask).enumerate() {
+                hash.update((index as u32).to_le_bytes());
+                hash.update(Sha256::digest(&frame.pixels));
+                hash.update(Sha256::digest(&mask.pixels));
+            }
+            for (ordinal, reference) in references.into_iter().enumerate() {
+                hash.update((ordinal as u32).to_le_bytes());
+                hash.update(reference.width.to_le_bytes());
+                hash.update(reference.height.to_le_bytes());
+                hash.update(Sha256::digest(&reference.pixels));
+            }
+        }
     }
     Ok(format!(
         "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:{:x}",
@@ -2100,6 +2300,9 @@ pub fn validate_context(
                     && prepared.backend == WanI2vBackend::Mlx) =>
         {
             WanPublicMode::VideoBridge
+        }
+        "replace_person" if matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) => {
+            WanPublicMode::ReplacePerson
         }
         _ => {
             return Err(crate::Error::Unsupported(format!(
@@ -2138,6 +2341,7 @@ pub fn validate_context(
             }
             WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
             WanI2vRoute::I2v14b => false,
+            WanI2vRoute::VaceFun => false,
         },
         WanPublicMode::VideoBridge => match prepared.route {
             WanI2vRoute::Ti2v5b => {
@@ -2146,31 +2350,36 @@ pub fn validate_context(
             }
             WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
             WanI2vRoute::I2v14b => false,
+            WanI2vRoute::VaceFun => false,
         },
+        WanPublicMode::ReplacePerson => prepared.route.accepts_rate(16, geometry.frames),
     };
     let carrier_ok = match mode {
         WanPublicMode::ImageToVideo => geometry.reference_count == 1,
         WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
         WanPublicMode::ExtendClip => geometry.reference_count == 1,
         WanPublicMode::VideoBridge => geometry.reference_count == 0,
+        WanPublicMode::ReplacePerson => (1..=4).contains(&geometry.reference_count),
     };
     let selection_ok = match mode {
-        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge
-            if mode == WanPublicMode::ExtendClip
-                || prepared.route == WanI2vRoute::Ti2v5b
-                || prepared.backend == WanI2vBackend::Candle =>
-        {
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => {
             matches!(
                 context.selection.strategy,
                 MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
             )
         }
-        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => matches!(
+        WanPublicMode::ReplacePerson if prepared.route == WanI2vRoute::Vace => matches!(
             context.selection.strategy,
-            MemoryStrategy::Resident
-                | MemoryStrategy::StagedResidency
-                | MemoryStrategy::BoundedDecode
+            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
         ),
+        WanPublicMode::ReplacePerson => {
+            matches!(
+                context.selection.strategy,
+                MemoryStrategy::Resident
+                    | MemoryStrategy::StagedResidency
+                    | MemoryStrategy::BoundedDecode
+            )
+        }
         WanPublicMode::FirstLastFrame if prepared.backend == WanI2vBackend::Mlx => matches!(
             context.selection.strategy,
             MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
@@ -2303,8 +2512,15 @@ pub fn geometry_from_request(request: &GenerationRequest) -> MemoryGeometry {
         // Clip carriers are execution inputs, not semantic image references.  In particular a
         // bridge has two endpoint carriers but zero conceptual references, so it cannot borrow
         // a still-image/FLF memory row merely because it has conditioning entries.
-        reference_count: u32::from(request.video_mode.as_deref() != Some("video_bridge"))
-            * request.conditioning.len() as u32,
+        reference_count: match request.video_mode.as_deref() {
+            Some("video_bridge") => 0,
+            Some(mode) if mode.starts_with("replace_person@") => request
+                .conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count() as u32,
+            _ => request.conditioning.len() as u32,
+        },
     }
 }
 
@@ -2397,6 +2613,7 @@ mod tests {
                 ("vae.safetensors", 5),
             ],
             WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun fixture"),
         };
         for &(name, logical) in files {
             if quant.is_some() && name.contains("model") {
@@ -2443,6 +2660,7 @@ mod tests {
             WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
             WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
             WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun fixture"),
         };
         for (index, component) in components.iter().enumerate() {
             std::fs::create_dir_all(root.join(component)).unwrap();
@@ -2484,13 +2702,25 @@ mod tests {
         (tmp, spec)
     }
 
-    fn vace_fixture(backend: WanI2vBackend, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+    fn vace_route_fixture(
+        backend: WanI2vBackend,
+        quant: Option<Quant>,
+        route: WanI2vRoute,
+    ) -> (tempfile::TempDir, LoadSpec) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("vace");
         match backend {
             WanI2vBackend::Mlx => {
                 std::fs::create_dir_all(root.join("transformer")).unwrap();
                 std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+                if route == WanI2vRoute::VaceFun {
+                    std::fs::create_dir_all(root.join("transformer_2")).unwrap();
+                    std::fs::write(root.join("transformer_2/config.json"), "{}").unwrap();
+                    write_safetensors(
+                        &root.join("transformer_2/model.safetensors"),
+                        &[("blocks.0.self_attn.to_q.weight", "BF16", &[9, 8])],
+                    );
+                }
                 std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
                 write_safetensors(
                     &root.join("transformer/model.safetensors"),
@@ -2506,7 +2736,10 @@ mod tests {
                 );
             }
             WanI2vBackend::Candle => {
-                for component in ["transformer", "text_encoder", "vae"] {
+                for component in ["transformer", "text_encoder", "vae"]
+                    .into_iter()
+                    .chain((route == WanI2vRoute::VaceFun).then_some("transformer_2"))
+                {
                     std::fs::create_dir_all(root.join(component)).unwrap();
                     std::fs::write(root.join(component).join("config.json"), "{}").unwrap();
                     write_safetensors(
@@ -2518,18 +2751,32 @@ mod tests {
                 std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
             }
         }
-        let mut spec = LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route("wan_vace");
+        let mut spec =
+            LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(route.provider_id());
         spec.quantize = quant;
-        ensure_wan_vace_source_receipt(
-            match &spec.weights {
-                WeightsSource::Dir(root) => root,
-                _ => unreachable!(),
-            },
-            backend,
-        )
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        if route == WanI2vRoute::VaceFun {
+            ensure_wan_vace_fun_source_receipt(root, backend)
+        } else {
+            ensure_wan_vace_source_receipt(root, backend)
+        }
         .unwrap();
-        prepare_load_spec(&mut spec, backend, "wan_vace").unwrap();
+        prepare_load_spec(&mut spec, backend, route.provider_id()).unwrap();
         (tmp, spec)
+    }
+
+    fn vace_fixture(backend: WanI2vBackend, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
+        vace_route_fixture(backend, quant, WanI2vRoute::Vace)
+    }
+
+    fn vace_fun_fixture(
+        backend: WanI2vBackend,
+        quant: Option<Quant>,
+    ) -> (tempfile::TempDir, LoadSpec) {
+        vace_route_fixture(backend, quant, WanI2vRoute::VaceFun)
     }
 
     fn vace_extend_request() -> GenerationRequest {
@@ -2656,6 +2903,248 @@ mod tests {
         request
     }
 
+    fn replace_person_request(
+        references: usize,
+        mode: crate::ReplacementMode,
+    ) -> GenerationRequest {
+        let frame = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![37; 832 * 480 * 3],
+        };
+        let mask = Image {
+            width: 832,
+            height: 480,
+            pixels: vec![255; 832 * 480 * 3],
+        };
+        let mut conditioning = vec![Conditioning::ControlClip {
+            frames: vec![frame; 45],
+            mask: vec![mask; 45],
+            masking_strength: 0.625,
+            start_frame: 0,
+            mode,
+        }];
+        conditioning.extend((0..references).map(|ordinal| Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![ordinal as u8 + 1; 16 * 16 * 3],
+            },
+            strength: None,
+        }));
+        GenerationRequest {
+            prompt: "replace the tracked person".to_owned(),
+            negative_prompt: Some("identity drift".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(0x1234_5678),
+            steps: Some(40),
+            guidance: Some(5.0),
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some(format!("replace_person@{}", "a".repeat(64))),
+            control_scale: Some(0.75),
+            conditioning,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replace_person_seals_vace_and_vace_fun_routes_rungs_tiers_and_full_carrier() {
+        for (route, backend, quant) in [
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vRoute::Vace, WanI2vBackend::Mlx, None),
+            (WanI2vRoute::Vace, WanI2vBackend::Candle, None),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, Some(Quant::Q8)),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Mlx, None),
+            (WanI2vRoute::VaceFun, WanI2vBackend::Candle, None),
+        ] {
+            let (_tmp, spec) = vace_route_fixture(backend, quant, route);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, backend, route.provider_id()).unwrap();
+            assert_eq!(prepared.tier.quant, quant);
+            assert_eq!(prepared.route, route);
+            assert_eq!(prepared.backend, backend);
+            assert_eq!(prepared.artifact_identity.len(), 64);
+            assert_eq!(prepared.revision.len(), 64);
+            for replacement in [
+                crate::ReplacementMode::FaceOnly,
+                crate::ReplacementMode::FullPersonKeepOutfit,
+                crate::ReplacementMode::FullPersonReplaceOutfit,
+            ] {
+                for references in 1..=4 {
+                    let mut request = replace_person_request(references, replacement);
+                    assert_eq!(
+                        validate_request(&prepared, &request).unwrap(),
+                        WanPublicMode::ReplacePerson
+                    );
+                    assert_eq!(
+                        geometry_from_request(&request).reference_count,
+                        references as u32
+                    );
+                    let contract = request_contract(&prepared, &request).unwrap();
+                    for strategy in MemoryStrategy::ALL {
+                        let expected = matches!(
+                            strategy,
+                            MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
+                        ) || (route == WanI2vRoute::VaceFun
+                            && strategy == MemoryStrategy::StagedResidency);
+                        assert_eq!(
+                            contract.capability(strategy).unwrap().support,
+                            if expected {
+                                MemoryStrategySupport::Implemented
+                            } else {
+                                MemoryStrategySupport::Missing
+                            }
+                        );
+                        if expected {
+                            let selected = selection(&prepared, strategy);
+                            request.memory = contract.generation_memory(&selected);
+                            let evidence = request_evidence_revision(&prepared, &request).unwrap();
+                            let run_context = context(&prepared, &request, selected, evidence);
+                            validate_context(&prepared, &run_context).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        let (_tmp, mut packed_candle) = vace_fun_fixture(WanI2vBackend::Candle, None);
+        packed_candle.quantize = Some(Quant::Q4);
+        assert!(prepare_load_spec(
+            &mut packed_candle,
+            WanI2vBackend::Candle,
+            WanI2vRoute::VaceFun.provider_id()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replace_person_receipt_rejects_crossed_public_and_physical_identity() {
+        let (_tmp, spec) = vace_fun_fixture(WanI2vBackend::Mlx, Some(Quant::Q4));
+        let prepared = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Mlx,
+            WanI2vRoute::VaceFun.provider_id(),
+        )
+        .unwrap();
+        let mut request = replace_person_request(2, crate::ReplacementMode::FaceOnly);
+        let resident = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: prepared.tier,
+        };
+        request.memory = request_contract(&prepared, &request)
+            .unwrap()
+            .generation_memory(&resident);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+
+        request.conditioning.swap(1, 2);
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.conditioning.swap(1, 2);
+        if let Conditioning::ControlClip {
+            mask,
+            masking_strength,
+            mode,
+            ..
+        } = &mut request.conditioning[0]
+        {
+            mask[0].pixels[0] ^= 1;
+            *masking_strength = 0.5;
+            *mode = crate::ReplacementMode::FullPersonKeepOutfit;
+        }
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+        request.video_mode = Some(format!("replace_person@{}", "b".repeat(64)));
+        assert_ne!(
+            request_evidence_revision(&prepared, &request).unwrap(),
+            receipt
+        );
+
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        assert!(ensure_wan_vace_fun_source_receipt(root, WanI2vBackend::Candle).is_err());
+        assert!(PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan_vace").is_err());
+    }
+
+    #[test]
+    fn vace_fun_seals_exact_ordered_shared_and_expert_adapters_on_both_backends() {
+        for (backend, quant) in [
+            (WanI2vBackend::Mlx, Some(Quant::Q4)),
+            (WanI2vBackend::Candle, None),
+        ] {
+            let (tmp, fixture) = vace_fun_fixture(backend, quant);
+            let shared = tmp.path().join("shared-adapter.safetensors");
+            let high = tmp.path().join("high-adapter.safetensors");
+            let low = tmp.path().join("low-adapter.safetensors");
+            for path in [&shared, &high, &low] {
+                write_safetensors(path, &[("lora_A.weight", "F32", &[2, 3])]);
+            }
+
+            let mut ordered = LoadSpec::new(fixture.weights.clone())
+                .with_resolved_route(WanI2vRoute::VaceFun.provider_id());
+            ordered.quantize = quant;
+            ordered.adapters = vec![
+                AdapterSpec::new(shared.clone(), 0.5, AdapterKind::Lora),
+                AdapterSpec::new(high.clone(), 0.75, AdapterKind::Lora)
+                    .with_moe_expert(MoeExpert::High),
+                AdapterSpec::new(low.clone(), 1.0, AdapterKind::Lora)
+                    .with_moe_expert(MoeExpert::Low),
+            ];
+            prepare_load_spec(&mut ordered, backend, WanI2vRoute::VaceFun.provider_id()).unwrap();
+            let prepared = PreparedWanI2vMemory::prepare(
+                &ordered,
+                backend,
+                WanI2vRoute::VaceFun.provider_id(),
+            )
+            .unwrap();
+            assert_eq!(
+                prepared
+                    .adapters
+                    .iter()
+                    .map(|adapter| adapter.ordinal)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(
+                prepared
+                    .adapters
+                    .iter()
+                    .map(|adapter| adapter.expert)
+                    .collect::<Vec<_>>(),
+                vec!["shared", "high", "low"]
+            );
+            assert_eq!(prepared.adapters[0].scale_bits, 0.5_f32.to_bits());
+            assert_eq!(prepared.adapters[1].scale_bits, 0.75_f32.to_bits());
+            assert_eq!(prepared.adapters[2].scale_bits, 1.0_f32.to_bits());
+
+            let mut reversed = LoadSpec::new(fixture.weights.clone())
+                .with_resolved_route(WanI2vRoute::VaceFun.provider_id());
+            reversed.quantize = quant;
+            reversed.adapters = ordered.adapters.iter().cloned().rev().collect();
+            prepare_load_spec(&mut reversed, backend, WanI2vRoute::VaceFun.provider_id()).unwrap();
+            let reversed = PreparedWanI2vMemory::prepare(
+                &reversed,
+                backend,
+                WanI2vRoute::VaceFun.provider_id(),
+            )
+            .unwrap();
+            assert_ne!(prepared.adapter_identity, reversed.adapter_identity);
+            assert_ne!(prepared.artifact_identity, reversed.artifact_identity);
+            assert_eq!(prepared.revision, reversed.revision);
+        }
+    }
+
     #[test]
     fn vace_bridge_admission_requires_the_production_mid_gray_generated_gap() {
         let (_tmp, spec) = vace_fixture(WanI2vBackend::Mlx, None);
@@ -2694,8 +3183,7 @@ mod tests {
                 let expected = matches!(
                     strategy,
                     MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
-                ) || (backend == WanI2vBackend::Mlx
-                    && strategy == MemoryStrategy::StagedResidency);
+                );
                 assert_eq!(
                     contract.capability(strategy).unwrap().support,
                     if expected {
@@ -2705,11 +3193,7 @@ mod tests {
                     }
                 );
             }
-            let strategy = if backend == WanI2vBackend::Mlx {
-                MemoryStrategy::StagedResidency
-            } else {
-                MemoryStrategy::BoundedDecode
-            };
+            let strategy = MemoryStrategy::BoundedDecode;
             let selection = selection(&prepared, strategy);
             request.memory = contract.generation_memory(&selection);
             let receipt = request_evidence_revision(&prepared, &request).unwrap();
@@ -3048,6 +3532,7 @@ mod tests {
             WanI2vRoute::Ti2v5b => (832, 480, 121, 24, 20, Some(5.0)),
             WanI2vRoute::I2v14b => (1280, 720, 77, 16, 40, None),
             WanI2vRoute::Vace => panic!("use a dedicated VACE request"),
+            WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun request"),
         };
         GenerationRequest {
             prompt: "animate the still".to_owned(),
@@ -3144,6 +3629,7 @@ mod tests {
                     Some("image_to_video") => "image_to_video",
                     Some("extend_clip") => "extend_clip",
                     Some("video_bridge") => "video_bridge",
+                    Some(mode) if mode.starts_with("replace_person@") => "replace_person",
                     _ => "first_last_frame",
                 }
                 .to_owned(),
