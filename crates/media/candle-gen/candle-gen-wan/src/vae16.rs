@@ -541,33 +541,47 @@ impl WanVae16 {
         self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
     }
 
-    /// Request-selected upper bound for the spatial tile. The ordinary free-aware planner remains
-    /// authoritative when `tile_cap` is absent; a selected cap can only shrink its tile.
+    /// Budgeted z16 decode intersected with a provider-selected maximum spatial tile edge.
+    ///
+    /// `max_tile_edge` is the request-scoped rung-2 seam used by Bernini still generation. It does
+    /// not replace the live free-VRAM plan: it can only keep or shrink that plan, and it forces a
+    /// tile when the output exceeds the admitted edge. This makes the selected cap load-bearing at
+    /// the final decode without weakening the existing budget and im2col guards.
     pub fn decode_budgeted_with_cancel_and_tile_cap(
         &self,
         z: &Tensor,
         cancel: &CancelFlag,
-        tile_cap: Option<u32>,
+        max_tile_edge: Option<u32>,
     ) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
         let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
         let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
         let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
         let mut plan = auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)?;
-        if let Some(cap) = tile_cap {
-            let cap = i32::try_from(cap).map_err(|_| {
-                candle_gen::CandleError::Msg("Wan z16 tile cap exceeds i32".to_owned())
+        if let Some(max_tile_edge) = max_tile_edge {
+            let max_tile_edge = i32::try_from(max_tile_edge).map_err(|_| {
+                candle_gen::candle_core::Error::Msg("wan z16 decode tile cap exceeds i32".into())
             })?;
-            let tile = plan
-                .and_then(|config| config.spatial.map(|spatial| spatial.tile_px))
-                .map_or(cap, |existing| existing.min(cap));
-            plan = Some(TilingConfig {
-                spatial: Some(SpatialTiling {
-                    tile_px: tile,
-                    overlap_px: 64,
-                }),
-                temporal: None,
-            });
+            if !WAN_Z16_VAE_SPATIAL_PX.contains(&max_tile_edge) {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "wan z16 decode tile cap {max_tile_edge} is outside the production domain {:?}",
+                    WAN_Z16_VAE_SPATIAL_PX
+                ))
+                .into());
+            }
+            if out_h > max_tile_edge || out_w > max_tile_edge {
+                let budget_edge = plan
+                    .as_ref()
+                    .and_then(|cfg| cfg.spatial.map(|spatial| spatial.tile_px));
+                let tile_px = budget_edge.map_or(max_tile_edge, |edge| edge.min(max_tile_edge));
+                plan = Some(TilingConfig {
+                    spatial: Some(SpatialTiling {
+                        tile_px,
+                        overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+                    }),
+                    temporal: plan.and_then(|cfg| cfg.temporal),
+                });
+            }
         }
         match plan {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
