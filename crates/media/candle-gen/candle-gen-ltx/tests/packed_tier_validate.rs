@@ -28,9 +28,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, MemoryBehaviorRoute,
-    MemoryMode, MemoryNumericTier, MemoryRequestScope, MemoryRunOutcome, MemoryStrategy, Precision,
-    Progress, Quant, WeightsSource,
+    GenerationOutput, GenerationRequest, Image, LoadSpec, MemoryBehaviorRoute, MemoryMode,
+    MemoryNumericTier, MemoryRunOutcome, MemoryStrategy, Precision, Progress, Quant, WeightsSource,
 };
 
 /// Basic per-frame non-degeneracy: the frame is not solid-black / constant (a broken packed forward —
