@@ -1105,4 +1105,67 @@ mod tests {
             plan.resident_bytes()
         );
     }
+
+    /// Real-weight check of the **NVFP4 fail-closed** path (sc-20385 review): the community
+    /// `kreamania_variant7` is a genuine ComfyUI NVFP4 checkpoint — 224 `U8` packed weights
+    /// `[6144, 3072]`, 224 `F8_E4M3` block scales `[6144, 384]`, 224 F32 `weight_scale_2`, with the
+    /// quantization declared in the **file header** (`__metadata__._quantization_metadata`, every
+    /// layer `{"format": "nvfp4"}`) rather than as `.comfy_quant` tensors. Both of those are out of
+    /// scope for this story, and the plan must refuse **by name** rather than silently plan the
+    /// `U8` payloads as dense weights or decode the `F8_E4M3` scales at unit scale.
+    ///
+    /// The refusal is the AC3 evidence for this artifact — an unsupported real checkpoint that
+    /// fails closed is as good as a supported one that renders. **sc-20641 owns flipping this from
+    /// a refusal to a supported codec**; when it lands, this test's expectation changes with it.
+    /// `KREA_NATIVE_DIT_NVFP4` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_NVFP4 to the nvfp4 kreamania_variant7"]
+    fn kreamania_nvfp4_refuses_by_name_until_sc_20641() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_NVFP4") else {
+            panic!("set KREA_NATIVE_DIT_NVFP4 to the nvfp4 kreamania_variant7");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+
+        // The fixture really is the NVFP4 shape, not merely some file that happens to refuse.
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        let scale_2 = headers
+            .iter()
+            .filter(|header| header.name.ends_with(".weight_scale_2"))
+            .count();
+        let block_scales = headers
+            .iter()
+            .filter(|header| {
+                header.name.ends_with(".weight_scale")
+                    && header.dtype == mlx_gen::gen_core::weightsmeta::Dtype::F8_E4M3
+            })
+            .count();
+        assert_eq!(scale_2, 224, "nvfp4 second-level scales");
+        assert_eq!(block_scales, 224, "E4M3 block scales");
+        assert!(
+            headers
+                .iter()
+                .all(|header| !header.name.ends_with(".comfy_quant")),
+            "this convention declares quantization in the file header, not in .comfy_quant tensors"
+        );
+
+        let error = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping,
+        )
+        .expect_err("an nvfp4 checkpoint has no registered codec and must refuse");
+        let error = error.to_string();
+        // Names the exact tensor, the exact format, and the story that will support it.
+        assert!(
+            error.contains("weight_scale_2")
+                && error.contains("nvfp4")
+                && error.contains("sc-20641"),
+            "{error}"
+        );
+        assert!(
+            error.contains(".weight_scale_2\""),
+            "the refusal must name the offending tensor, not just the format: {error}"
+        );
+        eprintln!("RESULT kreamania-nvfp4 refused: {error}");
+    }
 }
