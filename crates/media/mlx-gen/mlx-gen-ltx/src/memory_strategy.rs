@@ -1159,12 +1159,17 @@ impl LtxMemoryRequestScope {
             _ => None,
         };
         match (admitted_mode, reference.as_deref(), first_last.as_deref(), extend.as_deref(), bridge.as_deref()) {
-            ("text_to_video", None, None, None, None) => {}
+            ("text_to_video", None, None, None, None) if request.conditioning.is_empty() => {}
             ("image_to_video", Some(actual), None, None, None)
                 if Some(actual) == admitted_reference_axis(admitted_overlay) => {}
             ("image_to_video", None, None, None, None) => {
+                if request.conditioning.len() > 1 { return Err(gen_core::Error::Unsupported("ltx_2_3: image_to_video admission requires exactly one Reference".into())); }
+                if let [gen_core::Conditioning::Reference { image, strength }] = request.conditioning.as_slice() {
+                    if image.width != request.width || image.height != request.height { return Err(gen_core::Error::Unsupported("ltx_2_3: fitted reference shape does not match output".into())); }
+                    if strength.or(request.strength).unwrap_or(1.0).to_bits() != I2V_STRENGTH_BITS { return Err(gen_core::Error::Unsupported("ltx_2_3: image_to_video admission requires fixed strength 1.0".into())); }
+                }
                 return Err(gen_core::Error::Unsupported(
-                    "ltx_2_3: image_to_video admission requires one fitted Reference".into(),
+                    "ltx_2_3: image_to_video admission requires one fitted Reference with fixed strength".into(),
                 ));
             }
             ("first_last_frame", None, Some(actual), None, None)
@@ -1644,7 +1649,8 @@ mod tests {
                 .to_string();
             assert!(
                 error.contains("request mode/reference receipt crossed")
-                    || error.contains("accepts only the single fitted image Reference carrier"),
+                    || error.contains("accepts only the single fitted image Reference carrier")
+                    || error.contains("does not fit admitted"),
                 "{error}"
             );
             assert_eq!(temporal_conditioning.memory, None);
