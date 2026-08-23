@@ -50,7 +50,7 @@ pub const VAE_SCALE: u32 = 8;
 /// the source buffer (and the resize's intermediate f32 work) scale with the *input* dims, so an
 /// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
 /// while capping the source at a few hundred MB.
-const MAX_REFERENCE_DIM: u32 = 8192;
+pub(crate) const MAX_REFERENCE_DIM: u32 = 8192;
 /// Output `width`/`height` must be divisible by this: VAE 8× spatial compression then the UNet's 3
 /// stride-2 downsamples / nearest-2× upsamples (another 8×). An unaligned size fails deep in
 /// `UpBlock::forward` on a skip-concat shape mismatch instead of at validation (F-165). Exposed as
@@ -109,6 +109,7 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct Svd {
     pipeline: SvdPipeline,
     descriptor: ModelDescriptor,
+    memory: Option<crate::memory_strategy::PreparedSvdMemory>,
 }
 
 /// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
@@ -120,6 +121,29 @@ pub struct Svd {
 /// upcast internally by MLX). `Precision::Fp32` selects the full-precision quality path (the
 /// S1/S3/S4 parity-validated precision). The **VAE always stays f32** (`force_upcast=True`).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.quantize.is_some()
+        || !spec.adapters.is_empty()
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(Error::Unsupported(
+            "svd_xt: quantization, adapters, controls, identity, and extra components are unsupported"
+                .into(),
+        ));
+    }
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(crate::memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -165,10 +189,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &load("image_encoder", "model", dense)?,
         &ImageEncoderConfig::default(),
     )?;
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
 
     Ok(Box::new(Svd {
         pipeline: SvdPipeline::new(image_encoder, vae, unet, SchedulerConfig::default()),
         descriptor: descriptor(),
+        memory,
     }))
 }
 
@@ -294,13 +322,15 @@ fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> 
 impl Svd {
     /// Resolve the single conditioning reference image (image→video input).
     fn reference<'a>(&self, req: &'a GenerationRequest) -> Result<&'a Image> {
-        req.conditioning
-            .iter()
-            .find_map(|c| match c {
-                Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .ok_or_else(|| Error::Msg("svd_xt: image→video requires a Reference image".into()))
+        match req.conditioning.as_slice() {
+            [Conditioning::Reference {
+                image,
+                strength: None,
+            }] => Ok(image),
+            _ => Err(Error::Msg(
+                "svd_xt: image→video requires exactly one strength-free Reference image".into(),
+            )),
+        }
     }
 
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing`
@@ -361,10 +391,50 @@ impl Svd {
     }
 }
 
-mlx_gen::impl_generator!(Svd {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for Svd {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| crate::memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let prepared = self.memory.as_ref().ok_or_else(|| {
+            Error::Msg("svd_xt: loaded generator has no sealed memory receipt".into())
+        })?;
+        crate::memory_strategy::begin_request(prepared, context)
+    }
+}
 
 impl Svd {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -380,6 +450,13 @@ impl Svd {
         // size-range validation, so bound it here (F-164).
         let img = self.reference(req)?;
         validate_reference_image(img)?;
+        if req.memory.is_some() {
+            let prepared = self.memory.as_ref().ok_or_else(|| {
+                Error::Msg("svd_xt: memory request requires a sealed physical receipt".into())
+            })?;
+            crate::memory_strategy::validate_memory_request(req)?;
+            crate::memory_strategy::validate_active_request(prepared, req)?;
+        }
         Ok(())
     }
 

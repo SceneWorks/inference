@@ -130,6 +130,10 @@ use sha2::{Digest, Sha256};
 /// model-memory calibration matrix.
 pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
+/// ABI for canonical, load-exact structural evidence used to admit an estimate-backed Resident
+/// route without misrepresenting that estimate as measured calibration.
+pub const MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI: u32 = 1;
+
 /// Current ABI of production-latent tiled-decode quality records.
 ///
 /// This identity is deliberately independent from [`MEMORY_CALIBRATION_ABI`]: decode quality is a
@@ -802,6 +806,30 @@ pub fn adapter_stack_resident_bytes(
     })
 }
 
+/// Exact ordered identity of the load-time adapter stack used by provider request handshakes.
+///
+/// The digest binds every adapter's native path representation, LoRA/LoKr kind, and exact IEEE-754
+/// scale bits. It deliberately does not inspect mutable file contents: callers that require byte
+/// identity must prepare/pin those files separately before constructing the [`AdapterSpec`].
+pub fn adapter_stack_identity(adapters: &[AdapterSpec]) -> Option<String> {
+    if adapters.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"gen-core-adapter-stack-v1");
+    for adapter in adapters {
+        let path = format!("{:?}", adapter.path.as_os_str());
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update([match adapter.kind {
+            crate::AdapterKind::Lora => 0,
+            crate::AdapterKind::Lokr => 1,
+        }]);
+        digest.update(adapter.scale.to_bits().to_le_bytes());
+    }
+    Some(format!("adapters:{:x}", digest.finalize()))
+}
+
 impl MemoryComponentKind {
     pub const fn is_auxiliary(self) -> bool {
         matches!(
@@ -892,6 +920,132 @@ pub struct MemoryAssetFacts {
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
+}
+
+/// Immutable provider-owned facts for a narrowly pinned Resident route.
+///
+/// This is intentionally separate from [`MemoryCalibrationIdentity`]: it proves what was loaded and
+/// how many bytes it contains, but makes no measured-peak claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryStructuralResidentEvidence {
+    pub abi: u32,
+    pub provider_id: String,
+    pub repository: String,
+    pub revision: String,
+    pub variant: String,
+    pub receipt_sha256: String,
+    pub tier: MemoryNumericTier,
+    pub load_shape: LoadShape,
+    pub asset_facts: MemoryAssetFacts,
+    /// Request-scoped bytes needed while adapters are folded. These are not steady overlay bytes.
+    pub request_transient_bytes: u64,
+    pub direct_file_count: u32,
+    pub adapter_count: u32,
+}
+
+/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`]. Source ids are
+/// represented by a caller-produced digest so this contract does not depend on SceneWorks assets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryStructuralResidentRequestIdentity {
+    pub source_digest: String,
+    pub mode: String,
+    pub carrier_shape: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub fps: u32,
+    pub reference_count: u32,
+    pub seed: Option<u64>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f32>,
+    pub scheduler_shift: Option<f32>,
+    pub selection: MemorySelection,
+}
+
+impl MemoryStructuralResidentEvidence {
+    pub fn validate(&self) -> Result<()> {
+        if self.abi != MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI
+            || self.provider_id.is_empty()
+            || self.repository.is_empty()
+            || self.revision.is_empty()
+            || self.variant.is_empty()
+            || self.receipt_sha256.len() != 64
+            || !self
+                .receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.asset_facts.base_bytes == 0
+            || self.direct_file_count == 0
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident evidence".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn evidence_revision(
+        &self,
+        request: &MemoryStructuralResidentRequestIdentity,
+    ) -> Result<String> {
+        self.validate()?;
+        if request.source_digest.len() != 64
+            || !request
+                .source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident source identity".to_owned(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        for value in [
+            self.provider_id.as_str(),
+            self.repository.as_str(),
+            self.revision.as_str(),
+            self.variant.as_str(),
+            self.receipt_sha256.as_str(),
+            request.source_digest.as_str(),
+            request.mode.as_str(),
+            request.carrier_shape.as_str(),
+            request.sampler.as_deref().unwrap_or(""),
+            request.scheduler.as_deref().unwrap_or(""),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(request.width.to_le_bytes());
+        hasher.update(request.height.to_le_bytes());
+        hasher.update(request.frames.to_le_bytes());
+        hasher.update(request.fps.to_le_bytes());
+        hasher.update(request.reference_count.to_le_bytes());
+        hasher.update(request.seed.unwrap_or_default().to_le_bytes());
+        hasher.update(request.steps.unwrap_or_default().to_le_bytes());
+        hasher.update(
+            request
+                .guidance
+                .map(f32::to_bits)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        hasher.update(
+            request
+                .scheduler_shift
+                .map(f32::to_bits)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        hasher.update(format!("{:?}", request.selection));
+        Ok(format!(
+            "scail2-resident-v1:{}:{}:{:x}",
+            self.receipt_sha256,
+            request.source_digest,
+            hasher.finalize()
+        ))
+    }
 }
 
 /// Request-level cache keys must include every axis that can change residency or execution.
@@ -3850,6 +4004,49 @@ mod tests {
             adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
             None
         );
+    }
+
+    #[test]
+    fn adapter_stack_identity_binds_order_path_kind_and_exact_scale() {
+        let first = AdapterSpec::new(
+            "/adapters/first.safetensors".into(),
+            1.0,
+            crate::AdapterKind::Lora,
+        );
+        let second = AdapterSpec::new(
+            "/adapters/second.safetensors".into(),
+            0.5,
+            crate::AdapterKind::Lokr,
+        );
+        let expected = adapter_stack_identity(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            adapter_stack_identity(&[first.clone(), second.clone()]),
+            Some(expected.clone())
+        );
+        assert_ne!(
+            adapter_stack_identity(&[second.clone(), first.clone()]),
+            Some(expected.clone())
+        );
+
+        let mut changed_path = first.clone();
+        changed_path.path = "/adapters/other.safetensors".into();
+        assert_ne!(
+            adapter_stack_identity(&[changed_path, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_kind = first.clone();
+        changed_kind.kind = crate::AdapterKind::Lokr;
+        assert_ne!(
+            adapter_stack_identity(&[changed_kind, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_scale = first;
+        changed_scale.scale = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert_ne!(
+            adapter_stack_identity(&[changed_scale, second]),
+            Some(expected)
+        );
+        assert_eq!(adapter_stack_identity(&[]), None);
     }
 
     fn mlx_backend() -> MemoryBackendRealization {
