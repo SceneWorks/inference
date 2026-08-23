@@ -76,6 +76,134 @@ fn required_projected_safetensors_bytes(
     Ok(bytes)
 }
 
+fn uncensored_enhancer_resident_bytes(spec: &LoadSpec) -> Result<u64> {
+    let Some(source) = spec.components.get("uncensored_enhancer") else {
+        return Ok(0);
+    };
+    let WeightsSource::Dir(path) = source else {
+        return Err(mlx_gen::Error::Unsupported(
+            "ltx_2_3: uncensored_enhancer must be a directory source".into(),
+        ));
+    };
+    // The amoral Gemma loader retains packed affine tensors, but `load_embedding` dequantizes the
+    // packed token table to dense bf16. MLX keeps the packed source graph alive until that lazy
+    // dequantization is evaluated, so the conditioning load peak is the complete stored tensor
+    // inventory plus the expanded dense table. Its autoregressive KV work is bounded separately by
+    // the request-scope MAX_ENHANCE_TOKENS ceiling.
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(mlx_gen::Error::from)?;
+    let quant = crate::model::resolve_gemma_quant(path)?.ok_or_else(|| {
+        mlx_gen::Error::Unsupported(
+            "ltx_2_3: uncensored Gemma must declare affine quantization geometry".into(),
+        )
+    })?;
+    if quant.group <= 0 || !matches!(quant.bits, 4 | 8) {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "ltx_2_3: uncensored Gemma quantization must be q4/q8 with a positive group (got {}-bit group-{})",
+            quant.bits, quant.group
+        )));
+    }
+    let embedding_weights = headers
+        .iter()
+        .filter(|header| header.name.ends_with("embed_tokens.weight"))
+        .collect::<Vec<_>>();
+    let [weight] = embedding_weights.as_slice() else {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "ltx_2_3: uncensored Gemma must contain exactly one packed embed_tokens.weight (got {})",
+            embedding_weights.len()
+        )));
+    };
+    let base = weight
+        .name
+        .strip_suffix(".weight")
+        .expect("the filtered embedding name has a weight suffix");
+    let scales_name = format!("{base}.scales");
+    let biases_name = format!("{base}.biases");
+    let scales = headers
+        .iter()
+        .find(|header| header.name == scales_name)
+        .ok_or_else(|| {
+            mlx_gen::Error::Unsupported(format!(
+                "ltx_2_3: uncensored Gemma packed embedding is missing {scales_name}"
+            ))
+        })?;
+    let biases = headers
+        .iter()
+        .find(|header| header.name == biases_name)
+        .ok_or_else(|| {
+            mlx_gen::Error::Unsupported(format!(
+                "ltx_2_3: uncensored Gemma packed embedding is missing {biases_name}"
+            ))
+        })?;
+    if weight.dtype != gen_core::weightsmeta::Dtype::U32
+        || !matches!(
+            scales.dtype,
+            gen_core::weightsmeta::Dtype::F16
+                | gen_core::weightsmeta::Dtype::BF16
+                | gen_core::weightsmeta::Dtype::F32
+        )
+        || biases.dtype != scales.dtype
+        || biases.shape != scales.shape
+    {
+        return Err(mlx_gen::Error::Unsupported(
+            "ltx_2_3: uncensored Gemma packed embedding has invalid weight/scales/biases dtypes or shapes"
+                .to_string(),
+        ));
+    }
+    let [out, groups] = scales.shape.as_slice() else {
+        return Err(mlx_gen::Error::Unsupported(
+            "ltx_2_3: uncensored Gemma packed embedding scales must be rank two".to_string(),
+        ));
+    };
+    let group = usize::try_from(quant.group).map_err(|_| {
+        mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma group is unrepresentable".into())
+    })?;
+    let input = groups.checked_mul(group).ok_or_else(|| {
+        mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma embedding input width overflows".into())
+    })?;
+    let packed_bits = input
+        .checked_mul(usize::try_from(quant.bits).map_err(|_| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma bit width is unrepresentable".into())
+        })?)
+        .ok_or_else(|| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma packed width overflows".into())
+        })?;
+    if !packed_bits.is_multiple_of(32) || weight.shape.as_slice() != [*out, packed_bits / 32] {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "ltx_2_3: uncensored Gemma packed embedding geometry disagrees with {}-bit group-{} config",
+            quant.bits, quant.group
+        )));
+    }
+    let dense_embedding_bytes = u64::try_from(*out)
+        .ok()
+        .and_then(|out| {
+            u64::try_from(input)
+                .ok()
+                .and_then(|input| out.checked_mul(input))
+        })
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma dense embedding bytes overflow".into())
+        })?;
+    let stored_bytes = headers.iter().try_fold(0_u64, |total, header| {
+        total.checked_add(header.data_bytes).ok_or_else(|| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma stored bytes overflow".into())
+        })
+    })?;
+    let bytes = stored_bytes
+        .checked_add(dense_embedding_bytes)
+        .ok_or_else(|| {
+            mlx_gen::Error::Msg("ltx_2_3: uncensored Gemma load peak overflows u64".into())
+        })?;
+    if bytes == 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "ltx_2_3: uncensored Gemma enhancer has no projected resident safetensors bytes at {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 struct AssetDeclaration {
     facts: MemoryAssetFacts,
     resident_components: Vec<MemoryResidentComponent>,
@@ -111,10 +239,10 @@ fn production_asset_declaration(
         ));
     };
 
-    // The calibrated route rejects prompt enhancement, so its conditioning phase is exactly the
-    // canonical dense Gemma snapshot plus the LTX connector. Both loaders materialize every tensor
-    // as bf16 irrespective of the stored payload width. A provisioned uncensored enhancer remains a
-    // supported generator feature but is not materialized by this route.
+    // The conditioning phase includes the canonical dense Gemma snapshot, the LTX connector, and
+    // the optional uncensored Gemma artifact when that exact overlay is loaded. Standard prompt
+    // enhancement reuses the canonical Gemma; its autoregressive working set is bounded by the
+    // request-scope MAX_ENHANCE_TOKENS ceiling.
     let conditioning_bytes = checked_sum(
         "conditioning",
         [
@@ -128,6 +256,7 @@ fn production_asset_declaration(
                 "connector",
                 ResidentProjection::Bfloat16,
             )?,
+            uncensored_enhancer_resident_bytes(spec)?,
         ],
     )?;
 
@@ -252,15 +381,63 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> Result<MemoryNumericTier> {
     numeric_tier_from_split(spec, &SplitModel::from_model_dir(root)?)
 }
 
-pub(crate) fn route_overlay(spec: &LoadSpec) -> Option<String> {
+/// Canonical request overlay spelling shared with the SceneWorks admission identity.
+///
+/// Adapter count is part of the identity (the auto-distill adapter is therefore not allowed to
+/// borrow a plain-T2V cell), enhancer is a load-bearing asset axis, and the provider mode is a
+/// request-only axis.  The latter is appended by SceneWorks because `LoadSpec` does not carry the
+/// per-request `video_mode` field.
+pub(crate) fn canonical_overlay(
+    adapter_count: usize,
+    enhancer: Option<&str>,
+    video_mode: Option<&str>,
+) -> Option<String> {
     let mut axes = Vec::new();
-    if !spec.adapters.is_empty() {
-        axes.push("adapters");
+    if adapter_count > 0 {
+        axes.push(format!("adapters:{adapter_count}"));
     }
-    if spec.components.contains_key("uncensored_enhancer") {
-        axes.push("uncensored-enhancer");
+    if let Some(enhancer) = enhancer {
+        axes.push(format!("enhancer:{enhancer}"));
     }
-    (!axes.is_empty()).then(|| axes.join("-"))
+    if let Some(video_mode) = video_mode {
+        axes.push(format!("provider_video_mode:{video_mode}"));
+    }
+    (!axes.is_empty()).then(|| axes.join("+"))
+}
+
+pub(crate) fn route_overlay(spec: &LoadSpec) -> Option<String> {
+    canonical_overlay(
+        spec.adapters.len(),
+        spec.components
+            .contains_key("uncensored_enhancer")
+            .then_some("uncensored"),
+        None,
+    )
+}
+
+/// Compare a request overlay to the loaded route without dropping request-only axes.
+///
+/// The provider contract is created from `LoadSpec`, so it can only know the loaded adapter and
+/// enhancer axes.  `provider_video_mode:*` is carried by the request identity and is accepted only
+/// as an additional, explicitly named axis.  Unknown or missing load axes still fail closed.
+fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) -> bool {
+    let load_axes = |overlay: Option<&str>| {
+        overlay
+            .into_iter()
+            .flat_map(|value| value.split('+'))
+            .filter(|axis| {
+                !axis.starts_with("provider_video_mode:") && axis != &"enhancer:standard"
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let actual_axes = actual.into_iter().flat_map(|value| value.split('+'));
+    if actual_axes.clone().any(|axis| {
+        axis.starts_with("provider_video_mode:") && !matches!(axis, "provider_video_mode:no_audio")
+    }) {
+        return false;
+    }
+    load_axes(actual) == load_axes(expected)
 }
 
 fn strategies() -> Vec<MemoryStrategyCapability> {
@@ -506,7 +683,7 @@ pub(crate) fn safety_check(
                     .into(),
             ));
         }
-        if context.overlay.as_deref() != expected_overlay {
+        if !overlay_matches_loaded_route(context.overlay.as_deref(), expected_overlay) {
             return Err(gen_core::Error::Unsupported(format!(
                 "ltx_2_3: memory overlay {:?} does not match the loaded route {:?}",
                 context.overlay, expected_overlay
@@ -609,6 +786,8 @@ fn begin_with_cleanup(
     )?;
     Ok(Some(Box::new(LtxMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+        expected_overlay: expected_overlay.map(str::to_owned),
+        admitted_overlay: context.overlay.clone(),
     })))
 }
 
@@ -618,30 +797,77 @@ fn begin_with_cleanup(
 /// represent (temporal conditioning and prompt enhancement).
 struct LtxMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
+    expected_overlay: Option<String>,
+    admitted_overlay: Option<String>,
 }
 
 impl LtxMemoryRequestScope {
-    fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    fn validate_request(
+        request: &GenerationRequest,
+        expected_overlay: Option<&str>,
+        admitted_overlay: Option<&str>,
+    ) -> gen_core::Result<()> {
         if !request.conditioning.is_empty() {
             return Err(gen_core::Error::Unsupported(
                 "ltx_2_3: calibrated memory route requires empty conditioning".into(),
             ));
         }
-        if request.enhance_prompt || request.use_uncensored_enhancer {
+        // These controls are part of the exact request identity.  They are safe to carry through
+        // a future variant-specific evidence cell; they must not be silently erased or borrow the
+        // plain cell.  `SceneWorks` keeps them fail-open until that cell is packaged.
+        let expected_has_enhancer = expected_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .any(|axis| axis == "enhancer:uncensored");
+        let request_enhancer = if request.use_uncensored_enhancer {
+            Some("uncensored")
+        } else if request.enhance_prompt {
+            Some("standard")
+        } else {
+            None
+        };
+        let admitted_enhancer = admitted_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .find_map(|axis| axis.strip_prefix("enhancer:"));
+        if request_enhancer != admitted_enhancer {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route does not include prompt enhancement controls"
-                    .into(),
+                "ltx_2_3: enhancer flavor does not match admitted overlay".into(),
             ));
         }
-        if request.video_mode.is_some() {
+        if request.use_uncensored_enhancer && !expected_has_enhancer {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: calibrated memory route does not include video_mode variants".into(),
+                "ltx_2_3: uncensored enhancer does not match the loaded overlay".into(),
             ));
+        }
+        let admitted_video_mode = admitted_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.split('+'))
+            .find_map(|axis| axis.strip_prefix("provider_video_mode:"));
+        if let Some(video_mode) = request.video_mode.as_deref() {
+            if video_mode != "no_audio" {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ltx_2_3: unsupported video_mode variant {video_mode:?}"
+                )));
+            }
+        }
+        if request.video_mode.as_deref() != admitted_video_mode {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: provider video mode does not match admitted overlay".into(),
+            ));
+        }
+        if let Some(tokens) = request.enhance_max_tokens {
+            if tokens == 0 || tokens > gen_core::generator::MAX_ENHANCE_TOKENS {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "ltx_2_3: enhance_max_tokens must be in 1..={}, got {tokens}",
+                    gen_core::generator::MAX_ENHANCE_TOKENS
+                )));
+            }
         }
         let fps = request.fps.unwrap_or(24);
-        if !(24..=30).contains(&fps) {
+        if !matches!(fps, 24 | 25 | 30) {
             return Err(gen_core::Error::Unsupported(format!(
-                "ltx_2_3: calibrated memory route requires fps in 24..=30, got {fps}"
+                "ltx_2_3: calibrated memory route requires public fps 24, 25, or 30, got {fps}"
             )));
         }
         Ok(())
@@ -650,7 +876,11 @@ impl LtxMemoryRequestScope {
 
 impl MemoryRequestScope for LtxMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        Self::validate_request(request)?;
+        Self::validate_request(
+            request,
+            self.expected_overlay.as_deref(),
+            self.admitted_overlay.as_deref(),
+        )?;
         self.inner.configure_request(request)
     }
 
@@ -980,29 +1210,156 @@ mod tests {
             assert_eq!(temporal_conditioning.memory, None);
         }
 
-        let mut enhanced = GenerationRequest {
+        for variant in [
+            GenerationRequest {
+                enhance_prompt: true,
+                ..request.clone()
+            },
+            GenerationRequest {
+                use_uncensored_enhancer: true,
+                ..request.clone()
+            },
+        ] {
+            let mut variant = variant;
+            let error = scope
+                .configure_request(&mut variant)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("enhancer flavor does not match admitted overlay"));
+            assert_eq!(variant.memory, None);
+        }
+
+        let mut enhancer_spec = fixture_spec();
+        enhancer_spec.components.insert(
+            "uncensored_enhancer".into(),
+            WeightsSource::Dir("/nonexistent-enhancer-fixture".into()),
+        );
+        let enhancer_contract = weights_free_memory_strategy_contract(&enhancer_spec).unwrap();
+        let enhancer_fixture = registered_valid_fixtures(
+            &enhancer_spec,
+            &enhancer_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let mut enhancer_scope = registered_begin_request(
+            &enhancer_spec,
+            &enhancer_contract,
+            &enhancer_fixture.context,
+        )
+        .unwrap()
+        .unwrap();
+        let mut crossed_standard = GenerationRequest {
             enhance_prompt: true,
-            ..request.clone()
+            ..enhancer_fixture.request.clone()
         };
-        let error = scope
-            .configure_request(&mut enhanced)
+        let error = enhancer_scope
+            .configure_request(&mut crossed_standard)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("does not include prompt enhancement controls"));
-        assert_eq!(enhanced.memory, None);
+        assert!(error.contains("enhancer flavor does not match admitted overlay"));
+        let mut admitted_uncensored = GenerationRequest {
+            enhance_prompt: true,
+            use_uncensored_enhancer: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
+            ..enhancer_fixture.request.clone()
+        };
+        enhancer_scope
+            .configure_request(&mut admitted_uncensored)
+            .unwrap();
+        assert!(admitted_uncensored.memory.unwrap().stage_residency);
+        let mut crossed_token_budget = GenerationRequest {
+            enhance_prompt: true,
+            use_uncensored_enhancer: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS + 1),
+            ..enhancer_fixture.request.clone()
+        };
+        let error = enhancer_scope
+            .configure_request(&mut crossed_token_budget)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enhance_max_tokens must be in 1..="));
+        assert_eq!(crossed_token_budget.memory, None);
 
-        let mut uncensored = GenerationRequest {
+        let standard_spec = fixture_spec();
+        let standard_contract = weights_free_memory_strategy_contract(&standard_spec).unwrap();
+        let mut standard_context = registered_valid_fixtures(
+            &standard_spec,
+            &standard_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        standard_context.overlay = Some("enhancer:standard".into());
+        let mut standard_scope =
+            registered_begin_request(&standard_spec, &standard_contract, &standard_context)
+                .unwrap()
+                .unwrap();
+        let mut admitted_standard = GenerationRequest {
+            enhance_prompt: true,
+            enhance_max_tokens: Some(gen_core::generator::MAX_ENHANCE_TOKENS),
+            ..request.clone()
+        };
+        standard_scope
+            .configure_request(&mut admitted_standard)
+            .unwrap();
+        assert!(admitted_standard.memory.unwrap().stage_residency);
+        let mut crossed_uncensored = GenerationRequest {
             use_uncensored_enhancer: true,
             ..request.clone()
         };
-        let error = scope
-            .configure_request(&mut uncensored)
+        let error = standard_scope
+            .configure_request(&mut crossed_uncensored)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("does not include prompt enhancement controls"));
-        assert_eq!(uncensored.memory, None);
+        assert!(error.contains("enhancer flavor does not match admitted overlay"));
 
-        for video_mode in ["no_audio", "video_only"] {
+        let mut no_audio = GenerationRequest {
+            video_mode: Some("no_audio".into()),
+            ..request.clone()
+        };
+        let error = scope
+            .configure_request(&mut no_audio)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider video mode does not match admitted overlay"));
+        assert_eq!(no_audio.memory, None);
+
+        let no_audio_spec = fixture_spec();
+        let no_audio_contract = weights_free_memory_strategy_contract(&no_audio_spec).unwrap();
+        let mut no_audio_context = registered_valid_fixtures(
+            &no_audio_spec,
+            &no_audio_contract,
+            MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        no_audio_context.overlay = Some("provider_video_mode:no_audio".into());
+        let mut no_audio_scope =
+            registered_begin_request(&no_audio_spec, &no_audio_contract, &no_audio_context)
+                .unwrap()
+                .unwrap();
+        let mut admitted_no_audio = GenerationRequest {
+            video_mode: Some("no_audio".into()),
+            ..request.clone()
+        };
+        no_audio_scope
+            .configure_request(&mut admitted_no_audio)
+            .unwrap();
+        assert!(admitted_no_audio.memory.unwrap().stage_residency);
+        let mut crossed_plain = request.clone();
+        let error = no_audio_scope
+            .configure_request(&mut crossed_plain)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider video mode does not match admitted overlay"));
+
+        for video_mode in ["video_only", "image_to_video"] {
             let mut variant = GenerationRequest {
                 video_mode: Some(video_mode.into()),
                 ..request.clone()
@@ -1011,11 +1368,11 @@ mod tests {
                 .configure_request(&mut variant)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("does not include video_mode variants"));
+            assert!(error.contains("unsupported video_mode variant"));
             assert_eq!(variant.memory, None);
         }
 
-        for fps in [Some(0), Some(23), Some(31)] {
+        for fps in [Some(0), Some(23), Some(26), Some(29), Some(31)] {
             let mut outside_envelope = GenerationRequest {
                 fps,
                 ..request.clone()
@@ -1024,7 +1381,7 @@ mod tests {
                 .configure_request(&mut outside_envelope)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("requires fps in 24..=30"));
+            assert!(error.contains("requires public fps 24, 25, or 30"));
             assert_eq!(outside_envelope.memory, None);
         }
 
@@ -1037,5 +1394,99 @@ mod tests {
             .unwrap();
         let mut after_finish = request;
         assert!(scope.configure_request(&mut after_finish).is_err());
+    }
+
+    #[test]
+    fn canonical_overlay_preserves_adapter_count_enhancer_and_provider_mode() {
+        assert_eq!(canonical_overlay(0, None, None), None);
+        assert_eq!(
+            canonical_overlay(2, Some("uncensored"), Some("no_audio")).as_deref(),
+            Some("adapters:2+enhancer:uncensored+provider_video_mode:no_audio")
+        );
+        assert!(overlay_matches_loaded_route(
+            Some("adapters:2+enhancer:uncensored+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer:uncensored")
+        ));
+        assert!(!overlay_matches_loaded_route(
+            Some("adapters:1+enhancer:uncensored+provider_video_mode:no_audio"),
+            Some("adapters:2+enhancer:uncensored")
+        ));
+        assert!(!overlay_matches_loaded_route(
+            Some("provider_video_mode:video_only"),
+            None
+        ));
+    }
+
+    #[test]
+    fn uncensored_enhancer_artifact_is_charged_to_conditioning_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"quantization":{"mode":"affine","group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+        let header = br#"{"model.embed_tokens.weight":{"dtype":"U32","shape":[2,16],"data_offsets":[0,128]},"model.embed_tokens.scales":{"dtype":"F16","shape":[2,2],"data_offsets":[128,136]},"model.embed_tokens.biases":{"dtype":"F16","shape":[2,2],"data_offsets":[136,144]},"model.layer.weight":{"dtype":"F16","shape":[2,2],"data_offsets":[144,152]}}"#;
+        let mut padded = header.to_vec();
+        while !(padded.len() + 8).is_multiple_of(8) {
+            padded.push(b' ');
+        }
+        let mut file = (padded.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&padded);
+        file.extend_from_slice(&[0; 152]);
+        std::fs::write(dir.path().join("model.safetensors"), file).unwrap();
+
+        let mut spec = fixture_spec();
+        spec.components.insert(
+            "uncensored_enhancer".into(),
+            WeightsSource::Dir(dir.path().to_path_buf()),
+        );
+        let enhancer_bytes = uncensored_enhancer_resident_bytes(&spec).unwrap();
+        // Stored peak: 152 B. Expanded embedding: [2, 2*64] bf16 = 512 B. Both coexist while MLX
+        // evaluates the lazy dequantization graph, so the conditioning floor is their exact sum.
+        assert_eq!(enhancer_bytes, 664);
+
+        let contract = build_contract(
+            &spec,
+            AssetDeclaration {
+                facts: MemoryAssetFacts {
+                    base_bytes: enhancer_bytes,
+                    conditioning_bytes: enhancer_bytes,
+                    ..Default::default()
+                },
+                resident_components: Vec::new(),
+            },
+            STATIC_CALIBRATION_FINGERPRINT,
+        )
+        .unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, enhancer_bytes);
+        assert_eq!(contract.total_resident_bytes(), enhancer_bytes);
+    }
+
+    #[test]
+    fn uncensored_enhancer_rejects_config_that_disagrees_with_packed_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"quantization":{"mode":"affine","group_size":64,"bits":8}}"#,
+        )
+        .unwrap();
+        let header = br#"{"model.embed_tokens.weight":{"dtype":"U32","shape":[2,16],"data_offsets":[0,128]},"model.embed_tokens.scales":{"dtype":"F16","shape":[2,2],"data_offsets":[128,136]},"model.embed_tokens.biases":{"dtype":"F16","shape":[2,2],"data_offsets":[136,144]}}"#;
+        let mut padded = header.to_vec();
+        while !(padded.len() + 8).is_multiple_of(8) {
+            padded.push(b' ');
+        }
+        let mut file = (padded.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&padded);
+        file.extend_from_slice(&[0; 144]);
+        std::fs::write(dir.path().join("model.safetensors"), file).unwrap();
+        let mut spec = fixture_spec();
+        spec.components.insert(
+            "uncensored_enhancer".into(),
+            WeightsSource::Dir(dir.path().to_path_buf()),
+        );
+        let error = uncensored_enhancer_resident_bytes(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("geometry disagrees"), "{error}");
     }
 }

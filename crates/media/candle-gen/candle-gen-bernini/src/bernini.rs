@@ -69,7 +69,6 @@ use crate::forward::{
 use crate::guidance::MomentumBuffer;
 use crate::latent_dims;
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
-use crate::memory_strategy::PreparedMemory;
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
@@ -589,11 +588,10 @@ pub struct Bernini {
     root: PathBuf,
     device: Device,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
-    /// Sealed base/artifact/adapter identity plus the executable still-memory contract. Missing
-    /// weight paths remain loadable for the historical descriptor/validation fixtures, but an
-    /// existing snapshot must pass this receipt before any component can be loaded.
-    memory_strategy: Option<PreparedMemory>,
     components: Mutex<Option<Arc<RendererComponents>>>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
+    loaded_spec: LoadSpec,
 }
 
 impl Bernini {
@@ -601,21 +599,29 @@ impl Bernini {
     /// generate. The load lock serializes racing first-callers so two concurrent generates don't
     /// both mmap + upload ~50 GB (F-097).
     fn components(&self) -> CResult<Arc<RendererComponents>> {
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        let components = candle_gen::cached(&self.components, || {
-            Ok::<_, CandleError>(Arc::new(RendererComponents::load(
-                &self.root,
-                &self.device,
-                MODEL_ID,
-                &self.adapters,
-            )?))
-        })?;
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        Ok(components)
+        candle_gen::cached(&self.components, || {
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let components =
+                RendererComponents::load(&self.root, &self.device, MODEL_ID, &self.adapters)?;
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            Ok(Arc::new(components))
+        })
     }
 }
 
@@ -640,19 +646,25 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
-    let memory_strategy = root
-        .exists()
-        .then(|| PreparedMemory::prepare(spec))
-        .transpose()?;
     let device = candle_gen::default_device()?;
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         knobs,
         root,
         device,
         adapters: spec.adapters.clone(),
-        memory_strategy,
         components: Mutex::new(None),
+        memory_strategy,
+        memory_tier,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -663,43 +675,6 @@ candle_gen::register_generators! {
 impl Generator for Bernini {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
-    }
-
-    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref().map(|memory| &memory.contract)
-    }
-
-    fn memory_strategy_safety_check(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::MemorySafetyDecision {
-        let Some(memory) = &self.memory_strategy else {
-            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
-                gen_core::MemorySafetyDecision::Accept
-            } else {
-                gen_core::MemorySafetyDecision::Reject {
-                    reason: format!(
-                        "{MODEL_ID} loaded route has no certified still-memory contract"
-                    ),
-                }
-            };
-        };
-        crate::memory_strategy::safety_check(&memory.contract, memory.tier, context)
-    }
-
-    fn begin_memory_strategy_request(
-        &self,
-        context: &gen_core::MemoryRunContext,
-    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        let Some(memory) = &self.memory_strategy else {
-            return Ok(None);
-        };
-        crate::memory_strategy::begin_request(
-            &memory.contract,
-            memory.tier,
-            self.device.clone(),
-            context,
-        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -718,11 +693,10 @@ impl Generator for Bernini {
         // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
         // them off the request and dropping them.
         reject_unimplemented_video_clip_knobs(id, req)?;
-        // The public still route is intentionally exact: no implicit mode inference, extra
-        // references, phases, PiD, or unadvertised geometry may cross the same provider gate used
-        // by registry admission. Multi-frame Bernini remains the legacy resident video path.
+        // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
+        // surface share the provider but retain separate, fail-closed request identities.
         if req.frames == Some(1) || req.memory.is_some() {
-            crate::memory_strategy::validate_generation_request(req, !self.adapters.is_empty())?;
+            crate::memory_strategy::validate_request(req)?;
         }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
@@ -753,14 +727,31 @@ impl Generator for Bernini {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        let output = self.generate_impl(req, on_progress)?;
-        if let Some(memory) = &self.memory_strategy {
-            memory.ensure_unchanged(&self.adapters)?;
-        }
-        Ok(output)
+        Ok(self.generate_impl(req, on_progress)?)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 
@@ -1438,8 +1429,7 @@ mod tests {
         let f = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         assert!(load(&f).is_err());
         // A directory source is lazy-loaded, so it resolves past the marker.
-        let fixture = tempfile::tempdir().unwrap();
-        let d = LoadSpec::new(WeightsSource::Dir(fixture.path().join("missing")));
+        let d = LoadSpec::new(WeightsSource::Dir("/snap".into()));
         assert!(load(&d).is_ok());
     }
 
