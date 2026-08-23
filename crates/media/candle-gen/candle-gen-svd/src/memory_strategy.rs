@@ -5,12 +5,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::{
-    self, GenerationRequest, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities,
     MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategySupport, Precision, ResidentRequestMemory,
-    WeightsSource,
+    MemoryStrategyCapability, MemoryStrategySupport, Precision,
+    ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -395,6 +396,42 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProvi
     PreparedSvdMemory::prepare(spec).map(|prepared| prepared.contract)
 }
 
+/// Weights-free registry proof for the deliberately dense, resident-only SVD-XT surface.
+/// Production admission still uses [`memory_strategy_contract`] and its sealed physical facts.
+fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    if spec.precision != Precision::Bf16
+        || spec.quantize.is_some()
+        || spec.offload_policy != gen_core::OffloadPolicy::Resident
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: resident witness only covers the dense bf16 catalog surface",
+            crate::MODEL_ID
+        )));
+    }
+    Ok(build_contract(spec, MemoryAssetFacts::default()))
+}
+
+fn resident_only_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    [
+        LoadShape::EagerMaterialization,
+        LoadShape::DeferredMaterialization,
+    ]
+    .into_iter()
+    .map(|load_shape| MemoryContractSurfaceSpec {
+        selector: MemoryContractSurfaceSelector {
+            tier: MemoryContractSurfaceTier::Bf16,
+            offload_policy: gen_core::OffloadPolicy::Resident,
+            load_shape,
+        },
+        spec: LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+        .with_offload_policy(gen_core::OffloadPolicy::Resident)
+        .with_load_shape(load_shape),
+    })
+    .collect()
+}
+
 fn one_reference(request: &GenerationRequest) -> gen_core::Result<&gen_core::Image> {
     if request.conditioning.len() != 1 {
         return Err(gen_core::Error::Unsupported(format!(
@@ -699,6 +736,13 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
     },
 };
 
+pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
+    ResidentOnlyMemoryContractRegistration {
+        provider_id: crate::MODEL_ID,
+        contract: weights_free_resident_contract,
+        surface_specs: resident_only_surface_specs,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +807,36 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn weights_free_witness_covers_only_dense_resident_load_shapes() {
+        let surfaces = resident_only_surface_specs();
+        assert_eq!(surfaces.len(), 2);
+        for surface in surfaces {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            assert_eq!(contract.provider_id, crate::MODEL_ID);
+            assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+            assert!(contract.conformance_errors().is_empty());
+            assert!(contract.strategies.iter().all(|capability| {
+                capability.support
+                    == if capability.strategy == MemoryStrategy::Resident {
+                        MemoryStrategySupport::Implemented
+                    } else {
+                        MemoryStrategySupport::Missing
+                    }
+            }));
+        }
+        let witness_spec = || {
+            LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ))
+        };
+        assert!(weights_free_resident_contract(&witness_spec().with_quant(Quant::Q4)).is_err());
+        assert!(weights_free_resident_contract(
+            &witness_spec().with_offload_policy(OffloadPolicy::Sequential)
+        )
+        .is_err());
     }
 
     #[test]

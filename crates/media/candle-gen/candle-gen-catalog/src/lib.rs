@@ -140,6 +140,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
     registry.build()
 }
 
@@ -3370,6 +3372,11 @@ mod preview_advertising {
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
         MemoryRouteCrate {
+            dir: "candle-gen-bernini",
+            register_providers: candle_gen_bernini::register_providers,
+            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
@@ -3408,6 +3415,11 @@ mod preview_advertising {
             dir: "candle-gen-sensenova",
             register_providers: candle_gen_sensenova::register_providers,
             register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-svd",
+            register_providers: candle_gen_svd::register_providers,
+            register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",

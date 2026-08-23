@@ -833,9 +833,16 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+}
+
+/// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle SVD provider catalog.
