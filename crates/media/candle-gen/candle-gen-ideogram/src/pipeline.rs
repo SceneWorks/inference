@@ -45,7 +45,7 @@ const PID_BACKBONE: &str = "flux2";
 use crate::config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH,
     DEFAULT_INPAINT_STRENGTH, DEFAULT_STEPS, DEFAULT_TURBO_STEPS, EXTRACTED_LAYERS,
-    MAX_TEXT_TOKENS, PAD_TOKEN_ID, TURBO_LORA_FILE, TURBO_LORA_SCALE,
+    MAX_TEXT_TOKENS, MODEL_ID, MODEL_ID_TURBO, PAD_TOKEN_ID, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 use crate::scheduler::{make_step_intervals, preset_mu_std, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
@@ -92,12 +92,158 @@ pub struct Components {
     turbo_lora_report: Option<crate::adapters::TurboLoraReport>,
 }
 
+struct TextComponents {
+    te: Ideogram4TextEncoder,
+    tokenizer: TextTokenizer,
+}
+
+struct DenoiseComponents {
+    cond: Ideogram4Transformer,
+    uncond: Option<Ideogram4Transformer>,
+    dit: Ideogram4DitConfig,
+}
+
+struct SynchronizedPhase<T> {
+    component: Option<T>,
+    device: Device,
+    label: &'static str,
+}
+
+impl<T> SynchronizedPhase<T> {
+    fn new(component: T, device: Device, label: &'static str) -> Self {
+        Self {
+            component: Some(component),
+            device,
+            label,
+        }
+    }
+
+    fn release(mut self) -> CResult<()> {
+        let component = self
+            .component
+            .take()
+            .expect("phase component remains available before release");
+        crate::synchronized_release(component, || self.device.synchronize()).map_err(|error| {
+            CandleError::Msg(format!(
+                "ideogram: synchronize {} before release: {error}",
+                self.label
+            ))
+        })
+    }
+}
+
+impl<T> std::ops::Deref for SynchronizedPhase<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.component
+            .as_ref()
+            .expect("phase component remains available before release")
+    }
+}
+
+impl<T> Drop for SynchronizedPhase<T> {
+    fn drop(&mut self) {
+        if self.component.is_none() {
+            return;
+        }
+        if let Some(component) = self.component.take() {
+            let _ = crate::synchronized_release(component, || self.device.synchronize());
+        }
+    }
+}
+
 impl Components {
     /// Structured TurboTime adapter-install outcome. `None` for the quality pipeline, which has no
     /// bundled adapter; `Some` for turbo loads.
     pub fn turbo_lora_report(&self) -> Option<crate::adapters::TurboLoraReport> {
         self.turbo_lora_report
     }
+}
+
+fn load_text_components(root: &Path, device: &Device) -> CResult<TextComponents> {
+    let cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
+    Ok(TextComponents {
+        te: Ideogram4TextEncoder::new(
+            &cfg,
+            &EXTRACTED_LAYERS,
+            MAX_TEXT_TOKENS,
+            component_vb(root, "text_encoder", te_store_dtype(root, device), device)?,
+        )?,
+        tokenizer: build_tokenizer(root)?,
+    })
+}
+
+fn load_denoise_components(
+    root: &Path,
+    turbo: bool,
+    adapters: &[AdapterSpec],
+    device: &Device,
+) -> CResult<DenoiseComponents> {
+    let dit = Ideogram4DitConfig::v4();
+    let cond_w = crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
+    let uncond = if turbo {
+        crate::adapters::install_turbo_lora_additive_with_report(
+            &mut cond,
+            &root.join(TURBO_LORA_FILE),
+            TURBO_LORA_SCALE,
+        )?;
+        candle_gen::quant::install_dotted_adapters(
+            "ideogram turbo",
+            adapters,
+            device,
+            |visitor| cond.visit_adaptable_mut(visitor),
+        )?;
+        None
+    } else {
+        candle_gen::quant::install_dotted_adapters(
+            "ideogram quality conditional",
+            adapters,
+            device,
+            |visitor| cond.visit_adaptable_mut(visitor),
+        )?;
+        let uncond_w = crate::loader::Weights::from_dir(
+            &root.join("unconditional_transformer"),
+            device,
+            DIT_DTYPE,
+        )?;
+        let mut uncond = Ideogram4Transformer::load(&uncond_w, &dit)?;
+        candle_gen::quant::install_dotted_adapters(
+            "ideogram quality unconditional",
+            adapters,
+            device,
+            |visitor| uncond.visit_adaptable_mut(visitor),
+        )?;
+        Some(uncond)
+    };
+    Ok(DenoiseComponents { cond, uncond, dit })
+}
+
+fn load_vae(root: &Path, device: &Device) -> CResult<Flux2Vae> {
+    Ok(Flux2Vae::new_with_encoder(component_vb(
+        root, "vae", ENC_DTYPE, device,
+    )?)?)
+}
+
+fn tokenize(tokenizer: &TextTokenizer, prompt: &str) -> CResult<Vec<i32>> {
+    let ids = tokenizer
+        .encode_chat_ids(prompt, false)
+        .map_err(|error| CandleError::Msg(format!("ideogram: tokenize: {error}")))?;
+    if ids.len() > MAX_TEXT_TOKENS {
+        return Err(CandleError::Msg(format!(
+            "ideogram: prompt has {} tokens, exceeds max_text_tokens={MAX_TEXT_TOKENS}",
+            ids.len()
+        )));
+    }
+    Ok(ids)
+}
+
+fn encode_prompt(text: &TextComponents, ids: &[i32], device: &Device) -> CResult<Tensor> {
+    let ids_u32 = ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
+    let id_tensor = Tensor::from_vec(ids_u32, (1, ids.len()), device)?;
+    let attn = Tensor::ones((1, ids.len()), DType::U32, device)?;
+    Ok(text.te.prompt_embeds(&id_tensor, &attn)?)
 }
 
 /// Build the Ideogram tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011).
@@ -284,33 +430,6 @@ impl Components {
         Ok(ids)
     }
 
-    /// VAE-encode a source image into the bn-normalized packed latent `[1, num_img, 128]` the denoise
-    /// operates on — the exact inverse of [`decode`]'s de-normalize + (ph,pw,c) unpatchify: resize →
-    /// `vae.encode` (posterior mean) → 2×2 patchify (Ideogram's `(ph,pw,c)` c-innermost order) →
-    /// bn-normalize `(x − mean)/std`. Seed-independent; encode once per request.
-    fn encode_init_latents(
-        &self,
-        image: &Image,
-        height: u32,
-        width: u32,
-        device: &Device,
-    ) -> CResult<Tensor> {
-        let grid_h = (height / PATCH_AE) as usize;
-        let grid_w = (width / PATCH_AE) as usize;
-        let pre = preprocess_source_image(image, width, height, device)?; // [1, 3, H, W]
-        let enc = self.vae.encode(&pre)?; // [1, 32, H/8, W/8] = [1, 32, gh·2, gw·2]
-                                          // Patchify to packed [1, L, 128] (ph,pw,c) — inverse of decode's unpatchify permute.
-        let packed = enc
-            .reshape((1, 32, grid_h, 2, grid_w, 2))? // [B, c, gh, ph, gw, pw]
-            .permute((0, 2, 4, 3, 5, 1))? // [B, gh, gw, ph, pw, c]
-            .contiguous()?
-            .reshape((1, grid_h * grid_w, 128))?;
-        let (bn_std, bn_mean) = self.vae.bn_stats();
-        let bn_std = bn_std.reshape((1, 1, 128))?;
-        let bn_mean = bn_mean.reshape((1, 1, 128))?;
-        Ok(packed.broadcast_sub(&bn_mean)?.broadcast_div(&bn_std)?)
-    }
-
     /// Prepare the per-request [`EditInit`] (img2img / inpaint): VAE-encode the source once and build
     /// the optional latent-grid mask. Reused across the per-seed count loop (seed-independent).
     fn prepare_edit(
@@ -322,13 +441,37 @@ impl Components {
         width: u32,
         device: &Device,
     ) -> CResult<EditInit> {
-        let z0 = self.encode_init_latents(source, height, width, device)?;
-        let mask = match mask {
-            Some(m) => Some(preprocess_mask_packed(m, width, height, device)?),
-            None => None,
-        };
-        Ok(EditInit { z0, mask, strength })
+        prepare_edit_with_vae(&self.vae, source, mask, strength, height, width, device)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_edit_with_vae(
+    vae: &Flux2Vae,
+    source: &Image,
+    mask: Option<&Image>,
+    strength: f32,
+    height: u32,
+    width: u32,
+    device: &Device,
+) -> CResult<EditInit> {
+    let grid_h = (height / PATCH_AE) as usize;
+    let grid_w = (width / PATCH_AE) as usize;
+    let pre = preprocess_source_image(source, width, height, device)?;
+    let enc = vae.encode(&pre)?;
+    let packed = enc
+        .reshape((1, 32, grid_h, 2, grid_w, 2))?
+        .permute((0, 2, 4, 3, 5, 1))?
+        .contiguous()?
+        .reshape((1, grid_h * grid_w, 128))?;
+    let (bn_std, bn_mean) = vae.bn_stats();
+    let z0 = packed
+        .broadcast_sub(&bn_mean.reshape((1, 1, 128))?)?
+        .broadcast_div(&bn_std.reshape((1, 1, 128))?)?;
+    let mask = mask
+        .map(|image| preprocess_mask_packed(image, width, height, device))
+        .transpose()?;
+    Ok(EditInit { z0, mask, strength })
 }
 
 /// Render `req.count` images for `req`.
@@ -380,9 +523,17 @@ pub fn render(
     let pid_decoder =
         candle_gen_pid::resolve_pid_decoder(comps.pid.as_ref(), req, base_seed, model_id)?;
 
+    let ids_u32 = ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
+    let id_tensor = Tensor::from_vec(ids_u32, (1, ids.len()), device)?;
+    let attn = Tensor::ones((1, ids.len()), DType::U32, device)?;
+    let te_out = comps.te.prompt_embeds(&id_tensor, &attn)?;
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let z = denoise(
-            comps,
+            &comps.cond,
+            comps.uncond.as_ref(),
+            &comps.dit,
+            &te_out,
+            Some(comps.vae.bn_stats()),
             &ids,
             req,
             steps,
@@ -395,6 +546,163 @@ pub fn render(
         on_progress(Progress::Decoding);
         decode(comps, &z, req.width, req.height, pid_decoder.as_ref())
     })
+}
+
+/// Request-authoritative phase residency for Ideogram Base and Turbo. Conditioning, optional source
+/// encode, denoise, and decode are independently loaded and synchronously released. Base opens both
+/// DiT stacks only in the denoise phase; Turbo opens its DiT with the mandatory bundled residual and
+/// then installs the ordered user stack. A warm resident cache is never repopulated from these
+/// request-local components.
+#[allow(clippy::too_many_arguments)]
+pub fn render_staged(
+    root: &Path,
+    turbo: bool,
+    pid_spec: Option<&PidWeights>,
+    adapters: &[AdapterSpec],
+    req: &GenerationRequest,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> CResult<Vec<Image>> {
+    candle_gen::check_cancel(&req.cancel)?;
+    let default_steps = if turbo {
+        DEFAULT_TURBO_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
+    let steps = req
+        .steps
+        .map(|steps| steps as usize)
+        .unwrap_or(default_steps as usize);
+    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+    let text = SynchronizedPhase::new(
+        load_text_components(root, device)?,
+        device.clone(),
+        "conditioning components",
+    );
+    let ids = tokenize(&text.tokenizer, &req.prompt)?;
+    if ids.is_empty() {
+        return Err(CandleError::Msg(
+            "ideogram: empty prompt token sequence".into(),
+        ));
+    }
+    let te_out = encode_prompt(&text, &ids, device)?;
+    text.release()?;
+
+    candle_gen::check_cancel(&req.cancel)?;
+    let resolved_edit = resolve_edit(req)?;
+    // Source encoding is genuinely optional. Preview and PiD conversion also need the VAE's tiny
+    // BN tensors before decode, so those request axes intentionally stage the VAE here and clone
+    // only the statistics before synchronized release. Plain native T2I skips this phase entirely.
+    let needs_encode_phase = resolved_edit.is_some() || req.preview.is_active() || req.use_pid;
+    let (edit, mut preview_stats) = if needs_encode_phase {
+        let encode = SynchronizedPhase::new(
+            load_vae(root, device)?,
+            device.clone(),
+            "optional VAE encode components",
+        );
+        let (bn_std, bn_mean) = encode.bn_stats();
+        let stats = Some((bn_std.clone(), bn_mean.clone()));
+        let edit = match resolved_edit {
+            Some((source, mask, strength)) => Some(prepare_edit_with_vae(
+                &encode, source, mask, strength, req.height, req.width, device,
+            )?),
+            None => None,
+        };
+        encode.release()?;
+        (edit, stats)
+    } else {
+        (None, None)
+    };
+
+    candle_gen::check_cancel(&req.cancel)?;
+    let denoise_components = SynchronizedPhase::new(
+        load_denoise_components(root, turbo, adapters, device)?,
+        device.clone(),
+        "denoise components",
+    );
+    let mut latents = Vec::with_capacity(req.count as usize);
+    for index in 0..req.count {
+        candle_gen::check_cancel(&req.cancel)?;
+        let seed = base_seed.wrapping_add(u64::from(index));
+        latents.push(denoise(
+            &denoise_components.cond,
+            denoise_components.uncond.as_ref(),
+            &denoise_components.dit,
+            &te_out,
+            preview_stats.as_ref().map(|(std, mean)| (std, mean)),
+            &ids,
+            req,
+            steps,
+            guidance,
+            seed,
+            edit.as_ref(),
+            device,
+            on_progress,
+        )?);
+    }
+    denoise_components.release()?;
+
+    candle_gen::check_cancel(&req.cancel)?;
+    let pid = if req.use_pid {
+        Some(SynchronizedPhase::new(
+            load_pid(pid_spec, device)?.ok_or_else(|| {
+                CandleError::Msg("ideogram: PiD requested without a sealed PiD load".into())
+            })?,
+            device.clone(),
+            "PiD decode components",
+        ))
+    } else {
+        None
+    };
+    let vae = if req.use_pid {
+        None
+    } else {
+        Some(SynchronizedPhase::new(
+            load_vae(root, device)?,
+            device.clone(),
+            "native VAE decode components",
+        ))
+    };
+    let pid_decoder = match pid.as_ref() {
+        Some(engine) => candle_gen_pid::resolve_pid_decoder(
+            Some(&**engine),
+            req,
+            base_seed,
+            if turbo { MODEL_ID_TURBO } else { MODEL_ID },
+        )?,
+        None => None,
+    };
+    if preview_stats.is_none() {
+        let native = vae.as_deref().ok_or_else(|| {
+            CandleError::Msg("ideogram: decode has no sealed VAE statistics".into())
+        })?;
+        let (std, mean) = native.bn_stats();
+        preview_stats = Some((std.clone(), mean.clone()));
+    }
+    let preview_stats = preview_stats.expect("decode statistics established above");
+    let mut images = Vec::with_capacity(latents.len());
+    for latent in &latents {
+        candle_gen::check_cancel(&req.cancel)?;
+        on_progress(Progress::Decoding);
+        images.push(decode_with_vae_and_stats(
+            vae.as_deref(),
+            &preview_stats,
+            latent,
+            req.width,
+            req.height,
+            pid_decoder.as_ref(),
+        )?);
+    }
+    drop(pid_decoder);
+    if let Some(vae) = vae {
+        vae.release()?;
+    }
+    if let Some(pid) = pid {
+        pid.release()?;
+    }
+    Ok(images)
 }
 
 /// Resolve the optional edit conditioning: a single img2img/inpaint source [`Conditioning::Reference`]
@@ -447,7 +755,11 @@ fn resolve_edit(req: &GenerationRequest) -> CResult<Option<(&Image, Option<&Imag
 /// and (with a mask) pins the keep region per step; `edit = None` is the original text-to-image path.
 #[allow(clippy::too_many_arguments)]
 fn denoise(
-    comps: &Components,
+    cond: &Ideogram4Transformer,
+    uncond: Option<&Ideogram4Transformer>,
+    dit: &Ideogram4DitConfig,
+    te_out: &Tensor,
+    preview_stats: Option<(&Tensor, &Tensor)>,
     ids: &[i32],
     req: &GenerationRequest,
     steps: usize,
@@ -463,23 +775,18 @@ fn denoise(
     let num_img = grid_h * grid_w;
     let num_text = ids.len();
     let seq = num_text + num_img;
-    let llm_dim = comps.dit.llm_features_dim;
-    let ch = comps.dit.in_channels;
+    let llm_dim = dit.llm_features_dim;
+    let ch = dit.in_channels;
 
-    // ── Text encode (single prompt, no padding → positions 0..num_text) ──
-    let ids_u32: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-    let id_tensor = Tensor::from_vec(ids_u32, (1, num_text), device)?;
-    let attn = Tensor::ones((1, num_text), DType::U32, device)?;
-    let te_out = comps.te.prompt_embeds(&id_tensor, &attn)?; // [1, num_text, llm_dim] f32
     let llm_zeros = Tensor::zeros((1, num_img, llm_dim), ENC_DTYPE, device)?;
-    let llm_features = Tensor::cat(&[&te_out, &llm_zeros], 1)?; // [1, seq, llm_dim]
+    let llm_features = Tensor::cat(&[te_out, &llm_zeros], 1)?; // [1, seq, llm_dim]
 
     // ── Packed positions / segments / role indicators (host-built) ──
     let pack = Packing::build(num_text, grid_h, grid_w);
     let position_ids = Tensor::from_vec(pack.position_ids, (1, seq, 3), device)?;
     let segment_ids = Tensor::from_vec(pack.segment_ids, (1, seq), device)?;
     let indicator = Tensor::from_vec(pack.indicator, (1, seq), device)?;
-    let neg = match &comps.uncond {
+    let neg = match uncond {
         Some(uncond) => Some((
             uncond,
             Tensor::from_vec(pack.neg_position_ids, (1, num_img, 3), device)?,
@@ -543,14 +850,21 @@ fn denoise(
             &req.preview,
             &preview_counter,
             num_run - 1 - i,
-            || crate::preview::project_packed_tokens(comps, &z, grid_h, grid_w),
+            || match preview_stats {
+                Some((bn_std, bn_mean)) => crate::preview::project_packed_tokens_with_stats(
+                    bn_std, bn_mean, &z, grid_h, grid_w,
+                ),
+                None => Err(CandleError::Msg(
+                    "ideogram: preview BN statistics unavailable".into(),
+                )),
+            },
         );
         let t_val = schedule.eval(si[i + 1]) as f32;
         let s_val = schedule.eval(si[i]) as f32;
         let t = Tensor::from_vec(vec![t_val], 1, device)?;
 
         let pos_z = Tensor::cat(&[&text_z_padding, &z], 1)?; // [1, seq, ch]
-        let pos_out = comps.cond.forward(
+        let pos_out = cond.forward(
             &llm_features,
             &pos_z,
             &t,
@@ -606,25 +920,43 @@ fn decode(
     height: u32,
     pid: Option<&PidDecoder>,
 ) -> CResult<Image> {
+    decode_with_vae_and_stats(
+        Some(&comps.vae),
+        &(
+            comps.vae.bn_stats().0.clone(),
+            comps.vae.bn_stats().1.clone(),
+        ),
+        z,
+        width,
+        height,
+        pid,
+    )
+}
+
+fn decode_with_vae_and_stats(
+    vae: Option<&Flux2Vae>,
+    stats: &(Tensor, Tensor),
+    z: &Tensor,
+    width: u32,
+    height: u32,
+    pid: Option<&PidDecoder>,
+) -> CResult<Image> {
     let grid_h = (height / PATCH_AE) as usize;
     let grid_w = (width / PATCH_AE) as usize;
-
-    let latent = raw_latent(comps, z, grid_h, grid_w)?;
-
+    let latent = raw_latent_with_stats(&stats.0, &stats.1, z, grid_h, grid_w)?;
     let decoded = match pid {
-        Some(d) => {
+        Some(decoder) => {
             candle_gen::ensure_decoder_layout(
                 Some(&candle_gen::gen_core::FLUX2_PACKED_LATENT_SPACE),
-                d,
+                decoder,
             )?;
-            // Reconstruct the FLUX.2-canonical packed BN-normalized latent the flux2 student trained on:
-            // raw NCHW [1,32,H/8,W/8] -> canonical (c,ph,pw) patchify [1,128,H/16,W/16] -> BN-normalize.
-            let patched = candle_gen_flux2::vae::patchify(&latent)?; // [1,128,gh,gw] (c,ph,pw)
-            let (bn_std, bn_mean) = comps.vae.bn_stats(); // each [1,128,1,1], canonical order
-            let normed = patched.broadcast_sub(bn_mean)?.broadcast_div(bn_std)?;
-            d.decode(&normed)?
+            let patched = candle_gen_flux2::vae::patchify(&latent)?;
+            let normed = patched.broadcast_sub(&stats.1)?.broadcast_div(&stats.0)?;
+            decoder.decode(&normed)?
         }
-        None => comps.vae.decode_latent(&latent)?, // unchanged native path: [1, 3, H, W] f32 ~[-1,1]
+        None => vae
+            .ok_or_else(|| CandleError::Msg("ideogram: native decode missing VAE".into()))?
+            .decode_latent(&latent)?,
     };
     to_image(&decoded)
 }
@@ -653,8 +985,18 @@ pub(crate) fn raw_latent(
     grid_h: usize,
     grid_w: usize,
 ) -> CResult<Tensor> {
-    // bn de-normalize in the packed [1, L, 128] space (Ideogram's (ph,pw,c) channel order).
     let (bn_std, bn_mean) = comps.vae.bn_stats();
+    raw_latent_with_stats(bn_std, bn_mean, z, grid_h, grid_w)
+}
+
+pub(crate) fn raw_latent_with_stats(
+    bn_std: &Tensor,
+    bn_mean: &Tensor,
+    z: &Tensor,
+    grid_h: usize,
+    grid_w: usize,
+) -> CResult<Tensor> {
+    // bn de-normalize in the packed [1, L, 128] space (Ideogram's (ph,pw,c) channel order).
     let bn_std = bn_std.reshape((1, 1, 128))?;
     let bn_mean = bn_mean.reshape((1, 1, 128))?;
     let denorm = z
@@ -863,6 +1205,40 @@ impl Packing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct PhaseDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for PhaseDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn phase_release_is_once_only_on_normal_error_and_panic_unwind() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        SynchronizedPhase::new(PhaseDropProbe(Arc::clone(&drops)), Device::Cpu, "normal")
+            .release()
+            .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let error_scope =
+            SynchronizedPhase::new(PhaseDropProbe(Arc::clone(&drops)), Device::Cpu, "error");
+        drop(error_scope);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        let panic = std::panic::catch_unwind({
+            let drops = Arc::clone(&drops);
+            move || {
+                let _scope = SynchronizedPhase::new(PhaseDropProbe(drops), Device::Cpu, "panic");
+                panic!("fixture panic");
+            }
+        });
+        assert!(panic.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
 
     /// sc-12828: the text-encoder VarBuilder loads at **bf16** (`TE_STORE_DTYPE`), not `ENC_DTYPE`
     /// (f32) — the deliberate, non-default store the ~half-resident TE saving rides on. The encoder
