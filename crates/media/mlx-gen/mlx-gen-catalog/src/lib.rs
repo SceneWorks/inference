@@ -148,6 +148,11 @@ pub fn resolved_video_memory_numeric_tier(
     if let Some(tier) = mlx_gen_bernini::resolved_video_memory_numeric_tier(provider_id, spec)? {
         return Ok(Some(tier));
     }
+    if provider_id == mlx_gen_krea_realtime::MODEL_ID {
+        return mlx_gen_krea_realtime::resolved_numeric_tier(spec)
+            .map(Some)
+            .map_err(|error| media::gen_core::Error::Msg(error.to_string()));
+    }
     mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
 }
 

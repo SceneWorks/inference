@@ -7,14 +7,14 @@
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
-    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    MemoryWindowMaterialization, PerComponentBytes, Precision, Quant, TransformerComponent,
-    WeightsSource,
+    self, AdapterResidencyMode, GenerationMemory, GenerationRequest, LoadShape, LoadSpec,
+    MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes, Precision, Quant,
+    TransformerComponent, WeightsSource,
 };
 
 pub(crate) const DECODE_TILE_EDGE: u32 = 512;
@@ -29,7 +29,7 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub(crate) const TRANSFORMER_BLOCKS: u32 = 60;
 pub const CALIBRATION_FINGERPRINT: &str =
-    "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
+    "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
 
 fn streamable(spec: &LoadSpec) -> bool {
     // File and Dir share the provider identity, but the evidence matrix has no source axis. Keep the
@@ -150,6 +150,19 @@ pub(crate) fn provider_contract(
     if provider_id == crate::MODEL_ID {
         crate::validate_load_spec(spec)?;
     }
+    if provider_id == "qwen_image_edit" {
+        crate::edit::validate_memory_load_spec(spec)
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+        crate::edit::validate_memory_artifact_recipe(spec)
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+        let loaded_quant = snapshot_quant_tier(spec, provider_id)?;
+        if loaded_quant != spec.quantize {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: canonical tier {:?} resolves to {loaded_quant:?}",
+                spec.quantize
+            )));
+        }
+    }
     let streamable = streamable(spec);
     let base = gen_core::require_base_snapshot(spec, provider_id)?;
     let components = match &spec.weights {
@@ -179,12 +192,43 @@ pub(crate) fn provider_contract(
             }
         }
     };
+    let overlay_bytes = if provider_id == "qwen_image_edit" {
+        adapter_overlay_bytes(spec, base)?
+    } else {
+        0
+    };
     Ok(build_provider_contract(
         provider_id,
         spec,
         streamable,
         components,
+        overlay_bytes,
     ))
+}
+
+fn adapter_overlay_bytes(spec: &LoadSpec, base: &std::path::Path) -> gen_core::Result<u64> {
+    if spec.adapters.is_empty() {
+        return Ok(0);
+    }
+    let additive = crate::adapters::adapters_additive_capable(&spec.adapters)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    let packed = crate::transformer_is_packed(&base.join("transformer"));
+    if packed && !additive {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: packed tiers require an additive-capable adapter stack".to_owned(),
+        ));
+    }
+    let mode = if additive {
+        AdapterResidencyMode::Additive
+    } else {
+        AdapterResidencyMode::Folded
+    };
+    gen_core::adapter_stack_resident_bytes(&spec.adapters, mode).ok_or_else(|| {
+        gen_core::Error::Unsupported(
+            "qwen_image_edit: every additive adapter must have a non-zero safetensors residency"
+                .to_owned(),
+        )
+    })
 }
 
 /// Build the route-exact contract used by catalog conformance without opening model assets.
@@ -201,6 +245,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
         spec,
         streamable(spec),
         PerComponentBytes::default(),
+        0,
     ))
 }
 
@@ -209,6 +254,7 @@ fn build_provider_contract(
     spec: &LoadSpec,
     streamable: bool,
     components: PerComponentBytes,
+    overlay_bytes: u64,
 ) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -310,7 +356,7 @@ fn build_provider_contract(
             conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.vae,
-            overlay_bytes: 0,
+            overlay_bytes,
         },
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     }
@@ -388,6 +434,68 @@ pub(crate) fn validate_context(
     Ok(())
 }
 
+/// Validate the request axes owned by the bespoke Qwen-Image-Edit route. The shared safety check
+/// binds the calibration handshake, load shape, tier, selection, and budget; this gate binds the
+/// remaining provider semantics that must not cross between base/edit, plain/adapter, or unrelated
+/// request envelopes.
+fn validate_edit_route(context: &MemoryRunContext, has_adapters: bool) -> gen_core::Result<()> {
+    let supported_mode = context.mode == MemoryMode::Edit
+        || matches!(&context.mode, MemoryMode::Other(mode) if mode == "character_image");
+    if !supported_mode {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory mode {:?} is neither edit nor character_image",
+            context.mode
+        )));
+    }
+    if context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || !(1..=5).contains(&context.geometry.reference_count)
+        || !context.has_reference
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory context requires batch=1, frames=1, and 1..=5 references (got batch={}, frames={}, references={}, has_reference={})",
+            context.geometry.batch,
+            context.geometry.frames,
+            context.geometry.reference_count,
+            context.has_reference
+        )));
+    }
+    if context.geometry.width == 0 || context.geometry.height == 0 {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: memory context requires non-zero image geometry".to_owned(),
+        ));
+    }
+    if context.use_pid {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: PiD is not implemented by the bespoke edit provider".to_owned(),
+        ));
+    }
+    if context.has_phases {
+        return Err(gen_core::Error::Unsupported(
+            "qwen_image_edit: multi-phase denoise is not implemented by the bespoke edit provider"
+                .to_owned(),
+        ));
+    }
+    let expected_overlay = has_adapters.then_some("lora");
+    if context.overlay.as_deref() != expected_overlay {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen_image_edit: memory overlay {:?} does not match loaded adapter profile {:?}",
+            context.overlay, expected_overlay
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_edit_context(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+    has_adapters: bool,
+) -> gen_core::Result<()> {
+    validate_context("qwen_image_edit", contract, context, loaded_quant)?;
+    validate_edit_route(context, has_adapters)
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
@@ -411,7 +519,12 @@ pub(crate) fn admission_safety_check(
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    match validate_context(provider_id, contract, context, loaded_quant) {
+    let validated = if provider_id == "qwen_image_edit" {
+        validate_edit_context(contract, context, loaded_quant, false)
+    } else {
+        validate_context(provider_id, contract, context, loaded_quant)
+    };
+    match validated {
         Ok(()) => MemorySafetyDecision::Accept,
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
@@ -625,8 +738,35 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    if contract.provider_id == "qwen_image_edit" {
+        let recipe = match crate::edit::validate_memory_artifact_recipe(spec) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if let Err(error) = crate::edit::validate_memory_recipe_context(recipe, context) {
+            return MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+    }
     match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => admission_safety_check(&contract.provider_id, contract, context, quant),
+        Ok(quant) => {
+            let result = if contract.provider_id == "qwen_image_edit" {
+                validate_edit_context(contract, context, quant, !spec.adapters.is_empty())
+            } else {
+                validate_context(&contract.provider_id, contract, context, quant)
+            };
+            match result {
+                Ok(()) => MemorySafetyDecision::Accept,
+                Err(error) => MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            }
+        }
         Err(error) => MemorySafetyDecision::Reject {
             reason: error.to_string(),
         },
@@ -655,10 +795,21 @@ pub(crate) fn registered_valid_fixture(
             reference_count: u32::from(edit),
             use_pid: false,
             has_phases: false,
-            overlay: None,
+            overlay: (edit && !spec.adapters.is_empty()).then(|| "lora".to_owned()),
         },
     )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+    let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+    if edit {
+        let exact_base = std::path::PathBuf::from("models--SceneWorks--qwen-image-edit-2511-mlx")
+            .join("snapshots")
+            .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
+            .join("bf16");
+        let mut exact_spec = spec.clone();
+        exact_spec.weights = WeightsSource::Dir(exact_base);
+        exact_spec.resolved_route = Some(crate::edit::EDIT_2511_BASE_ROUTE.to_owned());
+        fixture = fixture.with_load_spec(exact_spec);
+    }
+    Ok(vec![fixture])
 }
 
 pub(crate) fn registered_begin_request(
@@ -667,8 +818,18 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    if provider_id == "qwen_image_edit" {
+        let recipe = crate::edit::validate_memory_artifact_recipe(spec)
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+        crate::edit::validate_memory_recipe_context(recipe, context)
+            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    }
     let quant = snapshot_quant_tier(spec, provider_id)?;
-    validate_context(provider_id, contract, context, quant)?;
+    if provider_id == "qwen_image_edit" {
+        validate_edit_context(contract, context, quant, !spec.adapters.is_empty())?;
+    } else {
+        validate_context(provider_id, contract, context, quant)?;
+    }
     Ok(Some(Box::new(QwenMemoryScope::new(
         provider_id,
         Device::Cpu,
@@ -865,7 +1026,12 @@ mod tests {
     }
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
-        let root = tmp.path().join("qwen-candle-memory-spec");
+        let root = tmp
+            .path()
+            .join("models--SceneWorks--qwen-image-edit-2511-mlx")
+            .join("snapshots")
+            .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
+            .join("bf16");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
             crate::ENCODER_CONTRACT,
@@ -880,6 +1046,7 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
+            .with_resolved_route(crate::edit::EDIT_2511_BASE_ROUTE)
     }
 
     #[test]
@@ -950,6 +1117,10 @@ mod tests {
     }
 
     fn selection(strategy: MemoryStrategy) -> MemorySelection {
+        selection_for_tier(strategy, None)
+    }
+
+    fn selection_for_tier(strategy: MemoryStrategy, quant: Option<Quant>) -> MemorySelection {
         let mut parameters = MemoryStrategyParameters::default();
         if matches!(
             strategy,
@@ -975,7 +1146,7 @@ mod tests {
             parameters,
             tier: MemoryNumericTier {
                 precision: Precision::Bf16,
-                quant: None,
+                quant,
                 component_precision_floors: &[],
             },
         }
@@ -1016,9 +1187,110 @@ mod tests {
     }
 
     #[test]
+    fn plain_edit_admits_all_five_rungs_at_bf16_q4_and_q8() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-edit".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for strategy in MemoryStrategy::ALL {
+                contract
+                    .validate_selection(&selection_for_tier(strategy, quant))
+                    .unwrap_or_else(|error| panic!("{quant:?} {strategy:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn edit_catalog_behavior_fixture_owns_an_exact_base_artifact_receipt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let exact = fixture
+            .load_spec
+            .as_ref()
+            .expect("route-sensitive fixture must carry its exact load receipt");
+        assert!(crate::edit::validate_memory_artifact_recipe(exact).is_ok());
+        assert!(matches!(
+            registered_safety_check(exact, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn edit_context_rejects_crossed_mode_overlay_and_request_shape() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-edit".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let contract = weights_free_memory_strategy_contract("qwen_image_edit", &spec).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedAttention,
+            MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode: MemoryMode::Edit,
+                reference_count: 2,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        assert!(validate_edit_context(&contract, &context, None, false).is_ok());
+
+        context.mode = MemoryMode::Other("character_image".to_owned());
+        context.geometry.reference_count = 1;
+        assert!(validate_edit_context(&contract, &context, None, false).is_ok());
+        // Character Studio pose execution carries exactly [identity, skeleton].
+        context.geometry.reference_count = 2;
+        assert!(validate_edit_context(&contract, &context, None, false).is_ok());
+        context.geometry.reference_count = 5;
+        assert!(validate_edit_context(&contract, &context, None, false).is_ok());
+        context.mode = MemoryMode::Other("style_variation".to_owned());
+        assert!(validate_edit_context(&contract, &context, None, false).is_err());
+
+        context.mode = MemoryMode::TextToImage;
+        assert!(validate_edit_context(&contract, &context, None, false).is_err());
+        context.mode = MemoryMode::Edit;
+        context.geometry.reference_count = 2;
+        context.overlay = Some("lora".to_owned());
+        assert!(validate_edit_context(&contract, &context, None, false).is_err());
+        assert!(validate_edit_context(&contract, &context, None, true).is_ok());
+        context.geometry.reference_count = 0;
+        context.has_reference = false;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.geometry.reference_count = 6;
+        context.has_reference = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.geometry.reference_count = 2;
+        context.use_pid = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.use_pid = false;
+        context.has_phases = true;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+        context.has_phases = false;
+        context.selection.tier.quant = Some(Quant::Q8);
+        assert!(validate_edit_context(&contract, &context, Some(Quant::Q4), true).is_err());
+        context.selection.tier.quant = None;
+        context.load_shape = LoadShape::EagerMaterialization;
+        assert!(validate_edit_context(&contract, &context, None, true).is_err());
+    }
+
+    #[test]
     fn evidence_identity_and_tier_match_the_executable_contract_and_packed_snapshot() {
         let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
+        let root = root_tmp
+            .path()
+            .join("models--SceneWorks--qwen-image-edit-2511-mlx")
+            .join("snapshots")
+            .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
+            .join("q4");
         let transformer = root.join("transformer");
         std::fs::create_dir_all(&transformer).unwrap();
         std::fs::write(
@@ -1032,11 +1304,14 @@ mod tests {
             crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let t2i = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let edit = LoadSpec::new(WeightsSource::Dir(root))
+            .with_quant(Quant::Q4)
+            .with_resolved_route(crate::edit::EDIT_2511_BASE_ROUTE);
 
-        for provider_id in ["qwen_image", "qwen_image_edit"] {
-            let contract = provider_contract(provider_id, &spec).unwrap();
-            let (identity, tier) = evidence_identity_and_tier(provider_id, &spec).unwrap();
+        for (provider_id, spec) in [("qwen_image", &t2i), ("qwen_image_edit", &edit)] {
+            let contract = provider_contract(provider_id, spec).unwrap();
+            let (identity, tier) = evidence_identity_and_tier(provider_id, spec).unwrap();
             assert_eq!(identity, contract.calibration.unwrap());
             assert_eq!(identity.fingerprint, CALIBRATION_FINGERPRINT);
             assert_eq!(tier.precision, Precision::Bf16);
@@ -1148,14 +1423,61 @@ mod tests {
     fn adapters_and_eager_loads_do_not_overstate_block_streaming() {
         let tmp = tempfile::tempdir().unwrap();
         let mut adapted = spec(&tmp);
+        let adapter = tmp.path().join("user.safetensors");
+        write_typed_safetensors(
+            &adapter,
+            &[(
+                "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                "BF16",
+                &[1],
+                2,
+            )],
+        );
         adapted.adapters.push(gen_core::AdapterSpec::new(
-            "lightning.safetensors".into(),
+            adapter,
             1.0,
             gen_core::AdapterKind::Lora,
         ));
+        adapted.prepare_file_sources().unwrap();
+        let adapted_bytes = std::fs::metadata(&adapted.adapters[0].path).unwrap().len();
+        let adapted_contract = provider_contract("qwen_image_edit", &adapted).unwrap();
+        assert_eq!(adapted_contract.asset_facts.overlay_bytes, adapted_bytes);
+
+        let mut lightning = spec(&tmp);
+        lightning.resolved_route = Some(crate::edit::EDIT_2511_LIGHTNING_ROUTE.to_owned());
+        let lightning_path = tmp
+            .path()
+            .join("models--lightx2v--Qwen-Image-Edit-2511-Lightning")
+            .join("snapshots")
+            .join("d74eba145674fd7e31b949324e148e21e7118abd")
+            .join("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors");
+        std::fs::create_dir_all(lightning_path.parent().unwrap()).unwrap();
+        write_typed_safetensors(
+            &lightning_path,
+            &[(
+                "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                "BF16",
+                &[1],
+                2,
+            )],
+        );
+        lightning.adapters.push(gen_core::AdapterSpec::new(
+            lightning_path,
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        lightning.prepare_file_sources().unwrap();
+        let lightning_bytes = std::fs::metadata(&lightning.adapters[0].path)
+            .unwrap()
+            .len();
+        let lightning_contract = provider_contract("qwen_image_edit", &lightning).unwrap();
+        assert_eq!(
+            lightning_contract.asset_facts.overlay_bytes,
+            lightning_bytes
+        );
         let mut eager = spec(&tmp);
         eager.load_shape = LoadShape::EagerMaterialization;
-        for candidate in [adapted, eager] {
+        for candidate in [adapted, lightning, eager] {
             let contract = provider_contract("qwen_image_edit", &candidate).unwrap();
             assert_eq!(
                 contract
