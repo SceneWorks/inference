@@ -5,13 +5,13 @@
 //! (`{prefix}.llm_adapter.*`). We detect the root `{prefix}` from the checkpoint keys and build both
 //! from the same mmap'd VarBuilder with their respective sub-prefixes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::{self as cst, MmapedSafetensors};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::{AdapterSpec, WeightsSource};
+use candle_gen::gen_core::{AdapterSpec, Quant, WeightsSource};
 use candle_gen::{CandleError, Result};
 
 use crate::adapters::{apply_anima_adapters, install_anima_residuals};
@@ -63,12 +63,10 @@ pub fn detect_dit_prefix(dit_path: &Path) -> Result<String> {
         })
 }
 
-/// Resolve `variant`'s DiT file and report whether it is a **packed** (Q4/Q8) tier — i.e. its
-/// safetensors header carries any `.scales` code tensor. Header-only (no weight data materialized), so
-/// it is cheap enough to gate a `LoadSpec` on. Lets the generator fail fast when a quantized tier is
-/// requested against a dense checkpoint instead of silently loading bf16 — a tier downgrade the caller
-/// never sees (`lin()` packed-detects PER-TENSOR, so a dense checkpoint just builds dense).
-pub fn dit_is_packed(source: &WeightsSource, variant: Variant) -> Result<bool> {
+/// Resolve the physical Q4/Q8 tier stored in `variant`'s DiT file. The header supplies both the
+/// packed-code and scale shapes, so a caller cannot relabel Q4 bytes as Q8 (or vice versa) through a
+/// `LoadSpec`. No tensor data is materialized.
+pub fn dit_quant_tier(source: &WeightsSource, variant: Variant) -> Result<Option<Quant>> {
     let root = resolve_split_files(source)?;
     let dit_path = root.join("diffusion_models").join(variant.dit_filename());
     if !dit_path.is_file() {
@@ -77,21 +75,191 @@ pub fn dit_is_packed(source: &WeightsSource, variant: Variant) -> Result<bool> {
             dit_path.display()
         )));
     }
-    dit_path_is_packed(&dit_path)
+    dit_path_quant_tier(&dit_path)
 }
 
-/// Header-only check: does this DiT safetensors file carry any `.scales` code tensor (a packed Q4/Q8
-/// tier)? Reads only the tensor names, no weight data. The single source of truth for "is this DiT
-/// packed" — the `LoadSpec` gate, the tier-mismatch guard, and the adapter fold-vs-residual branch all
-/// route through it.
-fn dit_path_is_packed(dit_path: &Path) -> Result<bool> {
-    // Header-only mmap: reads the tensor names without materializing any weight data.
+/// Header-only physical packed-tier detection. Every packed affine triple must agree on the bit
+/// width and match the exact U32/F32/F32 group-64 representation consumed by Anima's loader. A
+/// companion `config.json` may attest that representation, but cannot redefine it.
+fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
+    // Header-only mmap: reads tensor metadata without materializing any weight data.
     // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
     let st = unsafe { MmapedSafetensors::new(dit_path)? };
-    Ok(st
+    let config_path = dit_path.with_file_name("config.json");
+    let packed_config = if config_path.is_file() {
+        let text = std::fs::read_to_string(&config_path).map_err(|error| {
+            CandleError::Msg(format!(
+                "anima: cannot read packed config {}: {error}",
+                config_path.display()
+            ))
+        })?;
+        let config = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
+            CandleError::Msg(format!(
+                "anima: cannot parse packed config {}: {error}",
+                config_path.display()
+            ))
+        })?;
+        candle_gen::quant::PackedConfig::from_config(&config)
+    } else {
+        None
+    };
+    let group_size = packed_config
+        .map(|config| usize::try_from(config.group_size))
+        .transpose()
+        .map_err(|_| {
+            CandleError::Msg(format!(
+                "anima: packed config has invalid group size in {}",
+                config_path.display()
+            ))
+        })?
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
+    if group_size != candle_gen::quant::MLX_GROUP_SIZE {
+        return Err(CandleError::Msg(format!(
+            "anima: packed config group size {group_size} does not match the required group size {} in {}",
+            candle_gen::quant::MLX_GROUP_SIZE,
+            config_path.display()
+        )));
+    }
+
+    let tensor_names = st
         .tensors()
         .into_iter()
-        .any(|(k, _)| k.ends_with(".scales")))
+        .map(|(key, _)| key)
+        .collect::<HashSet<_>>();
+    let mut tier = None;
+    for key in &tensor_names {
+        let Some(base) = key.strip_suffix(".scales") else {
+            continue;
+        };
+        let weight_key = format!("{base}.weight");
+        let biases_key = format!("{base}.biases");
+        let weight = st.get(&weight_key).map_err(|_| {
+            CandleError::Msg(format!(
+                "anima: packed scale `{key}` has no companion `{weight_key}` in {}",
+                dit_path.display()
+            ))
+        })?;
+        let scales = st.get(key)?;
+        let biases = st.get(&biases_key).map_err(|_| {
+            CandleError::Msg(format!(
+                "anima: packed scale `{key}` has no companion `{biases_key}` in {}",
+                dit_path.display()
+            ))
+        })?;
+        let weight_shape = weight.shape();
+        let scales_shape = scales.shape();
+        let biases_shape = biases.shape();
+        if weight_shape.len() != 2
+            || scales_shape.len() != 2
+            || biases_shape.len() != 2
+            || weight_shape[0] != scales_shape[0]
+            || biases_shape != scales_shape
+            || scales_shape[1] == 0
+            || weight.dtype() != DType::U32.into()
+            || scales.dtype() != DType::F32.into()
+            || biases.dtype() != DType::F32.into()
+        {
+            return Err(CandleError::Msg(format!(
+                "anima: malformed packed affine triple `{base}` (expected U32 weight plus shape-matched F32 scales/biases) in {}",
+                dit_path.display()
+            )));
+        }
+        let input = scales_shape[1].checked_mul(group_size).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "anima: packed pair `{base}` input width overflows in {}",
+                dit_path.display()
+            ))
+        })?;
+        let encoded = weight_shape[1].checked_mul(32).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "anima: packed pair `{base}` code width overflows in {}",
+                dit_path.display()
+            ))
+        })?;
+        if input == 0 || !encoded.is_multiple_of(input) {
+            return Err(CandleError::Msg(format!(
+                "anima: packed pair `{base}` has inconsistent code/scale shapes in {}",
+                dit_path.display()
+            )));
+        }
+        let observed = match encoded / input {
+            4 => Quant::Q4,
+            8 => Quant::Q8,
+            bits => {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed pair `{base}` declares unsupported Q{bits} width in {}",
+                    dit_path.display()
+                )));
+            }
+        };
+        if let Some(config) = packed_config {
+            let configured = match config.bits {
+                4 => Quant::Q4,
+                8 => Quant::Q8,
+                bits => {
+                    return Err(CandleError::Msg(format!(
+                        "anima: packed config declares unsupported Q{bits} width in {}",
+                        config_path.display()
+                    )));
+                }
+            };
+            if configured != observed {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed config {:?} disagrees with physical {:?} codes in {}",
+                    configured,
+                    observed,
+                    dit_path.display()
+                )));
+            }
+        }
+        if let Some(previous) = tier.replace(observed) {
+            if previous != observed {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed DiT mixes {:?} and {:?} tensors in {}",
+                    previous,
+                    observed,
+                    dit_path.display()
+                )));
+            }
+        }
+    }
+    for key in &tensor_names {
+        if let Some(base) = key.strip_suffix(".biases") {
+            if !tensor_names.contains(&format!("{base}.weight"))
+                || !tensor_names.contains(&format!("{base}.scales"))
+            {
+                return Err(CandleError::Msg(format!(
+                    "anima: orphan packed bias `{key}` in {}",
+                    dit_path.display()
+                )));
+            }
+        }
+        if let Some(base) = key.strip_suffix(".weight") {
+            if st.get(key)?.dtype() == DType::U32.into()
+                && (!tensor_names.contains(&format!("{base}.scales"))
+                    || !tensor_names.contains(&format!("{base}.biases")))
+            {
+                return Err(CandleError::Msg(format!(
+                    "anima: packed weight `{key}` is missing its scales/biases sidecars in {}",
+                    dit_path.display()
+                )));
+            }
+        }
+    }
+    if packed_config.is_some() && tier.is_none() {
+        return Err(CandleError::Msg(format!(
+            "anima: packed config {} has no valid packed affine triples in {}",
+            config_path.display(),
+            dit_path.display()
+        )));
+    }
+    Ok(tier)
+}
+
+/// Compatibility discriminator for loader branches that only need dense versus packed. Tier identity
+/// still comes from [`dit_quant_tier`] at admission.
+pub(crate) fn dit_is_packed(source: &WeightsSource, variant: Variant) -> Result<bool> {
+    Ok(dit_quant_tier(source, variant)?.is_some())
 }
 
 /// Resolve the `split_files/` directory holding `diffusion_models/`, `text_encoders/`, `vae/`.
@@ -142,6 +310,24 @@ pub struct AnimaComponents {
     pub dtype: DType,
 }
 
+/// The conditioning half of an Anima request.  It deliberately owns the Qwen3 encoder and the
+/// bundled conditioner, but not the DiT or VAE, so a staged request can release it before the
+/// denoise/decode phase without changing the prompt, seed, schedule, or compute dtype.
+pub struct AnimaConditioningComponents {
+    pub conditioner: AnimaTextConditioner,
+    pub text_encoder: AnimaQwen3,
+    pub tokenizers: AnimaTokenizers,
+    pub dtype: DType,
+}
+
+/// The denoise/decode half of an Anima request.  Kept separate from
+/// [`AnimaConditioningComponents`] for the request-scoped Candle residency path.
+pub struct AnimaRenderComponents {
+    pub dit: CosmosDiT,
+    pub vae: QwenVae,
+    pub dtype: DType,
+}
+
 impl AnimaComponents {
     /// Load all components for `variant`. `adapters` are LoRA/LoKr `.safetensors` baked onto the DiT +
     /// bundled conditioner at load (stacked, mixed) — empty for the plain model.
@@ -169,7 +355,8 @@ impl AnimaComponents {
         // packed codes survive load) and install the adapters as **forward-time residuals** afterwards
         // (`y = base(x) + scale·(xA)B`, sc-10640 / epic 10043). A dense tier keeps the weight-level fold,
         // byte-for-byte unchanged, and the plain model has no adapters at all.
-        let packed_with_adapters = !adapters.is_empty() && dit_path_is_packed(&dit_path)?;
+        let packed_with_adapters =
+            !adapters.is_empty() && dit_path_quant_tier(&dit_path)?.is_some();
         let dit_vb = if adapters.is_empty() || packed_with_adapters {
             // Plain model, OR packed + adapters (residuals installed post-build): mmap the checkpoint
             // directly — no fold, so the packed codes are never cast/materialized.
@@ -219,6 +406,60 @@ impl AnimaComponents {
     }
 }
 
+impl AnimaConditioningComponents {
+    /// Load only the components needed to turn prompts into immutable DiT conditioning.  Staged
+    /// residency intentionally refuses adapters at the caller: a packed adapter residual spans
+    /// both this conditioner and the DiT, and splitting it would otherwise risk a partial overlay.
+    pub fn load(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+        let root = resolve_split_files(source)?;
+        let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+        if !dit_path.is_file() {
+            return Err(CandleError::Msg(format!(
+                "anima: DiT file not found: {}",
+                dit_path.display()
+            )));
+        }
+        let dtype = compute_dtype();
+        let prefix = detect_dit_prefix(&dit_path)?;
+        let dit_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?;
+        let conditioner = AnimaTextConditioner::new(
+            &dit_vb.pp(&prefix).pp("llm_adapter"),
+            ConditionerConfig::anima(),
+        )?;
+        let te_path = root.join(TEXT_ENCODER_FILE);
+        let te_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&te_path), dtype, device)?;
+        Ok(Self {
+            conditioner,
+            text_encoder: AnimaQwen3::new(&te_vb.pp("model"), &Qwen3Config::anima())?,
+            tokenizers: AnimaTokenizers::load()?,
+            dtype,
+        })
+    }
+}
+
+impl AnimaRenderComponents {
+    /// Load only the DiT and VAE for an adapter-free staged request.  Adapter-bearing requests
+    /// remain resident because their exact load-time overlay spans the split boundary.
+    pub fn load(source: &WeightsSource, variant: Variant, device: &Device) -> Result<Self> {
+        let root = resolve_split_files(source)?;
+        let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+        if !dit_path.is_file() {
+            return Err(CandleError::Msg(format!(
+                "anima: DiT file not found: {}",
+                dit_path.display()
+            )));
+        }
+        let dtype = compute_dtype();
+        let prefix = detect_dit_prefix(&dit_path)?;
+        let dit_vb = candle_gen::mmap_var_builder(std::slice::from_ref(&dit_path), dtype, device)?;
+        Ok(Self {
+            dit: CosmosDiT::new(&dit_vb.pp(&prefix), DitConfig::anima())?,
+            vae: load_vae(root.join(VAE_FILE), device)?,
+            dtype,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +477,46 @@ mod tests {
             Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
         );
         candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
+        path
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_packed_fixture(
+        root: &Path,
+        name: &str,
+        columns: usize,
+        config_bits: Option<u8>,
+        group_size: usize,
+        weight_dtype: DType,
+        scales_dtype: DType,
+        biases: Option<(DType, usize)>,
+    ) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("anima.safetensors");
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "net.x_embedder.proj.1.weight".to_owned(),
+            Tensor::zeros((2, columns), weight_dtype, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "net.x_embedder.proj.1.scales".to_owned(),
+            Tensor::zeros((2, 1), scales_dtype, &Device::Cpu).unwrap(),
+        );
+        if let Some((dtype, bias_columns)) = biases {
+            tensors.insert(
+                "net.x_embedder.proj.1.biases".to_owned(),
+                Tensor::zeros((2, bias_columns), dtype, &Device::Cpu).unwrap(),
+            );
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        if let Some(bits) = config_bits {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":{group_size}}}}}"#),
+            )
+            .unwrap();
+        }
         path
     }
 
@@ -262,5 +543,91 @@ mod tests {
         let bad = dir.join("noanchor.safetensors");
         candle_gen::candle_core::safetensors::save(&m, &bad).unwrap();
         assert!(detect_dit_prefix(&bad).is_err(), "no anchor key ⇒ error");
+    }
+
+    #[test]
+    fn packed_header_derives_exact_bit_width_and_rejects_config_lies() {
+        let temp = tempfile::tempdir().unwrap();
+        let write_packed = |name: &str, columns: usize, config_bits: Option<u8>| {
+            write_packed_fixture(
+                temp.path(),
+                name,
+                columns,
+                config_bits,
+                64,
+                DType::U32,
+                DType::F32,
+                Some((DType::F32, 1)),
+            )
+        };
+        assert_eq!(
+            dit_path_quant_tier(&write_packed("q4", 8, Some(4))).unwrap(),
+            Some(Quant::Q4)
+        );
+        assert_eq!(
+            dit_path_quant_tier(&write_packed("q8", 16, Some(8))).unwrap(),
+            Some(Quant::Q8)
+        );
+        assert!(
+            dit_path_quant_tier(&write_packed("lying-config", 8, Some(8))).is_err(),
+            "config Q8 must not relabel physical Q4 codes"
+        );
+    }
+
+    #[test]
+    fn packed_header_rejects_non_production_groups_and_malformed_triples() {
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = |name, group, weight_dtype, scales_dtype, biases| {
+            write_packed_fixture(
+                temp.path(),
+                name,
+                8,
+                Some(4),
+                group,
+                weight_dtype,
+                scales_dtype,
+                biases,
+            )
+        };
+        assert!(dit_path_quant_tier(&malformed(
+            "group32",
+            32,
+            DType::U32,
+            DType::F32,
+            Some((DType::F32, 1)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "dense-weight",
+            64,
+            DType::F32,
+            DType::F32,
+            Some((DType::F32, 1)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "missing-biases",
+            64,
+            DType::U32,
+            DType::F32,
+            None,
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "bias-shape",
+            64,
+            DType::U32,
+            DType::F32,
+            Some((DType::F32, 2)),
+        ))
+        .is_err());
+        assert!(dit_path_quant_tier(&malformed(
+            "bias-dtype",
+            64,
+            DType::U32,
+            DType::F32,
+            Some((DType::BF16, 1)),
+        ))
+        .is_err());
     }
 }
