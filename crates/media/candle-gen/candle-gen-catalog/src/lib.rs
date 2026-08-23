@@ -3428,7 +3428,7 @@ mod preview_advertising {
         MemoryRouteCrate {
             dir: "candle-gen-scail2",
             register_providers: candle_gen_scail2::register_providers,
-            register_surfaces: None,
+            register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
             resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
@@ -3436,11 +3436,6 @@ mod preview_advertising {
             register_providers: candle_gen_sensenova::register_providers,
             register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
-        },
-        MemoryRouteCrate {
-            dir: "candle-gen-scail2",
-            register_providers: candle_gen_scail2::register_providers,
-            register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",
