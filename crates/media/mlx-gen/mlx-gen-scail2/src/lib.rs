@@ -28,6 +28,7 @@ pub mod config;
 pub mod convert;
 pub mod generate;
 pub mod lora;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
@@ -69,7 +70,10 @@ pub use rope::ScailRope;
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit MLX Scail2 provider catalog.
