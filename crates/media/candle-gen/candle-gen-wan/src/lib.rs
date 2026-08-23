@@ -911,14 +911,7 @@ impl WanGenerator {
     }
 
     fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
-        if req.memory.is_some_and(|memory| memory.stage_residency) {
-            OffloadPolicy::Sequential
-        } else {
-            // An explicit Resident selection is represented by no request memory block. Preserve
-            // the policy with which this generator was loaded instead of silently overriding a
-            // caller-owned Sequential load.
-            self.offload
-        }
+        i2v_memory_strategy::selected_offload_policy(self.offload, self.i2v_memory.is_some(), req)
     }
 }
 
@@ -1069,7 +1062,8 @@ impl Generator for WanGenerator {
             // denoise peak is the DiT alone. A request-selected staged transition must first evict a
             // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
             // the still-resident aggregate and invalidate the published phase envelope.
-            let (frames, fps) = match self.request_offload(req) {
+            let effective_offload = self.request_offload(req);
+            let (frames, fps) = match effective_offload {
                 OffloadPolicy::Sequential => {
                     release_warm_cache_for_staged(&self.components, || {
                         Ok(self.device.synchronize()?)

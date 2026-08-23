@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadSpec, MemoryGeometry, MemoryPhase, MemoryRequestScope,
-    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, OffloadPolicy,
 };
 
 pub use gen_core::wan_i2v_memory::{PreparedWanI2vMemory, WanI2vBackend};
@@ -226,8 +226,8 @@ pub fn begin_request<'a>(
     })))
 }
 
-pub fn selected_strategy(request: &GenerationRequest) -> MemoryStrategy {
-    request.memory.map_or(MemoryStrategy::Resident, |memory| {
+pub fn selected_strategy(request: &GenerationRequest) -> Option<MemoryStrategy> {
+    request.memory.map(|memory| {
         if memory.tile_vae_decode {
             MemoryStrategy::BoundedDecode
         } else if memory.stage_residency {
@@ -236,6 +236,26 @@ pub fn selected_strategy(request: &GenerationRequest) -> MemoryStrategy {
             MemoryStrategy::Resident
         }
     })
+}
+
+/// Resolve the actual component-residency policy for this request.
+///
+/// SceneWorks loads Candle Wan with `Sequential` because that is the conservative historical
+/// default. An admitted Resident rung is represented by an explicit all-disabled memory block, so
+/// it must override that load default and use the cached resident renderer. Staged and the
+/// cumulative BoundedDecode rung keep the sequential renderer. An unadmitted request has no memory
+/// block and therefore preserves the load-time policy.
+pub fn selected_offload_policy(
+    loaded: OffloadPolicy,
+    explicit_resident: bool,
+    request: &GenerationRequest,
+) -> OffloadPolicy {
+    match request.memory {
+        Some(memory) if memory.stage_residency => OffloadPolicy::Sequential,
+        Some(_) if explicit_resident => OffloadPolicy::Resident,
+        None => loaded,
+        Some(_) => loaded,
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +277,47 @@ mod tests {
             guard.arm("flf-cancel-or-error".to_owned()).unwrap();
         }
         assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+    }
+
+    #[test]
+    fn selected_resident_and_staged_policies_are_operationally_distinct_and_truthful() {
+        let mut resident = GenerationRequest {
+            memory: Some(gen_core::GenerationMemory::default()),
+            ..Default::default()
+        };
+        assert_eq!(selected_strategy(&resident), Some(MemoryStrategy::Resident));
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Sequential, true, &resident),
+            OffloadPolicy::Resident,
+            "an explicit Resident rung must override the production Sequential load default"
+        );
+
+        resident.memory = Some(gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            selected_strategy(&resident),
+            Some(MemoryStrategy::StagedResidency)
+        );
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Sequential, true, &resident),
+            OffloadPolicy::Sequential
+        );
+
+        resident.memory = None;
+        assert_eq!(selected_strategy(&resident), None);
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Sequential, true, &resident),
+            OffloadPolicy::Sequential,
+            "an unadmitted request must preserve the load policy instead of claiming Resident"
+        );
+
+        resident.memory = Some(gen_core::GenerationMemory::default());
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Sequential, false, &resident),
+            OffloadPolicy::Sequential,
+            "a provider whose contract preserves load defaults must not inherit Wan I2V's override"
+        );
     }
 }
