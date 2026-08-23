@@ -139,8 +139,8 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
 }
 
 /// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Bernini
-/// validates its paired planner/renderer packed manifests and headers; Wan validates TI2V-5B's
-/// immutable packed surface. Other routes return `None` rather than synthesizing a tier.
+/// validates its paired planner/renderer packed manifests and headers; Krea and Wan validate their
+/// immutable packed surfaces. Other routes return `None` rather than synthesizing a tier.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
@@ -688,10 +688,10 @@ mod tests {
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert_eq!(resident_only, ["krea_realtime_14b"]);
+        assert_eq!(resident_only, vec!["krea_realtime_14b"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync, and FLUX.2 Dev Control now has its exact fixture): these
+        // joined them in the sc-17137 sync, and FLUX.2 Dev Control has its exact fixture): these
         // providers publish every tier and materialization selector, even where a provider correctly
         // classifies a strategy as Missing. Two video providers publish narrower, truthful
         // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
