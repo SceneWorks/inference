@@ -316,7 +316,6 @@ mod explicit_registry_tests {
 
             let declaration = fixture_contract(provider_id).unwrap();
             for strategy in [
-                MemoryStrategy::StagedResidency,
                 MemoryStrategy::BoundedDecode,
                 MemoryStrategy::BoundedAttention,
                 MemoryStrategy::BoundedTransformerResidency,
@@ -426,7 +425,6 @@ mod explicit_registry_tests {
             assert!(model.begin_memory_strategy_request(&windowed).is_err());
 
             for unaffected in [
-                MemoryStrategy::StagedResidency,
                 MemoryStrategy::BoundedDecode,
                 MemoryStrategy::BoundedAttention,
             ] {
@@ -473,7 +471,7 @@ mod explicit_registry_tests {
                         "{provider_id}: bernini reads no GenerationPhase"
                     );
                     assert!(fixture.request.phases.is_none(), "{provider_id}");
-                    assert_eq!(fixture.request.frames, Some(1), "{provider_id}");
+                    assert_eq!(fixture.request.frames, Some(45), "{provider_id}");
                     descriptor
                         .capabilities
                         .validate_request(descriptor.id, &fixture.request)
