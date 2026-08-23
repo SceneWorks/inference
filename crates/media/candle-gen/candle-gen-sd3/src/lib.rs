@@ -861,14 +861,18 @@ mod tests {
     #[test]
     fn load_accepts_quant_and_adapter_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
+        // `/snap` exists on Ubuntu hosts. This test exercises lazy load-shape admission, not a
+        // physical checkpoint receipt, so use a process-unique guaranteed-missing root.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("missing-sd3-snapshot");
         // sc-7879: Q4/Q8 quant is ACCEPTED (the MMDiT folds at load); loading is lazy so this builds
         // the generator without touching the (nonexistent) snapshot.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let quant = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q8);
         assert!(
             load(&quant).is_ok(),
             "Q8 quant load must be accepted (sc-7879)"
         );
-        let quant4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        let quant4 = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
         assert!(
             load(&quant4).is_ok(),
             "Q4 quant load must be accepted (sc-7879)"
@@ -877,7 +881,7 @@ mod tests {
         // sc-7881: LoRA/LoKr adapters are now ACCEPTED (merged into the MMDiT at load, lazily). The
         // spec is stashed; the actual merge happens on the first `generate` against a real snapshot.
         for kind in [AdapterKind::Lora, AdapterKind::Lokr] {
-            let adapter = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+            let adapter = LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![
                 AdapterSpec::new("/lora.safetensors".into(), 1.0, kind),
             ]);
             assert!(

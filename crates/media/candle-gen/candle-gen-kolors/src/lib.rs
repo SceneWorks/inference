@@ -552,15 +552,28 @@ mod tests {
 
     #[test]
     fn load_accepts_adapters_and_rejects_single_file() {
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        // `/snap` exists on Ubuntu hosts, which would turn this lazy-loader test into an
+        // unintended physical-receipt probe. Keep the fixture guaranteed missing while preserving
+        // the exact Kolors repository/revision/tier path shape.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join("models--SceneWorks--kolors-mlx")
+            .join("snapshots")
+            .join(memory_strategy::KOLORS_REVISION)
+            .join("bf16");
+        let lora =
+            LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
         assert!(load(&lora).is_ok());
 
         // sc-10819: a packed q4/q8 tier is auto-detected from disk, so `quantize` is NO LONGER a load
         // reject (contrast the LoRA/control overlays above). Load is lazy (no file I/O), so a quant-only
         // spec at a nonexistent dir succeeds — the packed tier is resolved on the first `generate`.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let quant = LoadSpec::new(WeightsSource::Dir(root)).with_quant(Quant::Q8);
         assert!(
             load(&quant).is_ok(),
             "a quant spec must not be rejected — packed tiers are wired (sc-10819)"
