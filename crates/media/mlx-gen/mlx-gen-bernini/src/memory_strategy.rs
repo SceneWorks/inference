@@ -13,7 +13,7 @@
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
 //! | 0 Resident | Implemented | Both experts co-resident for the whole denoise — today's shipped behaviour |
-//! | 1 Staged residency | Implemented (**unconditional**) | Every completed phase dropped + `clear_cache`d before the next: conditioning → source VAE → experts → decode |
+//! | 1 Staged residency | Missing | The provider releases phases unconditionally, but exposes no request-selected staged-residency lever |
 //! | 2 Bounded decode | Implemented | [`TilingConfig::spatial_only`] over the [`DECODE_TILE_EDGES`] ladder, replacing `TilingConfig::auto` |
 //! | 3 Bounded attention | Implemented (trunk) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] through both trunk SDPA seams, on both experts |
 //! | 4 Bounded transformer residency | Implemented (deferred-materialization loads) | [`mlx_gen::block_residency::run_windowed`] over the **80-block** trunk |
@@ -74,10 +74,10 @@
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
-    TransformerComponent,
+    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
+    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
@@ -125,6 +125,8 @@ pub const DECODE_TILE_EDGE: u32 = 512;
 /// The single published overlap. One overlap per route keeps admission able to reject a geometry
 /// assembled for a different one.
 pub const DECODE_OVERLAP: u32 = 64;
+pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
+    &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
 
 /// Rung 3 — the shared constrained score budget. Bernini does not invent its own.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -390,9 +392,8 @@ fn build_contract(
 
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
-            MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
-                MemoryStrategySupport::Implemented
-            }
+            MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
+            MemoryStrategy::StagedResidency => MemoryStrategySupport::Missing,
             MemoryStrategy::BoundedDecode => {
                 capability.parameters.decode_tile_edges = DECODE_TILE_EDGES.to_vec();
                 capability.parameters.decode_overlaps = vec![DECODE_OVERLAP];
@@ -444,6 +445,16 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
     Ok(())
 }
 
+fn validate_geometry(width: u32, height: u32) -> CoreResult<()> {
+    if ADVERTISED_GEOMETRIES.contains(&(width, height)) {
+        Ok(())
+    } else {
+        Err(CoreError::Unsupported(format!(
+            "bernini: memory evidence requires one of the advertised geometries {ADVERTISED_GEOMETRIES:?}, got {width}x{height}"
+        )))
+    }
+}
+
 /// Reject a window cadence outside the published domain.
 fn validate_window(size: u32) -> CoreResult<()> {
     if !TRANSFORMER_WINDOW_SIZES.contains(&size) {
@@ -474,6 +485,41 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
+        if context.mode.as_key() != "video_to_video"
+            || context.geometry.reference_count != 1
+            || !context.has_reference
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{}: Bernini memory evidence is scoped to exactly one video_to_video clip",
+                contract.provider_id
+            )));
+        }
+        validate_geometry(context.geometry.width, context.geometry.height)?;
+        if !matches!(context.geometry.frames, 45 | 61 | 77) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: Bernini V2V memory evidence covers exactly 45, 61, or 77 frames, got {}",
+                contract.provider_id, context.geometry.frames
+            )));
+        }
+        if context.overlay.as_deref().is_some_and(|overlay| {
+            overlay
+                .split('+')
+                .find(|axis| axis.starts_with("provider_video_mode:"))
+                .is_some_and(|axis| axis != "provider_video_mode:v2v")
+        }) {
+            return Err(CoreError::Unsupported(
+                "bernini MLX provider video mode overlay crossed the v2v contract".to_owned(),
+            ));
+        }
+        if context
+            .overlay
+            .as_deref()
+            .is_some_and(|overlay| overlay.contains("adapters:["))
+        {
+            return Err(CoreError::Unsupported(
+                "bernini MLX does not support adapter overlays".to_owned(),
+            ));
+        }
         // sc-15839 review defect, Resident+PiD admission. Bernini decodes through the Wan z16 VAE and
         // the crate carries no `mlx-gen-pid` dependency at all, so a PiD selection would silently
         // execute the ordinary native decode — a different strategy than the selector chose. Reject
@@ -579,13 +625,13 @@ pub(crate) fn registered_valid_fixture(
     {
         return Ok(Vec::new());
     }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
+    let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
         loaded_tier(spec),
         MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
+            mode: MemoryMode::Other("video_to_video".to_owned()),
+            reference_count: 1,
             use_pid: false,
             // Single-phase, deliberately (sc-18609). See the `has_phases` gate in `safety_check`:
             // this axis is the request's multi-phase denoise trajectory, which Bernini does not
@@ -594,15 +640,26 @@ pub(crate) fn registered_valid_fixture(
             overlay: None,
         },
     )?;
-    // The fixture request must be one this provider would actually accept, or the weights-free
-    // behavior oracle validates a route production `validate` rejects. `standard_memory_behavior_context`
-    // pins a 1024x1024, 1-frame geometry; `frames: Some(1)` is what makes that the STILL-IMAGE lane,
-    // whose carve-out in `validate_bernini_geometry` admits 1024^2. Left at the `None` default the
-    // same request is a video render at 1.05 Mpx, over the 14B video area cap — i.e. the declared
-    // route would not survive its own geometry guard. This matches the mode declared above.
+    context.geometry.width = 848;
+    context.geometry.height = 480;
+    context.geometry.frames = 45;
     let mut fixture = MemoryBehaviorFixture::new(context);
     fixture.request.prompt = "weights-free bernini memory behavior".to_owned();
-    fixture.request.frames = Some(1);
+    fixture.request.fps = Some(16);
+    fixture.request.video_mode = Some("v2v".to_owned());
+    fixture.request.conditioning.clear();
+    fixture
+        .request
+        .conditioning
+        .push(mlx_gen::gen_core::Conditioning::VideoClip {
+            frames: vec![mlx_gen::gen_core::Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0; 12],
+            }],
+            frame_idx: 0,
+            strength: 1.0,
+        });
     fixture.request.phases = None;
     Ok(vec![fixture])
 }
@@ -687,9 +744,14 @@ fn begin_with_cleanup(
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
+    // The shared MLX core's reference axis historically describes image references only. Bernini's
+    // exact route is one VideoClip, which is validated by the wrapper below; keep the core's
+    // compatibility geometry at zero image references while preserving the typed route in context.
+    let mut core_geometry = context.geometry;
+    core_geometry.reference_count = 0;
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
-        context.geometry,
+        core_geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
         // The WHOLE trunk, both experts, in one global index space — see the module docs. Derived
@@ -712,9 +774,89 @@ fn begin_with_cleanup(
         )
         .then_some(context.selection.parameters.transformer_window_size)
         .flatten();
-    Ok(Some(Box::new(
-        mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
-    )))
+    Ok(Some(Box::new(BerniniMemoryRequestScope {
+        inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+    })))
+}
+
+fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()> {
+    if request.video_mode.as_deref() != Some("v2v") {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope requires video_mode=v2v".to_owned(),
+        ));
+    }
+    if request.fps.unwrap_or(16) != 16 {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope requires FPS 16".to_owned(),
+        ));
+    }
+    if request.count != 1
+        || request.image_reference_count() != 0
+        || request.video_clips().len() != 1
+        || !matches!(
+            request.conditioning.as_slice(),
+            [mlx_gen::gen_core::Conditioning::VideoClip { .. }]
+        )
+    {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope requires exactly one normalized VideoClip and no image references"
+                .to_owned(),
+        ));
+    }
+    if !matches!(request.frames, Some(45 | 61 | 77)) {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope supports only the advertised 3/4/5 second frame counts at FPS 16"
+                .to_owned(),
+        ));
+    }
+    validate_geometry(request.width, request.height)?;
+    Ok(())
+}
+
+struct BerniniMemoryRequestScope {
+    inner: mlx_gen::request_scope::MlxRequestScopeCore,
+}
+
+impl MemoryRequestScope for BerniniMemoryRequestScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
+        validate_video_to_video_request(request)?;
+        self.inner.configure_request(request)
+    }
+
+    fn enter_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
+        self.inner.enter_phase(phase)
+    }
+
+    fn leave_phase(&mut self, phase: MemoryPhase) -> CoreResult<()> {
+        self.inner.leave_phase(phase)
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        mut geometry: MemoryGeometry,
+    ) -> CoreResult<()> {
+        geometry.reference_count = 0;
+        self.inner.configure_decode(tile_edge, overlap, geometry)
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> CoreResult<()> {
+        self.inner.configure_attention(chunk_size)
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> CoreResult<()> {
+        self.inner
+            .materialize_transformer_window(first_block, block_count)
+    }
+
+    fn finish(&mut self, outcome: MemoryRunOutcome) -> CoreResult<()> {
+        self.inner.finish(outcome)
+    }
 }
 
 /// The registry rows for one adopting provider.
@@ -826,18 +968,17 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
     )))
 }
 
-/// Rung 1 has **no request-side resolver, deliberately**, and this note is the declaration.
+/// Rung 1 has **no request-side resolver**, so it is deliberately declared `Missing`.
 ///
 /// Both `generate_impl`s release every completed phase unconditionally: the UMT5 encoder is dropped
 /// and `clear_cache`d before the source-VAE encode, the source-VAE encoder before the experts, and
-/// the experts before the decode. `GenerationMemory::stage_residency` therefore selects nothing —
-/// the provider is *structurally* always-staged, which is why both descriptors already advertise
-/// `unconditionally_engages_staged_residency` and why each descriptor test pins the independent
-/// false/true selectable/unconditional combination.
+/// the experts before the decode. `GenerationMemory::stage_residency` therefore selects nothing.
+/// This older unconditional staging behavior is not a request-selected rung and cannot be admitted
+/// as `StagedResidency` until a selector-controlled mechanism is wired through the provider.
 ///
 /// A resolver that branched on the flag would be a lever over behaviour that does not vary, i.e. a
-/// declaration with no enforcement behind it. The rung is `Implemented` because the synchronized
-/// phase release is real and executed, not because a flag is read.
+/// declaration with no enforcement behind it. The synchronized phase release remains useful
+/// lifecycle behavior, but it does not establish the memory-ladder rung.
 ///
 /// **What this does NOT include**, stated so it is not read as covered: releasing the *high* expert
 /// at the boundary switch so only one expert is resident during the denoise. The switch is monotone,
@@ -862,7 +1003,7 @@ pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core::GenerationMemory;
+    use mlx_gen::gen_core::{Conditioning, GenerationMemory};
     use mlx_gen::{OffloadPolicy, WeightsSource};
 
     fn spec(shape: LoadShape) -> LoadSpec {
@@ -913,8 +1054,8 @@ mod tests {
     }
 
     /// Rung 4 is declared per LOAD. An eager load publishes it `Missing`; only a
-    /// `DeferredMaterialization` load publishes it `Implemented`, and every other rung is unchanged
-    /// between the two — a load shape must not silently move rungs 1-3.
+    /// `DeferredMaterialization` load publishes it `Implemented`. Staged residency remains Missing
+    /// on both shapes because the provider has no request-selected rung-1 lever.
     #[test]
     fn rung_four_is_declared_per_load_and_moves_nothing_else() {
         for provider_id in PROVIDER_IDS {
@@ -922,7 +1063,6 @@ mod tests {
             let eager = contract(provider_id, LoadShape::EagerMaterialization);
             for rung in [
                 MemoryStrategy::Resident,
-                MemoryStrategy::StagedResidency,
                 MemoryStrategy::BoundedDecode,
                 MemoryStrategy::BoundedAttention,
             ] {
@@ -1118,11 +1258,12 @@ mod tests {
     /// The exact declared surface both variants publish across the whole MLX registry-load matrix
     /// (sc-18609) — 3 artifact tiers x 2 offload policies x 2 load shapes, per provider.
     ///
-    /// The per-rung counts are the family's real shape, not a copy of a neighbour's: rungs 0-3 are
-    /// unconditional, and rung 4 rides the load shape ALONE. It is 6 rather than 3 per provider
+    /// The per-rung counts are the family's real shape, not a copy of a neighbour's: rung 1 is
+    /// Missing because staging is unconditional, while rung 4 rides the load shape ALONE. It is 6
+    /// rather than 3 per provider
     /// because `structurally_streamable` does not consult `OffloadPolicy` — both descriptors advertise
     /// `supports_sequential_offload: false` (the family is unconditionally staged, so the policy is
-    /// not a lever here), and gating rung 4 on a control the provider does not consume would declare a
+    /// not a rung-1 lever here), and gating rung 4 on a control the provider does not consume would declare a
     /// dependency that does not exist.
     #[test]
     fn both_variants_publish_the_exact_declared_surface_ladder() {
@@ -1179,7 +1320,7 @@ mod tests {
                     .count()
             };
             assert_eq!(count(MemoryStrategy::Resident), 12, "{provider_id}");
-            assert_eq!(count(MemoryStrategy::StagedResidency), 12, "{provider_id}");
+            assert_eq!(count(MemoryStrategy::StagedResidency), 0, "{provider_id}");
             assert_eq!(count(MemoryStrategy::BoundedDecode), 12, "{provider_id}");
             assert_eq!(count(MemoryStrategy::BoundedAttention), 12, "{provider_id}");
             assert_eq!(
@@ -1313,5 +1454,126 @@ mod tests {
         assert!(contract(FULL_ID, LoadShape::DeferredMaterialization)
             .calibration
             .is_some());
+    }
+
+    #[test]
+    fn v2v_scope_rejects_plain_and_crossed_video_requests() {
+        let clip = Conditioning::VideoClip {
+            frames: vec![mlx_gen::gen_core::Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0; 12],
+            }],
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        let mut valid = GenerationRequest {
+            prompt: "v2v".to_owned(),
+            width: 848,
+            height: 480,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("v2v".to_owned()),
+            conditioning: vec![clip.clone()],
+            ..Default::default()
+        };
+        assert!(validate_video_to_video_request(&valid).is_ok());
+        valid.video_mode = None;
+        assert!(validate_video_to_video_request(&valid).is_err());
+        valid.video_mode = Some("v2v".to_owned());
+        valid.fps = Some(24);
+        assert!(validate_video_to_video_request(&valid).is_err());
+        valid.fps = Some(16);
+        valid.conditioning.clear();
+        assert!(validate_video_to_video_request(&valid).is_err());
+    }
+
+    #[test]
+    fn v2v_scope_admits_only_advertised_geometry_and_frames() {
+        for &(width, height) in ADVERTISED_GEOMETRIES {
+            for frames in [45, 61, 77] {
+                let request = GenerationRequest {
+                    prompt: "v2v".to_owned(),
+                    width,
+                    height,
+                    frames: Some(frames),
+                    fps: Some(16),
+                    video_mode: Some("v2v".to_owned()),
+                    conditioning: vec![Conditioning::VideoClip {
+                        frames: vec![mlx_gen::gen_core::Image {
+                            width: 2,
+                            height: 2,
+                            pixels: vec![0; 12],
+                        }],
+                        frame_idx: 0,
+                        strength: 1.0,
+                    }],
+                    ..Default::default()
+                };
+                assert!(
+                    validate_video_to_video_request(&request).is_ok(),
+                    "{width}x{height}/{frames}"
+                );
+            }
+        }
+        let mut crossed = GenerationRequest {
+            width: 640,
+            height: 640,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("v2v".to_owned()),
+            conditioning: vec![Conditioning::VideoClip {
+                frames: vec![mlx_gen::gen_core::Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0; 12],
+                }],
+                frame_idx: 0,
+                strength: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_video_to_video_request(&crossed).is_err());
+        crossed.width = 848;
+        crossed.height = 480;
+        crossed.fps = Some(24);
+        assert!(validate_video_to_video_request(&crossed).is_err());
+    }
+
+    /// Safety owns the context axis before a request scope is constructed. A valid request cannot
+    /// rescue a context whose frame cell was crossed after selection.
+    #[test]
+    fn v2v_safety_binds_the_exact_context_frame_cell_before_configure() {
+        for provider_id in PROVIDER_IDS {
+            let spec = spec(LoadShape::DeferredMaterialization);
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            let mut context =
+                registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .remove(0)
+                    .context;
+            for frames in [45, 61, 77] {
+                context.geometry.frames = frames;
+                assert_eq!(
+                    safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}/{frames}"
+                );
+            }
+            for frames in [1, 44, 46, 60, 62, 76, 78] {
+                context.geometry.frames = frames;
+                assert!(
+                    matches!(
+                        safety_check(&spec, &contract, &context),
+                        MemorySafetyDecision::Reject { .. }
+                    ),
+                    "{provider_id}/{frames} must be rejected before configure_request"
+                );
+                assert!(
+                    registered_begin_request(provider_id, &spec, &contract, &context).is_err(),
+                    "{provider_id}/{frames} crossed context reached request scope"
+                );
+            }
+        }
     }
 }
