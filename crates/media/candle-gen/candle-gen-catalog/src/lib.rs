@@ -125,6 +125,8 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
 pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     let registry = register_providers(ProviderRegistryBuilder::new());
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_chroma::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
@@ -3369,6 +3371,11 @@ mod preview_advertising {
     }
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
+        MemoryRouteCrate {
+            dir: "candle-gen-chroma",
+            register_providers: candle_gen_chroma::register_providers,
+            register_surfaces: Some(candle_gen_chroma::register_memory_contract_surfaces),
+        },
         MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
