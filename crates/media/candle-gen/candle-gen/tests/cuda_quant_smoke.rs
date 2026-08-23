@@ -36,6 +36,39 @@
 //! `vendor/candle-kernels/build.rs` appends sm_90 / sm_120 / `compute_120` PTX above it. What must
 //! hold is that the runner's arch is served by *some* rung — see the header comment on the
 //! `CUDA_COMPUTE_CAP` declaration in `.github/workflows/ci.yml`.
+//!
+//! ## How this target is excluded from the Linux CPU lane — and why NOT with `#[ignore]`
+//!
+//! sc-19447 widened `candle-cpu-test` to `--tests` and, in the same pass, converted 14 self-skipping
+//! cases to `#[ignore]` so a case that prints `SKIP` and `return`s could not be counted as a pass.
+//! This case was swept into that set on the belief that it was an env-var self-skipper reachable
+//! from no lane. **That was wrong on both halves.** Its guard is `default_device().is_cuda()`, not
+//! an env var, and `ci.yml`'s `windows-cuda` job runs
+//! `cargo test --lib --tests -p 'candle-gen*' --features cuda` with **no `-- --ignored`** — so
+//! `#[ignore]` did not keep a weight-bound case out of a lane that would have mis-run it, it
+//! silenced the sc-7544 canary on the only lane that has ever executed it.
+//!
+//! The exclusion mechanism is therefore the file-level `#![cfg(feature = "cuda")]` below — the same
+//! one `cublaslt_8bit_numerics.rs`, `cublaslt_nvfp4_gemm.rs` and `nvfp4_linear_gpu.rs` use, and the
+//! second of the two mechanisms `scripts/tests/test_candle_gen_ci_target_coverage.py` recognises. It
+//! gives both halves at once:
+//!
+//! * on `candle-cpu-test` (`ubuntu-latest`, default features, no `--features cuda`) the target
+//!   compiles to an **empty binary** — no case, so nothing to pass silently; and
+//! * under `--features cuda` the case is compiled **and runs**, with no `--ignored` opt-in needed.
+//!
+//! Under that cfg the device guard is *statically* satisfied: `candle_gen::default_device` is
+//! `Device::new_cuda(0)?` whenever `feature = "cuda"` is on, so it either yields a CUDA device or
+//! fails. The old `if !device.is_cuda() { SKIP; return }` early return was dead code in every
+//! configuration that can compile this file, and a dead self-skip is an invitation to re-classify
+//! the case as a self-skipper and re-`#[ignore]` it. It is an `assert!` now: unreachable, and loud
+//! if the reasoning above ever stops holding.
+//!
+//! `windows-cuda` remains `workflow_dispatch`-only — restoring reachability is not the same as
+//! putting the canary on an automatic lane, and this change does not claim to. What it restores is
+//! that a dispatch of that lane evaluates the canary instead of reporting it `ignored`.
+
+#![cfg(feature = "cuda")]
 
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{Device, Module, Tensor};
@@ -123,13 +156,20 @@ fn relative_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 /// On the broken sm_80-SASS-only packaging the CUDA result is all-zeros/garbage — this fails loudly.
 /// With the multi-arch fatbin (native sm_120 cubin) it passes. The comparison is a relative
 /// max-abs-diff, not cosine; see `relative_max_abs_diff` for why that distinction matters.
+///
+/// NOT `#[ignore]`d, deliberately: the whole target is behind `#![cfg(feature = "cuda")]`, so this
+/// case exists only in builds that have a CUDA device, and `windows-cuda` passes no `-- --ignored`.
+/// See the module header for why `#[ignore]` was the wrong exclusion mechanism here.
 #[test]
 fn cuda_qmatmul_matches_cpu() {
     let device = default_device().expect("default device");
-    if !device.is_cuda() {
-        eprintln!("SKIP cuda_qmatmul_matches_cpu: default_device()={device:?} is not CUDA");
-        return;
-    }
+    // Unreachable under `#![cfg(feature = "cuda")]` — `default_device()` is `Device::new_cuda(0)?`
+    // there. Asserted rather than early-`return`ed so this can never degrade into a silent pass.
+    assert!(
+        device.is_cuda(),
+        "default_device()={device:?} is not CUDA in a `--features cuda` build — \
+         candle_gen::default_device no longer routes the cuda feature to Device::new_cuda"
+    );
     eprintln!("[quant-smoke] device={device:?}");
 
     // out=N, in=K, rows=M. K is a multiple of 32 (Q4_0/Q8_0 block) and 256 (k-quant QK_K), so the

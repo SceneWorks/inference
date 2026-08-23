@@ -458,8 +458,13 @@ mod tests {
         let writer_source = source.clone();
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            std::fs::rename(replacement, writer_source).unwrap();
+            let swapped = std::fs::rename(replacement, writer_source);
+            // Release the materialize hook whatever the swap did. The hook is parked on this
+            // barrier on the main thread, so a writer that panics — or returns — ahead of it
+            // strands the hook there and hangs the whole test binary; the outcome is asserted on
+            // `join` instead, so a failed swap reads as a red test naming the error.
             writer_done.wait();
+            swapped
         });
 
         let hook_first = Arc::clone(&first_evaluated);
@@ -489,7 +494,10 @@ mod tests {
 
         let result = Krea2ControlBranch::from_pinned_file(&pinned, &Krea2Config::turbo());
         CONTROL_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
-        writer.join().unwrap();
+        writer
+            .join()
+            .expect("replacement writer")
+            .expect("atomically replace the control checkpoint during lazy evaluation");
 
         assert!(final_evaluated.load(Ordering::SeqCst));
         let error = result

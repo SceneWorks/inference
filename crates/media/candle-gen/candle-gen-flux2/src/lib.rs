@@ -1770,14 +1770,19 @@ mod tests {
         let writer_source = source.clone();
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            #[cfg(unix)]
-            std::fs::rename(replacement, writer_source).unwrap();
-            #[cfg(not(unix))]
-            {
-                let bytes = std::fs::read(replacement).unwrap();
-                std::fs::write(writer_source, bytes).unwrap();
-            }
+            // A replacing rename, on every platform. The loader is holding `source` mmapped, and
+            // Windows refuses to truncate or write a file with an open mapped section
+            // (ERROR_USER_MAPPED_FILE, 1224), so the read+write swap this used off-Unix could only
+            // ever fail here. Rename can do it, with the same meaning on both: the mapping keeps
+            // consuming the original object while the pinned path comes to name a new one. The
+            // fingerprint still catches it on Windows via the file id and change time, which differ
+            // even when the two files share a size and mtime.
+            let swapped = std::fs::rename(replacement, writer_source);
+            // Release the loader whatever the swap did. A writer that returns — or panics — ahead
+            // of this barrier strands the load hook on it and hangs the whole test binary; the
+            // outcome is asserted on `join` instead, so a failed swap reads as a red test.
             writer_done.wait();
+            swapped
         });
 
         let hook_consumed = Arc::clone(&payload_consumed);
@@ -1799,7 +1804,10 @@ mod tests {
 
         let result = pipeline.load_dit_seq();
         COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
-        writer.join().unwrap();
+        writer
+            .join()
+            .unwrap()
+            .expect("replace the pinned source mid-load");
 
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result

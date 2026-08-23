@@ -942,12 +942,29 @@ fn load_native_dit_at_dtype(
         let cfg = Krea2Config::from_snapshot(root)?;
         // Native keys ON, ConvRot OFF. Dense stores W directly; plain int8 reconstructs
         // W = codes * row_scale. Neither stores ConvRot's W·R, so neither may rotate.
-        let source_device = if quant.is_some() {
+        let source_device = if matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
             &Device::Cpu
         } else {
             device
         };
         let mut dit_w = Weights::from_pinned_native_file(native_dit, source_device, dit_dtype)?;
+        let native_nvfp4 = dit_w.is_native_nvfp4();
+        if native_nvfp4 && !adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 imports do not yet support LoRA/LoKr or diff-patch adapters"
+                    .into(),
+            ));
+        }
+        if native_nvfp4 && stream_blocks {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
+            ));
+        }
+        if native_nvfp4 && matches!(quant, Some(gen_core::Quant::Q4 | gen_core::Quant::Q8)) {
+            return Err(CandleError::Msg(
+                "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),
+            ));
+        }
         #[cfg(test)]
         run_native_dit_load_test_hook(&dit_w, device)?;
         crate::convert::validate_native_transformer(&dit_w, &cfg)?;
@@ -965,7 +982,7 @@ fn load_native_dit_at_dtype(
         if !adapters.is_empty() {
             crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
         }
-        if let Some(quant) = quant {
+        if let Some(quant) = quant.filter(|_| !native_nvfp4) {
             dit.quantize_onto(quant, device)?;
         }
 
@@ -2851,14 +2868,19 @@ mod tests {
         let writer_source = source.clone();
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            #[cfg(unix)]
-            std::fs::rename(replacement, writer_source).unwrap();
-            #[cfg(not(unix))]
-            {
-                let bytes = std::fs::read(replacement).unwrap();
-                std::fs::write(writer_source, bytes).unwrap();
-            }
+            // A replacing rename, on every platform. The loader is holding `source` mmapped, and
+            // Windows refuses to truncate or write a file with an open mapped section
+            // (ERROR_USER_MAPPED_FILE, 1224), so the read+write swap this used off-Unix could only
+            // ever fail here. Rename can do it, with the same meaning on both: the mapping keeps
+            // consuming the original object while the pinned path comes to name a new one. The
+            // fingerprint still catches it on Windows via the file id and change time, which differ
+            // even when the two files share a size and mtime.
+            let swapped = std::fs::rename(replacement, writer_source);
+            // Release the loader whatever the swap did. A writer that returns — or panics — ahead
+            // of this barrier strands the load hook on it and hangs the whole test binary; the
+            // outcome is asserted on `join` instead, so a failed swap reads as a red test.
             writer_done.wait();
+            swapped
         });
 
         let hook_first = Arc::clone(&first_consumed);
@@ -2883,7 +2905,10 @@ mod tests {
         let result =
             load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], None, false, DType::F32);
         NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
-        writer.join().unwrap();
+        writer
+            .join()
+            .unwrap()
+            .expect("replace the pinned source mid-load");
 
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result

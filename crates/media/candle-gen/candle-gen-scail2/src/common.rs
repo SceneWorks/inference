@@ -5,6 +5,7 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::{Linear, VarBuilder};
+use candle_gen::quant::QLinear;
 
 /// A biased `[out, in]` Linear (`nn.Linear`) loaded by dotted name under `vb`.
 pub(crate) fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
@@ -12,6 +13,18 @@ pub(crate) fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear
         vb.get((out_c, in_c), "weight")?,
         Some(vb.get(out_c, "bias")?),
     ))
+}
+
+/// A SCAIL2 block projection.  Hosted Q4/Q8 tiers replace only this surface with MLX-affine
+/// `{weight, scales, biases}` triples; all other SCAIL2 linears stay dense.  `QLinear` reads the
+/// triple directly on CPU and installs the resident GGML form, never materializing a dense base.
+pub(crate) fn packed_linear(
+    in_c: usize,
+    out_c: usize,
+    vb: &VarBuilder,
+    base: &str,
+) -> Result<QLinear> {
+    QLinear::linear_detect(in_c, out_c, vb, base, true)
 }
 
 /// A `Conv3d`/`Conv2d` patch embed with `kernel == stride` read as a `[out, in·∏kernel]` dense Linear

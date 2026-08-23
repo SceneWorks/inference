@@ -15,10 +15,11 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::quant::QLinear;
 use candle_gen_wan::rope::apply_rope;
 
 use crate::common::{
-    conv_as_linear, linear, ln_affine, ln_no_affine, patchify, rms, sdpa, unpatchify,
+    conv_as_linear, linear, ln_affine, ln_no_affine, packed_linear, patchify, rms, sdpa, unpatchify,
 };
 use crate::config::Scail2Config;
 use crate::rope::ScailRope;
@@ -39,10 +40,10 @@ fn gated(x: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {
 
 /// Wan self-attention with qk-RMSNorm and 3-axis RoPE, over the full packed sequence.
 struct SelfAttn {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     n: usize,
@@ -55,10 +56,10 @@ impl SelfAttn {
     fn new(vb: &VarBuilder, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: linear(cfg.dim, cfg.dim, vb.pp("q"))?,
-            k: linear(cfg.dim, cfg.dim, vb.pp("k"))?,
-            v: linear(cfg.dim, cfg.dim, vb.pp("v"))?,
-            o: linear(cfg.dim, cfg.dim, vb.pp("o"))?,
+            q: packed_linear(cfg.dim, cfg.dim, vb, "q")?,
+            k: packed_linear(cfg.dim, cfg.dim, vb, "k")?,
+            v: packed_linear(cfg.dim, cfg.dim, vb, "v")?,
+            o: packed_linear(cfg.dim, cfg.dim, vb, "o")?,
             norm_q: vb.pp("norm_q").get(cfg.dim, "weight")?,
             norm_k: vb.pp("norm_k").get(cfg.dim, "weight")?,
             n: cfg.num_heads,
@@ -90,12 +91,12 @@ impl SelfAttn {
 /// Wan **I2V** cross-attention: text tokens through `k`/`v`, CLIP image tokens through `k_img`/`v_img`;
 /// the two attention outputs are summed before the output projection.
 struct CrossAttnI2V {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
-    k_img: Linear,
-    v_img: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
+    k_img: QLinear,
+    v_img: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     norm_k_img: Tensor,
@@ -109,12 +110,12 @@ impl CrossAttnI2V {
     fn new(vb: &VarBuilder, cfg: &Scail2Config) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: linear(cfg.dim, cfg.dim, vb.pp("q"))?,
-            k: linear(cfg.dim, cfg.dim, vb.pp("k"))?,
-            v: linear(cfg.dim, cfg.dim, vb.pp("v"))?,
-            o: linear(cfg.dim, cfg.dim, vb.pp("o"))?,
-            k_img: linear(cfg.dim, cfg.dim, vb.pp("k_img"))?,
-            v_img: linear(cfg.dim, cfg.dim, vb.pp("v_img"))?,
+            q: packed_linear(cfg.dim, cfg.dim, vb, "q")?,
+            k: packed_linear(cfg.dim, cfg.dim, vb, "k")?,
+            v: packed_linear(cfg.dim, cfg.dim, vb, "v")?,
+            o: packed_linear(cfg.dim, cfg.dim, vb, "o")?,
+            k_img: packed_linear(cfg.dim, cfg.dim, vb, "k_img")?,
+            v_img: packed_linear(cfg.dim, cfg.dim, vb, "v_img")?,
             norm_q: vb.pp("norm_q").get(cfg.dim, "weight")?,
             norm_k: vb.pp("norm_k").get(cfg.dim, "weight")?,
             norm_k_img: vb.pp("norm_k_img").get(cfg.dim, "weight")?,
@@ -160,8 +161,8 @@ struct Block {
     cross: CrossAttnI2V,
     norm3_w: Tensor,
     norm3_b: Tensor,
-    ffn0: Linear,
-    ffn2: Linear,
+    ffn0: QLinear,
+    ffn2: QLinear,
     eps: f64,
 }
 
@@ -173,8 +174,8 @@ impl Block {
             cross: CrossAttnI2V::new(&vb.pp("cross_attn"), cfg)?,
             norm3_w: vb.pp("norm3").get(cfg.dim, "weight")?,
             norm3_b: vb.pp("norm3").get(cfg.dim, "bias")?,
-            ffn0: linear(cfg.dim, cfg.ffn_dim, vb.pp("ffn").pp("0"))?,
-            ffn2: linear(cfg.ffn_dim, cfg.dim, vb.pp("ffn").pp("2"))?,
+            ffn0: packed_linear(cfg.dim, cfg.ffn_dim, &vb.pp("ffn"), "0")?,
+            ffn2: packed_linear(cfg.ffn_dim, cfg.dim, &vb.pp("ffn"), "2")?,
             eps: cfg.eps,
         })
     }
@@ -607,5 +608,282 @@ impl Scail2Dit {
             .narrow(1, offset, seq_length)?
             .reshape((seq_length, op))?;
         unpatchify(&vid_tok, (rope_t, rope_h, rope_w), cfg.out_dim, ps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::Shape;
+    use candle_gen::gen_core::Quant;
+    use std::collections::HashMap;
+
+    fn tiny_config(quant: Quant) -> Scail2Config {
+        let mut cfg = Scail2Config::scail2_14b();
+        // Every packed projection needs a group-64-aligned input. Keep the model small while still
+        // exercising the real QLinear detection and the full additional-reference token path.
+        cfg.dim = 64;
+        cfg.ffn_dim = 64;
+        cfg.num_heads = 1;
+        cfg.num_layers = 1;
+        cfg.in_dim = 20;
+        cfg.out_dim = 16;
+        cfg.mask_dim = 28;
+        cfg.i2v_mask_dim = 4;
+        cfg.freq_dim = 64;
+        cfg.text_len = 4;
+        cfg.text_dim = 64;
+        cfg.packed_quant = Some(quant);
+        cfg
+    }
+
+    fn put<S: Into<Shape>>(
+        map: &mut HashMap<String, Tensor>,
+        key: impl Into<String>,
+        shape: S,
+        dev: &Device,
+    ) {
+        map.insert(
+            key.into(),
+            Tensor::randn(0f32, 0.02f32, shape, dev).expect("synthetic tensor"),
+        );
+    }
+
+    fn put_linear(
+        map: &mut HashMap<String, Tensor>,
+        key: &str,
+        out: usize,
+        input: usize,
+        dev: &Device,
+    ) {
+        put(map, format!("{key}.weight"), (out, input), dev);
+        put(map, format!("{key}.bias"), out, dev);
+    }
+
+    fn put_packed_linear(
+        map: &mut HashMap<String, Tensor>,
+        key: &str,
+        out: usize,
+        input: usize,
+        bits: usize,
+        dev: &Device,
+    ) {
+        let dense = Tensor::randn(0f32, 0.02f32, (out, input), dev).expect("synthetic weight");
+        let (weight, scales, biases) =
+            candle_gen::quant::pack_mlx_affine(&dense, bits, 64).expect("group-64 pack");
+        map.insert(format!("{key}.weight"), weight);
+        map.insert(format!("{key}.scales"), scales);
+        map.insert(format!("{key}.biases"), biases);
+        put(map, format!("{key}.bias"), out, dev);
+    }
+
+    fn tiny_weights(cfg: &Scail2Config, bits: usize, dev: &Device) -> HashMap<String, Tensor> {
+        let mut map = HashMap::new();
+        let patch_volume = cfg.patch.0 * cfg.patch.1 * cfg.patch.2;
+        put(
+            &mut map,
+            "patch_embedding.weight",
+            (cfg.dim, cfg.in_dim, cfg.patch.0, cfg.patch.1, cfg.patch.2),
+            dev,
+        );
+        put(&mut map, "patch_embedding.bias", cfg.dim, dev);
+        put(
+            &mut map,
+            "patch_embedding_pose.weight",
+            (cfg.dim, cfg.in_dim, cfg.patch.0, cfg.patch.1, cfg.patch.2),
+            dev,
+        );
+        put(&mut map, "patch_embedding_pose.bias", cfg.dim, dev);
+        put(
+            &mut map,
+            "patch_embedding_mask.weight",
+            (cfg.dim, cfg.mask_dim, cfg.patch.0, cfg.patch.1, cfg.patch.2),
+            dev,
+        );
+        put(&mut map, "patch_embedding_mask.bias", cfg.dim, dev);
+        put_linear(&mut map, "text_embedding.0", cfg.dim, cfg.text_dim, dev);
+        put_linear(&mut map, "text_embedding.2", cfg.dim, cfg.dim, dev);
+        put_linear(&mut map, "time_embedding.0", cfg.dim, cfg.freq_dim, dev);
+        put_linear(&mut map, "time_embedding.2", cfg.dim, cfg.dim, dev);
+        put_linear(&mut map, "time_projection.1", 6 * cfg.dim, cfg.dim, dev);
+        put(&mut map, "img_emb.proj.0.weight", 1280, dev);
+        put(&mut map, "img_emb.proj.0.bias", 1280, dev);
+        put_linear(&mut map, "img_emb.proj.1", 1280, 1280, dev);
+        put_linear(&mut map, "img_emb.proj.3", cfg.dim, 1280, dev);
+        put(&mut map, "img_emb.proj.4.weight", cfg.dim, dev);
+        put(&mut map, "img_emb.proj.4.bias", cfg.dim, dev);
+
+        for block in 0..cfg.num_layers {
+            let prefix = format!("blocks.{block}");
+            put(
+                &mut map,
+                format!("{prefix}.modulation"),
+                (1, 6, cfg.dim),
+                dev,
+            );
+            for name in ["q", "k", "v", "o"] {
+                put_packed_linear(
+                    &mut map,
+                    &format!("{prefix}.self_attn.{name}"),
+                    cfg.dim,
+                    cfg.dim,
+                    bits,
+                    dev,
+                );
+            }
+            put(
+                &mut map,
+                format!("{prefix}.self_attn.norm_q.weight"),
+                cfg.dim,
+                dev,
+            );
+            put(
+                &mut map,
+                format!("{prefix}.self_attn.norm_k.weight"),
+                cfg.dim,
+                dev,
+            );
+            for name in ["q", "k", "v", "o", "k_img", "v_img"] {
+                put_packed_linear(
+                    &mut map,
+                    &format!("{prefix}.cross_attn.{name}"),
+                    cfg.dim,
+                    cfg.dim,
+                    bits,
+                    dev,
+                );
+            }
+            for name in ["norm_q", "norm_k", "norm_k_img"] {
+                put(
+                    &mut map,
+                    format!("{prefix}.cross_attn.{name}.weight"),
+                    cfg.dim,
+                    dev,
+                );
+            }
+            put(&mut map, format!("{prefix}.norm3.weight"), cfg.dim, dev);
+            put(&mut map, format!("{prefix}.norm3.bias"), cfg.dim, dev);
+            put_packed_linear(
+                &mut map,
+                &format!("{prefix}.ffn.0"),
+                cfg.ffn_dim,
+                cfg.dim,
+                bits,
+                dev,
+            );
+            put_packed_linear(
+                &mut map,
+                &format!("{prefix}.ffn.2"),
+                cfg.dim,
+                cfg.ffn_dim,
+                bits,
+                dev,
+            );
+        }
+        put(&mut map, "head.modulation", (1, 2, cfg.dim), dev);
+        put_linear(
+            &mut map,
+            "head.head",
+            cfg.out_dim * patch_volume,
+            cfg.dim,
+            dev,
+        );
+        map
+    }
+
+    fn all_block_projections_are_packed(dit: &Scail2Dit) -> bool {
+        dit.blocks.iter().all(|block| {
+            [
+                &block.self_attn.q,
+                &block.self_attn.k,
+                &block.self_attn.v,
+                &block.self_attn.o,
+                &block.cross.q,
+                &block.cross.k,
+                &block.cross.v,
+                &block.cross.o,
+                &block.cross.k_img,
+                &block.cross.v_img,
+                &block.ffn0,
+                &block.ffn2,
+            ]
+            .into_iter()
+            .all(QLinear::is_quantized)
+        })
+    }
+
+    #[test]
+    fn q4_and_q8_forwards_consume_additional_references_without_dense_fallback() {
+        let dev = Device::Cpu;
+        for (bits, quant) in [(4usize, Quant::Q4), (8usize, Quant::Q8)] {
+            let cfg = tiny_config(quant);
+            let dit = Scail2Dit::new(
+                VarBuilder::from_tensors(tiny_weights(&cfg, bits, &dev), DType::F32, &dev),
+                &cfg,
+            )
+            .expect("synthetic packed SCAIL2 DiT");
+            assert!(
+                all_block_projections_are_packed(&dit),
+                "Q{bits} must keep every SCAIL2 block projection packed"
+            );
+
+            // Full-resolution latent is 4x4; pose/mask are the real half-resolution 2x2 path.
+            let x = Tensor::randn(0f32, 1f32, (16, 1, 4, 4), &dev).unwrap();
+            let reference = Tensor::randn(0f32, 1f32, (16, 1, 4, 4), &dev).unwrap();
+            let reference_masks = Tensor::randn(0f32, 1f32, (28, 2, 4, 4), &dev).unwrap();
+            let pose = Tensor::randn(0f32, 1f32, (16, 1, 2, 2), &dev).unwrap();
+            let driving_masks = Tensor::randn(0f32, 1f32, (28, 1, 2, 2), &dev).unwrap();
+            let clip = Tensor::randn(0f32, 1f32, (1, 1, 1280), &dev).unwrap();
+            let context = Tensor::randn(0f32, 1f32, (1, cfg.text_dim), &dev).unwrap();
+            let additional = Tensor::randn(0f32, 1f32, (16, 1, 4, 4), &dev).unwrap();
+            let additional_masks = Tensor::randn(0f32, 1f32, (28, 1, 4, 4), &dev).unwrap();
+
+            let single = dit
+                .forward(&Scail2Inputs {
+                    x: &x,
+                    ref_latent: &reference,
+                    ref_masks: &reference_masks,
+                    pose_latent: &pose,
+                    driving_masks: &driving_masks,
+                    history_mask: None,
+                    additional_ref_latent: None,
+                    additional_ref_masks: None,
+                    clip_fea: &clip,
+                    context: &context,
+                    t: 500.0,
+                    replace_flag: false,
+                })
+                .expect("single-reference packed forward");
+            let multi = dit
+                .forward(&Scail2Inputs {
+                    x: &x,
+                    ref_latent: &reference,
+                    ref_masks: &reference_masks,
+                    pose_latent: &pose,
+                    driving_masks: &driving_masks,
+                    history_mask: None,
+                    additional_ref_latent: Some(&additional),
+                    additional_ref_masks: Some(&additional_masks),
+                    clip_fea: &clip,
+                    context: &context,
+                    t: 500.0,
+                    replace_flag: false,
+                })
+                .expect("multi-reference packed forward");
+            assert_eq!(single.dims(), &[16, 1, 4, 4]);
+            assert_eq!(multi.dims(), single.dims());
+            let difference = (single - multi)
+                .expect("subtract outputs")
+                .abs()
+                .expect("absolute difference")
+                .max_all()
+                .expect("maximum difference")
+                .to_scalar::<f32>()
+                .expect("CPU scalar");
+            assert!(
+                difference > 1e-7,
+                "Q{bits} additional reference must change the real output (saw {difference})"
+            );
+        }
     }
 }

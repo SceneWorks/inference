@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline, SanaSprintPipeline};
@@ -136,8 +136,9 @@ impl SanaGenerator {
 /// introspection and capability advertisement. True-CFG text-to-image and singular-reference img2img:
 /// negative prompt + guidance scale, flow-match Euler over the unified curated sampler/scheduler menu
 /// (epic 7114).
-/// Control/IP-adapter overlays, LoRA, and quantization are not wired on the candle base path. Backend
-/// `"candle"`, `mac_only = false`.
+/// Control/IP-adapter overlays and LoRA are not wired on the candle base path. The hosted MLX affine
+/// Q4/Q8 tiers are packed-detected from their on-disk triples; NVFP4 is a separate Candle format and
+/// is deliberately not advertised as either tier. Backend `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
@@ -161,8 +162,10 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // SANA is the f32/bf16 weight path; no load-time quantization is wired yet.
-            supported_quants: &[],
+            // Hosted group-64 affine Q4/Q8 tiers are consumed directly from their MLX-packed
+            // triples. `LoadSpec::quantize` selects a tier upstream; it never turns a dense SANA
+            // checkpoint into a different format at load time.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
             // No candle `render_sequential` residency seam wired (sc-11126).
@@ -208,6 +211,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // sc-16959: the SCM lane emits per-step latent previews through
             // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
             // correction the SCM driver's pre-scaled running latent needs.
@@ -267,8 +271,8 @@ fn resolve_reference<'a>(
 
 /// Construct the (lazy) candle SANA-1.6B generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `Sana_1600M_1024px_diffusers`-layout snapshot. LoRA/LoKr
-/// adapters, on-the-fly quantization, and control/IP-adapter overlays are rejected (not wired —
-/// refusing is more honest than silently dropping; the worker falls back to Python).
+/// adapters and control/IP-adapter overlays are rejected. Q4/Q8 are pre-packed tier selectors,
+/// detected from the resolved snapshot at the first generation; they are not on-the-fly quantization.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -280,9 +284,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
+    if matches!(spec.quantize, Some(Quant::Nvfp4)) {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_1600m does not support on-the-fly Q4/Q8 quantization yet".into(),
+            "candle sana_1600m accepts only hosted MLX-packed Q4/Q8 tiers; NVFP4 is a distinct format"
+                .into(),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -510,7 +515,7 @@ fn generate_sprint_images(
 /// Construct the (lazy) candle **SANA-Sprint** generator (sc-11781) from a [`LoadSpec`]. Identical
 /// snapshot contract to [`load`] (`transformer/ vae/ text_encoder/ tokenizer/`), but the transformer
 /// loads the Sprint config (guidance embedder + qk-norm) and the CFG-free SCM few-step pipeline drives
-/// it. LoRA/LoKr adapters, on-the-fly quantization, and control/IP-adapter overlays are rejected.
+/// it. LoRA/LoKr adapters and control/IP-adapter overlays are rejected; Q4/Q8 are hosted packed tiers.
 pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -522,9 +527,10 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
+    if matches!(spec.quantize, Some(Quant::Nvfp4)) {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_sprint_1600m does not support on-the-fly Q4/Q8 quantization yet".into(),
+            "candle sana_sprint_1600m accepts only hosted MLX-packed Q4/Q8 tiers; NVFP4 is a distinct format"
+                .into(),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -846,7 +852,7 @@ mod tests {
             d.capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
-        assert!(d.capabilities.supported_quants.is_empty());
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.mac_only, "candle is Windows/CUDA, not Mac");
         assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
         assert_eq!(
@@ -902,12 +908,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_accepts_packed_tier_selectors_and_rejects_distinct_nvfp4() {
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(
+            load(&quant).is_ok(),
+            "packed Q8 tier selector must reach Candle"
+        );
+        let nvfp4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Nvfp4);
+        let error = load(&nvfp4)
+            .err()
+            .expect("NVFP4 must not be relabeled as affine Q4");
+        assert!(error.to_string().contains("distinct format"));
         let control = LoadSpec::new(WeightsSource::Dir("/snap".into()))
             .with_control(WeightsSource::Dir("/ctrl".into()));
         assert!(matches!(
@@ -967,6 +978,7 @@ mod tests {
         );
         assert_eq!(d.capabilities.samplers, vec!["default"]);
         assert_eq!(d.capabilities.schedulers, vec!["default"]);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.mac_only, "candle is Windows/CUDA");
     }
 
@@ -977,15 +989,12 @@ mod tests {
     }
 
     #[test]
-    fn sprint_load_rejects_single_file_and_unwired_surfaces() {
+    fn sprint_load_rejects_single_file_and_accepts_packed_tier_selector() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_sprint(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load_sprint(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_sprint(&quant).is_ok());
     }
 
     /// CRITICAL base-unchanged regression: adding the Sprint adapter must NOT perturb the base

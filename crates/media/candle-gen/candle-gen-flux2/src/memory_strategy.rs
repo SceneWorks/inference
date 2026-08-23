@@ -1253,6 +1253,9 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
+        // `OPEN_EXISTING` keeps whatever flag the fixture writer set, so this only re-asserts it —
+        // but the appended span is what would allocate if the base file arrived dense.
+        gen_core_testkit::mark_sparse(path);
         let mut encoded_len = [0_u8; 8];
         file.read_exact(&mut encoded_len).unwrap();
         let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];

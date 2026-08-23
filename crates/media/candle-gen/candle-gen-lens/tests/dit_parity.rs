@@ -49,6 +49,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo transformer snapshot (LENS_DIT_DIR) + goldens (LENS_DIT_GOLDENS)"]
 fn lens_dit_matches_reference() -> Result<()> {
     let dit_dir = match std::env::var("LENS_DIT_DIR") {
         Ok(d) => d,

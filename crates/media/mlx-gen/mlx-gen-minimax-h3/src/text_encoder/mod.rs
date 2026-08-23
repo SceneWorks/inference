@@ -36,12 +36,14 @@
 //!    no vocabulary file. See [`tokenizer`].
 
 pub mod attention;
+pub mod degeneracy;
 pub mod encoder;
 pub mod layer;
 pub mod mlp;
 pub mod tokenizer;
 
 pub use attention::Qwen3Attention;
+pub use degeneracy::{inspect_conditioning, ConditioningDefect, DegenerateConditioning};
 pub use encoder::MiniMaxH3TextEncoder;
 pub use layer::Qwen3DecoderLayer;
 pub use mlp::Qwen3Mlp;
@@ -313,6 +315,24 @@ pub struct GroundedVision {
 /// Split from [`encode_grounded_from_vision`] so a CFG pass runs the tower ONCE and grounds both the
 /// positive and negative prompt on the shared output — the tower forward is the expensive,
 /// text-independent half. At least one source is required.
+///
+/// # The second conditioning producer, and why it needs its own screen
+///
+/// The merged embeds are conditioning in their own right: [`encoder`] *replaces* the
+/// `<|image_pad|>` rows with them, it does not blend them. So a zeroed tower survives the encoder's
+/// own [`degeneracy`] screen — the surrounding text rows still carry signal, the context is not
+/// all-zero, and the render silently ignores the references. That is a distinct failure from the
+/// sc-17153 all-zero context and only a screen here can see it. The tower is also dense bf16 out of
+/// the same `text_encoder/` component (shard 14, `model.visual.*`), loaded through the same
+/// [`Weights`] path, so it is exposed to whatever mechanism sc-17153 is still chasing.
+///
+/// The `deepstack` features are deliberately **not** screened, and not because the embed screen
+/// covers them — it does not. They come from separate `deepstack_merger_list.{i}` `Merger` modules
+/// with their own weights (`mlx-gen-boogu/src/vision/mod.rs:307-311`, applied at `:508`), so under
+/// the per-tensor `Load` race this epic is chasing a zeroed merger leaves `emb` perfectly healthy
+/// and `ds` dead. The reason they are out of scope is what they do: deepstack is injected
+/// **additively** over the first few layers, so a zero there degrades the grounding rather than
+/// voiding it, whereas the merged embeds *replace* the pad rows outright and a zero there is total.
 pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVision> {
     if sources.is_empty() {
         return Err(Error::Msg(
@@ -334,6 +354,17 @@ pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVi
         embeds.push(emb);
         deepstack.push(ds);
         grids.push(grid);
+    }
+    // SCREENED AFTER THE LOOP, ON PURPOSE. The screen forces evaluation, and this is a
+    // memory-measured surface: `model.rs` already forces every embed exactly here, in one
+    // `mlx_rs::transforms::eval` immediately after `run_vision` returns (sc-19120's staged figures
+    // are taken against that shape). Screening inside the loop would force each reference's tower
+    // graph separately — probably a *lower* peak on a 12-reference `ref2va`, since the per-reference
+    // activations would stop accumulating, but that is an unmeasured change to a declared constant
+    // and this PR is not the place to make it. Here the screen is purely additive: same force point,
+    // same peak, one extra reduction per reference.
+    for emb in &embeds {
+        degeneracy::refuse_if_degenerate("vision tower", emb)?;
     }
     Ok(GroundedVision {
         embeds,
