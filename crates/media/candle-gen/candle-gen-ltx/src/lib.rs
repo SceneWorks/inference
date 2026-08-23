@@ -39,6 +39,7 @@ pub mod connector;
 pub mod conv3d;
 pub mod dit_train;
 pub mod gemma;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod quant;
 pub mod rope;
@@ -758,7 +759,12 @@ impl Pipeline {
         on_progress(Progress::Decoding);
         // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
         // full-video decode that OOMs the worker on large/long outputs.
-        let decoded = comps.vae.decode_budgeted(&vlat)?;
+        let decoded = match memory_strategy::selected_decode_cap(req)? {
+            Some((edge, overlap)) => comps
+                .vae
+                .decode_budgeted_with_spatial_cap(&vlat, edge, overlap)?,
+            None => comps.vae.decode_budgeted(&vlat)?,
+        };
         let images = pipeline::frames_to_images(&decoded)?;
         // Audio decode only when the audio chain is loaded (the dense bundle); the packed MLX tier is
         // video-only (sc-9545) — its audio VAE/vocoder are a separate ingestion slice.
@@ -784,6 +790,7 @@ pub struct LtxGenerator {
     gemma_override: Option<PathBuf>,
     upsampler_override: Option<PathBuf>,
     adapters: Vec<AdapterSpec>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
     components: Mutex<Option<Components>>,
 }
 
@@ -985,6 +992,38 @@ impl Generator for LtxGenerator {
         let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video { frames, fps, audio })
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                gen_core::MemorySafetyDecision::Accept
+            } else {
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID}: loaded route has no calibrated q4 I2V memory contract"
+                    ),
+                }
+            };
+        };
+        memory_strategy::safety_check(contract, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_strategy.as_ref() else {
+            return Ok(None);
+        };
+        memory_strategy::begin_request(contract, self.device.clone(), context)
+    }
 }
 
 /// LTX-2.3 distilled video descriptor — two-stage rectified-flow (no CFG / negative prompt;
@@ -1033,7 +1072,10 @@ pub fn descriptor() -> ModelDescriptor {
             // Derived from the σ table rather than written as `vec![8]`, so re-baking the schedule
             // moves the advertised surface with it instead of leaving a stale literal behind.
             supported_steps: StepSupport::Exact(vec![NATIVE_STEPS]),
-            supported_quants: &[] as &[Quant],
+            // The practical CUDA route is the pre-packed split q4 tier. Dense and q8 remain
+            // loadable compatibility paths but are deliberately not advertised as this provider's
+            // request-scoped I2V memory surface.
+            supported_quants: &[Quant::Q4],
             ..Default::default()
         },
     }
@@ -1269,9 +1311,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         &[gen_core::LTX_SPATIAL_UPSCALER_COMPONENT],
         MODEL_ID,
     )?;
-    if spec.quantize.is_some() {
+    if spec.quantize.is_some() && spec.quantize != Some(Quant::Q4) {
         return Err(gen_core::Error::Unsupported(
-            "candle ltx does not support on-the-fly Q4/Q8 quantization yet".into(),
+            "candle ltx supports only the pre-packed q4 tier; q8/on-the-fly quantization are not a released route".into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -1291,6 +1333,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         .map(|src| match src {
             WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
         });
+    #[cfg(feature = "cuda")]
+    let memory_strategy: Option<gen_core::MemoryProviderContract> =
+        memory_strategy::contract_for_loaded(spec)?.map(|(contract, _tier)| contract);
+    #[cfg(not(feature = "cuda"))]
+    let memory_strategy = None;
     let device = candle_gen::default_device()?;
     Ok(Box::new(LtxGenerator {
         descriptor: descriptor(),
@@ -1299,6 +1346,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         gemma_override,
         upsampler_override,
         adapters: spec.adapters.clone(),
+        memory_strategy,
         components: Mutex::new(None),
     }))
 }
@@ -1312,9 +1360,23 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    let registry = registry.register_generator(REGISTRATION);
+    #[cfg(feature = "cuda")]
+    let registry = registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
+    registry.register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Register the weights-free Candle/CUDA q4 I2V memory surface without requiring CUDA or weights.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle LTX provider catalog.

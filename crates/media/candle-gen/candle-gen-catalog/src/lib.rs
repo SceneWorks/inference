@@ -133,6 +133,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
@@ -3393,6 +3395,11 @@ mod preview_advertising {
             dir: "candle-gen-lens",
             register_providers: candle_gen_lens::register_providers,
             register_surfaces: Some(candle_gen_lens::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-ltx",
+            register_providers: candle_gen_ltx::register_providers,
+            register_surfaces: Some(candle_gen_ltx::register_memory_contract_surfaces),
         },
         MemoryRouteCrate {
             dir: "candle-gen-mage",

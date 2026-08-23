@@ -28,7 +28,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, MemoryBehaviorRoute,
+    MemoryMode, MemoryNumericTier, MemoryRequestScope, MemoryRunOutcome, MemoryStrategy, Precision,
+    Progress, Quant, WeightsSource,
 };
 
 /// Basic per-frame non-degeneracy: the frame is not solid-black / constant (a broken packed forward —
@@ -125,6 +127,92 @@ fn render_tier(env: &str, tag: &str) {
 #[ignore = "needs LTX_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q4_renders_coherent_video() {
     render_tier("LTX_PACKED_Q4", "q4");
+}
+
+/// SC-20772's exact Candle q4 I2V memory cell. This is intentionally separate from the generic
+/// packed render above: it proves the selected bounded-decode request control, fixed-strength
+/// fitted reference, and the actual q4 loader execute together rather than only agreeing in a
+/// weights-free fixture. It is Windows/CUDA-only and deliberately not a calibration run.
+#[test]
+#[ignore = "needs LTX_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
+fn packed_q4_i2v_memory_route_renders() {
+    let dir = std::env::var("LTX_PACKED_Q4")
+        .expect("set LTX_PACKED_Q4 to the packed q4 tier subdirectory");
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(dir)));
+    spec.quantize = Some(Quant::Q4);
+    let generator = candle_gen_ltx::provider_registry()
+        .unwrap()
+        .load("ltx_2_3_distilled", &spec)
+        .expect("ltx q4 generator");
+    let contract = generator
+        .memory_strategy_contract()
+        .expect("the exact q4 split artifact publishes its I2V memory contract");
+    let mut context = candle_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        MemoryStrategy::BoundedDecode,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("image_to_video".into()),
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some("reference:image:768x512:strength:3f800000".into()),
+        },
+    )
+    .expect("q4 bounded decode selection");
+    context.geometry.width = 768;
+    context.geometry.height = 512;
+    context.geometry.frames = 97;
+
+    let mut request = GenerationRequest {
+        prompt: "a red fox walking through snowy pines, slow dolly shot".into(),
+        width: 768,
+        height: 512,
+        count: 1,
+        seed: Some(42),
+        frames: Some(97),
+        fps: Some(24),
+        sampler: Some("euler".into()),
+        conditioning: vec![candle_gen::gen_core::Conditioning::Reference {
+            image: Image {
+                width: 768,
+                height: 512,
+                pixels: vec![127; 768 * 512 * 3],
+            },
+            strength: Some(1.0),
+        }],
+        ..Default::default()
+    };
+    {
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("q4 I2V admission")
+            .expect("memory scope");
+        scope
+            .configure_request(&mut request)
+            .expect("bind request controls");
+        scope
+            .finish(MemoryRunOutcome::Complete)
+            .expect("scope cleanup");
+    }
+    assert!(request
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.tile_vae_decode));
+    let mut on_progress = |_p: Progress| {};
+    let output = generator
+        .generate(&request, &mut on_progress)
+        .expect("q4 I2V render with selected bounded decode");
+    let GenerationOutput::Video { frames, fps, .. } = output else {
+        panic!("expected video");
+    };
+    assert_eq!(fps, 24);
+    assert_eq!(frames.len(), 97);
+    assert_frame_coherent(&frames[0], "q4-i2v#0");
 }
 
 /// The q8 packed tier renders a coherent short video (double-quant Q8_0 path); only runs when the q8
