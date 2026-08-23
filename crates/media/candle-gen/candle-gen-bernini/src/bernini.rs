@@ -591,6 +591,7 @@ pub struct Bernini {
     components: Mutex<Option<Arc<RendererComponents>>>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
+    loaded_spec: LoadSpec,
 }
 
 impl Bernini {
@@ -599,12 +600,27 @@ impl Bernini {
     /// both mmap + upload ~50 GB (F-097).
     fn components(&self) -> CResult<Arc<RendererComponents>> {
         candle_gen::cached(&self.components, || {
-            Ok(Arc::new(RendererComponents::load(
-                &self.root,
-                &self.device,
-                MODEL_ID,
-                &self.adapters,
-            )?))
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let components =
+                RendererComponents::load(&self.root, &self.device, MODEL_ID, &self.adapters)?;
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            Ok(Arc::new(components))
         })
     }
 }
@@ -648,6 +664,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         components: Mutex::new(None),
         memory_strategy,
         memory_tier,
+        loaded_spec: spec.clone(),
     }))
 }
 

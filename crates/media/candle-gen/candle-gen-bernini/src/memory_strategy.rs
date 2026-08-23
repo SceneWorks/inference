@@ -8,11 +8,12 @@
 //! intentionally absent until the Windows/CUDA real-weight campaign exists.
 
 use candle_gen::candle_core::Device;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use candle_gen::gen_core::weightsmeta::{Dtype, SafetensorsTensorHeader};
 use candle_gen::gen_core::LoadShape;
 use candle_gen::gen_core::{
     self, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -33,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-v2v-v1";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
@@ -73,7 +75,8 @@ enum ComponentPacking {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentReceipt {
-    verified_bytes: u64,
+    resident_bytes: u64,
+    projections: BTreeMap<String, (usize, usize)>,
 }
 
 fn nested_safetensors(path: &Path, depth: usize) -> gen_core::Result<Option<PathBuf>> {
@@ -91,13 +94,46 @@ fn nested_safetensors(path: &Path, depth: usize) -> gen_core::Result<Option<Path
     Ok(None)
 }
 
-/// Inspect exactly the direct safetensors files `component_vb` opens. Recursive byte scans and a
-/// marker alone are not loader evidence: both can be satisfied by a stale or foreign nested file.
-fn component_receipt(
+fn tensor_elements(component: &str, tensor: &SafetensorsTensorHeader) -> gen_core::Result<u64> {
+    let elements = tensor.shape.iter().try_fold(1_u64, |total, &dimension| {
+        total
+            .checked_mul(u64::try_from(dimension).map_err(|_| {
+                gen_core::Error::Msg(format!(
+                    "Bernini {component} tensor {} has an unrepresentable dimension",
+                    tensor.name
+                ))
+            })?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "Bernini {component} tensor {} element count overflow",
+                    tensor.name
+                ))
+            })
+    })?;
+    let stored = elements
+        .checked_mul(tensor.dtype.size() as u64)
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "Bernini {component} tensor {} stored byte count overflow",
+                tensor.name
+            ))
+        })?;
+    if stored != tensor.data_bytes {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} tensor {} declares {} bytes but its dtype/shape require {stored}",
+            tensor.name, tensor.data_bytes
+        )));
+    }
+    Ok(elements)
+}
+
+/// Inspect exactly the direct safetensors shards `component_vb` opens, with later shards winning
+/// duplicate keys. The generic weightsmeta directory helper is recursive and is therefore not
+/// load-exact for this provider.
+fn component_headers(
     root: &Path,
     component: &str,
-    expected: ComponentPacking,
-) -> gen_core::Result<ComponentReceipt> {
+) -> gen_core::Result<BTreeMap<String, SafetensorsTensorHeader>> {
     let path = root.join(component);
     if let Some(foreign) = nested_safetensors(&path, 0)? {
         return Err(gen_core::Error::Unsupported(format!(
@@ -105,91 +141,207 @@ fn component_receipt(
             foreign.display()
         )));
     }
-    let mut direct_files = Vec::new();
-    for entry in std::fs::read_dir(&path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "safetensors")
-        {
-            direct_files.push(entry.path());
-        }
-    }
-    direct_files.sort();
-    if direct_files.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "Bernini Candle memory contract requires direct {component} safetensors files at {}",
+    let direct_files = candle_gen::sorted_safetensors(&path, component).map_err(|error| {
+        gen_core::Error::Unsupported(format!(
+            "Bernini {component} direct artifacts at {} are not loadable: {error}",
             path.display()
-        )));
-    }
-
-    let mut names = BTreeSet::new();
-    let mut verified_bytes = 0_u64;
-    for file in &direct_files {
-        let raw = std::fs::read(file)?;
-        let parsed = safetensors::SafeTensors::deserialize(&raw).map_err(|error| {
-            gen_core::Error::Unsupported(format!(
-                "Bernini {component} direct artifact {} is not safetensors: {error}",
-                file.display()
-            ))
-        })?;
-        verified_bytes = verified_bytes
-            .checked_add(u64::try_from(raw.len()).map_err(|_| {
-                gen_core::Error::Msg(format!("Bernini {component} byte length overflow"))
-            })?)
-            .ok_or_else(|| {
-                gen_core::Error::Msg(format!("Bernini {component} byte total overflow"))
+        ))
+    })?;
+    let mut tensors = BTreeMap::new();
+    for file in direct_files {
+        let headers =
+            gen_core::weightsmeta::safetensors_path_tensor_headers(&file).map_err(|error| {
+                gen_core::Error::Unsupported(format!(
+                    "Bernini {component} direct artifact {} is not safetensors: {error}",
+                    file.display()
+                ))
             })?;
-        names.extend(parsed.tensors().into_iter().map(|(name, _)| name));
-    }
-    if verified_bytes == 0 {
-        return Err(gen_core::Error::Unsupported(format!(
-            "Bernini {component} direct safetensors are empty"
-        )));
-    }
-
-    let scale_names = names
-        .iter()
-        .filter(|name| name.ends_with(".scales"))
-        .cloned()
-        .collect::<Vec<_>>();
-    for scales in &scale_names {
-        let base = scales.trim_end_matches(".scales");
-        if !names.contains(&format!("{base}.weight")) || !names.contains(&format!("{base}.biases"))
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini {component} has orphan/incomplete packed evidence at {scales}"
-            )));
+        for tensor in headers {
+            tensor_elements(component, &tensor)?;
+            tensors.insert(tensor.name.clone(), tensor);
         }
     }
-    let marker = quant_marker(root, component)?;
-    let loader_packed = if matches!(component, "transformer" | "transformer_2") {
-        names.contains("proj_out.scales")
-    } else {
-        !scale_names.is_empty()
-    };
-    let packing = match (loader_packed, marker) {
-        (false, None | Some(0)) if scale_names.is_empty() => ComponentPacking::Dense,
-        (true, Some(4)) => ComponentPacking::Q4,
-        (true, Some(8)) => ComponentPacking::Q8,
-        _ => {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini {component} packing evidence is mixed or inconsistent: loader_packed={loader_packed}, scales={}, marker={marker:?}",
-                scale_names.len()
-            )))
-        }
-    };
-    if packing != expected {
+    if tensors.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
-            "Bernini {component} loads as {packing:?}, crossed requested tier {expected:?}"
+            "Bernini {component} direct safetensors contain no tensors"
         )));
     }
-    Ok(ComponentReceipt { verified_bytes })
+    Ok(tensors)
 }
 
-fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<u8>> {
+fn packed_bits(
+    component: &str,
+    base: &str,
+    weight: &SafetensorsTensorHeader,
+    scales: &SafetensorsTensorHeader,
+) -> gen_core::Result<ComponentPacking> {
+    let [_, packed_columns] = weight.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} packed {base}.weight must be rank-2 U32 codes"
+        )));
+    };
+    let [_, scale_columns] = scales.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} packed {base}.scales must be rank-2"
+        )));
+    };
+    let input = scale_columns.checked_mul(PACK_GROUP_SIZE).ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "Bernini {component} packed {base} input width overflow"
+        ))
+    })?;
+    let encoded = packed_columns.checked_mul(32).ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "Bernini {component} packed {base} code width overflow"
+        ))
+    })?;
+    if input == 0 || !encoded.is_multiple_of(input) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} packed {base} has inconsistent U32/scales geometry"
+        )));
+    }
+    match encoded / input {
+        4 => Ok(ComponentPacking::Q4),
+        8 => Ok(ComponentPacking::Q8),
+        bits => Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} packed {base} encodes unsupported Q{bits}"
+        ))),
+    }
+}
+
+/// Project one direct component into the bytes the loader actually retains. Dense source tensors
+/// are cast to the component's load dtype. Affine U32/scales/biases triples are validated at group
+/// 64, derive their tier from geometry, and are priced as the GGML Q4_1/Q8_0 tensors Candle builds;
+/// the transient safetensors payload is never charged as resident memory.
+fn component_receipt(
+    root: &Path,
+    component: &str,
+    expected: ComponentPacking,
+    float_bytes: u64,
+) -> gen_core::Result<ComponentReceipt> {
+    let tensors = component_headers(root, component)?;
+
+    let mut packed_bases = BTreeSet::new();
+    let mut derived_packing = None;
+    let mut resident_bytes = 0_u64;
+    let mut projections = BTreeMap::new();
+    for scales in tensors
+        .values()
+        .filter(|tensor| tensor.name.ends_with(".scales"))
+    {
+        let base = scales.name.trim_end_matches(".scales");
+        let weight = tensors.get(&format!("{base}.weight")).ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "Bernini {component} has orphan packed scales {}",
+                scales.name
+            ))
+        })?;
+        let biases = tensors.get(&format!("{base}.biases")).ok_or_else(|| {
+            gen_core::Error::Unsupported(format!("Bernini {component} packed {base} has no biases"))
+        })?;
+        if weight.dtype != Dtype::U32
+            || !matches!(scales.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+            || !matches!(biases.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini {component} packed {base} requires U32 codes and F16/BF16/F32 scales/biases"
+            )));
+        }
+        let packing = packed_bits(component, base, weight, scales)?;
+        if derived_packing
+            .replace(packing)
+            .is_some_and(|prior| prior != packing)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini {component} mixes Q4 and Q8 packed geometry"
+            )));
+        }
+        let projected = candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+            weight,
+            scales,
+            biases,
+            PACK_GROUP_SIZE,
+        )?;
+        resident_bytes = resident_bytes.checked_add(projected).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "Bernini {component} packed resident byte total overflow"
+            ))
+        })?;
+        let [output, scale_columns] = scales.shape.as_slice() else {
+            unreachable!("packed_bits validated rank")
+        };
+        projections.insert(base.to_owned(), (*output, scale_columns * PACK_GROUP_SIZE));
+        packed_bases.insert(base.to_owned());
+    }
+    for tensor in tensors.values() {
+        if tensor.name.ends_with(".scales") || tensor.name.ends_with(".biases") {
+            let base = tensor
+                .name
+                .trim_end_matches(".scales")
+                .trim_end_matches(".biases");
+            if !packed_bases.contains(base) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "Bernini {component} has an orphan packed leaf {}",
+                    tensor.name
+                )));
+            }
+            continue;
+        }
+        if let Some(base) = tensor.name.strip_suffix(".weight") {
+            if packed_bases.contains(base) {
+                continue;
+            }
+        }
+        if !tensor.is_float() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "Bernini {component} ordinary tensor {} must use floating storage; only validated packed weights may be U32",
+                tensor.name
+            )));
+        }
+        let projected = tensor_elements(component, tensor)?
+            .checked_mul(float_bytes)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "Bernini {component} tensor {} projected byte count overflow",
+                    tensor.name
+                ))
+            })?;
+        resident_bytes = resident_bytes.checked_add(projected).ok_or_else(|| {
+            gen_core::Error::Msg(format!("Bernini {component} resident byte total overflow"))
+        })?;
+        if let [output, input] = tensor.shape.as_slice() {
+            if tensor.name.ends_with(".weight") {
+                projections.insert(
+                    tensor.name.trim_end_matches(".weight").to_owned(),
+                    (*output, *input),
+                );
+            }
+        }
+    }
+    let actual = derived_packing.unwrap_or(ComponentPacking::Dense);
+    let marker = quant_marker(root, component)?;
+    if marker != derived_packing {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} quantize_config disagrees with direct tensor geometry: marker={marker:?}, actual={derived_packing:?}"
+        )));
+    }
+    if actual != expected {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} loads as {actual:?}, crossed requested tier {expected:?}"
+        )));
+    }
+    if resident_bytes == 0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {component} has zero projected resident bytes"
+        )));
+    }
+    Ok(ComponentReceipt {
+        resident_bytes,
+        projections,
+    })
+}
+
+fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<ComponentPacking>> {
     let path = root.join(component).join("quantize_config.json");
     if !path.is_file() {
         return Ok(None);
@@ -207,12 +359,25 @@ fn quant_marker(root: &Path, component: &str) -> gen_core::Result<Option<u8>> {
         .ok_or_else(|| {
             gen_core::Error::Unsupported(format!("{}: quant marker has no bits", path.display()))
         })?;
-    u8::try_from(bits).map(Some).map_err(|_| {
-        gen_core::Error::Unsupported(format!(
-            "{}: quant marker bits {bits} is out of range",
+    let group = value
+        .get("quantization")
+        .and_then(|quantization| quantization.get("group_size"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(PACK_GROUP_SIZE as u64);
+    if group != PACK_GROUP_SIZE as u64 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: quant marker group size {group} disagrees with loader group {PACK_GROUP_SIZE}",
             path.display()
-        ))
-    })
+        )));
+    }
+    match bits {
+        4 => Ok(Some(ComponentPacking::Q4)),
+        8 => Ok(Some(ComponentPacking::Q8)),
+        _ => Err(gen_core::Error::Unsupported(format!(
+            "{}: quant marker bits {bits} must be 4 or 8",
+            path.display()
+        ))),
+    }
 }
 
 fn expected_packing(spec: &LoadSpec) -> gen_core::Result<ComponentPacking> {
@@ -234,7 +399,8 @@ struct AdapterLoadReceipt {
     scale_bits: u32,
     pass_scale_bits: Option<Vec<u32>>,
     expert: Option<gen_core::MoeExpert>,
-    verified_bytes: u64,
+    artifact_bytes: u64,
+    applied_f32_bytes: u64,
 }
 
 impl AdapterLoadReceipt {
@@ -256,17 +422,21 @@ impl AdapterLoadReceipt {
             },
         );
         format!(
-            "artifact=safetensors;path_hex={path_hex};digest=sha256:{};kind={:?};scale_bits={:08x};pass_scale_bits={pass_scales};expert={:?};verified_bytes={};stable=true",
+            "artifact=safetensors;path_hex={path_hex};digest=sha256:{};kind={:?};scale_bits={:08x};pass_scale_bits={pass_scales};expert={:?};artifact_bytes={};applied_f32_bytes={};stable=true",
             self.digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             self.kind,
             self.scale_bits,
             self.expert,
-            self.verified_bytes
+            self.artifact_bytes,
+            self.applied_f32_bytes
         )
     }
 }
 
-fn read_adapter_receipt(adapter: &gen_core::AdapterSpec) -> gen_core::Result<AdapterLoadReceipt> {
+fn read_adapter_receipt(
+    adapter: &gen_core::AdapterSpec,
+    projection_sets: &[&BTreeMap<String, (usize, usize)>],
+) -> gen_core::Result<AdapterLoadReceipt> {
     if adapter
         .path
         .extension()
@@ -300,19 +470,21 @@ fn read_adapter_receipt(adapter: &gen_core::AdapterSpec) -> gen_core::Result<Ada
             canonical_path.display()
         )));
     }
-    let parsed = safetensors::SafeTensors::deserialize(&bytes).map_err(|error| {
+    safetensors::SafeTensors::deserialize(&bytes).map_err(|error| {
         gen_core::Error::Unsupported(format!(
             "Bernini adapter {} is not loadable safetensors: {error}",
             canonical_path.display()
         ))
     })?;
-    let tensor_bytes = parsed
-        .tensors()
-        .into_iter()
-        .try_fold(0_u64, |total, (_, tensor)| {
-            total.checked_add(u64::try_from(tensor.data().len()).ok()?)
-        })
-        .ok_or_else(|| gen_core::Error::Msg("Bernini adapter tensor bytes overflow".into()))?;
+    let applied_f32_bytes = projection_sets
+        .iter()
+        .try_fold(0_u64, |total, projections| {
+            let bytes = candle_gen_wan::adapters::applied_factor_f32_bytes(adapter, projections)
+                .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+            total.checked_add(bytes).ok_or_else(|| {
+                gen_core::Error::Msg("Bernini adapter retained F32 bytes overflow".into())
+            })
+        })?;
     let verified_again = std::fs::read(&canonical_path)?;
     if verified_again != bytes {
         return Err(gen_core::Error::Unsupported(format!(
@@ -341,27 +513,37 @@ fn read_adapter_receipt(adapter: &gen_core::AdapterSpec) -> gen_core::Result<Ada
             .as_ref()
             .map(|scales| scales.iter().map(|scale| scale.to_bits()).collect()),
         expert: adapter.moe_expert,
-        // The packed additive path keeps tensor payloads on the expert device, not the container
-        // header. Charging the parsed payload is the exact independent resident quantity.
-        verified_bytes: tensor_bytes,
+        artifact_bytes: u64::try_from(bytes.len())
+            .map_err(|_| gen_core::Error::Msg("Bernini adapter artifact bytes overflow".into()))?,
+        applied_f32_bytes,
     })
 }
 
-fn adapter_identity(spec: &LoadSpec, packing: ComponentPacking) -> gen_core::Result<(u64, String)> {
+fn adapter_identity(
+    spec: &LoadSpec,
+    packing: ComponentPacking,
+    high_projections: &BTreeMap<String, (usize, usize)>,
+    low_projections: &BTreeMap<String, (usize, usize)>,
+) -> gen_core::Result<(u64, String)> {
     if spec.adapters.is_empty() {
         return Ok((0, String::new()));
     }
     let mut total = 0_u64;
     let mut identities = Vec::with_capacity(spec.adapters.len());
     for adapter in &spec.adapters {
-        let receipt = read_adapter_receipt(adapter)?;
+        let projection_sets = match (packing, adapter.moe_expert) {
+            (ComponentPacking::Dense, _) => Vec::new(),
+            (_, None) => vec![high_projections, low_projections],
+            (_, Some(gen_core::MoeExpert::High)) => vec![high_projections],
+            (_, Some(gen_core::MoeExpert::Low)) => vec![low_projections],
+        };
+        let receipt = read_adapter_receipt(adapter, &projection_sets)?;
         // Dense adapters are folded into each expert's base map and leave no independent resident
         // allocation. Packed tiers keep an additive residual alive; shared adapters are installed
         // on both loaded experts, while an expert-targeted one is installed once.
         if packing != ComponentPacking::Dense {
-            let loaded_experts = if receipt.expert.is_none() { 2 } else { 1 };
             total = total
-                .checked_add(receipt.verified_bytes.saturating_mul(loaded_experts))
+                .checked_add(receipt.applied_f32_bytes)
                 .ok_or_else(|| {
                     gen_core::Error::Msg("Bernini adapter resident bytes overflow".into())
                 })?;
@@ -512,25 +694,28 @@ fn production_assets(
     }
     let expected = expected_packing(spec)?;
     let conditioning =
-        component_receipt(root, "text_encoder", ComponentPacking::Dense)?.verified_bytes;
-    let transformer = component_receipt(root, "transformer", expected)?
-        .verified_bytes
-        .checked_add(component_receipt(root, "transformer_2", expected)?.verified_bytes)
+        component_receipt(root, "text_encoder", ComponentPacking::Dense, 4)?.resident_bytes;
+    let high = component_receipt(root, "transformer", expected, 2)?;
+    let low = component_receipt(root, "transformer_2", expected, 2)?;
+    let transformer = high
+        .resident_bytes
+        .checked_add(low.resident_bytes)
         .ok_or_else(|| gen_core::Error::Msg("Bernini transformer bytes overflow".into()))?;
-    let decoder = component_receipt(root, "vae", ComponentPacking::Dense)?.verified_bytes;
+    let decoder = component_receipt(root, "vae", ComponentPacking::Dense, 4)?.resident_bytes;
     let planner = if provider_id == crate::bernini::MODEL_ID {
-        let mllm = component_receipt(root, "mllm", expected)?.verified_bytes;
+        let mllm = component_receipt(root, "mllm", expected, 2)?.resident_bytes;
         let connector =
-            component_receipt(root, "connector", ComponentPacking::Dense)?.verified_bytes;
+            component_receipt(root, "connector", ComponentPacking::Dense, 2)?.resident_bytes;
         let vit_decoder =
-            component_receipt(root, "vit_decoder", ComponentPacking::Dense)?.verified_bytes;
+            component_receipt(root, "vit_decoder", ComponentPacking::Dense, 2)?.resident_bytes;
         mllm.checked_add(connector)
             .and_then(|total| total.checked_add(vit_decoder))
             .ok_or_else(|| gen_core::Error::Msg("Bernini planner bytes overflow".into()))?
     } else {
         0
     };
-    let (overlay_bytes, overlay_identity) = adapter_identity(spec, expected)?;
+    let (overlay_bytes, overlay_identity) =
+        adapter_identity(spec, expected, &high.projections, &low.projections)?;
     let facts = MemoryAssetFacts {
         base_bytes: conditioning
             .checked_add(planner)
@@ -560,6 +745,25 @@ pub fn memory_strategy_contract(
 ) -> gen_core::Result<MemoryProviderContract> {
     let (facts, _tier, adapter_identity) = production_assets(provider_id, spec)?;
     Ok(contract(provider_id, spec, None, facts, adapter_identity))
+}
+
+/// Recompute the load-exact contract immediately around the lazy component load. A caller may keep
+/// the same adapter path while replacing its contents after provider construction; that path must
+/// never execute new bytes under the old receipt.
+pub fn validate_loaded_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    expected_contract: &MemoryProviderContract,
+    expected_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    let (facts, actual_tier, adapter_identity) = production_assets(provider_id, spec)?;
+    let actual_contract = contract(provider_id, spec, None, facts, adapter_identity);
+    if actual_tier != expected_tier || actual_contract != *expected_contract {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini {provider_id} lazy-load artifacts changed after the memory contract was sealed"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
@@ -924,32 +1128,90 @@ pub fn register_memory_strategy(
 mod tests {
     use super::*;
 
-    fn write_safetensors(path: &Path, names: &[&str]) {
-        let bytes = [0_u8; 4];
-        let tensors = names
+    fn write_tensor_file(
+        path: &Path,
+        tensors: &[(&str, safetensors::Dtype, Vec<usize>)],
+        metadata: Option<std::collections::HashMap<String, String>>,
+    ) {
+        let owned = tensors
             .iter()
-            .map(|name| {
+            .map(|(name, dtype, shape)| {
+                let elements = shape.iter().product::<usize>();
                 (
                     (*name).to_owned(),
-                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &bytes)
-                        .unwrap(),
+                    *dtype,
+                    shape.clone(),
+                    vec![0_u8; (elements * dtype.bitsize()).div_ceil(8)],
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        safetensors::serialize_to_file(tensors, None, path).unwrap();
+            .collect::<Vec<_>>();
+        let views = owned
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (
+                    name.clone(),
+                    safetensors::tensor::TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        safetensors::serialize_to_file(views, metadata, path).unwrap();
     }
 
-    fn write_component(root: &Path, component: &str, packing: ComponentPacking) {
+    fn write_component_with_marker(
+        root: &Path,
+        component: &str,
+        packing: ComponentPacking,
+        marker: ComponentPacking,
+    ) {
         let dir = root.join(component);
         std::fs::create_dir_all(&dir).unwrap();
-        let names = match packing {
-            ComponentPacking::Dense => vec!["proj_out.weight"],
+        let path = dir.join("model.safetensors");
+        match packing {
+            ComponentPacking::Dense => write_tensor_file(
+                &path,
+                &[
+                    ("proj_out.weight", safetensors::Dtype::F16, vec![2, 64]),
+                    (
+                        "blocks.0.attn1.to_q.weight",
+                        safetensors::Dtype::BF16,
+                        vec![2, 64],
+                    ),
+                ],
+                None,
+            ),
             ComponentPacking::Q4 | ComponentPacking::Q8 => {
-                vec!["proj_out.weight", "proj_out.scales", "proj_out.biases"]
+                let columns = if packing == ComponentPacking::Q4 {
+                    8
+                } else {
+                    16
+                };
+                write_tensor_file(
+                    &path,
+                    &[
+                        ("proj_out.weight", safetensors::Dtype::U32, vec![2, columns]),
+                        ("proj_out.scales", safetensors::Dtype::F16, vec![2, 1]),
+                        ("proj_out.biases", safetensors::Dtype::BF16, vec![2, 1]),
+                        (
+                            "blocks.0.attn1.to_q.weight",
+                            safetensors::Dtype::U32,
+                            vec![2, columns],
+                        ),
+                        (
+                            "blocks.0.attn1.to_q.scales",
+                            safetensors::Dtype::BF16,
+                            vec![2, 1],
+                        ),
+                        (
+                            "blocks.0.attn1.to_q.biases",
+                            safetensors::Dtype::F32,
+                            vec![2, 1],
+                        ),
+                    ],
+                    None,
+                );
             }
-        };
-        write_safetensors(&dir.join("model.safetensors"), &names);
-        let bits = match packing {
+        }
+        let bits = match marker {
             ComponentPacking::Dense => None,
             ComponentPacking::Q4 => Some(4),
             ComponentPacking::Q8 => Some(8),
@@ -963,6 +1225,10 @@ mod tests {
         }
     }
 
+    fn write_component(root: &Path, component: &str, packing: ComponentPacking) {
+        write_component_with_marker(root, component, packing, packing);
+    }
+
     fn write_full_snapshot(root: &Path, packing: ComponentPacking) {
         for component in ["text_encoder", "connector", "vit_decoder", "vae"] {
             write_component(root, component, ComponentPacking::Dense);
@@ -970,6 +1236,36 @@ mod tests {
         for component in ["transformer", "transformer_2", "mllm"] {
             write_component(root, component, packing);
         }
+    }
+
+    fn write_lora(path: &Path, dtype: safetensors::Dtype, extra_unknown: bool) {
+        let mut tensors = vec![
+            ("blocks.0.attn1.to_q.lora_A.weight", dtype, vec![2, 64]),
+            ("blocks.0.attn1.to_q.lora_B.weight", dtype, vec![2, 2]),
+        ];
+        if extra_unknown {
+            tensors.push(("text_encoder.unused.weight", dtype, vec![128, 128]));
+        }
+        write_tensor_file(path, &tensors, None);
+    }
+
+    fn write_lokr(path: &Path, dtype: safetensors::Dtype) {
+        write_tensor_file(
+            path,
+            &[
+                ("blocks.0.attn1.to_q.lokr_w1", dtype, vec![1, 8]),
+                ("blocks.0.attn1.to_q.lokr_w2", dtype, vec![2, 8]),
+            ],
+            Some(std::collections::HashMap::from([
+                ("networkType".to_owned(), "lokr".to_owned()),
+                ("rank".to_owned(), "2".to_owned()),
+                ("alpha".to_owned(), "2".to_owned()),
+            ])),
+        );
+    }
+
+    fn fixture_projections() -> BTreeMap<String, (usize, usize)> {
+        BTreeMap::from([("blocks.0.attn1.to_q".to_owned(), (2, 64))])
     }
 
     #[test]
@@ -1102,23 +1398,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_full_snapshot(root.path(), ComponentPacking::Q4);
         let adapter = root.path().join("adapter.safetensors");
-        write_safetensors(&adapter, &["blocks.0.attn.lora_A.weight"]);
+        write_lora(&adapter, safetensors::Dtype::F16, true);
         let high_adapter = root.path().join("high-adapter.safetensors");
-        write_safetensors(&high_adapter, &["blocks.0.attn.lokr_w1"]);
-        let adapter_bytes = read_adapter_receipt(&gen_core::AdapterSpec::new(
-            adapter.clone(),
-            0.5,
-            gen_core::AdapterKind::Lora,
-        ))
+        write_lokr(&high_adapter, safetensors::Dtype::BF16);
+        let projections = fixture_projections();
+        let adapter_bytes = read_adapter_receipt(
+            &gen_core::AdapterSpec::new(adapter.clone(), 0.5, gen_core::AdapterKind::Lora),
+            &[&projections, &projections],
+        )
         .unwrap()
-        .verified_bytes;
-        let high_bytes = read_adapter_receipt(&gen_core::AdapterSpec::new(
-            high_adapter.clone(),
-            1.0,
-            gen_core::AdapterKind::Lokr,
-        ))
+        .applied_f32_bytes;
+        let high_bytes = read_adapter_receipt(
+            &gen_core::AdapterSpec::new(high_adapter.clone(), 1.0, gen_core::AdapterKind::Lokr),
+            &[&projections],
+        )
         .unwrap()
-        .verified_bytes;
+        .applied_f32_bytes;
+        assert_eq!(adapter_bytes, 1_056, "F16 shared factors retain F32 twice");
+        assert_eq!(
+            high_bytes, 96,
+            "BF16 LoKr factors retain their built F32 form"
+        );
         let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
             .with_quant(gen_core::Quant::Q4);
         spec.adapters = vec![
@@ -1135,15 +1435,16 @@ mod tests {
         assert_eq!(contract.calibration, None);
         assert_eq!(
             contract.asset_facts.overlay_bytes,
-            adapter_bytes * 2 + high_bytes
+            adapter_bytes + high_bytes
         );
         assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
         assert!(contract.resident_components().iter().any(|component| {
             component.kind == MemoryComponentKind::AdapterStack
-                && component.resident_bytes == adapter_bytes * 2 + high_bytes
+                && component.resident_bytes == adapter_bytes + high_bytes
                 && component.id.contains("digest=sha256:")
                 && component.id.contains("scale_bits=3f000000")
                 && component.id.contains("expert=Some(High)")
+                && component.id.contains("applied_f32_bytes=")
         }));
         let stale = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
         assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &stale).is_err());
@@ -1153,14 +1454,18 @@ mod tests {
     fn adapter_receipt_binds_every_load_knob_and_post_read_artifact() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("adapter.safetensors");
-        write_safetensors(&path, &["blocks.0.attn.lora_A.weight"]);
+        write_lora(&path, safetensors::Dtype::F16, false);
+        let projections = fixture_projections();
         let base =
             gen_core::AdapterSpec::new(path.clone(), 0.123_456_79, gen_core::AdapterKind::Lora);
-        let base_id = read_adapter_receipt(&base).unwrap().identity();
+        let base_id = read_adapter_receipt(&base, &[&projections])
+            .unwrap()
+            .identity();
         assert!(base_id.contains(&format!("scale_bits={:08x}", base.scale.to_bits())));
         assert!(base_id.contains("pass_scale_bits=none"));
         assert!(base_id.contains("expert=None"));
-        assert!(base_id.contains("verified_bytes="));
+        assert!(base_id.contains("artifact_bytes="));
+        assert!(base_id.contains("applied_f32_bytes=528"));
         assert!(base_id.contains("stable=true"));
 
         let mut crossed_scale = base.clone();
@@ -1171,9 +1476,14 @@ mod tests {
         let mut crossed_kind = base.clone();
         crossed_kind.kind = gen_core::AdapterKind::Lokr;
         for crossed in [&crossed_scale, &crossed_pass, &crossed_high, &crossed_kind] {
-            assert_ne!(read_adapter_receipt(crossed).unwrap().identity(), base_id);
+            let result = read_adapter_receipt(crossed, &[&projections]);
+            if crossed.kind == gen_core::AdapterKind::Lokr {
+                assert!(result.is_err(), "kind/file disagreement must fail closed");
+            } else {
+                assert_ne!(result.unwrap().identity(), base_id);
+            }
         }
-        assert!(read_adapter_receipt(&crossed_pass)
+        assert!(read_adapter_receipt(&crossed_pass, &[&projections])
             .unwrap()
             .identity()
             .contains(&format!(
@@ -1184,27 +1494,45 @@ mod tests {
 
         // A post-receipt artifact mutation cannot borrow the old identity, even when the file stays
         // valid safetensors and happens to retain the same filesystem path.
-        write_safetensors(
-            &path,
-            &["blocks.0.attn.lora_B.weight", "blocks.1.attn.lora_B.weight"],
-        );
-        let mutated_id = read_adapter_receipt(&base).unwrap().identity();
+        write_lora(&path, safetensors::Dtype::BF16, true);
+        let mutated_id = read_adapter_receipt(&base, &[&projections])
+            .unwrap()
+            .identity();
         assert_ne!(mutated_id, base_id);
-        assert!(mutated_id.contains("verified_bytes=8"));
+        assert!(mutated_id.contains("applied_f32_bytes=528"));
+
+        let unapplied = root.path().join("unapplied.safetensors");
+        write_tensor_file(
+            &unapplied,
+            &[(
+                "unknown.branch.weight",
+                safetensors::Dtype::F16,
+                vec![64, 64],
+            )],
+            None,
+        );
+        let unapplied = gen_core::AdapterSpec::new(unapplied, 1.0, gen_core::AdapterKind::Lora);
+        assert!(
+            read_adapter_receipt(&unapplied, &[&projections]).is_err(),
+            "a valid adapter container with no factors applied to the selected expert must fail closed"
+        );
 
         let second = root.path().join("second.safetensors");
-        write_safetensors(&second, &["blocks.1.attn.lora_A.weight"]);
+        write_lora(&second, safetensors::Dtype::BF16, false);
         let mut stack = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
         stack.adapters = vec![
             base,
             gen_core::AdapterSpec::new(second, 1.0, gen_core::AdapterKind::Lora)
                 .with_moe_expert(gen_core::MoeExpert::Low),
         ];
-        let (_, multi) = adapter_identity(&stack, ComponentPacking::Q4).unwrap();
+        let (_, multi) =
+            adapter_identity(&stack, ComponentPacking::Q4, &projections, &projections).unwrap();
         assert_eq!(
-            adapter_identity(&stack, ComponentPacking::Q4).unwrap().0,
-            20,
-            "shared payload is installed on both experts and Low-targeted payload once"
+            adapter_identity(&stack, ComponentPacking::Q4, &projections, &projections)
+                .unwrap()
+                .0,
+            1_584,
+            "shared retained f32 factors are installed on both experts and Low-targeted factors once"
         );
         assert_eq!(multi.matches("artifact=safetensors").count(), 2);
         assert!(multi.contains("expert=Some(Low)"));
@@ -1216,8 +1544,8 @@ mod tests {
         write_full_snapshot(root.path(), ComponentPacking::Dense);
         let shared = root.path().join("shared.safetensors");
         let low = root.path().join("low.safetensors");
-        write_safetensors(&shared, &["blocks.0.attn.lora_A.weight"]);
-        write_safetensors(&low, &["blocks.0.attn.lora_B.weight"]);
+        write_lora(&shared, safetensors::Dtype::F16, true);
+        write_lokr(&low, safetensors::Dtype::BF16);
         let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()));
         spec.adapters = vec![
             gen_core::AdapterSpec::new(shared, 0.75, gen_core::AdapterKind::Lora),
@@ -1258,7 +1586,11 @@ mod tests {
         write_component(root.path(), "transformer", ComponentPacking::Q4);
         let nested = root.path().join("transformer/foreign");
         std::fs::create_dir_all(&nested).unwrap();
-        write_safetensors(&nested.join("model.safetensors"), &["proj_out.scales"]);
+        write_tensor_file(
+            &nested.join("model.safetensors"),
+            &[("proj_out.scales", safetensors::Dtype::F16, vec![2, 1])],
+            None,
+        );
         assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
         std::fs::remove_dir_all(nested).unwrap();
 
@@ -1274,5 +1606,74 @@ mod tests {
         write_component(root.path(), "transformer_2", ComponentPacking::Q8);
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
+    }
+
+    #[test]
+    fn packed_tier_and_resident_bytes_come_from_tensor_geometry_not_the_marker() {
+        let q4 = tempfile::tempdir().unwrap();
+        write_full_snapshot(q4.path(), ComponentPacking::Q4);
+        let q4_spec = LoadSpec::new(gen_core::WeightsSource::Dir(q4.path().to_owned()))
+            .with_quant(gen_core::Quant::Q4);
+        let (q4_contract, q4_tier) = contract_for_loaded(&q4_spec, crate::pipeline::MODEL_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q4_tier.quant, Some(gen_core::Quant::Q4));
+        assert_eq!(q4_contract.asset_facts.transformer_bytes, 320);
+
+        let q8 = tempfile::tempdir().unwrap();
+        write_full_snapshot(q8.path(), ComponentPacking::Q8);
+        let q8_spec = LoadSpec::new(gen_core::WeightsSource::Dir(q8.path().to_owned()))
+            .with_quant(gen_core::Quant::Q8);
+        let (q8_contract, q8_tier) = contract_for_loaded(&q8_spec, crate::pipeline::MODEL_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q8_tier.quant, Some(gen_core::Quant::Q8));
+        assert_eq!(q8_contract.asset_facts.transformer_bytes, 544);
+        assert!(
+            q8_contract.asset_facts.transformer_bytes > q4_contract.asset_facts.transformer_bytes
+        );
+
+        write_component_with_marker(
+            q8.path(),
+            "transformer",
+            ComponentPacking::Q8,
+            ComponentPacking::Q4,
+        );
+        assert!(memory_strategy_contract(crate::pipeline::MODEL_ID, &q8_spec).is_err());
+        write_component_with_marker(
+            q4.path(),
+            "transformer_2",
+            ComponentPacking::Q4,
+            ComponentPacking::Q8,
+        );
+        assert!(memory_strategy_contract(crate::pipeline::MODEL_ID, &q4_spec).is_err());
+    }
+
+    #[test]
+    fn lazy_load_rejects_post_contract_adapter_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        write_full_snapshot(root.path(), ComponentPacking::Q4);
+        let adapter = root.path().join("adapter.safetensors");
+        write_lora(&adapter, safetensors::Dtype::F16, false);
+        let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
+            .with_quant(gen_core::Quant::Q4);
+        spec.adapters.push(gen_core::AdapterSpec::new(
+            adapter.clone(),
+            0.5,
+            gen_core::AdapterKind::Lora,
+        ));
+        let (sealed, tier) = contract_for_loaded(&spec, crate::pipeline::MODEL_ID)
+            .unwrap()
+            .unwrap();
+        validate_loaded_contract(crate::pipeline::MODEL_ID, &spec, &sealed, tier).unwrap();
+
+        // Same path and still-loadable LoRA, but different bytes after provider construction. The
+        // before/after guard used by the lazy component load compares against the sealed contract.
+        write_lora(&adapter, safetensors::Dtype::BF16, true);
+        let error =
+            validate_loaded_contract(crate::pipeline::MODEL_ID, &spec, &sealed, tier).unwrap_err();
+        assert!(error.to_string().contains("changed after"), "{error}");
+        let refreshed = memory_strategy_contract(crate::pipeline::MODEL_ID, &spec).unwrap();
+        assert_ne!(refreshed, sealed);
     }
 }
