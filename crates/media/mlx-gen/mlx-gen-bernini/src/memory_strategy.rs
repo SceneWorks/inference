@@ -82,6 +82,8 @@ use mlx_gen::gen_core::{
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
 use mlx_gen_wan::config::WanModelConfig;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// The full Bernini pipeline — the provider the SceneWorks `bernini_image` catalog entry resolves to.
 pub const FULL_ID: &str = crate::bernini::MODEL_ID;
@@ -127,6 +129,107 @@ pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
+
+/// Content-independent memory-evidence identity and request-only byte-seal domains.
+pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-v2";
+pub const R2V_REFERENCE_SEAL_DOMAIN: &str = "bernini-r2v-request-seal-v1";
+
+fn is_reference_receipt_axis(axis: &str) -> bool {
+    axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)
+        .is_some_and(|suffix| suffix.starts_with(":backend-mlx:count-"))
+}
+
+fn r2v_images(request: &GenerationRequest) -> CoreResult<&[mlx_gen::gen_core::Image]> {
+    let [mlx_gen::gen_core::Conditioning::MultiReference { images }] =
+        request.conditioning.as_slice()
+    else {
+        return Err(CoreError::Unsupported(
+            "bernini r2v requires exactly one MultiReference carrier and no other conditioning"
+                .to_owned(),
+        ));
+    };
+    if !(1..=8).contains(&images.len()) {
+        return Err(CoreError::Unsupported(format!(
+            "bernini r2v requires 1-8 flattened reference images, got {}",
+            images.len()
+        )));
+    }
+    Ok(images)
+}
+
+/// Bind the content-independent memory shape separately from the request-only byte seal. The two
+/// axes travel together to provider safety, but only the shape axis is eligible for fitted-curve
+/// lookup. This is recomputed at configure so post-admission content mutation is rejected.
+pub fn r2v_reference_receipt(request: &GenerationRequest) -> CoreResult<String> {
+    let images = r2v_images(request)?;
+    let mut request_seal = Sha256::new();
+    request_seal.update(R2V_REFERENCE_SEAL_DOMAIN.as_bytes());
+    let mut entries = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let expected_pixels = u64::from(image.width)
+            .checked_mul(u64::from(image.height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .and_then(|pixels| usize::try_from(pixels).ok())
+            .ok_or_else(|| CoreError::Unsupported("bernini r2v image geometry overflow".into()))?;
+        if image.pixels.len() != expected_pixels {
+            return Err(CoreError::Unsupported(format!(
+                "bernini r2v reference {index} has {} RGB bytes, expected {expected_pixels}",
+                image.pixels.len()
+            )));
+        }
+        let (vit_h, vit_w) = crate::vit_preprocess::smart_resize(
+            i64::from(image.height),
+            i64::from(image.width),
+            crate::vit_preprocess::FACTOR,
+            3136,
+            50176,
+        );
+        let (vae_w, vae_h) = crate::vae_preprocess::resize_dims(
+            i64::from(image.width),
+            i64::from(image.height),
+            crate::vae_preprocess::VAE_MAX_SIZE,
+            crate::vae_preprocess::VAE_MIN_SIZE,
+            crate::vae_preprocess::VAE_STRIDE,
+        );
+        request_seal.update(image.width.to_le_bytes());
+        request_seal.update(image.height.to_le_bytes());
+        request_seal.update(&image.pixels);
+        entries.push(format!(
+            "{index}:native-{}x{};vit-{}x{};vae-{}x{}",
+            image.width, image.height, vit_w, vit_h, vae_w, vae_h
+        ));
+    }
+    Ok(format!(
+        "{R2V_REFERENCE_RECEIPT_DOMAIN}:backend-mlx:count-{}:{}+{R2V_REFERENCE_SEAL_DOMAIN}-{:x}",
+        images.len(),
+        entries.join("|"),
+        request_seal.finalize()
+    ))
+}
+
+fn receipt_count(axis: &str) -> Option<u32> {
+    axis.strip_prefix(R2V_REFERENCE_RECEIPT_DOMAIN)?
+        .strip_prefix(":backend-mlx:count-")?
+        .split_once(':')?
+        .0
+        .parse()
+        .ok()
+}
+
+fn reference_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
+    let axes = overlay?.split('+').collect::<Vec<_>>();
+    let evidence = axes
+        .iter()
+        .copied()
+        .filter(|axis| is_reference_receipt_axis(axis))
+        .collect::<Vec<_>>();
+    let seals = axes
+        .iter()
+        .copied()
+        .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+        .collect::<Vec<_>>();
+    (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
+}
 
 /// Rung 3 — the shared constrained score budget. Bernini does not invent its own.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -485,14 +588,66 @@ pub(crate) fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
-        if context.mode.as_key() != "video_to_video"
-            || context.geometry.reference_count != 1
-            || !context.has_reference
-        {
+        let mode = context.mode.as_key();
+        let axes: Vec<_> = context
+            .overlay
+            .as_deref()
+            .unwrap_or_default()
+            .split('+')
+            .filter(|axis| !axis.is_empty())
+            .collect();
+        let expected_provider_mode = match mode {
+            "video_to_video" if context.geometry.reference_count == 1 => "provider_video_mode:v2v",
+            "reference_to_video" if (1..=8).contains(&context.geometry.reference_count) => {
+                "provider_video_mode:r2v"
+            }
+            _ => {
+                return Err(CoreError::Unsupported(format!(
+                    "{}: Bernini memory evidence covers exact video_to_video/one-clip or \
+                     reference_to_video/1-8-image routes",
+                    contract.provider_id
+                )))
+            }
+        };
+        if !context.has_reference || !axes.contains(&expected_provider_mode) {
             return Err(CoreError::Unsupported(format!(
-                "{}: Bernini memory evidence is scoped to exactly one video_to_video clip",
+                "{}: Bernini memory evidence requires the exact provider task {expected_provider_mode}",
                 contract.provider_id
             )));
+        }
+        let reference_axis = axes
+            .iter()
+            .copied()
+            .find(|axis| is_reference_receipt_axis(axis));
+        let seal_axis = axes
+            .iter()
+            .copied()
+            .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN));
+        let exact_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
+        if mode == "reference_to_video"
+            && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+                || seal_axis.is_none()
+                || exact_receipt.is_none())
+        {
+            return Err(CoreError::Unsupported(format!(
+                "{}: Bernini r2v memory evidence requires an ordered MLX reference receipt for all {} images",
+                contract.provider_id, context.geometry.reference_count
+            )));
+        }
+        if mode == "video_to_video" && (reference_axis.is_some() || seal_axis.is_some()) {
+            return Err(CoreError::Unsupported(
+                "bernini V2V cannot carry an R2V image receipt".to_owned(),
+            ));
+        }
+        if axes.iter().any(|axis| {
+            *axis != expected_provider_mode
+                && !is_reference_receipt_axis(axis)
+                && !axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN)
+        }) {
+            return Err(CoreError::Unsupported(
+                "bernini MLX memory evidence contains an unknown or crossed overlay axis"
+                    .to_owned(),
+            ));
         }
         validate_geometry(context.geometry.width, context.geometry.height)?;
         if !matches!(context.geometry.frames, 45 | 61 | 77) {
@@ -500,25 +655,6 @@ pub(crate) fn safety_check(
                 "{}: Bernini V2V memory evidence covers exactly 45, 61, or 77 frames, got {}",
                 contract.provider_id, context.geometry.frames
             )));
-        }
-        if context.overlay.as_deref().is_some_and(|overlay| {
-            overlay
-                .split('+')
-                .find(|axis| axis.starts_with("provider_video_mode:"))
-                .is_some_and(|axis| axis != "provider_video_mode:v2v")
-        }) {
-            return Err(CoreError::Unsupported(
-                "bernini MLX provider video mode overlay crossed the v2v contract".to_owned(),
-            ));
-        }
-        if context
-            .overlay
-            .as_deref()
-            .is_some_and(|overlay| overlay.contains("adapters:["))
-        {
-            return Err(CoreError::Unsupported(
-                "bernini MLX does not support adapter overlays".to_owned(),
-            ));
         }
         // sc-15839 review defect, Resident+PiD admission. Bernini decodes through the Wan z16 VAE and
         // the crate carries no `mlx-gen-pid` dependency at all, so a PiD selection would silently
@@ -591,25 +727,227 @@ pub(crate) fn safety_check(
         }
         Ok(())
     };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    let loaded_tier = if contract.provider_id != FULL_ID
+        || contract
+            .calibration
+            .as_ref()
+            .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION)
+    {
+        fixture_tier(spec)
+    } else {
+        match resolved_numeric_tier(spec) {
+            Ok(tier) => tier,
+            Err(error) => {
+                return MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    };
+    standard_memory_strategy_safety_check(contract, context, Some(loaded_tier), Some(&route_gate))
 }
 
-/// The numeric tier this generator actually runs.
-///
-/// Every shipped Bernini tier is **pre-packed** — `config.json` carries a `quantization` block and
-/// the loader packed-detects off the on-disk `.scales` — so `LoadSpec::quantize` records the resolved
-/// tier rather than a load-time transform request.
-fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
+fn fixture_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
         component_precision_floors: &[],
     }
+}
+
+fn quant_manifest(path: &std::path::Path) -> CoreResult<Option<(i32, usize)>> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "bernini numeric tier cannot read {}: {error}",
+            path.display()
+        ))
+    })?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CoreError::Unsupported(format!(
+            "bernini numeric tier cannot parse {}: {error}",
+            path.display()
+        ))
+    })?;
+    let Some(quant) = json.get("quantization") else {
+        return Ok(None);
+    };
+    if quant.is_null() {
+        return Ok(None);
+    }
+    let bits = quant.get("bits").and_then(serde_json::Value::as_i64);
+    let group = quant.get("group_size").and_then(serde_json::Value::as_u64);
+    let (Some(bits @ (4 | 8)), Some(64)) = (bits, group) else {
+        return Err(CoreError::Unsupported(format!(
+            "bernini numeric tier requires an exact q4/q8 group-64 quantization manifest in {}",
+            path.display()
+        )));
+    };
+    Ok(Some((bits as i32, 64)))
+}
+
+fn packed_header_bits(path: &std::path::Path, group_size: usize) -> CoreResult<Option<i32>> {
+    use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype};
+
+    let headers = safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<BTreeMap<_, _>>();
+    let packed_bases = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .collect::<Vec<_>>();
+    if packed_bases.is_empty() {
+        if headers
+            .iter()
+            .any(|header| header.name.ends_with(".weight") && header.dtype == Dtype::U32)
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini numeric tier found U32 weights without packed scale headers in {}",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    }
+    for header in headers
+        .iter()
+        .filter(|header| header.name.ends_with(".weight") && header.dtype == Dtype::U32)
+    {
+        let base = header
+            .name
+            .strip_suffix(".weight")
+            .expect("filtered weight suffix");
+        if !by_name.contains_key(format!("{base}.scales").as_str())
+            || !by_name.contains_key(format!("{base}.biases").as_str())
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini numeric tier found unpaired packed weight {} in {}",
+                header.name,
+                path.display()
+            )));
+        }
+    }
+
+    let mut exact_bits = None;
+    for base in packed_bases {
+        let weight_name = format!("{base}.weight");
+        let scale_name = format!("{base}.scales");
+        let bias_name = format!("{base}.biases");
+        let weight = by_name.get(weight_name.as_str()).ok_or_else(|| {
+            CoreError::Unsupported(format!("{scale_name} has no packed {weight_name}"))
+        })?;
+        let scales = by_name
+            .get(scale_name.as_str())
+            .expect("base came from scales");
+        let biases = by_name.get(bias_name.as_str()).ok_or_else(|| {
+            CoreError::Unsupported(format!("{scale_name} has no packed {bias_name}"))
+        })?;
+        let ([weight_out, words], [scale_out, groups], [bias_out, bias_groups]) = (
+            weight.shape.as_slice(),
+            scales.shape.as_slice(),
+            biases.shape.as_slice(),
+        ) else {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} must be rank two"
+            )));
+        };
+        if weight.dtype != Dtype::U32
+            || scales.dtype != Dtype::BF16
+            || biases.dtype != Dtype::BF16
+            || weight_out != scale_out
+            || scale_out != bias_out
+            || groups != bias_groups
+            || *groups == 0
+        {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} has crossed dtype or shape companions"
+            )));
+        }
+        let input = groups.checked_mul(group_size).ok_or_else(|| {
+            CoreError::Unsupported(format!("bernini packed header {base} input overflow"))
+        })?;
+        let numerator = words.checked_mul(32).ok_or_else(|| {
+            CoreError::Unsupported(format!("bernini packed header {base} bit-width overflow"))
+        })?;
+        if numerator % input != 0 {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {base} does not encode an integral bit width"
+            )));
+        }
+        let bits = i32::try_from(numerator / input).map_err(|_| {
+            CoreError::Unsupported(format!("bernini packed header {base} bit width overflow"))
+        })?;
+        if !matches!(bits, 4 | 8) || exact_bits.is_some_and(|current| current != bits) {
+            return Err(CoreError::Unsupported(format!(
+                "bernini packed header {} mixes or declares unsupported {bits}-bit weights",
+                path.display()
+            )));
+        }
+        exact_bits = Some(bits);
+    }
+    Ok(exact_bits)
+}
+
+/// Resolve the numeric tier actually carried by the immutable Bernini snapshot. Prepacked tiers
+/// require matching renderer/planner manifests and matching packed safetensors headers; legacy
+/// dense snapshots retain the explicit load-time quantization behavior.
+pub fn resolved_numeric_tier(spec: &LoadSpec) -> CoreResult<MemoryNumericTier> {
+    let mlx_gen::WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "bernini numeric tier requires a checkpoint directory".to_owned(),
+        ));
+    };
+    let renderer_manifest = quant_manifest(&root.join("config.json"))?;
+    let planner_manifest = quant_manifest(&root.join("qwen2_5_vl_config.json"))?;
+    if renderer_manifest != planner_manifest {
+        return Err(CoreError::Unsupported(
+            "bernini renderer and planner quantization manifests disagree".to_owned(),
+        ));
+    }
+    let files = [
+        root.join("high_noise_model.safetensors"),
+        root.join("low_noise_model.safetensors"),
+        root.join("qwen2_5_vl.safetensors"),
+    ];
+    let header_bits = files
+        .iter()
+        .map(|path| packed_header_bits(path, 64))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let resolved_quant = match renderer_manifest {
+        Some((bits, 64)) => {
+            if spec.quantize.is_some() {
+                return Err(CoreError::Unsupported(
+                    "bernini prepacked tiers must not request a second load-time quantization"
+                        .to_owned(),
+                ));
+            }
+            if header_bits.iter().any(|actual| *actual != Some(bits)) {
+                return Err(CoreError::Unsupported(format!(
+                    "bernini q{bits} manifest disagrees with packed renderer/planner headers"
+                )));
+            }
+            Some(match bits {
+                4 => mlx_gen::Quant::Q4,
+                8 => mlx_gen::Quant::Q8,
+                _ => unreachable!("manifest validator accepts q4/q8 only"),
+            })
+        }
+        None => {
+            if header_bits.iter().any(Option::is_some) {
+                return Err(CoreError::Unsupported(
+                    "bernini dense manifest disagrees with packed renderer/planner headers"
+                        .to_owned(),
+                ));
+            }
+            spec.quantize
+        }
+        Some(_) => unreachable!("manifest validator accepts group 64 only"),
+    };
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant: resolved_quant,
+        component_precision_floors: &[],
+    })
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -628,7 +966,7 @@ pub(crate) fn registered_valid_fixture(
     let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
         contract,
         strategy,
-        loaded_tier(spec),
+        fixture_tier(spec),
         MemoryBehaviorRoute {
             mode: MemoryMode::Other("video_to_video".to_owned()),
             reference_count: 1,
@@ -637,7 +975,7 @@ pub(crate) fn registered_valid_fixture(
             // this axis is the request's multi-phase denoise trajectory, which Bernini does not
             // read, not the contract's `MemoryPhase` lifecycle, which it always runs.
             has_phases: false,
-            overlay: None,
+            overlay: Some("provider_video_mode:v2v".to_owned()),
         },
     )?;
     context.geometry.width = 848;
@@ -661,7 +999,36 @@ pub(crate) fn registered_valid_fixture(
             strength: 1.0,
         });
     fixture.request.phases = None;
-    Ok(vec![fixture])
+    let images = vec![
+        mlx_gen::gen_core::Image {
+            width: 40,
+            height: 24,
+            pixels: vec![1; 40 * 24 * 3],
+        },
+        mlx_gen::gen_core::Image {
+            width: 24,
+            height: 40,
+            pixels: vec![2; 24 * 40 * 3],
+        },
+    ];
+    let mut r2v_request = fixture.request.clone();
+    r2v_request.prompt = "weights-free bernini r2v memory behavior".to_owned();
+    r2v_request.video_mode = Some("r2v".to_owned());
+    r2v_request.conditioning = vec![mlx_gen::gen_core::Conditioning::MultiReference { images }];
+    let reference_axis = r2v_reference_receipt(&r2v_request)?;
+    let mut r2v_context = fixture.context.clone();
+    r2v_context.mode = MemoryMode::Other("reference_to_video".to_owned());
+    r2v_context.geometry.reference_count = 2;
+    r2v_context.overlay = Some(format!("provider_video_mode:r2v+{reference_axis}"));
+    let load_spec = fixture.load_spec.clone();
+    Ok(vec![
+        fixture,
+        MemoryBehaviorFixture {
+            context: r2v_context,
+            request: r2v_request,
+            load_spec,
+        },
+    ])
 }
 
 pub(crate) fn registered_begin_request(
@@ -744,11 +1111,22 @@ fn begin_with_cleanup(
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    // The shared MLX core's reference axis historically describes image references only. Bernini's
-    // exact route is one VideoClip, which is validated by the wrapper below; keep the core's
-    // compatibility geometry at zero image references while preserving the typed route in context.
+    let route = match context.mode.as_key() {
+        "video_to_video" => BerniniMemoryRoute::VideoToVideo,
+        "reference_to_video" => BerniniMemoryRoute::ReferenceToVideo,
+        mode => {
+            return Err(CoreError::Unsupported(format!(
+                "bernini memory scope cannot configure crossed mode {mode}"
+            )))
+        }
+    };
+    let expected_reference_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
+    // VideoClip is a temporal carrier and therefore maps to zero image references in the shared
+    // core. MultiReference is flattened and stays equal to the exact 1-8 image count.
     let mut core_geometry = context.geometry;
-    core_geometry.reference_count = 0;
+    if route == BerniniMemoryRoute::VideoToVideo {
+        core_geometry.reference_count = 0;
+    }
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         provider_id,
         core_geometry,
@@ -776,10 +1154,17 @@ fn begin_with_cleanup(
         .flatten();
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(config, cleanup),
+        route,
+        expected_reference_receipt,
     })))
 }
 
 fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()> {
+    if request.phases.is_some() {
+        return Err(CoreError::Unsupported(
+            "bernini memory scope does not implement multi-phase denoise requests".to_owned(),
+        ));
+    }
     if request.video_mode.as_deref() != Some("v2v") {
         return Err(CoreError::Unsupported(
             "bernini memory scope requires video_mode=v2v".to_owned(),
@@ -813,13 +1198,56 @@ fn validate_video_to_video_request(request: &GenerationRequest) -> CoreResult<()
     Ok(())
 }
 
+fn validate_reference_to_video_request(request: &GenerationRequest) -> CoreResult<String> {
+    if request.phases.is_some() {
+        return Err(CoreError::Unsupported(
+            "bernini r2v memory scope does not implement multi-phase denoise requests".to_owned(),
+        ));
+    }
+    if request.video_mode.as_deref() != Some("r2v") {
+        return Err(CoreError::Unsupported(
+            "bernini r2v memory scope requires video_mode=r2v".to_owned(),
+        ));
+    }
+    if request.fps.unwrap_or(16) != 16 || request.count != 1 {
+        return Err(CoreError::Unsupported(
+            "bernini r2v memory scope requires FPS16 and count 1".to_owned(),
+        ));
+    }
+    if !matches!(request.frames, Some(45 | 61 | 77)) {
+        return Err(CoreError::Unsupported(
+            "bernini r2v memory scope supports only 45/61/77 frames".to_owned(),
+        ));
+    }
+    validate_geometry(request.width, request.height)?;
+    r2v_reference_receipt(request)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BerniniMemoryRoute {
+    VideoToVideo,
+    ReferenceToVideo,
+}
+
 struct BerniniMemoryRequestScope {
     inner: mlx_gen::request_scope::MlxRequestScopeCore,
+    route: BerniniMemoryRoute,
+    expected_reference_receipt: Option<String>,
 }
 
 impl MemoryRequestScope for BerniniMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> CoreResult<()> {
-        validate_video_to_video_request(request)?;
+        match self.route {
+            BerniniMemoryRoute::VideoToVideo => validate_video_to_video_request(request)?,
+            BerniniMemoryRoute::ReferenceToVideo => {
+                let actual = validate_reference_to_video_request(request)?;
+                if self.expected_reference_receipt.as_deref() != Some(actual.as_str()) {
+                    return Err(CoreError::Unsupported(
+                        "bernini r2v references changed after admission".to_owned(),
+                    ));
+                }
+            }
+        }
         self.inner.configure_request(request)
     }
 
@@ -837,7 +1265,9 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
         overlap: u32,
         mut geometry: MemoryGeometry,
     ) -> CoreResult<()> {
-        geometry.reference_count = 0;
+        if self.route == BerniniMemoryRoute::VideoToVideo {
+            geometry.reference_count = 0;
+        }
         self.inner.configure_decode(tile_edge, overlap, geometry)
     }
 
@@ -1234,7 +1664,7 @@ mod tests {
         assert!(!attention_budget(&chunked).is_unbounded());
     }
 
-    /// No PiD route, no overlay, one image per request — each stated positively rather than by
+    /// No PiD route, no resident overlay, one output per request — each stated positively rather than by
     /// omission, because the sc-15839 review found all three shipped as silent gaps elsewhere.
     #[test]
     fn the_absent_capabilities_are_declared_absent() {
@@ -1575,5 +2005,294 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn r2v_request() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "ordered subjects".to_owned(),
+            width: 848,
+            height: 480,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("r2v".to_owned()),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![
+                    mlx_gen::gen_core::Image {
+                        width: 640,
+                        height: 360,
+                        pixels: vec![11; 640 * 360 * 3],
+                    },
+                    mlx_gen::gen_core::Image {
+                        width: 360,
+                        height: 640,
+                        pixels: vec![29; 360 * 640 * 3],
+                    },
+                ],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn distinct_references(count: usize) -> Vec<mlx_gen::gen_core::Image> {
+        (0..count)
+            .map(|index| mlx_gen::gen_core::Image {
+                width: 28,
+                height: 28,
+                pixels: vec![u8::try_from(index + 1).unwrap(); 28 * 28 * 3],
+            })
+            .collect()
+    }
+
+    fn write_tier_file(path: &std::path::Path, bits: Option<i32>) {
+        let mut tensors = serde_json::Map::new();
+        let mut offset = 0_u64;
+        let mut insert = |name: &str, dtype: &str, shape: &[usize], bytes: u64| {
+            tensors.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        };
+        match bits {
+            Some(bits @ (4 | 8)) => {
+                let words = usize::try_from(bits).unwrap() * 64 / 32;
+                insert("block.weight", "U32", &[2, words], (2 * words * 4) as u64);
+                insert("block.scales", "BF16", &[2, 1], 4);
+                insert("block.biases", "BF16", &[2, 1], 4);
+            }
+            None => insert("block.weight", "BF16", &[2, 64], 256),
+            Some(bits) => panic!("unsupported fixture q{bits}"),
+        }
+        let mut header = serde_json::to_vec(&tensors).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + usize::try_from(offset).unwrap(), 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn tier_snapshot(bits: Option<i32>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let quantization = bits.map(|bits| {
+            serde_json::json!({
+                "bits": bits,
+                "group_size": 64,
+            })
+        });
+        let config = serde_json::json!({ "quantization": quantization });
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            root.path().join("qwen2_5_vl_config.json"),
+            config.to_string(),
+        )
+        .unwrap();
+        for name in [
+            "high_noise_model.safetensors",
+            "low_noise_model.safetensors",
+            "qwen2_5_vl.safetensors",
+        ] {
+            write_tier_file(&root.path().join(name), bits);
+        }
+        root
+    }
+
+    #[test]
+    fn provider_owned_tier_resolver_reads_q4_q8_and_bf16_headers() {
+        for (bits, expected) in [
+            (Some(4), Some(mlx_gen::Quant::Q4)),
+            (Some(8), Some(mlx_gen::Quant::Q8)),
+            (None, None),
+        ] {
+            let root = tier_snapshot(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            let tier = resolved_numeric_tier(&spec).unwrap();
+            assert_eq!(tier.quant, expected, "fixture q{bits:?}");
+            assert_eq!(
+                crate::resolved_video_memory_numeric_tier(FULL_ID, &spec)
+                    .unwrap()
+                    .unwrap(),
+                tier
+            );
+
+            let production = memory_strategy_contract(FULL_ID, &spec).unwrap();
+            let declaration = weights_free_memory_strategy_contract(FULL_ID, &spec).unwrap();
+            let mut context =
+                registered_valid_fixture(&spec, &declaration, MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .remove(0)
+                    .context;
+            context.selection.tier = tier;
+            context.optimization_authority =
+                mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated;
+            assert_eq!(
+                safety_check(&spec, &production, &context),
+                MemorySafetyDecision::Accept,
+                "provider safety must admit the resolved q{bits:?} tier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_owned_tier_resolver_rejects_manifest_header_disagreement() {
+        let root = tier_snapshot(Some(4));
+        write_tier_file(&root.path().join("qwen2_5_vl.safetensors"), Some(8));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert!(resolved_numeric_tier(&spec).is_err());
+
+        let root = tier_snapshot(Some(4));
+        let crossed = serde_json::json!({
+            "quantization": { "bits": 8, "group_size": 64 }
+        });
+        std::fs::write(
+            root.path().join("qwen2_5_vl_config.json"),
+            crossed.to_string(),
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert!(resolved_numeric_tier(&spec).is_err());
+    }
+
+    #[test]
+    fn r2v_receipt_binds_order_bytes_and_mlx_effective_shapes() {
+        let request = r2v_request();
+        let receipt = r2v_reference_receipt(&request).expect("exact receipt");
+        assert_eq!(
+            receipt,
+            "bernini-r2v-references-v2:backend-mlx:count-2:0:native-640x360;vit-280x168;vae-624x352|1:native-360x640;vit-168x280;vae-352x624+bernini-r2v-request-seal-v1-cd11cf62ec83e85860e1790538062a88b39ae384d2956fd1dc54c0e45d6fa8f5"
+        );
+
+        let mut reversed = request.clone();
+        let [Conditioning::MultiReference { images }] = reversed.conditioning.as_mut_slice() else {
+            unreachable!()
+        };
+        images.reverse();
+        assert_ne!(receipt, r2v_reference_receipt(&reversed).unwrap());
+
+        let mut duplicate = request;
+        let [Conditioning::MultiReference { images }] = duplicate.conditioning.as_mut_slice()
+        else {
+            unreachable!()
+        };
+        images[1] = images[0].clone();
+        assert!(r2v_reference_receipt(&duplicate).is_ok());
+
+        let mut crossed = r2v_request();
+        crossed.conditioning.clear();
+        assert!(r2v_reference_receipt(&crossed).is_err());
+        crossed.conditioning = vec![Conditioning::Reference {
+            image: distinct_references(1).into_iter().next().unwrap(),
+            strength: Some(1.0),
+        }];
+        assert!(r2v_reference_receipt(&crossed).is_err());
+    }
+
+    #[test]
+    fn r2v_request_scope_covers_every_public_geometry_duration_and_reference_bound() {
+        for count in [1, 8] {
+            for (width, height) in ADVERTISED_GEOMETRIES {
+                for frames in [45, 61, 77] {
+                    let mut request = r2v_request();
+                    request.width = *width;
+                    request.height = *height;
+                    request.frames = Some(frames);
+                    request.conditioning = vec![Conditioning::MultiReference {
+                        images: distinct_references(count),
+                    }];
+                    validate_reference_to_video_request(&request).unwrap_or_else(|error| {
+                        panic!("{count}/{width}x{height}/{frames}: {error}")
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_implemented_mlx_rung_exposes_both_v2v_and_r2v_behavior() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        for provider_id in PROVIDER_IDS {
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            for strategy in [
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+                MemoryStrategy::BoundedTransformerResidency,
+            ] {
+                let fixtures = registered_valid_fixture(&spec, &contract, strategy).unwrap();
+                assert_eq!(fixtures.len(), 2, "{provider_id}/{strategy:?}");
+                assert_eq!(fixtures[0].context.mode.as_key(), "video_to_video");
+                assert_eq!(fixtures[1].context.mode.as_key(), "reference_to_video");
+                assert_eq!(fixtures[1].context.geometry.reference_count, 2);
+                assert_eq!(
+                    safety_check(&spec, &contract, &fixtures[1].context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}/{strategy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r2v_scope_revalidates_references_and_finishes_every_outcome() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        let contract = contract(FULL_ID, LoadShape::DeferredMaterialization);
+        let fixture = registered_valid_fixture(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .remove(1);
+        let mut empty_phases = fixture.request.clone();
+        empty_phases.phases = Some(Vec::new());
+        assert!(validate_reference_to_video_request(&empty_phases).is_err());
+        for outcome in [
+            MemoryRunOutcome::Complete,
+            MemoryRunOutcome::Canceled,
+            MemoryRunOutcome::Error {
+                message: "fixture error".to_owned(),
+            },
+        ] {
+            let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("scope");
+            let mut request = fixture.request.clone();
+            scope
+                .configure_request(&mut request)
+                .expect("exact request");
+            scope.enter_phase(MemoryPhase::Conditioning).unwrap();
+            scope.leave_phase(MemoryPhase::Conditioning).unwrap();
+            scope.finish(outcome).unwrap();
+        }
+
+        let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &fixture.context)
+            .unwrap()
+            .expect("scope");
+        let mut mutated = fixture.request.clone();
+        let [Conditioning::MultiReference { images }] = mutated.conditioning.as_mut_slice() else {
+            unreachable!()
+        };
+        images[0].pixels[0] ^= 1;
+        assert!(scope.configure_request(&mut mutated).is_err());
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: "crossed references".to_owned(),
+            })
+            .unwrap();
+
+        let mut scope = registered_begin_request(FULL_ID, &spec, &contract, &fixture.context)
+            .unwrap()
+            .expect("scope");
+        let mut phased = fixture.request;
+        phased.phases = Some(vec![mlx_gen::gen_core::GenerationPhase {
+            steps: 1,
+            ..Default::default()
+        }]);
+        assert!(scope.configure_request(&mut phased).is_err());
+        scope
+            .finish(MemoryRunOutcome::Error {
+                message: "crossed phases".to_owned(),
+            })
+            .unwrap();
     }
 }
