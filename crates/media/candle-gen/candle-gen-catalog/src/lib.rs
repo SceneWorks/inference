@@ -3370,6 +3370,11 @@ mod preview_advertising {
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
         MemoryRouteCrate {
+            dir: "candle-gen-bernini",
+            register_providers: candle_gen_bernini::register_providers,
+            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),

@@ -53,6 +53,7 @@ pub mod convert;
 pub mod forward;
 pub mod guidance;
 pub mod mar;
+pub mod memory_strategy;
 mod nn;
 pub mod pipeline;
 pub mod preprocess;
@@ -142,9 +143,26 @@ pub use vit_preprocess::{
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
-        .register_generator(bernini::FULL_REGISTRATION)
+        .register_generator(bernini::FULL_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+}
+
+/// Register the weights-free Bernini memory surface on CPU hosts and the executable behavior on
+/// CUDA hosts. The public still-image route resolves to the full `bernini` provider, not the
+/// renderer-only compatibility id.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: bernini::MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
 }
 
 /// Build the complete explicit Candle Bernini provider catalog.

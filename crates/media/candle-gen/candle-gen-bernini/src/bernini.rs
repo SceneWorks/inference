@@ -69,6 +69,7 @@ use crate::forward::{
 use crate::guidance::MomentumBuffer;
 use crate::latent_dims;
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
+use crate::memory_strategy::PreparedMemory;
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
@@ -588,6 +589,10 @@ pub struct Bernini {
     root: PathBuf,
     device: Device,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
+    /// Sealed base/artifact/adapter identity plus the executable still-memory contract. Missing
+    /// weight paths remain loadable for the historical descriptor/validation fixtures, but an
+    /// existing snapshot must pass this receipt before any component can be loaded.
+    memory_strategy: Option<PreparedMemory>,
     components: Mutex<Option<Arc<RendererComponents>>>,
 }
 
@@ -596,14 +601,21 @@ impl Bernini {
     /// generate. The load lock serializes racing first-callers so two concurrent generates don't
     /// both mmap + upload ~50 GB (F-097).
     fn components(&self) -> CResult<Arc<RendererComponents>> {
-        candle_gen::cached(&self.components, || {
-            Ok(Arc::new(RendererComponents::load(
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        let components = candle_gen::cached(&self.components, || {
+            Ok::<_, CandleError>(Arc::new(RendererComponents::load(
                 &self.root,
                 &self.device,
                 MODEL_ID,
                 &self.adapters,
             )?))
-        })
+        })?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        Ok(components)
     }
 }
 
@@ -628,6 +640,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
+    let memory_strategy = root
+        .exists()
+        .then(|| PreparedMemory::prepare(spec))
+        .transpose()?;
     let device = candle_gen::default_device()?;
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
@@ -635,6 +651,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         adapters: spec.adapters.clone(),
+        memory_strategy,
         components: Mutex::new(None),
     }))
 }
@@ -646,6 +663,43 @@ candle_gen::register_generators! {
 impl Generator for Bernini {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref().map(|memory| &memory.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(memory) = &self.memory_strategy else {
+            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                gen_core::MemorySafetyDecision::Accept
+            } else {
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_ID} loaded route has no certified still-memory contract"
+                    ),
+                }
+            };
+        };
+        crate::memory_strategy::safety_check(&memory.contract, memory.tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(memory) = &self.memory_strategy else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(
+            &memory.contract,
+            memory.tier,
+            self.device.clone(),
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -664,6 +718,12 @@ impl Generator for Bernini {
         // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
         // them off the request and dropping them.
         reject_unimplemented_video_clip_knobs(id, req)?;
+        // The public still route is intentionally exact: no implicit mode inference, extra
+        // references, phases, PiD, or unadvertised geometry may cross the same provider gate used
+        // by registry admission. Multi-frame Bernini remains the legacy resident video path.
+        if req.frames == Some(1) || req.memory.is_some() {
+            crate::memory_strategy::validate_generation_request(req, !self.adapters.is_empty())?;
+        }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
         let has_video = req
@@ -693,7 +753,14 @@ impl Generator for Bernini {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        Ok(self.generate_impl(req, on_progress)?)
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        let output = self.generate_impl(req, on_progress)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        Ok(output)
     }
 }
 
@@ -1008,7 +1075,9 @@ impl Bernini {
 
         // --- Stage 4: z16 VAE decode → image / video ---
         on_progress(Progress::Decoding);
-        let decoded = vae.decode_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
+        let decoded =
+            vae.decode_budgeted_with_cancel_and_tile_cap(&latents, &req.cancel, decode_cap)?;
         let images_out = frames_to_images(&decoded)?;
 
         if frames == 1 {
@@ -1369,7 +1438,8 @@ mod tests {
         let f = LoadSpec::new(WeightsSource::File("/tmp/w.safetensors".into()));
         assert!(load(&f).is_err());
         // A directory source is lazy-loaded, so it resolves past the marker.
-        let d = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let fixture = tempfile::tempdir().unwrap();
+        let d = LoadSpec::new(WeightsSource::Dir(fixture.path().join("missing")));
         assert!(load(&d).is_ok());
     }
 
