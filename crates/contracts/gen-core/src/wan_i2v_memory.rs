@@ -1141,6 +1141,12 @@ pub fn prepare_load_spec(
 ) -> crate::Result<()> {
     let route = WanI2vRoute::for_provider(provider_id)?;
     let tier = tier(spec, backend)?;
+    // Wan-VACE constructors retain only metadata; components are built lazily for the request
+    // and the Candle cache warms its component bundle on first render.  Its receipt must not
+    // claim eager bulk materialization merely because the generic LoadSpec default is eager.
+    if route == WanI2vRoute::Vace {
+        *spec = spec.clone().with_applied_load_shape_declaration();
+    }
     if route == WanI2vRoute::Vace
         && backend == WanI2vBackend::Candle
         && (tier.quant.is_some() || !spec.adapters.is_empty())
