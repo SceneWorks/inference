@@ -1086,7 +1086,7 @@ impl Scail2 {
             additional: characters.additional,
             driving_frames: driving.frames,
             driving_masks: driving.mask,
-            replace_flag: false,
+            replace_flag: replace_flag_for_request(req),
             seed: req.seed.unwrap_or_else(gen_core::default_seed),
             steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
             shift: req.scheduler_shift.unwrap_or(DEFAULT_SHIFT) as f64,
@@ -1102,10 +1102,32 @@ impl Scail2 {
     }
 }
 
+/// SCAIL-2's provider mode is the engine's cross-identity switch. Legacy requests that predate the
+/// explicit mode remain animation; the memory-backed public surface validates the only two accepted
+/// values before this mapping is reached.
+fn replace_flag_for_request(req: &GenerationRequest) -> bool {
+    req.video_mode.as_deref() == Some("replacement")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn provider_mode_selects_the_exact_engine_replace_flag() {
+        for (mode, expected) in [
+            (Some("animation"), false),
+            (Some("replacement"), true),
+            (None, false),
+        ] {
+            let request = GenerationRequest {
+                video_mode: mode.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");
+        }
+    }
 
     type MapMutation = Box<dyn Fn(&mut HashMap<String, Tensor>)>;
 
