@@ -33,7 +33,7 @@ use crate::candle_core::{Device, Tensor};
 use crate::gen_core::{
     Image, LoadShape, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
     MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
-    MemoryParityResult, MemoryStrategy, MemoryStrategyParameters,
+    MemoryParityResult, MemoryReferenceShape, MemoryStrategy, MemoryStrategyParameters,
 };
 
 /// Typed inputs for one real-weight calibration observation.
@@ -78,13 +78,28 @@ pub fn memory_evidence_v1_line_with_parity(
     let output_sha256 = format!("{:x}", Sha256::digest(probe.output_bytes));
     MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
+            // Older probe call sites carry a resolved route but not a catalog-family token. Keeping
+            // the route as this legacy record's family is conservative: it cannot share evidence
+            // across routes, and new collectors can mint a distinct explicit family key directly.
+            model_family: probe.resolved_route.to_owned(),
             resolved_route: probe.resolved_route.to_owned(),
             backend: MemoryBackend::Candle,
             tier: probe.tier,
             load_shape: probe.load_shape,
             mode: probe.mode,
+            reference_shape: if probe.geometry.reference_count == 0 {
+                MemoryReferenceShape::None
+            } else {
+                // Do not silently label an old, shape-less probe as an image reference. The opaque
+                // carrier keeps it distinct from every newly typed shape and from a different count.
+                MemoryReferenceShape::Other(format!(
+                    "legacy-untyped-reference-count-{}",
+                    probe.geometry.reference_count
+                ))
+            },
             overlay: probe.overlay,
             geometry: probe.geometry,
+            frames_per_second: None,
             strategy: probe.strategy,
             engaged_composition: probe.engaged_composition,
             parameters: probe.parameters,

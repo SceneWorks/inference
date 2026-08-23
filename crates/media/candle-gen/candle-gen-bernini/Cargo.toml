@@ -19,6 +19,7 @@ candle-gen-wan = { path = "../candle-gen-wan" }
 # The Bernini provider entry is composed explicitly by the platform bundles.
 # bernini_renderer.json knob sidecar reading + the converter's config emit.
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # The candle turnkey tier converter reads the ByteDance/Bernini-Diffusers combined `bernini/` index.
 safetensors = "0.7"
 # ViT (Qwen2.5-VL) image preprocessing: the `smart_resize` → Catmull-Rom resize path (the target dims

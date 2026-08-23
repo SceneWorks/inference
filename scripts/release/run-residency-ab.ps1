@@ -18,7 +18,7 @@ $env:FLUX_DEV_DIR = (Resolve-Path $FluxSnapshot).Path
 $env:INFERENCE_REVISION = $InferenceRevision
 $env:SCENEWORKS_REVISION = $SceneWorksRevision
 $env:MEMORY_EXPECTED_ABI = "3"
-$QwenCalibrationFingerprint = "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1"
+$QwenCalibrationFingerprint = "qwen-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2"
 
 $checkedOutRevision = (& git rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $checkedOutRevision -ne $InferenceRevision) {

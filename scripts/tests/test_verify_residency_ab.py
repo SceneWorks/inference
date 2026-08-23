@@ -28,8 +28,9 @@ def record(strategy: str, peak: int, output: bytes = OUTPUT, parity: dict | None
     if strategy == "staged_residency":
         composition.append("staged_residency")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "key": {
+            "model_family": "flux",
             "resolved_route": "flux1_dev",
             "backend": "candle",
             "tier": {
@@ -39,6 +40,7 @@ def record(strategy: str, peak: int, output: bytes = OUTPUT, parity: dict | None
             },
             "load_shape": "eager_materialization",
             "mode": "text_to_image",
+            "reference_shape": "none",
             "overlay": None,
             "geometry": {
                 "width": 1024,
@@ -47,6 +49,7 @@ def record(strategy: str, peak: int, output: bytes = OUTPUT, parity: dict | None
                 "frames": 1,
                 "reference_count": 0,
             },
+            "frames_per_second": None,
             "strategy": strategy,
             "engaged_composition": composition,
             "parameters": {
@@ -142,7 +145,7 @@ class VerifyResidencyAbTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "legacy SEQ_AB"):
                 read_record(path, "resident")
-            path.write_text(f'{PREFIX}{{"schema_version":1,"schema_version":1}}\n', encoding="utf-8")
+            path.write_text(f'{PREFIX}{{"schema_version":2,"schema_version":2}}\n', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "duplicate JSON key"):
                 read_record(path, "resident")
 
@@ -186,6 +189,24 @@ class VerifyResidencyAbTests(unittest.TestCase):
             path.write_text(f"{PREFIX}{encoded}\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "finite and non-negative"):
                 read_record(path, "resident")
+
+    def test_requires_schema_v2_and_the_expanded_evidence_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_schema = record("resident", 10)
+            old_schema["schema_version"] = 1
+            with self.assertRaisesRegex(RuntimeError, "schema_version must be 2"):
+                read_record(self.write_log(root, "old-schema", old_schema), "resident")
+
+            missing_family = record("resident", 10)
+            missing_family["key"].pop("model_family")
+            with self.assertRaisesRegex(RuntimeError, "key keys differ"):
+                read_record(self.write_log(root, "missing-family", missing_family), "resident")
+
+            crossed_reference = record("resident", 10)
+            crossed_reference["key"]["reference_shape"] = "image"
+            with self.assertRaisesRegex(RuntimeError, "reference_shape must be none"):
+                read_record(self.write_log(root, "crossed-reference", crossed_reference), "resident")
 
     def test_rejects_fingerprint_abi_revision_and_load_shape_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

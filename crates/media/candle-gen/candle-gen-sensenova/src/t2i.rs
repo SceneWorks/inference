@@ -24,6 +24,7 @@
 
 use candle_gen::candle_core::{Device, IndexOp, Result as CResult, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::preview::{PreviewCounter, PreviewHook};
 use candle_gen::{CandleError, Result};
@@ -78,6 +79,12 @@ pub struct T2iOptions {
     /// Think-mode: interleave reasons (and may emit images) inside a `<think>…</think>` block before
     /// the final answer. Off ⇒ the non-think sentinel is primed so the model answers directly.
     pub think_mode: bool,
+    /// Request-selected maximum attention score elements. `None` retains the historical overflow
+    /// guard; the memory ladder supplies its smaller measured bound.
+    pub attention_score_budget: Option<u64>,
+    /// Generation-path decoder blocks materialized together on a deferred load. Ignored by the
+    /// understanding path and by eager loads.
+    pub transformer_window_size: Option<usize>,
 }
 
 impl Default for T2iOptions {
@@ -93,6 +100,8 @@ impl Default for T2iOptions {
             t_eps: 0.02,
             seed: 0,
             think_mode: false,
+            attention_score_budget: None,
+            transformer_window_size: None,
         }
     }
 }
@@ -155,6 +164,25 @@ pub struct T2iModel {
 impl T2iModel {
     /// Build from a loaded checkpoint VarBuilder (`language_model.*` + `fm_modules.*`, all f32).
     pub fn from_weights(vb: &VarBuilder, cfg: &NeoChatConfig) -> Result<Self> {
+        let backbone = Qwen3Backbone::from_weights(vb, cfg, "language_model")?;
+        Self::from_weights_and_backbone(vb, cfg, backbone)
+    }
+
+    pub(crate) fn from_weights_with_deferred_gen(
+        vb: &VarBuilder<'static>,
+        cfg: &NeoChatConfig,
+        inventory: crate::memory_strategy::CheckpointInventory,
+    ) -> Result<Self> {
+        let backbone =
+            Qwen3Backbone::from_weights_with_deferred_gen(vb, cfg, "language_model", inventory)?;
+        Self::from_weights_and_backbone(vb, cfg, backbone)
+    }
+
+    fn from_weights_and_backbone(
+        vb: &VarBuilder,
+        cfg: &NeoChatConfig,
+        backbone: Qwen3Backbone,
+    ) -> Result<Self> {
         // `noise_scale_embed` divides each step's conditioning by `noise_scale_max_value`; a
         // zero/negative value would inject NaN/Inf conditioning silently. Reject at load (F-012).
         if cfg.noise_scale_max_value <= 0.0 || cfg.noise_scale_max_value.is_nan() {
@@ -183,7 +211,7 @@ impl T2iModel {
             None
         };
         Ok(Self {
-            backbone: Qwen3Backbone::from_weights(vb, cfg, "language_model")?,
+            backbone,
             gen_vision: NeoVisionEmbedder::from_weights(
                 vb,
                 cfg,
@@ -220,6 +248,22 @@ impl T2iModel {
         self.patch_size * self.merge_size
     }
 
+    fn attention_plan<'a>(
+        &self,
+        opts: &T2iOptions,
+        cancel: Option<&'a CancelFlag>,
+    ) -> AttentionPlan<'a> {
+        let budget = opts
+            .attention_score_budget
+            .unwrap_or(candle_gen::ATTN_SCORES_BUDGET as u64)
+            .min(candle_gen::ATTN_SCORES_BUDGET as u64);
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, false));
+        match cancel {
+            Some(cancel) => plan.with_cancel(cancel),
+            None => plan,
+        }
+    }
+
     /// The resolution-mode noise scale for a `grid_h × grid_w` patch grid (the `t2i_generate`
     /// formula), clamped to `noise_scale_max_value`.
     fn noise_scale_for(&self, grid_h: usize, grid_w: usize) -> f32 {
@@ -238,14 +282,23 @@ impl T2iModel {
     }
 
     /// Prefill a text query into a fresh understanding-path cache; returns the cache and prefix len.
-    fn prefill(&self, ids: &[i32]) -> CResult<(KvCache, usize)> {
+    fn prefill(&self, ids: &[i32], attention: AttentionPlan<'_>) -> Result<(KvCache, usize)> {
         let embeds = self.backbone.embed(ids)?;
         let (t, h, w) = text_indexes(ids.len());
         let mut cache = self.backbone.new_cache();
         // The returned hidden state is unused (non-think → no logits); we only need the populated
         // cache for the denoise loop's gen-path forwards.
-        self.backbone
-            .forward_cached(&embeds, &t, &h, &w, Path::Und, &mut cache, true)?;
+        self.backbone.forward_cached_planned(
+            &embeds,
+            &t,
+            &h,
+            &w,
+            Path::Und,
+            &mut cache,
+            true,
+            attention,
+            None,
+        )?;
         Ok((cache, ids.len()))
     }
 
@@ -264,6 +317,7 @@ impl T2iModel {
 
     /// Gen-path velocity prediction for one diffusion step against a prefilled cache: `forward_prepared`
     /// (Gen, use-only) over the conditioned image block, `fm_head` → `x_pred`, then the velocity.
+    #[allow(clippy::too_many_arguments)]
     fn predict_v(
         &self,
         image_embeds: &Tensor,
@@ -272,12 +326,20 @@ impl T2iModel {
         z: &Tensor,
         t: f32,
         t_eps: f32,
-    ) -> CResult<Tensor> {
-        let hidden = self
-            .backbone
-            .forward_prepared(image_embeds, rm, Path::Gen, cache, false)?;
+        attention: AttentionPlan<'_>,
+        transformer_window: Option<usize>,
+    ) -> Result<Tensor> {
+        let hidden = self.backbone.forward_prepared_planned(
+            image_embeds,
+            rm,
+            Path::Gen,
+            cache,
+            false,
+            attention,
+            transformer_window,
+        )?;
         let x_pred = self.fm_head.forward(&hidden)?;
-        velocity(&x_pred, z, t, t_eps)
+        Ok(velocity(&x_pred, z, t, t_eps)?)
     }
 
     /// Build one denoise step's latent `z` (channel-last patchify at `cell`) and the conditioned image
@@ -357,7 +419,8 @@ impl T2iModel {
             build_neo1_query(prompt, SYSTEM_MESSAGE_FOR_GEN)
         );
         let ids_cond = tokenizer.encode_ids(&query_cond, true)?;
-        let (mut cache_cond, text_len) = self.prefill(&ids_cond)?;
+        let attention = self.attention_plan(opts, Some(cancel));
+        let (mut cache_cond, text_len) = self.prefill(&ids_cond, attention)?;
 
         // ---- Uncondition prefix (CFG) ----
         let needs_cfg = opts.cfg_scale > 1.0;
@@ -366,7 +429,7 @@ impl T2iModel {
         if needs_cfg {
             let query_uncond = format!("{}<img>", build_neo1_query("", ""));
             let ids_uncond = tokenizer.encode_ids(&query_uncond, true)?;
-            let (cache, plen) = self.prefill(&ids_uncond)?;
+            let (cache, plen) = self.prefill(&ids_uncond, attention)?;
             cache_uncond = Some(cache);
             uncond_text_len = plen;
         }
@@ -448,6 +511,7 @@ impl T2iModel {
         }
 
         let (needs_img, needs_uncond) = it2i_cache_requirements(opts.cfg_scale, opts.img_cfg_scale);
+        let attention = self.attention_plan(opts, Some(cancel));
 
         let cond_query = format!(
             "{}<think>\n\n</think>\n\n<img>",
@@ -457,7 +521,7 @@ impl T2iModel {
         let (cond_embeds, cond_t, cond_h, cond_w) =
             self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
         let (mut cache_cond, _, cond_temporal) =
-            self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w)?;
+            self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w, attention)?;
 
         let mut cache_img = if needs_img {
             let query = format!(
@@ -466,7 +530,7 @@ impl T2iModel {
             );
             let ids = self.build_it2i_query_ids(tokenizer, &query, &grids)?;
             let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
             Some((cache, temporal))
         } else {
             None
@@ -476,7 +540,7 @@ impl T2iModel {
             let query = format!("{}<img>", build_neo1_query("", ""));
             let ids = tokenizer.encode_ids(&query, true)?;
             let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
             Some((cache, temporal))
         } else {
             None
@@ -528,6 +592,7 @@ impl T2iModel {
         let cell = self.cell();
         let token_h = height / cell;
         let token_w = width / cell;
+        let attention = self.attention_plan(opts, Some(cancel));
         let grid_h = height / self.patch_size;
         let grid_w = width / self.patch_size;
         let l = token_h * token_w;
@@ -569,7 +634,16 @@ impl T2iModel {
             let t_next = timesteps[i + 1];
 
             let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let v_cond = self.predict_v(&cond, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let v_cond = self.predict_v(
+                &cond,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention,
+                opts.transformer_window_size,
+            )?;
 
             // CFG-interval gate (inclusive both ends — the reference T2I gate).
             let v_pred = if needs_cfg && t >= opts.cfg_interval.0 && t <= opts.cfg_interval.1 {
@@ -580,7 +654,16 @@ impl T2iModel {
                 // `cond` here is the image/timestep token embedding (from `step_cond_embeds`), NOT the
                 // text conditioning — it is identical for both passes. The cond/uncond split lives
                 // entirely in `cache_u` (uncond text cache) and `rm_u`, so reusing `cond` is correct.
-                let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
+                let v_uncond = self.predict_v(
+                    &cond,
+                    rm_u,
+                    cache_u,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention,
+                    opts.transformer_window_size,
+                )?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale)?
             } else {
                 v_cond
@@ -772,11 +855,20 @@ impl T2iModel {
         t: &[i32],
         h: &[i32],
         w: &[i32],
-    ) -> CResult<(KvCache, Vec<f32>, usize)> {
+        attention: AttentionPlan<'_>,
+    ) -> Result<(KvCache, Vec<f32>, usize)> {
         let mut cache = self.backbone.new_cache();
-        let hidden = self
-            .backbone
-            .forward_cached(embeds, t, h, w, Path::Und, &mut cache, true)?;
+        let hidden = self.backbone.forward_cached_planned(
+            embeds,
+            t,
+            h,
+            w,
+            Path::Und,
+            &mut cache,
+            true,
+            attention,
+            None,
+        )?;
         let s = t.len();
         let last_hidden = hidden.narrow(1, s - 1, 1)?; // [1, 1, H]
         let logits = self.backbone.lm_head(&last_hidden)?; // [1, 1, vocab]
@@ -794,8 +886,30 @@ impl T2iModel {
         pixel_values: Option<&Tensor>,
         grids: &[(usize, usize)],
     ) -> CResult<(KvCache, Vec<f32>, usize)> {
+        self.prefill_it2i_logits_planned(
+            ids,
+            pixel_values,
+            grids,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+        )
+        .map_err(|error| match error {
+            CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    pub(crate) fn prefill_it2i_logits_planned(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Tensor>,
+        grids: &[(usize, usize)],
+        attention: AttentionPlan<'_>,
+    ) -> Result<(KvCache, Vec<f32>, usize)> {
         let (embeds, t, h, w) = self.build_it2i_prefix(ids, pixel_values, grids)?;
-        let (cache, last, img_temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+        let (cache, last, img_temporal) = self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
         Ok((cache, last, img_temporal - 1))
     }
 
@@ -832,7 +946,35 @@ impl T2iModel {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
     ) -> Result<Vec<i32>> {
-        self.backbone.generate(
+        let attention = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            candle_gen::ATTN_SCORES_BUDGET as u64,
+            false,
+        ));
+        self.decode_text_planned(
+            first_logits,
+            cache,
+            t_idx,
+            eos,
+            max_new_tokens,
+            sampler,
+            cancel,
+            attention,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_text_planned(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: usize,
+        eos: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Vec<i32>> {
+        self.backbone.generate_planned(
             first_logits,
             cache,
             t_idx as i32,
@@ -840,6 +982,7 @@ impl T2iModel {
             max_new_tokens,
             sampler,
             cancel,
+            attention,
         )
     }
 
@@ -864,6 +1007,30 @@ impl T2iModel {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            &T2iOptions::default(),
+            cancel,
+        )
+    }
+
+    /// Memory-aware VQA entry used by the worker's request-scoped direct runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<String> {
+        let attention = self.attention_plan(opts, cancel);
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
         for img in images {
@@ -895,8 +1062,8 @@ impl T2iModel {
         };
 
         let (mut cache, last_logits, t_idx) =
-            self.prefill_it2i_logits(&ids, pixel_values.as_ref(), &grids)?;
-        let toks = self.decode_text(
+            self.prefill_it2i_logits_planned(&ids, pixel_values.as_ref(), &grids, attention)?;
+        let toks = self.decode_text_planned(
             &last_logits,
             &mut cache,
             t_idx,
@@ -904,6 +1071,7 @@ impl T2iModel {
             max_new_tokens,
             sampler,
             cancel,
+            attention,
         )?;
         let u32s: Vec<u32> = toks.iter().map(|&i| i as u32).collect();
         Ok(tokenizer.decode(&u32s, true)?.trim().to_string())
@@ -923,6 +1091,33 @@ impl T2iModel {
         t_idx: usize,
         cache: &mut KvCache,
     ) -> CResult<(Vec<f32>, usize)> {
+        self.append_generated_image_planned(
+            image,
+            token_h,
+            token_w,
+            t_idx,
+            cache,
+            AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+                candle_gen::ATTN_SCORES_BUDGET as u64,
+                false,
+            )),
+        )
+        .map_err(|error| match error {
+            CandleError::Candle(error) => error,
+            other => candle_gen::candle_core::Error::Msg(other.to_string()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_generated_image_planned(
+        &self,
+        image: &Tensor,
+        token_h: usize,
+        token_w: usize,
+        t_idx: usize,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
+    ) -> Result<(Vec<f32>, usize)> {
         let (_, _, h, w) = image.dims4()?;
         let raw = image.affine(0.5, 0.5)?.reshape((3, h, w))?; // model-space [-1,1] → [0,1]
         let (patches, (gh, gw)) = self.preprocess_image(&raw)?;
@@ -939,9 +1134,17 @@ impl T2iModel {
         let mut t = vec![ti + 1; n_img];
         t.push(ti + 2);
         let (hh, ww) = merged_grid_position_ids(n_img, token_h, token_w)?;
-        let hs = self
-            .backbone
-            .forward_cached(&embeds, &t, &hh, &ww, Path::Und, cache, true)?;
+        let hs = self.backbone.forward_cached_planned(
+            &embeds,
+            &t,
+            &hh,
+            &ww,
+            Path::Und,
+            cache,
+            true,
+            attention,
+            None,
+        )?;
         // Slice the kept `</img>` hidden row (index `n_img`) before `lm_head` (F-129).
         let last_hidden = hs.narrow(1, n_img, 1)?; // [1, 1, H]
         let logits = self.backbone.lm_head(&last_hidden)?;
@@ -1015,6 +1218,7 @@ impl T2iModel {
             None => None,
         };
         let preview_counter = PreviewCounter::with_steps(steps);
+        let attention = self.attention_plan(opts, Some(cancel));
 
         for i in 0..steps {
             if cancel.is_cancelled() {
@@ -1030,30 +1234,75 @@ impl T2iModel {
 
             let (z, cond_emb) =
                 self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let out_cond = self.predict_v(&cond_emb, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
+            let out_cond = self.predict_v(
+                &cond_emb,
+                &rm_cond,
+                cache_cond,
+                &z,
+                t,
+                opts.t_eps,
+                attention,
+                opts.transformer_window_size,
+            )?;
 
             let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
                 out_cond.clone()
             } else if img_cfg == 1.0 {
                 let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                 let c = cache_img.as_deref_mut().ok_or_else(img_cache_err)?;
-                let oi = self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?;
+                let oi = self.predict_v(
+                    &cond_emb,
+                    rm_i,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention,
+                    opts.transformer_window_size,
+                )?;
                 (&oi + ((&out_cond - &oi)? * cfg as f64)?)?
             } else if cfg == img_cfg {
                 let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                 let c = cache_uncond.as_deref_mut().ok_or_else(uncond_cache_err)?;
-                let ou = self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?;
+                let ou = self.predict_v(
+                    &cond_emb,
+                    rm_u,
+                    c,
+                    &z,
+                    t,
+                    opts.t_eps,
+                    attention,
+                    opts.transformer_window_size,
+                )?;
                 (&ou + ((&out_cond - &ou)? * cfg as f64)?)?
             } else {
                 let oi = {
                     let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
                     let c = cache_img.as_deref_mut().ok_or_else(img_cache_err)?;
-                    self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_i,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention,
+                        opts.transformer_window_size,
+                    )?
                 };
                 let ou = {
                     let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
                     let c = cache_uncond.as_deref_mut().ok_or_else(uncond_cache_err)?;
-                    self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?
+                    self.predict_v(
+                        &cond_emb,
+                        rm_u,
+                        c,
+                        &z,
+                        t,
+                        opts.t_eps,
+                        attention,
+                        opts.transformer_window_size,
+                    )?
                 };
                 let a = ((&out_cond - &oi)? * cfg as f64)?;
                 let b = ((&oi - &ou)? * img_cfg as f64)?;
@@ -1137,6 +1386,7 @@ impl T2iModel {
         }
         let token_h = height / cell;
         let token_w = width / cell;
+        let attention = self.attention_plan(opts, Some(cancel));
 
         // Source images (optional).
         let mut pv_parts = Vec::with_capacity(input_images.len());
@@ -1164,7 +1414,7 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
         let (mut cache_cond, cond_logits, mut t_cond) =
-            self.prefill_it2i_logits(&cond_ids, pixel_values.as_ref(), &grids)?;
+            self.prefill_it2i_logits_planned(&cond_ids, pixel_values.as_ref(), &grids, attention)?;
 
         let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
         let tu_ids = if input_images.is_empty() {
@@ -1173,11 +1423,12 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
         };
         let (mut cache_tu, _, mut t_tu) =
-            self.prefill_it2i_logits(&tu_ids, pixel_values.as_ref(), &grids)?;
+            self.prefill_it2i_logits_planned(&tu_ids, pixel_values.as_ref(), &grids, attention)?;
 
         let iu_query = format!("{}<img>", build_neo1_query("", ""));
         let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
-        let (mut cache_iu, _, iu_max) = self.prefill_it2i_logits(&iu_ids, None, &[])?;
+        let (mut cache_iu, _, iu_max) =
+            self.prefill_it2i_logits_planned(&iu_ids, None, &[], attention)?;
 
         let mut text = String::new();
         let mut images: Vec<Tensor> = Vec::new();
@@ -1197,9 +1448,12 @@ impl T2iModel {
                 }
                 gen_tokens.push(next);
                 total_tokens += 1;
-                let logits =
-                    self.backbone
-                        .decode_logits(next, (t_cond + 1) as i32, &mut cache_cond)?;
+                let logits = self.backbone.decode_logits_planned(
+                    next,
+                    (t_cond + 1) as i32,
+                    &mut cache_cond,
+                    attention,
+                )?;
                 t_cond += 1;
                 next = argmax(&logits);
                 if total_tokens >= max_new_tokens {
@@ -1221,11 +1475,19 @@ impl T2iModel {
             // ---- Image generation ----
             text.push_str("<image>");
             // Append `<img>` to the condition + text-uncondition caches.
-            self.backbone
-                .decode_logits(self.img_start_id, (t_cond + 1) as i32, &mut cache_cond)?;
+            self.backbone.decode_logits_planned(
+                self.img_start_id,
+                (t_cond + 1) as i32,
+                &mut cache_cond,
+                attention,
+            )?;
             t_cond += 1;
-            self.backbone
-                .decode_logits(self.img_start_id, (t_tu + 1) as i32, &mut cache_tu)?;
+            self.backbone.decode_logits_planned(
+                self.img_start_id,
+                (t_tu + 1) as i32,
+                &mut cache_tu,
+                attention,
+            )?;
             t_tu += 1;
 
             let base_noise = gaussian(
@@ -1251,11 +1513,23 @@ impl T2iModel {
             )?;
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
-            let (cond_next, nt_cond) =
-                self.append_generated_image(&image, token_h, token_w, t_cond, &mut cache_cond)?;
+            let (cond_next, nt_cond) = self.append_generated_image_planned(
+                &image,
+                token_h,
+                token_w,
+                t_cond,
+                &mut cache_cond,
+                attention,
+            )?;
             t_cond = nt_cond;
-            let (_, nt_tu) =
-                self.append_generated_image(&image, token_h, token_w, t_tu, &mut cache_tu)?;
+            let (_, nt_tu) = self.append_generated_image_planned(
+                &image,
+                token_h,
+                token_w,
+                t_tu,
+                &mut cache_tu,
+                attention,
+            )?;
             t_tu = nt_tu;
             images.push(image);
             next = argmax(&cond_next);

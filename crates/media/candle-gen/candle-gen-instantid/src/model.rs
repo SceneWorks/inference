@@ -16,7 +16,9 @@
 //!     threads the tokens into `forward_with_ip_control` each step. Determinism is a seeded CPU `StdRng`
 //!     (the launch-portable sc-3673 contract), seeded per request.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -24,8 +26,9 @@ use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
 };
 use candle_gen::gen_core::{
-    reject_unknown_components, require_component, AdapterSpec, DetectedFace, FaceEmbedder, Image,
-    LoadSpec, PidWeights, Progress, WeightsSource,
+    reject_unknown_components, require_component, AdapterSpec, DetectedFace, FaceEmbedder,
+    GenerationRequest, Image, LoadSpec, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemoryStrategy, PidWeights, Progress, WeightsSource,
 };
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8373).
@@ -200,6 +203,7 @@ impl SdxlComponents {
 }
 
 /// Paths to the InstantID checkpoints.
+#[derive(Clone)]
 pub struct InstantIdPaths {
     /// SDXL base snapshot dir (`unet/`, `text_encoder{,_2}/`, …).
     pub sdxl_base: PathBuf,
@@ -277,13 +281,13 @@ impl Default for InstantIdRequest {
 /// the `add_embedding` head) + the dual-CLIP conditioner + the IdentityNet + the face Resampler + the
 /// f16 VAE + the ancestral sampler, plus optional OpenPose CN (pose mode) and face-analysis stack.
 pub struct InstantId {
-    conditioner: SdxlConditioner,
-    unet: UNet2DConditionModel,
-    identitynet: ControlNet,
+    conditioner: Option<SdxlConditioner>,
+    unet: Option<UNet2DConditionModel>,
+    identitynet: Option<ControlNet>,
     /// The OpenPose ControlNet for pose mode (sc-3117), attached via [`with_openpose`](Self::with_openpose).
     openpose: Option<ControlNet>,
-    resampler: Resampler,
-    vae: SdxlVaeDecoder,
+    resampler: Option<Resampler>,
+    vae: Option<SdxlVaeDecoder>,
     sampler: EulerAncestralSampler,
     /// SDXL ε-prediction α-cumprod schedule (`scaled_linear`), built once at load — the
     /// [`DiscreteModelSampling`] source for the curated unified-sampler path (epic 7114, sc-7297).
@@ -295,9 +299,300 @@ pub struct InstantId {
     /// checkpoint ([`PID_BACKBONE`]) as the registered SDXL provider — there is no InstantID-specific PiD.
     pid: Option<PidEngine>,
     device: Device,
+    reload: InstantIdReload,
+    staged_residency: bool,
+    memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
+    memory_identity: Option<crate::memory_strategy::InstantIdMemoryIdentity>,
+    active_memory_scope: RefCell<Option<Rc<SharedMemoryScope>>>,
+}
+
+struct SharedMemoryScope {
+    inner: RefCell<Box<dyn MemoryRequestScope>>,
+    active: Cell<bool>,
+    phase: Cell<Option<MemoryPhase>>,
+}
+
+struct MemoryScopeHandle {
+    shared: Rc<SharedMemoryScope>,
+}
+
+fn drop_resident_component<T>(slot: &mut Option<T>) {
+    drop(slot.take());
+}
+
+fn reload_resident_component<T, E>(
+    slot: &mut Option<T>,
+    load: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<(), E> {
+    if slot.is_none() {
+        *slot = Some(load()?);
+    }
+    Ok(())
+}
+
+fn transition_shared_memory_scope(
+    active_scope: &RefCell<Option<Rc<SharedMemoryScope>>>,
+    next: Option<MemoryPhase>,
+) -> Result<()> {
+    let Some(shared) = active_scope.borrow().as_ref().cloned() else {
+        return Ok(());
+    };
+    if !shared.active.get() || shared.phase.get() == next {
+        return Ok(());
+    }
+    let current = shared.phase.get();
+    let mut scope = shared.inner.borrow_mut();
+    if let Some(phase) = current {
+        scope.leave_phase(phase)?;
+    }
+    if let Some(phase) = next {
+        scope.enter_phase(phase)?;
+    }
+    drop(scope);
+    shared.phase.set(next);
+    Ok(())
+}
+
+impl Drop for MemoryScopeHandle {
+    fn drop(&mut self) {
+        self.shared.active.set(false);
+        self.shared.phase.set(None);
+    }
+}
+
+impl MemoryRequestScope for MemoryScopeHandle {
+    fn configure_request(
+        &mut self,
+        request: &mut GenerationRequest,
+    ) -> candle_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().configure_request(request)
+    }
+
+    fn enter_phase(&mut self, phase: MemoryPhase) -> candle_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().enter_phase(phase)?;
+        self.shared.phase.set(Some(phase));
+        Ok(())
+    }
+
+    fn leave_phase(&mut self, phase: MemoryPhase) -> candle_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().leave_phase(phase)?;
+        self.shared.phase.set(None);
+        Ok(())
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        geometry: MemoryGeometry,
+    ) -> candle_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .configure_decode(tile_edge, overlap, geometry)
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> candle_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .configure_attention(chunk_size)
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> candle_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .materialize_transformer_window(first_block, block_count)
+    }
+
+    fn finish(&mut self, outcome: MemoryRunOutcome) -> candle_gen::gen_core::Result<()> {
+        let result = self.shared.inner.borrow_mut().finish(outcome);
+        self.shared.active.set(false);
+        self.shared.phase.set(None);
+        result
+    }
+}
+
+#[derive(Clone)]
+struct InstantIdReload {
+    paths: InstantIdPaths,
+    openpose: Option<WeightsSource>,
+    face_dir: Option<PathBuf>,
+    pid: Option<PidWeights>,
+}
+
+impl InstantIdReload {
+    fn new(paths: &InstantIdPaths) -> Self {
+        Self {
+            paths: paths.clone(),
+            openpose: None,
+            face_dir: None,
+            pid: None,
+        }
+    }
 }
 
 impl InstantId {
+    fn transition_memory_phase(&self, next: Option<MemoryPhase>) -> Result<()> {
+        transition_shared_memory_scope(&self.active_memory_scope, next)
+    }
+
+    fn require<'a, T>(value: &'a Option<T>, component: &str) -> Result<&'a T> {
+        value.as_ref().ok_or_else(|| {
+            CandleError::Msg(format!(
+                "instantid: {component} is not resident in the active memory phase"
+            ))
+        })
+    }
+
+    fn load_conditioning_components(&mut self) -> Result<()> {
+        if self.conditioner.is_some() {
+            return Ok(());
+        }
+        let paths = &self.reload.paths;
+        let root = paths.sdxl_base.as_path();
+        let conditioner = SdxlConditioner::load(
+            root,
+            &self.device,
+            DTYPE,
+            &paths.sdxl.tokenizer_clip_l,
+            &paths.sdxl.tokenizer_clip_bigg,
+        )?;
+        let ipa = Weights::from_file(&paths.ip_adapter, &self.device, DTYPE).map_err(|e| {
+            CandleError::Msg(format!(
+                "instantid: load ip-adapter {:?} (run tools/convert_instantid.py): {e}",
+                paths.ip_adapter
+            ))
+        })?;
+        let resampler =
+            Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::instantid_face())?;
+        let face = match &self.reload.face_dir {
+            Some(dir) => Some(candle_gen_face::load_on(dir, &self.device)?),
+            None => None,
+        };
+        self.conditioner = Some(conditioner);
+        self.resampler = Some(resampler);
+        self.face = face;
+        Ok(())
+    }
+
+    fn load_denoise_components(&mut self) -> Result<()> {
+        if self.unet.is_some() {
+            return Ok(());
+        }
+        let paths = &self.reload.paths;
+        let root = paths.sdxl_base.as_path();
+        let mut unet = if paths.adapters.is_empty() {
+            load_instantid_unet(root, &self.device, DTYPE)?
+        } else {
+            load_instantid_unet_with_adapters(root, &self.device, DTYPE, &paths.adapters)?
+        };
+        let identitynet = load_sdxl_controlnet(&paths.identitynet, &self.device, DTYPE)?;
+        let ipa = Weights::from_file(&paths.ip_adapter, &self.device, DTYPE).map_err(|e| {
+            CandleError::Msg(format!(
+                "instantid: load ip-adapter {:?} (run tools/convert_instantid.py): {e}",
+                paths.ip_adapter
+            ))
+        })?;
+        unet.install_ip_adapter(load_ip_kv_pairs(&ipa)?)?;
+        let openpose = match &self.reload.openpose {
+            Some(source) => Some(load_sdxl_controlnet(source, &self.device, DTYPE)?),
+            None => None,
+        };
+        self.unet = Some(unet);
+        self.identitynet = Some(identitynet);
+        self.openpose = openpose;
+        Ok(())
+    }
+
+    fn load_decode_components(&mut self, use_pid: bool) -> Result<()> {
+        let vae_source = self.reload.paths.sdxl.vae_fp16_fix.clone();
+        let device = self.device.clone();
+        reload_resident_component(&mut self.vae, || load_sdxl_vae(&vae_source, &device, DTYPE))?;
+        if use_pid && self.pid.is_none() {
+            let pid = self.reload.pid.as_ref().ok_or_else(|| {
+                CandleError::Msg(
+                    "instantid: use_pid was requested but no PiD decoder is configured (call with_pid)"
+                        .into(),
+                )
+            })?;
+            self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.device)?);
+        }
+        Ok(())
+    }
+
+    fn synchronize_phase(&self) -> Result<()> {
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    fn release_conditioning_components(&mut self) -> Result<()> {
+        if self.staged_residency {
+            self.synchronize_phase()?;
+            drop_resident_component(&mut self.conditioner);
+            drop_resident_component(&mut self.resampler);
+            drop_resident_component(&mut self.face);
+        }
+        Ok(())
+    }
+
+    fn release_denoise_components(&mut self) -> Result<()> {
+        if self.staged_residency {
+            self.synchronize_phase()?;
+            drop_resident_component(&mut self.unet);
+            drop_resident_component(&mut self.identitynet);
+            drop_resident_component(&mut self.openpose);
+        }
+        Ok(())
+    }
+
+    fn release_decode_components(&mut self) -> Result<()> {
+        if self.staged_residency {
+            self.synchronize_phase()?;
+            drop_resident_component(&mut self.vae);
+            drop_resident_component(&mut self.pid);
+        }
+        self.transition_memory_phase(None)
+    }
+
+    fn release_all_staged_components(&mut self) -> Result<()> {
+        self.release_conditioning_components()?;
+        self.release_denoise_components()?;
+        self.release_decode_components()
+    }
+
+    fn prepare_conditioning_phase(&mut self) -> Result<()> {
+        self.transition_memory_phase(Some(MemoryPhase::Conditioning))?;
+        if self.staged_residency {
+            self.release_denoise_components()?;
+            self.release_decode_components()?;
+        }
+        self.load_conditioning_components()
+    }
+
+    fn finish_conditioning_phase(&mut self) -> Result<()> {
+        if self.staged_residency {
+            self.release_conditioning_components()?;
+            self.load_denoise_components()?;
+        }
+        self.transition_memory_phase(Some(MemoryPhase::Denoise))?;
+        Ok(())
+    }
+
+    fn finish_denoise_phase(&mut self, use_pid: bool) -> Result<()> {
+        if self.staged_residency {
+            self.release_denoise_components()?;
+            self.load_decode_components(use_pid)?;
+        }
+        self.transition_memory_phase(Some(MemoryPhase::Decode))?;
+        Ok(())
+    }
+
     /// Load the SDXL backbone + dual-CLIP conditioner + IdentityNet + face Resampler, installing the
     /// decoupled-cross-attn K/V pairs into the UNet. The face-analysis stack attaches separately via
     /// [`with_face`](Self::with_face).
@@ -342,12 +637,12 @@ impl InstantId {
 
         let vae = load_sdxl_vae(&paths.sdxl.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
-            conditioner,
-            unet,
-            identitynet,
+            conditioner: Some(conditioner),
+            unet: Some(unet),
+            identitynet: Some(identitynet),
             openpose: None,
-            resampler,
-            vae,
+            resampler: Some(resampler),
+            vae: Some(vae),
             sampler: EulerAncestralSampler::sdxl(),
             alpha_schedule: AlphaSchedule::scaled_linear(
                 SDXL_TRAIN_STEPS,
@@ -357,14 +652,142 @@ impl InstantId {
             face: None,
             pid: None,
             device,
+            reload: InstantIdReload::new(paths),
+            staged_residency: false,
+            memory_contract: None,
+            memory_identity: None,
+            active_memory_scope: RefCell::new(None),
         })
+    }
+
+    /// Load and retain the exact request-scoped admission identity for the bespoke route.
+    pub fn load_with_memory_context(
+        paths: &InstantIdPaths,
+        identity: crate::memory_strategy::InstantIdMemoryIdentity,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract();
+        crate::memory_strategy::validate_context(&contract, &identity, &context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let staged_residency = context.selection.strategy == MemoryStrategy::StagedResidency;
+        let mut model = if staged_residency {
+            Self {
+                conditioner: None,
+                unet: None,
+                identitynet: None,
+                openpose: None,
+                resampler: None,
+                vae: None,
+                sampler: EulerAncestralSampler::sdxl(),
+                alpha_schedule: AlphaSchedule::scaled_linear(
+                    SDXL_TRAIN_STEPS,
+                    SDXL_BETA_START,
+                    SDXL_BETA_END,
+                ),
+                face: None,
+                pid: None,
+                device: candle_gen::default_device()?,
+                reload: InstantIdReload::new(paths),
+                staged_residency: true,
+                memory_contract: None,
+                memory_identity: None,
+                active_memory_scope: RefCell::new(None),
+            }
+        } else {
+            Self::load(paths)?
+        };
+        model.memory_contract = Some(contract);
+        model.memory_identity = Some(identity);
+        Ok(model)
+    }
+
+    /// Revalidate the exact route/geometry handshake and create the cleanup-owning CUDA scope.
+    /// Dropping the returned scope on an error or cancellation synchronizes the device.
+    pub fn begin_memory_request(
+        &mut self,
+        context: &MemoryRunContext,
+        identity: &crate::memory_strategy::InstantIdMemoryIdentity,
+        req: &InstantIdRequest,
+        route: crate::memory_strategy::InstantIdRoute,
+    ) -> Result<Box<dyn MemoryRequestScope>> {
+        let loaded_identity = self.memory_identity.as_ref().ok_or_else(|| {
+            CandleError::Msg("instantid: model was not loaded with a memory context".into())
+        })?;
+        let contract = self
+            .memory_contract
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg("instantid: loaded model lost its memory contract".into())
+            })?
+            .clone();
+        if loaded_identity != identity || identity.route != route {
+            return Err(CandleError::Msg(
+                "instantid: request crossed its admitted route/composition context".into(),
+            ));
+        }
+        if (req.width, req.height, req.use_pid)
+            != (
+                context.geometry.width,
+                context.geometry.height,
+                context.use_pid,
+            )
+        {
+            return Err(CandleError::Msg(
+                "instantid: request geometry/PiD route changed after admission".into(),
+            ));
+        }
+        crate::memory_strategy::validate_context(&contract, identity, context)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let staged = context.selection.strategy == MemoryStrategy::StagedResidency;
+        if staged != self.staged_residency {
+            if staged {
+                self.staged_residency = true;
+                self.release_all_staged_components()?;
+            } else {
+                let load = (|| {
+                    self.load_conditioning_components()?;
+                    self.load_denoise_components()?;
+                    self.load_decode_components(req.use_pid)
+                })();
+                if let Err(error) = load {
+                    self.release_all_staged_components()?;
+                    return Err(error);
+                }
+                self.staged_residency = false;
+            }
+        }
+        let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+            crate::memory_strategy::PROVIDER_ID,
+            self.device.clone(),
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            req.use_pid,
+            0,
+            |_pid, _edge, _overlap| {
+                Err(candle_gen::gen_core::Error::Unsupported(
+                    "instantid: bounded decode is Missing".into(),
+                ))
+            },
+        )?;
+        let shared = Rc::new(SharedMemoryScope {
+            inner: RefCell::new(Box::new(
+                candle_gen::request_scope::CandleRequestScopeCore::new(config),
+            )),
+            active: Cell::new(true),
+            phase: Cell::new(None),
+        });
+        *self.active_memory_scope.borrow_mut() = Some(Rc::clone(&shared));
+        Ok(Box::new(MemoryScopeHandle { shared }))
     }
 
     /// Attach the OpenPose ControlNet for pose mode (sc-3117) — a stock diffusers SDXL ControlNet
     /// (`xinsir/controlnet-openpose-sdxl-1.0`), loaded via the same [`load_sdxl_controlnet`] as
     /// IdentityNet. Required by [`generate_pose`](Self::generate_pose).
     pub fn with_openpose(mut self, openpose: &WeightsSource) -> Result<Self> {
-        self.openpose = Some(load_sdxl_controlnet(openpose, &self.device, DTYPE)?);
+        self.reload.openpose = Some(openpose.clone());
+        if !self.staged_residency {
+            self.openpose = Some(load_sdxl_controlnet(openpose, &self.device, DTYPE)?);
+        }
         Ok(self)
     }
 
@@ -372,7 +795,10 @@ impl InstantId {
     /// take a raw reference image. `dir` holds `scrfd_10g.safetensors` + `arcface_iresnet100.safetensors`
     /// (the [`candle_gen_face`] layout). The stack loads onto this model's device.
     pub fn with_face(mut self, dir: &Path) -> Result<Self> {
-        self.face = Some(candle_gen_face::load_on(dir, &self.device)?);
+        self.reload.face_dir = Some(dir.to_path_buf());
+        if !self.staged_residency {
+            self.face = Some(candle_gen_face::load_on(dir, &self.device)?);
+        }
         Ok(self)
     }
 
@@ -384,7 +810,10 @@ impl InstantId {
     /// `use_pid = true` decodes through the student (4× SR → 2K/4K) instead of the native VAE; without it,
     /// `use_pid` errors loudly (the engine never silently falls back). Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
-        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.device)?);
+        self.reload.pid = Some(pid.clone());
+        if !self.staged_residency {
+            self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.device)?);
+        }
         Ok(self)
     }
 
@@ -415,8 +844,11 @@ impl InstantId {
 
     /// Detect + embed the largest face in `image` (the reference): bbox + 5 kps + 512-d ArcFace
     /// embedding. Requires [`with_face`](Self::with_face).
-    pub fn largest_face(&self, image: &Image) -> Result<DetectedFace> {
-        largest_face_from(self.face.as_ref(), image)
+    pub fn largest_face(&mut self, image: &Image) -> Result<DetectedFace> {
+        self.prepare_conditioning_phase()?;
+        let result = largest_face_from(self.face.as_ref(), image);
+        self.release_conditioning_components()?;
+        result
     }
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
@@ -496,32 +928,53 @@ impl InstantId {
         kps: &[(f32, f32)],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let result = self.generate_with_loaded(req, embedding, kps, on_progress);
+        self.release_all_staged_components()?;
+        result
+    }
+
+    fn generate_with_loaded(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        kps: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
         check_steps(req.steps)?;
         check_embedding(embedding)?;
         validate_kps(kps)?;
+        self.prepare_conditioning_phase()?;
         let cfg_on = req.guidance > 1.0;
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap).
-        let (conditioning, pooled) = self
-            .conditioner
+        let (conditioning, pooled) = Self::require(&self.conditioner, "dual CLIP conditioner")?
             .encode(&req.prompt, &req.negative, cfg_on)?;
         let batch = conditioning.dim(0)?;
         let time_ids = text_time_ids(batch, &self.device, DTYPE)?;
         let face_tokens = self.face_tokens(embedding, cfg_on)?;
+        self.synchronize_phase()?;
+        self.finish_conditioning_phase()?;
         let kps_image = kps::draw_kps(req.width, req.height, kps);
-        let id_cond_embed =
-            self.cond_embed(&self.identitynet, &kps_image, req.width, req.height, cfg_on)?;
+        let id_cond_embed = self.cond_embed(
+            Self::require(&self.identitynet, "IdentityNet")?,
+            &kps_image,
+            req.width,
+            req.height,
+            cfg_on,
+        )?;
 
         // Set the face IP tokens on the UNet (constant across the denoise — phase 2c/2e design).
         self.unet
+            .as_mut()
+            .ok_or_else(|| CandleError::Msg("instantid: UNet is not resident".into()))?
             .set_ip_context(Some(&face_tokens), req.ip_adapter_scale as f64)?;
 
         let control_ctx = ControlContext {
-            controlnet: &self.identitynet,
+            controlnet: Self::require(&self.identitynet, "IdentityNet")?,
             cond_embed: id_cond_embed,
             scale: req.controlnet_scale as f64,
         };
@@ -536,12 +989,21 @@ impl InstantId {
             &face_tokens, // the IdentityNet cross-attn conditioning = the face tokens
             on_progress,
         )?;
+        self.synchronize_phase()?;
+        self.finish_denoise_phase(req.use_pid)?;
         on_progress(Progress::Decoding);
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
+        let image = decode_image(
+            Self::require(&self.vae, "VAE")?,
+            &latents,
+            pid_ref,
+            Some(&req.cancel),
+        )?;
+        self.release_decode_components()?;
+        Ok(image)
     }
 
     /// Build the CFG-batched face tokens from a 512-d ArcFace `embedding`. **Uncond-first**: under CFG
@@ -556,7 +1018,7 @@ impl InstantId {
         } else {
             embed
         };
-        self.resampler.forward(&input) // [B, 16, 2048]
+        Self::require(&self.resampler, "face resampler")?.forward(&input) // [B, 16, 2048]
     }
 
     /// Preprocess a control image → the step-invariant ControlNet conditioning embedding, CFG-batched to
@@ -633,7 +1095,7 @@ impl InstantId {
                 candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
             let prior = seeded_sigma_prior(req.seed, width, height, sigmas[0], &self.device)?;
             denoise_curated(
-                &self.unet,
+                Self::require(&self.unet, "UNet")?,
                 Some(sampler_name),
                 &ms,
                 &sigmas,
@@ -663,7 +1125,7 @@ impl InstantId {
             // bit-identical to the historical `denoise_ip_control`).
             let prior = self.seeded_prior_with(req.seed, width, height)?;
             let d = Denoiser {
-                unet: &self.unet,
+                unet: Self::require(&self.unet, "UNet")?,
                 sampler: &self.sampler,
             };
             let steps = self.sampler.timesteps(req.steps, self.sampler.max_time());
@@ -730,6 +1192,20 @@ impl InstantId {
         keypoints: &[BodyPoint],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let result =
+            self.generate_pose_with_loaded(req, embedding, face_kps, keypoints, on_progress);
+        self.release_all_staged_components()?;
+        result
+    }
+
+    fn generate_pose_with_loaded(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        face_kps: Option<&[(f32, f32)]>,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -738,20 +1214,22 @@ impl InstantId {
         if let Some(kps) = face_kps {
             validate_kps(kps)?;
         }
-        if self.openpose.is_none() {
+        if self.reload.openpose.is_none() && self.openpose.is_none() {
             return Err(CandleError::Msg(
                 "instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into(),
             ));
         }
+        self.prepare_conditioning_phase()?;
         let side = req.width;
         let cfg_on = req.guidance > 1.0;
 
-        let (conditioning, pooled) = self
-            .conditioner
+        let (conditioning, pooled) = Self::require(&self.conditioner, "dual CLIP conditioner")?
             .encode(&req.prompt, &req.negative, cfg_on)?;
         let batch = conditioning.dim(0)?;
         let time_ids = text_time_ids(batch, &self.device, DTYPE)?;
         let face_tokens = self.face_tokens(embedding, cfg_on)?;
+        self.synchronize_phase()?;
+        self.finish_conditioning_phase()?;
         let skeleton = openpose::draw_bodypose(side, side, keypoints, STICKWIDTH);
 
         // Face landmark control image + per-branch scales. No visible face ⇒ blank kps, IdentityNet + IP
@@ -774,7 +1252,13 @@ impl InstantId {
                 0.0,
             ),
         };
-        let id_cond_embed = self.cond_embed(&self.identitynet, &face_image, side, side, cfg_on)?;
+        let id_cond_embed = self.cond_embed(
+            Self::require(&self.identitynet, "IdentityNet")?,
+            &face_image,
+            side,
+            side,
+            cfg_on,
+        )?;
         let op_cond_embed = {
             let op = self.openpose.as_ref().expect("openpose checked above");
             self.cond_embed(op, &skeleton, side, side, cfg_on)?
@@ -782,13 +1266,16 @@ impl InstantId {
 
         // No-face mode zeros the IP scale; the head-visible path uses the request scale. Set on the
         // UNet (constant across the denoise) before the shared `run_identity_denoise`.
-        self.unet.set_ip_context(Some(&face_tokens), ip_scale)?;
+        self.unet
+            .as_mut()
+            .ok_or_else(|| CandleError::Msg("instantid: UNet is not resident".into()))?
+            .set_ip_context(Some(&face_tokens), ip_scale)?;
 
         let op = self.openpose.as_ref().expect("openpose checked above");
         // MultiControlNet branch order matches the reference: [IdentityNet(kps), OpenPose(skeleton)].
         let controls = [
             ControlContext {
-                controlnet: &self.identitynet,
+                controlnet: Self::require(&self.identitynet, "IdentityNet")?,
                 cond_embed: id_cond_embed,
                 scale: id_scale,
             },
@@ -809,12 +1296,21 @@ impl InstantId {
             &face_tokens, // both branches' cross-attn conditioning = the face tokens
             on_progress,
         )?;
+        self.synchronize_phase()?;
+        self.finish_denoise_phase(req.use_pid)?;
         on_progress(Progress::Decoding);
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
+        let image = decode_image(
+            Self::require(&self.vae, "VAE")?,
+            &latents,
+            pid_ref,
+            Some(&req.cancel),
+        )?;
+        self.release_decode_components()?;
+        Ok(image)
     }
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
@@ -833,7 +1329,10 @@ impl InstantId {
             return Err(CandleError::Canceled);
         }
         // Detect (no embed — only the box/landmarks are used; the identity is the `embedding` param).
-        let dets = restore_face_detections(self.face.as_ref(), base)?;
+        self.prepare_conditioning_phase()?;
+        let dets = restore_face_detections(self.face.as_ref(), base);
+        self.release_conditioning_components()?;
+        let dets = dets?;
         let Some(f) = dets.first() else {
             return Ok(base.clone()); // no face to restore — leave the base untouched
         };
@@ -971,6 +1470,173 @@ fn place_face_kps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingScope(Rc<RefCell<Vec<String>>>);
+
+    impl MemoryRequestScope for RecordingScope {
+        fn configure_request(
+            &mut self,
+            _request: &mut GenerationRequest,
+        ) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn enter_phase(&mut self, phase: MemoryPhase) -> candle_gen::gen_core::Result<()> {
+            self.0.borrow_mut().push(format!("enter:{phase:?}"));
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: MemoryPhase) -> candle_gen::gen_core::Result<()> {
+            self.0.borrow_mut().push(format!("leave:{phase:?}"));
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _tile_edge: u32,
+            _overlap: u32,
+            _geometry: MemoryGeometry,
+        ) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_attention(&mut self, _chunk_size: u32) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _first_block: u32,
+            _block_count: u32,
+        ) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self, _outcome: MemoryRunOutcome) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn provider_scope_tracks_conditioning_denoise_decode_and_terminal_cleanup() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let shared = Rc::new(SharedMemoryScope {
+            inner: RefCell::new(Box::new(RecordingScope(Rc::clone(&events)))),
+            active: Cell::new(true),
+            phase: Cell::new(None),
+        });
+        let active = RefCell::new(Some(shared));
+        for phase in [
+            Some(MemoryPhase::Conditioning),
+            Some(MemoryPhase::Denoise),
+            Some(MemoryPhase::Decode),
+            None,
+        ] {
+            transition_shared_memory_scope(&active, phase).unwrap();
+        }
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "enter:Conditioning",
+                "leave:Conditioning",
+                "enter:Denoise",
+                "leave:Denoise",
+                "enter:Decode",
+                "leave:Decode",
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_component_primitive_drops_reloads_and_cleans_up_after_error() {
+        #[derive(Clone)]
+        struct DropProbe(Rc<Cell<usize>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let loads = Cell::new(0);
+        let mut slot = Some(DropProbe(Rc::clone(&drops)));
+        drop_resident_component(&mut slot);
+        assert!(slot.is_none());
+        assert_eq!(drops.get(), 1, "conditioning owner must physically drop");
+
+        reload_resident_component(&mut slot, || {
+            loads.set(loads.get() + 1);
+            Ok::<_, &'static str>(DropProbe(Rc::clone(&drops)))
+        })
+        .unwrap();
+        assert!(slot.is_some());
+        assert_eq!(loads.get(), 1, "the next request reloads the component");
+        drop_resident_component(&mut slot);
+        assert_eq!(drops.get(), 2, "terminal cleanup drops the reloaded owner");
+
+        let error = reload_resident_component(&mut slot, || Err::<DropProbe, _>("load failed"));
+        assert_eq!(error, Err("load failed"));
+        assert!(
+            slot.is_none(),
+            "a failed reload cannot leave a partial resident"
+        );
+    }
+
+    #[test]
+    fn staged_to_resident_switch_is_transactional_when_reload_fails() {
+        use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
+
+        let tier = crate::memory_strategy::resolved_numeric_tier();
+        let identity = crate::memory_strategy::InstantIdMemoryIdentity {
+            route: crate::memory_strategy::InstantIdRoute::Identity,
+            adapter_count: 0,
+            use_pid: false,
+            face_restore: false,
+            artifact_fingerprint: "fixture".into(),
+        };
+        let contract = crate::memory_strategy::provider_contract();
+        let make_context = |strategy| {
+            let mut context = candle_gen::gen_core::standard_memory_behavior_context(
+                &contract,
+                strategy,
+                tier,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("character_image".into()),
+                    reference_count: 1,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: Some(identity.overlay_key()),
+                },
+            )
+            .unwrap();
+            context.evidence_revision = crate::memory_strategy::REQUEST_EVIDENCE_REVISION.into();
+            context
+        };
+        let missing = PathBuf::from("/definitely-missing/instantid");
+        let paths = InstantIdPaths {
+            sdxl_base: missing.clone(),
+            identitynet: WeightsSource::Dir(missing.clone()),
+            ip_adapter: missing.clone(),
+            adapters: Vec::new(),
+            sdxl: SdxlComponents {
+                tokenizer_clip_l: WeightsSource::Dir(missing.clone()),
+                tokenizer_clip_bigg: WeightsSource::Dir(missing.clone()),
+                vae_fp16_fix: WeightsSource::Dir(missing),
+            },
+        };
+        let mut model = InstantId::load_with_memory_context(
+            &paths,
+            identity.clone(),
+            make_context(MemoryStrategy::StagedResidency),
+        )
+        .expect("staged construction must not touch weights");
+        assert!(model.staged_residency);
+        assert!(model.conditioner.is_none() && model.unet.is_none() && model.vae.is_none());
+
+        let error = model.begin_memory_request(
+            &make_context(MemoryStrategy::Resident),
+            &identity,
+            &InstantIdRequest::default(),
+            crate::memory_strategy::InstantIdRoute::Identity,
+        );
+        assert!(error.is_err(), "resident switch must attempt a real reload");
+        assert!(model.staged_residency, "failed switch rolls back strategy");
+        assert!(model.conditioner.is_none() && model.unet.is_none() && model.vae.is_none());
+    }
 
     #[test]
     fn restore_resize_uses_generated_image_dimensions() {

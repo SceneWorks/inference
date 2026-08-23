@@ -129,7 +129,7 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
     if let Some(bits) = quant_bits {
         model = model.quantize(bits).expect("quantize");
     }
-    let model = model
+    let mut model = model
         .with_face(&scrfd, &arcface)
         .expect("attach face stack");
 
@@ -257,7 +257,7 @@ fn instantid_pose_mode_preserves_identity() {
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
         adapters: Vec::new(),
     };
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_openpose(&openpose_controlnet())
         .expect("attach OpenPose ControlNet")
@@ -326,7 +326,7 @@ fn instantid_face_restore_improves_identity() {
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
         adapters: Vec::new(),
     };
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_openpose(&openpose_controlnet())
         .expect("attach OpenPose ControlNet")
@@ -414,7 +414,7 @@ fn instantid_view_angle_preserves_identity() {
         ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
         adapters: Vec::new(),
     };
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_face(
             &golden("scrfd_10g.safetensors"),
@@ -497,7 +497,7 @@ fn instantid_user_lora_changes_output() {
             ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
             adapters,
         };
-        let model = InstantId::load(&paths)
+        let mut model = InstantId::load(&paths)
             .expect("load InstantID")
             .with_face(
                 &golden("scrfd_10g.safetensors"),
@@ -569,7 +569,7 @@ fn instantid_honors_cancellation() {
     };
     let scrfd = golden("scrfd_10g.safetensors");
     let arcface = golden("arcface_iresnet100.safetensors");
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_face(&scrfd, &arcface)
         .expect("attach face stack");
