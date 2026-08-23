@@ -144,6 +144,11 @@ fn validate_v2v_contract(req: &GenerationRequest, resolved: ResolvedFrames) -> R
         }
         return Ok(());
     }
+    if !explicitly_v2v {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: a VideoClip carrier requires video_mode=video_to_video"
+        )));
+    }
     if clips.len() != 1 || req.conditioning.len() != 1 {
         return Err(Error::Unsupported(format!(
             "{MODEL_ID} video_to_video requires exactly one VideoClip and no other conditioning carriers"
@@ -1168,5 +1173,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires exactly one VideoClip"));
+    }
+
+    #[test]
+    fn video_clip_requires_the_exact_v2v_mode() {
+        let provider = unloaded();
+        for crossed_mode in [None, Some("image_to_video")] {
+            let mut request = v2v_request(5);
+            request.video_mode = crossed_mode.map(str::to_owned);
+            let error = Generator::validate(&provider, &request)
+                .expect_err("a VideoClip must never infer or borrow a non-V2V public mode");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires video_mode=video_to_video"),
+                "{crossed_mode:?}: {error}"
+            );
+        }
     }
 }

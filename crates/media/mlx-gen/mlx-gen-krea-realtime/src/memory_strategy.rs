@@ -30,7 +30,12 @@ const TOKENIZER: &str = "tokenizer.json";
 const VAE: &str = "vae.safetensors";
 const DIT: &str = "dit.safetensors";
 const TRANSFORMER: &str = "transformer";
-const FINGERPRINT_PREFIX: &str = "krea-realtime-video-resident-v3";
+/// Cross-repository ABI domain used by the provider and the SceneWorks worker when sealing the
+/// same direct-file/adapter receipt. Keep this public so paired fixtures can name the authoritative
+/// provider spelling instead of reviving an I2V-only predecessor.
+pub const ARTIFACT_RECEIPT_DOMAIN: &str = "krea-realtime-video-resident-v3";
+/// Cross-repository ABI domain for the request envelope carrying that artifact receipt.
+pub const REQUEST_RECEIPT_DOMAIN: &str = "provider-resident-video-request-v3";
 pub const CANONICAL_REPOSITORY: &str = "SceneWorks/krea-realtime-14b-mlx";
 pub const CANONICAL_REVISION: &str = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626";
 const PACKED_FILES: &[&str] = &[CONFIG, DIT, TEXT_ENCODER, TOKENIZER, VAE];
@@ -372,7 +377,7 @@ fn canonical_artifact_identity_for_source(
     let mut direct = required_direct_files(root, resolved_tier)?;
     direct.sort();
     let mut digest = Sha256::new();
-    digest.update(FINGERPRINT_PREFIX.as_bytes());
+    digest.update(ARTIFACT_RECEIPT_DOMAIN.as_bytes());
     digest.update(repository.as_bytes());
     digest.update(revision.as_bytes());
     digest.update(resolved_tier.as_bytes());
@@ -551,7 +556,7 @@ pub(crate) fn safety_check(
         }
     };
     let sealed_request_prefix =
-        format!("provider-resident-video-request-v3:{MODEL_ID}:mode={mode}:shape={shape}:");
+        format!("{REQUEST_RECEIPT_DOMAIN}:{MODEL_ID}:mode={mode}:shape={shape}:");
     if &expected != contract
         || context.geometry.reference_count != 1
         || !context
@@ -677,6 +682,23 @@ mod tests {
         } else {
             tensor(&root.join(DIT), dit_bytes, if tier == "q4" { 4 } else { 8 });
         }
+        (temp, LoadSpec::new(WeightsSource::Dir(root)))
+    }
+
+    /// Byte-for-byte twin of the SceneWorks worker's sealed q8 fixture. This deliberately does not
+    /// call the provider fixture helper: both sides must independently reproduce the same receipt.
+    fn worker_sealed_fixture() -> (tempfile::TempDir, LoadSpec) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        std::fs::write(
+            root.join(CONFIG),
+            br#"{"quantization":{"bits":8},"denoising_step_list":[1000,937,833,625,0]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(TOKENIZER), b"{}").unwrap();
+        tensor(&root.join(TEXT_ENCODER), 101, 101);
+        tensor(&root.join(DIT), 401, 401_u64 as u8);
+        tensor(&root.join(VAE), 211, 211);
         (temp, LoadSpec::new(WeightsSource::Dir(root)))
     }
 
@@ -881,6 +903,30 @@ mod tests {
         assert!(matches!(
             safety_check(&spec, &contract, &crossed),
             MemorySafetyDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn worker_sealed_v3_artifact_receipt_is_provider_accepted() {
+        const WORKER_SEALED_ARTIFACT: &str =
+            "59024c46ca617e4a45071e685bbefcea282cad6e2e41c0ab909a78e1dff77e7c";
+        let (_root, spec) = worker_sealed_fixture();
+        let contract = memory_strategy_contract(&spec).unwrap();
+        let artifact = canonical_artifact_identity(&spec).unwrap();
+        assert_eq!(artifact, WORKER_SEALED_ARTIFACT);
+        let context = resident_context(
+            "video_to_video",
+            "video_clip",
+            WORKER_SEALED_ARTIFACT,
+            Some(Quant::Q8),
+        );
+        assert!(matches!(
+            safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        ));
+        assert!(matches!(
+            loaded_safety_check(&spec, &contract, WORKER_SEALED_ARTIFACT, &context),
+            MemorySafetyDecision::Accept
         ));
     }
 }
