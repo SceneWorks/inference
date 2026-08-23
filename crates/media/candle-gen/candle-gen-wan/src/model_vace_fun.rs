@@ -10,7 +10,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, PerComponentBytes, Progress, Quant, WeightsSource,
+    OffloadPolicy, PerComponentBytes, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -401,6 +401,7 @@ pub struct WanVaceFunGenerator {
     tier: Option<VaceFunTierPaths>,
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceFunGenerator {
@@ -530,6 +531,9 @@ impl Generator for WanVaceFunGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate_request(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let pipeline = Pipeline::new(
             &self.root,
             &self.device,
@@ -651,6 +655,29 @@ impl Generator for WanVaceFunGenerator {
             audio: None,
         })
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|p| &p.contract)
+    }
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "wan2_2_vace_fun_14b loaded route has no sealed memory contract".to_owned(),
+            },
+            |p| crate::i2v_memory_strategy::safety_check(p, context),
+        )
+    }
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        self.i2v_memory.as_ref().map_or(Ok(None), |p| {
+            crate::i2v_memory_strategy::begin_request(p, self.device.clone(), context)
+        })
+    }
 }
 
 pub fn descriptor() -> ModelDescriptor {
@@ -725,6 +752,16 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE_FUN)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(
+            spec,
+            MODEL_ID_VACE_FUN,
+        )?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceFunGenerator {
         descriptor: descriptor(),
         root,
@@ -734,6 +771,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         tier,
         shared: Mutex::new(None),
         experts: Mutex::new(None),
+        i2v_memory,
     }))
 }
 
@@ -746,6 +784,7 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use crate::vace::weighted_control_scale;
+    use candle_gen::gen_core::Quant;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
 

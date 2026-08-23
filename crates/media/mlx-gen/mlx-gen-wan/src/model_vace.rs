@@ -647,6 +647,7 @@ pub struct WanVaceFun {
     quantize: Option<Quant>,
     adapters: Vec<AdapterSpec>,
     offload_policy: OffloadPolicy,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceFun {
@@ -811,6 +812,13 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     let config = WanVaceConfig::vace_fun_from_model_dir(&root)?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE_FUN)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_VACE_FUN).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceFun {
         descriptor: descriptor_vace_fun(),
         config,
@@ -818,14 +826,49 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         quantize: spec.quantize,
         adapters: spec.adapters.clone(),
         offload_policy: spec.offload_policy,
+        i2v_memory,
     }))
 }
 
-// Identical control-clip contract as single-expert VACE.
-mlx_gen::impl_generator!(WanVaceFun {
-    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, &s.config, req),
-    generate: generate_impl,
-});
+impl Generator for WanVaceFun {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_vace_clip(&self.descriptor, MODEL_ID_VACE_FUN, &self.config, req)
+            .map_err(Into::into)
+    }
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|p| &p.contract)
+    }
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "wan2_2_vace_fun_14b loaded route has no sealed memory contract".to_owned(),
+            },
+            |p| crate::i2v_memory_strategy::safety_check(p, context),
+        )
+    }
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        self.i2v_memory.as_ref().map_or(Ok(None), |p| {
+            crate::i2v_memory_strategy::begin_request(p, context)
+        })
+    }
+}
 
 impl WanVaceFun {
     /// The dual-expert VACE pipeline: identical staging to [`WanVace::generate_impl`] (UMT5 encode →
@@ -837,6 +880,9 @@ impl WanVaceFun {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let base = &self.config.base;
         let sequential = self.offload_policy == OffloadPolicy::Sequential;
 
