@@ -19,7 +19,7 @@ use crate::{
     MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
 
-pub const RECEIPT_VERSION: &str = "wan-i2v-structural-v2";
+pub const RECEIPT_VERSION: &str = "wan-video-structural-v3";
 pub const LIGHTNING_REPOSITORY: &str = "lightx2v/Wan2.2-Lightning";
 pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
@@ -67,6 +67,30 @@ impl WanI2vRoute {
             Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
         }
     }
+
+    fn accepts_first_last_rate(self, fps: u32, frames: u32) -> bool {
+        self == Self::Ti2v5b
+            && match fps {
+                16 => [61, 77, 93, 109, 125].contains(&frames),
+                24 => [93, 117, 141, 165, 189].contains(&frames),
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WanPublicMode {
+    ImageToVideo,
+    FirstLastFrame,
+}
+
+impl WanPublicMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::ImageToVideo => "image_to_video",
+            Self::FirstLastFrame => "first_last_frame",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +128,7 @@ impl WanI2vBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WanAdapterReceipt {
     pub ordinal: u32,
+    pub path: PathBuf,
     pub kind: &'static str,
     pub scale_bits: u32,
     pub pass_scale_bits: Vec<u32>,
@@ -111,6 +136,8 @@ pub struct WanAdapterReceipt {
     pub digest: String,
     pub source_bytes: u64,
     pub persistent_bytes: u64,
+    pub realization: &'static str,
+    pub stability: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -834,15 +861,26 @@ fn adapter_receipts(
             Some(MoeExpert::High) => "high",
             Some(MoeExpert::Low) => "low",
         };
+        let realization = if packed {
+            "packed_additive_factors"
+        } else {
+            "dense_folded"
+        };
+        let stability = "pinned_digest_and_tensor_geometry";
         identity.update((ordinal as u32).to_le_bytes());
+        identity.update(absolute.to_string_lossy().as_bytes());
         identity.update(kind.as_bytes());
         identity.update(adapter.scale.to_bits().to_le_bytes());
+        identity.update(0_u32.to_le_bytes());
         identity.update(expert.as_bytes());
         identity.update(digest.as_bytes());
         identity.update(source_bytes.to_le_bytes());
         identity.update(persistent_bytes.to_le_bytes());
+        identity.update(realization.as_bytes());
+        identity.update(stability.as_bytes());
         receipts.push(WanAdapterReceipt {
             ordinal: ordinal as u32,
+            path: absolute.clone(),
             kind,
             scale_bits: adapter.scale.to_bits(),
             pass_scale_bits: Vec::new(),
@@ -850,6 +888,8 @@ fn adapter_receipts(
             digest: digest.clone(),
             source_bytes,
             persistent_bytes,
+            realization,
+            stability,
         });
         files.push(SealedFile {
             relative: format!("adapter:{ordinal}"),
@@ -1247,11 +1287,135 @@ fn reference(request: &GenerationRequest) -> crate::Result<&crate::Image> {
     }
 }
 
+fn valid_rgb8_image(image: &crate::Image) -> bool {
+    image.width > 0
+        && image.height > 0
+        && image
+            .width
+            .checked_mul(image.height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .is_some_and(|bytes| bytes as usize == image.pixels.len())
+}
+
+fn first_last_keyframes(request: &GenerationRequest) -> crate::Result<[crate::KeyframeRef<'_>; 2]> {
+    let [Conditioning::Keyframe {
+        image: first_image,
+        frame_idx: first_index,
+        strength: first_strength,
+    }, Conditioning::Keyframe {
+        image: last_image,
+        frame_idx: last_index,
+        strength: last_strength,
+    }] = request.conditioning.as_slice()
+    else {
+        return Err(crate::Error::Unsupported(
+            "Wan public first_last_frame requires exactly two ordered Keyframes".to_owned(),
+        ));
+    };
+    if *first_index != 0
+        || *last_index != -1
+        || !first_strength.is_finite()
+        || !last_strength.is_finite()
+        || !(0.0..=1.0).contains(first_strength)
+        || !(0.0..=1.0).contains(last_strength)
+        || !valid_rgb8_image(first_image)
+        || !valid_rgb8_image(last_image)
+        || first_image.width != request.width
+        || first_image.height != request.height
+        || last_image.width != request.width
+        || last_image.height != request.height
+    {
+        return Err(crate::Error::Unsupported(
+            "Wan public first_last_frame requires ordered fitted RGB8 first@0/last@-1 Keyframes"
+                .to_owned(),
+        ));
+    }
+    Ok([
+        crate::KeyframeRef {
+            image: first_image,
+            frame_idx: *first_index,
+            strength: *first_strength,
+        },
+        crate::KeyframeRef {
+            image: last_image,
+            frame_idx: *last_index,
+            strength: *last_strength,
+        },
+    ])
+}
+
+fn request_mode(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<WanPublicMode> {
+    match request.video_mode.as_deref() {
+        Some("image_to_video") => {
+            reference(request)?;
+            Ok(WanPublicMode::ImageToVideo)
+        }
+        None if prepared.route == WanI2vRoute::Ti2v5b => {
+            first_last_keyframes(request)?;
+            Ok(WanPublicMode::FirstLastFrame)
+        }
+        _ => Err(crate::Error::Unsupported(format!(
+            "{}: request is neither exact public I2V nor first_last_frame",
+            prepared.route.provider_id()
+        ))),
+    }
+}
+
+fn request_contract_for_mode(
+    prepared: &PreparedWanI2vMemory,
+    mode: WanPublicMode,
+) -> MemoryProviderContract {
+    let mut contract = prepared.contract.clone();
+    if mode == WanPublicMode::FirstLastFrame && prepared.backend == WanI2vBackend::Mlx {
+        let staged = contract
+            .strategies
+            .iter_mut()
+            .find(|capability| capability.strategy == MemoryStrategy::StagedResidency)
+            .expect("Wan strategy table is complete");
+        staged.support = MemoryStrategySupport::Missing;
+        staged.parameters = MemoryParameterRanges::default();
+    }
+    contract
+}
+
+pub fn contract_for_mode_key(
+    prepared: &PreparedWanI2vMemory,
+    mode: &str,
+) -> crate::Result<MemoryProviderContract> {
+    let mode = match mode {
+        "image_to_video" => WanPublicMode::ImageToVideo,
+        "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
+            WanPublicMode::FirstLastFrame
+        }
+        _ => {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: unsupported Wan memory mode {mode}",
+                prepared.route.provider_id()
+            )))
+        }
+    };
+    Ok(request_contract_for_mode(prepared, mode))
+}
+
+/// The request-specific ladder. MLX first/last-frame generation exposes only Resident and
+/// BoundedDecode; Candle additionally retains StagedResidency because its request-selected
+/// Sequential renderer is operationally distinct from Resident.
+pub fn request_contract(
+    prepared: &PreparedWanI2vMemory,
+    request: &GenerationRequest,
+) -> crate::Result<MemoryProviderContract> {
+    let mode = validate_request(prepared, request)?;
+    Ok(request_contract_for_mode(prepared, mode))
+}
+
 pub fn validate_request(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
-) -> crate::Result<()> {
-    let image = reference(request)?;
+) -> crate::Result<WanPublicMode> {
+    let mode = request_mode(prepared, request)?;
     let frames = request.frames.unwrap_or_default();
     let fps = request.fps.unwrap_or_default();
     let steps = request.steps.unwrap_or_default();
@@ -1277,13 +1441,40 @@ pub fn validate_request(
     } else {
         !has_lightning
     };
-    if request.video_mode.as_deref() != Some("image_to_video")
-        || request.count != 1
+    let exact_rate = match mode {
+        WanPublicMode::ImageToVideo => prepared.route.accepts_rate(fps, frames),
+        WanPublicMode::FirstLastFrame => prepared.route.accepts_first_last_rate(fps, frames),
+    };
+    let sampler_ok = match mode {
+        WanPublicMode::ImageToVideo => true,
+        WanPublicMode::FirstLastFrame => match request.sampler.as_deref() {
+            None | Some("uni_pc" | "euler") => true,
+            Some("dpmpp_2m") => prepared.backend == WanI2vBackend::Mlx,
+            Some(_) => false,
+        },
+    };
+    let flf_axes_ok = mode != WanPublicMode::FirstLastFrame
+        || (request.strength.is_none()
+            && request.true_cfg.is_none()
+            && request.timestep_to_start_cfg.is_none()
+            && request.guidance_method.is_none()
+            && request.guidance_eta.is_none()
+            && request.guidance_momentum.is_none()
+            && request.guidance_norm_threshold.is_none()
+            && request.control_scale.is_none()
+            && request.text_style_gain.is_none()
+            && request.image_guidance.is_none()
+            && request.duration.is_none()
+            && request.trim_first_frames.is_none()
+            && request.softness.is_none()
+            && request.pid_capture_sigma.is_none()
+            && request.approximation.is_none());
+    if request.count != 1
         || !prepared
             .route
             .public_geometries()
             .contains(&(request.width, request.height))
-        || !prepared.route.accepts_rate(fps, frames)
+        || !exact_rate
         || !(1..=100).contains(&steps)
         || request.seed.is_none()
         || request.audio.is_some()
@@ -1295,15 +1486,16 @@ pub fn validate_request(
         || request.use_uncensored_enhancer
         || unsupported_svd
         || !lightning_sampling
-        || image.width == 0
-        || image.height == 0
+        || !sampler_ok
+        || !flf_axes_ok
     {
         return Err(crate::Error::Unsupported(format!(
-            "{}: request left the exact public one-Reference I2V envelope",
-            prepared.route.provider_id()
+            "{}: request left the exact public {} envelope",
+            prepared.route.provider_id(),
+            mode.key()
         )));
     }
-    Ok(())
+    Ok(mode)
 }
 
 fn update_optional_u32(hash: &mut Sha256, value: Option<u32>) {
@@ -1311,6 +1503,27 @@ fn update_optional_u32(hash: &mut Sha256, value: Option<u32>) {
         Some(value) => {
             hash.update([1]);
             hash.update(value.to_le_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn update_optional_f32(hash: &mut Sha256, value: Option<f32>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_bits().to_le_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn update_optional_str(hash: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
         }
         None => hash.update([0]),
     }
@@ -1342,6 +1555,7 @@ fn selection_receipt_digest(selection: &MemorySelection) -> String {
 
 fn validate_selection(
     prepared: &PreparedWanI2vMemory,
+    mode: WanPublicMode,
     selection: &MemorySelection,
 ) -> crate::Result<()> {
     if selection.tier != prepared.tier {
@@ -1350,7 +1564,7 @@ fn validate_selection(
             prepared.route.provider_id()
         )));
     }
-    prepared.contract.validate_selection(selection)
+    request_contract_for_mode(prepared, mode).validate_selection(selection)
 }
 
 fn request_evidence_revision_for_selection(
@@ -1358,9 +1572,8 @@ fn request_evidence_revision_for_selection(
     request: &GenerationRequest,
     selection: &MemorySelection,
 ) -> crate::Result<String> {
-    validate_request(prepared, request)?;
-    validate_selection(prepared, selection)?;
-    let image = reference(request)?;
+    let mode = validate_request(prepared, request)?;
+    validate_selection(prepared, mode, selection)?;
     let selection_receipt = selection_receipt_digest(selection);
     let mut hash = Sha256::new();
     hash.update(RECEIPT_VERSION.as_bytes());
@@ -1368,6 +1581,7 @@ fn request_evidence_revision_for_selection(
     hash.update(prepared.adapter_identity.as_bytes());
     hash.update(prepared.backend.key().as_bytes());
     hash.update(prepared.route.provider_id().as_bytes());
+    hash.update(mode.key().as_bytes());
     hash.update(selection_receipt.as_bytes());
     hash.update(request.width.to_le_bytes());
     hash.update(request.height.to_le_bytes());
@@ -1376,21 +1590,35 @@ fn request_evidence_revision_for_selection(
     hash.update(request.steps.unwrap().to_le_bytes());
     hash.update(request.seed.unwrap().to_le_bytes());
     hash.update(request.prompt.as_bytes());
-    hash.update(request.negative_prompt.as_deref().unwrap_or("").as_bytes());
-    hash.update(
-        request
-            .guidance
-            .map(f32::to_bits)
-            .unwrap_or_default()
-            .to_le_bytes(),
-    );
-    hash.update(request.sampler.as_deref().unwrap_or("default").as_bytes());
+    update_optional_str(&mut hash, request.negative_prompt.as_deref());
+    update_optional_f32(&mut hash, request.guidance);
+    update_optional_str(&mut hash, request.sampler.as_deref());
     hash.update(NATIVE_SCHEDULE.as_bytes());
-    hash.update(image.width.to_le_bytes());
-    hash.update(image.height.to_le_bytes());
-    hash.update(Sha256::digest(&image.pixels));
+    match mode {
+        WanPublicMode::ImageToVideo => {
+            let image = reference(request)?;
+            hash.update(b"reference");
+            hash.update(image.width.to_le_bytes());
+            hash.update(image.height.to_le_bytes());
+            hash.update(Sha256::digest(&image.pixels));
+        }
+        WanPublicMode::FirstLastFrame => {
+            for (role, keyframe) in ["first", "last"]
+                .into_iter()
+                .zip(first_last_keyframes(request)?)
+            {
+                hash.update(role.as_bytes());
+                hash.update(keyframe.frame_idx.to_le_bytes());
+                hash.update(keyframe.strength.to_bits().to_le_bytes());
+                hash.update(keyframe.image.width.to_le_bytes());
+                hash.update(keyframe.image.height.to_le_bytes());
+                hash.update(Sha256::digest(&keyframe.image.pixels));
+            }
+        }
+    }
     Ok(format!(
-        "{RECEIPT_VERSION}:{}:{selection_receipt}:{:x}",
+        "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:{:x}",
+        mode.key(),
         prepared.artifact_identity,
         hash.finalize()
     ))
@@ -1402,26 +1630,51 @@ pub fn validate_context(
 ) -> crate::Result<()> {
     prepared.ensure_unchanged()?;
     let geometry = context.geometry;
+    let mode = match context.mode.as_key() {
+        "image_to_video" => WanPublicMode::ImageToVideo,
+        "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
+            WanPublicMode::FirstLastFrame
+        }
+        _ => {
+            return Err(crate::Error::Unsupported(format!(
+                "{}: crossed Wan public memory mode",
+                prepared.route.provider_id()
+            )))
+        }
+    };
+    let request_contract = request_contract_for_mode(prepared, mode);
     let selection_receipt = selection_receipt_digest(&context.selection);
     let prefix = format!(
-        "{RECEIPT_VERSION}:{}:{selection_receipt}:",
+        "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:",
+        mode.key(),
         prepared.artifact_identity
     );
-    let rate_ok = prepared.route.accepts_rate(
-        if prepared.route == WanI2vRoute::I2v14b {
-            16
-        } else {
-            24
-        },
-        geometry.frames,
-    ) || (prepared.route == WanI2vRoute::Ti2v5b
-        && prepared.route.accepts_rate(16, geometry.frames));
+    let rate_ok = match mode {
+        WanPublicMode::ImageToVideo => {
+            prepared.route.accepts_rate(
+                if prepared.route == WanI2vRoute::I2v14b {
+                    16
+                } else {
+                    24
+                },
+                geometry.frames,
+            ) || (prepared.route == WanI2vRoute::Ti2v5b
+                && prepared.route.accepts_rate(16, geometry.frames))
+        }
+        WanPublicMode::FirstLastFrame => {
+            prepared.route.accepts_first_last_rate(16, geometry.frames)
+                || prepared.route.accepts_first_last_rate(24, geometry.frames)
+        }
+    };
+    let carrier_ok = match mode {
+        WanPublicMode::ImageToVideo => geometry.reference_count == 1,
+        WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
+    };
     if !matches!(
         context.selection.strategy,
         MemoryStrategy::Resident | MemoryStrategy::StagedResidency | MemoryStrategy::BoundedDecode
-    ) || context.mode.as_key() != "image_to_video"
-        || geometry.batch != 1
-        || geometry.reference_count != 1
+    ) || geometry.batch != 1
+        || !carrier_ok
         || !context.has_reference
         || !prepared
             .route
@@ -1439,7 +1692,7 @@ pub fn validate_context(
         )));
     }
     match crate::standard_memory_strategy_safety_check(
-        &prepared.contract,
+        &request_contract,
         context,
         Some(prepared.tier),
         None,
@@ -1455,6 +1708,8 @@ pub fn selection_from_request(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
 ) -> crate::Result<MemorySelection> {
+    let mode = validate_request(prepared, request)?;
+    let request_contract = request_contract_for_mode(prepared, mode);
     let memory = request.memory.ok_or_else(|| {
         crate::Error::Unsupported(format!(
             "{}: admitted Wan I2V request is missing its explicit memory carrier",
@@ -1483,8 +1738,8 @@ pub fn selection_from_request(
         },
         tier: prepared.tier,
     };
-    validate_selection(prepared, &selection)?;
-    if prepared.contract.generation_memory(&selection) != Some(memory) {
+    validate_selection(prepared, mode, &selection)?;
+    if request_contract.generation_memory(&selection) != Some(memory) {
         return Err(crate::Error::Unsupported(format!(
             "{}: request memory controls do not match the selected Wan I2V rung",
             prepared.route.provider_id()
@@ -1840,6 +2095,41 @@ mod tests {
         }
     }
 
+    fn flf_request(backend: WanI2vBackend) -> GenerationRequest {
+        let image = |pixel| Image {
+            width: 832,
+            height: 480,
+            pixels: vec![pixel; 832 * 480 * 3],
+        };
+        GenerationRequest {
+            prompt: "move between the two exact endpoints".to_owned(),
+            negative_prompt: Some("camera cut".to_owned()),
+            width: 832,
+            height: 480,
+            count: 1,
+            seed: Some(23),
+            steps: Some(20),
+            guidance: Some(5.0),
+            sampler: (backend == WanI2vBackend::Mlx).then(|| "dpmpp_2m".to_owned()),
+            frames: Some(117),
+            fps: Some(24),
+            video_mode: None,
+            conditioning: vec![
+                Conditioning::Keyframe {
+                    image: image(17),
+                    frame_idx: 0,
+                    strength: 0.25,
+                },
+                Conditioning::Keyframe {
+                    image: image(91),
+                    frame_idx: -1,
+                    strength: 0.75,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
     fn selection(prepared: &PreparedWanI2vMemory, strategy: MemoryStrategy) -> MemorySelection {
         MemorySelection {
             strategy,
@@ -1872,7 +2162,14 @@ mod tests {
             calibration_abi: crate::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: String::new(),
             load_shape: prepared.contract.load_shape,
-            mode: crate::MemoryMode::Other("image_to_video".to_owned()),
+            mode: crate::MemoryMode::Other(
+                if request.video_mode.as_deref() == Some("image_to_video") {
+                    "image_to_video"
+                } else {
+                    "first_last_frame"
+                }
+                .to_owned(),
+            ),
             has_reference: true,
             use_pid: false,
             has_phases: false,
@@ -2020,6 +2317,165 @@ mod tests {
     }
 
     #[test]
+    fn first_last_frame_exact_menu_and_request_specific_rungs_cover_both_backends_and_tiers() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let (_tmp, spec) = match backend {
+                    WanI2vBackend::Mlx => mlx_fixture(WanI2vRoute::Ti2v5b, quant),
+                    WanI2vBackend::Candle => candle_fixture(WanI2vRoute::Ti2v5b, quant),
+                };
+                let prepared = PreparedWanI2vMemory::prepare(
+                    &spec,
+                    backend,
+                    WanI2vRoute::Ti2v5b.provider_id(),
+                )
+                .unwrap();
+                let mut request = flf_request(backend);
+                let contract = request_contract(&prepared, &request).unwrap();
+                for strategy in MemoryStrategy::ALL {
+                    let expected = match strategy {
+                        MemoryStrategy::Resident | MemoryStrategy::BoundedDecode => {
+                            MemoryStrategySupport::Implemented
+                        }
+                        MemoryStrategy::StagedResidency if backend == WanI2vBackend::Candle => {
+                            MemoryStrategySupport::Implemented
+                        }
+                        _ => MemoryStrategySupport::Missing,
+                    };
+                    assert_eq!(contract.capability(strategy).unwrap().support, expected);
+                }
+                let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+                let memory = contract.generation_memory(&bounded).unwrap();
+                assert!(memory.tile_vae_decode);
+                if backend == WanI2vBackend::Mlx {
+                    assert!(!memory.stage_residency);
+                }
+
+                for (fps, frames) in [(16, [61, 77, 93, 109, 125]), (24, [93, 117, 141, 165, 189])]
+                {
+                    request.fps = Some(fps);
+                    for frame_count in frames {
+                        request.frames = Some(frame_count);
+                        assert_eq!(
+                            validate_request(&prepared, &request).unwrap(),
+                            WanPublicMode::FirstLastFrame
+                        );
+                    }
+                }
+                request.fps = Some(24);
+                request.frames = Some(121);
+                assert!(validate_request(&prepared, &request).is_err(), "117 != 121");
+            }
+        }
+    }
+
+    #[test]
+    fn first_last_frame_receipt_binds_roles_indices_strengths_shapes_and_mode() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let request = flf_request(WanI2vBackend::Mlx);
+        let resident = selection(&prepared, MemoryStrategy::Resident);
+        let baseline =
+            request_evidence_revision_for_selection(&prepared, &request, &resident).unwrap();
+        let mut changed = request.clone();
+        changed.conditioning.swap(0, 1);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { frame_idx, .. } = &mut changed.conditioning[0] {
+            *frame_idx = 1;
+        }
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { strength, .. } = &mut changed.conditioning[1] {
+            *strength = 0.5;
+        }
+        assert_ne!(
+            baseline,
+            request_evidence_revision_for_selection(&prepared, &changed, &resident).unwrap()
+        );
+        let mut changed = request.clone();
+        if let Conditioning::Keyframe { image, .. } = &mut changed.conditioning[0] {
+            image.width = 480;
+        }
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.video_mode = Some("image_to_video".to_owned());
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.frames = Some(121);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut changed = request.clone();
+        changed.fps = Some(25);
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+        let mut no_guidance = request.clone();
+        no_guidance.guidance = None;
+        let mut zero_guidance = request.clone();
+        zero_guidance.guidance = Some(0.0);
+        assert_ne!(
+            request_evidence_revision_for_selection(&prepared, &no_guidance, &resident).unwrap(),
+            request_evidence_revision_for_selection(&prepared, &zero_guidance, &resident).unwrap()
+        );
+        let mut changed = request.clone();
+        changed.width = 1280;
+        assert!(request_evidence_revision_for_selection(&prepared, &changed, &resident).is_err());
+    }
+
+    #[test]
+    fn first_last_frame_context_and_configure_refuse_crossed_mode_or_mlx_staged() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q8));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let mut request = flf_request(WanI2vBackend::Mlx);
+        let contract = request_contract(&prepared, &request).unwrap();
+        let bounded = selection(&prepared, MemoryStrategy::BoundedDecode);
+        request.memory = contract.generation_memory(&bounded);
+        let evidence = request_evidence_revision(&prepared, &request).unwrap();
+        let valid = context(&prepared, &request, bounded, evidence.clone());
+        assert!(validate_context(&prepared, &valid).is_ok());
+
+        let mut crossed = valid.clone();
+        crossed.mode = crate::MemoryMode::Other("image_to_video".to_owned());
+        assert!(validate_context(&prepared, &crossed).is_err());
+        let staged = selection(&prepared, MemoryStrategy::StagedResidency);
+        let mut crossed = valid.clone();
+        crossed.selection = staged;
+        assert!(validate_context(&prepared, &crossed).is_err());
+        let mut crossed_request = request.clone();
+        crossed_request.memory = prepared.contract.generation_memory(&staged);
+        assert!(
+            validate_request_evidence(&prepared, &crossed_request, &bounded, &evidence,).is_err()
+        );
+    }
+
+    #[test]
+    fn first_last_frame_sampler_set_is_backend_truthful() {
+        for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+            let (_tmp, spec) = match backend {
+                WanI2vBackend::Mlx => mlx_fixture(WanI2vRoute::Ti2v5b, None),
+                WanI2vBackend::Candle => candle_fixture(WanI2vRoute::Ti2v5b, None),
+            };
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, backend, WanI2vRoute::Ti2v5b.provider_id())
+                    .unwrap();
+            for sampler in [None, Some("uni_pc"), Some("euler")] {
+                let mut request = flf_request(backend);
+                request.sampler = sampler.map(str::to_owned);
+                assert!(validate_request(&prepared, &request).is_ok());
+            }
+            let mut dpm = flf_request(backend);
+            dpm.sampler = Some("dpmpp_2m".to_owned());
+            assert_eq!(
+                validate_request(&prepared, &dpm).is_ok(),
+                backend == WanI2vBackend::Mlx
+            );
+            let mut broad = flf_request(backend);
+            broad.sampler = Some("heun".to_owned());
+            assert!(validate_request(&prepared, &broad).is_err());
+        }
+    }
+
+    #[test]
     fn adapter_residency_is_dense_zero_packed_shared_twice_targeted_once_and_loha_refuses() {
         let make_adapter = |dir: &Path, name: &str, key: &str| {
             let path = dir.join(name);
@@ -2041,6 +2497,18 @@ mod tests {
         let prepared =
             PreparedWanI2vMemory::prepare(&dense, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
         assert_eq!(prepared.contract.asset_facts.overlay_bytes, 0);
+        assert_eq!(
+            prepared.adapters[0].path,
+            std::path::absolute(&shared).unwrap()
+        );
+        assert_eq!(prepared.adapters[0].scale_bits, 0.5_f32.to_bits());
+        assert!(prepared.adapters[0].pass_scale_bits.is_empty());
+        assert_eq!(prepared.adapters[0].expert, "shared");
+        assert_eq!(prepared.adapters[0].realization, "dense_folded");
+        assert_eq!(
+            prepared.adapters[0].stability,
+            "pinned_digest_and_tensor_geometry"
+        );
 
         let (_tmp, packed_fixture) = mlx_fixture(WanI2vRoute::I2v14b, Some(Quant::Q4));
         let mut packed =
@@ -2058,6 +2526,8 @@ mod tests {
             prepared.adapters[1].persistent_bytes,
             prepared.adapters[1].source_bytes
         );
+        assert_eq!(prepared.adapters[0].realization, "packed_additive_factors");
+        assert_eq!(prepared.adapters[1].expert, "high");
 
         let loha = make_adapter(tmp.path(), "loha.safetensors", "block.hada_w1_a");
         let (_dense_loha_tmp, dense_loha_fixture) = mlx_fixture(WanI2vRoute::I2v14b, None);

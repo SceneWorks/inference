@@ -29,6 +29,40 @@ thread_local! {
     static ACTIVE_EVIDENCE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+#[derive(Default)]
+struct ActiveEvidenceGuard {
+    armed: bool,
+}
+
+impl ActiveEvidenceGuard {
+    fn arm(&mut self, evidence: String) -> gen_core::Result<()> {
+        ACTIVE_EVIDENCE.with(|active| {
+            if active.borrow().is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "another Wan video request is active on this thread".to_owned(),
+                ));
+            }
+            *active.borrow_mut() = Some(evidence);
+            Ok(())
+        })?;
+        self.armed = true;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        if self.armed {
+            ACTIVE_EVIDENCE.with(|active| *active.borrow_mut() = None);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ActiveEvidenceGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 pub fn validate_active_request(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
@@ -108,15 +142,7 @@ struct WanI2vRequestScope {
     prepared: PreparedWanI2vMemory,
     selection: gen_core::MemorySelection,
     evidence_revision: String,
-    armed: bool,
-}
-
-impl Drop for WanI2vRequestScope {
-    fn drop(&mut self) {
-        if self.armed {
-            ACTIVE_EVIDENCE.with(|active| *active.borrow_mut() = None);
-        }
-    }
+    active: ActiveEvidenceGuard,
 }
 
 impl MemoryRequestScope for WanI2vRequestScope {
@@ -128,16 +154,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
             &self.evidence_revision,
         )?;
         self.core.configure_request(request)?;
-        ACTIVE_EVIDENCE.with(|active| {
-            if active.borrow().is_some() {
-                return Err(gen_core::Error::Unsupported(
-                    "another Wan I2V request is active on this thread".to_owned(),
-                ));
-            }
-            *active.borrow_mut() = Some(actual);
-            Ok(())
-        })?;
-        self.armed = true;
+        self.active.arm(actual)?;
         Ok(())
     }
     fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
@@ -162,10 +179,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
     }
     fn finish(&mut self, outcome: MemoryRunOutcome) -> gen_core::Result<()> {
         let result = self.core.finish(outcome);
-        if self.armed {
-            ACTIVE_EVIDENCE.with(|active| *active.borrow_mut() = None);
-            self.armed = false;
-        }
+        self.active.clear();
         result
     }
 }
@@ -176,7 +190,9 @@ pub fn begin_request<'a>(
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope + 'a>>> {
     gen_core::wan_i2v_memory::validate_context(prepared, context)?;
-    let memory = prepared.contract.generation_memory(&context.selection);
+    let request_contract =
+        gen_core::wan_i2v_memory::contract_for_mode_key(prepared, context.mode.as_key())?;
+    let memory = request_contract.generation_memory(&context.selection);
     let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
         prepared.route.provider_id(),
         device,
@@ -206,7 +222,7 @@ pub fn begin_request<'a>(
         prepared: prepared.clone(),
         selection: context.selection,
         evidence_revision: context.evidence_revision.clone(),
-        armed: false,
+        active: ActiveEvidenceGuard::default(),
     })))
 }
 
@@ -220,4 +236,26 @@ pub fn selected_strategy(request: &GenerationRequest) -> MemoryStrategy {
             MemoryStrategy::Resident
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_first_last_receipt_clears_on_finish_and_drop() {
+        ACTIVE_EVIDENCE.with(|active| *active.borrow_mut() = None);
+        {
+            let mut guard = ActiveEvidenceGuard::default();
+            guard.arm("flf-finish".to_owned()).unwrap();
+            assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_some()));
+            guard.clear();
+            assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+        }
+        {
+            let mut guard = ActiveEvidenceGuard::default();
+            guard.arm("flf-cancel-or-error".to_owned()).unwrap();
+        }
+        assert!(ACTIVE_EVIDENCE.with(|active| active.borrow().is_none()));
+    }
 }
