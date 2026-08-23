@@ -9,7 +9,7 @@
 //! ```text
 //! LTX_VAE_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/<h>/q8 \
 //! LTX_W=768 LTX_H=768 LTX_FRAMES=25 \
-//!   cargo test -p mlx-gen-ltx --test vae_decode_sweep --release -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --test integration vae_decode_sweep:: --release -- --ignored --nocapture
 //! # add LTX_TILE_PX=256 [LTX_OVERLAP_PX=32 LTX_TILE_FRAMES=.. LTX_OVERLAP_FRAMES=..] for a tiled run
 //! # add LTX_LIMIT_GB=48 to simulate a smaller-RAM tier
 //! ```

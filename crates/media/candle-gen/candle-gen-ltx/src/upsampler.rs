@@ -59,7 +59,9 @@ impl GroupNorm32 {
         let mean = groups.mean_keepdim((2, 3, 4, 5))?;
         let centered = groups.broadcast_sub(&mean)?;
         let variance = centered.sqr()?.mean_keepdim((2, 3, 4, 5))?;
-        let normalized = (centered / (variance + EPS)?.sqrt()?)?.reshape((b, c, t, h, w))?;
+        let normalized = centered
+            .broadcast_div(&(variance + EPS)?.sqrt()?)?
+            .reshape((b, c, t, h, w))?;
         let weight = self.weight.to_dtype(DType::F32)?.reshape((1, c, 1, 1, 1))?;
         let bias = self.bias.to_dtype(DType::F32)?.reshape((1, c, 1, 1, 1))?;
         ((normalized.broadcast_mul(&weight)?).broadcast_add(&bias)?).to_dtype(dtype)
@@ -192,6 +194,20 @@ mod tests {
             y.flatten_all()?.to_vec1::<f32>()?,
             vec![0., 4., 1., 5., 8., 12., 9., 13., 2., 6., 3., 7., 10., 14., 11., 15.]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn group_norm_broadcasts_production_upsampler_variance_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let norm = GroupNorm32 {
+            weight: Tensor::ones(1024, DType::F32, &device)?,
+            bias: Tensor::zeros(1024, DType::F32, &device)?,
+        };
+        let x = Tensor::ones((1, 1024, 5, 8, 12), DType::F32, &device)?;
+        let y = norm.forward(&x)?;
+        assert_eq!(y.dims(), &[1, 1024, 5, 8, 12]);
+        assert_eq!(y.sum_all()?.to_scalar::<f32>()?, 0.0);
         Ok(())
     }
 }

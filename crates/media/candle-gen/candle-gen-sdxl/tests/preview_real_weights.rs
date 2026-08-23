@@ -33,7 +33,7 @@
 //! SDXL_VAE_FP16_FIX_DIR=...\models--madebyollin--sdxl-vae-fp16-fix\snapshots\<rev> \
 //! SDXL_KOLORS_VAE=...\models--Kwai-Kolors--Kolors-diffusers\snapshots\<rev>\vae\diffusion_pytorch_model.fp16.safetensors \
 //! SDXL_PREVIEW_ARTIFACT_DIR=E:\out\sc-16954 \
-//!   cargo test -p candle-gen-sdxl --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-sdxl --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

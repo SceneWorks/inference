@@ -18,7 +18,7 @@
 //! plausible tensor**. Equality against `hidden_states[50]` alone cannot catch it, so the fixture
 //! also carries both neighbours and this file asserts *inequality* against them.
 
-mod common;
+use crate::common;
 
 use common::{assert_parity, rel, std_dev, te_fixture_config, TE_FIXTURE};
 

@@ -24,7 +24,7 @@
 //! — diverges by orders of magnitude, which the mutation tests at the bottom confirm by measuring
 //! and PRINTING how far a perturbed weight actually moves the decode.
 
-mod common;
+use crate::common;
 
 use common::{assert_parity, cosine, fixture_config, l2_norm, rel, std_dev, FIXTURE};
 

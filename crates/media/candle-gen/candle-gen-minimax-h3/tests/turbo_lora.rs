@@ -28,7 +28,7 @@
 //! were blind to real defects in this family seven times. Every parity assertion below is
 //! `max|a-b| / max|b|`.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

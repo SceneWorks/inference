@@ -22,7 +22,7 @@
 //! cost 39.3 % of the DiT every step and produce **bit-identical output**, so the equivalence test
 //! below is exactly the test that cannot catch it.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

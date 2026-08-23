@@ -79,7 +79,7 @@
 //! digits; in the **DiT**, which inherits the same swap, it moves the block by 8.8e-1 at cosine
 //! 0.708 with the norm changing only 79.5 → 91.7.
 
-mod common;
+use crate::common;
 
 use common::{
     audio_fixture_config, cosine, dit_fixture_config, encode_fixture_config, encode_fixture_tiles,

@@ -536,9 +536,13 @@ mod tests {
         let writer_done = Arc::clone(&replacement_done);
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            std::fs::rename(writer_replacement, writer_source)
-                .expect("atomically replace native checkpoint during lazy evaluation");
+            let swapped = std::fs::rename(writer_replacement, writer_source);
+            // Release the materialize hook whatever the swap did. The hook is parked on this
+            // barrier on the main thread, so a writer that panics — or returns — ahead of it
+            // strands the hook there and hangs the whole test binary; the outcome is asserted on
+            // `join` instead, so a failed swap reads as a red test naming the error.
             writer_done.wait();
+            swapped
         });
 
         let evaluated = Arc::clone(&final_evaluated);
@@ -568,13 +572,18 @@ mod tests {
         // post-check must run first and win as the stronger provenance diagnosis.
         let result = load_transformer_from_native_file(&source, &Krea2Config::turbo());
         NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        // Diagnose the swap before the load result: the `Ok` arm below panics, and a panic there
+        // would otherwise mask a writer that never managed to replace the checkpoint at all.
+        writer
+            .join()
+            .expect("replacement writer")
+            .expect("atomically replace the native checkpoint during lazy evaluation");
         let error = match result {
             Ok(_) => {
                 panic!("replacement during MLX evaluation must invalidate the native file pin")
             }
             Err(error) => error.to_string(),
         };
-        writer.join().expect("replacement writer");
 
         assert!(
             final_evaluated.load(Ordering::SeqCst),

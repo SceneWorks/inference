@@ -11,7 +11,7 @@ use mlx_gen_krea::KreaTextEncoder;
 use mlx_rs::ops::{all_close, multiply, sqrt, sum};
 use mlx_rs::{Array, Dtype};
 
-mod common;
+use crate::common;
 
 use common::tiny_te_config;
 

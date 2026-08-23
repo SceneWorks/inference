@@ -9,9 +9,9 @@
 //! converted snapshot's `tokenizer/` dir. Golden: `tools/golden/ideogram4_prompt_ids.safetensors`
 //! ← `tools/dump_ideogram4_prompt_ids.py` (the same `CAPTION_JSON`). Run:
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test tokenizer_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration tokenizer_parity:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

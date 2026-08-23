@@ -6,7 +6,7 @@
 //!
 //! `#[ignore]`d — each needs a converted bf16 snapshot (env-var override, else the SceneWorks /
 //! mlx-gen cache default). Run:
-//!   cargo test -p mlx-gen-wan --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/UMT5-encoded and cached (then the TE freed), the expert(s) train on their noise band(s), and

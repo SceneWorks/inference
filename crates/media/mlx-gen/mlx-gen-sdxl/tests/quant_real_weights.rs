@@ -3,7 +3,7 @@
 //! scope Rust uses (UNet + both CLIP encoders; VAE stays f32).
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the goldens from `tools/dump_sdxl_quant_golden.py`.
-//! Run: cargo test -p mlx-gen-sdxl --release --test quant_real_weights -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration quant_real_weights:: -- --ignored --nocapture
 //!
 //! Gates: (1) **scales byte-match** — the loaded Q8/Q4 `wq`/`scales`/`biases` of a real
 //! `down_blocks.1…attn1.to_q` are bit-exact to `mx.quantize(bf16_weight)`, proving the bf16-cast
@@ -11,7 +11,7 @@
 //! (2)+(3) **render parity** — the full `load(Q).generate()` matches the vendored-equivalent Q8/Q4
 //! render (tight: both quantize identically, so the chaos sampler stays on one trajectory).
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

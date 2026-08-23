@@ -13,7 +13,7 @@
 //! snapshot dir (env `PID_GEMMA_DIR`, else the HF cache).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-boogu --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-boogu --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

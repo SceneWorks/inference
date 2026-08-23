@@ -3,7 +3,7 @@
 //! `black-forest-labs/FLUX.2-klein-9b` snapshot AND the wikeeyang `Flux2-Klein-9B-True-V2`
 //! `*-bf16.safetensors` single file:
 //!
-//!   cargo test -p mlx-gen-flux2 --test convert_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration convert_real_weights:: -- --ignored --nocapture
 //!
 //! The committed `convert` unit tests prove the remap *math* (qkv split, adaLN half-swap, key
 //! renames) on synthetic tensors; this proves the *whole assembly* on the real fine-tune: the

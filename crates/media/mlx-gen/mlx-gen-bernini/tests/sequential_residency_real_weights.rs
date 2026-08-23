@@ -1,7 +1,7 @@
 //! sc-10840 (epic 10834): Bernini's staged-residency peak scaffold on real weights.
 //!
 //! `#[ignore]`d — assembles + loads the full ~56 GB Bernini snapshot (see `bernini_e2e.rs`). Run:
-//!   cargo test -p mlx-gen-bernini --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-bernini --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! **Why no Resident-vs-Sequential A/B.** Unlike the image engines wired onto the two-phase
 //! [`mlx_gen::Residency`] seam (SD3 / Qwen-Image / Boogu), Bernini is **structurally always-staged**:

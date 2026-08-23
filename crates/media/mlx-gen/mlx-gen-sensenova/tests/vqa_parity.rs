@@ -8,7 +8,7 @@
 //! bit-identical. The tiny vocab can't hold the real special-token ids, so the model is built with
 //! [`T2iModel::with_image_token_ids`] (10 / 11), mirroring the dump.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test vqa_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration vqa_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Sampler, T2iModel};

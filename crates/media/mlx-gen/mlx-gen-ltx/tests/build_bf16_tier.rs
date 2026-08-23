@@ -11,7 +11,7 @@
 //!   LTX_BF16_SRC=/path/to/.../ltx-2.3-22b-distilled-1.1.safetensors \
 //!   LTX_BF16_UPSCALER_DIR=~/ltx-bf16-staging/upscaler \
 //!   LTX_BF16_OUT=~/ltx-bf16-staging/out/bf16 \
-//!   cargo test -p mlx-gen-ltx --test build_bf16_tier -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --test integration build_bf16_tier:: -- --ignored --nocapture
 
 use mlx_gen_ltx::convert::{convert_and_assemble, LtxConvertOpts};
 use std::path::PathBuf;

@@ -1,4 +1,4 @@
-//! Phase-timing bench (manual: `cargo test -p mlx-gen-seedvr2 --test bench_phases --release -- --ignored --nocapture`).
+//! Phase-timing bench (manual: `cargo test -p mlx-gen-seedvr2 --test integration bench_phases:: --release -- --ignored --nocapture`).
 //! Times encode / DiT / decode for per-frame (T=1) vs batched video (T=8) at 512², to locate the
 //! bottleneck before optimizing. Not a correctness gate. Weight-gated.
 

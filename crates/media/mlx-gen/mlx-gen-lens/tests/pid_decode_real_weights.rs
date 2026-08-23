@@ -11,7 +11,7 @@
 //! ~20 B params, so this defaults to Q8 (quantizes the encoder's MoE experts at load).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-lens --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-lens --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

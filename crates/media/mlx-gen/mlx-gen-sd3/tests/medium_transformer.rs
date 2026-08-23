@@ -335,7 +335,7 @@ fn large_arch_has_no_attn2_targets() {
 // ----------------------------------------------------------------------------------------------
 // Real-weight Medium forward (shape / finite / stats; all 24 blocks). #[ignore]: licensed weights.
 //   SD3_MEDIUM_TRANSFORMER=/path/to/stable-diffusion-3.5-medium/transformer \
-//     cargo test -p mlx-gen-sd3 --release --test medium_transformer real_weight -- --ignored --nocapture
+//     cargo test -p mlx-gen-sd3 --release --test integration medium_transformer::real_weight -- --ignored --nocapture
 // ----------------------------------------------------------------------------------------------
 
 #[test]
@@ -403,7 +403,7 @@ fn real_weight_medium_forward_shape_finite_stats() {
 // Numeric A/B vs diffusers Medium SD3Transformer2DModel. #[ignore]: needs a reference dump from a
 // torch/diffusers env (NOT present in this workspace).
 //   SD3_MEDIUM_TRANSFORMER=… SD3_MEDIUM_REF_DUMP=/path/to/ref.safetensors \
-//     cargo test -p mlx-gen-sd3 --release --test medium_transformer numeric_parity -- --ignored --nocapture
+//     cargo test -p mlx-gen-sd3 --release --test integration medium_transformer::numeric_parity -- --ignored --nocapture
 // ----------------------------------------------------------------------------------------------
 
 #[test]

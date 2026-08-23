@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<upstream snapshot root> SCENEWORKS_GPU_ID=mlx \
-//!   cargo test -p mlx-gen-minimax-h3 --test block_window_real -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration block_window_real:: -- --ignored --nocapture \
 //!   --test-threads=1 --exact the_text_encoder_arm_is_measured_per_window
 //! # the packed arm takes a tier and is its OWN invocation — see below:
 //! MINIMAX_H3_TE=<tier>/text_encoder  …  --exact the_packed_text_encoder_arm_is_measured_per_window
@@ -59,7 +59,7 @@
 //! the peak and the rung's parameter would be inert — which is exactly what
 //! `epic_15448`'s rung-4 survey found on another family.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::time::Instant;

@@ -21,7 +21,7 @@
 //! AdaLN row actually depends on — is the **resolved per-row timestep value**, which
 //! `row_timesteps_resolve_to_the_reference_values` compares element by element.
 
-mod common;
+use crate::common;
 
 use mlx_rs::{Array, Dtype};
 

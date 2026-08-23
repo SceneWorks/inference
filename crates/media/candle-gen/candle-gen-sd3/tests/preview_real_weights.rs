@@ -39,7 +39,7 @@
 //! SD3_MEDIUM_SNAPSHOT=E:\huggingface\hub\models--stabilityai--stable-diffusion-3.5-medium\snapshots\<rev> \
 //! SD3_FLUX1_VAE=E:\huggingface\hub\models--black-forest-labs--FLUX.1-dev\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! SD3_PREVIEW_ARTIFACT_DIR=E:\out\sc-16958 \
-//!   cargo test -p candle-gen-sd3 --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-sd3 --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

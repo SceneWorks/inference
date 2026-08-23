@@ -22,7 +22,7 @@
 //! History (sc-2842): a host-f64 timestep table once seeded a real ~0.9% divergence — that class
 //! (named, fixable op bugs) lands orders of magnitude above these bounds and is still caught.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test dit_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration dit_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

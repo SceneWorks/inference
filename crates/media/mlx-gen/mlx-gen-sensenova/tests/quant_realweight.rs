@@ -5,7 +5,7 @@
 //! gate is directional: Q8 ≈ bf16 (near-lossless) and Q4 coherent. Validates the backbone quant
 //! seam end to end on real weights + the footprint win (Q4 loads where bf16's ~35 GB is heavy).
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test quant_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration quant_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

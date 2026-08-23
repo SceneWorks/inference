@@ -22,7 +22,7 @@ use mlx_llm::{write_hf_snapshot, LlamaProvider};
 
 use mlx_rs::Dtype;
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_a_guarded_entry, Fixture};
 
 const PROMPT: &str = "The capital of France is";

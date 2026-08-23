@@ -37,7 +37,7 @@
 //! tiny VAE with a recording `JointVelocity` standing in for the DiT. Checkpoint selection is gated
 //! separately by `ref2va_checkpoint.rs`.
 
-mod common;
+use crate::common;
 
 use common::{encode_fixture_config, rel, weights, Golden, ENCODE_FIXTURE};
 

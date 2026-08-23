@@ -7,7 +7,7 @@
 //! ```text
 //! set LTX_TRAINING_TIER=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\q4
 //! set LTX_GEMMA_DIR=E:\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\gemma
-//! cargo test -p candle-gen-ltx --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-ltx --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

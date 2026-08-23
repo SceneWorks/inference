@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! MLX_GEN_ZIMAGE_SNAPSHOT=<snapshot or tier dir> \
-//!   cargo test -p mlx-gen-z-image --release --test block_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration block_residency_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! Constrained-host arm: add `SCENEWORKS_MLX_MEMORY_CAP_GB=6` (see
@@ -22,7 +22,7 @@
 //! Every printed number is a measurement. Where a figure is a bound rather than an estimate — the
 //! constrained-host re-materialization cost in particular — it says so.
 
-mod common;
+use crate::common;
 
 use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::GenerationMemory;

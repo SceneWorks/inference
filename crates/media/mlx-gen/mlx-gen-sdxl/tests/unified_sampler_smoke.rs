@@ -13,9 +13,9 @@
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot (env
 //! `SDXL_SNAPSHOT` or the HF cache):
 //!   SDXL_SNAPSHOT=/path/to/sdxl-base-1.0 \
-//!     cargo test -p mlx-gen-sdxl --release --test unified_sampler_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sdxl --release --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl::MODEL_ID;

@@ -596,7 +596,7 @@ Krea suite needs `KREA_TURBO_BF16_DIR` + `KREA_TURBO_Q4_DIR`:
 CUDA_VISIBLE_DEVICES=0 CUDA_COMPUTE_CAP=120 \
 KREA_TURBO_BF16_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/bf16 \
 KREA_TURBO_Q4_DIR=…/krea-2-turbo-mlx/snapshots/<rev>/q4 \
-  cargo test -p candle-gen-krea --release --features cuda --test nvfp4_krea_dit_gpu -- --ignored --nocapture
+  cargo test -p candle-gen-krea --release --features cuda --test integration nvfp4_krea_dit_gpu:: -- --ignored --nocapture
 ```
 
 **Budget ~10 minutes per NVFP4 trunk build**: `Nvfp4Tensor::pack` runs single-threaded on the CPU, and

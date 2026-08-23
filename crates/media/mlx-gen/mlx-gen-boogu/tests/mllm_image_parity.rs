@@ -8,7 +8,7 @@
 //!
 //! `#[ignore]` — needs the Base snapshot (`mllm/`) + the golden:
 //!   BOOGU_BASE_DIR=<snapshot> CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test mllm_image_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration mllm_image_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -24,7 +24,7 @@
 //! `mlx_gen_wan::convert::convert_dual_a14b` steps 3-4 on SCAIL-2's own stock Wan2.1 VAE + umt5-xxl.)
 //!
 //! `#[ignore]` (needs the ~46 GB real snapshot, off CI). Run on macOS with:
-//! `cargo test -p mlx-gen-scail2 --test snapshot_load -- --ignored --nocapture`.
+//! `cargo test -p mlx-gen-scail2 --test integration snapshot_load:: -- --ignored --nocapture`.
 
 use std::path::PathBuf;
 

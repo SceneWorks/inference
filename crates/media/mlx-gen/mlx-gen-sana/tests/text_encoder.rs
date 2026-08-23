@@ -20,9 +20,9 @@
 //!    `[1, 32, H, W]` noise prediction.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-sana --test text_encoder            # default (CHI contract)
+//! cargo test -p mlx-gen-sana --test integration text_encoder::            # default (CHI contract)
 //! PID_GEMMA_DIR=/path/to/gemma-2-2b-it \
-//!   cargo test -p mlx-gen-sana --release --test text_encoder -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sana --release --test integration text_encoder:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen_sana::{SanaTextEncoder, SANA_CHI_PROMPT};

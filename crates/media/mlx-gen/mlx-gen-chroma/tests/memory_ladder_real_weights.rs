@@ -65,7 +65,7 @@
 //!
 //! ```text
 //! CHROMA_LADDER_BASE=<snapshot root containing q4/> \
-//!   cargo test -p mlx-gen-chroma --release --test memory_ladder_real_weights \
+//!   cargo test -p mlx-gen-chroma --release --test integration memory_ladder_real_weights:: \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
 

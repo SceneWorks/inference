@@ -9,7 +9,7 @@
 //!
 //! `#[ignore]`d — needs the real `black-forest-labs/FLUX.2-klein-9b` snapshot (env `FLUX2_SNAPSHOT`
 //! or the HF cache):
-//!   cargo test -p mlx-gen-flux2 --test unified_sampler_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

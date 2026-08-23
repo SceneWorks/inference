@@ -5,7 +5,7 @@
 //! directory holding `vae/`) and run:
 //!
 //! ```sh
-//! MINIMAX_H3_SNAPSHOT=<root> cargo test -p mlx-gen-minimax-h3 --test real_weights -- --ignored --nocapture
+//! MINIMAX_H3_SNAPSHOT=<root> cargo test -p mlx-gen-minimax-h3 --test integration real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! **A skipped run must not look like a passing one.** An `#[ignore]`d test that returns early
@@ -15,7 +15,7 @@
 //! that the output is finite and non-constant. None of those can hold unless real weights were
 //! read and a real decode ran.
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

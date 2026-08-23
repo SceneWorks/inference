@@ -9,9 +9,9 @@
 //!
 //! Requires the converted snapshot's `mllm/tokenizer.json` (~11 MB, not committed); `#[ignore]`
 //! otherwise. Point `BERNINI_MLLM_TOKENIZER` at the `tokenizer.json` and run:
-//!   `cargo test -p candle-gen-bernini --test template_parity -- --ignored --nocapture`
+//!   `cargo test -p candle-gen-bernini --test integration template_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
 use common::{
     Golden, SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS, SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW,

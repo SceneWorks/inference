@@ -5,7 +5,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` snapshot (the 23 GB f32 transformer +
 //! 7.5 GB bf16 text encoder + VAE). Run with:
-//!   cargo test -p mlx-gen-z-image --release --test prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs:
 //!   SC8670_SRC    source snapshot dir (default: the first HF-cache Z-Image-Turbo snapshot)

@@ -8,7 +8,7 @@
 //! `#[ignore]`d: needs the Kolors snapshot (+ tokenizer.json) and, for the control/IP tests, the
 //! Kolors-ControlNet-Pose / Kolors-IP-Adapter-Plus snapshots.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test registry_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration registry_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

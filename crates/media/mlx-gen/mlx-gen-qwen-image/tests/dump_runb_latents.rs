@@ -12,7 +12,7 @@
 //! (net + gemma) runs separately so the two large weight sets never coexist. `#[ignore]`d.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-qwen-image --release --test dump_runb_latents -- --ignored --nocapture
+//! cargo test -p mlx-gen-qwen-image --release --test integration dump_runb_latents:: -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};

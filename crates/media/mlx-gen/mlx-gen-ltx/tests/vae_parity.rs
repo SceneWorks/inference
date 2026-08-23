@@ -7,7 +7,7 @@
 //! checks the Rust `LtxVideoVae` reproduces both. Honors "divergence is not rounding": the only
 //! expected gap is f32 conv summation ordering (mlx conv3d is the shared op → near bit-exact).
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test vae_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract};
 use mlx_rs::Array;

@@ -7,9 +7,9 @@
 //!
 //! `#[ignore]`d — needs the SDXL snapshot + the golden from `tools/dump_sdxl_unet_golden_fp16.py`.
 //! Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test unet_fp16_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration unet_fp16_real_weights:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::load_unet_dtype;

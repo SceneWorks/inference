@@ -64,7 +64,7 @@
 //! Every test prints its residual so the real margin stays auditable, and the mutation table
 //! clears the whole-encoder gate by one to two orders of magnitude.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 
