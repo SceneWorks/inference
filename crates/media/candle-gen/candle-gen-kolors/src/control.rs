@@ -44,7 +44,7 @@ use candle_gen_sdxl::{
 use crate::chatglm3::ChatGlmModel;
 use crate::common::{self, CuratedSetup};
 use crate::config::ChatGlmConfig;
-use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config};
+use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config, SynchronizedPhase};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -69,6 +69,7 @@ const CROSS_ATTENTION_DIM: usize = 2048;
 pub const DEFAULT_CONTROL_SCALE: f32 = 1.0;
 
 /// Paths to the Kolors ControlNet checkpoints.
+#[derive(Clone)]
 pub struct KolorsControlPaths {
     /// The `Kwai-Kolors/Kolors-diffusers` snapshot dir (`tokenizer/`, `text_encoder/` ChatGLM3-6B,
     /// `unet/` SDXL-family UNet, `vae/` SDXL VAE).
@@ -167,9 +168,12 @@ fn resolve_controlnet_file(path: &Path) -> Result<PathBuf> {
 /// Loaded Kolors ControlNet model: the ChatGLM3 tokenizer + encoder, the UNet's `encoder_hid_proj`
 /// context projection, the vendored SDXL UNet (NO IP installed — plain SDXL + control residuals), the
 /// Kolors ControlNet + its OWN `encoder_hid_proj`, and the f32 SDXL VAE.
-pub struct KolorsControl {
+struct ControlConditioningPhase {
     tokenizer: KolorsTokenizer,
     chatglm: ChatGlmModel,
+}
+
+struct ControlDenoisePhase {
     /// The UNet's ChatGLM3 context projection (4096 → 2048), applied before the base cross-attentions
     /// (the vendored UNet has no `encoder_hid_proj`, unlike [`crate::unet::KolorsUNet`]).
     encoder_hid_proj: QLinear,
@@ -178,10 +182,25 @@ pub struct KolorsControl {
     /// UNet's, applied before the control branch's cross-attentions.
     cn_encoder_hid_proj: Linear,
     controlnet: ControlNet,
+}
+
+struct ControlDecodePhase {
     vae: AutoEncoderKL,
     /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
     /// Kolors composes the SDXL VAE, so it loads the `sdxl` student (same tag as the base Kolors provider).
     pid: Option<PidEngine>,
+}
+
+struct ControlResident {
+    conditioning: ControlConditioningPhase,
+    denoise: ControlDenoisePhase,
+    decode: ControlDecodePhase,
+}
+
+pub struct KolorsControl {
+    resident: Option<ControlResident>,
+    paths: KolorsControlPaths,
+    pid_spec: Option<PidWeights>,
     device: Device,
     memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
     admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
@@ -193,14 +212,20 @@ impl KolorsControl {
     /// Kolors `ControlNetModel` (encoder copy + its own `encoder_hid_proj`). No IP-Adapter K/V is
     /// installed — the control branch is the only conditioning overlay.
     pub fn load(paths: &KolorsControlPaths) -> Result<Self> {
-        Self::load_internal(paths, None, None)
+        Self::load_internal(paths, None, None, None)
     }
 
     pub fn load_with_memory_context(
         paths: &KolorsControlPaths,
         context: candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract_for("candle_kolors_control");
+        if context.use_pid {
+            return Err(CandleError::Msg(
+                "kolors-control: PiD admission requires load_with_memory_context_and_pid".into(),
+            ));
+        }
+        let contract = crate::memory_strategy::provider_contract_for_control(paths, None)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         crate::memory_strategy::validate_bespoke_context(
             &contract,
             &paths.kolors_base,
@@ -209,33 +234,86 @@ impl KolorsControl {
             context.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        Self::load_internal(paths, Some(contract), Some(context))
+        Self::load_internal(paths, None, Some(contract), Some(context))
+    }
+
+    pub fn load_with_memory_context_and_pid(
+        paths: &KolorsControlPaths,
+        pid: Option<&PidWeights>,
+        context: candle_gen::gen_core::MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract_for_control(paths, pid)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_bespoke_context(
+            &contract,
+            &paths.kolors_base,
+            &context,
+            false,
+            pid.is_some(),
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Self::load_internal(paths, pid.cloned(), Some(contract), Some(context))
     }
 
     fn load_internal(
         paths: &KolorsControlPaths,
+        pid_spec: Option<PidWeights>,
         memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
         admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
     ) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let base = paths.kolors_base.as_path();
+        let staged = admitted_context.as_ref().is_some_and(|context| {
+            context.selection.strategy == candle_gen::gen_core::MemoryStrategy::StagedResidency
+        });
+        let resident = if staged {
+            None
+        } else {
+            Some(ControlResident {
+                conditioning: Self::load_conditioning_phase(paths, &device)?,
+                denoise: Self::load_denoise_phase(paths, &device)?,
+                decode: Self::load_decode_phase(paths, pid_spec.as_ref(), &device)?,
+            })
+        };
+        Ok(Self {
+            resident,
+            paths: paths.clone(),
+            pid_spec,
+            device,
+            memory_contract,
+            admitted_context,
+            source_root: paths.kolors_base.clone(),
+        })
+    }
 
+    fn load_conditioning_phase(
+        paths: &KolorsControlPaths,
+        device: &Device,
+    ) -> Result<ControlConditioningPhase> {
+        let base = paths.kolors_base.as_path();
         let tokenizer = KolorsTokenizer::from_dir(base.join("tokenizer"))?;
         let text_group =
             detect_packed_group(&base.join("text_encoder/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
         let chatglm = ChatGlmModel::new_gs(
             ChatGlmConfig::chatglm3_6b(),
-            f32_vb(&base.join("text_encoder"), &device)?,
+            f32_vb(&base.join("text_encoder"), device)?,
             text_group,
         )?;
+        Ok(ControlConditioningPhase { tokenizer, chatglm })
+    }
+
+    fn load_denoise_phase(
+        paths: &KolorsControlPaths,
+        device: &Device,
+    ) -> Result<ControlDenoisePhase> {
+        let base = paths.kolors_base.as_path();
 
         // Vendored SDXL UNet from the Kolors `unet/` weights + the 5632 `add_embedding` head + the UNet's
         // `encoder_hid_proj` (all in the same checkpoint). NOTE: no `install_ip_adapter` — `forward_instantid`
         // then runs as a plain SDXL UNet (its decoupled-attn branch is `None`-guarded) + control residuals.
-        let vs = f32_vb(&base.join("unet"), &device)?;
+        let vs = f32_vb(&base.join("unet"), device)?;
         let unet = load_vendored_unet_with_adapters(
             base,
-            &device,
+            device,
             DTYPE,
             &paths.adapters,
             ADDITION_TIME_EMBED_DIM,
@@ -254,7 +332,7 @@ impl KolorsControl {
 
         // Kolors ControlNet (a diffusers SDXL-family `ControlNetModel`) + its OWN `encoder_hid_proj`.
         let cn_file = resolve_controlnet_file(&paths.controlnet)?;
-        let cn_vb = candle_gen::mmap_var_builder(&[cn_file], DTYPE, &device)?;
+        let cn_vb = candle_gen::mmap_var_builder(&[cn_file], DTYPE, device)?;
         let cn_encoder_hid_proj = nn::linear(
             CONTEXT_DIM,
             CROSS_ATTENTION_DIM,
@@ -262,22 +340,29 @@ impl KolorsControl {
         )?;
         let controlnet = ControlNet::new(cn_vb, &ControlNetConfig::kolors())?;
 
-        let vae = AutoEncoderKL::new(f32_vb(&base.join("vae"), &device)?, 3, 3, sdxl_vae_config())?;
-
-        Ok(Self {
-            tokenizer,
-            chatglm,
+        Ok(ControlDenoisePhase {
             encoder_hid_proj,
             unet,
             cn_encoder_hid_proj,
             controlnet,
-            vae,
-            pid: None,
-            device,
-            memory_contract,
-            admitted_context,
-            source_root: paths.kolors_base.clone(),
         })
+    }
+
+    fn load_decode_phase(
+        paths: &KolorsControlPaths,
+        pid: Option<&PidWeights>,
+        device: &Device,
+    ) -> Result<ControlDecodePhase> {
+        let vae = AutoEncoderKL::new(
+            f32_vb(&paths.kolors_base.join("vae"), device)?,
+            3,
+            3,
+            sdxl_vae_config(),
+        )?;
+        let pid = pid
+            .map(|spec| PidEngine::from_spec(spec, "sdxl", device))
+            .transpose()?;
+        Ok(ControlDecodePhase { vae, pid })
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
@@ -287,7 +372,19 @@ impl KolorsControl {
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
         // Kolors reuses the SDXL VAE latent space, so the PiD backbone tag is `sdxl` (the base Kolors
         // provider's `pipeline::PID_BACKBONE`).
-        self.pid = Some(PidEngine::from_spec(pid, "sdxl", &self.device)?);
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "kolors-control: admitted PiD must be sealed before load".into(),
+            ));
+        }
+        self.pid_spec = Some(pid.clone());
+        self.resident
+            .as_mut()
+            .ok_or_else(|| {
+                CandleError::Msg("kolors-control: missing resident decode phase".into())
+            })?
+            .decode
+            .pid = Some(PidEngine::from_spec(pid, "sdxl", &self.device)?);
         Ok(self)
     }
 
@@ -299,7 +396,27 @@ impl KolorsControl {
         // Route through the shared guarded seam (sc-11242 / F-091) so the SR decode is budgeted
         // (F-013 sc-9095) and spatially tiled (sc-10087). Clean-latent σ=0 decode, single image.
         candle_gen_pid::resolve_pid_decoder_for_fields(
-            self.pid.as_ref(),
+            self.resident
+                .as_ref()
+                .and_then(|resident| resident.decode.pid.as_ref()),
+            req.use_pid,
+            &req.prompt,
+            1,
+            req.width,
+            req.height,
+            &req.cancel,
+            req.seed,
+            "kolors control",
+            0.0,
+        )
+    }
+
+    fn pid_decoder_with(
+        decode: &ControlDecodePhase,
+        req: &KolorsControlRequest,
+    ) -> Result<Option<PidDecoder>> {
+        candle_gen_pid::resolve_pid_decoder_for_fields(
+            decode.pid.as_ref(),
             req.use_pid,
             &req.prompt,
             1,
@@ -358,7 +475,13 @@ impl KolorsControl {
             req.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let result = self.generate_inner(req, skeleton, on_progress);
+        let result = if context.selection.strategy
+            == candle_gen::gen_core::MemoryStrategy::StagedResidency
+        {
+            self.generate_staged(req, skeleton, on_progress)
+        } else {
+            self.generate_inner(req, skeleton, on_progress)
+        };
         let sync = self.device.synchronize().map_err(CandleError::Candle);
         match (result, sync) {
             (Err(error), _) => Err(error),
@@ -373,6 +496,9 @@ impl KolorsControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let resident = self.resident.as_ref().ok_or_else(|| {
+            CandleError::Msg("kolors-control: resident execution has no resident components".into())
+        })?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -390,15 +516,15 @@ impl KolorsControl {
             // selection — so the mode is this lane's fixed convention, stated rather than
             // implied. `cfg_batch_context` still refuses anything else.
             candle_gen::gen_core::CfgBatching::Batched,
-            |p| self.encode(p),
+            |p| Self::encode_with(&resident.conditioning, p),
         )?;
 
         // Two SEPARATE ChatGLM3 → cross-attention projections: the UNet's `encoder_hid_proj` feeds the
         // base cross-attentions; the ControlNet's own (separately-trained) `encoder_hid_proj` feeds the
         // control branch's. Both project the raw 4096-wide context to 2048 up front. (This dual
         // projection is the control lane's genuine drift — NOT shared.)
-        let projected = self.encoder_hid_proj.forward(&context)?;
-        let cn_context = self.cn_encoder_hid_proj.forward(&context)?;
+        let projected = resident.denoise.encoder_hid_proj.forward(&context)?;
+        let cn_context = resident.denoise.cn_encoder_hid_proj.forward(&context)?;
         let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
 
         // The pose skeleton → `[batch, 3, H, W]` in `[0,1]` (the diffusers control-image normalization,
@@ -411,7 +537,7 @@ impl KolorsControl {
         } else {
             control
         };
-        let cond_embed = self.controlnet.embed_cond(&control)?;
+        let cond_embed = resident.denoise.controlnet.embed_cond(&control)?;
         let control_scale = req.control_scale as f64;
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
 
@@ -430,7 +556,7 @@ impl KolorsControl {
             let setup = CuratedSetup::new(req.scheduler.as_deref(), req.steps, &noise)?;
             // The control lane's genuine drift: the ControlNet residual context threaded into the solver.
             let control_ctx = ControlContext {
-                controlnet: &self.controlnet,
+                controlnet: &resident.denoise.controlnet,
                 cond_embed,
                 scale: control_scale,
             };
@@ -440,7 +566,7 @@ impl KolorsControl {
             // renormalizes before projecting (sc-16954). Built per image.
             let preview = crate::preview::ve_hook(&req.preview);
             denoise_curated(
-                &self.unet,
+                &resident.denoise.unet,
                 Some(sampler_name),
                 &setup.model_sampling,
                 &setup.sigmas,
@@ -485,7 +611,7 @@ impl KolorsControl {
                 let t = sampler.timestep(i) as f64;
                 // Control residuals from the Kolors ControlNet (its own context projection), scaled by
                 // `control_scale`, then added into the UNet skip + mid via `forward_instantid`.
-                let res = self.controlnet.forward(
+                let res = resident.denoise.controlnet.forward(
                     &model_in,
                     &cond_embed,
                     t,
@@ -494,7 +620,7 @@ impl KolorsControl {
                     &time_ids,
                     control_scale,
                 )?;
-                let eps = self.unet.forward_instantid(
+                let eps = resident.denoise.unet.forward_instantid(
                     &model_in,
                     t,
                     &projected,
@@ -524,16 +650,164 @@ impl KolorsControl {
         // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). Kolors
         // composes the SDXL VAE, so it shares the `sdxl` student with the base Kolors provider.
         let pid_decoder = self.pid_decoder_for(req)?;
-        common::decode(&self.vae, pid_decoder.as_ref(), &latents)
+        common::decode(&resident.decode.vae, pid_decoder.as_ref(), &latents)
+    }
+
+    /// True request-authoritative staged execution: ChatGLM is released before the co-resident
+    /// UNet + ControlNet phase opens, and both denoisers are released before F32 VAE/PiD decode.
+    fn generate_staged(
+        &self,
+        req: &KolorsControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        common::reject_zero_steps("kolors control", req.steps)?;
+        let use_guide = req.guidance > 1.0;
+
+        let conditioning = SynchronizedPhase::new(
+            Self::load_conditioning_phase(&self.paths, &self.device)?,
+            self.device.clone(),
+        );
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            &req.negative,
+            use_guide,
+            candle_gen::gen_core::CfgBatching::Batched,
+            |prompt| Self::encode_with(&conditioning, prompt),
+        )?;
+        let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
+        conditioning.release()?;
+
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let denoise = SynchronizedPhase::new(
+            Self::load_denoise_phase(&self.paths, &self.device)?,
+            self.device.clone(),
+        );
+        let projected = denoise.encoder_hid_proj.forward(&context)?;
+        let cn_context = denoise.cn_encoder_hid_proj.forward(&context)?;
+        let control = preprocess_control_image(skeleton, req.width, req.height, &self.device)?
+            .to_dtype(DTYPE)?;
+        let control = if use_guide {
+            Tensor::cat(&[&control, &control], 0)?
+        } else {
+            control
+        };
+        let cond_embed = denoise.controlnet.embed_cond(&control)?;
+        let control_scale = req.control_scale as f64;
+        let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
+        let latents = if let Some(sampler_name) = curated {
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
+            let setup = CuratedSetup::new(req.scheduler.as_deref(), req.steps, &noise)?;
+            let control_ctx = ControlContext {
+                controlnet: &denoise.controlnet,
+                cond_embed,
+                scale: control_scale,
+            };
+            let preview = crate::preview::ve_hook(&req.preview);
+            denoise_curated(
+                &denoise.unet,
+                Some(sampler_name),
+                &setup.model_sampling,
+                &setup.sigmas,
+                setup.prior,
+                &projected,
+                &pooled,
+                &time_ids,
+                req.guidance as f64,
+                DTYPE,
+                req.seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                std::slice::from_ref(&control_ctx),
+                &cn_context,
+            )?
+        } else {
+            let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
+            let mut current = (noise * sampler.init_noise_sigma() as f64)?;
+            let total = sampler.num_steps() as u32;
+            let preview_counter =
+                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
+            for step in 0..sampler.num_steps() {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let scaled = (&current / sampler.scale_in(step) as f64)?;
+                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step, || {
+                    crate::preview::project_spatial_latents(&scaled)
+                });
+                let model_in = if use_guide {
+                    Tensor::cat(&[&scaled, &scaled], 0)?
+                } else {
+                    scaled
+                };
+                let timestep = sampler.timestep(step) as f64;
+                let residuals = denoise.controlnet.forward(
+                    &model_in,
+                    &cond_embed,
+                    timestep,
+                    &cn_context,
+                    &pooled,
+                    &time_ids,
+                    control_scale,
+                )?;
+                let eps = denoise.unet.forward_instantid(
+                    &model_in,
+                    timestep,
+                    &projected,
+                    &pooled,
+                    &time_ids,
+                    Some(residuals.down.as_slice()),
+                    Some(&residuals.mid),
+                )?;
+                let eps = if use_guide {
+                    let chunks = eps.chunk(2, 0)?;
+                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * req.guidance as f64)?)?
+                } else {
+                    eps
+                };
+                current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
+                on_progress(Progress::Step {
+                    current: step as u32 + 1,
+                    total,
+                });
+            }
+            current
+        };
+        denoise.release()?;
+
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let decode = SynchronizedPhase::new(
+            Self::load_decode_phase(&self.paths, self.pid_spec.as_ref(), &self.device)?,
+            self.device.clone(),
+        );
+        on_progress(Progress::Decoding);
+        let pid_decoder = Self::pid_decoder_with(&decode, req)?;
+        let image = common::decode(&decode.vae, pid_decoder.as_ref(), &latents)?;
+        drop(pid_decoder);
+        decode.release()?;
+        Ok(image)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (borrows `&self.tokenizer` / `&self.chatglm`); passed as a closure to the shared
     /// [`common::cfg_batch_context`], so the ChatGLM3 plumbing is per-site and only the CFG convention
     /// is shared.
-    fn encode(&self, prompt: &str) -> Result<(Tensor, Tensor)> {
-        let tokens = self.tokenizer.encode(prompt)?;
-        Ok(self.chatglm.encode_prompt(&tokens)?)
+    fn encode_with(
+        conditioning: &ControlConditioningPhase,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor)> {
+        let tokens = conditioning.tokenizer.encode(prompt)?;
+        Ok(conditioning.chatglm.encode_prompt(&tokens)?)
     }
 }
 

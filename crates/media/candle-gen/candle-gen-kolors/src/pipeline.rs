@@ -887,19 +887,19 @@ impl Pipeline {
 /// Own one staged component group and synchronize its device work before release.  Explicit
 /// `release` catches synchronization failures; `Drop` supplies the same cleanup for cancellation,
 /// error, and unwind paths where there is no result channel.
-struct SynchronizedPhase<T> {
+pub(crate) struct SynchronizedPhase<T> {
     value: Option<T>,
     device: Device,
 }
 
 impl<T> SynchronizedPhase<T> {
-    fn new(value: T, device: Device) -> Self {
+    pub(crate) fn new(value: T, device: Device) -> Self {
         Self {
             value: Some(value),
             device,
         }
     }
-    fn release(mut self) -> Result<()> {
+    pub(crate) fn release(mut self) -> Result<()> {
         self.device.synchronize()?;
         drop(self.value.take());
         Ok(())
@@ -910,6 +910,12 @@ impl<T> std::ops::Deref for SynchronizedPhase<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         self.value.as_ref().expect("staged phase released")
+    }
+}
+
+impl<T> std::ops::DerefMut for SynchronizedPhase<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.as_mut().expect("staged phase released")
     }
 }
 
@@ -1024,6 +1030,7 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
     /// path — it was previously dropped on the floor by txt2img, silently rendering the native
@@ -1185,6 +1192,39 @@ mod tests {
         let encode = &source[encode_start..encode_end];
         assert!(encode.contains("candle_gen::cached(&components.vae_encoder"));
         assert!(encode.contains("VaeMomentsEncoder::new"));
+    }
+
+    #[test]
+    fn synchronized_phase_releases_on_success_error_and_panic() {
+        struct Probe(std::sync::Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let device = Device::Cpu;
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        SynchronizedPhase::new(Probe(drops.clone()), device.clone())
+            .release()
+            .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let error_path = || -> Result<()> {
+            let _phase = SynchronizedPhase::new(Probe(drops.clone()), device.clone());
+            Err(CandleError::Msg("injected phase error".into()))
+        };
+        assert!(error_path().is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        let unwind = std::panic::catch_unwind({
+            let drops = drops.clone();
+            move || {
+                let _phase = SynchronizedPhase::new(Probe(drops), Device::Cpu);
+                panic!("injected phase panic");
+            }
+        });
+        assert!(unwind.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a

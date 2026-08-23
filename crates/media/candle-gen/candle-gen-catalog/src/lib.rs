@@ -1064,11 +1064,10 @@ mod preview_advertising {
             dir: "candle-gen-kolors",
             register: candle_gen_kolors::register_providers,
             denoise: Denoise::Shared,
-            // sc-16954's inventory. Kolors has one hooked driver call — the registered route's curated
-            // lane in `pipeline.rs` — and three bespoke leading-Euler loops, one per entry point, each
-            // emitting directly: the registered route's native lane (`pipeline.rs`), the pose-control
-            // provider (`control.rs`) and the IP-Adapter provider (`ip_provider.rs`). The two
-            // providers' CURATED lanes are invisible here by construction: they reach
+            // sc-16954/sc-20790 inventory. Kolors has one hooked driver call — the registered route's
+            // curated resident lane in `pipeline.rs` — and resident plus request-staged leading-Euler
+            // loops in each of `pipeline.rs`, `control.rs`, and `ip_provider.rs`, all emitting directly.
+            // The two providers' CURATED lanes are invisible here by construction: they reach
             // `candle_gen_sdxl::denoise_curated` rather than a driver of their own, so the hook they
             // build is counted in `candle-gen-sdxl`'s `denoise.rs` row. No dark site — this crate has
             // no trainer.
@@ -1076,19 +1075,19 @@ mod preview_advertising {
                 FileRoutes {
                     file: "control.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "ip_provider.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 1,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
             ],

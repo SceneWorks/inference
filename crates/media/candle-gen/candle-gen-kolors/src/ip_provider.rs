@@ -46,7 +46,7 @@ use candle_gen_sdxl::{denoise_curated, load_vendored_unet_with_adapters, UNet2DC
 use crate::chatglm3::ChatGlmModel;
 use crate::common::{self, CuratedSetup};
 use crate::config::ChatGlmConfig;
-use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config};
+use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config, SynchronizedPhase};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -78,6 +78,7 @@ const IP_BUNDLE_FILE: &str = "ip_adapter_plus_general.safetensors";
 pub const DEFAULT_IP_ADAPTER_SCALE: f32 = 0.6;
 
 /// Paths to the Kolors IP-Adapter-Plus checkpoints.
+#[derive(Clone)]
 pub struct IpAdapterKolorsPaths {
     /// The `Kwai-Kolors/Kolors-diffusers` snapshot dir (`tokenizer/`, `text_encoder/` ChatGLM3-6B,
     /// `unet/` SDXL-family UNet, `vae/` SDXL VAE).
@@ -166,15 +167,28 @@ fn resolve_image_encoder(dir: &Path) -> Result<PathBuf> {
 /// Loaded Kolors IP-Adapter model: the ChatGLM3 tokenizer + encoder, the `encoder_hid_proj` context
 /// projection, the vendored SDXL UNet (with the IP K/V pairs installed + the 5632 `add_embedding`), the
 /// CLIP ViT-L/14-336 image-token source, and the f32 SDXL VAE.
-pub struct IpAdapterKolors {
+struct IpConditioningPhase {
     tokenizer: KolorsTokenizer,
     chatglm: ChatGlmModel,
+    ip_encoder: IpImageEncoder,
+}
+
+struct IpDenoisePhase {
     /// Kolors-only: project the ChatGLM3 context (4096) to the cross-attention width (2048), applied
     /// here (the vendored UNet has no `encoder_hid_proj`, unlike [`crate::unet::KolorsUNet`]).
     encoder_hid_proj: QLinear,
     unet: UNet2DConditionModel,
-    ip_encoder: IpImageEncoder,
+}
+
+struct IpResident {
+    conditioning: IpConditioningPhase,
+    denoise: IpDenoisePhase,
     vae: AutoEncoderKL,
+}
+
+pub struct IpAdapterKolors {
+    resident: Option<IpResident>,
+    paths: IpAdapterKolorsPaths,
     device: Device,
     memory_contract: Option<candle_gen::gen_core::MemoryProviderContract>,
     admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
@@ -193,7 +207,8 @@ impl IpAdapterKolors {
         paths: &IpAdapterKolorsPaths,
         context: candle_gen::gen_core::MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract_for("candle_kolors_ipadapter");
+        let contract = crate::memory_strategy::provider_contract_for_ip(paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         crate::memory_strategy::validate_bespoke_context(
             &contract,
             &paths.kolors_base,
@@ -211,23 +226,76 @@ impl IpAdapterKolors {
         admitted_context: Option<candle_gen::gen_core::MemoryRunContext>,
     ) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let base = paths.kolors_base.as_path();
+        let staged = admitted_context.as_ref().is_some_and(|context| {
+            context.selection.strategy == candle_gen::gen_core::MemoryStrategy::StagedResidency
+        });
+        let resident = if staged {
+            None
+        } else {
+            let conditioning = Self::load_conditioning_phase(paths, &device)?;
+            let denoise = Self::load_denoise_phase(paths, &device)?;
+            let vae = Self::load_vae(paths, &device)?;
+            Some(IpResident {
+                conditioning,
+                denoise,
+                vae,
+            })
+        };
 
+        Ok(Self {
+            resident,
+            paths: paths.clone(),
+            device,
+            memory_contract,
+            admitted_context,
+            source_root: paths.kolors_base.clone(),
+        })
+    }
+
+    fn load_conditioning_phase(
+        paths: &IpAdapterKolorsPaths,
+        device: &Device,
+    ) -> Result<IpConditioningPhase> {
+        let base = paths.kolors_base.as_path();
         let tokenizer = KolorsTokenizer::from_dir(base.join("tokenizer"))?;
         let text_group =
             detect_packed_group(&base.join("text_encoder/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
         let chatglm = ChatGlmModel::new_gs(
             ChatGlmConfig::chatglm3_6b(),
-            f32_vb(&base.join("text_encoder"), &device)?,
+            f32_vb(&base.join("text_encoder"), device)?,
             text_group,
         )?;
 
+        let bundle = paths.ip_adapter.join(IP_BUNDLE_FILE);
+        let ipa = Weights::from_file(&bundle, device, DTYPE)
+            .map_err(|e| CandleError::Msg(format!("kolors-ip: load bundle {bundle:?}: {e}")))?;
+        let resampler =
+            Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::kolors_plus())?;
+        let enc_cfg = VisionConfig::vit_l_14_336();
+        let enc_path = resolve_image_encoder(&paths.ip_adapter.join("image_encoder"))?;
+        let enc_w = Weights::from_file(&enc_path, device, DTYPE).map_err(|e| {
+            CandleError::Msg(format!(
+                "kolors-ip: load CLIP image encoder {enc_path:?}: {e}"
+            ))
+        })?;
+        check_layer_count(&enc_w, &enc_cfg)?;
+        let encoder = ClipVisionEncoder::from_weights(&enc_w, &enc_cfg)?;
+        Ok(IpConditioningPhase {
+            tokenizer,
+            chatglm,
+            ip_encoder: IpImageEncoder::new(encoder, resampler, KOLORS_IP_IMAGE_SIZE),
+        })
+    }
+
+    fn load_denoise_phase(paths: &IpAdapterKolorsPaths, device: &Device) -> Result<IpDenoisePhase> {
+        let base = paths.kolors_base.as_path();
+
         // Vendored SDXL UNet from the Kolors `unet/` weights. One mmap'd VarBuilder feeds the UNet body,
         // the 5632 `add_embedding` head, and the `encoder_hid_proj` (all in the same checkpoint).
-        let vs = f32_vb(&base.join("unet"), &device)?;
+        let vs = f32_vb(&base.join("unet"), device)?;
         let mut unet = load_vendored_unet_with_adapters(
             base,
-            &device,
+            device,
             DTYPE,
             &paths.adapters,
             ADDITION_TIME_EMBED_DIM,
@@ -247,38 +315,24 @@ impl IpAdapterKolors {
         // IP-Adapter-Plus bundle: the Resampler (`image_proj.*`) + the decoupled K/V pairs
         // (`ip_adapter.*`), both at the UNet dtype.
         let bundle = paths.ip_adapter.join(IP_BUNDLE_FILE);
-        let ipa = Weights::from_file(&bundle, &device, DTYPE)
+        let ipa = Weights::from_file(&bundle, device, DTYPE)
             .map_err(|e| CandleError::Msg(format!("kolors-ip: load bundle {bundle:?}: {e}")))?;
-        let resampler =
-            Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::kolors_plus())?;
         unet.install_ip_adapter(load_ip_kv_pairs(&ipa)?)?;
 
-        // CLIP ViT-L/14-336 image encoder (`vision_model.*`).
-        let enc_cfg = VisionConfig::vit_l_14_336();
-        let enc_path = resolve_image_encoder(&paths.ip_adapter.join("image_encoder"))?;
-        let enc_w = Weights::from_file(&enc_path, &device, DTYPE).map_err(|e| {
-            CandleError::Msg(format!(
-                "kolors-ip: load CLIP image encoder {enc_path:?}: {e}"
-            ))
-        })?;
-        check_layer_count(&enc_w, &enc_cfg)?;
-        let encoder = ClipVisionEncoder::from_weights(&enc_w, &enc_cfg)?;
-        let ip_encoder = IpImageEncoder::new(encoder, resampler, KOLORS_IP_IMAGE_SIZE);
-
-        let vae = AutoEncoderKL::new(f32_vb(&base.join("vae"), &device)?, 3, 3, sdxl_vae_config())?;
-
-        Ok(Self {
-            tokenizer,
-            chatglm,
+        Ok(IpDenoisePhase {
             encoder_hid_proj,
             unet,
-            ip_encoder,
-            vae,
-            device,
-            memory_contract,
-            admitted_context,
-            source_root: paths.kolors_base.clone(),
         })
+    }
+
+    fn load_vae(paths: &IpAdapterKolorsPaths, device: &Device) -> Result<AutoEncoderKL> {
+        AutoEncoderKL::new(
+            f32_vb(&paths.kolors_base.join("vae"), device)?,
+            3,
+            3,
+            sdxl_vae_config(),
+        )
+        .map_err(Into::into)
     }
 
     /// Reference-image T2I: condition the Kolors generation on `reference`'s CLIP-ViT-L/14-336 identity
@@ -325,7 +379,13 @@ impl IpAdapterKolors {
             false,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
-        let result = self.generate_inner(req, reference, on_progress);
+        let result = if context.selection.strategy
+            == candle_gen::gen_core::MemoryStrategy::StagedResidency
+        {
+            self.generate_staged(req, reference, on_progress)
+        } else {
+            self.generate_inner(req, reference, on_progress)
+        };
         let sync = self.device.synchronize().map_err(CandleError::Candle);
         match (result, sync) {
             (Err(error), _) => Err(error),
@@ -340,6 +400,9 @@ impl IpAdapterKolors {
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let resident = self.resident.as_mut().ok_or_else(|| {
+            CandleError::Msg("kolors-ip: resident execution has no resident components".into())
+        })?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -360,20 +423,23 @@ impl IpAdapterKolors {
             // selection — so the mode is this lane's fixed convention, stated rather than
             // implied. `cfg_batch_context` still refuses anything else.
             candle_gen::gen_core::CfgBatching::Batched,
-            |p| self.encode(p),
+            |p| Self::encode_with(&resident.conditioning, p),
         )?;
         // Project the ChatGLM3 context to the cross-attention width once up front — the vendored UNet
         // (unlike `KolorsUNet`) has no `encoder_hid_proj`, so its context must already be 2048-wide.
-        let projected = self.encoder_hid_proj.forward(&context)?;
+        let projected = resident.denoise.encoder_hid_proj.forward(&context)?;
         let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
         // The IP lane's genuine drift: the CFG-batched (uncond zeros-first) reference image tokens.
-        let ip_tokens = self.ip_tokens(reference, use_guide)?;
+        let ip_tokens =
+            Self::ip_tokens_with(&resident.conditioning, reference, use_guide, &self.device)?;
 
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
 
         // Set the IP image tokens on the UNet (constant across the denoise) — picked up by BOTH the
         // native and curated denoise paths via `forward_instantid`'s decoupled-attn branch.
-        self.unet
+        resident
+            .denoise
+            .unet
             .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
 
         // Curated unified-sampler path (epic 7114, sc-7297): a curated solver name (≠ the native
@@ -395,7 +461,7 @@ impl IpAdapterKolors {
             // renormalizes before projecting (sc-16954). Built per image.
             let preview = crate::preview::ve_hook(&req.preview);
             denoise_curated(
-                &self.unet,
+                &resident.denoise.unet,
                 Some(sampler_name),
                 &setup.model_sampling,
                 &setup.sigmas,
@@ -437,7 +503,7 @@ impl IpAdapterKolors {
                 } else {
                     scaled
                 };
-                let eps = self.unet.forward_instantid(
+                let eps = resident.denoise.unet.forward_instantid(
                     &model_in,
                     sampler.timestep(i) as f64,
                     &projected,
@@ -465,24 +531,151 @@ impl IpAdapterKolors {
         on_progress(Progress::Decoding);
         // IP-Adapter lane does not carry a PiD decoder (base txt2img is the shipping PiD path,
         // epic 7840 / sc-7853); native SDXL VAE decode.
-        common::decode(&self.vae, None, &latents)
+        common::decode(&resident.vae, None, &latents)
+    }
+
+    /// True request-authoritative staged execution: ChatGLM + CLIP/Resampler are released before
+    /// the IP-installed UNet is materialized, and the UNet is released before the F32 VAE opens.
+    fn generate_staged(
+        &mut self,
+        req: &IpAdapterKolorsRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        common::reject_zero_steps("kolors ip-adapter", req.steps)?;
+        let use_guide = req.guidance > 1.0;
+
+        let conditioning = SynchronizedPhase::new(
+            Self::load_conditioning_phase(&self.paths, &self.device)?,
+            self.device.clone(),
+        );
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            &req.negative,
+            use_guide,
+            candle_gen::gen_core::CfgBatching::Batched,
+            |prompt| Self::encode_with(&conditioning, prompt),
+        )?;
+        let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
+        let ip_tokens = Self::ip_tokens_with(&conditioning, reference, use_guide, &self.device)?;
+        conditioning.release()?;
+
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let mut denoise = SynchronizedPhase::new(
+            Self::load_denoise_phase(&self.paths, &self.device)?,
+            self.device.clone(),
+        );
+        let projected = denoise.encoder_hid_proj.forward(&context)?;
+        denoise
+            .unet
+            .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
+        let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
+        let latents = if let Some(sampler_name) = curated {
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
+            let setup = CuratedSetup::new(req.scheduler.as_deref(), req.steps, &noise)?;
+            let preview = crate::preview::ve_hook(&req.preview);
+            denoise_curated(
+                &denoise.unet,
+                Some(sampler_name),
+                &setup.model_sampling,
+                &setup.sigmas,
+                setup.prior,
+                &projected,
+                &pooled,
+                &time_ids,
+                req.guidance as f64,
+                DTYPE,
+                req.seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview),
+                &[],
+                &projected,
+            )?
+        } else {
+            let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
+            let mut current = (noise * sampler.init_noise_sigma() as f64)?;
+            let total = sampler.num_steps() as u32;
+            let preview_counter =
+                candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
+            for step in 0..sampler.num_steps() {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let scaled = (&current / sampler.scale_in(step) as f64)?;
+                candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step, || {
+                    crate::preview::project_spatial_latents(&scaled)
+                });
+                let model_in = if use_guide {
+                    Tensor::cat(&[&scaled, &scaled], 0)?
+                } else {
+                    scaled
+                };
+                let eps = denoise.unet.forward_instantid(
+                    &model_in,
+                    sampler.timestep(step) as f64,
+                    &projected,
+                    &pooled,
+                    &time_ids,
+                    None,
+                    None,
+                )?;
+                let eps = if use_guide {
+                    let chunks = eps.chunk(2, 0)?;
+                    (&chunks[0] + ((&chunks[1] - &chunks[0])? * req.guidance as f64)?)?
+                } else {
+                    eps
+                };
+                current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
+                on_progress(Progress::Step {
+                    current: step as u32 + 1,
+                    total,
+                });
+            }
+            current
+        };
+        denoise.release()?;
+
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let vae = SynchronizedPhase::new(
+            Self::load_vae(&self.paths, &self.device)?,
+            self.device.clone(),
+        );
+        on_progress(Progress::Decoding);
+        let image = common::decode(&vae, None, &latents)?;
+        vae.release()?;
+        Ok(image)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (borrows `&self.tokenizer` / `&self.chatglm`); passed as a closure to the shared
     /// [`common::cfg_batch_context`], so only the CFG convention is shared, not the ChatGLM3 plumbing.
-    fn encode(&self, prompt: &str) -> Result<(Tensor, Tensor)> {
-        let tokens = self.tokenizer.encode(prompt)?;
-        Ok(self.chatglm.encode_prompt(&tokens)?)
+    fn encode_with(conditioning: &IpConditioningPhase, prompt: &str) -> Result<(Tensor, Tensor)> {
+        let tokens = conditioning.tokenizer.encode(prompt)?;
+        Ok(conditioning.chatglm.encode_prompt(&tokens)?)
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond
     /// row is literal **zero tokens** (the IP-Adapter convention) stacked *before* the positive row.
     /// The IP lane's genuine drift — NOT shared with the txt2img / control lanes.
-    fn ip_tokens(&self, reference: &Image, use_guide: bool) -> Result<Tensor> {
-        let tokens = self.ip_encoder.tokens(reference, &self.device)?; // [1, 16, 2048]
+    fn ip_tokens_with(
+        conditioning: &IpConditioningPhase,
+        reference: &Image,
+        use_guide: bool,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let tokens = conditioning.ip_encoder.tokens(reference, device)?; // [1, 16, 2048]
         if use_guide {
-            let zeros = self.ip_encoder.zeros_tokens(&self.device)?;
+            let zeros = conditioning.ip_encoder.zeros_tokens(device)?;
             Ok(Tensor::cat(&[&zeros, &tokens], 0)?) // uncond (zeros) first, then cond
         } else {
             Ok(tokens)

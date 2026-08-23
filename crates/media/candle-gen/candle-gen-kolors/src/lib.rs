@@ -24,7 +24,7 @@ mod chatglm3;
 // CFG-batched-encode / curated-σ-prior blocks that were copy-pasted across the three entry points.
 mod common;
 mod config;
-mod memory_strategy;
+pub mod memory_strategy;
 mod pipeline;
 // Per-step latent preview wiring (epic 16948, sc-16954). No coefficients of its own — Kolors shares
 // the SDXL four-channel latent space (one byte-identical VAE file, `scaling_factor` 0.13025) and
@@ -278,6 +278,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let memory_contract = if root.exists() {
+        memory_strategy::provider_contract_for_load(&root, &spec.adapters, spec.pid.as_ref())?
+    } else {
+        // Registry/catalog introspection intentionally permits a missing lazy root. It cannot begin
+        // an admitted request: physical-tier and receipt validation both require the real source.
+        memory_strategy::provider_contract()
+    };
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         root,
@@ -289,7 +296,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
         lifecycle: Mutex::new(()),
-        memory_contract: memory_strategy::provider_contract(),
+        memory_contract,
     }))
 }
 
