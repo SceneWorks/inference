@@ -669,7 +669,11 @@ fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
 /// missing config is treated as dense; the downstream loader gives the precise "missing X" error). Used
 /// for the ChatGLM3 `text_encoder/` group thread (the per-Linear `.scales` detection is
 /// [`QLinear::linear_detect_gs`]'s job, so this only recovers the grid, never gates the packed path).
-fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
+/// Read the physical MLX packing grid from a component config.  The conditioned
+/// IP/Control providers use this too: their base snapshot is the same canonical
+/// q4/q8 artifact as the registered route, so treating those paths as dense
+/// would either decode u32 codes as weights or silently cross a tier.
+pub(crate) fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
     if !cfg_path.is_file() {
         return Ok(None);
     }

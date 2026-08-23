@@ -31,6 +31,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{AdapterSpec, Image, PidWeights, PreviewSink, Progress};
+use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
@@ -43,7 +44,7 @@ use candle_gen_sdxl::{
 use crate::chatglm3::ChatGlmModel;
 use crate::common::{self, CuratedSetup};
 use crate::config::ChatGlmConfig;
-use crate::pipeline::{curated_route, sdxl_vae_config};
+use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -171,7 +172,7 @@ pub struct KolorsControl {
     chatglm: ChatGlmModel,
     /// The UNet's ChatGLM3 context projection (4096 → 2048), applied before the base cross-attentions
     /// (the vendored UNet has no `encoder_hid_proj`, unlike [`crate::unet::KolorsUNet`]).
-    encoder_hid_proj: Linear,
+    encoder_hid_proj: QLinear,
     unet: UNet2DConditionModel,
     /// The ControlNet's OWN ChatGLM3 context projection (4096 → 2048), trained separately from the
     /// UNet's, applied before the control branch's cross-attentions.
@@ -193,9 +194,12 @@ impl KolorsControl {
         let base = paths.kolors_base.as_path();
 
         let tokenizer = KolorsTokenizer::from_dir(base.join("tokenizer"))?;
-        let chatglm = ChatGlmModel::new(
+        let text_group =
+            detect_packed_group(&base.join("text_encoder/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
+        let chatglm = ChatGlmModel::new_gs(
             ChatGlmConfig::chatglm3_6b(),
             f32_vb(&base.join("text_encoder"), &device)?,
+            text_group,
         )?;
 
         // Vendored SDXL UNet from the Kolors `unet/` weights + the 5632 `add_embedding` head + the UNet's
@@ -210,8 +214,16 @@ impl KolorsControl {
             ADDITION_TIME_EMBED_DIM,
             PROJECTION_INPUT_DIM,
         )?;
-        let encoder_hid_proj =
-            nn::linear(CONTEXT_DIM, CROSS_ATTENTION_DIM, vs.pp("encoder_hid_proj"))?;
+        let unet_group =
+            detect_packed_group(&base.join("unet/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
+        let encoder_hid_proj = QLinear::linear_detect_gs(
+            CONTEXT_DIM,
+            CROSS_ATTENTION_DIM,
+            &vs,
+            "encoder_hid_proj",
+            true,
+            unet_group,
+        )?;
 
         // Kolors ControlNet (a diffusers SDXL-family `ControlNetModel`) + its OWN `encoder_hid_proj`.
         let cn_file = resolve_controlnet_file(&paths.controlnet)?;

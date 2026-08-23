@@ -31,9 +31,10 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress};
+use candle_gen::quant::{QLinear, MLX_GROUP_SIZE};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 
@@ -45,7 +46,7 @@ use candle_gen_sdxl::{denoise_curated, load_vendored_unet_with_adapters, UNet2DC
 use crate::chatglm3::ChatGlmModel;
 use crate::common::{self, CuratedSetup};
 use crate::config::ChatGlmConfig;
-use crate::pipeline::{curated_route, sdxl_vae_config};
+use crate::pipeline::{curated_route, detect_packed_group, sdxl_vae_config};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -170,7 +171,7 @@ pub struct IpAdapterKolors {
     chatglm: ChatGlmModel,
     /// Kolors-only: project the ChatGLM3 context (4096) to the cross-attention width (2048), applied
     /// here (the vendored UNet has no `encoder_hid_proj`, unlike [`crate::unet::KolorsUNet`]).
-    encoder_hid_proj: Linear,
+    encoder_hid_proj: QLinear,
     unet: UNet2DConditionModel,
     ip_encoder: IpImageEncoder,
     vae: AutoEncoderKL,
@@ -186,9 +187,12 @@ impl IpAdapterKolors {
         let base = paths.kolors_base.as_path();
 
         let tokenizer = KolorsTokenizer::from_dir(base.join("tokenizer"))?;
-        let chatglm = ChatGlmModel::new(
+        let text_group =
+            detect_packed_group(&base.join("text_encoder/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
+        let chatglm = ChatGlmModel::new_gs(
             ChatGlmConfig::chatglm3_6b(),
             f32_vb(&base.join("text_encoder"), &device)?,
+            text_group,
         )?;
 
         // Vendored SDXL UNet from the Kolors `unet/` weights. One mmap'd VarBuilder feeds the UNet body,
@@ -202,8 +206,16 @@ impl IpAdapterKolors {
             ADDITION_TIME_EMBED_DIM,
             PROJECTION_INPUT_DIM,
         )?;
-        let encoder_hid_proj =
-            nn::linear(CONTEXT_DIM, CROSS_ATTENTION_DIM, vs.pp("encoder_hid_proj"))?;
+        let unet_group =
+            detect_packed_group(&base.join("unet/config.json"))?.unwrap_or(MLX_GROUP_SIZE);
+        let encoder_hid_proj = QLinear::linear_detect_gs(
+            CONTEXT_DIM,
+            CROSS_ATTENTION_DIM,
+            &vs,
+            "encoder_hid_proj",
+            true,
+            unet_group,
+        )?;
 
         // IP-Adapter-Plus bundle: the Resampler (`image_proj.*`) + the decoupled K/V pairs
         // (`ip_adapter.*`), both at the UNet dtype.
