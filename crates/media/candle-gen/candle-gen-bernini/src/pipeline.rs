@@ -107,17 +107,35 @@ pub struct BerniniRenderer {
     device: Device,
     adapters: Vec<candle_gen::gen_core::AdapterSpec>,
     components: Mutex<Option<Arc<RendererComponents>>>,
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
+    loaded_spec: LoadSpec,
 }
 
 impl BerniniRenderer {
     fn components(&self) -> CResult<Arc<RendererComponents>> {
         candle_gen::cached(&self.components, || {
-            Ok(Arc::new(RendererComponents::load(
-                &self.root,
-                &self.device,
-                MODEL_ID,
-                &self.adapters,
-            )?))
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            let components =
+                RendererComponents::load(&self.root, &self.device, MODEL_ID, &self.adapters)?;
+            if let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) {
+                crate::memory_strategy::validate_loaded_contract(
+                    MODEL_ID,
+                    &self.loaded_spec,
+                    contract,
+                    tier,
+                )
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            }
+            Ok(Arc::new(components))
         })
     }
 
@@ -309,7 +327,12 @@ impl BerniniRenderer {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let out_images = frames_to_images(&decoded)?;
 
         // num_frames == 1 ⇒ a still image (t2i). A single latent frame still decodes to one VAE
@@ -384,6 +407,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // NOT reject here; both experts load through the sc-10025 packed-detect seam.
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
+    #[cfg(any(feature = "cuda", test))]
+    let (memory_strategy, memory_tier) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID)? {
+            Some((contract, tier)) => (Some(contract), Some(tier)),
+            None => (None, None),
+        };
+    #[cfg(not(any(feature = "cuda", test)))]
+    let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
         knobs,
@@ -391,6 +422,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        memory_strategy,
+        memory_tier,
+        loaded_spec: spec.clone(),
     }))
 }
 
@@ -441,6 +475,30 @@ impl Generator for BerniniRenderer {
         self.validate(req)?;
         let comps = self.components()?;
         Ok(self.render(req, &comps, on_progress)?)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return gen_core::MemorySafetyDecision::Accept;
+        };
+        crate::memory_strategy::safety_check(contract, tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
 }
 

@@ -257,6 +257,13 @@ CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS: dict[str, str] = {
 # unequal by spelling whatever the geometry does. `wan.VAE_TILING` itself is now compared directly,
 # which covers the substance; the two re-exports are still text.
 CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
+    ("bernini", "DECODE_TILE_EDGES"): (
+        "the same z16 decoder has backend-specific safe operating domains: candle is capped at "
+        "512px by its CUDA conv2d im2col safety guard and keeps the CUDA tiler's 448/192 entries; "
+        "mlx has no CUDA im2col ceiling and publishes its Metal 768/640 candidates with a 256px "
+        "floor. Both use output pixels and 64px overlap, but copying either list would make the "
+        "other backend claim an invalid runtime domain."
+    ),
     ("catalog", "BESPOKE_UTILITY_CRATES"): (
         "each backend's own inventory of platform-owned crates, not a shared declaration: candle "
         "ships `pulid`, mlx ships it as `pulid_flux` and ships `sam2`, which candle has no port of. "
