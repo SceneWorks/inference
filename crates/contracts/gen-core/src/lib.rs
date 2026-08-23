@@ -17,6 +17,7 @@ pub mod audio_embed;
 pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
+pub mod checkpoint_codec;
 pub mod control;
 pub mod encoder_contract;
 pub mod error;
@@ -66,6 +67,12 @@ pub use audio_transform::{
 pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
+};
+pub use checkpoint_codec::{
+    compile_logical_weight_plan, CheckpointCodecRegistration, CheckpointCodecRegistry,
+    CodecResidencyReport, IdentityKeyMapping, LogicalKeyMapping, LogicalReadMaterialization,
+    LogicalTensorPlan, LogicalWeightPlan, LogicalWeightPlanError, LogicalWeightReceipt,
+    WeightEncoding, DENSE_BF16_CODEC, DENSE_CODECS, DENSE_F16_CODEC, DENSE_F32_CODEC,
 };
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,

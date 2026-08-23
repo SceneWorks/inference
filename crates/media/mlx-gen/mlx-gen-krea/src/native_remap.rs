@@ -41,8 +41,31 @@
 //! `scale_shift_table` from the single file's flat `[6·hidden]` to the diffusers `[6, hidden]`), which
 //! the single-file loader runs between the remap and `validate_transformer`.
 
+use mlx_gen::gen_core::LogicalKeyMapping;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+/// The Krea 2 adapter's canonical key-mapping authority for the `krea-native` dialect (sc-20634):
+/// the [`LogicalKeyMapping`] the mapped logical-weight reader consults, backed by
+/// [`native_dit_key_to_diffusers`]. Its id is the one the portable
+/// [`KREA_2_CHECKPOINT_ADAPTER`](mlx_gen::gen_core::KREA_2_CHECKPOINT_ADAPTER) row registers for
+/// that dialect; the crate's conformance test proves the two agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KreaNativeToDiffusersMapping;
+
+impl KreaNativeToDiffusersMapping {
+    pub const MAPPING_ID: &'static str = "krea-native-to-diffusers-v1";
+}
+
+impl LogicalKeyMapping for KreaNativeToDiffusersMapping {
+    fn mapping_id(&self) -> &'static str {
+        Self::MAPPING_ID
+    }
+
+    fn logical_key(&self, physical_key: &str) -> Option<String> {
+        native_dit_key_to_diffusers(physical_key)
+    }
+}
 
 /// Translate a **native-mmdit** single-file DiT tensor key to the **diffusers** key the MLX
 /// [`Krea2Transformer`](crate::transformer::Krea2Transformer) module tree loads. Returns `None` for any

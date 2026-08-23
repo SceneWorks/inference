@@ -341,21 +341,94 @@ fn normalized_native_weights_with_materializer(
     normalized_native_weights_with_options(dit_file, true, materialize)
 }
 
+/// The receipt of the most recent native-file read that went through the mapped logical-weight
+/// reader on this process (sc-20634). Diagnostics only: the loader's correctness does not depend
+/// on it, but SceneWorks' parity checks and this crate's tests read it to prove a dense bf16 file
+/// was consumed through the codec seam and what the codec left resident.
+static LAST_NATIVE_FILE_RECEIPT: std::sync::Mutex<Option<mlx_gen::gen_core::LogicalWeightReceipt>> =
+    std::sync::Mutex::new(None);
+
+pub fn last_native_file_receipt() -> Option<mlx_gen::gen_core::LogicalWeightReceipt> {
+    LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub fn reset_native_file_receipt() {
+    *LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn record_native_file_receipt(receipt: mlx_gen::gen_core::LogicalWeightReceipt) {
+    *LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt);
+}
+
+/// Header-only classification of a native single-file DiT: does it carry the ComfyUI plain-int8
+/// convention (I8 projections and/or `.comfy_quant` descriptors)? Descriptor-gated packings stay on
+/// the bespoke dequantization arm until sc-20385 registers their codecs; everything else is read
+/// through the mapped logical-weight reader and the registered codec table, which refuses any
+/// encoding it has no codec for before an array exists.
+fn native_file_carries_plain_int8_convention(dit_file: &Path) -> Result<bool> {
+    let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(dit_file)?;
+    Ok(headers.iter().any(|header| {
+        header.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8
+            || header.name.ends_with(".comfy_quant")
+    }))
+}
+
 fn normalized_native_weights_with_options(
     dit_file: &Path,
-    evaluate_plain_int8: bool,
+    eager: bool,
     materialize: impl FnOnce(&Weights) -> Result<()>,
 ) -> Result<Weights> {
-    let native = dequant_plain_int8_tensorwise_with_evaluation(
-        Weights::from_file(dit_file)?,
-        evaluate_plain_int8,
+    if native_file_carries_plain_int8_convention(dit_file)? {
+        let native =
+            dequant_plain_int8_tensorwise_with_evaluation(Weights::from_file(dit_file)?, eager)?;
+        let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
+        crate::native_remap::normalize_modulation_tables(&mut remapped)?;
+        // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized
+        // map while the caller's `PinnedWeightsFile::read_unchanged` guard still spans this function.
+        materialize(&remapped)?;
+        return Ok(remapped);
+    }
+
+    // Dense path (sc-20634): the adapter's key mapping + the registered dense-bf16 codec. The plan
+    // is compiled from the header, so an unmapped key, a collision, or an unregistered encoding
+    // (fp8, packed u8, …) refuses here, before any MLX array is created.
+    let plan = mlx_gen::logical_weights::plan_logical_weights(
+        dit_file,
+        &crate::native_remap::KreaNativeToDiffusersMapping,
     )?;
-    let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
-    crate::native_remap::normalize_modulation_tables(&mut remapped)?;
-    // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized map
-    // while the caller's `PinnedWeightsFile::read_unchanged` guard still spans this function.
-    materialize(&remapped)?;
-    Ok(remapped)
+    let mut materialize = Some(materialize);
+    let mut eager_materializer = |weights: &mut Weights| -> Result<()> {
+        crate::native_remap::normalize_modulation_tables(weights)?;
+        match materialize.take() {
+            Some(materialize) => materialize(weights),
+            None => Err(Error::Msg(
+                "krea native-file materializer invoked twice".to_owned(),
+            )),
+        }
+    };
+    let mode = if eager {
+        mlx_gen::logical_weights::LogicalReadMode::Eager(&mut eager_materializer)
+    } else {
+        mlx_gen::logical_weights::LogicalReadMode::Deferred
+    };
+    let mlx_gen::logical_weights::LogicalWeights {
+        mut weights,
+        receipt,
+    } = mlx_gen::logical_weights::read_logical_weights(dit_file, &plan, mode)?;
+    if receipt.materialization == mlx_gen::gen_core::LogicalReadMaterialization::Deferred {
+        // The deferred reader leaves the closure unused; the shape normalization is still part of
+        // the canonical logical form, so apply it here (lazily, under the caller's pin guard).
+        crate::native_remap::normalize_modulation_tables(&mut weights)?;
+    }
+    record_native_file_receipt(receipt);
+    Ok(weights)
 }
 
 pub fn load_transformer_from_native_file(
@@ -503,8 +576,13 @@ mod tests {
         let replacement = dir.path().join("krea-native.replacement.safetensors");
         let elements = 64 * 1024;
 
-        let original_weight = Array::from_slice(&vec![0.25_f32; elements], &[elements as i32]);
-        let original_bias = Array::from_slice(&vec![0.75_f32; elements], &[elements as i32]);
+        // Dense bf16, the one encoding the baseline codec table serves (sc-20634).
+        let original_weight = Array::from_slice(&vec![0.25_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let original_bias = Array::from_slice(&vec![0.75_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         Array::save_safetensors(
             vec![
                 ("model.diffusion_model.first.weight", &original_weight),
@@ -514,8 +592,12 @@ mod tests {
             &source,
         )
         .expect("write original native checkpoint");
-        let replacement_weight = Array::from_slice(&vec![-0.25_f32; elements], &[elements as i32]);
-        let replacement_bias = Array::from_slice(&vec![-0.75_f32; elements], &[elements as i32]);
+        let replacement_weight = Array::from_slice(&vec![-0.25_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let replacement_bias = Array::from_slice(&vec![-0.75_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         Array::save_safetensors(
             vec![
                 ("model.diffusion_model.first.weight", &replacement_weight),
@@ -546,7 +628,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move |stage, weights| {
                 match stage {
                     NativeMaterializeTestStage::Before => {
-                        let first = weights.require("img_in.weight")?;
+                        let first = mlx_gen::weights::to_f32(weights.require("img_in.weight")?)?;
                         first.eval()?;
                         assert!(first.as_slice::<f32>().iter().all(|value| *value == 0.25));
                         first_evaluated.wait();
@@ -554,7 +636,9 @@ mod tests {
                     }
                     NativeMaterializeTestStage::After => {
                         assert_eq!(
-                            weights.require("img_in.bias")?.as_slice::<f32>().len(),
+                            mlx_gen::weights::to_f32(weights.require("img_in.bias")?)?
+                                .as_slice::<f32>()
+                                .len(),
                             elements
                         );
                         evaluated.store(true, Ordering::SeqCst);
@@ -581,6 +665,302 @@ mod tests {
             "the final MLX array map must be evaluated before the post-check rejects the mutation"
         );
         assert!(error.contains("changed after load"), "unexpected: {error}");
+    }
+
+    fn write_native_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], Vec<u8>)]) {
+        let mut header_entries = Vec::new();
+        let mut body = Vec::new();
+        for (name, dtype, shape, payload) in tensors {
+            let start = body.len();
+            body.extend_from_slice(payload);
+            let end = body.len();
+            header_entries.push(format!(
+                "{:?}:{{\"dtype\":{:?},\"shape\":{:?},\"data_offsets\":[{start},{end}]}}",
+                name, dtype, shape
+            ));
+        }
+        let mut header = format!("{{{}}}", header_entries.join(",")).into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + header.len() + body.len());
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&body);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn bf16_le(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    fn native_fixture_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("krea-native-{}-", std::process::id()))
+            .tempdir()
+            .unwrap()
+    }
+
+    /// sc-20634: a dense bf16 native file is consumed through the mapped logical-weight reader and
+    /// the registered dense-bf16 codec — keys arrive canonical, the adapter's modulation reshape is
+    /// part of the logical form, and the receipt reports what the codec left resident, measured
+    /// from the arrays (dense bf16 ⇒ exactly the source bytes).
+    #[test]
+    fn dense_native_file_reads_through_the_logical_codec_seam_and_reports_residency() {
+        let dir = native_fixture_dir();
+        let source = dir.path().join("dense-native.safetensors");
+        write_native_safetensors(
+            &source,
+            &[
+                (
+                    "model.diffusion_model.first.weight",
+                    "BF16",
+                    &[2],
+                    bf16_le(&[0.25, -2.0]),
+                ),
+                (
+                    "model.diffusion_model.first.bias",
+                    "BF16",
+                    &[2],
+                    bf16_le(&[1.0, 0.5]),
+                ),
+                (
+                    "model.diffusion_model.blocks.0.mod.lin",
+                    "BF16",
+                    &[12],
+                    bf16_le(&[1.0; 12]),
+                ),
+            ],
+        );
+        reset_native_file_receipt();
+        let normalized = normalized_native_weights(&source).unwrap();
+        let mut keys: Vec<&str> = normalized.keys().collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "img_in.bias",
+                "img_in.weight",
+                "transformer_blocks.0.scale_shift_table"
+            ]
+        );
+        assert_eq!(
+            normalized
+                .require("transformer_blocks.0.scale_shift_table")
+                .unwrap()
+                .shape(),
+            [6, 2],
+            "the adapter-owned flat→[6, hidden] reshape is applied inside the logical form"
+        );
+        let weight =
+            mlx_gen::weights::to_f32(normalized.require("img_in.weight").unwrap()).unwrap();
+        assert_eq!(weight.as_slice::<f32>(), [0.25, -2.0]);
+
+        let receipt = last_native_file_receipt().expect("the dense path records its receipt");
+        assert_eq!(
+            receipt.mapping_id,
+            crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(receipt.tensor_count, 3);
+        assert_eq!(receipt.source_bytes, 4 + 4 + 24);
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(receipt.residency.len(), 1);
+        assert_eq!(receipt.residency[0].codec_id, "dense-bf16-v1");
+        assert_eq!(receipt.residency[0].tensor_count, 3);
+        let measured: usize = normalized
+            .keys()
+            .map(|key| normalized.get(key).unwrap().nbytes())
+            .sum();
+        assert_eq!(receipt.residency[0].resident_bytes, measured as u64);
+        assert_eq!(receipt.resident_bytes(), 32);
+
+        // The deferred (block-stream / bounded) entry keeps payloads lazy and says so.
+        reset_native_file_receipt();
+        let lazy = normalized_native_weights_lazy(&source).unwrap();
+        assert_eq!(
+            lazy.require("transformer_blocks.0.scale_shift_table")
+                .unwrap()
+                .shape(),
+            [6, 2]
+        );
+        let receipt = last_native_file_receipt().expect("the deferred path records its receipt");
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        assert!(receipt.residency.is_empty());
+    }
+
+    /// sc-20634: an encoding with no registered codec (here fp8) refuses from the header — before
+    /// any MLX array exists — naming the exact tensor; a plain-int8 descriptor file still takes its
+    /// bespoke dequantization arm (sc-20385 owns moving that onto a codec).
+    #[test]
+    fn unregistered_encoding_refuses_from_the_header_and_descriptor_files_keep_their_arm() {
+        let dir = native_fixture_dir();
+        let fp8 = dir.path().join("fp8-native.safetensors");
+        write_native_safetensors(
+            &fp8,
+            &[
+                (
+                    "model.diffusion_model.first.weight",
+                    "BF16",
+                    &[1],
+                    bf16_le(&[0.25]),
+                ),
+                (
+                    "model.diffusion_model.first.bias",
+                    "F8_E4M3",
+                    &[2],
+                    vec![0x38, 0x40],
+                ),
+            ],
+        );
+        reset_native_file_receipt();
+        let error = normalized_native_weights(&fp8)
+            .err()
+            .expect("fp8 must refuse")
+            .to_string();
+        assert!(
+            error.contains("\"model.diffusion_model.first.bias\"")
+                && error.contains("fp8-e4m3")
+                && error.contains("no checkpoint codec is registered"),
+            "{error}"
+        );
+        assert!(
+            last_native_file_receipt().is_none(),
+            "a refused plan must not leave a receipt behind"
+        );
+
+        let foreign = dir.path().join("foreign-native.safetensors");
+        write_native_safetensors(
+            &foreign,
+            &[(
+                "model.diffusion_model.unknown.weight",
+                "BF16",
+                &[1],
+                bf16_le(&[0.25]),
+            )],
+        );
+        let error = normalized_native_weights(&foreign)
+            .err()
+            .expect("foreign key must refuse")
+            .to_string();
+        assert!(
+            error.contains("\"model.diffusion_model.unknown.weight\"")
+                && error.contains("no canonical logical key"),
+            "{error}"
+        );
+
+        // Plain int8 descriptor convention: header says I8 + `.comfy_quant` ⇒ bespoke arm, which
+        // dequantizes to dense bf16 through the same remap; no receipt is recorded for it.
+        let int8 = dir.path().join("int8-native.safetensors");
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#;
+        write_native_safetensors(
+            &int8,
+            &[
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight",
+                    "I8",
+                    &[1, 2],
+                    vec![2, 0xFE],
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                    "F32",
+                    &[1],
+                    0.5_f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+        reset_native_file_receipt();
+        let dequantized = normalized_native_weights(&int8).unwrap();
+        let projection = mlx_gen::weights::to_f32(
+            dequantized
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projection.as_slice::<f32>(), [1.0, -1.0]);
+        assert!(
+            last_native_file_receipt().is_none(),
+            "the descriptor arm is not the codec seam yet and must not claim a codec receipt"
+        );
+    }
+
+    /// Real-weight check of the dense walking-skeleton input (sc-20634): the community
+    /// `kreamania_variant5` DiT plans entirely onto the dense-bf16 codec through the Krea native
+    /// mapping (430 tensors, every byte of the data region accounted for) and its deferred read
+    /// goes through the codec seam with a recorded receipt. Header-only plus a lazy open: no GPU
+    /// render. `KREA_NATIVE_DIT` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT to a dense bf16 ComfyUI Krea 2 DiT"]
+    fn variant5_plans_as_dense_bf16_through_the_codec_seam() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT") else {
+            panic!("set KREA_NATIVE_DIT to a dense bf16 ComfyUI Krea 2 single-file DiT");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        assert!(
+            !native_file_carries_plain_int8_convention(&dit).unwrap(),
+            "expected a dense file, not the plain-int8 descriptor convention"
+        );
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping,
+        )
+        .expect("variant5 plans through the Krea native mapping");
+        // variant5 is 415 bf16 + 15 f32 tensors (in/out projections and biases): both dense rows.
+        assert_eq!(plan.codec_ids(), ["dense-bf16-v1", "dense-f32-v1"]);
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        assert_eq!(plan.tensor_count(), headers.len());
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared);
+        let mut file = std::fs::File::open(&dit).unwrap();
+        let mut prefix = [0_u8; 8];
+        std::io::Read::read_exact(&mut file, &mut prefix).unwrap();
+        let header_len = u64::from_le_bytes(prefix);
+        let file_len = std::fs::metadata(&dit).unwrap().len();
+        assert_eq!(
+            plan.source_bytes,
+            file_len - 8 - header_len,
+            "every byte of the data region is planned"
+        );
+        assert!(plan
+            .logical_keys()
+            .any(|key| key == "transformer_blocks.0.attn.to_q.weight"));
+
+        reset_native_file_receipt();
+        let lazy = normalized_native_weights_lazy(&dit).expect("deferred read through the seam");
+        assert!(lazy.get("img_in.weight").is_some());
+        let receipt = last_native_file_receipt().expect("receipt recorded");
+        assert_eq!(
+            receipt.mapping_id,
+            crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(receipt.tensor_count, headers.len());
+        assert_eq!(receipt.source_bytes, declared);
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT variant5 tensors={} source_bytes={} codecs={:?}",
+            receipt.tensor_count,
+            receipt.source_bytes,
+            plan.codec_ids()
+        );
     }
 
     #[test]

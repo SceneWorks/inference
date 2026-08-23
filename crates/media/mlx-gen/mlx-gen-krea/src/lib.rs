@@ -71,7 +71,10 @@ pub use block_stream::{
 };
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
-pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
+pub use loader::{
+    last_native_file_receipt, load_text_encoder, load_transformer,
+    load_transformer_from_native_file, reset_native_file_receipt,
+};
 pub use memory::{control_geometry_fits, require_control_geometry};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_from_native_dit_file, load_raw,
@@ -86,7 +89,9 @@ pub use multiphase::{
     resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
     ResolvedPhaseAdapter,
 };
-pub use native_remap::{native_dit_key_to_diffusers, remap_native_dit_to_diffusers};
+pub use native_remap::{
+    native_dit_key_to_diffusers, remap_native_dit_to_diffusers, KreaNativeToDiffusersMapping,
+};
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};

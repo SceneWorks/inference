@@ -5,6 +5,7 @@
 use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
+use crate::checkpoint_codec::{CheckpointCodecRegistration, CheckpointCodecRegistry};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor, StepSupport};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::memory_strategy::{
@@ -1150,6 +1151,7 @@ pub struct AudioEmbedderRegistration {
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
     checkpoint_adapters: Vec<CheckpointAdapterRegistration>,
+    checkpoint_codecs: Vec<CheckpointCodecRegistration>,
     encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
@@ -1606,6 +1608,15 @@ impl ProviderRegistryBuilder {
         checkpoint_adapters,
         CheckpointAdapterRegistration
     );
+    /// Register one portable checkpoint codec row. Codecs are engine-level: a platform catalog
+    /// registers its backend's baseline table exactly once, and a family adapter never carries a
+    /// codec table of its own. `build` refuses duplicate ids and two codecs claiming one stored
+    /// encoding, so a composed catalog that registers the same row twice fails closed instead of
+    /// silently shipping duplicate rows.
+    pub fn register_checkpoint_codec(mut self, registration: CheckpointCodecRegistration) -> Self {
+        self.checkpoint_codecs.push(registration);
+        self
+    }
     builder_registration_method!(
         register_encoder_contract_route,
         encoder_contract_routes,
@@ -1917,10 +1928,13 @@ impl ProviderRegistryBuilder {
         ensure_unique!(text_embedders, "text embedder");
         ensure_unique!(voice_embedders, "voice embedder");
         ensure_unique!(audio_embedders, "audio embedder");
+        let checkpoint_codecs =
+            CheckpointCodecRegistry::new(self.checkpoint_codecs.iter().copied())?;
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
             checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
+            checkpoint_codecs,
             imported_models: imported_models.into_boxed_slice(),
             encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
@@ -1950,6 +1964,7 @@ impl ProviderRegistryBuilder {
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
     checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
+    checkpoint_codecs: CheckpointCodecRegistry,
     imported_models: Box<[ImportedModelRegistration]>,
     encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
@@ -2002,6 +2017,11 @@ impl ProviderRegistry {
         &self,
     ) -> impl ExactSizeIterator<Item = &CheckpointAdapterRegistration> {
         self.checkpoint_adapters.iter()
+    }
+
+    /// The validated codec table this platform catalog registered (engine-level, registered once).
+    pub fn checkpoint_codecs(&self) -> &CheckpointCodecRegistry {
+        &self.checkpoint_codecs
     }
 
     /// Check that two platform catalogs agree on the stable family/adapter-id mapping and portable
@@ -4346,6 +4366,57 @@ mod tests {
             error.to_string(),
             "duplicate generator id 'dummy_test_model' in explicit registry"
         );
+    }
+
+    #[test]
+    fn checkpoint_codecs_register_once_per_catalog_and_duplicate_rows_fail_closed() {
+        use crate::checkpoint_codec::{WeightEncoding, DENSE_BF16_CODEC};
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .build()
+            .expect("one baseline codec row builds");
+        assert_eq!(
+            registry
+                .checkpoint_codecs()
+                .codecs()
+                .copied()
+                .collect::<Vec<_>>(),
+            [DENSE_BF16_CODEC]
+        );
+        assert_eq!(
+            registry
+                .checkpoint_codecs()
+                .for_encoding(WeightEncoding::DenseBf16),
+            Some(&DENSE_BF16_CODEC)
+        );
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(WeightEncoding::Fp8E4M3)
+            .is_none());
+
+        // A composed catalog that registers the same portable row twice (the withdrawn sc-20638
+        // draft's duplicate codec-suite rows) is refused at build, not deduplicated silently.
+        let duplicated = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .build();
+        assert!(
+            duplicated
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("duplicate checkpoint codec id")),
+            "duplicate codec rows must fail the build: {:?}",
+            duplicated.as_ref().err().map(ToString::to_string)
+        );
+
+        let empty = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .expect("a catalog without codecs still builds");
+        assert!(empty.checkpoint_codecs().is_empty());
     }
 
     #[test]
