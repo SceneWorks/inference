@@ -11,10 +11,11 @@ use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryWindowMaterialization, Precision, Quant, WeightsSource,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization, Precision,
+    Quant, TransformerComponent, WeightsSource,
 };
 #[cfg(feature = "cuda")]
 use candle_gen::gen_core::{
@@ -24,6 +25,7 @@ use candle_gen::gen_core::{
 use sha2::{Digest, Sha256};
 
 use crate::config::{Ideogram4DitConfig, MODEL_ID, MODEL_ID_TURBO, TURBO_LORA_FILE};
+use candle_gen::gen_core::Conditioning;
 
 pub const PACKED_REPOSITORY: &str = "ideogram-4-mlx";
 pub const PACKED_REVISION: &str = "a3095855b8819dc0d6b067cb1354aaa7da189ff8";
@@ -41,6 +43,11 @@ pub const PUBLIC_GEOMETRIES: &[(u32, u32)] = &[
 const USER_ADAPTER_PREFIX: &str = "ideogram.adapters.ordered-additive.sha256:";
 const TURBO_ADAPTER_PREFIX: &str = "ideogram.turbo-time.sha256:";
 const PID_PREFIX: &str = "ideogram.pid.flux2.sha256:";
+pub const PHYSICAL_RECEIPT_PREFIX: &str = "ideogram.physical.sha256:";
+pub const DECODE_TILE_EDGE: u32 = 512;
+pub const DECODE_OVERLAP: u32 = 64;
+pub const ATTENTION_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+pub const TRANSFORMER_WINDOW_SIZE: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RouteIdentity {
@@ -141,6 +148,7 @@ pub(crate) struct ComponentBytes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IdeogramLoadReceipt {
     pub route: RouteIdentity,
+    pub lexical_root: PathBuf,
     pub canonical_root: PathBuf,
     inventory: Vec<(PathBuf, gen_core::PinnedWeightsFile, [u8; 32])>,
     pub transformer: Vec<FileReceipt>,
@@ -217,7 +225,7 @@ impl IdeogramLoadReceipt {
         }
         let transformer = capture_component(spec, &transformer_paths, route.tier, false)?;
         let unconditional_transformer = capture_component(spec, &uncond_paths, route.tier, false)?;
-        let text_encoder = capture_component(spec, &text_paths, route.tier, false)?;
+        let text_encoder = capture_component(spec, &text_paths, route.tier, true)?;
         let vae = vae_paths
             .iter()
             .map(|path| FileReceipt::capture(spec, path, f32_projection))
@@ -256,6 +264,7 @@ impl IdeogramLoadReceipt {
         }
         let receipt = Self {
             route,
+            lexical_root,
             canonical_root,
             inventory,
             transformer,
@@ -362,12 +371,46 @@ impl IdeogramLoadReceipt {
     fn pid_identity(&self) -> Option<String> {
         self.pid.as_ref().map(|pid| {
             digest_identity(PID_PREFIX, |digest| {
+                update_framed(digest, b"SceneWorks/pid-flux2");
+                update_framed(digest, PID_FLUX2_REVISION.as_bytes());
                 update_framed(digest, &pid.student.sha256);
+                update_framed(digest, b"SceneWorks/gemma-2-2b-it");
+                update_framed(digest, PID_GEMMA_REVISION.as_bytes());
                 for file in &pid.gemma {
                     update_framed(digest, &file.sha256);
                 }
                 update_framed(digest, &pid.materialized_bytes.to_le_bytes());
             })
+        })
+    }
+
+    pub(crate) fn physical_identity(&self) -> String {
+        digest_identity(PHYSICAL_RECEIPT_PREFIX, |digest| {
+            update_framed(digest, self.route.provider.as_bytes());
+            update_framed(digest, self.route.repository.as_bytes());
+            update_framed(digest, self.route.revision.as_bytes());
+            update_framed(
+                digest,
+                match self.route.tier {
+                    Some(Quant::Q4) => b"q4",
+                    Some(Quant::Q8) => b"q8",
+                    Some(Quant::Nvfp4) => b"nvfp4",
+                    None => b"bf16",
+                },
+            );
+            for (path, _, sha256) in &self.inventory {
+                let relative = path.strip_prefix(&self.lexical_root).unwrap_or(path);
+                update_framed(digest, relative.as_os_str().as_encoded_bytes());
+                update_framed(digest, sha256);
+            }
+            for bytes in [
+                self.components.text_encoder,
+                self.components.conditional_transformer,
+                self.components.unconditional_transformer,
+                self.components.vae,
+            ] {
+                update_framed(digest, &bytes.to_le_bytes());
+            }
         })
     }
 }
@@ -572,6 +615,19 @@ fn route_identity(provider_id: &str, root: &Path) -> gen_core::Result<RouteIdent
 }
 
 fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Result<()> {
+    validate_snapshot_path(root, route)?;
+    let canonical = std::fs::canonicalize(root).map_err(|error| {
+        gen_core::Error::Unsupported(format!(
+            "{}: cannot resolve canonical snapshot root {}: {error}",
+            route.provider,
+            root.display()
+        ))
+    })?;
+    validate_snapshot_path(&canonical, route)?;
+    Ok(())
+}
+
+fn validate_snapshot_path(root: &Path, route: RouteIdentity) -> gen_core::Result<()> {
     let hf = format!("models--SceneWorks--{}", route.repository);
     let app = format!("SceneWorks__{}", route.repository);
     let tier = root
@@ -587,7 +643,11 @@ fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Res
         vec![app, route.revision.into(), tier.into()],
         vec![route.repository.into(), route.revision.into(), tier.into()],
     ];
-    if !suffixes.iter().any(|suffix| components.ends_with(suffix)) {
+    let Some(identity_depth) = suffixes
+        .iter()
+        .find(|suffix| components.ends_with(suffix))
+        .map(Vec::len)
+    else {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: weights path {} crosses SceneWorks/{}@{}",
             route.provider,
@@ -595,6 +655,20 @@ fn validate_snapshot_binding(root: &Path, route: RouteIdentity) -> gen_core::Res
             route.repository,
             route.revision
         )));
+    };
+    let mut identity_component = root;
+    for _ in 0..identity_depth {
+        if std::fs::symlink_metadata(identity_component)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: snapshot identity component {} is a symlink; exact repository/revision/tier provenance must be canonical",
+                route.provider,
+                identity_component.display()
+            )));
+        }
+        identity_component = identity_component.parent().unwrap_or(identity_component);
     }
     Ok(())
 }
@@ -715,7 +789,7 @@ fn capture_component(
     spec: &LoadSpec,
     paths: &[PathBuf],
     tier: Option<Quant>,
-    f32_dense: bool,
+    text_encoder: bool,
 ) -> gen_core::Result<Vec<FileReceipt>> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -765,7 +839,16 @@ fn capture_component(
                         "ideogram: unrecognized packed U32 tensor".into(),
                     ));
                 }
-                header.materialized_bytes(if f32_dense { 4 } else { 2 })
+                let f32_normalization = text_encoder
+                    && [
+                        "input_layernorm.weight",
+                        "post_attention_layernorm.weight",
+                        "q_norm.weight",
+                        "k_norm.weight",
+                    ]
+                    .iter()
+                    .any(|suffix| header.name.ends_with(suffix));
+                header.materialized_bytes(if f32_normalization { 4 } else { 2 })
             })
         })
         .collect()
@@ -844,6 +927,18 @@ fn path_has_identity(path: &Path, repo: &str, revision: &str, trailing: &[&str])
     suffixes.iter().any(|suffix| parts.ends_with(suffix))
 }
 
+fn canonical_parent_has_identity(path: &Path, repo: &str, revision: &str) -> bool {
+    path.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .is_some_and(|parent| path_has_identity(&parent, repo, revision, &[]))
+}
+
+fn canonical_dir_has_identity(path: &Path, repo: &str, revision: &str) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| path_has_identity(&canonical, repo, revision, &[]))
+}
+
 fn capture_pid(spec: &LoadSpec) -> gen_core::Result<Option<PidReceipt>> {
     let Some(pid) = &spec.pid else {
         return Ok(None);
@@ -868,7 +963,9 @@ fn capture_pid(spec: &LoadSpec) -> gen_core::Result<Option<PidReceipt>> {
             | "pid_flux2_2kto4k.safetensors"
             | "pid_flux2_2kto4k_v1pt5.safetensors"
     ) || !path_has_identity(student_path, "pid-flux2", PID_FLUX2_REVISION, &[name])
+        || !canonical_parent_has_identity(student_path, "pid-flux2", PID_FLUX2_REVISION)
         || !path_has_identity(gemma_dir, "gemma-2-2b-it", PID_GEMMA_REVISION, &[])
+        || !canonical_dir_has_identity(gemma_dir, "gemma-2-2b-it", PID_GEMMA_REVISION)
     {
         return Err(gen_core::Error::Unsupported(
             "ideogram: crossed PiD Flux2/Gemma identity".into(),
@@ -915,7 +1012,16 @@ pub(crate) fn contract_from_receipt(
     spec: &LoadSpec,
     receipt: &IdeogramLoadReceipt,
 ) -> MemoryProviderContract {
-    let mut resident_components = Vec::new();
+    let mut resident_components = vec![MemoryResidentComponent {
+        id: receipt.physical_identity(),
+        kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+        resident_bytes: receipt
+            .components
+            .conditional_transformer
+            .saturating_add(receipt.components.unconditional_transformer),
+        bounded_by: Some(MemoryStrategy::BoundedTransformerResidency),
+        residency: MemoryComponentResidency::WholeRender,
+    }];
     if let Some(file) = &receipt.turbo_adapter {
         resident_components.push(MemoryResidentComponent {
             id: receipt
@@ -1052,43 +1158,76 @@ fn build_contract(
         .map(|strategy| MemoryStrategyCapability {
             strategy,
             support: match strategy {
-                MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
-                    MemoryStrategySupport::Implemented
-                }
-                MemoryStrategy::BoundedDecode
+                MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
                 | MemoryStrategy::BoundedAttention
-                | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
+                | MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Implemented,
             },
-            parameters: MemoryParameterRanges::default(),
+            parameters: match strategy {
+                MemoryStrategy::BoundedDecode => MemoryParameterRanges {
+                    decode_tile_edges: vec![DECODE_TILE_EDGE],
+                    decode_overlaps: vec![DECODE_OVERLAP],
+                    ..Default::default()
+                },
+                MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                    attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
+                    ..Default::default()
+                },
+                MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
+                    transformer_window_sizes: vec![TRANSFORMER_WINDOW_SIZE],
+                    transformer_window_components: vec![TransformerComponent::Dit],
+                    ..Default::default()
+                },
+                _ => MemoryParameterRanges::default(),
+            },
         })
         .collect();
     let transformer_bytes = components
         .conditional_transformer
         .saturating_add(components.unconditional_transformer);
-    let overlay_bytes = resident_components.iter().fold(0_u64, |total, component| {
-        total.saturating_add(component.resident_bytes)
-    });
+    let overlay_bytes = resident_components
+        .iter()
+        .filter(|component| component.kind.is_auxiliary())
+        .fold(0_u64, |total, component| {
+            total.saturating_add(component.resident_bytes)
+        });
     MemoryProviderContract {
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
-            host_to_device_block_materialization: false,
+            host_to_device_block_materialization: true,
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies,
         decode_geometry_policy_authoritative: false,
         pid_decode_routes: None,
         load_shape: spec.load_shape,
-        additional_prerequisites: Vec::new(),
+        additional_prerequisites: [
+            MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
+            MemoryStrategy::BoundedTransformerResidency,
+        ]
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
+                MemoryStrategyPrerequisite::Rung {
+                    rung: MemoryStrategy::StagedResidency,
+                    scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+                },
+            )
+        })
+        .collect(),
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
             phases: phases.clone(),
             synchronized_phase_release: true,
-            decode_tiling: false,
-            attention_chunking: false,
-            transformer_window_materialization: false,
+            decode_tiling: true,
+            attention_chunking: true,
+            transformer_window_materialization: true,
         },
         formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases,
@@ -1098,6 +1237,9 @@ fn build_contract(
                 MemoryFormulaVariable::BatchCount,
                 MemoryFormulaVariable::ConditioningTokenCount,
                 MemoryFormulaVariable::OverlayBytes,
+                MemoryFormulaVariable::DecodeTileArea,
+                MemoryFormulaVariable::AttentionChunkSize,
+                MemoryFormulaVariable::TransformerWindowSize,
             ],
             resident_components: resident_components.clone(),
         },
@@ -1196,7 +1338,9 @@ fn validate_route(
     let has_pid_receipt = identities
         .iter()
         .any(|identity| identity.starts_with(PID_PREFIX));
-    if context.use_pid != has_pid_receipt {
+    let native_hires_over_pid_load =
+        context.mode == MemoryMode::ImageToImage && !context.use_pid && has_pid_receipt;
+    if context.use_pid != has_pid_receipt && !native_hires_over_pid_load {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: native/PiD request crosses its sealed decoder receipt"
         )));
@@ -1230,7 +1374,15 @@ pub(crate) fn validate_context(
     ) {
         return Err(gen_core::Error::Unsupported(reason));
     }
-    validate_route(provider_id, contract, context)
+    validate_route(provider_id, contract, context)?;
+    if context.use_pid
+        && contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: PiD has no admitted bounded native-VAE decode plan"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn registered_safety_check(
@@ -1306,11 +1458,54 @@ struct RequestBinding {
     scheduler: Option<String>,
     shift_bits: Option<u32>,
     preview_active: bool,
+    carrier: IdeogramCarrier,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdeogramCarrier {
+    PromptOnly,
+    Reference,
+    ReferenceAndMask,
+}
+
+fn request_carrier(request: &GenerationRequest) -> gen_core::Result<IdeogramCarrier> {
+    let mut references = 0_u32;
+    let mut masks = 0_u32;
+    for conditioning in &request.conditioning {
+        match conditioning {
+            Conditioning::Reference { .. } => references += 1,
+            Conditioning::Mask { .. } => masks += 1,
+            _ => {
+                return Err(gen_core::Error::Unsupported(
+                    "ideogram: admitted request contains a non-Reference/Mask carrier".into(),
+                ))
+            }
+        }
+    }
+    match (references, masks) {
+        (0, 0) => Ok(IdeogramCarrier::PromptOnly),
+        (1, 0) => Ok(IdeogramCarrier::Reference),
+        (1, 1) => Ok(IdeogramCarrier::ReferenceAndMask),
+        _ => Err(gen_core::Error::Unsupported(format!(
+            "ideogram: exact carrier requires none, one Reference, or Reference+Mask; got {references} Reference and {masks} Mask"
+        ))),
+    }
+}
+
+fn carrier_matches_context(carrier: IdeogramCarrier, context: &MemoryRunContext) -> bool {
+    matches!(
+        (&context.mode, context.geometry.reference_count, carrier),
+        (MemoryMode::TextToImage, 0, IdeogramCarrier::PromptOnly)
+            | (MemoryMode::TextToImage, 1, IdeogramCarrier::Reference)
+            | (MemoryMode::Edit, 1, IdeogramCarrier::Reference)
+            | (MemoryMode::Edit, 2, IdeogramCarrier::ReferenceAndMask)
+            | (MemoryMode::ImageToImage, 1, IdeogramCarrier::Reference)
+    )
 }
 
 impl RequestBinding {
-    fn from_request(request: &GenerationRequest) -> Self {
-        Self {
+    fn from_request(request: &GenerationRequest) -> gen_core::Result<Self> {
+        Ok(Self {
             address: std::ptr::from_ref(request).addr(),
             geometry: MemoryGeometry {
                 width: request.width,
@@ -1333,7 +1528,8 @@ impl RequestBinding {
             scheduler: request.scheduler.clone(),
             shift_bits: request.scheduler_shift.map(f32::to_bits),
             preview_active: request.preview.is_active(),
-        }
+            carrier: request_carrier(request)?,
+        })
     }
 }
 
@@ -1426,12 +1622,15 @@ impl AdmissionRegistry {
                 self.provider_id
             ))
         })?;
-        let binding = RequestBinding::from_request(request);
+        let binding = RequestBinding::from_request(request)?;
         if active.token != token
             || active.binding.is_some()
             || active.consumed
             || binding.geometry != active.context.geometry
             || binding.memory != active.expected_memory
+            || binding.use_pid != active.context.use_pid
+            || binding.has_phases != active.context.has_phases
+            || !carrier_matches_context(binding.carrier, &active.context)
         {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: stale or changed admitted request",
@@ -1457,7 +1656,7 @@ impl AdmissionRegistry {
                 Ok(())
             };
         };
-        if active.binding.as_ref() != Some(&RequestBinding::from_request(request))
+        if active.binding.as_ref() != Some(&RequestBinding::from_request(request)?)
             || active.consumed
         {
             return Err(gen_core::Error::Unsupported(format!(
@@ -1575,19 +1774,32 @@ fn request_scope(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<candle_gen::request_scope::CandleRequestScopeCore> {
-    let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+    let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
         provider_id,
         device,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
         Ideogram4DitConfig::v4().num_layers,
-        move |_use_pid, _edge, _overlap| {
-            Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: bounded raw-latent decode is Missing"
-            )))
+        move |use_pid, edge, overlap| {
+            if !use_pid && edge == DECODE_TILE_EDGE && overlap == DECODE_OVERLAP {
+                Ok(())
+            } else {
+                Err(gen_core::Error::Unsupported(format!(
+                    "{provider_id}: native bounded decode requires {DECODE_TILE_EDGE}/{DECODE_OVERLAP} and is unavailable for PiD"
+                )))
+            }
         },
     )?;
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
+        config.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE);
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        config.transformer_window = Some(TRANSFORMER_WINDOW_SIZE);
+    }
     Ok(candle_gen::request_scope::CandleRequestScopeCore::new(
         config,
     ))
@@ -1737,6 +1949,11 @@ mod tests {
     }
 
     fn component(path: &Path, tier: &str, prefix: &str) {
+        let norm = if prefix == "text" {
+            "language_model.layers.0.input_layernorm.weight".to_owned()
+        } else {
+            format!("{prefix}.norm.weight")
+        };
         match tier {
             "q4" | "q8" => {
                 let bits = if tier == "q4" { 4 } else { 8 };
@@ -1762,12 +1979,7 @@ mod tests {
                             &[2, 1],
                             4,
                         ),
-                        (
-                            Box::leak(format!("{prefix}.norm.weight").into_boxed_str()),
-                            "BF16",
-                            &[2],
-                            4,
-                        ),
+                        (Box::leak(norm.clone().into_boxed_str()), "BF16", &[2], 4),
                     ],
                 );
             }
@@ -1780,12 +1992,7 @@ mod tests {
                         &[2, 64],
                         256,
                     ),
-                    (
-                        Box::leak(format!("{prefix}.norm.weight").into_boxed_str()),
-                        "BF16",
-                        &[2],
-                        4,
-                    ),
+                    (Box::leak(norm.into_boxed_str()), "BF16", &[2], 4),
                 ],
             ),
             _ => unreachable!(),
@@ -1956,6 +2163,7 @@ mod tests {
         );
         let receipt =
             IdeogramLoadReceipt::capture(MODEL_ID, &spec(root.clone(), MODEL_ID)).unwrap();
+        let original_identity = receipt.physical_identity();
         std::fs::write(root.join("transformer/nested/note.txt"), b"ignored too").unwrap();
         receipt.ensure_unchanged().unwrap();
 
@@ -1964,6 +2172,9 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 0x5a;
         std::fs::write(&path, bytes).unwrap();
         assert!(receipt.ensure_unchanged().is_err());
+        let replacement =
+            IdeogramLoadReceipt::capture(MODEL_ID, &spec(root.clone(), MODEL_ID)).unwrap();
+        assert_ne!(replacement.physical_identity(), original_identity);
 
         let tmp = tempfile::tempdir().unwrap();
         let root = fixture_root(tmp.path(), MODEL_ID, "bf16");
@@ -1996,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_public_modes_geometries_overlays_and_missing_rungs_fail_closed() {
+    fn exact_public_modes_geometries_overlays_and_all_rungs_fail_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = fixture_root(tmp.path(), MODEL_ID_TURBO, "q4");
         let load = spec(root, MODEL_ID_TURBO);
@@ -2047,16 +2258,170 @@ mod tests {
         assert!(
             validate_context(MODEL_ID_TURBO, &contract, &crossed_overlay, Some(Quant::Q4)).is_err()
         );
-        for missing in [
+        for implemented in [
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
             MemoryStrategy::BoundedTransformerResidency,
         ] {
             assert_eq!(
-                contract.capability(missing).unwrap().support,
-                MemoryStrategySupport::Missing
+                contract.capability(implemented).unwrap().support,
+                MemoryStrategySupport::Implemented
             );
         }
+        assert!(contract.lifecycle.decode_tiling);
+        assert!(contract.lifecycle.attention_chunking);
+        assert!(contract.lifecycle.transformer_window_materialization);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            vec![DECODE_TILE_EDGE]
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .parameters
+                .attention_chunk_sizes,
+            vec![ATTENTION_CHUNK_SIZE]
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_sizes,
+            vec![TRANSFORMER_WINDOW_SIZE]
+        );
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::BoundedTransformerResidency,
+            parameters: MemoryStrategyParameters {
+                decode_tile_edge: Some(DECODE_TILE_EDGE),
+                decode_overlap: Some(DECODE_OVERLAP),
+                attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
+                transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+                transformer_window_component: Some(TransformerComponent::Dit),
+            },
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+        };
+        let memory = contract
+            .generation_memory(&selection)
+            .expect("bounded transformer execution controls");
+        assert!(memory.stage_residency && memory.tile_vae_decode);
+        assert!(memory.chunk_attention && memory.stream_transformer_blocks);
+        assert_eq!(memory.decode_tile_edge, Some(DECODE_TILE_EDGE));
+        assert_eq!(memory.decode_overlap, Some(DECODE_OVERLAP));
+        assert_eq!(memory.attention_chunk_size, Some(ATTENTION_CHUNK_SIZE));
+        assert_eq!(
+            memory.transformer_window_size,
+            Some(TRANSFORMER_WINDOW_SIZE)
+        );
+        assert_eq!(
+            memory.transformer_window_component,
+            Some(TransformerComponent::Dit)
+        );
+    }
+
+    #[test]
+    fn f32_text_normalization_is_accounted_at_execution_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fixture_root(tmp.path(), MODEL_ID_TURBO, "bf16");
+        let receipt =
+            IdeogramLoadReceipt::capture(MODEL_ID_TURBO, &spec(root, MODEL_ID_TURBO)).unwrap();
+        // Dense projection: 2x64 bf16 = 256 B. The RMSNorm is loaded by `rms_norm_f32`, so its
+        // two elements occupy 8 B rather than the four container bytes.
+        assert_eq!(receipt.components.text_encoder, 264);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_snapshot_and_pid_provenance_reject_exact_looking_symlink_roots() {
+        use std::os::unix::fs::symlink;
+
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            let tmp = tempfile::tempdir().unwrap();
+            let foreign = fixture_root(&tmp.path().join("foreign"), provider, "q4");
+            let lexical = tmp
+                .path()
+                .join(format!("models--SceneWorks--{PACKED_REPOSITORY}"))
+                .join("snapshots")
+                .join(PACKED_REVISION)
+                .join("q4");
+            std::fs::create_dir_all(lexical.parent().unwrap()).unwrap();
+            symlink(&foreign, &lexical).unwrap();
+            assert!(IdeogramLoadReceipt::capture(provider, &spec(lexical, provider)).is_err());
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign_student_dir = tmp.path().join("foreign-pid");
+        let foreign_student = foreign_student_dir.join("pid_flux2_2k.safetensors");
+        write_safetensors(&foreign_student, &[("student.weight", "F32", &[2], 8)]);
+        let lexical_student_dir = tmp
+            .path()
+            .join("models--SceneWorks--pid-flux2/snapshots")
+            .join(PID_FLUX2_REVISION);
+        std::fs::create_dir_all(lexical_student_dir.parent().unwrap()).unwrap();
+        symlink(&foreign_student_dir, &lexical_student_dir).unwrap();
+        let gemma = tmp
+            .path()
+            .join("models--SceneWorks--gemma-2-2b-it/snapshots")
+            .join(PID_GEMMA_REVISION);
+        write_safetensors(
+            &gemma.join("gemma-2-2b-it.safetensors"),
+            &[("gemma.weight", "F32", &[2], 8)],
+        );
+        std::fs::write(gemma.join("tokenizer.json"), b"{}").unwrap();
+        let mut load = spec(fixture_root(tmp.path(), MODEL_ID, "bf16"), MODEL_ID);
+        load.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(lexical_student_dir.join("pid_flux2_2k.safetensors")),
+            gemma: WeightsSource::Dir(gemma),
+        });
+        assert!(capture_pid(&load).is_err());
+    }
+
+    #[test]
+    fn admission_binds_typed_reference_mask_carrier_pid_and_pass_axes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fixture_root(tmp.path(), MODEL_ID, "q4");
+        let load = spec(root, MODEL_ID);
+        let receipt = IdeogramLoadReceipt::capture(MODEL_ID, &load).unwrap();
+        let contract = contract_from_receipt(MODEL_ID, &load, &receipt);
+        let context = context(&contract, MemoryMode::Edit, 2, None, false);
+        let admission = AdmissionRegistry::new(MODEL_ID);
+        admission.approve(&context).unwrap();
+        let mut scope =
+            IdeogramMemoryScope::new_bound(MODEL_ID, Device::Cpu, &contract, &context, admission)
+                .unwrap();
+        let image = gen_core::Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        };
+        let mut crossed = GenerationRequest {
+            prompt: "caption".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: image.clone(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image,
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        crossed.memory = contract.generation_memory(&context.selection);
+        assert!(scope.configure_request(&mut crossed).is_err());
     }
 
     #[test]

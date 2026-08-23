@@ -43,6 +43,7 @@ impl Ideogram4Attention {
         cos: &Tensor,
         sin: &Tensor,
         mask: Option<&Tensor>,
+        attention_budget: usize,
     ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, hd) = (self.num_heads, self.head_dim);
@@ -80,7 +81,7 @@ impl Ideogram4Attention {
             scale,
             mask.as_ref(),
             softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
+            attention_budget,
         )?; // [B,H,L,hd]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o.forward(&o)
@@ -191,6 +192,7 @@ impl Ideogram4Block {
         sin: &Tensor,
         mask: Option<&Tensor>,
         adaln_input: &Tensor,
+        attention_budget: usize,
     ) -> Result<Tensor> {
         let mod_ = self.adaln_modulation.forward(adaln_input)?; // [B,1,4*emb]
         let chunks = mod_.chunk(4, D::Minus1)?;
@@ -200,7 +202,9 @@ impl Ideogram4Block {
         let gate_mlp = chunks[3].contiguous()?.tanh()?;
 
         let normed = rmsnorm(x, &self.attention_norm1, self.eps)?.broadcast_mul(&scale_msa)?;
-        let attn_out = self.attention.forward(&normed, cos, sin, mask)?;
+        let attn_out = self
+            .attention
+            .forward(&normed, cos, sin, mask, attention_budget)?;
         let x =
             (x + rmsnorm(&attn_out, &self.attention_norm2, self.eps)?.broadcast_mul(&gate_msa)?)?;
 

@@ -179,42 +179,68 @@ fn load_denoise_components(
     turbo: bool,
     adapters: &[AdapterSpec],
     device: &Device,
+    memory: gen_core::GenerationMemory,
 ) -> CResult<DenoiseComponents> {
     let dit = Ideogram4DitConfig::v4();
     let cond_w = crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
-    let uncond = if turbo {
-        crate::adapters::install_turbo_lora_additive_with_report(
-            &mut cond,
-            &root.join(TURBO_LORA_FILE),
-            TURBO_LORA_SCALE,
-        )?;
-        candle_gen::quant::install_dotted_adapters(
-            "ideogram turbo",
+    let window = memory.stream_transformer_blocks.then(|| {
+        memory
+            .transformer_window_size
+            .unwrap_or(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE) as usize
+    });
+    let mut cond = if let Some(window) = window {
+        Ideogram4Transformer::load_streamed(
+            cond_w,
+            &dit,
+            window,
+            turbo.then(|| root.join(TURBO_LORA_FILE)).as_deref(),
             adapters,
-            device,
-            |visitor| cond.visit_adaptable_mut(visitor),
-        )?;
+        )?
+    } else {
+        Ideogram4Transformer::load(&cond_w, &dit)?
+    };
+    let uncond = if turbo {
+        if window.is_none() {
+            crate::adapters::install_turbo_lora_additive_with_report(
+                &mut cond,
+                &root.join(TURBO_LORA_FILE),
+                TURBO_LORA_SCALE,
+            )?;
+            candle_gen::quant::install_dotted_adapters(
+                "ideogram turbo",
+                adapters,
+                device,
+                |visitor| cond.visit_adaptable_mut(visitor),
+            )?;
+        }
         None
     } else {
-        candle_gen::quant::install_dotted_adapters(
-            "ideogram quality conditional",
-            adapters,
-            device,
-            |visitor| cond.visit_adaptable_mut(visitor),
-        )?;
+        if window.is_none() {
+            candle_gen::quant::install_dotted_adapters(
+                "ideogram quality conditional",
+                adapters,
+                device,
+                |visitor| cond.visit_adaptable_mut(visitor),
+            )?;
+        }
         let uncond_w = crate::loader::Weights::from_dir(
             &root.join("unconditional_transformer"),
             device,
             DIT_DTYPE,
         )?;
-        let mut uncond = Ideogram4Transformer::load(&uncond_w, &dit)?;
-        candle_gen::quant::install_dotted_adapters(
-            "ideogram quality unconditional",
-            adapters,
-            device,
-            |visitor| uncond.visit_adaptable_mut(visitor),
-        )?;
+        let mut uncond = if let Some(window) = window {
+            Ideogram4Transformer::load_streamed(uncond_w, &dit, window, None, adapters)?
+        } else {
+            Ideogram4Transformer::load(&uncond_w, &dit)?
+        };
+        if window.is_none() {
+            candle_gen::quant::install_dotted_adapters(
+                "ideogram quality unconditional",
+                adapters,
+                device,
+                |visitor| uncond.visit_adaptable_mut(visitor),
+            )?;
+        }
         Some(uncond)
     };
     Ok(DenoiseComponents { cond, uncond, dit })
@@ -544,7 +570,14 @@ pub fn render(
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode(comps, &z, req.width, req.height, pid_decoder.as_ref())
+        decode(
+            comps,
+            &z,
+            req.width,
+            req.height,
+            pid_decoder.as_ref(),
+            req.memory.unwrap_or_default(),
+        )
     })
 }
 
@@ -618,7 +651,13 @@ pub fn render_staged(
 
     candle_gen::check_cancel(&req.cancel)?;
     let denoise_components = SynchronizedPhase::new(
-        load_denoise_components(root, turbo, adapters, device)?,
+        load_denoise_components(
+            root,
+            turbo,
+            adapters,
+            device,
+            req.memory.unwrap_or_default(),
+        )?,
         device.clone(),
         "denoise components",
     );
@@ -693,6 +732,7 @@ pub fn render_staged(
             req.width,
             req.height,
             pid_decoder.as_ref(),
+            req.memory.unwrap_or_default(),
         )?);
     }
     drop(pid_decoder);
@@ -836,6 +876,14 @@ fn denoise(
     // `num_run` — not `steps` — is the total: an edit skips the noisiest leading steps, so a
     // strength-0.5 img2img genuinely runs (and previews) half as many.
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(num_run);
+    let memory = req.memory.unwrap_or_default();
+    let attention_budget = if memory.chunk_attention {
+        memory
+            .attention_chunk_size
+            .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE) as usize
+    } else {
+        candle_gen::ATTN_SCORES_BUDGET
+    };
 
     for i in (0..num_run).rev() {
         if req.cancel.is_cancelled() {
@@ -871,12 +919,23 @@ fn denoise(
             &position_ids,
             &segment_ids,
             &indicator,
+            attention_budget,
+            &req.cancel,
         )?;
         let pos_v = pos_out.narrow(1, num_text, num_img)?; // image-token velocities [1, num_img, ch]
 
         let v = match &neg {
             Some((uncond, neg_pos, neg_seg, neg_ind, neg_llm)) => {
-                let neg_v = uncond.forward(neg_llm, &z, &t, neg_pos, neg_seg, neg_ind)?;
+                let neg_v = uncond.forward(
+                    neg_llm,
+                    &z,
+                    &t,
+                    neg_pos,
+                    neg_seg,
+                    neg_ind,
+                    attention_budget,
+                    &req.cancel,
+                )?;
                 // Per-step asymmetric CFG: the loop runs i = steps-1 → 0, so the final POLISH_STEPS
                 // are i ∈ {0,1,2}.
                 let gw = if i < POLISH_STEPS {
@@ -919,6 +978,7 @@ fn decode(
     width: u32,
     height: u32,
     pid: Option<&PidDecoder>,
+    memory: gen_core::GenerationMemory,
 ) -> CResult<Image> {
     decode_with_vae_and_stats(
         Some(&comps.vae),
@@ -930,6 +990,7 @@ fn decode(
         width,
         height,
         pid,
+        memory,
     )
 }
 
@@ -940,6 +1001,7 @@ fn decode_with_vae_and_stats(
     width: u32,
     height: u32,
     pid: Option<&PidDecoder>,
+    memory: gen_core::GenerationMemory,
 ) -> CResult<Image> {
     let grid_h = (height / PATCH_AE) as usize;
     let grid_w = (width / PATCH_AE) as usize;
@@ -954,9 +1016,23 @@ fn decode_with_vae_and_stats(
             let normed = patched.broadcast_sub(&stats.1)?.broadcast_div(&stats.0)?;
             decoder.decode(&normed)?
         }
-        None => vae
-            .ok_or_else(|| CandleError::Msg("ideogram: native decode missing VAE".into()))?
-            .decode_latent(&latent)?,
+        None => {
+            let vae =
+                vae.ok_or_else(|| CandleError::Msg("ideogram: native decode missing VAE".into()))?;
+            if memory.tile_vae_decode {
+                vae.decode_latent_tiled(
+                    &latent,
+                    memory
+                        .decode_tile_edge
+                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                    memory
+                        .decode_overlap
+                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                )?
+            } else {
+                vae.decode_latent(&latent)?
+            }
+        }
     };
     to_image(&decoded)
 }

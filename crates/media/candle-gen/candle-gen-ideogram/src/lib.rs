@@ -244,12 +244,6 @@ impl Generator for Ideogram4Generator {
             receipt.ensure_unchanged()?;
         }
         let memory = req.memory.unwrap_or_default();
-        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: bounded decode, attention, and transformer residency are Missing",
-                self.descriptor.id
-            )));
-        }
         let images = if memory.stage_residency {
             if let Some(warm) = candle_gen::lock_recover(&self.components).take() {
                 synchronized_release(warm, || self.device.synchronize())
