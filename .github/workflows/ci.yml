@@ -539,6 +539,17 @@ jobs:
       # Cargo config is intentionally overridable so hosted CI exercises the
       # correct non-NAX path; a 26.2+ self-hosted lane is still needed for NAX.
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      # Line tables only, no full DWARF, for every profile this lane builds. Measured 2026-08-23
+      # (run 32630010202): with full debuginfo the broad `--lib --tests` graph alone grew `target/`
+      # to 35 GB, which is what forced the two mid-job `cargo clean`s — and each clean threw away
+      # the restored libmlx.a, so `pmetal-mlx-sys` (≈6 min of cmake on the 3-core hosted M1) was
+      # rebuilt FOUR times in one job, ~24 of its 61 minutes, against 6.7 minutes of actual test
+      # execution. Nothing in CI reads the DWARF; line tables keep panic backtraces addressable.
+      # `test` inherits `dev`, but it is set explicitly so a future `[profile.test]` block cannot
+      # silently re-inflate this lane. Do NOT reintroduce `cargo clean` between the cargo steps:
+      # the `Disk after ...` probes below are the evidence that it is no longer needed.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -559,13 +570,20 @@ jobs:
       #     so the restored ~1.2 GB target/ is kept AND a second generation of artifacts is built on
       #     top of it. Branches whose manifests match `main` get "full match: true" and never build
       #     that second generation, which is why they passed the same day on the same image.
-      # We cannot shrink the second generation without a full rebuild, so reclaim the image payload
-      # instead. This step is diagnostics + deletion only: it never fails the job.
-      - name: Reclaim runner disk
+      # The second generation has since been shrunk (line-tables-only debuginfo, see the job `env`),
+      # but the image payload is still dead weight, so it is still pruned — in the BACKGROUND.
+      # Measured at 3.6 min on the critical path when it ran inline; `sudo rm -rf` of eight Xcode
+      # bundles is pure I/O that overlaps fine with the cache restore and the first cargo build.
+      # Only non-active Xcodes and the Android SDK are removed, so nothing a later step selects
+      # can disappear under it. The log is printed by the final disk probe. This step is
+      # diagnostics + deletion only: it never fails the job.
+      - name: Reclaim runner disk (background)
         run: |
           set +e
           echo "--- disk before reclaim ---"
           df -h /
+          cat > "$RUNNER_TEMP/reclaim-runner-disk.sh" <<'EOS'
+          set +e
           resolve() { ( cd "$1" >/dev/null 2>&1 && pwd -P ); }
           keep="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer.*##')"
           case "$keep" in
@@ -591,6 +609,9 @@ jobs:
           sudo rm -rf "$HOME/Library/Android" "$HOME/.android"
           echo "--- disk after reclaim ---"
           df -h /
+          EOS
+          nohup bash "$RUNNER_TEMP/reclaim-runner-disk.sh" > "$RUNNER_TEMP/reclaim-runner-disk.log" 2>&1 &
+          echo "reclaim running in background (pid $!); log: $RUNNER_TEMP/reclaim-runner-disk.log"
           exit 0
       - name: Ensure Metal compiler
         run: |
@@ -637,11 +658,11 @@ jobs:
           df -h /
           du -sh target 2>/dev/null
           exit 0
-      - name: Reclaim Clippy and rustdoc artifacts before linking MLX tests
-        # The complete all-target Clippy graph plus rustdoc output exhausted the hosted macOS disk
-        # while the broad test graph was linking. Both gates have already succeeded, so rebuild the
-        # narrower lib/test profile from a clean target before the existing post-test reclamation.
-        run: cargo clean
+      # There is deliberately NO `cargo clean` here any more. Until 2026-08-23 one sat between
+      # rustdoc and the test build because the full-debuginfo test graph did not fit next to the
+      # Clippy graph; it also discarded the rust-cache-restored `pmetal-mlx-sys` output, so libmlx
+      # was rebuilt from cmake for the test step. With line-tables-only debuginfo (job `env`) both
+      # graphs fit and the native build is reused.
       # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
       # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
       # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
@@ -669,12 +690,9 @@ jobs:
           du -sh target 2>/dev/null
           du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
           exit 0
-      - name: Reclaim broad MLX test artifacts before bundle profiles
-        # The complete MLX test graph has already passed. Its linked test artifacts do not fit on
-        # the hosted macOS image alongside the separately compiled runtime bundle profiles and the
-        # Candle Metal Clippy graph, so discard them before continuing with those unchanged gates.
-        # This mirrors the hosted Linux lane's post-Clippy reclamation boundary.
-        run: cargo clean
+      # Likewise no `cargo clean` before the bundle profiles (removed 2026-08-23): the bundle
+      # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
+      # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
@@ -698,6 +716,9 @@ jobs:
         if: always()
         run: |
           set +e
+          echo "--- background reclaim log ---"
+          cat "$RUNNER_TEMP/reclaim-runner-disk.log" 2>/dev/null || echo "(no reclaim log)"
+          echo "--- disk ---"
           df -h /
           du -sh target 2>/dev/null
           du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
