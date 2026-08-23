@@ -860,6 +860,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -2197,6 +2198,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.21.4",
 ]
@@ -2548,8 +2550,10 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

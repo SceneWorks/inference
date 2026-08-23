@@ -138,12 +138,16 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
-/// Resolve a provider-owned, load-exact numeric tier for MLX video admission. Packed providers carry
-/// no load-time quant hint, so Krea and Wan must read their immutable snapshot surfaces here.
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Bernini
+/// validates its paired planner/renderer packed manifests and headers; Krea and Wan validate their
+/// immutable packed surfaces. Other routes return `None` rather than synthesizing a tier.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
 ) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    if let Some(tier) = mlx_gen_bernini::resolved_video_memory_numeric_tier(provider_id, spec)? {
+        return Ok(Some(tier));
+    }
     if provider_id == mlx_gen_krea_realtime::MODEL_ID {
         return mlx_gen_krea_realtime::resolved_numeric_tier(spec)
             .map(Some)
@@ -272,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+    fn selected_video_memory_apis_stay_provider_owned() {
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
         for provider in [
             "unknown",
@@ -291,6 +295,7 @@ mod tests {
                 None
             );
         }
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
     }
 
     #[test]
@@ -677,16 +682,16 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 51);
+        assert_eq!(registry.memory_strategy_registrations().len(), 52);
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert_eq!(resident_only, ["krea_realtime_14b"]);
+        assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync, and FLUX.2 Dev Control now has its exact fixture): these
+        // joined them in the sc-17137 sync, and FLUX.2 Dev Control has its exact fixture): these
         // providers publish every tier and materialization selector, even where a provider correctly
         // classifies a strategy as Missing. Two video providers publish narrower, truthful
         // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager

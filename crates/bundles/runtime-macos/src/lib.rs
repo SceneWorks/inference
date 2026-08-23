@@ -167,6 +167,7 @@ mod tests {
             super::selected_video_decode_memory_profile("unknown", 480, 480, 1, 448, 64).unwrap(),
             None
         );
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
     }
 
     #[cfg(feature = "media")]
