@@ -1798,18 +1798,22 @@ pub(crate) fn registered_valid_fixture(
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
+            load_spec: None,
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
+            load_spec: None,
         },
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
+            load_spec: None,
         },
         MemoryBehaviorFixture {
             context: ads2v_context,
             request: ads2v_request,
+            load_spec: None,
         },
     ])
 }

@@ -42,7 +42,7 @@ fn env_opt(key: &str) -> Option<PathBuf> {
 
 /// Re-embed the largest face in `img` and report its cosine to `ref_emb`. Returns `-1.0` (with a
 /// warning) when no face is detected, so framing-dependent modes don't hard-panic.
-fn output_cosine(model: &InstantId, ref_emb: &[f32], img: &Image, tag: &str) -> f32 {
+fn output_cosine(model: &mut InstantId, ref_emb: &[f32], img: &Image, tag: &str) -> f32 {
     match model.largest_face(img) {
         Ok(face) => {
             let c = cosine(ref_emb, &face.embedding);
@@ -189,7 +189,7 @@ fn real_weight_instantid() {
         .expect("identity generate");
     eprintln!("[identity] {:?}", t.elapsed());
     write_ppm(&out_dir.join("identity.ppm"), &img);
-    let id_cos = output_cosine(&model, &ref_emb, &img, "identity");
+    let id_cos = output_cosine(&mut model, &ref_emb, &img, "identity");
 
     // --- 2) AngleSet (engine `generate_angle`, front view, square) ---
     let t = Instant::now();
@@ -198,7 +198,7 @@ fn real_weight_instantid() {
         .expect("angle generate");
     eprintln!("[angle:front] {:?}", t.elapsed());
     write_ppm(&out_dir.join("angle_front.ppm"), &img);
-    let ang_cos = output_cosine(&model, &ref_emb, &img, "angle:front");
+    let ang_cos = output_cosine(&mut model, &ref_emb, &img, "angle:front");
 
     // --- 3) PoseSet (engine `generate_pose`, MultiControlNet IdentityNet + OpenPose, square) ---
     let mut pose_cos = None;
@@ -209,7 +209,7 @@ fn real_weight_instantid() {
             .expect("pose generate");
         eprintln!("[pose:front] {:?}", t.elapsed());
         write_ppm(&out_dir.join("pose_front.ppm"), &img);
-        pose_cos = Some(output_cosine(&model, &ref_emb, &img, "pose:front"));
+        pose_cos = Some(output_cosine(&mut model, &ref_emb, &img, "pose:front"));
     } else {
         eprintln!("[pose] skipped (IID_OPENPOSE unset)");
     }

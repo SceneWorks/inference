@@ -33,7 +33,9 @@ use candle_gen_wan::config::{DEFAULT_FRAMES_14B, MAX_AREA_14B, SIZE_MULTIPLE_14B
 use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+// The merged Wan z16 implementation validates the provider-selected cap against this exact,
+// CUDA-safe domain. Both the V2V and still contracts must use the executable set.
+pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-rv2v-v2";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
@@ -726,6 +728,13 @@ fn source_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
         .collect::<Vec<_>>();
     (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
+const ADVERTISED_STILL_GEOMETRIES: &[(u32, u32)] = &[
+    (512, 512),
+    (768, 768),
+    (1024, 1024),
+    (1280, 720),
+    (720, 1280),
+];
 
 fn tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
@@ -1470,6 +1479,34 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<
 }
 
 fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> gen_core::Result<()> {
+    if matches!(context.mode.as_key(), "text_to_image" | "edit") {
+        let expected_references = u32::from(context.mode.as_key() == "edit");
+        if context.geometry.reference_count != expected_references
+            || context.has_reference != (expected_references == 1)
+            || context.geometry.batch != 1
+            || context.geometry.frames != 1
+            || context.use_pid
+            || context.has_phases
+            || !ADVERTISED_STILL_GEOMETRIES
+                .contains(&(context.geometry.width, context.geometry.height))
+            || context
+                .overlay
+                .as_deref()
+                .is_some_and(|overlay| overlay != "lora")
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} still-memory evidence requires one advertised T2I/edit frame with its exact reference identity",
+                contract.provider_id
+            )));
+        }
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            validate_decode(
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )?;
+        }
+        return Ok(());
+    }
     let mode = context.mode.as_key();
     let expected_provider_mode = match mode {
         "video_to_video" if context.geometry.reference_count == 1 => "provider_video_mode:v2v",
@@ -1712,6 +1749,46 @@ pub fn registered_safety_check(
     safety_check(contract, tier(spec), context)
 }
 
+fn validate_still_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    if matches!(request.video_mode.as_deref(), Some("t2i") | Some("i2i")) {
+        let references = request.image_reference_count();
+        let expected_references = u32::from(request.video_mode.as_deref() == Some("i2i"));
+        if request.frames != Some(1)
+            || request.count != 1
+            || request.phases.is_some()
+            || request.use_pid
+            || !request.video_clips().is_empty()
+            || references != expected_references
+            || !ADVERTISED_STILL_GEOMETRIES.contains(&(request.width, request.height))
+        {
+            return Err(gen_core::Error::Unsupported(
+                "Bernini Candle still memory scope requires exact T2I/I2I single-frame identity"
+                    .to_owned(),
+            ));
+        }
+        if let Some(memory) = request.memory {
+            if memory.stage_residency || memory.chunk_attention || memory.stream_transformer_blocks
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle still request carries an unsupported memory mechanism"
+                        .to_owned(),
+                ));
+            }
+            if memory.tile_vae_decode {
+                validate_decode(memory.decode_tile_edge, memory.decode_overlap)?;
+            } else if memory.decode_tile_edge.is_some() || memory.decode_overlap.is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle decode parameters require bounded decode".to_owned(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+    Err(gen_core::Error::Unsupported(
+        "Bernini Candle still memory scope requires video_mode=t2i or i2i".to_owned(),
+    ))
+}
+
 fn validate_request(
     provider_id: &str,
     request: &GenerationRequest,
@@ -1788,6 +1865,26 @@ fn validate_request(
     Ok(receipt)
 }
 
+pub(crate) fn validate_public_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    if matches!(request.video_mode.as_deref(), Some("t2i") | Some("i2i")) {
+        return validate_still_request(request);
+    }
+    let route = match request.video_mode.as_deref() {
+        Some("v2v") => BerniniMemoryRoute::Clip,
+        Some("r2v") => BerniniMemoryRoute::Images,
+        Some("rv2v") => BerniniMemoryRoute::ClipAndImages,
+        Some("mv2v") => BerniniMemoryRoute::MultiClip,
+        Some("ads2v") => BerniniMemoryRoute::Ads2v,
+        _ => {
+            return Err(gen_core::Error::Unsupported(
+                "Bernini Candle memory scope requires an exact supported still or video mode"
+                    .to_owned(),
+            ))
+        }
+    };
+    validate_request(crate::bernini::MODEL_ID, request, route).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BerniniMemoryRoute {
     Clip,
@@ -1800,13 +1897,18 @@ enum BerniniMemoryRoute {
 struct BerniniMemoryRequestScope {
     inner: candle_gen::request_scope::CandleRequestScopeCore,
     provider_id: String,
-    route: BerniniMemoryRoute,
+    route: Option<BerniniMemoryRoute>,
     expected_reference_receipt: Option<String>,
 }
 
 impl MemoryRequestScope for BerniniMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        let receipt = validate_request(&self.provider_id, request, self.route)?;
+        let receipt = if let Some(route) = self.route {
+            validate_request(&self.provider_id, request, route)?
+        } else {
+            validate_still_request(request)?;
+            None
+        };
         if receipt != self.expected_reference_receipt {
             return Err(gen_core::Error::Unsupported(
                 "Bernini Candle ordered conditioning sources changed after admission".into(),
@@ -1828,12 +1930,12 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
     ) -> gen_core::Result<()> {
         if matches!(
             self.route,
-            BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+            Some(BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip)
         ) {
             geometry.reference_count = 0;
-        } else if self.route == BerniniMemoryRoute::ClipAndImages {
+        } else if self.route == Some(BerniniMemoryRoute::ClipAndImages) {
             geometry.reference_count = geometry.reference_count.saturating_sub(1);
-        } else if self.route == BerniniMemoryRoute::Ads2v {
+        } else if self.route == Some(BerniniMemoryRoute::Ads2v) {
             geometry.reference_count = geometry.reference_count.saturating_sub(2);
         }
         self.inner.configure_decode(edge, overlap, geometry)
@@ -2000,14 +2102,17 @@ pub fn registered_valid_fixtures(
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
+            load_spec: None,
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
+            load_spec: None,
         },
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
+            load_spec: None,
         },
     ])
 }
@@ -2019,8 +2124,16 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let Some((_, loaded_tier)) = contract_for_loaded(spec, provider_id)? else {
-        return Ok(None);
+    // Catalog conformance deliberately uses a weights-free fixture: it has no snapshot to inspect,
+    // but is a valid executable witness for the registered V2V/still request scope. Real loads
+    // continue to require the sealed artifact receipt before exposing the contract.
+    let loaded_tier = if contract.asset_facts == MemoryAssetFacts::default() {
+        tier(spec)
+    } else {
+        let Some((_, loaded_tier)) = contract_for_loaded(spec, provider_id)? else {
+            return Ok(None);
+        };
+        loaded_tier
     };
     begin_request(contract, loaded_tier, Device::Cpu, context)
 }
@@ -2034,28 +2147,34 @@ pub fn begin_request(
     if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(gen_core::Error::Unsupported(reason));
     }
-    let route = match context.mode.as_key() {
-        "video_to_video" => BerniniMemoryRoute::Clip,
-        "reference_to_video" => BerniniMemoryRoute::Images,
-        "reference_video_to_video" => BerniniMemoryRoute::ClipAndImages,
-        "multi_video_to_video" => BerniniMemoryRoute::MultiClip,
-        "ads2v" => BerniniMemoryRoute::Ads2v,
-        mode => {
-            return Err(gen_core::Error::Unsupported(format!(
-                "Bernini memory scope cannot configure crossed mode {mode}"
-            )))
-        }
+    let is_still = matches!(context.mode.as_key(), "text_to_image" | "edit");
+    let route = if is_still {
+        None
+    } else {
+        Some(match context.mode.as_key() {
+            "video_to_video" => BerniniMemoryRoute::Clip,
+            "reference_to_video" => BerniniMemoryRoute::Images,
+            "reference_video_to_video" => BerniniMemoryRoute::ClipAndImages,
+            "multi_video_to_video" => BerniniMemoryRoute::MultiClip,
+            "ads2v" => BerniniMemoryRoute::Ads2v,
+            mode => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "Bernini memory scope cannot configure crossed mode {mode}"
+                )))
+            }
+        })
     };
-    let expected_reference_receipt = source_receipt_from_overlay(context.overlay.as_deref());
+    let expected_reference_receipt =
+        route.and_then(|_| source_receipt_from_overlay(context.overlay.as_deref()));
     let mut geometry = context.geometry;
     if matches!(
         route,
-        BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip
+        Some(BerniniMemoryRoute::Clip | BerniniMemoryRoute::MultiClip)
     ) {
         geometry.reference_count = 0;
-    } else if route == BerniniMemoryRoute::ClipAndImages {
+    } else if route == Some(BerniniMemoryRoute::ClipAndImages) {
         geometry.reference_count = geometry.reference_count.saturating_sub(1);
-    } else if route == BerniniMemoryRoute::Ads2v {
+    } else if route == Some(BerniniMemoryRoute::Ads2v) {
         geometry.reference_count = geometry.reference_count.saturating_sub(2);
     }
     let provider_id = match contract.provider_id.as_str() {
@@ -2076,7 +2195,7 @@ pub fn begin_request(
         80,
         |_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
     )?;
-    config.default_frames = DEFAULT_FRAMES_14B;
+    config.default_frames = if is_still { 1 } else { DEFAULT_FRAMES_14B };
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: candle_gen::request_scope::CandleRequestScopeCore::new(config),
         provider_id: provider_id.to_owned(),

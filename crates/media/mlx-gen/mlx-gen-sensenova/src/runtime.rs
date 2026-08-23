@@ -24,6 +24,7 @@
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::{CancelFlag, Error, Result};
 
 // Shared decode sampler (sc-7159): on-device greedy argmax + the unified temperature/top-k/top-p
@@ -107,9 +108,28 @@ impl Qwen3Backbone {
     /// One cached single-token forward on the understanding path: embed `token`, run it at temporal
     /// position `pos_t` (`h = w = 0`), persist its K/V, and return the `[vocab]` next-token logits.
     pub fn decode_logits(&self, token: i32, pos_t: i32, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.decode_logits_budgeted(token, pos_t, cache, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn decode_logits_budgeted(
+        &self,
+        token: i32,
+        pos_t: i32,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Vec<f32>> {
         let ids = Array::from_slice(&[token], &[1, 1]);
         let embeds = self.embed(&ids)?;
-        let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
+        let hidden = self.forward_cached_budgeted(
+            &embeds,
+            &[pos_t],
+            &[0],
+            &[0],
+            Path::Und,
+            cache,
+            true,
+            attention,
+        )?;
         let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
         let vocab = logits.shape()[2];
         // F-144: `as_slice::<f32>()` reinterprets the raw buffer — it is only correct if `logits` is
@@ -124,9 +144,28 @@ impl Qwen3Backbone {
     /// MLX `argmax` breaks ties to the lowest index, matching the host `argmax` (`torch.argmax`), so
     /// the greedy stream is bit-identical (F-140).
     pub fn decode_argmax(&self, token: i32, pos_t: i32, cache: &mut KvCache) -> Result<i32> {
+        self.decode_argmax_budgeted(token, pos_t, cache, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn decode_argmax_budgeted(
+        &self,
+        token: i32,
+        pos_t: i32,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
+    ) -> Result<i32> {
         let ids = Array::from_slice(&[token], &[1, 1]);
         let embeds = self.embed(&ids)?;
-        let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
+        let hidden = self.forward_cached_budgeted(
+            &embeds,
+            &[pos_t],
+            &[0],
+            &[0],
+            Path::Und,
+            cache,
+            true,
+            attention,
+        )?;
         // The shared on-device argmax flattens the `[1, 1, vocab]` logits internally and breaks ties
         // to the lowest index — the same single-element host transfer + tie rule as the prior local
         // `argmax_device` (F-140).
@@ -139,6 +178,16 @@ impl Qwen3Backbone {
     /// tokens take positions `t_idx+1 .. t_idx+len` (`h = w = 0`), so the within-run mask is causal
     /// and they attend to all cached context.
     pub fn append_tokens(&self, ids: &[i32], t_idx: i32, cache: &mut KvCache) -> Result<i32> {
+        self.append_tokens_budgeted(ids, t_idx, cache, AttentionPlan::UNBOUNDED)
+    }
+
+    pub fn append_tokens_budgeted(
+        &self,
+        ids: &[i32],
+        t_idx: i32,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
+    ) -> Result<i32> {
         if ids.is_empty() {
             return Ok(t_idx);
         }
@@ -147,7 +196,16 @@ impl Qwen3Backbone {
         let embeds = self.embed(&ids_arr)?;
         let temporal: Vec<i32> = (t_idx + 1..=t_idx + n).collect();
         let zeros = vec![0i32; ids.len()];
-        self.forward_cached(&embeds, &temporal, &zeros, &zeros, Path::Und, cache, true)?;
+        self.forward_cached_budgeted(
+            &embeds,
+            &temporal,
+            &zeros,
+            &zeros,
+            Path::Und,
+            cache,
+            true,
+            attention,
+        )?;
         Ok(t_idx + n)
     }
 
@@ -170,6 +228,30 @@ impl Qwen3Backbone {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
     ) -> Result<Vec<i32>> {
+        self.generate_budgeted(
+            first_logits,
+            cache,
+            t_idx,
+            eos,
+            max_new_tokens,
+            sampler,
+            cancel,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_budgeted(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: i32,
+        eos: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Vec<i32>> {
         // Greedy decodes argmax on device (single-index host transfer per token); sampling needs the
         // full logits row on host. Split so the common greedy path avoids the ~600 KB copy (F-140).
         if let Sampler::Greedy = sampler {
@@ -185,7 +267,7 @@ impl Qwen3Backbone {
                 }
                 out.push(next);
                 t += 1;
-                next = self.decode_argmax(next, t, cache)?;
+                next = self.decode_argmax_budgeted(next, t, cache, attention)?;
             }
             return Ok(out);
         }
@@ -204,7 +286,7 @@ impl Qwen3Backbone {
             }
             out.push(next);
             t += 1;
-            logits = self.decode_logits(next, t, cache)?;
+            logits = self.decode_logits_budgeted(next, t, cache, attention)?;
         }
         Ok(out)
     }
@@ -227,6 +309,32 @@ impl Qwen3Backbone {
         max_think_tokens: usize,
         cancel: Option<&CancelFlag>,
     ) -> Result<ThinkRollout> {
+        self.generate_think_budgeted(
+            first_logits,
+            cache,
+            t_idx,
+            think_end_id,
+            eos,
+            append_ids,
+            max_think_tokens,
+            cancel,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_think_budgeted(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: i32,
+        think_end_id: i32,
+        eos: i32,
+        append_ids: &[i32],
+        max_think_tokens: usize,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+    ) -> Result<ThinkRollout> {
         let mut t = t_idx;
         let mut next = argmax(first_logits);
         let mut think_token_ids = Vec::new();
@@ -241,24 +349,24 @@ impl Qwen3Backbone {
             if next == think_end_id {
                 // Forward `</think>` so the cache includes it, then stop. No logits needed here, so
                 // splice it in without an lm_head projection (F-140).
-                t = self.append_tokens(&[next], t, cache)?;
+                t = self.append_tokens_budgeted(&[next], t, cache, attention)?;
                 think_token_ids.push(next);
                 closed = true;
                 break;
             }
             think_token_ids.push(next);
             // Greedy: argmax the next-token logits on device (single-index transfer; F-140).
-            next = self.decode_argmax(next, t + 1, cache)?;
+            next = self.decode_argmax_budgeted(next, t + 1, cache, attention)?;
             t += 1;
         }
         // Budget exhausted before `</think>` (and the model didn't emit `eos`): synthesize the close
         // so the cache is not primed on an unclosed `<think>` token sequence the model was never
         // trained on, which would degrade the subsequent image generation (F-013).
         if !closed && next != eos {
-            t = self.append_tokens(&[think_end_id], t, cache)?;
+            t = self.append_tokens_budgeted(&[think_end_id], t, cache, attention)?;
             think_token_ids.push(think_end_id);
         }
-        t = self.append_tokens(append_ids, t, cache)?;
+        t = self.append_tokens_budgeted(append_ids, t, cache, attention)?;
         Ok(ThinkRollout {
             think_token_ids,
             t_idx: t,
