@@ -12,7 +12,8 @@ use candle_gen::gen_core::{
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision,
-    ResidentRequestMemory, WeightsSource, MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
+    ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
+    MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
 use sha2::{Digest, Sha256};
 
@@ -603,6 +604,24 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
     PreparedMemory::prepare(spec).map(|prepared| prepared.contract)
 }
 
+/// Weights-free witness for the deliberately Resident-only public SCAIL-2 animation surface.
+///
+/// Production admission obtains physical byte facts from [`PreparedMemory`]. This registry
+/// witness proves the static rung disposition for each standard Candle load shape without
+/// claiming a nonexistent optimized implementation or requiring model weights during catalog
+/// conformance.
+fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    validate_load_spec(spec)?;
+    Ok(build_contract(spec, MemoryAssetFacts::default()))
+}
+
+fn memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.spec.quantize.is_none())
+        .collect()
+}
+
 fn validate_route(
     contract: &MemoryProviderContract,
     tier: MemoryNumericTier,
@@ -727,6 +746,13 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
         },
     },
 };
+
+pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
+    ResidentOnlyMemoryContractRegistration {
+        provider_id: PROVIDER_ID,
+        contract: weights_free_resident_contract,
+        surface_specs: memory_contract_surface_specs,
+    };
 
 #[cfg(test)]
 mod tests {

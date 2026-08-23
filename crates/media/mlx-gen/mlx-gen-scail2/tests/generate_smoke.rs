@@ -78,13 +78,39 @@ fn color_mask(w: usize, h: usize, split: usize) -> Image {
 
 #[test]
 fn missing_reference_errors() {
-    // load() only needs an existing dir (config.json is optional → defaults). The conditioning
-    // extraction runs before any weight load, so an empty request fails fast. Use a per-process
-    // empty dir rather than the shared `$TMPDIR` itself, so nothing another concurrent `cargo test`
-    // process leaves lying around is ever inside this provider's weights root.
+    // The resident-memory receipt validates the canonical artifact set at load time. Its contents
+    // are deliberately inert here: conditioning extraction runs before any tensor is opened, so
+    // an empty request still fails fast without touching weights. Use a per-process directory so
+    // nothing another concurrent `cargo test` process leaves lying around is inside this provider's
+    // weights root.
     let dir_tmp = tempfile::tempdir().unwrap();
-    let dir = dir_tmp.path().to_path_buf();
-    let spec = LoadSpec::new(WeightsSource::Dir(dir));
+    let dir = dir_tmp
+        .path()
+        .join("models--SceneWorks--scail2-mlx")
+        .join("snapshots")
+        .join(mlx_gen_scail2::memory_strategy::CANONICAL_REVISION)
+        .join("bf16");
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in mlx_gen_scail2::pipeline::SHARED_TIER_FILES {
+        if *file == "config.json" || *file == "tokenizer.json" {
+            std::fs::write(dir.join(file), "{}").unwrap();
+        } else {
+            let bytes = [7_u8];
+            let tensor = safetensors::tensor::TensorView::new(
+                safetensors::Dtype::U8,
+                vec![bytes.len()],
+                &bytes,
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join(file),
+                safetensors::serialize([("fixture", tensor)], None).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    let mut spec = LoadSpec::new(WeightsSource::Dir(dir));
+    spec.resolved_route = Some(MODEL_ID.to_owned());
     let gen = mlx_gen_scail2::provider_registry()
         .unwrap()
         .load(MODEL_ID, &spec)
