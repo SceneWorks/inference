@@ -1592,6 +1592,32 @@ mod tests {
     }
 
     #[test]
+    fn bridge_fixture_binds_ordered_two_clip_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "video_bridge")
+            .unwrap();
+        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        let mut accepted = fixture.request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+        assert!(accepted.memory.unwrap().stage_residency);
+
+        let mut crossed = fixture.request;
+        crossed.conditioning.swap(0, 1);
+        let error = scope
+            .configure_request(&mut crossed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ordered fitted IC-LoRA clips"), "{error}");
+        assert_eq!(crossed.memory, None);
+    }
+
+    #[test]
     fn calibrated_scope_binds_empty_t2v_request_and_exact_fps_frame_pair_before_controls() {
         let (mut scope, request) = calibrated_t2v_scope_and_request();
         let mut accepted = request.clone();
