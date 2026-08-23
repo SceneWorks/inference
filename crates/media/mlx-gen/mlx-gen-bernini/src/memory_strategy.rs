@@ -118,8 +118,8 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "bernini-image-q4-mlx-dual-expe
 /// `AutoencoderKLWan`), so every published edge is a multiple of 8 and lands on a whole latent cell.
 /// The floor is geometric rather than measured: a tile must exceed twice the overlap by at least one
 /// latent cell or successive tiles do not advance, which puts the smallest admissible edge at
-/// `2 * DECODE_OVERLAP + 8 = 136`. 256 is the first published multiple comfortably above it.
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+/// `2 * DECODE_OVERLAP + 8 = 136`. 192 is the first published multiple comfortably above it.
+pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 
 /// The default edge when a request enables rung 2 without naming one.
 pub const DECODE_TILE_EDGE: u32 = 512;
@@ -1523,22 +1523,23 @@ pub(crate) fn registered_valid_fixture(
     mv2v_context.mode = MemoryMode::Other("multi_video_to_video".to_owned());
     mv2v_context.geometry.reference_count = 2;
     mv2v_context.overlay = Some(format!("provider_video_mode:mv2v+{mv2v_axis}"));
+    let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
-            load_spec: None,
+            load_spec,
         },
     ])
 }

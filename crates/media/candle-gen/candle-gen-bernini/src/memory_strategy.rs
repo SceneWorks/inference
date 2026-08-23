@@ -33,7 +33,8 @@ use candle_gen_wan::config::{DEFAULT_FRAMES_14B, MAX_AREA_14B, SIZE_MULTIPLE_14B
 use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+// Keep the provider's bounded-decode domain in lockstep with the merged Wan z16 implementation.
+pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-rv2v-v2";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
@@ -541,7 +542,6 @@ fn reference_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
         .collect::<Vec<_>>();
     (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
-
 fn source_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
     let axes = overlay?.split('+').collect::<Vec<_>>();
     let evidence = axes
@@ -1531,8 +1531,38 @@ fn validate_memory_request(
     request: &GenerationRequest,
     route: BerniniMemoryRoute,
 ) -> gen_core::Result<Option<String>> {
-    if route == BerniniMemoryRoute::Still {
-        validate_request(request)?;
+    if matches!(route, BerniniMemoryRoute::Still) {
+        let expected_references = u32::from(request.video_mode.as_deref() == Some("i2i"));
+        if !matches!(request.video_mode.as_deref(), Some("t2i") | Some("i2i"))
+            || request.frames != Some(1)
+            || request.count != 1
+            || request.phases.is_some()
+            || request.use_pid
+            || !request.video_clips().is_empty()
+            || request.image_reference_count() != expected_references
+            || !ADVERTISED_STILL_GEOMETRIES.contains(&(request.width, request.height))
+        {
+            return Err(gen_core::Error::Unsupported(
+                "Bernini Candle still memory scope requires exact T2I/I2I single-frame identity"
+                    .to_owned(),
+            ));
+        }
+        if let Some(memory) = request.memory {
+            if memory.stage_residency || memory.chunk_attention || memory.stream_transformer_blocks
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle still request carries an unsupported memory mechanism"
+                        .to_owned(),
+                ));
+            }
+            if memory.tile_vae_decode {
+                validate_decode(memory.decode_tile_edge, memory.decode_overlap)?;
+            } else if memory.decode_tile_edge.is_some() || memory.decode_overlap.is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle decode parameters require bounded decode".to_owned(),
+                ));
+            }
+        }
         return Ok(None);
     }
     if request.phases.is_some() {
@@ -1861,22 +1891,23 @@ pub fn registered_valid_fixtures(
         mv2v_axes.push(adapter_axis);
     }
     mv2v_context.overlay = Some(mv2v_axes.join("+"));
+    let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
-            load_spec: None,
+            load_spec,
         },
     ])
 }
@@ -1888,15 +1919,18 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let loaded_tier = if contract.asset_facts == MemoryAssetFacts::default() {
-        tier(spec)
-    } else {
-        let Some((_, loaded_tier)) = contract_for_loaded(spec, provider_id)? else {
-            return Ok(None);
-        };
-        loaded_tier
-    };
-    begin_request(contract, loaded_tier, Device::Cpu, context)
+    if contract.provider_id != provider_id {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini behavior registration {provider_id} received crossed contract {}",
+            contract.provider_id
+        )));
+    }
+    // The registration's contract factory already validated production assets and sealed their
+    // exact receipts. Re-reading them here makes weights-free registry fixtures non-executable and
+    // creates a second, racy asset read between contract construction and request configuration.
+    // Use the same spec-derived tier as the paired registered safety check; real lazy loads still
+    // revalidate their sealed contract at the component-load boundary.
+    begin_request(contract, tier(spec), Device::Cpu, context)
 }
 
 pub fn begin_request(
@@ -2283,6 +2317,32 @@ mod tests {
             BerniniMemoryRoute::Clip
         )
         .is_err());
+    }
+
+    #[test]
+    fn candle_bernini_public_validation_keeps_t2i_and_i2i_single_frame_routes() {
+        let mut request = GenerationRequest {
+            prompt: "still Bernini".to_owned(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            video_mode: Some("t2i".to_owned()),
+            ..Default::default()
+        };
+        assert!(validate_request(&request).is_ok());
+
+        request.video_mode = Some("i2i".to_owned());
+        request.conditioning = vec![Conditioning::MultiReference {
+            images: vec![gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            }],
+        }];
+        assert!(validate_request(&request).is_ok());
+
+        request.frames = Some(45);
+        assert!(validate_request(&request).is_err());
     }
 
     #[test]
@@ -2691,7 +2751,7 @@ mod tests {
                 },
             ] {
                 let mut scope =
-                    begin_request(&contract, tier(&spec), Device::Cpu, &fixtures[1].context)
+                    registered_begin_request(provider_id, &spec, &contract, &fixtures[1].context)
                         .unwrap()
                         .expect("scope");
                 let mut request = fixtures[1].request.clone();
