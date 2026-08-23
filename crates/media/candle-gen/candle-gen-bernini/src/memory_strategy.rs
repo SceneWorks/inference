@@ -1217,10 +1217,18 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    let Some((_, loaded_tier)) = contract_for_loaded(spec, provider_id)? else {
-        return Ok(None);
-    };
-    begin_request(contract, loaded_tier, Device::Cpu, context)
+    if contract.provider_id != provider_id {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini behavior registration {provider_id} received crossed contract {}",
+            contract.provider_id
+        )));
+    }
+    // The registration's contract factory already validated production assets and sealed their
+    // exact receipts. Re-reading them here makes weights-free registry fixtures non-executable and
+    // creates a second, racy asset read between contract construction and request configuration.
+    // Use the same spec-derived tier as the paired registered safety check; real lazy loads still
+    // revalidate their sealed contract at the component-load boundary.
+    begin_request(contract, tier(spec), Device::Cpu, context)
 }
 
 pub fn begin_request(
@@ -1748,7 +1756,7 @@ mod tests {
                 },
             ] {
                 let mut scope =
-                    begin_request(&contract, tier(&spec), Device::Cpu, &fixtures[1].context)
+                    registered_begin_request(provider_id, &spec, &contract, &fixtures[1].context)
                         .unwrap()
                         .expect("scope");
                 let mut request = fixtures[1].request.clone();
