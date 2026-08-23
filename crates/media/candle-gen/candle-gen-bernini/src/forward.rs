@@ -447,7 +447,7 @@ pub struct VitGuidanceParams {
 /// `sample_one_step` (the full-Bernini per-step velocity over the 4 prompt streams × the packed-latent
 /// variants). Each prediction is one [`PackedForward::velocity`] (≡ the reference `shared_step`) over a
 /// source subset + a chosen prompt stream:
-///   - `wvae` = image ⧺ video sources; `wvidvae` = video; `wovae` = target only.
+///   - `wvae` = video ⧺ image sources; `wvidvae` = video; `wovae` = target only.
 ///   - `images`/`videos` are `(latent, source_id)` source lists (the target is added with id 0 inside
 ///     `velocity`).
 ///
@@ -457,6 +457,10 @@ pub struct VitGuidanceParams {
 /// momentum through the caller-owned `mbufs` (allocated once before the denoise loop via
 /// [`num_vit_momentum_buffers`]) so a nonzero momentum default actually persists across steps instead of
 /// resetting each call (F-161); an empty `mbufs` degrades to no momentum. Returns `[1, 16, T, H8, W8]`.
+fn ordered_wvae_sources<T: Clone>(videos: &[(T, f64)], images: &[(T, f64)]) -> Vec<(T, f64)> {
+    videos.iter().chain(images).cloned().collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn vit_one_step(
     pf: &PackedForward,
@@ -473,7 +477,7 @@ pub fn vit_one_step(
 ) -> CResult<Tensor> {
     // ADS2V receipts bind source/reference clips before the ordered images; retain that exact
     // videos-first sequence in the physical VAE pack.
-    let wvae: Vec<(Tensor, f64)> = videos.iter().chain(images).cloned().collect();
+    let wvae = ordered_wvae_sources(videos, images);
     let v = |sources: &[(Tensor, f64)], ctx: &Tensor| pf.velocity(dit, noisy, sources, t, ctx);
 
     match mode {
@@ -1002,6 +1006,19 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "vae_txt_vit dispatch must equal manual combine"
+        );
+    }
+
+    #[test]
+    fn ads2v_wvae_packs_videos_before_images_for_three_and_four_sources() {
+        let videos = [(10_u8, 0.0), (20_u8, 1.0)];
+        let three_sources = ordered_wvae_sources(&videos, &[(30_u8, 2.0)]);
+        let four_sources = ordered_wvae_sources(&videos, &[(30_u8, 2.0), (40_u8, 3.0)]);
+
+        assert_eq!(three_sources, vec![(10, 0.0), (20, 1.0), (30, 2.0)]);
+        assert_eq!(
+            four_sources,
+            vec![(10, 0.0), (20, 1.0), (30, 2.0), (40, 3.0)]
         );
     }
 }
