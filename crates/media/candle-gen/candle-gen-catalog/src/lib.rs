@@ -3441,6 +3441,7 @@ mod preview_advertising {
             dir: "candle-gen-svd",
             register_providers: candle_gen_svd::register_providers,
             register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",
