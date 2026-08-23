@@ -588,8 +588,36 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         append: bool,
     ) -> Result<Array> {
+        self.forward_cached_budgeted(
+            embeds,
+            temporal,
+            height,
+            width,
+            path,
+            cache,
+            append,
+            AttentionPlan::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::forward_cached`] with an explicit request-scoped attention plan. This is used by
+    /// every production SenseNova route, including understanding/VQA/interleave forwards; the
+    /// unqualified wrapper remains for parity fixtures and callers that deliberately select the
+    /// resident path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached_budgeted(
+        &self,
+        embeds: &Array,
+        temporal: &[i32],
+        height: &[i32],
+        width: &[i32],
+        path: Path,
+        cache: &mut KvCache,
+        append: bool,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Array> {
         let rm = self.prepare_rope_mask(temporal, height, width, cache.offset())?;
-        self.forward_prepared(embeds, &rm, path, cache, append)
+        self.forward_prepared_budgeted(embeds, &rm, path, cache, append, attention)
     }
 
     /// Build the tri-axis RoPE tables + block mask for `(temporal, height, width)` position indexes
@@ -635,8 +663,8 @@ impl Qwen3Backbone {
     }
 
     /// [`Self::forward_prepared`] with an explicit shared attention plan. The production denoise
-    /// path selects a bounded plan per request; understanding/AR paths retain the historical
-    /// unbounded call so text, VQA, and think-token behavior are unchanged.
+    /// paths select a bounded plan per request; the wrapper preserves resident/unbounded behavior
+    /// for parity fixtures and callers without request memory.
     pub fn forward_prepared_budgeted(
         &self,
         embeds: &Array,
