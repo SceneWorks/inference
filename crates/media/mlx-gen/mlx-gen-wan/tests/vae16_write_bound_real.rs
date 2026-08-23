@@ -26,7 +26,7 @@
 //! Run:
 //! ```text
 //! Z16_VAE=/path/to/models--SceneWorks--wan2.2-t2v-a14b-mlx/snapshots/<h>/bf16/vae.safetensors \
-//!   cargo test -p mlx-gen-wan --test vae16_write_bound_real -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration vae16_write_bound_real:: -- --ignored --nocapture
 //! ```
 //! (With `Z16_VAE` unset it auto-discovers the bf16 snapshot under the HF cache, else skips.)
 

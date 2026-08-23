@@ -10,7 +10,7 @@
 //! production path — every op is the same mlx op at the same dtype, so the gate is tight. Honors
 //! "divergence is not rounding": a >1% gap here would be a real bug.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test upsampler_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration upsampler_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

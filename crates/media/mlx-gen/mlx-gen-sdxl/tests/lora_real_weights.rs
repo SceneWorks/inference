@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot, a real kohya LoRA (`latent-consistency/lcm-lora-sdxl`
 //! in the HF cache), and the golden from `tools/dump_sdxl_lora_golden.py`.
-//! Run: cargo test -p mlx-gen-sdxl --release --test lora_real_weights -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration lora_real_weights:: -- --ignored --nocapture
 //!
 //! Gates:
 //! - `routing_surface_is_vendored_515` — the `AdaptableHost` routes exactly the vendored reachable
@@ -16,7 +16,7 @@
 //!   class as base T2I, slightly amplified by the extra delta matmul through the ancestral sampler).
 //! - `scale_zero_lora_is_bit_exact_noop` — a scale-0 LoRA leaves the render bit-identical to base.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

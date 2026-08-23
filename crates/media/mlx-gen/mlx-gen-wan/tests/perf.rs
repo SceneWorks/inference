@@ -15,7 +15,7 @@
 //! Run it:
 //! ```text
 //! WAN_A14B_MODEL_DIR=~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16 \
-//!   cargo test --release -p mlx-gen-wan --test perf -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-wan --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `WAN_PERF_FRAMES` / `WAN_PERF_HEIGHT` / `WAN_PERF_WIDTH` (default 25/480/832).
 

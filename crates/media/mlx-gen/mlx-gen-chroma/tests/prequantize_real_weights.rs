@@ -15,7 +15,7 @@
 //!
 //! `#[ignore]`d — needs a real ~18GB Chroma diffusers snapshot. Run per tier:
 //!   SC8777_SRC=<snap> SC8777_BITS=4 SC8777_MODEL=chroma1_base \
-//!     cargo test -p mlx-gen-chroma --release --test prequantize_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-chroma --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs: SC8777_SRC (source snapshot dir; default the cached Chroma1-Base snapshot),
 //! SC8777_OUT (tier output dir), SC8777_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8777_MODEL
@@ -68,7 +68,7 @@ fn bits_env() -> i32 {
 /// snapshot into `SC8777_OUT` and keep it — no load/generate. `SC8777_BITS=0` (dense bf16) is a
 /// verbatim mirror of the source; copy the snapshot dir directly rather than running the packer. Run:
 ///   SC8777_SRC=<snap> SC8777_OUT=<staging/q4> SC8777_BITS=4 \
-///     cargo test -p mlx-gen-chroma --release --test prequantize_real_weights -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-chroma --release --test integration -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set SC8777_SRC/OUT/BITS"]
 fn build_tier_only() {

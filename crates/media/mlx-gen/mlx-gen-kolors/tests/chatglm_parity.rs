@@ -7,7 +7,7 @@
 //! (causal+padding) cases, in BOTH f32 (cross-backend Metal-vs-CPU floor ~1e-3, flat over depth) and
 //! fp16 (production-dtype floor).
 //!
-//! Run: `cargo test -p mlx-gen-kolors --test chatglm_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --test integration chatglm_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};

@@ -43,7 +43,7 @@
 //!
 //! ```text
 //! WAN_TI2V_5B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<hash>/q4 \
-//!   cargo test -p mlx-gen-wan --test ti2v_5b_offload_footprint -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration ti2v_5b_offload_footprint:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

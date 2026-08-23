@@ -39,14 +39,14 @@
 //!
 //! ```sh
 //! MLX_GEN_ZIMAGE_SNAPSHOT=<snapshot root, containing bf16/ q4/ q8/> \
-//!   cargo test -p mlx-gen-z-image --release --test text_encoder_residency_real_weights \
+//!   cargo test -p mlx-gen-z-image --release --test integration text_encoder_residency_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! `MLX_GEN_ZIMAGE_SNAPSHOT` may point either at a multi-tier root (all present tiers are measured) or at a
 //! single tier directory (that one is measured).
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

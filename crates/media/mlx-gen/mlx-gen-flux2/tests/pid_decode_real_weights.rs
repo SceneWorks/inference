@@ -13,7 +13,7 @@
 //! model **plus** the PiD net + Gemma, so it is memory-heavy; defaults to Q8 + 512² (→ 2048² PiD).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-flux2 --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-flux2 --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

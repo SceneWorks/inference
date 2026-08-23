@@ -27,7 +27,7 @@
 //! The DiT's own arithmetic is gated by `dit_parity.rs`; what is under test here is whether the
 //! keyframe reaches it.
 
-mod common;
+use crate::common;
 
 use common::{encode_fixture_config, rel, ENCODE_FIXTURE};
 

@@ -4,9 +4,9 @@
 //!
 //! `#[ignore]` — needs the bf16 snapshot (~53 GB) and writes the Q4 snapshot (~14 GB). Run:
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert IDEOGRAM4_Q4=~/.cache/ideogram4-mlx-q4 \
-//!     cargo test -p mlx-gen-ideogram --test prequantize -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration prequantize:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

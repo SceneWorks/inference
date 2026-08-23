@@ -2150,8 +2150,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 self.assertIn("set -o pipefail", run)
                 self.assertIn(snapshot_binding, run)
                 self.assertIn(f"cargo test --locked --release -p {package}", run)
-                self.assertIn(f"--test vae_real_weights", run)
-                self.assertIn(test_name, run)
+                # sc-21383: one integration binary per crate; the former per-file target is the
+                # module prefix of the case name.
+                self.assertIn("--test integration", run)
+                self.assertIn(f"vae_real_weights::{test_name}", run)
                 self.assertIn("-- --exact --ignored --nocapture", run)
                 self.assertIn('grep -qE "test result: ok\\. 1 passed"', run)
                 self.assertNotIn("GOLDEN", run)

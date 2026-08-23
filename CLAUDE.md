@@ -40,7 +40,7 @@ cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
 ```
 
 Run a **single test**: `cargo test --locked -p <crate> <test_name>`
-(e.g. `cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored`).
+(e.g. `cargo test --locked -p mlx-llm --test integration conformance::real_model_passes_core_llm_conformance -- --ignored`).
 Real-weight tests are `#[ignore]`d and gated behind snapshot env vars — see `.github/workflows/real-weights.yml`.
 
 **Parity goldens are single-host, deliberately.** The rows reading `crates/media/mlx-gen/tools/golden/`

@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<root> SCENEWORKS_GPU_ID=mlx \
-//!   cargo test -p mlx-gen-minimax-h3 --test first_light -- --ignored --nocapture
+//!   cargo test -p mlx-gen-minimax-h3 --test integration first_light:: -- --ignored --nocapture
 //! ```
 //!
 //! **A skipped run must not look like a passing one.** `common::snapshot()` asserts rather than
@@ -25,7 +25,7 @@
 //! Together they say "the frames are structured **and** they are the same scene", which is what
 //! "produces a coherent clip" means and what a pixel-std datum alone cannot say.
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

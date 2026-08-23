@@ -4,7 +4,7 @@
 //! fork's f32 VAE weights (keyed by the internal module tree) + fixed inputs + fork encode/decode
 //! outputs. Both sides run f32, so this isolates VAE *math* parity (the disk-snapshot key remapping
 //! lands with the full-model assembly). Run:
-//!   cargo test -p mlx-gen-qwen-image --release --test vae_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration vae_real_weights:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder};

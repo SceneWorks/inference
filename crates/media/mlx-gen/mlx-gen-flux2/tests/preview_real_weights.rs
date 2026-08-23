@@ -3,7 +3,7 @@
 //! ```sh
 //! MLX_GEN_FLUX2_SNAPSHOT=/path/to/snapshot \
 //! FLUX2_PREVIEW_ARTIFACT_DIR=/path/to/output \
-//! cargo test --locked --release -p mlx-gen-flux2 --test preview_real_weights \
+//! cargo test --locked --release -p mlx-gen-flux2 --test integration preview_real_weights:: \
 //!   -- --ignored --nocapture
 //! ```
 

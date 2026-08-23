@@ -90,7 +90,7 @@
 //!
 //! ```text
 //! SANA_LADDER_1600M=<root containing q4/> SANA_LADDER_SPRINT=<root containing q4/> \
-//!   cargo test -p mlx-gen-sana --release --test memory_ladder_real_weights \
+//!   cargo test -p mlx-gen-sana --release --test integration memory_ladder_real_weights:: \
 //!   -- --ignored --test-threads=1 --nocapture
 //! ```
 

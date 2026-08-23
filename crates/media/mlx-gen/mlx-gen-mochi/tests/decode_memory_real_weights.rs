@@ -34,8 +34,8 @@
 //! Run (one test at a time):
 //! ```text
 //! MOCHI_SNAPSHOT=/path/to/models--genmo--mochi-1-preview/snapshots/<sha> \
-//!   cargo test -p mlx-gen-mochi --release --test decode_memory_real_weights \
-//!   -- --ignored --nocapture --exact decode_peak_is_flat_in_clip_length
+//!   cargo test -p mlx-gen-mochi --release --test integration \
+//!   -- --ignored --nocapture --exact decode_memory_real_weights::decode_peak_is_flat_in_clip_length
 //! ```
 
 use std::path::PathBuf;

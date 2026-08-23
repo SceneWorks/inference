@@ -7,7 +7,7 @@
 //! the Rust `generate_av_latents` (joint 2-stage denoise) + `decode_to_frames` + `decode_audio_track`
 //! must reproduce the frames (px>8) + waveform.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_e2e_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration av_e2e_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -178,7 +178,7 @@ fn av_e2e_matches_reference() {
 /// sibling of chroma's per-step cancel (sc-5514); the per-step `eval` is what makes the check effective
 /// (otherwise MLX's lazy graph defers all compute to decode). Deterministic (callback-tripped, not a
 /// timer). `#[ignore]` like the rest of this file — run with the real weights:
-/// `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_e2e_parity av_generate_honors_midloop_cancel -- --ignored`.
+/// `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration av_e2e_parity::av_generate_honors_midloop_cancel -- --ignored`.
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 weights (~20 GB)"]
 fn av_generate_honors_midloop_cancel() {

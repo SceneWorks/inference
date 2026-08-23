@@ -14,7 +14,7 @@
 //! `block_out.1` gate masks padded positions via `encoder_attention_mask` (the `te_parity` precedent).
 //!
 //! Run the real-weight gate:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test block_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p mlx-gen-mochi --test integration block_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract};
 use mlx_rs::{Array, Dtype};

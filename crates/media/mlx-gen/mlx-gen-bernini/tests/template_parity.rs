@@ -10,7 +10,7 @@
 //!
 //! Requires the converted snapshot's `mllm/tokenizer.json`; `#[ignore]` otherwise (the tokenizer is
 //! ~11 MB, not committed). Run:
-//!   `cargo test -p mlx-gen-bernini --test template_parity -- --ignored --nocapture`
+//!   `cargo test -p mlx-gen-bernini --test integration template_parity:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_bernini::process::generate_unified_inputs;
 use mlx_gen_bernini::template::{BerniniTemplate, TemplateOutput};
 
-mod common;
+use crate::common;
 
 use common::{
     SHARED_FIXTURE_TEMPLATE_IMAGE_TOKEN_NUMS, SHARED_FIXTURE_TEMPLATE_INPUT_IMAGE_HW,

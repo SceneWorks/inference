@@ -12,7 +12,7 @@
 //! it advertises (run under `/usr/bin/time -l` to confirm the peak RSS) rather than the `~40 GB`
 //! dense bf16 stack — the whole point of the story.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test encoder_quant_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration encoder_quant_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{multiply, sum};
 use mlx_rs::{Array, Dtype};

@@ -13,7 +13,7 @@
 //! Reuses the sc-3083/3084 goldens (gitignored) — hence `#[ignore]`. Run:
 //!   ~/.dwpose-spike/venv/bin/python tools/dump_face_align_golden.py
 //!   ~/.bisenet-spike/venv/bin/python tools/convert_bisenet.py
-//!   cargo test -p mlx-gen-face --release --test face_analysis_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-face --release --test integration face_analysis_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{detector_blob, FaceAnalysis};

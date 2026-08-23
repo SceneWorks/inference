@@ -8,14 +8,14 @@
 //!
 //! These are exact host/array ops (gather, scatter, concat, pad, slice) → bit-for-bit equality.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test assembly_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration assembly_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use mlx_gen_bernini::qwen2_5_vl::{Qwen25VlText, QwenVlTextConfig};
 use mlx_rs::Array;
 
-mod common;
+use crate::common;
 
 use common::{
     SHARED_FIXTURE_ASSEMBLY_HEAD_DIM, SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE,

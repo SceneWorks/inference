@@ -8,7 +8,7 @@
 //! `#[ignore]`d only because the goldens are gitignored (they need the licensed weights to
 //! produce), not because they need weights to *check*.
 
-mod common;
+use crate::common;
 
 use common::{error, ints, require_golden, BLOCK_GOLDEN, STACK_GOLDEN};
 

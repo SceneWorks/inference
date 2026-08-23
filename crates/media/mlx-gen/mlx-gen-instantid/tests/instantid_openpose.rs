@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the golden from `tools/dump_instantid_openpose_golden.py` (cv2 4.13 ground
 //! truth). Run:
-//!   cargo test -p mlx-gen-instantid --release --test instantid_openpose -- --ignored --nocapture
+//!   cargo test -p mlx-gen-instantid --release --test integration instantid_openpose:: -- --ignored --nocapture
 //!
 //! Four cases (real gallery pose on a square 1024² canvas, the same on a non-square canvas, an
 //! occluded-head pose, and a tiny 128²) — each compared byte-for-byte against the OpenCV output

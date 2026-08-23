@@ -4,7 +4,7 @@
 //! `#[ignore]` — needs the real snapshot + the golden (`tools/dump_krea_te_real_golden.py`):
 //! ```sh
 //! KREA_TURBO_DIR=/path/to/models--krea--Krea-2-Turbo/snapshots/<rev> \
-//!   cargo test -p mlx-gen-krea --release --test te_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration te_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

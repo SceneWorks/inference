@@ -24,7 +24,7 @@
 //! and MLX's allocator counters are process-global. `tests/adaln_evict_memory.rs` and
 //! `tests/adaln_evict_real_weights.rs` own that, one measurement per process.
 
-mod common;
+use crate::common;
 
 use common::{assert_parity, dit_fixture_config, rel, DIT_FIXTURE, DIT_LAYOUT};
 

@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! LENS_DIR=<SceneWorks/lens-mlx/q4 or lens-turbo-mlx/bf16> \
-//!   cargo test -p mlx-gen-lens --release --test text_encoder_window_real_weights \
+//!   cargo test -p mlx-gen-lens --release --test integration text_encoder_window_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 

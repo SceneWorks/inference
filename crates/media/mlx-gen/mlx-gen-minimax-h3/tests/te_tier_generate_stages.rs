@@ -6,7 +6,7 @@
 //! MINIMAX_H3_SNAPSHOT=<upstream snapshot root> \
 //! MINIMAX_H3_DIT=<tier>/transformer \
 //! MINIMAX_H3_TE=<text_encoder dir> \
-//!   cargo test -p mlx-gen-minimax-h3 --test te_tier_generate_stages -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration te_tier_generate_stages:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!
