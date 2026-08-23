@@ -313,6 +313,109 @@ fn packed_q4_first_last_memory_route_renders() {
     assert_frame_coherent(frames.last().expect("last frame"), "q4-first-last#last");
 }
 
+/// SC-20775's two-clip bridge witness. It exercises the packed q4 CUDA loader with the two
+/// ordered IC-LoRA clip endpoints and bounded-decode scope, so a receipt-only fixture cannot
+/// accidentally advertise a route the physical provider no longer executes.
+#[test]
+#[ignore = "needs LTX_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
+fn packed_q4_video_bridge_memory_route_renders() {
+    let dir = std::env::var("LTX_PACKED_Q4")
+        .expect("set LTX_PACKED_Q4 to the packed q4 tier subdirectory");
+    let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(dir)));
+    spec.quantize = Some(Quant::Q4);
+    let generator = candle_gen_ltx::provider_registry()
+        .unwrap()
+        .load("ltx_2_3_distilled", &spec)
+        .expect("ltx q4 generator");
+    let contract = generator
+        .memory_strategy_contract()
+        .expect("the exact q4 split artifact publishes its bridge memory contract");
+    let mut context = candle_gen::gen_core::standard_memory_behavior_context(
+        contract,
+        MemoryStrategy::BoundedDecode,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: Some(Quant::Q4),
+            component_precision_floors: &[],
+        },
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("video_bridge".into()),
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(
+                "clip:append:frames:97:image:768x512:frame:0:strength:3f800000+clip:append:frames:97:image:768x512:frame:-1:strength:3f800000".into(),
+            ),
+        },
+    )
+    .expect("q4 bridge bounded decode selection");
+    context.geometry.width = 768;
+    context.geometry.height = 512;
+    context.geometry.frames = 97;
+
+    let left = Image {
+        width: 768,
+        height: 512,
+        pixels: vec![96; 768 * 512 * 3],
+    };
+    let right = Image {
+        width: 768,
+        height: 512,
+        pixels: vec![160; 768 * 512 * 3],
+    };
+    let mut request = GenerationRequest {
+        prompt: "a red fox walks from one snowy clearing into another, continuous dolly shot"
+            .into(),
+        width: 768,
+        height: 512,
+        count: 1,
+        seed: Some(42),
+        frames: Some(97),
+        fps: Some(24),
+        sampler: Some("euler".into()),
+        conditioning: vec![
+            candle_gen::gen_core::Conditioning::VideoClip {
+                frames: vec![left; 97],
+                frame_idx: 0,
+                strength: 1.0,
+            },
+            candle_gen::gen_core::Conditioning::VideoClip {
+                frames: vec![right; 97],
+                frame_idx: -1,
+                strength: 1.0,
+            },
+        ],
+        ..Default::default()
+    };
+    {
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("q4 bridge admission")
+            .expect("memory scope");
+        scope
+            .configure_request(&mut request)
+            .expect("bind ordered bridge controls");
+        scope
+            .finish(MemoryRunOutcome::Complete)
+            .expect("scope cleanup");
+    }
+    assert!(request
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.tile_vae_decode));
+    let mut on_progress = |_p: Progress| {};
+    let output = generator
+        .generate(&request, &mut on_progress)
+        .expect("q4 bridge render with selected bounded decode");
+    let GenerationOutput::Video { frames, fps, .. } = output else {
+        panic!("expected video");
+    };
+    assert_eq!(fps, 24);
+    assert_eq!(frames.len(), 97);
+    assert_frame_coherent(&frames[0], "q4-bridge#0");
+    assert_frame_coherent(frames.last().expect("last frame"), "q4-bridge#last");
+}
+
 /// The q8 packed tier renders a coherent short video (double-quant Q8_0 path); only runs when the q8
 /// tier is present locally.
 #[test]

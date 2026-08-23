@@ -860,4 +860,36 @@ mod tests {
         );
         assert_eq!(crossed.memory, None);
     }
+
+    #[test]
+    fn bridge_fixture_binds_ordered_two_clip_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "video_bridge")
+            .unwrap();
+        assert!(matches!(
+            safety_check(&contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        ));
+        let mut scope = begin(&contract, Device::Cpu, &fixture.context)
+            .unwrap()
+            .unwrap();
+        let mut accepted = fixture.request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+
+        let mut crossed = fixture.request;
+        crossed.conditioning.swap(0, 1);
+        let error = scope
+            .configure_request(&mut crossed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("conditioning/FPS/strength identity"),
+            "{error}"
+        );
+        assert_eq!(crossed.memory, None);
+    }
 }
