@@ -12,7 +12,7 @@
 //! # MOCHI_MLX_TIER_DIR = the SceneWorks/mochi-1-mlx download root (holds q4/ q8/ bf16/ + shared
 //! # text_encoder/ vae/ tokenizer/ siblings). Or leave unset to use ~/mochi-tiers.
 //! set MOCHI_MLX_TIER_DIR=C:\models\mochi-1-mlx
-//! cargo test -p candle-gen-mochi --features cuda --test tier_parity -- --ignored --nocapture
+//! cargo test -p candle-gen-mochi --features cuda --test integration tier_parity:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

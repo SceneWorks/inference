@@ -1,7 +1,7 @@
 //! LoRA/LoKr injection tests for mlx-gen-anima (sc-10521). All `#[ignore]`d and real-weights-gated —
 //! they need BOTH the `circlestone-labs/Anima` base snapshot (DiT checkpoints) and the
 //! `circlestone-labs/Anima-Official-LoRAs` snapshot in the HF cache, plus Metal. Run with:
-//!   cargo test -p mlx-gen-anima --release --test lora_injection -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration lora_injection:: -- --ignored --nocapture
 //! The α = r ⇒ scale-1.0 weight-level checks live in a sibling process-isolated binary,
 //! `tests/scale_convention.rs` (see its module doc for the Metal-stream reason). Both binaries — and
 //! `tests/real_weights.rs` / `tests/velocity_convention.rs` — run under the full documented invocation
@@ -28,7 +28,7 @@
 //!   2. the α = r ⇒ scale 1.0 convention (weight-level: injected forward == base + B·A, + the
 //!      halve-scale mutation) — in `tests/scale_convention.rs`.
 
-mod common;
+use crate::common;
 
 use mlx_rs::ops::{matmul, multiply, subtract};
 use mlx_rs::Dtype;

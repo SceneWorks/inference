@@ -5,7 +5,7 @@
 //! e2e prompt was plain ASCII. This gate tokenizes a battery of edge-case prompts with the Rust
 //! loaders and asserts byte-equality against the fork's ids (`tools/dump_flux_tokenizer_battery.py`).
 //!
-//! Run: MLX_GEN_FLUX_SNAPSHOT=<snapshot> cargo test -p mlx-gen-flux --test tokenizer_parity \
+//! Run: MLX_GEN_FLUX_SNAPSHOT=<snapshot> cargo test -p mlx-gen-flux --test integration tokenizer_parity:: \
 //!        -- --ignored --nocapture
 
 use std::path::PathBuf;

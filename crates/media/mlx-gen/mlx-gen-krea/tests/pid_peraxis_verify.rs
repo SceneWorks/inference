@@ -5,7 +5,7 @@
 //! aspect-preserving (old fix) +13.86, wide absolute −1.97.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-krea --release --test pid_peraxis_verify -- --ignored --nocapture
+//! cargo test -p mlx-gen-krea --release --test integration pid_peraxis_verify:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

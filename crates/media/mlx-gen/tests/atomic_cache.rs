@@ -1,4 +1,5 @@
 #[path = "support/atomic_cache.rs"]
+#[allow(clippy::module_inception)] // the test file and the support module share the name
 mod atomic_cache;
 
 #[test]

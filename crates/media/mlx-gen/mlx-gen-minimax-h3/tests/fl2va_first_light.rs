@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<root> SCENEWORKS_GPU_ID=mlx MINIMAX_H3_FL2VA_STEPS=4 \
-//!   cargo test -p mlx-gen-minimax-h3 --test fl2va_first_light -- --ignored --nocapture
+//!   cargo test -p mlx-gen-minimax-h3 --test integration fl2va_first_light:: -- --ignored --nocapture
 //! ```
 //!
 //! # What this covers that `fl2va_conditioning.rs` cannot
@@ -41,7 +41,7 @@
 //! shapes are **different renders from the same seed**, and that a keyframe **changes the output**
 //! against the `t2va` baseline — which is the pixel-level statement that can be made honestly.
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

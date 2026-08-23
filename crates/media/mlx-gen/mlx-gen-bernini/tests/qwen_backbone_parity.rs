@@ -8,7 +8,7 @@
 //! checkpoint. f32 throughout; the penultimate tolerance reflects the MLX-Metal-vs-torch f32 matmul
 //! floor over the 2-layer stack, while the MRoPE table (trig only) matches far tighter.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test qwen_backbone_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration qwen_backbone_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::qwen2_5_vl::{Qwen25VlText, QwenVlTextConfig};

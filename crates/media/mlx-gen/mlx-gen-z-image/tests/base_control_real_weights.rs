@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image` base snapshot (the 19 GB base weights) **and**
 //! the base control checkpoint `alibaba-pai/Z-Image-Fun-Controlnet-Union-2.1` in the HF cache. Run with:
-//!   cargo test -p mlx-gen-z-image --release --test base_control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration base_control_real_weights:: -- --ignored --nocapture
 //!
 //! Unlike the Turbo control golden tests (which compare against a fork dump), the base control variant
 //! has no fork golden, so this is a **steering smoke**: drive the public

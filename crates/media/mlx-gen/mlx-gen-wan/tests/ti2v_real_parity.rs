@@ -19,7 +19,7 @@
 //! ```text
 //! WAN_5B_MODEL_DIR="$HOME/Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b" \
 //! WAN_5B_FIXTURE=/tmp/wan_5b_ti2v.safetensors \
-//!   cargo test -p mlx-gen-wan --test ti2v_real_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration ti2v_real_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

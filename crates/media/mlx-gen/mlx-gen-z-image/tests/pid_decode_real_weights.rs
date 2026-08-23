@@ -13,7 +13,7 @@
 //! else the HF cache).
 //!
 //! ```sh
-//! cargo test -p mlx-gen-z-image --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-z-image --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the golden from `tools/dump_instantid_kps_golden.py` (cv2 4.13 ground truth).
 //! Run:
-//!   cargo test -p mlx-gen-instantid --release --test instantid_kps -- --ignored --nocapture
+//!   cargo test -p mlx-gen-instantid --release --test integration instantid_kps:: -- --ignored --nocapture
 //!
 //! Four cases (square+view-angle, non-square+detected, extreme profile, tiny 64²) — each compared
 //! byte-for-byte against the OpenCV output (zero differing pixels required).

@@ -50,7 +50,7 @@
 //! until sc-17151's review, which is how it came to name `get_active_memory`-alone blindness in its
 //! own assertion string while measuring with it.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

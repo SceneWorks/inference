@@ -32,7 +32,7 @@
 //! SENSENOVA_PREVIEW_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sensenova-u1-8b-mlx\snapshots\<rev>\q8 \
 //! SENSENOVA_PREVIEW_FAST_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sensenova-u1-8b-fast-mlx\snapshots\<rev>\bf16 \
 //! SENSENOVA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16960 \
-//!   cargo test -p candle-gen-sensenova --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-sensenova --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

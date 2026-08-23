@@ -28,7 +28,7 @@
 //!
 //! ```sh
 //! # 1) Build the test binary WITHOUT running it.
-//! cargo test -p mlx-gen-sd3 --release --test profile_memory --no-run
+//! cargo test -p mlx-gen-sd3 --release --test integration profile_memory:: --no-run
 //! # 2) Resolve the binary and run it DIRECTLY under /usr/bin/time -l.
 //! BIN=$(ls -t target/release/deps/profile_memory-* | grep -v '\.d$' | head -1)
 //! SD3_LARGE_SNAPSHOT=/path/to/models--stabilityai--stable-diffusion-3.5-large/snapshots/<rev> \

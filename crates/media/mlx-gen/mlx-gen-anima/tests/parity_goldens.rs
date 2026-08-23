@@ -285,7 +285,7 @@ fn prompt_weighting_is_parsed_out_and_plain_is_strict_noop() {
 // the channel concat and the adaLN modulation each make this test fail.
 //
 // Regenerate the golden (only when the forward legitimately changes) with:
-//   ANIMA_BLESS_SYNTH=1 cargo test -p mlx-gen-anima --test parity_goldens -- \
+//   ANIMA_BLESS_SYNTH=1 cargo test -p mlx-gen-anima --test integration parity_goldens:: -- \
 //       --ignored bless_synthetic_dit_golden --nocapture
 // =================================================================================================
 
@@ -688,7 +688,7 @@ fn bless_synthetic_dit_golden() {
                 "sigma": SHARED_FIXTURE_SYNTH_SIGMA,
                 "post_patch_grid": [1, 2, 3],
             },
-            "regen_command": "ANIMA_BLESS_SYNTH=1 cargo test -p mlx-gen-anima --test parity_goldens -- \
+            "regen_command": "ANIMA_BLESS_SYNTH=1 cargo test -p mlx-gen-anima --test integration parity_goldens:: -- \
                               --ignored bless_synthetic_dit_golden --nocapture",
         },
         "block0": synth_summarize(&block0, 64),

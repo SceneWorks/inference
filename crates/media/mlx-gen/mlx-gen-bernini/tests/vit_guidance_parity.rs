@@ -5,14 +5,14 @@
 //! `rv2v_wapg` / `r2v_wapg`) over random `[1, n, C]` target-sliced packed-token predictions. Pure
 //! elementwise + a single-scalar projection per delta, so this matches to the f32 floor.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test vit_guidance_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration vit_guidance_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::guidance::apg_delta;
 use mlx_gen_bernini::vit_guidance::{rv2v_chain, vae_txt_vit};
 use mlx_rs::Array;
 
-mod common;
+use crate::common;
 
 use common::{
     SHARED_FIXTURE_VIT_GUIDANCE_APG_ETA, SHARED_FIXTURE_VIT_GUIDANCE_APG_NORM_THRESHOLD,

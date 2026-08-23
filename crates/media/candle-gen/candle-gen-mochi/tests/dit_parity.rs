@@ -5,7 +5,7 @@
 //! golden. The random-weight shape/determinism gate lives in `transformer::tests`.
 //!
 //! Windows run:
-//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test dit_parity -- --ignored --nocapture`
+//!   `MOCHI_SNAPSHOT=/path/to/mochi-1-preview cargo test -p candle-gen-mochi --features cuda --test integration dit_parity:: -- --ignored --nocapture`
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};

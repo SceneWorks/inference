@@ -17,7 +17,7 @@
 //! KREA_TURBO_DIR=D:\models\Krea-2-Turbo \
 //! QWEN_IMAGE_VAE_FILE=D:\models\qwen-image-mlx\q8\vae\diffusion_pytorch_model.safetensors \
 //! KREA_PREVIEW_ARTIFACT_DIR=D:\out\sc-16950 \
-//!   cargo test -p candle-gen-krea --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

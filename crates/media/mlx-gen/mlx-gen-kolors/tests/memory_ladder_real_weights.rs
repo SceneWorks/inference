@@ -38,7 +38,7 @@
 //!
 //! ```text
 //! KOLORS_LADDER_ROOT=<the SceneWorks/kolors-mlx snapshot root, containing q4/ q8/ bf16/> \
-//!   cargo test -p mlx-gen-kolors --test memory_ladder_real_weights -- --ignored --test-threads=1
+//!   cargo test -p mlx-gen-kolors --test integration memory_ladder_real_weights:: -- --ignored --test-threads=1
 //! ```
 //!
 //! The env var is the only input: nothing here derives a cache location (epic 13657).

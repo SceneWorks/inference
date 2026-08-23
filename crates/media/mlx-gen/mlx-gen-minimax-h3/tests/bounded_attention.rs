@@ -21,7 +21,7 @@
 //! decided at the live shape *inside* the forward. Without it every assertion here would be a false
 //! green: "bounded output == unbounded output" is trivially true when the bounding never engaged.
 
-mod common;
+use crate::common;
 
 use mlx_rs::{Array, Dtype};
 

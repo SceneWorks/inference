@@ -8,7 +8,7 @@
 //!   exact-multiple edge, and multi-image.
 //!
 //! Run: `cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_qwen_vision_golden.py`, then
-//! `cargo test -p mlx-gen-qwen-image --release --test vision_real_weights -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-qwen-image --release --test integration vision_real_weights:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

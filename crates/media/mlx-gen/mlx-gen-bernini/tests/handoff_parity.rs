@@ -6,7 +6,7 @@
 //! `for_gen` integration end-to-end. Tolerance reflects the f32 `for_gen` floor (erf-GELU + 2 matmuls
 //! + RMSNorm); the mask selection itself is exact (a wrong stream is O(1)).
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test handoff_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration handoff_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::connector::MlpConnector;

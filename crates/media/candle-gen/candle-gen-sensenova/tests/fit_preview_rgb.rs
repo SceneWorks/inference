@@ -31,13 +31,21 @@
 //! ```sh
 //! SENSENOVA_PREVIEW_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--sensenova-u1-8b-mlx\snapshots\<rev>\q8 \
 //! SENSENOVA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16960 \
-//!   cargo test -p candle-gen-sensenova --release --features cuda --test fit_preview_rgb \
+//!   cargo test -p candle-gen-sensenova --release --features cuda --test integration fit_preview_rgb:: \
 //!     -- --ignored --nocapture
 //! ```
 //!
 //! Every input is **required** by the row that uses it: a row that early-returns on an unset variable
 //! still reports SUCCESS, and in a run log a skipped gate is indistinguishable from one that ran and
 //! proved something. Asking for `--ignored` is already the opt-in.
+//!
+//! This module needs the diagnostics-only raw loader
+//! (`candle_gen_sensenova::load_understanding_for_diagnostics`), which is gated behind the
+//! `real-weight-diagnostics` feature. sc-21383 folded every `tests/*.rs` into one `integration`
+//! binary whose module list is generated, so the gate lives here as an inner `cfg` rather than as a
+//! `required-features` key on a per-file `[[test]]` target: the consolidated binary still builds
+//! without the feature, and this module's contents are simply configured out.
+#![cfg(feature = "real-weight-diagnostics")]
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

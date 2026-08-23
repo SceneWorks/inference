@@ -20,7 +20,7 @@
 //! ```text
 //! set LTX_PACKED_Q4=D:\.cache\huggingface\hub\models--SceneWorks--ltx-2.3-mlx\snapshots\<hash>\q4
 //! set LTX_PACKED_Q8=...\q8    (optional)
-//! cargo test -p candle-gen-ltx --features cuda --release --test packed_tier_validate -- --ignored --nocapture
+//! cargo test -p candle-gen-ltx --features cuda --release --test integration packed_tier_validate:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

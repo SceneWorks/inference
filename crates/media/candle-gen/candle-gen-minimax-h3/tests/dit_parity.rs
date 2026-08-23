@@ -34,7 +34,7 @@
 //! Setting the tolerance from *this* lane's measured floor is what sc-17154 established, and it is
 //! what makes the suite able to see defects the MLX one structurally cannot.
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeSet, HashMap};
 

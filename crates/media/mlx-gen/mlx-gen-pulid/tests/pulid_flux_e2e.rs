@@ -11,7 +11,7 @@
 //!
 //! Inputs resolve from local caches (FLUX HF cache, guozinan/PuLID, tools/golden for EVA + face).
 //! Run:
-//!   cargo test -p mlx-gen-pulid --release --test pulid_flux_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pulid --release --test integration pulid_flux_e2e:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

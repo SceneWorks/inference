@@ -40,7 +40,7 @@ use mlx_gen_mage::{
     DualStream, ImgShape, MageTransformer, MsRope, PackContext, PackLayout, RopeTable,
 };
 
-mod common;
+use crate::common;
 use common::error;
 
 const FIXTURE: &str = concat!(

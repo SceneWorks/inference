@@ -31,7 +31,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::Weights;
 use candle_gen_sana::{SanaTransformer, SanaTransformerConfig};
 
-mod common;
+use crate::common;
 
 use common::{tiny_config, tiny_sprint_config};
 
@@ -152,7 +152,7 @@ fn sprint_trunk_matches_diffusers_tiny() {
 /// Run:
 ///   SANA_TRANSFORMER_WEIGHTS=/path/to/Sana_1600M_1024px_diffusers \
 ///   SANA_TRANSFORMER_GOLDEN=/path/to/sana_transformer_real.safetensors \
-///   cargo test -p candle-gen-sana --test transformer_parity -- --ignored --nocapture
+///   cargo test -p candle-gen-sana --test integration transformer_parity:: -- --ignored --nocapture
 #[test]
 #[ignore = "needs Sana_1600M_1024px_diffusers transformer + a --real golden (SANA_TRANSFORMER_WEIGHTS / SANA_TRANSFORMER_GOLDEN)"]
 fn trunk_matches_diffusers_real() {

@@ -11,7 +11,7 @@
 //!
 //! `#[ignore]`d — needs the golden from `tools/dump_qwen_lightning_golden.py` (gitignored):
 //!   /Users/michael/Repos/mflux/.venv/bin/python tools/dump_qwen_lightning_golden.py
-//!   cargo test -p mlx-gen-qwen-image --test lightning_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --test integration lightning_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen::DiffusionSampler;

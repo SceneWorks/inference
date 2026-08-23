@@ -27,7 +27,7 @@
 //! f32 ground-truth manual attention (≈16-bit rounding, not garbage). It FAILS on a NAX build whose
 //! metal kernels were compiled below the 26.2 floor (e.g. MACOSX_DEPLOYMENT_TARGET regressed to 26.0).
 //! On non-NAX builds 16-bit SDPA uses correct fallback kernels, so it passes there too. Needs no
-//! weights, only MLX. Run: `cargo test -p mlx-gen-qwen-image --release --test sdpa_nax_repro
+//! weights, only MLX. Run: `cargo test -p mlx-gen-qwen-image --release --test integration sdpa_nax_repro::
 //! -- --nocapture`.
 
 use mlx_gen::array::scalar;

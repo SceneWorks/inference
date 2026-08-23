@@ -6,7 +6,7 @@
 //! golden from `tools/dump_hyper_flux_golden.py` (gitignored, local):
 //!   cd ~/Repos/mflux && .venv/bin/python ~/Repos/mlx-gen/tools/dump_hyper_flux_golden.py
 //!   python3 ~/Repos/mlx-gen/tools/verify_adapter_parity_artifacts.py
-//!   cargo test -p mlx-gen-flux --test hyper_flux_real_weights -- --ignored --nocapture --test-threads=1
+//!   cargo test -p mlx-gen-flux --test integration hyper_flux_real_weights:: -- --ignored --nocapture --test-threads=1
 //!
 //! Gates the story's "acceleration-LoRA viability on that path":
 //! (1) the PEFT-format Hyper-FLUX LoRA — which targets the top-level GLOBAL projections the fork's

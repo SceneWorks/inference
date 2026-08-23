@@ -733,8 +733,8 @@ fn base_trunk_does_not_require_sprint_keys() {
 ///
 /// Run:
 ///   SANA_SPRINT_WEIGHTS=/path/Sana_Sprint_1.6B_1024px_diffusers \
-///     cargo test -p mlx-gen-sana --release --test sprint_contract \
-///       -- --ignored --nocapture real_weight_sprint_1024_e2e
+///     cargo test -p mlx-gen-sana --release --test integration \
+///       -- --ignored --nocapture sprint_contract::real_weight_sprint_1024_e2e
 #[test]
 #[ignore = "needs a Sana_Sprint_1.6B_1024px_diffusers snapshot; set SANA_SPRINT_WEIGHTS"]
 fn real_weight_sprint_1024_e2e() {

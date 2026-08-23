@@ -1,8 +1,8 @@
 //! CUDA performance regression for the SANA-1.6B Mix-FFN depthwise convolution (sc-12111).
 //!
 //! Run on an exclusive GPU in release mode:
-//! `CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test depthwise_conv_gpu \
-//!     --features cuda --release -- --ignored --nocapture`
+//! `CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test integration \
+//!     --features depthwise_conv_gpu::cuda --release -- --ignored --nocapture`
 
 #![cfg(feature = "cuda")]
 

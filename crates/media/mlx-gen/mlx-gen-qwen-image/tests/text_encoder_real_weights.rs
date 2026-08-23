@@ -4,7 +4,7 @@
 //! (the on-disk `model.*` layout maps onto the Rust tree under the `"model"` prefix) and the local
 //! golden from `tools/dump_qwen_text_encoder_golden.py` (gitignored: fixed inputs + the fork's f32
 //! encoder hidden states + drop-34 prompt embeds). Run:
-//!   cargo test -p mlx-gen-qwen-image --release --test text_encoder_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration text_encoder_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -34,8 +34,8 @@
 //!
 //! Run (exclusive GPU, `--release`; `-j 1` avoids lld OOM):
 //! ```text
-//! CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test nvfp4_sana_dit_gpu \
-//!     --features cuda --release -- --ignored --nocapture
+//! CUDA_COMPUTE_CAP=120 cargo test --locked -j 1 -p candle-gen-sana --test integration \
+//!     --features nvfp4_sana_dit_gpu::cuda --release -- --ignored --nocapture
 //! ```
 
 #![cfg(feature = "cuda")]
