@@ -696,7 +696,7 @@ impl Generator for Bernini {
         // Reconciled memory lanes: the existing public still surface and SC-20765's exact V2V
         // surface share the provider but retain separate, fail-closed request identities.
         if req.frames == Some(1) || req.memory.is_some() {
-            crate::memory_strategy::validate_request(req)?;
+            crate::memory_strategy::validate_public_request(req)?;
         }
         // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
         // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
@@ -991,11 +991,14 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors the packing order).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V uses the trained source/reference/first-image triplet; extra images interpolate
+        // across ids 1..=3, matching its admission receipt.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Tensor, f64)> = src_videos
             .iter()
             .enumerate()
@@ -1027,11 +1030,7 @@ impl Bernini {
             ];
             let high = BVitExpert::build(&comps.high, streams4)?;
             let low = BVitExpert::build(&comps.low, streams4)?;
-            let pf = PackedForward::new(
-                dit_cfg,
-                self.knobs.max_trained_src_id,
-                self.knobs.interpolate_src_id,
-            );
+            let pf = PackedForward::new(dit_cfg, trained_sources, self.knobs.interpolate_src_id);
             let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
             let shift = req
                 .scheduler_shift

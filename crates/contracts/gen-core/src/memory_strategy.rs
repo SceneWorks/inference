@@ -130,6 +130,10 @@ use sha2::{Digest, Sha256};
 /// model-memory calibration matrix.
 pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
+/// ABI for canonical, load-exact structural evidence used to admit an estimate-backed Resident
+/// route without misrepresenting that estimate as measured calibration.
+pub const MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI: u32 = 1;
+
 /// Current ABI of production-latent tiled-decode quality records.
 ///
 /// This identity is deliberately independent from [`MEMORY_CALIBRATION_ABI`]: decode quality is a
@@ -892,6 +896,132 @@ pub struct MemoryAssetFacts {
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
+}
+
+/// Immutable provider-owned facts for a narrowly pinned Resident route.
+///
+/// This is intentionally separate from [`MemoryCalibrationIdentity`]: it proves what was loaded and
+/// how many bytes it contains, but makes no measured-peak claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryStructuralResidentEvidence {
+    pub abi: u32,
+    pub provider_id: String,
+    pub repository: String,
+    pub revision: String,
+    pub variant: String,
+    pub receipt_sha256: String,
+    pub tier: MemoryNumericTier,
+    pub load_shape: LoadShape,
+    pub asset_facts: MemoryAssetFacts,
+    /// Request-scoped bytes needed while adapters are folded. These are not steady overlay bytes.
+    pub request_transient_bytes: u64,
+    pub direct_file_count: u32,
+    pub adapter_count: u32,
+}
+
+/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`]. Source ids are
+/// represented by a caller-produced digest so this contract does not depend on SceneWorks assets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryStructuralResidentRequestIdentity {
+    pub source_digest: String,
+    pub mode: String,
+    pub carrier_shape: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub fps: u32,
+    pub reference_count: u32,
+    pub seed: Option<u64>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f32>,
+    pub scheduler_shift: Option<f32>,
+    pub selection: MemorySelection,
+}
+
+impl MemoryStructuralResidentEvidence {
+    pub fn validate(&self) -> Result<()> {
+        if self.abi != MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI
+            || self.provider_id.is_empty()
+            || self.repository.is_empty()
+            || self.revision.is_empty()
+            || self.variant.is_empty()
+            || self.receipt_sha256.len() != 64
+            || !self
+                .receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.asset_facts.base_bytes == 0
+            || self.direct_file_count == 0
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident evidence".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn evidence_revision(
+        &self,
+        request: &MemoryStructuralResidentRequestIdentity,
+    ) -> Result<String> {
+        self.validate()?;
+        if request.source_digest.len() != 64
+            || !request
+                .source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident source identity".to_owned(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        for value in [
+            self.provider_id.as_str(),
+            self.repository.as_str(),
+            self.revision.as_str(),
+            self.variant.as_str(),
+            self.receipt_sha256.as_str(),
+            request.source_digest.as_str(),
+            request.mode.as_str(),
+            request.carrier_shape.as_str(),
+            request.sampler.as_deref().unwrap_or(""),
+            request.scheduler.as_deref().unwrap_or(""),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(request.width.to_le_bytes());
+        hasher.update(request.height.to_le_bytes());
+        hasher.update(request.frames.to_le_bytes());
+        hasher.update(request.fps.to_le_bytes());
+        hasher.update(request.reference_count.to_le_bytes());
+        hasher.update(request.seed.unwrap_or_default().to_le_bytes());
+        hasher.update(request.steps.unwrap_or_default().to_le_bytes());
+        hasher.update(
+            request
+                .guidance
+                .map(f32::to_bits)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        hasher.update(
+            request
+                .scheduler_shift
+                .map(f32::to_bits)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        hasher.update(format!("{:?}", request.selection));
+        Ok(format!(
+            "scail2-resident-v1:{}:{}:{:x}",
+            self.receipt_sha256,
+            request.source_digest,
+            hasher.finalize()
+        ))
+    }
 }
 
 /// Request-level cache keys must include every axis that can change residency or execution.

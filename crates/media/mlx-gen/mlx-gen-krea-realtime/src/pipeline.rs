@@ -119,6 +119,73 @@ fn reject_unimplemented_video_clip_knobs(req: &GenerationRequest) -> Result<()> 
     Ok(())
 }
 
+/// Krea V2V has exactly one conditioning carrier. Multiple clips, a clip plus a still, malformed
+/// strength, or a source shorter than the requested output used to pass validation and let `run`
+/// silently choose the first clip. Refuse that ambiguity before any staging or source allocation.
+fn validate_v2v_contract(req: &GenerationRequest, resolved: ResolvedFrames) -> Result<()> {
+    let clips = req
+        .conditioning
+        .iter()
+        .filter_map(|conditioning| match conditioning {
+            Conditioning::VideoClip {
+                frames,
+                strength,
+                frame_idx,
+            } => Some((frames, *strength, *frame_idx)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let explicitly_v2v = req.video_mode.as_deref() == Some("video_to_video");
+    if clips.is_empty() {
+        if explicitly_v2v {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID} video_to_video requires exactly one VideoClip carrier"
+            )));
+        }
+        return Ok(());
+    }
+    if !explicitly_v2v {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: a VideoClip carrier requires video_mode=video_to_video"
+        )));
+    }
+    if clips.len() != 1 || req.conditioning.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} video_to_video requires exactly one VideoClip and no other conditioning carriers"
+        )));
+    }
+    let (frames, strength, _) = clips[0];
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} VideoClip strength must be finite in [0, 1], got {strength}"
+        )));
+    }
+    if frames.len() < resolved.output as usize {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} video_to_video source has {} frames but the requested output requires {}",
+            frames.len(),
+            resolved.output
+        )));
+    }
+    let Some(first) = frames.first() else {
+        unreachable!("the source-length check rejects an empty clip")
+    };
+    if first.width == 0
+        || first.height == 0
+        || frames.iter().any(|frame| {
+            frame.width != first.width
+                || frame.height != first.height
+                || frame.pixels.len()
+                    != (u64::from(frame.width) * u64::from(frame.height) * 3) as usize
+        })
+    {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID} VideoClip frames must carry one non-zero, RGB8 effective geometry"
+        )));
+    }
+    Ok(())
+}
+
 /// Stable identity + advertised capabilities for Krea Realtime 14B (Wan-2.1-T2V-14B backbone,
 /// autoregressive self-forcing **text-to-video**; **CFG off** → no negative prompt / no guidance; a
 /// fixed Self-Forcing few-step sampler; a rolling causal KV cache).
@@ -390,7 +457,9 @@ impl KreaRealtime {
         // under a `..` and dropping it. Both `validate` and `run` route through here, so the
         // pre-flight and the render cannot disagree.
         reject_unimplemented_video_clip_knobs(req)?;
-        resolve_frames(req)
+        let frames = resolve_frames(req)?;
+        validate_v2v_contract(req, frames)?;
+        Ok(frames)
     }
 
     fn finish_reported_generation(
@@ -918,7 +987,9 @@ mod tests {
         GenerationRequest {
             width: 512,
             height: 512,
+            frames: Some(u32::try_from(source_frames).unwrap_or(u32::MAX)),
             count: 1,
+            video_mode: Some("video_to_video".to_owned()),
             conditioning: vec![Conditioning::VideoClip {
                 frames: vec![source; source_frames],
                 frame_idx: 0,
@@ -1034,5 +1105,90 @@ mod tests {
             *strength = 1.0;
         }
         Generator::validate(&provider, &default_strength).unwrap();
+    }
+
+    #[test]
+    fn v2v_contract_rejects_crossed_carriers_strength_short_source_and_geometry() {
+        let provider = unloaded();
+        let valid = v2v_request(5);
+        Generator::validate(&provider, &valid).expect("one exact clip is valid");
+
+        let mut crossed = valid.clone();
+        crossed.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        });
+        assert!(Generator::validate(&provider, &crossed)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one VideoClip"));
+
+        for strength in [-0.01, 1.01, f32::NAN] {
+            let mut invalid = valid.clone();
+            let Conditioning::VideoClip {
+                strength: actual, ..
+            } = &mut invalid.conditioning[0]
+            else {
+                unreachable!()
+            };
+            *actual = strength;
+            let error = Generator::validate(&provider, &invalid)
+                .expect_err("out-of-range and non-finite clip strengths must fail");
+            assert!(error.to_string().contains("strength"), "{error}");
+        }
+
+        let mut short = valid.clone();
+        short.frames = Some(9);
+        assert!(Generator::validate(&provider, &short)
+            .unwrap_err()
+            .to_string()
+            .contains("source has 5 frames"));
+
+        let mut crossed_geometry = valid;
+        let Conditioning::VideoClip { frames, .. } = &mut crossed_geometry.conditioning[0] else {
+            unreachable!()
+        };
+        frames[1].width = 2;
+        assert!(Generator::validate(&provider, &crossed_geometry)
+            .unwrap_err()
+            .to_string()
+            .contains("effective geometry"));
+    }
+
+    #[test]
+    fn explicit_v2v_mode_cannot_fall_through_to_unconditioned_generation() {
+        let provider = unloaded();
+        let request = GenerationRequest {
+            width: 512,
+            height: 512,
+            frames: Some(5),
+            video_mode: Some("video_to_video".to_owned()),
+            ..Default::default()
+        };
+        assert!(Generator::validate(&provider, &request)
+            .unwrap_err()
+            .to_string()
+            .contains("requires exactly one VideoClip"));
+    }
+
+    #[test]
+    fn video_clip_requires_the_exact_v2v_mode() {
+        let provider = unloaded();
+        for crossed_mode in [None, Some("image_to_video")] {
+            let mut request = v2v_request(5);
+            request.video_mode = crossed_mode.map(str::to_owned);
+            let error = Generator::validate(&provider, &request)
+                .expect_err("a VideoClip must never infer or borrow a non-V2V public mode");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires video_mode=video_to_video"),
+                "{crossed_mode:?}: {error}"
+            );
+        }
     }
 }
