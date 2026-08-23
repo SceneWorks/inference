@@ -1124,6 +1124,9 @@ impl Pipeline {
                     .map(|decoder| decoder as &dyn LatentDecoder),
                 &latents,
                 &req.cancel,
+                req.memory
+                    .map(|memory| memory.tile_vae_decode)
+                    .unwrap_or_else(crate::vae_tiling_enabled),
             )
         })
     }
@@ -1289,13 +1292,14 @@ impl Pipeline {
         pid: Option<&dyn LatentDecoder>,
         latents: &Tensor,
         cancel: &CancelFlag,
+        tiling_enabled: bool,
     ) -> Result<Image> {
         let native = if self.ldm.is_some() {
             SdxlLatentDecoder::with_decode_dtype(vae, DType::F32)
         } else {
             SdxlLatentDecoder::new(vae)
         };
-        self.decode_with_tiling_gate(&native, pid, latents, cancel, crate::vae_tiling_enabled())
+        self.decode_with_tiling_gate(&native, pid, latents, cancel, tiling_enabled)
     }
 
     /// Production SDXL decoder dispatch after the process-global tiling gate is sampled. Kept
@@ -1586,12 +1590,14 @@ mod tests {
         let expected = legacy_sdxl_image(&vae, &latents);
         let pipeline = decode_test_pipeline(&device);
         let cancel = CancelFlag::default();
-        let got = pipeline.decode(&vae, None, &latents, &cancel).unwrap();
+        let got = pipeline
+            .decode(&vae, None, &latents, &cancel, false)
+            .unwrap();
         assert_eq!(got, expected);
 
         let pid = SdxlDecodeSpy::same(Tensor::ones((1, 3, 4, 7), DType::F32, &device).unwrap());
         let got = pipeline
-            .decode(&vae, Some(&pid), &latents, &cancel)
+            .decode(&vae, Some(&pid), &latents, &cancel, false)
             .unwrap();
         assert_eq!((got.width, got.height), (7, 4));
         assert!(got.pixels.iter().all(|pixel| *pixel == 255));

@@ -11,22 +11,24 @@ use std::path::PathBuf;
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, LoadSpec, MemoryRunContext, PreviewSink, Progress, WeightsSource,
+};
 use candle_gen::{CandleError, Result, STEP_RNG_SALT};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::conditioning::SdxlConditioner;
 use crate::denoise::{
-    decode_image, denoise_ip_control, preprocess_control_image, text_time_ids, ControlContext,
-    Denoiser,
+    decode_image_with_tiling, denoise_ip_control, preprocess_control_image, text_time_ids,
+    ControlContext, Denoiser,
 };
 use crate::loaders::{
     load_instantid_unet_with_adapters, load_sdxl_controlnet, load_sdxl_vae, load_sdxl_vae_encoder,
 };
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, UNet2DConditionModel, VaeMomentsEncoder};
-use crate::{SdxlVaeDecoder, SIZE_MULTIPLE};
+use crate::{SdxlArtifactSeal, SdxlVaeDecoder, SIZE_MULTIPLE};
 
 const DTYPE: DType = DType::F16;
 
@@ -87,6 +89,7 @@ pub struct SdxlDetail {
     controlnet: ControlNet,
     sampler: EulerAncestralSampler,
     device: Device,
+    memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
 }
 
 impl SdxlDetail {
@@ -112,7 +115,23 @@ impl SdxlDetail {
             controlnet,
             sampler: EulerAncestralSampler::sdxl(),
             device,
+            memory_admission: None,
         })
+    }
+
+    /// Load from the exact selector-authorized base/tile-ControlNet/component/adapter assembly.
+    pub fn load_admitted(
+        paths: &SdxlDetailPaths,
+        spec: &LoadSpec,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        crate::memory_strategy::validate_detail_spec(paths, spec)?;
+        let seal = SdxlArtifactSeal::capture(spec)?;
+        crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
+        crate::memory_strategy::validate_bespoke_context(&context)?;
+        let mut model = Self::load(paths)?;
+        model.memory_admission = Some((seal, context));
+        Ok(model)
     }
 
     /// Refine `source` while using `control` as the SDXL tile-ControlNet condition.
@@ -127,6 +146,21 @@ impl SdxlDetail {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let memory = if let Some((seal, context)) = &self.memory_admission {
+            crate::memory_strategy::validate_bespoke_request(
+                seal,
+                context,
+                req.width,
+                req.height,
+                1,
+                false,
+                "image_detail",
+            )?;
+            seal.contract().generation_memory(&context.selection)
+        } else {
+            None
+        };
+        let _attention = crate::enter_attention_memory(memory);
 
         let cfg_on = req.guidance > 1.0;
         let (conditioning, pooled) = self
@@ -185,7 +219,10 @@ impl SdxlDetail {
             &conditioning,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents, None, Some(&req.cancel))
+        let tiling = memory
+            .map(|memory| memory.tile_vae_decode)
+            .unwrap_or_else(crate::vae_tiling_enabled);
+        decode_image_with_tiling(&self.vae, &latents, None, Some(&req.cancel), tiling)
     }
 
     fn encode_source(&self, source: &Image, width: u32, height: u32) -> Result<Tensor> {
