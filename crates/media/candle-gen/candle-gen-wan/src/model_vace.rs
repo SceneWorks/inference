@@ -267,9 +267,12 @@ impl Pipeline {
         // single high-res frame can't spike VRAM (48 GiB single-pass would OOM a 24 GB card), forces
         // tiling below the candle conv2d im2col-safe cap so the untiled decode can't silently corrupt,
         // and returns a catchable error rather than OOM-ing when over budget.
-        let decoded = comps
-            .vae
-            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let images = frames_to_images(&decoded)?;
         Ok((images, fps))
     }
@@ -282,6 +285,7 @@ pub struct WanVaceGenerator {
     root: PathBuf,
     device: Device,
     components: Mutex<Option<Components>>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceGenerator {
@@ -422,6 +426,9 @@ impl Generator for WanVaceGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let pipe = Pipeline::load(&self.root, &self.device);
         let components = self.components(&pipe)?;
         let (frames, fps) = pipe.render(req, &components, on_progress)?;
@@ -430,6 +437,34 @@ impl Generator for WanVaceGenerator {
             fps,
             audio: None,
         })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "wan_vace loaded route has no sealed memory contract".to_owned(),
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        match &self.i2v_memory {
+            Some(prepared) => {
+                crate::i2v_memory_strategy::begin_request(prepared, self.device.clone(), context)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -485,11 +520,19 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_VACE)?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceGenerator {
         descriptor: descriptor(),
         root,
         device,
         components: Mutex::new(None),
+        i2v_memory,
     }))
 }
 

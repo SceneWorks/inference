@@ -52,6 +52,7 @@
 
 pub mod config;
 pub mod dc_ae;
+pub mod memory_strategy;
 pub mod model;
 pub mod nvfp4_dit;
 pub mod pipeline;

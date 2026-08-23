@@ -41,7 +41,9 @@
 //! `SanaTransformer2DModel` names exactly, so a converted checkpoint (or the committed tiny golden)
 //! loads unchanged.
 
-use candle_gen::candle_core::{DType, Result, Tensor, D};
+use std::path::PathBuf;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{silu, softmax_last_dim};
 use candle_gen::candle_nn::{Conv2d, Module};
 use candle_gen::quant::{linear_from_weights, ActPrecision, Nvfp4Context, Nvfp4Linear, QLinear};
@@ -432,7 +434,7 @@ impl CrossAttn {
     }
 
     /// `x` (query) `[B, N, dim]`, `kv` (caption) `[B, M, dim]`.
-    fn forward(&self, x: &Tensor, kv: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, kv: &Tensor, score_budget: Option<usize>) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let m = kv.dim(1)?;
 
@@ -461,12 +463,23 @@ impl CrossAttn {
         let k = split(&k, m)?; // [B,H,M,hd]
         let v = split(&v, m)?; // [B,H,M,hd]
 
-        // Softmax SDPA in f32 (caption seq is short; full attention).
-        let scores = q
-            .matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
-            .affine(scale, 0.0)?; // [B,H,N,M]
-        let probs = softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // [B,H,N,hd]
+        let kt = k.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+        let rows = score_budget
+            .map(|budget| (budget / b.max(1) / self.heads.max(1) / m.max(1)).max(1))
+            .unwrap_or(n)
+            .min(n);
+        let ctx = if rows == n {
+            let scores = q.matmul(&kt)?.affine(scale, 0.0)?;
+            softmax_last_dim(&scores)?.matmul(&v)?
+        } else {
+            let mut chunks = Vec::with_capacity(n.div_ceil(rows));
+            for first in (0..n).step_by(rows) {
+                let count = rows.min(n - first);
+                let scores = q.narrow(2, first, count)?.matmul(&kt)?.affine(scale, 0.0)?;
+                chunks.push(softmax_last_dim(&scores)?.matmul(&v)?);
+            }
+            Tensor::cat(&chunks, 2)?
+        };
 
         let ctx = ctx.permute((0, 2, 1, 3))?.reshape((b, n, inner))?;
         self.to_out.forward(&ctx)
@@ -549,6 +562,7 @@ impl SanaBlock {
         temb: &Tensor,
         h: usize,
         w: usize,
+        attention_budget: Option<usize>,
     ) -> Result<Tensor> {
         let (b, n, dim) = hidden.dims3()?;
 
@@ -566,7 +580,7 @@ impl SanaBlock {
         let hidden = (hidden + gate_msa.broadcast_mul(&attn_out)?)?;
 
         // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption)?;
+        let cross = self.attn2.forward(&hidden, caption, attention_budget)?;
         let hidden = (cross + hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to NCHW [B,dim,H,W] → GLUMBConv → flatten → gate.
@@ -604,8 +618,24 @@ pub struct SanaTransformer {
     caption_proj_2: Proj,
     caption_norm: Tensor, // RMSNorm weight [inner]
     blocks: Vec<SanaBlock>,
+    window_source: Option<WindowSource>,
     scale_shift_table: Tensor, // [2, inner] (output modulated norm)
     proj_out: Proj,
+}
+
+struct WindowSource {
+    files: Vec<PathBuf>,
+    pins: Vec<candle_gen::gen_core::PinnedWeightsFile>,
+    digests: Vec<[u8; 32]>,
+    device: Device,
+    window: usize,
+}
+
+fn block_windows(total: usize, window: usize) -> Vec<(usize, usize)> {
+    (0..total)
+        .step_by(window)
+        .map(|first| (first, window.min(total - first)))
+        .collect()
 }
 
 impl SanaTransformer {
@@ -626,6 +656,15 @@ impl SanaTransformer {
         cfg: SanaTransformerConfig,
         plan: &DitPlan,
     ) -> candle_gen::Result<Self> {
+        Self::from_weights_planned_inner(w, cfg, plan, None)
+    }
+
+    fn from_weights_planned_inner(
+        w: &Weights,
+        cfg: SanaTransformerConfig,
+        plan: &DitPlan,
+        window_source: Option<WindowSource>,
+    ) -> candle_gen::Result<Self> {
         if let Some(bits) = validate_packed_tier(w, &cfg)? {
             if plan.is_nvfp4() {
                 return Err(candle_gen::CandleError::Msg(format!(
@@ -644,21 +683,27 @@ impl SanaTransformer {
         };
         let p = cfg.patch_size as usize;
         let patch_embed = conv(w, "patch_embed.proj", p, 0, 1, true)?;
-        let mut blocks = Vec::with_capacity(cfg.num_layers as usize);
+        let mut blocks = Vec::with_capacity(if window_source.is_some() {
+            0
+        } else {
+            cfg.num_layers as usize
+        });
         let last = cfg.num_layers - 1;
-        for i in 0..cfg.num_layers {
-            // The spike sc-11038 outlier class includes the FIRST and LAST DiT blocks. sc-11045's real
-            // activation capture showed block **1**'s self-attention also measures Dense-outlier on a
-            // live Sana-1.6B denoise (min benign fraction 0.969, crush 176×) — the residual stream is
-            // still outlier-carrying two blocks in — so the leading edge covers blocks 0 AND 1.
-            let edge = i <= 1 || i == last;
-            blocks.push(SanaBlock::load(
-                w,
-                &format!("transformer_blocks.{i}"),
-                &cfg,
-                plan,
-                edge,
-            )?);
+        if window_source.is_none() {
+            for i in 0..cfg.num_layers {
+                // The spike sc-11038 outlier class includes the FIRST and LAST DiT blocks. sc-11045's real
+                // activation capture showed block **1**'s self-attention also measures Dense-outlier on a
+                // live Sana-1.6B denoise (min benign fraction 0.969, crush 176×) — the residual stream is
+                // still outlier-carrying two blocks in — so the leading edge covers blocks 0 AND 1.
+                let edge = i <= 1 || i == last;
+                blocks.push(SanaBlock::load(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    &cfg,
+                    plan,
+                    edge,
+                )?);
+            }
         }
         // The Sprint guidance variant (`SanaCombinedTimestepGuidanceEmbeddings`) drops the `.emb.`
         // nesting AdaLayerNormSingle introduces and adds a parallel `guidance_embedder`.
@@ -691,10 +736,65 @@ impl SanaTransformer {
             caption_proj_2: proj(w, "caption_projection.linear_2", true, plan, interior)?,
             caption_norm: w.require("caption_norm.weight")?.to_dtype(DType::F32)?,
             blocks,
+            window_source,
             scale_shift_table: w.require("scale_shift_table")?.to_dtype(DType::F32)?,
             proj_out: proj(w, "proj_out", true, plan, LayerRole::final_proj())?,
             cfg,
         })
+    }
+
+    /// Build a host-backed 20-block trunk. Common projections are resident; each denoise forward
+    /// reopens and materializes only the selected consecutive block window.
+    pub fn from_files_windowed(
+        files: &[PathBuf],
+        cfg: SanaTransformerConfig,
+        window: usize,
+        device: &Device,
+    ) -> candle_gen::Result<Self> {
+        if window == 0
+            || !crate::memory_strategy::TRANSFORMER_WINDOW_SIZES.contains(&(window as u32))
+        {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "unsupported SANA transformer window {window}"
+            )));
+        }
+        let pins = files
+            .iter()
+            .map(candle_gen::gen_core::PinnedWeightsFile::pin)
+            .collect::<candle_gen::gen_core::Result<Vec<_>>>()
+            .map_err(candle_gen::CandleError::from)?;
+        let digests = pins
+            .iter()
+            .map(|pin| {
+                pin.read_unchanged(crate::memory_strategy::sha256_file)
+                    .map_err(candle_gen::CandleError::from)
+            })
+            .collect::<candle_gen::Result<Vec<_>>>()?;
+        let common = Weights::from_files_filtered(
+            files,
+            device,
+            DType::F32,
+            &[
+                "patch_embed.",
+                "time_embed.",
+                "caption_projection.",
+                "caption_norm.",
+                "scale_shift_table",
+                "proj_out.",
+            ],
+        )?;
+        Self::from_weights_planned_inner(
+            &common,
+            cfg,
+            &DitPlan::dense(),
+            Some(WindowSource {
+                files: files.to_vec(),
+                pins,
+                digests,
+                device: device.clone(),
+                window,
+            }),
+        )
     }
 
     /// Every quantizable projection in the trunk, in a stable order.
@@ -772,7 +872,7 @@ impl SanaTransformer {
         caption: &Tensor,
         timestep: &Tensor,
     ) -> Result<Tensor> {
-        self.forward_with_guidance(latent_nchw, caption, timestep, None)
+        self.forward_with_guidance_memory(latent_nchw, caption, timestep, None, None)
     }
 
     /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint).
@@ -787,6 +887,17 @@ impl SanaTransformer {
         caption: &Tensor,
         timestep: &Tensor,
         guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_with_guidance_memory(latent_nchw, caption, timestep, guidance, None)
+    }
+
+    pub fn forward_with_guidance_memory(
+        &self,
+        latent_nchw: &Tensor,
+        caption: &Tensor,
+        timestep: &Tensor,
+        guidance: Option<&Tensor>,
+        attention_budget: Option<usize>,
     ) -> Result<Tensor> {
         let cfg = &self.cfg;
         let dim = cfg.inner_dim() as usize;
@@ -825,8 +936,47 @@ impl SanaTransformer {
         let caption = rms_norm_last(&cap, &self.caption_norm, cfg.caption_norm_eps as f64)?;
 
         // 4. Transformer blocks.
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, &caption, &temb, ph, pw)?;
+        if let Some(source) = &self.window_source {
+            let total = cfg.num_layers as usize;
+            for (first, count) in block_windows(total, source.window) {
+                for (pin, digest) in source.pins.iter().zip(&source.digests) {
+                    pin.ensure_unchanged()
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    let current = pin
+                        .read_unchanged(crate::memory_strategy::sha256_file)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    if current != *digest {
+                        return Err(candle_gen::candle_core::Error::Msg(format!(
+                            "SANA transformer source changed before lazy window load: {}",
+                            pin.loader_path().display()
+                        )));
+                    }
+                }
+                let prefixes = (first..first + count)
+                    .map(|index| format!("transformer_blocks.{index}."))
+                    .collect::<Vec<_>>();
+                let refs = prefixes.iter().map(String::as_str).collect::<Vec<_>>();
+                let weights =
+                    Weights::from_files_filtered(&source.files, &source.device, DType::F32, &refs)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                for index in first..first + count {
+                    let edge = index <= 1 || index + 1 == total;
+                    let block = SanaBlock::load(
+                        &weights,
+                        &format!("transformer_blocks.{index}"),
+                        cfg,
+                        &DitPlan::dense(),
+                        edge,
+                    )
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+                }
+                source.device.synchronize()?;
+            }
+        } else {
+            for block in &self.blocks {
+                hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+            }
         }
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
@@ -1084,6 +1234,60 @@ mod tests {
             hi - lo > 1e-5,
             "trunk output is constant — graph degenerate: [{lo}, {hi}]"
         );
+    }
+
+    #[test]
+    fn bounded_caption_cross_attention_preserves_the_full_row_domain() {
+        let dev = Device::Cpu;
+        let cfg = small_cfg();
+        let model =
+            SanaTransformer::from_weights(&synthetic_trunk_weights(&cfg, &dev), cfg.clone())
+                .unwrap();
+        let latent = det(&[1, cfg.in_channels as usize, 4, 4], 101, &dev);
+        let caption = det(&[1, 3, cfg.caption_channels as usize], 202, &dev);
+        let timestep = Tensor::from_vec(vec![0.7f32], (1,), &dev).unwrap();
+        let full = model
+            .forward(&latent, &caption, &timestep)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let chunked = model
+            .forward_with_guidance_memory(&latent, &caption, &timestep, None, Some(12))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(full.len(), chunked.len());
+        let max_error = full
+            .iter()
+            .zip(&chunked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_error < 1e-5,
+            "query-row chunking changed caption attention by {max_error}"
+        );
+    }
+
+    #[test]
+    fn every_published_window_visits_the_real_twenty_block_stack_once_in_order() {
+        for window in crate::memory_strategy::TRANSFORMER_WINDOW_SIZES {
+            let ranges = block_windows(
+                crate::memory_strategy::TRANSFORMER_BLOCKS as usize,
+                *window as usize,
+            );
+            assert_eq!(ranges.first(), Some(&(0, (*window as usize).min(20))));
+            let visited = ranges
+                .iter()
+                .flat_map(|(first, count)| *first..*first + *count)
+                .collect::<Vec<_>>();
+            assert_eq!(visited, (0..20).collect::<Vec<_>>());
+            let (last, count) = ranges.last().copied().unwrap();
+            assert_eq!(last + count, 20);
+        }
     }
 
     /// NVFP4-eligible small config: `inner = 64` (K % 32 == 0, N % 16 == 0 — the cuBLASLt FP4 shape
