@@ -33,13 +33,19 @@ use candle_gen_wan::config::{DEFAULT_FRAMES_14B, MAX_AREA_14B, SIZE_MULTIPLE_14B
 use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
-// The merged Wan z16 implementation validates the provider-selected cap against this exact,
-// CUDA-safe domain. Both the V2V and still contracts must use the executable set.
+// Keep the provider's bounded-decode domain in lockstep with the merged Wan z16 implementation.
 pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-rv2v-v2";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
+const ADVERTISED_STILL_GEOMETRIES: &[(u32, u32)] = &[
+    (512, 512),
+    (768, 768),
+    (1024, 1024),
+    (1280, 720),
+    (720, 1280),
+];
 /// Content-independent memory-evidence identity and request-only byte-seal domains.
 pub const R2V_REFERENCE_RECEIPT_DOMAIN: &str = "bernini-r2v-references-v2";
 pub const R2V_REFERENCE_SEAL_DOMAIN: &str = "bernini-r2v-request-seal-v1";
@@ -705,7 +711,6 @@ fn reference_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
         .collect::<Vec<_>>();
     (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
-
 fn source_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
     let axes = overlay?.split('+').collect::<Vec<_>>();
     let evidence = axes
@@ -728,13 +733,6 @@ fn source_receipt_from_overlay(overlay: Option<&str>) -> Option<String> {
         .collect::<Vec<_>>();
     (evidence.len() == 1 && seals.len() == 1).then(|| format!("{}+{}", evidence[0], seals[0]))
 }
-const ADVERTISED_STILL_GEOMETRIES: &[(u32, u32)] = &[
-    (512, 512),
-    (768, 768),
-    (1024, 1024),
-    (1280, 720),
-    (720, 1280),
-];
 
 fn tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
@@ -1479,8 +1477,9 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<
 }
 
 fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> gen_core::Result<()> {
-    if matches!(context.mode.as_key(), "text_to_image" | "edit") {
-        let expected_references = u32::from(context.mode.as_key() == "edit");
+    let mode = context.mode.as_key();
+    if matches!(mode, "text_to_image" | "edit") {
+        let expected_references = u32::from(mode == "edit");
         if context.geometry.reference_count != expected_references
             || context.has_reference != (expected_references == 1)
             || context.geometry.batch != 1
@@ -1507,7 +1506,6 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
         }
         return Ok(());
     }
-    let mode = context.mode.as_key();
     let expected_provider_mode = match mode {
         "video_to_video" if context.geometry.reference_count == 1 => "provider_video_mode:v2v",
         "reference_to_video" if (1..=8).contains(&context.geometry.reference_count) => {
@@ -1789,7 +1787,7 @@ fn validate_still_request(request: &GenerationRequest) -> gen_core::Result<()> {
     ))
 }
 
-fn validate_request(
+fn validate_memory_request(
     provider_id: &str,
     request: &GenerationRequest,
     route: BerniniMemoryRoute,
@@ -1865,7 +1863,9 @@ fn validate_request(
     Ok(receipt)
 }
 
-pub(crate) fn validate_public_request(request: &GenerationRequest) -> gen_core::Result<()> {
+/// Validate the public request surface before provider construction. The later memory scope repeats
+/// the route-specific check with the actual provider id and retains the matching immutable receipt.
+pub(crate) fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
     if matches!(request.video_mode.as_deref(), Some("t2i") | Some("i2i")) {
         return validate_still_request(request);
     }
@@ -1882,7 +1882,11 @@ pub(crate) fn validate_public_request(request: &GenerationRequest) -> gen_core::
             ))
         }
     };
-    validate_request(crate::bernini::MODEL_ID, request, route).map(|_| ())
+    validate_memory_request(crate::bernini::MODEL_ID, request, route).map(|_| ())
+}
+
+pub(crate) fn validate_public_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    validate_request(request)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1904,7 +1908,7 @@ struct BerniniMemoryRequestScope {
 impl MemoryRequestScope for BerniniMemoryRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         let receipt = if let Some(route) = self.route {
-            validate_request(&self.provider_id, request, route)?
+            validate_memory_request(&self.provider_id, request, route)?
         } else {
             validate_still_request(request)?;
             None
@@ -2097,22 +2101,23 @@ pub fn registered_valid_fixtures(
         mv2v_axes.push(adapter_axis);
     }
     mv2v_context.overlay = Some(mv2v_axes.join("+"));
+    let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
         MemoryBehaviorFixture {
             context: r2v_context,
             request: r2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: rv2v_context,
             request: rv2v_request,
-            load_spec: None,
+            load_spec: load_spec.clone(),
         },
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
-            load_spec: None,
+            load_spec,
         },
     ])
 }
@@ -2124,18 +2129,18 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    // Catalog conformance deliberately uses a weights-free fixture: it has no snapshot to inspect,
-    // but is a valid executable witness for the registered V2V/still request scope. Real loads
-    // continue to require the sealed artifact receipt before exposing the contract.
-    let loaded_tier = if contract.asset_facts == MemoryAssetFacts::default() {
-        tier(spec)
-    } else {
-        let Some((_, loaded_tier)) = contract_for_loaded(spec, provider_id)? else {
-            return Ok(None);
-        };
-        loaded_tier
-    };
-    begin_request(contract, loaded_tier, Device::Cpu, context)
+    if contract.provider_id != provider_id {
+        return Err(gen_core::Error::Unsupported(format!(
+            "Bernini behavior registration {provider_id} received crossed contract {}",
+            contract.provider_id
+        )));
+    }
+    // The registration's contract factory already validated production assets and sealed their
+    // exact receipts. Re-reading them here makes weights-free registry fixtures non-executable and
+    // creates a second, racy asset read between contract construction and request configuration.
+    // Use the same spec-derived tier as the paired registered safety check; real lazy loads still
+    // revalidate their sealed contract at the component-load boundary.
+    begin_request(contract, tier(spec), Device::Cpu, context)
 }
 
 pub fn begin_request(
@@ -2505,18 +2510,53 @@ mod tests {
             conditioning: vec![clip],
             ..Default::default()
         };
-        assert!(
-            validate_request(crate::bernini::MODEL_ID, &request, BerniniMemoryRoute::Clip).is_ok()
-        );
+        assert!(validate_memory_request(
+            crate::bernini::MODEL_ID,
+            &request,
+            BerniniMemoryRoute::Clip
+        )
+        .is_ok());
         request.video_mode = None;
-        assert!(
-            validate_request(crate::bernini::MODEL_ID, &request, BerniniMemoryRoute::Clip).is_err()
-        );
+        assert!(validate_memory_request(
+            crate::bernini::MODEL_ID,
+            &request,
+            BerniniMemoryRoute::Clip
+        )
+        .is_err());
         request.video_mode = Some("v2v".to_owned());
         request.fps = Some(24);
-        assert!(
-            validate_request(crate::bernini::MODEL_ID, &request, BerniniMemoryRoute::Clip).is_err()
-        );
+        assert!(validate_memory_request(
+            crate::bernini::MODEL_ID,
+            &request,
+            BerniniMemoryRoute::Clip
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn candle_bernini_public_validation_keeps_t2i_and_i2i_single_frame_routes() {
+        let mut request = GenerationRequest {
+            prompt: "still Bernini".to_owned(),
+            width: 512,
+            height: 512,
+            frames: Some(1),
+            video_mode: Some("t2i".to_owned()),
+            ..Default::default()
+        };
+        assert!(validate_request(&request).is_ok());
+
+        request.video_mode = Some("i2i".to_owned());
+        request.conditioning = vec![Conditioning::MultiReference {
+            images: vec![gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 3],
+            }],
+        }];
+        assert!(validate_request(&request).is_ok());
+
+        request.frames = Some(45);
+        assert!(validate_request(&request).is_err());
     }
 
     #[test]
@@ -2542,8 +2582,12 @@ mod tests {
                     ..Default::default()
                 };
                 assert!(
-                    validate_request(crate::bernini::MODEL_ID, &request, BerniniMemoryRoute::Clip)
-                        .is_ok(),
+                    validate_memory_request(
+                        crate::bernini::MODEL_ID,
+                        &request,
+                        BerniniMemoryRoute::Clip,
+                    )
+                    .is_ok(),
                     "{width}x{height}/{frames}"
                 );
             }
@@ -2565,15 +2609,21 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(
-            validate_request(crate::bernini::MODEL_ID, &crossed, BerniniMemoryRoute::Clip).is_err()
-        );
+        assert!(validate_memory_request(
+            crate::bernini::MODEL_ID,
+            &crossed,
+            BerniniMemoryRoute::Clip
+        )
+        .is_err());
         crossed.width = 848;
         crossed.height = 480;
         crossed.fps = Some(24);
-        assert!(
-            validate_request(crate::bernini::MODEL_ID, &crossed, BerniniMemoryRoute::Clip).is_err()
-        );
+        assert!(validate_memory_request(
+            crate::bernini::MODEL_ID,
+            &crossed,
+            BerniniMemoryRoute::Clip
+        )
+        .is_err());
     }
 
     fn r2v_request() -> GenerationRequest {
@@ -2765,7 +2815,7 @@ mod tests {
                     request.conditioning = vec![Conditioning::MultiReference {
                         images: distinct_references(count),
                     }];
-                    validate_request(
+                    validate_memory_request(
                         crate::bernini::MODEL_ID,
                         &request,
                         BerniniMemoryRoute::Images,
@@ -2950,7 +3000,7 @@ mod tests {
                 },
             ] {
                 let mut scope =
-                    begin_request(&contract, tier(&spec), Device::Cpu, &fixtures[1].context)
+                    registered_begin_request(provider_id, &spec, &contract, &fixtures[1].context)
                         .unwrap()
                         .expect("scope");
                 let mut request = fixtures[1].request.clone();
@@ -3038,7 +3088,7 @@ mod tests {
             .remove(1);
         let mut empty_phases = fixture.request.clone();
         empty_phases.phases = Some(Vec::new());
-        assert!(validate_request(
+        assert!(validate_memory_request(
             crate::bernini::MODEL_ID,
             &empty_phases,
             BerniniMemoryRoute::Images
@@ -3046,7 +3096,7 @@ mod tests {
         .is_err());
         let mut crossed = fixture.request.clone();
         crossed.video_mode = Some("v2v".to_owned());
-        assert!(validate_request(
+        assert!(validate_memory_request(
             crate::bernini::MODEL_ID,
             &crossed,
             BerniniMemoryRoute::Images
