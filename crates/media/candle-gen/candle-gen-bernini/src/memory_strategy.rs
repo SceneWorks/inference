@@ -33,11 +33,20 @@ use candle_gen_wan::config::{DEFAULT_FRAMES_14B, MAX_AREA_14B, SIZE_MULTIPLE_14B
 use sha2::{Digest, Sha256};
 
 pub const DECODE_OVERLAP: u32 = 64;
-pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 320, 256];
+// The merged Wan z16 implementation validates the provider-selected cap against this exact,
+// CUDA-safe domain. Both the V2V and still contracts must use the executable set.
+pub const DECODE_TILE_EDGES: &[u32] = &[512, 448, 384, 320, 256, 192];
 const PACK_GROUP_SIZE: usize = 64;
 const STATIC_CALIBRATION: &str = "bernini-candle-registry-v2v-v1";
 pub const ADVERTISED_GEOMETRIES: &[(u32, u32)] =
     &[(848, 480), (480, 848), (1280, 720), (720, 1280)];
+const ADVERTISED_STILL_GEOMETRIES: &[(u32, u32)] = &[
+    (512, 512),
+    (768, 768),
+    (1024, 1024),
+    (1280, 720),
+    (720, 1280),
+];
 
 fn tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
@@ -782,6 +791,34 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<
 }
 
 fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> gen_core::Result<()> {
+    if matches!(context.mode.as_key(), "text_to_image" | "edit") {
+        let expected_references = u32::from(context.mode.as_key() == "edit");
+        if context.geometry.reference_count != expected_references
+            || context.has_reference != (expected_references == 1)
+            || context.geometry.batch != 1
+            || context.geometry.frames != 1
+            || context.use_pid
+            || context.has_phases
+            || !ADVERTISED_STILL_GEOMETRIES
+                .contains(&(context.geometry.width, context.geometry.height))
+            || context
+                .overlay
+                .as_deref()
+                .is_some_and(|overlay| overlay != "lora")
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{} still-memory evidence requires one advertised T2I/edit frame with its exact reference identity",
+                contract.provider_id
+            )));
+        }
+        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+            validate_decode(
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )?;
+        }
+        return Ok(());
+    }
     if context.mode.as_key() != "video_to_video"
         || context.geometry.reference_count != 1
         || !context.has_reference
@@ -867,7 +904,41 @@ pub fn registered_safety_check(
     safety_check(contract, tier(spec), context)
 }
 
-fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
+pub(crate) fn validate_request(request: &GenerationRequest) -> gen_core::Result<()> {
+    if matches!(request.video_mode.as_deref(), Some("t2i") | Some("i2i")) {
+        let references = request.image_reference_count();
+        let expected_references = u32::from(request.video_mode.as_deref() == Some("i2i"));
+        if request.frames != Some(1)
+            || request.count != 1
+            || request.phases.is_some()
+            || request.use_pid
+            || !request.video_clips().is_empty()
+            || references != expected_references
+            || !ADVERTISED_STILL_GEOMETRIES.contains(&(request.width, request.height))
+        {
+            return Err(gen_core::Error::Unsupported(
+                "Bernini Candle still memory scope requires exact T2I/I2I single-frame identity"
+                    .to_owned(),
+            ));
+        }
+        if let Some(memory) = request.memory {
+            if memory.stage_residency || memory.chunk_attention || memory.stream_transformer_blocks
+            {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle still request carries an unsupported memory mechanism"
+                        .to_owned(),
+                ));
+            }
+            if memory.tile_vae_decode {
+                validate_decode(memory.decode_tile_edge, memory.decode_overlap)?;
+            } else if memory.decode_tile_edge.is_some() || memory.decode_overlap.is_some() {
+                return Err(gen_core::Error::Unsupported(
+                    "Bernini Candle decode parameters require bounded decode".to_owned(),
+                ));
+            }
+        }
+        return Ok(());
+    }
     if request.video_mode.as_deref() != Some("v2v")
         || request.fps.unwrap_or(Defaults::FPS) != Defaults::FPS
         || request.count != 1
@@ -1006,8 +1077,11 @@ pub fn begin_request(
     if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
         return Err(gen_core::Error::Unsupported(reason));
     }
+    let is_v2v = context.mode.as_key() == "video_to_video";
     let mut geometry = context.geometry;
-    geometry.reference_count = 0;
+    if is_v2v {
+        geometry.reference_count = 0;
+    }
     let provider_id = match contract.provider_id.as_str() {
         crate::pipeline::MODEL_ID => crate::pipeline::MODEL_ID,
         crate::bernini::MODEL_ID => crate::bernini::MODEL_ID,
@@ -1026,7 +1100,7 @@ pub fn begin_request(
         80,
         |_pid, edge, overlap| validate_decode(Some(edge), Some(overlap)),
     )?;
-    config.default_frames = DEFAULT_FRAMES_14B;
+    config.default_frames = if is_v2v { DEFAULT_FRAMES_14B } else { 1 };
     Ok(Some(Box::new(BerniniMemoryRequestScope {
         inner: candle_gen::request_scope::CandleRequestScopeCore::new(config),
     })))

@@ -893,10 +893,11 @@ mod tests {
     /// live sink on CUDA.
     #[test]
     fn no_sibling_module_in_this_crate_touches_the_requests_sink() {
-        const OTHERS: [(&str, &str); 8] = [
+        const OTHERS: [(&str, &str); 9] = [
             ("config", include_str!("config.rs")),
             ("distill", include_str!("distill.rs")),
             ("fm", include_str!("fm.rs")),
+            ("memory_strategy", include_str!("memory_strategy.rs")),
             ("quant", include_str!("quant.rs")),
             ("qwen3", include_str!("qwen3.rs")),
             ("runtime", include_str!("runtime.rs")),
