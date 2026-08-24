@@ -943,8 +943,13 @@ pub struct MemoryStructuralResidentEvidence {
     pub adapter_count: u32,
 }
 
-/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`]. Source ids are
-/// represented by a caller-produced digest so this contract does not depend on SceneWorks assets.
+/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`].
+///
+/// `source_digest` is an opaque 64-hex digest produced by the caller, so this contract does not
+/// depend on SceneWorks assets or on any particular notion of a "source id". Both SCAIL-2 providers
+/// derive it from the **carrier bytes** of the request (the character image, mask and driving
+/// frames) rather than from an asset identifier; a different provider is free to digest whatever
+/// makes its execution identity exact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryStructuralResidentRequestIdentity {
     pub source_digest: String,
