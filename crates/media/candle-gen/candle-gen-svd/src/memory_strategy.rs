@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -63,6 +65,12 @@ pub struct PreparedSvdMemory {
     tier: MemoryNumericTier,
     root: PathBuf,
     files: Vec<SealedFile>,
+    /// Whether the full content digest of every sealed file has already been verified for this
+    /// loaded artifact. `components()` re-runs `ensure_unchanged` on every generate, and a full
+    /// re-hash of the multi-GB snapshot per request is not what that guard is for: the per-file
+    /// stat pin (size + mtime + ctime + inode + symlink target) is the cheap identity check, and it
+    /// is re-run every time. The expensive byte-for-byte digest runs once, at admission.
+    digest_verified: Arc<AtomicBool>,
 }
 
 fn sha256_file(path: &Path) -> gen_core::Result<String> {
@@ -280,6 +288,7 @@ impl PreparedSvdMemory {
             tier,
             root: root.to_path_buf(),
             files,
+            digest_verified: Arc::new(AtomicBool::new(false)),
         };
         prepared.ensure_unchanged()?;
         Ok(prepared)
@@ -305,10 +314,13 @@ impl PreparedSvdMemory {
                 crate::MODEL_ID
             )));
         }
+        // Verify content digests only until the artifact has been proven once; the stat pin below
+        // is re-checked on every call and is what detects a swapped or rewritten file thereafter.
+        let verify_digests = !self.digest_verified.load(Ordering::Acquire);
         for file in &self.files {
             file.pin.ensure_unchanged()?;
             let path = self.root.join(file.relative);
-            if sha256_file(&path)? != file.digest {
+            if verify_digests && sha256_file(&path)? != file.digest {
                 return Err(gen_core::Error::Unsupported(format!(
                     "{}: {} changed after admission",
                     crate::MODEL_ID,
@@ -329,6 +341,9 @@ impl PreparedSvdMemory {
                     file.relative
                 )));
             }
+        }
+        if verify_digests {
+            self.digest_verified.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -765,10 +780,17 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, LoadSpec) {
+        fixture_under("models--stabilityai--stable-video-diffusion-img2vid-xt")
+    }
+
+    /// The same complete, readable SVD snapshot, published under an arbitrary repository dir. Used
+    /// to build a *real* decoy — a crossed-repo assertion against a path that does not exist proves
+    /// only that `canonicalize` fails.
+    fn fixture_under(repo_dir: &str) -> (tempfile::TempDir, LoadSpec) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp
             .path()
-            .join("models--stabilityai--stable-video-diffusion-img2vid-xt")
+            .join(repo_dir)
             .join("snapshots")
             .join("0123456789abcdef0123456789abcdef01234567");
         for relative in EXPECTED_TENSOR_INVENTORY {
@@ -862,6 +884,34 @@ mod tests {
         assert!(PreparedSvdMemory::prepare(&spec).is_err());
     }
 
+    /// `components()` runs `ensure_unchanged` on every generate. The stat pin re-checks every
+    /// call; the full byte-for-byte digest of a multi-GB snapshot must not.
+    #[test]
+    fn the_snapshot_content_digest_is_hashed_once_per_loaded_artifact() {
+        let (_tmp, spec) = fixture();
+        let prepared = PreparedSvdMemory::prepare(&spec).unwrap();
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            _ => unreachable!(),
+        };
+        let path = root.join(SELECTED_FILES[0].0);
+
+        // Rewrite the file with the SAME bytes: the content digest is unchanged, so only the stat
+        // pin can notice. It does — the guard stays closed without re-hashing.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(prepared.ensure_unchanged().is_err());
+
+        // A clone shares the verification state (the request scope owns a clone of the receipt).
+        let (_tmp, spec) = fixture();
+        let prepared = PreparedSvdMemory::prepare(&spec).unwrap();
+        let scoped = prepared.clone();
+        prepared.ensure_unchanged().unwrap();
+        scoped.ensure_unchanged().unwrap();
+        assert!(prepared.digest_verified.load(Ordering::Acquire));
+        assert!(scoped.digest_verified.load(Ordering::Acquire));
+    }
+
     #[test]
     fn repository_tier_overlay_and_request_identity_are_exact() {
         let (_tmp, spec) = fixture();
@@ -921,10 +971,43 @@ mod tests {
         let mut overlay = spec.clone();
         overlay.ip_adapter = Some(WeightsSource::Dir(PathBuf::from("overlay")));
         assert!(PreparedSvdMemory::prepare(&overlay).is_err());
+        // A crossed repository, as a REAL, readable, byte-identical snapshot. The old assertion
+        // pointed at a nonexistent path, so it passed on `canonicalize` failing and said nothing
+        // about repository identity.
+        let (_decoy_tmp, decoy_spec) = fixture_under("models--other--repo");
+        let decoy_root = match &decoy_spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            decoy_root.is_dir(),
+            "the decoy snapshot must actually exist"
+        );
+        let canonical_root = match &spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        // `repository_revision` recognizes the canonical repo dir and falls back to a
+        // path-derived `local:` identity for anything else — that is the discriminator.
+        let canonical_revision = repository_revision(&canonical_root).unwrap();
+        let decoy_revision = repository_revision(&decoy_root).unwrap();
+        assert_eq!(
+            canonical_revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert!(decoy_revision.starts_with("local:"), "{decoy_revision}");
+        assert_ne!(canonical_revision, decoy_revision);
+
+        // The decoy prepares (it is a complete snapshot) but seals a DIFFERENT artifact identity,
+        // so a receipt minted against the canonical repo can never match it.
+        let canonical = PreparedSvdMemory::prepare(&spec).unwrap();
+        let decoy = PreparedSvdMemory::prepare(&decoy_spec).unwrap();
+        assert_ne!(canonical.artifact_identity, decoy.artifact_identity);
+        assert_ne!(canonical.revision, decoy.revision);
+
+        // ...and the canonical spec's sealed pins do not cover the decoy's files.
         let mut crossed_repo = spec.clone();
-        crossed_repo.weights = WeightsSource::Dir(PathBuf::from(
-            "/tmp/models--other--repo/snapshots/0123456789abcdef0123456789abcdef01234567",
-        ));
+        crossed_repo.weights = WeightsSource::Dir(decoy_root);
         assert!(PreparedSvdMemory::prepare(&crossed_repo).is_err());
     }
 }

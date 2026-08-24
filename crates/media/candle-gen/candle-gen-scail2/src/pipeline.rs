@@ -25,7 +25,7 @@ use candle_gen::candle_nn::var_builder::{Rename, SimpleBackend};
 use candle_gen::candle_nn::{Init, VarBuilder};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
     ReplacementMode, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
@@ -33,9 +33,6 @@ use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
 use candle_gen_wan::scheduler::Sampler;
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use cst::Load;
-
-#[cfg(test)]
-use candle_gen::gen_core::Quant;
 
 use crate::clip::{ClipVisionConfig, ScailClip};
 use crate::config::Scail2Config;
@@ -175,7 +172,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 32,
             max_size: 1280,
             max_count: 1,
-            supported_quants: &[],
+            // The hosted packed Q4/Q8 tiers stay selectable (the Resident *memory* receipt is
+            // dense-bf16 only, which is a separate surface); MLX advertises the same pair.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
             // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
             size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
@@ -628,8 +627,13 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "scail2: adapters require the dense DiT; packed Q4/Q8 tiers refuse adapter merging rather than staging a dense base".into(),
         ));
     }
+    // A shared tier that is not the canonical dense-bf16 public-animation artifact — a
+    // non-canonical snapshot, or a packed VACE-Fun Q4/Q8 tier — carries no public memory evidence,
+    // but it must still load and render exactly as it did before this epic. The memory seams fail
+    // closed on `None` (`memory_strategy_safety_check` Rejects and `validate` refuses a request
+    // that asks for memory), so dropping the receipt cannot silently admit anything.
     let memory_strategy = if layout == SnapshotLayout::SharedMlxTier {
-        Some(crate::memory_strategy::PreparedMemory::prepare(spec)?)
+        crate::memory_strategy::PreparedMemory::prepare(spec).ok()
     } else {
         None
     };
@@ -657,8 +661,18 @@ impl Generator for Scail2 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        if self.memory_strategy.is_some() {
+        // Gate on `req.memory`, as SVD does. Running the exact Resident envelope for *every*
+        // request hard-rejected the documented `0x0` resolve-from-clip sentinel and the multi-
+        // character Reference/Mask pairs this pipeline still accepts.
+        if req.memory.is_some() {
+            let memory = self.memory_strategy.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{MODEL_ID}: memory request requires the sealed canonical dense-bf16 receipt"
+                ))
+            })?;
             crate::memory_strategy::validate_generation_request(req)?;
+            // The executing request must be the one the admitted scope opened.
+            crate::memory_strategy::validate_active_request(memory, req)?;
         }
         // Validate pair/order/cardinality before the generic capability floor. This keeps an image-only
         // MultiReference or an orphan Mask an actionable request error instead of a render that omits a
@@ -1210,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_q4_q8_blocks_remain_packed_but_public_candle_load_refuses_them() {
+    fn hosted_q4_q8_scail2_block_keys_load_as_quantized_without_dense_staging() {
         for (bits, quant) in [(4, Quant::Q4), (8, Quant::Q8)] {
             let tmp = tempfile::tempdir().unwrap();
             write_dit(tmp.path(), &packed_dit_map(bits));
@@ -1236,11 +1250,14 @@ mod tests {
             .unwrap();
             let selected =
                 LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf())).with_quant(quant);
-            let error = load(&selected)
-                .err()
-                .expect("public Candle SCAIL-2 must not expand to a packed tier")
-                .to_string();
-            assert!(error.contains("dense-bf16"), "Q{bits}: {error}");
+            // sc-20799: the Resident animation receipt is dense-bf16 only, but that is a *memory*
+            // surface — a packed VACE-Fun tier must still load and render, as it did before the
+            // memory-ladder epic. It simply carries no memory contract.
+            let generator = load(&selected).expect("Q{bits} tier must be selectable");
+            assert!(
+                generator.memory_strategy_contract().is_none(),
+                "Q{bits}: a packed tier has no public memory evidence"
+            );
 
             // This is the exact bounded mmap + raw SCAIL2 key form used by transformer_vb.  The
             // assertion proves the q/k block projection chose QLinear's packed arm rather than a
@@ -2162,6 +2179,109 @@ mod tests {
         // carries it past the cap. `1×30000` → `32×29984` = 959 488 px.
         assert_eq!((align(1), align(30000)), (32, 29984));
         assert!(reject_over_area(MODEL_ID, 1, 30000).is_err());
+    }
+
+    /// A canonical shared-tier `Scail2` that *does* hold a sealed Resident receipt.
+    fn with_sealed_memory() -> (tempfile::TempDir, Scail2) {
+        let (temp, spec) = crate::memory_strategy::tests::candle_fixture(None);
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        let generator = Scail2 {
+            descriptor: descriptor(),
+            config: Scail2Config::default(),
+            root,
+            layout: SnapshotLayout::SharedMlxTier,
+            device: Device::Cpu,
+            adapters: Vec::new(),
+            memory_strategy: Some(crate::memory_strategy::PreparedMemory::prepare(&spec).unwrap()),
+            components: Mutex::new(None),
+        };
+        (temp, generator)
+    }
+
+    fn animation_clip(width: u32, height: u32, frames: u32) -> Vec<Image> {
+        (0..frames)
+            .map(|_| Image {
+                width,
+                height,
+                pixels: vec![3; width as usize * height as usize * 3],
+            })
+            .collect()
+    }
+
+    /// sc-20799: the exact Resident envelope is a *memory* surface. Running it for every request
+    /// hard-rejected the documented `0x0` resolve-from-clip sentinel and the multi-character
+    /// Reference/Mask pairs this pipeline still accepts, on every canonical shared-tier load.
+    #[test]
+    fn a_sealed_tier_still_accepts_the_sentinel_and_multi_character_pairs_without_memory() {
+        let (_temp, generator) = with_sealed_memory();
+        assert!(generator.memory_strategy_contract().is_some());
+        let character = |tag| Image {
+            width: 64,
+            height: 64,
+            pixels: vec![tag; 64 * 64 * 3],
+        };
+
+        // `0x0` resolves from the driving clip.
+        let mut sentinel = GenerationRequest {
+            prompt: "sentinel".into(),
+            width: 0,
+            height: 0,
+            count: 1,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("animation".into()),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: character(11),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: character(12),
+                },
+                Conditioning::ControlClip {
+                    frames: animation_clip(832, 480, 45),
+                    mask: animation_clip(832, 480, 45),
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: ReplacementMode::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        generator.validate(&sentinel).expect("0x0 sentinel");
+
+        // Two ordered character pairs.
+        let mut pairs = sentinel.clone();
+        pairs.width = 832;
+        pairs.height = 480;
+        pairs.conditioning.insert(
+            2,
+            Conditioning::Mask {
+                image: character(22),
+            },
+        );
+        pairs.conditioning.insert(
+            2,
+            Conditioning::Reference {
+                image: character(21),
+                strength: None,
+            },
+        );
+        assert_eq!(
+            resolve_character_references(MODEL_ID, &pairs)
+                .unwrap()
+                .additional
+                .len(),
+            1
+        );
+        generator.validate(&pairs).expect("two character pairs");
+
+        // ...but a request that *asks* for memory is still held to the exact envelope.
+        sentinel.memory = Some(gen_core::GenerationMemory::default());
+        assert!(generator.validate(&sentinel).is_err());
     }
 
     fn unloaded() -> Scail2 {
