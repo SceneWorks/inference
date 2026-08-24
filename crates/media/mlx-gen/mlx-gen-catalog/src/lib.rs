@@ -432,29 +432,60 @@ mod tests {
             .is_some());
     }
 
+    /// Every `mapping_id` the composed MLX catalog registers resolves to a real
+    /// `LogicalKeyMapping` on this backend, **or** is explicitly declared not plan-driven here
+    /// (sc-20651). Previously this only covered Krea, so the other adapters' declared ids — none of
+    /// which had an implementation anywhere — went unproven in both directions.
     #[test]
-    fn krea_adapter_canonical_mappings_are_backed_by_real_mapping_implementations() {
-        use mlx_gen::gen_core::{IdentityKeyMapping, LogicalKeyMapping, KREA_2_CHECKPOINT_ADAPTER};
+    fn canonical_mappings_are_backed_by_declared_implementations() {
+        use mlx_gen::gen_core::{CheckpointBackend, LogicalKeyMapping};
 
         let registry = super::provider_registry().unwrap();
-        let krea = registry
-            .checkpoint_adapters()
-            .find(|adapter| adapter.adapter_id == KREA_2_CHECKPOINT_ADAPTER.adapter_id)
-            .expect("the Krea 2 adapter is registered");
+        let krea_config = mlx_gen_krea::Krea2Config::turbo();
+        // The complete set of `LogicalKeyMapping` implementations reachable from the MLX platform.
         let implementations: &[&dyn LogicalKeyMapping] = &[
             &mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(),
-            &IdentityKeyMapping,
+            &mlx_gen_krea::KreaDiffusersKeyMapping::new(&krea_config),
         ];
-        for mapping in krea.canonical_mappings {
-            assert!(
-                implementations
+
+        let mut declared_here = 0usize;
+        for adapter in registry.checkpoint_adapters() {
+            for mapping in adapter.canonical_mappings {
+                let implemented = implementations
                     .iter()
-                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id),
-                "registry mapping id {:?} for dialect {:?} has no implementation",
-                mapping.mapping_id,
-                mapping.dialect
-            );
+                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id);
+                let declared = mapping
+                    .plan_driven_backends
+                    .contains(&CheckpointBackend::Mlx);
+                assert_eq!(
+                    implemented,
+                    declared,
+                    "adapter {} dialect {:?}: mapping id {:?} is {} on MLX but {} — a declared \
+                     mapping must resolve to a real implementation, and an implementation must be \
+                     declared (loader-native dialects declare no backend at all)",
+                    adapter.adapter_id,
+                    mapping.dialect,
+                    mapping.mapping_id,
+                    if implemented {
+                        "implemented"
+                    } else {
+                        "unimplemented"
+                    },
+                    if declared {
+                        "declared plan-driven"
+                    } else {
+                        "declared loader-native"
+                    },
+                );
+                declared_here += usize::from(declared);
+            }
         }
+        assert_eq!(
+            declared_here,
+            implementations.len(),
+            "every MLX mapping implementation must be claimed by exactly one registered dialect"
+        );
+
         // And the native mapping really is the remap the provider loads through.
         assert_eq!(
             mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()

@@ -39,6 +39,14 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+// The GGUF container route's public surface (epic 20398, sc-20649/sc-20651): the registered codec
+// id this crate implements, the codec registry the route plans against, the refusing canonical
+// mapping the checkpoint registry names, the plan producer, and its typed refusals. The module
+// itself stays private — everything else in it is loader internals.
+pub use gguf::{
+    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_receipt, GgufDitPlan,
+    GgufPlanError, WanNativeToDiffusersMapping, GGUF_CODEC_IMPLEMENTATION_ID,
+};
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;
 pub mod model_vace;

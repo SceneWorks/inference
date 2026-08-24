@@ -158,6 +158,55 @@ impl LogicalKeyMapping for KreaNativeToDiffusersMapping<'_> {
     }
 }
 
+/// The Krea 2 **`diffusers`-dialect** mapping (sc-20651): the registered authority for a Krea 2
+/// checkpoint that already ships canonical diffusers keys.
+///
+/// # Why this exists instead of `IdentityKeyMapping`
+///
+/// The registry used to name `identity-v1` here, and
+/// [`IdentityKeyMapping`](mlx_gen::gen_core::IdentityKeyMapping)'s own doc comment forbids exactly
+/// that use: it accepts **every** on-disk key as a logical weight, so an fp8 checkpoint carrying a
+/// scale companion under an unrecognised suffix has that companion accepted as an ordinary weight
+/// and its layer planned as undescribed fp8 at
+/// [`ScalarScaleSource::Unit`](mlx_gen::gen_core::ScalarScaleSource) — decoding at unit scale,
+/// silently wrong rather than refused.
+///
+/// This mapping is identity **only** over the keys the Krea 2 architecture actually contains, which
+/// [`diffusers_logical_shape`] already enumerates exhaustively from the config, and returns `None`
+/// for everything else. `None` is a typed
+/// [`LogicalWeightPlanError::UnmappedKey`](mlx_gen::gen_core::LogicalWeightPlanError) naming the
+/// offending tensor, so a foreign key — an unrecognised scale suffix included — refuses the import
+/// instead of decoding wrong. The config is mandatory for the same reason: the key surface is
+/// derived from it, and a mapping with no config could only be permissive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KreaDiffusersKeyMapping<'cfg> {
+    cfg: &'cfg Krea2Config,
+}
+
+impl<'cfg> KreaDiffusersKeyMapping<'cfg> {
+    pub const MAPPING_ID: &'static str = "krea-2-diffusers-v1";
+
+    pub const fn new(cfg: &'cfg Krea2Config) -> Self {
+        Self { cfg }
+    }
+}
+
+impl LogicalKeyMapping for KreaDiffusersKeyMapping<'_> {
+    fn mapping_id(&self) -> &'static str {
+        Self::MAPPING_ID
+    }
+
+    fn logical_key(&self, physical_key: &str) -> Option<String> {
+        // Recognised ⇔ the architecture declares a shape for it. One surface, one source of truth:
+        // a key this returns `Some` for is a key the DiT really loads.
+        diffusers_logical_shape(self.cfg, physical_key).map(|_| physical_key.to_owned())
+    }
+
+    fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
+        diffusers_logical_shape(self.cfg, logical_key)
+    }
+}
+
 /// The architecture's true (unpadded) shape for one **diffusers** logical key, derived entirely from
 /// `cfg` — the shape the [`Krea2Transformer`](crate::transformer::Krea2Transformer) module tree
 /// constructs for that key and [`crate::convert::validate_transformer`] enforces.
@@ -531,6 +580,68 @@ mod tests {
         };
         cfg.validate().expect("the test architecture is coherent");
         cfg
+    }
+
+    /// The `diffusers`-dialect mapping is identity over the **real** Krea 2 diffusers key surface —
+    /// every key `expected_transformer_keys` says the DiT loads — and REFUSES anything else,
+    /// including the undescribed-fp8 scale companions that made `identity-v1` unsafe here.
+    ///
+    /// The refusal corpus is deliberately the real hazard, not a toy string: `.scale_weight` is the
+    /// legacy ComfyUI marker convention, `.scale_input`/`.weight_scale_2` are companions this route
+    /// does not claim on an undescribed layer, and each is a suffix an fp8 export really ships. With
+    /// `identity-v1` every one of them was accepted as an ordinary weight, and its layer then
+    /// planned as undescribed fp8 at unit scale.
+    #[test]
+    fn diffusers_dialect_mapping_accepts_the_architecture_and_refuses_everything_else() {
+        let cfg = asymmetric_config();
+        let mapping = KreaDiffusersKeyMapping::new(&cfg);
+        assert_eq!(mapping.mapping_id(), "krea-2-diffusers-v1");
+
+        let expected = expected_transformer_keys(&cfg);
+        assert!(
+            expected.len() > 50,
+            "the corpus must be the real architecture, got {} keys",
+            expected.len()
+        );
+        for key in &expected {
+            assert_eq!(
+                mapping.logical_key(key).as_deref(),
+                Some(key.as_str()),
+                "the diffusers dialect must accept its own canonical key {key:?} unchanged"
+            );
+            assert!(
+                mapping.logical_shape(key).is_some(),
+                "declared surface must declare a shape for {key:?}"
+            );
+        }
+
+        // The scale-companion suffixes an fp8 export ships, hung off a REAL layer of this
+        // architecture, plus a foreign tensor and an out-of-range block index.
+        let real_layer = "transformer_blocks.0.attn.to_q";
+        for suffix in [
+            ".scale_weight",
+            ".scale_input",
+            ".weight_scale",
+            ".weight_scale_2",
+            ".input_scale",
+            ".comfy_quant",
+        ] {
+            let key = format!("{real_layer}{suffix}");
+            assert_eq!(
+                mapping.logical_key(&key),
+                None,
+                "{key:?} is not a Krea 2 logical weight and must refuse, not decode at unit scale"
+            );
+        }
+        assert_eq!(mapping.logical_key("foreign.weight"), None);
+        assert_eq!(
+            mapping.logical_key(&format!(
+                "transformer_blocks.{}.attn.to_q.weight",
+                cfg.num_layers
+            )),
+            None,
+            "a block past the configured stack depth is not part of this architecture"
+        );
     }
 
     /// The real native-mmdit key set captured from `kreamania_variant5.safetensors` (430 tensors) — the

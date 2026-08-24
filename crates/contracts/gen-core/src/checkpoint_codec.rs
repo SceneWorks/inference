@@ -55,6 +55,17 @@ pub enum WeightEncoding {
     UInt32,
     UInt64,
     Bool,
+    /// A **GGUF container** payload: one ggml block-quantized (or dense F16/F32/BF16) tensor as it
+    /// sits in a `.gguf` file (epic 20398, sc-20649).
+    ///
+    /// Deliberately unreachable from safetensors: [`WeightEncoding::from_dtype`] never returns it,
+    /// so no safetensors header can route to the GGUF codec row, and
+    /// [`element_bytes`](WeightEncoding::element_bytes) reports `0` because a block quant has no
+    /// integral per-element width — a caller that tried to size a GGUF tensor the safetensors way
+    /// gets `0` and fails closed on the byte-integrity check instead of a plausible-looking number.
+    /// A GGUF plan producer looks the row up directly (`for_encoding(GgufContainer)`) and measures
+    /// every byte from the container's own ggml block/type sizes — see [`GGUF_CONTAINER_CODEC`].
+    GgufContainer,
 }
 
 impl WeightEncoding {
@@ -82,9 +93,12 @@ impl WeightEncoding {
         })
     }
 
-    /// Bytes one element occupies when resident in this encoding.
+    /// Bytes one element occupies when resident in this encoding. `0` for
+    /// [`WeightEncoding::GgufContainer`], which is block-quantized and has no integral per-element
+    /// width — see that variant's documentation.
     pub fn element_bytes(self) -> u64 {
         match self {
+            Self::GgufContainer => 0,
             Self::Bool | Self::Int8 | Self::UInt8 | Self::Fp8E4M3 | Self::Fp8E5M2 => 1,
             Self::DenseBf16 | Self::DenseF16 | Self::Int16 | Self::UInt16 => 2,
             Self::DenseF32 | Self::Int32 | Self::UInt32 => 4,
@@ -119,6 +133,12 @@ impl WeightEncoding {
             Self::UInt32 => Dtype::U32,
             Self::UInt64 => Dtype::U64,
             Self::Bool => Dtype::BOOL,
+            // GGUF is a different *container*: its tensors carry a ggml block type, not a
+            // safetensors dtype, and a block quant has no integral bytes-per-element. `from_dtype`
+            // can never produce this variant, so this arm exists only so the map stays total; the
+            // opaque byte view is the honest projection of ggml blocks, and the `data_bytes` a
+            // pricing consumer reads alongside it carries the measured size regardless.
+            Self::GgufContainer => Dtype::U8,
         }
     }
 
@@ -139,6 +159,7 @@ impl WeightEncoding {
             Self::UInt32 => "uint32",
             Self::UInt64 => "uint64",
             Self::Bool => "bool",
+            Self::GgufContainer => "gguf-container",
         }
     }
 }
@@ -325,6 +346,32 @@ pub const BASELINE_CHECKPOINT_CODECS: &[CheckpointCodecRegistration] = &[
     INT8_PER_ROW_CODEC,
     NVFP4_CODEC,
 ];
+
+/// The **GGUF container** codec (epic 20398, sc-20649): one ggml-quantized tensor read out of a
+/// `.gguf` file and held **quantized-resident**, dequantized per matmul rather than at load.
+///
+/// # Why this row is not a safetensors format
+///
+/// Every other row claims a [`StoredTensorFormat`] built from a safetensors dtype plus an optional
+/// `.comfy_quant` descriptor. GGUF is a different *container*: its tensors carry a ggml block type
+/// (`Q4_K`, `Q6_K`, `F16`, …), not a safetensors dtype, and a block quant has no integral
+/// bytes-per-element. So this row claims [`WeightEncoding::GgufContainer`], which
+/// [`WeightEncoding::from_dtype`] can never produce — a safetensors header cannot reach this codec,
+/// and this codec never shadows one of the safetensors rows.
+///
+/// # Residency
+///
+/// The engine that implements this row keeps the ggml blocks resident (the whole point of a GGUF
+/// tier: a Q4_K DiT that fits where a bf16 one does not) and reports **measured** container bytes;
+/// [`resident_encoding`](CheckpointCodecRegistration::resident_encoding) is the bf16 the dense
+/// fallback would leave, i.e. what the per-matmul dequant produces.
+pub const GGUF_CONTAINER_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+    codec_id: "gguf-container-v1",
+    stored: &[StoredTensorFormat::undescribed(
+        WeightEncoding::GgufContainer,
+    )],
+    resident_encoding: WeightEncoding::DenseBf16,
+};
 
 /// Validated, immutable set of codecs keyed by stored format. Built by
 /// [`CheckpointCodecRegistry::new`] (and by `ProviderRegistryBuilder::build` from the rows a catalog
