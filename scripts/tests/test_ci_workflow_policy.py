@@ -283,6 +283,62 @@ def workflow_job_bodies(workflow: str) -> dict[str, list[str]]:
     return jobs
 
 
+def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
+    """Return every static regression in the three-process H3 CUDA VRAM campaign."""
+    errors: list[str] = []
+    job = yaml.safe_load(workflow).get("jobs", {}).get("candle-minimax-h3", {})
+    steps = job.get("steps", [])
+    expected = {"q4": "minimax_h3_vram_q4", "q8": "minimax_h3_vram_q8", "bf16": "minimax_h3_vram_bf16"}
+    probes = [step for step in steps if step.get("name", "").startswith("Measure candle vramGbByTier (")]
+    if len(probes) != len(expected):
+        errors.append(f"expected three H3 VRAM processes, got {len(probes)}")
+    for tier, test in expected.items():
+        matching = [step for step in probes if f"({tier}," in step.get("name", "")]
+        if len(matching) != 1:
+            errors.append(f"{tier}: expected exactly one dedicated process")
+            continue
+        step = matching[0]
+        env = step.get("env", {})
+        for name in ("MINIMAX_H3_VRAM_DIR", "MINIMAX_H3_VRAM_DIT_DIR", "MINIMAX_H3_VRAM_TE_DIR"):
+            if not env.get(name):
+                errors.append(f"{tier}: missing explicit {name}")
+        run = step.get("run", "")
+        if run.count("cargo test ") != 1 or f"set \"name={test}\"" not in run:
+            errors.append(f"{tier}: does not run exactly its own probe process")
+        for required in (
+            "nvidia-smi --query-gpu=index,name,memory.total,memory.used",
+            'findstr /C:"test result: ok. 1 passed"',
+            'findstr /C:"[[H3_VRAM]]"',
+            f'findstr /C:"\\\"tier\\\":\\\"{tier}\\\""',
+            'findstr /C:"\\\"baselineGb\\\":"',
+            'findstr /C:"\\\"peakOwner\\\":\\\""',
+        ):
+            if required not in run:
+                errors.append(f"{tier}: missing result guard {required}")
+
+    preflight = next((step.get("run", "") for step in steps if step.get("name") == "Require real MiniMax-H3 files and staged tier inputs before measuring"), "")
+    for required in ("fsutil reparsepoint query", "hardlink/copy-staged real directory", "hardlink/copy-staged real files", "CANDLE_MINIMAX_H3_Q4_DIT_DIR", "CANDLE_MINIMAX_H3_Q4_TE_DIR", "CANDLE_MINIMAX_H3_Q8_DIT_DIR", "CANDLE_MINIMAX_H3_Q8_TE_DIR"):
+        if required not in preflight:
+            errors.append(f"preflight: missing {required}")
+    for shard in range(1, 15):
+        name = f"model-000{shard:02}-of-00014.safetensors"
+        if name not in manifest or "01 02 03 04 05 06 07 08 09 10 11 12 13 14" not in preflight:
+            errors.append(f"preflight/manifest: does not require text encoder shard {shard:02}")
+
+    models = {model["key"]: model for model in tomllib.loads(manifest)["models"]}
+    vram = models.get("minimax-h3-vram", {})
+    if vram.get("repository") != "MiniMaxAI/MiniMax-H3" or vram.get("revision") != "939557dc319dd91227e30195a763f272ba7f8765":
+        errors.append("minimax-h3-vram: does not pin the upstream snapshot contract")
+    required_vram_files = {"transformer/*", "text_encoder/config.json", "text_encoder/model.safetensors.index.json", *(f"text_encoder/model-{shard:05}-of-00014.safetensors" for shard in range(1, 15))}
+    if not required_vram_files <= set(vram.get("download_files", [])):
+        errors.append("minimax-h3-vram: allow-list omits a required transformer or text-encoder file")
+    for tier in ("bf16", "q8", "q4"):
+        source = models.get(f"minimax-h3-mlx-{tier}", {})
+        if source.get("revision") != "137ce668c55a20bc0935fd1cf2a3de8448abb7f4":
+            errors.append(f"minimax-h3-mlx-{tier}: does not match the provider's built-in revision")
+    return errors
+
+
 def privileged_real_weight_jobs(workflow: str) -> list[str]:
     """Find ordinary-CI jobs whose job-level runner declaration names the privileged label."""
     privileged: list[str] = []
@@ -3304,7 +3360,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     # share), but the SELECTION still has to name a test that exists and is still
                     # `#[ignore]`d, which is exactly what this binding checks.
                     "crates/media/candle-gen/candle-gen-minimax-h3/tests/vram_probe.rs",
-                    ("minimax_h3_vram_bf16",),
+                    ("minimax_h3_vram_q4", "minimax_h3_vram_q8", "minimax_h3_vram_bf16"),
                 ),
             ),
         }
@@ -3468,6 +3524,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "\n".join(bodies[job]),
                 f"{job} does not materialize and verify the pinned snapshot",
             )
+
+    def test_minimax_h3_vram_campaign_policy_rejects_unsafe_staging_and_shared_processes(self) -> None:
+        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        manifest = MODEL_MANIFEST.read_text(encoding="utf-8")
+        self.assertEqual(minimax_h3_vram_policy_errors(workflow, manifest), [])
+
+        # Mutation checks prove each policy branch rejects the failure modes this campaign cannot
+        # safely discover until a multi-hour CUDA render: omitted tier, shared process, missing
+        # component override, reparse-point staging, and an incomplete or mixed-revision manifest.
+        mutations = {
+            "q8 process removed": workflow.replace("      - name: Measure candle vramGbByTier (q8, shipped geometry)", "      - name: Measure another H3 check", 1),
+            "q4 uses the bf16 test": workflow.replace("set \"name=minimax_h3_vram_q4\"", "set \"name=minimax_h3_vram_bf16\"", 1),
+            "q8 text-encoder override removed": workflow.replace("          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}\n", "", 1),
+            "reparse-point refusal removed": workflow.replace("          fsutil reparsepoint query \"%~1\" >nul 2>&1 && (echo ::error::%~2 is a Windows reparse point: %~1. Candle needs a hardlink/copy-staged real directory, not a Hugging Face cache link. & exit /b 1)\n", "", 1),
+        }
+        for label, mutated in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutated, workflow, f"{label} changed nothing")
+                self.assertTrue(minimax_h3_vram_policy_errors(mutated, manifest))
+        for label, mutated in {
+            "dense text shard omitted": manifest.replace('  "text_encoder/model-00014-of-00014.safetensors",\n', "", 1),
+            "tier source revision mixed": manifest.replace("137ce668c55a20bc0935fd1cf2a3de8448abb7f4", "f22bc294f46894584645aec59a513ee411450c96", 1),
+        }.items():
+            with self.subTest(mutation=label):
+                self.assertTrue(minimax_h3_vram_policy_errors(workflow, mutated))
 
     def test_windows_cuda_check_rejects_fork_prs_but_preserves_trusted_events(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
