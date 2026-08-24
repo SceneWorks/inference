@@ -325,17 +325,6 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "each backend's distinct MODEL_ID; its differing identity is deliberate rather than a "
         "cross-backend geometry disagreement."
     ),
-    ("sana", "BASE_MEMORY_REGISTRATION"): (
-        "the registration is structurally identical but wires each backend's own contract and "
-        "safety-check functions — candle resolves them through `SanaVariant::Base`, mlx through "
-        "its `MODEL_ID` string. Same shape as the ltx `MEMORY_REGISTRATION` entry above: an "
-        "aggregate of backend-local function paths, carrying no geometry the two could disagree "
-        "about."
-    ),
-    ("sana", "SPRINT_MEMORY_REGISTRATION"): (
-        "as `BASE_MEMORY_REGISTRATION`: backend-local contract/safety-check function paths for the "
-        "Sprint route, not a shared geometry value."
-    ),
     ("mage", "ATTENTION_CHUNK_SIZE"): (
         "candle takes the shared `gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET` "
         "(64 Mi score elements); mlx pins 16 Mi, a quarter of it, under the SC-15509 Apple/Metal "

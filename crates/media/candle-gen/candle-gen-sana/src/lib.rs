@@ -100,13 +100,13 @@ pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
+        .register_memory_strategy(memory_strategy::CANDLE_BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: memory_strategy::surface_specs,
             provider_id: MODEL_ID,
             contract: |spec| memory_strategy::weights_free_contract(SanaVariant::Base, spec),
         })
-        .register_memory_strategy(memory_strategy::SPRINT_MEMORY_REGISTRATION)
+        .register_memory_strategy(memory_strategy::CANDLE_SPRINT_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: memory_strategy::surface_specs,
             provider_id: SPRINT_MODEL_ID,
