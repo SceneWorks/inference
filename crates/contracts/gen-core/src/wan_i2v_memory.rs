@@ -19,7 +19,16 @@ use crate::{
     MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
 
-pub const RECEIPT_VERSION: &str = "wan-video-structural-v4";
+/// Receipt spelling for the Wan video structural evidence revision.
+///
+/// `v5` (sc-20799) inserted the request frame rate as a **plain-text** field between the mode key
+/// and the artifact identity:
+/// `wan-video-structural-v5:<mode>:fps<fps>:<artifact_identity>:<selection_receipt>:<sha256>`.
+/// The rate was always hashed, but the hash is opaque to a capture record and to
+/// [`validate_context`], so a 16-fps and a 24-fps Ti2V-5B cell were indistinguishable at the
+/// receipt surface and admission had to OR both public rate menus. With the rate readable,
+/// admission pins the exact menu and an evidence collector can key the two cells apart.
+pub const RECEIPT_VERSION: &str = "wan-video-structural-v5";
 pub const LIGHTNING_REPOSITORY: &str = "lightx2v/Wan2.2-Lightning";
 pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 pub const NATIVE_SCHEDULE: &str = "wan-flow-match-native";
@@ -1896,7 +1905,10 @@ fn request_mode(
             Ok(WanPublicMode::ReplacePerson)
         }
         _ => Err(crate::Error::Unsupported(format!(
-            "{}: request is neither exact public I2V nor first_last_frame",
+            "{}: request matches no exact public Wan carrier — this route admits \
+             image_to_video/one Reference (non-VACE), first_last_frame/two ordered Keyframes \
+             (Ti2V-5B, no video_mode), extend_clip and video_bridge (Ti2V-5B MLX keyframes or \
+             VACE ControlClip), and replace_person@<64-hex identity> (VACE / VACE-Fun)",
             prepared.route.provider_id()
         ))),
     }
@@ -2269,11 +2281,35 @@ fn request_evidence_revision_for_selection(
         }
     }
     Ok(format!(
-        "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:{:x}",
+        "{RECEIPT_VERSION}:{}:fps{}:{}:{selection_receipt}:{:x}",
         mode.key(),
+        request.fps.unwrap(),
         prepared.artifact_identity,
         hash.finalize()
     ))
+}
+
+/// The public frame rate carried in plain text by a [`RECEIPT_VERSION`] evidence revision, together
+/// with the receipt tail that follows it.
+///
+/// Returned as `(fps, tail)` where `tail` is everything after `…:fps<fps>:` — the artifact identity,
+/// selection receipt and digest. `None` when the revision is not a receipt of this version and mode.
+fn receipt_rate_and_tail<'a>(
+    evidence_revision: &'a str,
+    mode: WanPublicMode,
+) -> Option<(u32, &'a str)> {
+    let rest = evidence_revision.strip_prefix(RECEIPT_VERSION)?;
+    let rest = rest.strip_prefix(':')?;
+    let rest = rest.strip_prefix(mode.key())?;
+    let rest = rest.strip_prefix(':')?;
+    let (rate, tail) = rest.split_once(':')?;
+    let rate = rate.strip_prefix("fps")?;
+    // `parse` accepts a leading `+`; the emitter never writes one, so refuse a re-spelling that
+    // would let two distinct receipts claim the same rate.
+    if rate.is_empty() || !rate.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((rate.parse().ok()?, tail))
 }
 
 pub fn validate_context(
@@ -2283,7 +2319,10 @@ pub fn validate_context(
     prepared.ensure_unchanged()?;
     let geometry = context.geometry;
     let mode = match context.mode.as_key() {
-        "image_to_video" => WanPublicMode::ImageToVideo,
+        // The VACE routes have no exact public I2V request contract (`request_mode` and
+        // `contract_for_mode_key` both refuse it), so admission must refuse it here too rather
+        // than admit a row no request can ever execute against.
+        "image_to_video" if prepared.route != WanI2vRoute::Vace => WanPublicMode::ImageToVideo,
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
         }
@@ -2313,46 +2352,27 @@ pub fn validate_context(
     };
     let request_contract = request_contract_for_mode(prepared, mode);
     let selection_receipt = selection_receipt_digest(&context.selection);
-    let prefix = format!(
-        "{RECEIPT_VERSION}:{}:{}:{selection_receipt}:",
-        mode.key(),
-        prepared.artifact_identity
-    );
+    // The receipt carries its own frame rate (see [`RECEIPT_VERSION`]), so the exact public rate
+    // menu is pinned here instead of OR-ing 16 and 24 fps into one indistinguishable cell.
+    let Some((fps, tail)) = receipt_rate_and_tail(&context.evidence_revision, mode) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: crossed Wan I2V memory context",
+            prepared.route.provider_id()
+        )));
+    };
+    let tail_prefix = format!("{}:{selection_receipt}:", prepared.artifact_identity);
     let rate_ok = match mode {
-        WanPublicMode::ImageToVideo => {
-            prepared.route.accepts_rate(
-                if prepared.route == WanI2vRoute::I2v14b {
-                    16
-                } else {
-                    24
-                },
-                geometry.frames,
-            ) || (prepared.route == WanI2vRoute::Ti2v5b
-                && prepared.route.accepts_rate(16, geometry.frames))
-        }
+        WanPublicMode::ImageToVideo => prepared.route.accepts_rate(fps, geometry.frames),
         WanPublicMode::FirstLastFrame => {
-            prepared.route.accepts_first_last_rate(16, geometry.frames)
-                || prepared.route.accepts_first_last_rate(24, geometry.frames)
+            prepared.route.accepts_first_last_rate(fps, geometry.frames)
         }
-        WanPublicMode::ExtendClip => match prepared.route {
-            WanI2vRoute::Ti2v5b => {
-                prepared.route.accepts_first_last_rate(16, geometry.frames)
-                    || prepared.route.accepts_first_last_rate(24, geometry.frames)
-            }
-            WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
+        WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => match prepared.route {
+            WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, geometry.frames),
+            WanI2vRoute::Vace => prepared.route.accepts_rate(fps, geometry.frames),
             WanI2vRoute::I2v14b => false,
             WanI2vRoute::VaceFun => false,
         },
-        WanPublicMode::VideoBridge => match prepared.route {
-            WanI2vRoute::Ti2v5b => {
-                prepared.route.accepts_first_last_rate(16, geometry.frames)
-                    || prepared.route.accepts_first_last_rate(24, geometry.frames)
-            }
-            WanI2vRoute::Vace => prepared.route.accepts_rate(16, geometry.frames),
-            WanI2vRoute::I2v14b => false,
-            WanI2vRoute::VaceFun => false,
-        },
-        WanPublicMode::ReplacePerson => prepared.route.accepts_rate(16, geometry.frames),
+        WanPublicMode::ReplacePerson => prepared.route.accepts_rate(fps, geometry.frames),
     };
     let carrier_ok = match mode {
         WanPublicMode::ImageToVideo => geometry.reference_count == 1,
@@ -2403,7 +2423,7 @@ pub fn validate_context(
         || context.overlay.as_deref() != Some(prepared.adapter_identity.as_str())
         || context.use_pid
         || context.has_phases
-        || !context.evidence_revision.starts_with(&prefix)
+        || !tail.starts_with(&tail_prefix)
     {
         return Err(crate::Error::Unsupported(format!(
             "{}: crossed Wan I2V memory context",
@@ -2512,15 +2532,14 @@ pub fn geometry_from_request(request: &GenerationRequest) -> MemoryGeometry {
         // Clip carriers are execution inputs, not semantic image references.  In particular a
         // bridge has two endpoint carriers but zero conceptual references, so it cannot borrow
         // a still-image/FLF memory row merely because it has conditioning entries.
-        reference_count: match request.video_mode.as_deref() {
-            Some("video_bridge") => 0,
-            Some(mode) if mode.starts_with("replace_person@") => request
-                .conditioning
-                .iter()
-                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
-                .count() as u32,
-            _ => request.conditioning.len() as u32,
-        },
+        //
+        // This is deliberately the *same* function both request-scope cores compare an executing
+        // request against ([`GenerationRequest::memory_reference_count`]).  Admission and execution
+        // previously counted the carriers with two separate rules, and they disagreed on the
+        // Wan-VACE `extend_clip` ControlClip (admission 1, execution 0) and on the Ti2V-5B
+        // `video_bridge` keyframe pair (admission 0, execution 2) — so neither mode could ever pass
+        // both gates.  One authority, no drift.
+        reference_count: request.memory_reference_count(),
     }
 }
 
@@ -4066,5 +4085,109 @@ mod tests {
         let crossed =
             PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, "wan2_2_i2v_14b").unwrap();
         assert!(validate_request(&crossed, &lightning_request).is_err());
+    }
+
+    /// sc-20799: the evidence receipt carries its own frame rate in plain text, so admission pins
+    /// the exact public rate menu instead of OR-ing 16 fps and 24 fps into one indistinguishable
+    /// cell, and a capture record can key the two Ti2V-5B cells apart.
+    #[test]
+    fn the_receipt_carries_its_frame_rate_and_admission_pins_the_exact_public_menu() {
+        let (_tmp, spec) = mlx_fixture(WanI2vRoute::Ti2v5b, Some(Quant::Q4));
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").unwrap();
+        let mut request = request(WanI2vRoute::Ti2v5b);
+        // 121 frames is on the 24 fps menu and NOT on the 16 fps menu.
+        assert_eq!(request.fps, Some(24));
+        assert!(prepared.route.accepts_rate(24, 121));
+        assert!(!prepared.route.accepts_rate(16, 121));
+
+        let selection = selection(&prepared, MemoryStrategy::Resident);
+        let contract = request_contract(&prepared, &request).unwrap();
+        request.memory = contract.generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        assert!(
+            receipt.starts_with(&format!("{RECEIPT_VERSION}:image_to_video:fps24:")),
+            "{receipt}"
+        );
+        let run_context = context(&prepared, &request, selection, receipt.clone());
+        validate_context(&prepared, &run_context).unwrap();
+
+        // Re-spelling the rate must move the cell, and the crossed cell must be refused because
+        // 121 frames is not on the 16 fps menu.
+        let mut forged = run_context.clone();
+        forged.evidence_revision = receipt.replacen(":fps24:", ":fps16:", 1);
+        assert_ne!(forged.evidence_revision, receipt);
+        assert!(validate_context(&prepared, &forged).is_err());
+
+        // A receipt with no rate field at all, or an unparsable one, fails closed.
+        for crossed in [
+            receipt.replacen(":fps24:", ":", 1),
+            receipt.replacen(":fps24:", ":fps:", 1),
+            receipt.replacen(":fps24:", ":fps+24:", 1),
+            receipt.replacen(":fps24:", ":24:", 1),
+        ] {
+            let mut forged = run_context.clone();
+            forged.evidence_revision = crossed.clone();
+            assert!(
+                validate_context(&prepared, &forged).is_err(),
+                "{crossed} must not be admitted"
+            );
+        }
+    }
+
+    /// sc-20799: the VACE routes have no exact public I2V request contract, so admission must not
+    /// hand out a row that `request_mode` and `contract_for_mode_key` both refuse.
+    #[test]
+    fn vace_admission_refuses_the_image_to_video_mode_no_vace_request_can_execute() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Candle, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, "wan_vace").unwrap();
+        assert!(contract_for_mode_key(&prepared, "image_to_video").is_err());
+
+        let mut request = vace_extend_request();
+        let selection = selection(&prepared, MemoryStrategy::Resident);
+        let contract = request_contract(&prepared, &request).unwrap();
+        request.memory = contract.generation_memory(&selection);
+        let receipt = request_evidence_revision(&prepared, &request).unwrap();
+        let mut run_context = context(&prepared, &request, selection, receipt);
+        validate_context(&prepared, &run_context).unwrap();
+
+        run_context.mode = crate::MemoryMode::Other("image_to_video".to_owned());
+        let error = validate_context(&prepared, &run_context)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("crossed Wan public memory mode"), "{error}");
+
+        // The non-VACE VACE-Fun route keeps its public I2V contract.
+        let (_tmp, spec) = vace_fun_fixture(WanI2vBackend::Candle, None);
+        let fun = PreparedWanI2vMemory::prepare(
+            &spec,
+            WanI2vBackend::Candle,
+            WanI2vRoute::VaceFun.provider_id(),
+        )
+        .unwrap();
+        assert!(contract_for_mode_key(&fun, "image_to_video").is_ok());
+    }
+
+    /// sc-20799: the catch-all refusal must name the selector it actually enforces.
+    #[test]
+    fn the_unmatched_carrier_refusal_enumerates_every_public_wan_mode() {
+        let (_tmp, spec) = vace_fixture(WanI2vBackend::Candle, None);
+        let prepared =
+            PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, "wan_vace").unwrap();
+        let mut request = vace_extend_request();
+        request.video_mode = Some("not_a_wan_mode".to_owned());
+        let error = validate_request(&prepared, &request)
+            .unwrap_err()
+            .to_string();
+        for mode in [
+            "image_to_video",
+            "first_last_frame",
+            "extend_clip",
+            "video_bridge",
+            "replace_person",
+        ] {
+            assert!(error.contains(mode), "{mode} missing from: {error}");
+        }
     }
 }
