@@ -126,7 +126,8 @@ impl SdxlDetail {
         context: MemoryRunContext,
     ) -> Result<Self> {
         crate::memory_strategy::validate_detail_spec(paths, spec)?;
-        let seal = SdxlArtifactSeal::capture(spec)?;
+        let seal =
+            SdxlArtifactSeal::capture_for(spec, crate::memory_strategy::SdxlSurface::Bespoke)?;
         crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
         crate::memory_strategy::validate_bespoke_context(&context)?;
         let mut model = Self::load(paths)?;
@@ -219,9 +220,7 @@ impl SdxlDetail {
             &conditioning,
         )?;
         on_progress(Progress::Decoding);
-        let tiling = memory
-            .map(|memory| memory.tile_vae_decode)
-            .unwrap_or_else(crate::vae_tiling_enabled);
+        let tiling = crate::denoise::decode_tiling(memory);
         decode_image_with_tiling(&self.vae, &latents, None, Some(&req.cancel), tiling)
     }
 

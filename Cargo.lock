@@ -653,6 +653,7 @@ dependencies = [
  "candle-gen-sdxl",
  "image",
  "rand",
+ "tempfile",
 ]
 
 [[package]]

@@ -398,6 +398,13 @@ pub(crate) fn validate_artifact_tier(spec: &LoadSpec) -> gen_core::Result<()> {
     CheckpointInventory::capture(root)?.validate_numeric_tier(spec)
 }
 
+/// The single production contract for a loaded spec, on every load shape and from every entry
+/// point (the registered generator, `load_understanding_with_spec`, and the registry
+/// `MemoryRegistration`). Component bytes always come from the on-disk inventory when the root
+/// exists, so an eager load can never advertise zero bytes for weights a deferred load prices at
+/// full size. Unlike the registry-only fixture seam it never grants a synthetic calibration
+/// identity. Load shape is expressed *inside* the contract, not by swapping contracts:
+/// `build_contract` declares `BoundedTransformerResidency` `Missing` on a non-streamable spec.
 pub(crate) fn provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -433,20 +440,6 @@ pub(crate) fn weights_free_contract(
             spec.load_shape,
         )),
     ))
-}
-
-/// Production eager/lazy contract before weights materialize. Unlike the registry-only fixture
-/// seam, it never grants a synthetic calibration identity.
-pub(crate) fn uncalibrated_contract(
-    provider_id: &str,
-    spec: &LoadSpec,
-) -> gen_core::Result<MemoryProviderContract> {
-    validate_load_spec(provider_id, spec)?;
-    validate_resolved_artifact_binding(spec)?;
-    if matches!(&spec.weights, WeightsSource::Dir(root) if root.is_dir()) {
-        validate_artifact_tier(spec)?;
-    }
-    Ok(build_contract(provider_id, spec, 0, None))
 }
 
 fn build_contract(
@@ -540,6 +533,21 @@ fn build_contract(
     }
 }
 
+/// **Understanding scope (`vqa` / `interleave`) is single-provider by construction.**
+/// `crate::MODEL_ID_FAST` is the 8-step distilled *generation* variant: it has no understanding
+/// loader at all — `SenseNovaUnderstanding` is only reachable through
+/// `crate::load_understanding_with_spec`, which validates against `crate::MODEL_ID`, and
+/// `run_vqa`/`run_interleave` exist only on that type. So the fast id is registered as a t2i/i2i
+/// surface only, and the understanding surface deliberately reuses `MODEL_ID`'s registration id
+/// and contract (same checkpoint, same spec, same inventory) rather than claiming a phantom
+/// provider id that no generator backs.
+///
+/// The refusal below is nonetheless *reachable*: the fast id owns a registered
+/// `MemoryRegistration`/`MemoryBehaviorRegistration`, so a caller can present a `vqa`/`interleave`
+/// context to `registered_safety_check`/`registered_begin_request` for `MODEL_ID_FAST`. It must
+/// fail closed there, and `registered_valid_fixture` correspondingly emits no understanding
+/// fixtures for that id. Both halves are pinned by
+/// `understanding_routes_are_admitted_only_on_the_quality_provider`.
 fn validate_route(provider_id: &str, context: &MemoryRunContext) -> gen_core::Result<()> {
     if context.use_pid || context.overlay.is_some() || context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
@@ -901,10 +909,6 @@ mod tests {
             .unwrap()
             .calibration
             .is_none());
-        assert!(uncalibrated_contract(crate::MODEL_ID, &spec)
-            .unwrap()
-            .calibration
-            .is_none());
     }
 
     #[test]
@@ -1192,6 +1196,73 @@ mod tests {
         let exact = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()))
             .with_resolved_route(QUALITY_ROUTES[0]);
         assert!(provider_contract(crate::MODEL_ID, &exact).is_err());
+    }
+
+    /// Understanding scope is single-provider (see `validate_route`'s doc). Pin BOTH halves through
+    /// the registered behavior seam a caller actually reaches: `MODEL_ID` ADMITS `vqa`/`interleave`,
+    /// and `MODEL_ID_FAST` refuses them with the exact typed route refusal — not merely "some
+    /// error", which the geometry/prerequisite guards above would also produce.
+    #[test]
+    fn understanding_routes_are_admitted_only_on_the_quality_provider() {
+        let load_spec = spec(LoadShape::EagerMaterialization);
+        for (mode, reference_count) in [
+            (MemoryMode::Other("vqa".into()), 1_u32),
+            (MemoryMode::Other("interleave".into()), 0),
+        ] {
+            let route = |provider_id: &str| {
+                let contract = weights_free_contract(provider_id, &load_spec).unwrap();
+                let context = gen_core::standard_memory_behavior_context(
+                    &contract,
+                    MemoryStrategy::BoundedAttention,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant: None,
+                        component_precision_floors: &[],
+                    },
+                    MemoryBehaviorRoute {
+                        mode: mode.clone(),
+                        reference_count,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                )
+                .unwrap();
+                (contract, context)
+            };
+
+            let (contract, context) = route(crate::MODEL_ID);
+            registered_begin_request(crate::MODEL_ID, &load_spec, &contract, &context)
+                .unwrap_or_else(|error| {
+                    panic!("{mode:?} must be admitted on the quality provider: {error}")
+                })
+                .expect("SenseNova always installs a request scope");
+
+            let (contract, context) = route(crate::MODEL_ID_FAST);
+            let refusal =
+                registered_begin_request(crate::MODEL_ID_FAST, &load_spec, &contract, &context)
+                    .err()
+                    .expect("understanding has no fast loader; the fast route must fail closed");
+            let gen_core::Error::Unsupported(reason) = &refusal else {
+                panic!("fast understanding refusal must be Unsupported, got {refusal:?}");
+            };
+            assert_eq!(
+                reason,
+                &format!(
+                    "{}: memory mode {mode:?} with {reference_count} references is not an executable SenseNova route",
+                    crate::MODEL_ID_FAST
+                )
+            );
+            // The weights-free conformance fixtures must agree with that refusal rather than
+            // handing the fast id an understanding route it can never execute.
+            let fixtures =
+                registered_valid_fixture(&load_spec, &contract, MemoryStrategy::BoundedAttention)
+                    .unwrap();
+            assert!(
+                fixtures.iter().all(|fixture| fixture.context.mode != mode),
+                "fast fixtures must not offer {mode:?}"
+            );
+        }
     }
 
     #[test]

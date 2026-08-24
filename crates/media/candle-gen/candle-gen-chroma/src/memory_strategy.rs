@@ -16,7 +16,6 @@ use candle_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1615,7 +1614,6 @@ pub(crate) fn request_scope(
     ))
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) fn registered_begin_request(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1632,7 +1630,6 @@ pub(crate) fn registered_begin_request(
     )?)))
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1666,7 +1663,6 @@ pub(crate) fn registered_valid_fixture(
     ])
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
     let route = route_identity(provider_id)?;
     let tier = match physical_tier_hint(spec) {
@@ -1692,7 +1688,6 @@ fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::R
     Ok(exact)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn estimated_behavior_context(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,

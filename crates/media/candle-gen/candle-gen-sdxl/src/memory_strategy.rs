@@ -82,6 +82,89 @@ pub const SDXL_ROUTES: &[SdxlRoute] = &[
     },
 ];
 
+/// Which SDXL execution surface a contract describes.
+///
+/// The five routes share one `provider_id`, but the *registered* generator and the *bespoke*
+/// eagerly-assembled providers (edit / IP-Adapter / detail) are different executables with
+/// different rung support. A single contract that claimed the union would let a selector pick a
+/// rung the bespoke loader hard-refuses at admission, so the surface is part of the contract's
+/// identity rather than a caller-side convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdxlSurface {
+    /// The registered generator: text-to-image, hires, img2img/edit and control.
+    Registered,
+    /// The eagerly-assembled `edit` / `ip` / `detail` providers, which materialize their whole
+    /// stack up front and therefore cannot stage component residency across phases.
+    Bespoke,
+}
+
+/// A route id as kebab tokens that cannot be mistaken for the fingerprint's version token.
+///
+/// `gen_core::validate_calibration_fingerprint` requires **exactly one** `vN` token, and two of
+/// the five route ids already end in one (`illustrious_xl_v1`, `illustrious_xl_v2`). Rendered
+/// naively those produce `…-illustrious-xl-v1-…-v1`, which the validator rejects — a defect the
+/// old weights-free witness hid by only ever minting the base route's fingerprint. The model
+/// revision keeps its number and reads as `rev1`/`rev2`, leaving the trailing `v1` as the sole
+/// semantics version.
+fn route_identity_tokens(route: SdxlRoute) -> String {
+    route
+        .id
+        .replace('_', "-")
+        .split('-')
+        .map(|token| match token.strip_prefix('v') {
+            Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                format!("rev{digits}")
+            }
+            _ => token.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The exact calibration fingerprint naming one route's executable memory semantics.
+///
+/// This is the *whole* identity, not a prefix: `realvisxl` and `realvisxl_lightning` both render
+/// `sdxl-candle-realvisxl…`, so any substring or prefix comparison silently resolves the lightning
+/// route to `realvisxl` — which declares `edit: true` — and admits the edit/inpaint/detail/
+/// character modes the lightning route's own row refuses.
+fn route_fingerprint(route: SdxlRoute) -> String {
+    format!(
+        "sdxl-candle-{}-staged-decode-attention-v1",
+        route_identity_tokens(route)
+    )
+}
+
+/// Resolve the route a contract names from its complete calibration fingerprint.
+fn route_from_fingerprint(fingerprint: &str) -> Option<SdxlRoute> {
+    SDXL_ROUTES
+        .iter()
+        .copied()
+        .find(|route| route_fingerprint(*route) == fingerprint)
+}
+
+/// The bounded-decode geometry for one request: the **selected** parameters when the selector
+/// engaged the rung, otherwise this provider's own declared constants.
+///
+/// sc-20799: the contract declares `decode_tile_edges`/`decode_overlaps` from these constants and
+/// [`request_scope`] re-validates exactly them, but the decoder executed a second hardcoded
+/// `512/128` pair that no part of the contract named. Routing execution through the declaration
+/// makes declared, validated and executed one value.
+///
+/// This is a function rather than two `pub(crate)` constants on purpose: `mlx-gen-sdxl` declares
+/// its own Metal-measured `DECODE_TILE_EDGE`, and giving these visibility would mint a new
+/// cross-backend shared-declaration claim that is not one.
+pub(crate) fn decode_tiling_config(
+    memory: Option<gen_core::GenerationMemory>,
+) -> gen_core::tiling::TilingConfig {
+    let edge = memory
+        .and_then(|memory| memory.decode_tile_edge)
+        .unwrap_or(DECODE_TILE_EDGE);
+    let overlap = memory
+        .and_then(|memory| memory.decode_overlap)
+        .unwrap_or(DECODE_OVERLAP);
+    gen_core::tiling::TilingConfig::spatial_only(edge as i32, overlap as i32)
+}
+
 pub(crate) fn backend() -> MemoryBackendRealization {
     MemoryBackendRealization::CandleCuda {
         device_residency: true,
@@ -349,7 +432,15 @@ pub struct SdxlArtifactSeal {
 }
 
 impl SdxlArtifactSeal {
+    /// Seal the registered generator's surface.
     pub fn capture(spec: &LoadSpec) -> gen_core::Result<Self> {
+        Self::capture_for(spec, SdxlSurface::Registered)
+    }
+
+    /// Seal one named execution surface. The bespoke providers must use
+    /// [`SdxlSurface::Bespoke`] so the contract they publish declares the staged-residency rung
+    /// they refuse at admission as `Missing` rather than `Implemented`.
+    pub fn capture_for(spec: &LoadSpec, surface: SdxlSurface) -> gen_core::Result<Self> {
         spec.validate_prepared_file_pins()?;
         let route = route(spec)?;
         let WeightsSource::Dir(root) = &spec.weights else {
@@ -445,16 +536,7 @@ impl SdxlArtifactSeal {
         }
         let receipt = format!("{:x}", receipt.finalize());
         let facts = asset_facts(spec, &root, tier)?;
-        let contract = build_contract(
-            spec,
-            route,
-            tier,
-            facts,
-            format!(
-                "sdxl-candle-{}-staged-decode-attention-v1",
-                route.id.replace('_', "-")
-            ),
-        );
+        let contract = build_contract(spec, surface, tier, facts, route_fingerprint(route));
         let seal = Self {
             contract,
             tier,
@@ -601,7 +683,7 @@ fn asset_facts(
 
 fn build_contract(
     spec: &LoadSpec,
-    _route: SdxlRoute,
+    surface: SdxlSurface,
     _tier: MemoryNumericTier,
     asset_facts: MemoryAssetFacts,
     fingerprint: String,
@@ -618,7 +700,15 @@ fn build_contract(
             .into_iter()
             .map(|strategy| MemoryStrategyCapability {
                 strategy,
-                support: if strategy == MemoryStrategy::BoundedTransformerResidency {
+                // The UNet trunk is never host-backed on this route, so block windowing is
+                // Missing on every surface. Staged residency is Missing on the bespoke surface:
+                // the edit / IP / detail providers assemble their whole stack eagerly and
+                // `validate_bespoke_context` refuses that rung, so declaring it Implemented would
+                // advertise a rung the loader hard-refuses.
+                support: if strategy == MemoryStrategy::BoundedTransformerResidency
+                    || (surface == SdxlSurface::Bespoke
+                        && strategy == MemoryStrategy::StagedResidency)
+                {
                     MemoryStrategySupport::Missing
                 } else {
                     MemoryStrategySupport::Implemented
@@ -879,12 +969,11 @@ fn validate_context_axes(
         .as_ref()
         .map(|identity| identity.fingerprint.as_str())
         .unwrap_or_default();
-    let route = SDXL_ROUTES
-        .iter()
-        .find(|route| route_id.contains(&format!("sdxl-candle-{}-", route.id.replace('_', "-"))))
-        .ok_or_else(|| {
-            gen_core::Error::Unsupported("sdxl: contract has no exact route identity".into())
-        })?;
+    let route = route_from_fingerprint(route_id).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "sdxl: contract fingerprint {route_id:?} is not the exact identity of any SDXL route"
+        ))
+    })?;
     let refs = context.geometry.reference_count;
     match &context.mode {
         MemoryMode::TextToImage if refs == 0 => {}
@@ -984,22 +1073,37 @@ pub(crate) fn request_scope(
     ))
 }
 
+/// Admission for a contract minted without weights.
+///
+/// The overlay axis is taken from the spec, not pinned to `None`: an IP-Adapter / ControlNet /
+/// PiD / LoRA spec carries an overlay identity that a sealed contract would have recorded, and
+/// hardcoding `None` here refused every overlay-bearing request on the pre-load path while the
+/// sealed path admitted it. The tier is the weights-free `bf16 + spec.quantize` witness — the
+/// on-disk tier cannot be read without the artifact.
+fn validate_weights_free_context(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    validate_context_axes(
+        contract,
+        context,
+        MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        },
+        load_overlay_identity(spec).as_deref(),
+    )
+}
+
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let result = if contract.asset_facts == MemoryAssetFacts::default() {
-        validate_context_axes(
-            contract,
-            context,
-            MemoryNumericTier {
-                precision: Precision::Bf16,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
-            None,
-        )
+        validate_weights_free_context(spec, contract, context)
     } else {
         SdxlArtifactSeal::capture(spec).and_then(|seal| validate_context(contract, context, &seal))
     };
@@ -1009,6 +1113,71 @@ pub(crate) fn registered_safety_check(
             reason: error.to_string(),
         },
     }
+}
+
+/// Every route/mode the registered SDXL surface advertises, as executable behavior witnesses.
+///
+/// Plain text-to-image alone left the whole edit family — img2img/edit, inpaint, detail, character,
+/// control and hires — advertised by [`validate_context_axes`] but never exercised by conformance,
+/// so a regression in any of those admission arms was invisible. Each witness carries the exact
+/// `LoadSpec` its overlay identity requires, because [`validate_weights_free_context`] compares the
+/// request overlay against the spec's own overlay identity.
+fn advertised_behavior_routes(
+    spec: &LoadSpec,
+    route: SdxlRoute,
+    strategy: MemoryStrategy,
+) -> Vec<(gen_core::MemoryBehaviorRoute, LoadSpec)> {
+    let plain = |mode: MemoryMode, reference_count: u32, has_phases: bool| {
+        (
+            gen_core::MemoryBehaviorRoute {
+                mode,
+                reference_count,
+                use_pid: false,
+                has_phases,
+                overlay: None,
+            },
+            spec.clone(),
+        )
+    };
+    let mut routes = vec![
+        plain(MemoryMode::TextToImage, 0, false),
+        plain(MemoryMode::Other("hires".to_owned()), 0, true),
+    ];
+    // A control render carries a real ControlNet source, so its overlay identity is `control:1`
+    // on both sides of the comparison rather than absent.
+    let control_spec = spec.clone().with_control(WeightsSource::Dir(PathBuf::from(
+        "/__weights_free__/control",
+    )));
+    let control_overlay = load_overlay_identity(&control_spec);
+    routes.push((
+        gen_core::MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 1,
+            use_pid: false,
+            has_phases: false,
+            overlay: control_overlay,
+        },
+        control_spec,
+    ));
+    if route.edit {
+        routes.push(plain(MemoryMode::ImageToImage, 1, false));
+        routes.push(plain(MemoryMode::Edit, 1, false));
+        // The four `Other` modes are executed by the eagerly-assembled bespoke providers, which
+        // refuse staged residency (`validate_bespoke_context`) and publish a
+        // [`SdxlSurface::Bespoke`] contract that declares that rung `Missing`. Witnessing them
+        // under `StagedResidency` would advertise a rung their executor rejects.
+        if strategy != MemoryStrategy::StagedResidency {
+            for mode in [
+                "image_inpaint",
+                "image_detail",
+                "character_image",
+                "control_image",
+            ] {
+                routes.push(plain(MemoryMode::Other(mode.to_owned()), 1, false));
+            }
+        }
+    }
+    routes
 }
 
 pub(crate) fn registered_valid_fixtures(
@@ -1026,23 +1195,34 @@ pub(crate) fn registered_valid_fixtures(
     {
         return Ok(Vec::new());
     }
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: spec.quantize,
-            component_precision_floors: &[],
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+    let tier = MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    };
+    let route = contract
+        .calibration
+        .as_ref()
+        .and_then(|identity| route_from_fingerprint(&identity.fingerprint))
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "sdxl: behavior fixtures need a contract that names an exact route".into(),
+            )
+        })?;
+    advertised_behavior_routes(spec, route, strategy)
+        .into_iter()
+        .map(|(behavior_route, fixture_spec)| {
+            let context = gen_core::standard_memory_behavior_context(
+                contract,
+                strategy,
+                tier,
+                behavior_route,
+            )?;
+            let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+            fixture.load_spec = Some(fixture_spec);
+            Ok(fixture)
+        })
+        .collect()
 }
 
 pub(crate) fn registered_begin_request(
@@ -1051,16 +1231,7 @@ pub(crate) fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
     if contract.asset_facts == MemoryAssetFacts::default() {
-        validate_context_axes(
-            contract,
-            context,
-            MemoryNumericTier {
-                precision: Precision::Bf16,
-                quant: spec.quantize,
-                component_precision_floors: &[],
-            },
-            None,
-        )?;
+        validate_weights_free_context(spec, contract, context)?;
     } else {
         let seal = SdxlArtifactSeal::capture(spec)?;
         validate_context(contract, context, &seal)?;
@@ -1091,19 +1262,40 @@ pub(crate) fn surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
     gen_core::candle_memory_contract_surface_specs()
 }
 
-pub(crate) fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    let route = SDXL_ROUTES[0];
+/// Weights-free contract for the route the spec names.
+///
+/// The five routes do not share memory semantics — `realvisxl_lightning` refuses the edit family
+/// its `edit: false` row declares — so a pre-load price must be minted under the *requested*
+/// route's identity. An unrouted spec (the catalog's common weights-free witness) resolves to the
+/// base route explicitly rather than by falling off the end of a hardcoded index.
+pub fn weights_free_contract_for_route(
+    route: SdxlRoute,
+    surface: SdxlSurface,
+    spec: &LoadSpec,
+) -> MemoryProviderContract {
     let tier = MemoryNumericTier {
         precision: Precision::Bf16,
         quant: spec.quantize,
         component_precision_floors: &[],
     };
-    Ok(build_contract(
+    build_contract(
         spec,
-        route,
+        surface,
         tier,
         MemoryAssetFacts::default(),
-        "sdxl-candle-sdxl-staged-decode-attention-v1".to_owned(),
+        route_fingerprint(route),
+    )
+}
+
+pub(crate) fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    let route = match spec.resolved_route {
+        Some(_) => route(spec)?,
+        None => SDXL_ROUTES[0],
+    };
+    Ok(weights_free_contract_for_route(
+        route,
+        SdxlSurface::Registered,
+        spec,
     ))
 }
 
@@ -1207,6 +1399,253 @@ mod tests {
                 .unwrap()
                 .edit
         );
+    }
+
+    /// Weights-free witness for one route: no filesystem, exact route identity.
+    fn routed_weights_free_contract(route: SdxlRoute) -> MemoryProviderContract {
+        let spec = LoadSpec::new(WeightsSource::Dir("/__weights_free__".into()))
+            .with_resolved_route(route.id);
+        weights_free_contract(&spec).unwrap()
+    }
+
+    fn context_for(
+        contract: &MemoryProviderContract,
+        mode: MemoryMode,
+        reference_count: u32,
+    ) -> MemoryRunContext {
+        gen_core::standard_memory_behavior_context(
+            contract,
+            MemoryStrategy::BoundedDecode,
+            MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+            gen_core::MemoryBehaviorRoute {
+                mode,
+                reference_count,
+                use_pid: false,
+                has_phases: false,
+                overlay: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// sc-20799 blocker 1. Resolution used to be `fingerprint.contains("sdxl-candle-realvisxl-")`,
+    /// which the *lightning* fingerprint also satisfies — so the lightning route resolved to
+    /// `realvisxl` (`edit: true`, declared first) and was admitted for the whole edit family its
+    /// own row refuses. Each route must resolve to exactly itself.
+    #[test]
+    fn every_route_resolves_to_exactly_itself_from_its_contract() {
+        for route in SDXL_ROUTES {
+            let contract = routed_weights_free_contract(*route);
+            let fingerprint = &contract.calibration.as_ref().unwrap().fingerprint;
+            assert_eq!(
+                route_from_fingerprint(fingerprint).map(|resolved| resolved.id),
+                Some(route.id),
+                "{} resolved to the wrong route from {fingerprint:?}",
+                route.id
+            );
+        }
+        let fingerprints = SDXL_ROUTES
+            .iter()
+            .map(|route| route_fingerprint(*route))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(fingerprints.len(), SDXL_ROUTES.len());
+        // Two route ids end in their own `vN`; the fingerprint must still carry exactly one
+        // semantics version token.
+        for fingerprint in &fingerprints {
+            gen_core::validate_calibration_fingerprint(fingerprint)
+                .unwrap_or_else(|error| panic!("{fingerprint}: {error}"));
+        }
+    }
+
+    /// The behavioural consequence of the collision: the lightning route declares `edit: false`,
+    /// so its own contract must refuse Edit / img2img / inpaint / detail / character, while an
+    /// edit-capable route admits them.
+    #[test]
+    fn the_lightning_route_refuses_the_edit_family_its_row_declares_absent() {
+        let lightning = SDXL_ROUTES
+            .iter()
+            .copied()
+            .find(|route| route.lightning)
+            .expect("the table ships a lightning route");
+        assert!(!lightning.edit);
+        let lightning_contract = routed_weights_free_contract(lightning);
+        let base_contract = routed_weights_free_contract(SDXL_ROUTES[0]);
+        assert!(SDXL_ROUTES[0].edit);
+
+        for mode in [
+            MemoryMode::Edit,
+            MemoryMode::ImageToImage,
+            MemoryMode::Other("image_inpaint".to_owned()),
+            MemoryMode::Other("image_detail".to_owned()),
+            MemoryMode::Other("character_image".to_owned()),
+            MemoryMode::Other("control_image".to_owned()),
+        ] {
+            let refused = context_for(&lightning_contract, mode.clone(), 1);
+            let error =
+                validate_context_axes(&lightning_contract, &refused, refused.selection.tier, None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("realvisxl_lightning"),
+                "the refusal must name the lightning route, got {error}"
+            );
+
+            let admitted = context_for(&base_contract, mode.clone(), 1);
+            validate_context_axes(&base_contract, &admitted, admitted.selection.tier, None)
+                .unwrap_or_else(|error| panic!("the base route must admit {mode:?}: {error}"));
+        }
+    }
+
+    /// sc-20799 blocker 2: **declared == validated == executed.**
+    ///
+    /// The contract publishes exactly one candidate edge and one candidate overlap,
+    /// `CandleRequestScopeCore` re-validates exactly those, and the decoder must execute the same
+    /// pair — the executed config used to be a second hardcoded `512/128` literal that neither the
+    /// contract nor the scope named.
+    #[test]
+    fn the_executed_decode_geometry_is_the_declared_and_validated_one() {
+        let contract = routed_weights_free_contract(SDXL_ROUTES[0]);
+        let declared = contract
+            .capability(MemoryStrategy::BoundedDecode)
+            .expect("bounded decode is declared");
+        assert_eq!(
+            declared.parameters.decode_tile_edges,
+            vec![DECODE_TILE_EDGE]
+        );
+        assert_eq!(declared.parameters.decode_overlaps, vec![DECODE_OVERLAP]);
+
+        // What an unstated selection executes must be exactly what the contract advertises.
+        let spatial = decode_tiling_config(None)
+            .spatial
+            .expect("the SDXL decode is spatially tiled");
+        assert_eq!(
+            spatial.tile_px,
+            declared.parameters.decode_tile_edges[0] as i32
+        );
+        assert_eq!(
+            spatial.overlap_px,
+            declared.parameters.decode_overlaps[0] as i32
+        );
+
+        // An explicit selection executes the selected values, not the constants.
+        let selected = decode_tiling_config(Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(256),
+            decode_overlap: Some(32),
+            ..Default::default()
+        }))
+        .spatial
+        .expect("the SDXL decode is spatially tiled");
+        assert_eq!(selected.tile_px, 256);
+        assert_eq!(selected.overlap_px, 32);
+    }
+
+    /// sc-20799 blocker 3. Every route must be priceable pre-load under its **own** identity; the
+    /// witness used to hardcode `SDXL_ROUTES[0]` and one literal fingerprint.
+    #[test]
+    fn weights_free_contracts_carry_each_routes_own_identity() {
+        for route in SDXL_ROUTES {
+            let contract = routed_weights_free_contract(*route);
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                route_fingerprint(*route)
+            );
+            gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        }
+    }
+
+    /// sc-20799 issue 8. The bespoke providers hard-refuse staged residency at admission, so their
+    /// contract must not advertise the rung as Implemented.
+    #[test]
+    fn the_bespoke_surface_declares_the_rung_it_refuses_missing() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/__weights_free__".into()))
+            .with_resolved_route(SDXL_ROUTES[0].id);
+        let bespoke = weights_free_contract_for_route(SDXL_ROUTES[0], SdxlSurface::Bespoke, &spec);
+        let registered =
+            weights_free_contract_for_route(SDXL_ROUTES[0], SdxlSurface::Registered, &spec);
+        assert_eq!(
+            bespoke
+                .capability(MemoryStrategy::StagedResidency)
+                .map(|capability| &capability.support),
+            Some(&MemoryStrategySupport::Missing)
+        );
+        assert_eq!(
+            registered
+                .capability(MemoryStrategy::StagedResidency)
+                .map(|capability| &capability.support),
+            Some(&MemoryStrategySupport::Implemented)
+        );
+        // The refusal the declaration now mirrors is still enforced at admission.
+        let mut context = context_for(&bespoke, MemoryMode::Edit, 1);
+        context.selection.strategy = MemoryStrategy::StagedResidency;
+        assert!(validate_bespoke_context(&context).is_err());
+    }
+
+    /// sc-20799 issue 7. Conformance witnessed only plain text-to-image while
+    /// `validate_context_axes` advertised the whole edit/control/hires family.
+    #[test]
+    fn behavior_fixtures_witness_every_advertised_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/__weights_free__".into()))
+            .with_resolved_route(SDXL_ROUTES[0].id);
+        let contract = weights_free_contract(&spec).unwrap();
+        let fixtures =
+            registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
+        let modes = fixtures
+            .iter()
+            .map(|fixture| format!("{:?}", fixture.context.mode))
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "TextToImage",
+            "ImageToImage",
+            "Edit",
+            "Other(\"hires\")",
+            "Other(\"image_inpaint\")",
+            "Other(\"image_detail\")",
+            "Other(\"character_image\")",
+            "Other(\"control_image\")",
+        ] {
+            assert!(
+                modes.iter().any(|mode| mode == expected),
+                "no behavior fixture witnesses {expected}; got {modes:?}"
+            );
+        }
+        // Every witness must pass the production admission seam it claims to exercise.
+        for fixture in &fixtures {
+            let fixture_spec = fixture.load_spec.as_ref().unwrap_or(&spec);
+            registered_begin_request(fixture_spec, &contract, &fixture.context).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "fixture {:?} is not admissible: {error}",
+                        fixture.context.mode
+                    )
+                },
+            );
+        }
+        // Staged residency is the one rung the bespoke-only modes' executor refuses.
+        let staged =
+            registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency).unwrap();
+        assert!(staged.iter().all(
+            |fixture| !matches!(&fixture.context.mode, MemoryMode::Other(mode) if mode != "hires")
+        ));
+    }
+
+    /// sc-20799 minor: the weights-free admission branch pinned the overlay axis to `None`, which
+    /// refused every overlay-bearing request the sealed path admits.
+    #[test]
+    fn the_weights_free_branch_admits_the_specs_own_overlay() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/__weights_free__".into()))
+            .with_resolved_route(SDXL_ROUTES[0].id)
+            .with_control(WeightsSource::Dir("/__weights_free__/control".into()));
+        let overlay = load_overlay_identity(&spec).expect("a control spec carries an overlay");
+        assert_eq!(overlay, "control:1");
+        let contract = weights_free_contract(&spec).unwrap();
+        let mut context = context_for(&contract, MemoryMode::TextToImage, 1);
+        context.overlay = Some(overlay);
+        validate_weights_free_context(&spec, &contract, &context).unwrap();
     }
 
     #[test]

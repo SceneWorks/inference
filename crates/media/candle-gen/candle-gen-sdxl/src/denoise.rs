@@ -34,7 +34,9 @@ use candle_gen::gen_core::sampling::DiscreteModelSampling;
 use candle_gen::gen_core::{self, Image, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
 
-use crate::pipeline::{sdxl_tiling_config, SdxlLatentDecoder};
+use candle_gen::gen_core::tiling::TilingConfig;
+
+use crate::pipeline::SdxlLatentDecoder;
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 
@@ -165,7 +167,20 @@ pub fn decode_image(
     pid: Option<&dyn LatentDecoder>,
     cancel: Option<&CancelFlag>,
 ) -> Result<Image> {
-    decode_image_with_tiling(vae, latents, pid, cancel, crate::vae_tiling_enabled())
+    decode_image_with_tiling(vae, latents, pid, cancel, decode_tiling(None))
+}
+
+/// Resolve the bounded-decode geometry for one request from its selected memory plan.
+///
+/// `None` means "decode monolithically" — either the process-global tiling gate is off, or the
+/// selection did not engage the bounded-decode rung. Otherwise the tile edge and overlap are the
+/// ones the selector chose from the contract's published ranges, so declared, validated and
+/// executed are one value (sc-20799).
+pub fn decode_tiling(memory: Option<gen_core::GenerationMemory>) -> Option<TilingConfig> {
+    let enabled = memory
+        .map(|memory| memory.tile_vae_decode)
+        .unwrap_or_else(crate::vae_tiling_enabled);
+    enabled.then(|| crate::memory_strategy::decode_tiling_config(memory))
 }
 
 pub fn decode_image_with_tiling(
@@ -173,7 +188,7 @@ pub fn decode_image_with_tiling(
     latents: &Tensor,
     pid: Option<&dyn LatentDecoder>,
     cancel: Option<&CancelFlag>,
-    tiling_enabled: bool,
+    tiling: Option<TilingConfig>,
 ) -> Result<Image> {
     let native = SdxlLatentDecoder::new(vae);
     let decoder: &dyn LatentDecoder = pid.unwrap_or(&native);
@@ -181,10 +196,9 @@ pub fn decode_image_with_tiling(
         return Err(CandleError::Canceled);
     }
     candle_gen::ensure_decoder_compatible(Some(&candle_gen::gen_core::SDXL_LATENT_SPACE), decoder)?;
-    let img = if tiling_enabled {
-        decoder.decode_tiled(latents, &sdxl_tiling_config(), cancel)?
-    } else {
-        decoder.decode(latents)?
+    let img = match &tiling {
+        Some(tiling) => decoder.decode_tiled(latents, tiling, cancel)?,
+        None => decoder.decode(latents)?,
     };
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let scaled = (img * 255.)?;

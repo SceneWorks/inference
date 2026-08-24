@@ -416,9 +416,7 @@ impl Generator for SdxlControlGenerator {
                     &latents,
                     None,
                     Some(&req.cancel),
-                    req.memory
-                        .map(|memory| memory.tile_vae_decode)
-                        .unwrap_or_else(crate::vae_tiling_enabled),
+                    crate::denoise::decode_tiling(req.memory),
                 )?);
             }
             Ok(())
