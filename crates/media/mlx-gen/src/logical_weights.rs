@@ -48,7 +48,7 @@ use gen_core::checkpoint_codec::{
     DenseResidencyPolicy, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
     LogicalWeightPlan, LogicalWeightReceipt, ScalarScaleSource, TensorCodecSpec, WeightEncoding,
     DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
-    FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC,
+    FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::weightsmeta::Dtype as HeaderDtype;
 use gen_core::ProviderRegistryBuilder;
@@ -71,6 +71,7 @@ pub const BASELINE_CODECS: &[CheckpointCodecRegistration] = &[
     FP8_E5M2_SCALAR_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
+    NVFP4_CODEC,
 ];
 
 /// The codec ids this engine has a decode implementation for. Must equal the ids of
@@ -83,6 +84,7 @@ pub const CODEC_IMPLEMENTATION_IDS: &[&str] = &[
     FP8_E5M2_SCALAR_CODEC.codec_id,
     MXFP8_CODEC.codec_id,
     INT8_PER_ROW_CODEC.codec_id,
+    NVFP4_CODEC.codec_id,
 ];
 
 /// Register the engine's codec table exactly once into a platform catalog.
@@ -116,9 +118,14 @@ pub fn plan_logical_weights(
         |header| header.name.ends_with(".comfy_quant"),
         MAX_DESCRIPTOR_BYTES,
     )?;
-    gen_core::compile_logical_weight_plan(
+    // A checkpoint declares its quantization per layer (`.comfy_quant` tensors), file-wide
+    // (`__metadata__._quantization_metadata`, sc-20641), or not at all; both routes are read and
+    // the compiler refuses a layer the two disagree about.
+    let quantization_metadata = gen_core::safetensors_path_quantization_metadata(path)?;
+    gen_core::compile_logical_weight_plan_with_metadata(
         &headers,
         &descriptors,
+        quantization_metadata.as_deref(),
         mapping,
         baseline_codec_registry(),
         &DenseResidencyPolicy,
@@ -431,6 +438,57 @@ fn decode(
             let dense = mlx_rs::ops::multiply(&values, &block_scales)?.reshape(&[rows, cols])?;
             let logical = dense.index((..tensor.shape[0] as i32, ..tensor.shape[1] as i32));
             Ok(logical.as_dtype(Dtype::Bfloat16)?)
+        }
+        TensorCodecSpec::Nvfp4 {
+            block_scale,
+            global_scale,
+            stored_shape,
+            ..
+        } => {
+            // NVFP4 is decoded on the host through the gen-core reference: MLX has no 4-bit
+            // element type to view the packed nibbles as, so the same reference decode both
+            // backends share is the honest single implementation rather than a second
+            // bit-twiddling path that could drift from it.
+            let packed_shape = [stored_shape[0], stored_shape[1] / 2];
+            guard_shape(tensor, &array, &packed_shape)?;
+            guard_dtype(tensor, &array, Dtype::Uint8)?;
+            let scales = companion(tensor, physical, block_scale)?;
+            if scales.dtype() != Dtype::Uint8 {
+                return Err(Error::Msg(format!(
+                    "codec {}: companion {block_scale:?} must load as U8 E4M3 block-scale bytes, \
+                     got {:?}",
+                    tensor.codec_id,
+                    scales.dtype()
+                )));
+            }
+            let global = companion(tensor, physical, global_scale)?;
+            if global.dtype() != Dtype::Float32 || global.size() != 1 {
+                return Err(Error::Msg(format!(
+                    "codec {}: companion {global_scale:?} must load as one F32 scalar, got {:?} \
+                     with {} elements",
+                    tensor.codec_id,
+                    global.dtype(),
+                    global.size()
+                )));
+            }
+            let mut values = Vec::new();
+            gen_core::decode_nvfp4(
+                array.as_slice::<u8>(),
+                scales.as_slice::<u8>(),
+                global.as_slice::<f32>()[0],
+                *stored_shape,
+                [tensor.shape[0], tensor.shape[1]],
+                &mut values,
+            )
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "codec {}: tensor {:?}: {error}",
+                    tensor.codec_id, tensor.physical_key
+                ))
+            })?;
+            let dense =
+                Array::from_slice(&values, &[tensor.shape[0] as i32, tensor.shape[1] as i32]);
+            Ok(dense.as_dtype(Dtype::Bfloat16)?)
         }
         TensorCodecSpec::Int8PerRow { scale, .. } => {
             guard_shape(tensor, &array, &tensor.shape)?;
@@ -1238,6 +1296,117 @@ mod tests {
         assert_eq!(receipt.resident_bytes(), plan.resident_bytes());
     }
 
+    /// AC1 (MLX). The NVFP4 golden fixture decodes on the dense fallback to a **hand-derived**
+    /// expectation: E2M1 grid value × E4M3 block scale × the `weight_scale_2` global, with both the
+    /// grid and the scale values written out literally below rather than obtained from the decoder
+    /// under test.
+    ///
+    /// The fixture is 16-padded on both axes (`[32, 64]` stored, `[20, 50]` declared logical), so
+    /// the unpad is on the path and blocks that cover only padding carry NaN poison. It also
+    /// exercises MLX's header-rewriting reader: the block scales are stored `F8_E4M3`, a dtype MLX
+    /// has no array type for and re-presents as `U8`.
+    #[test]
+    fn nvfp4_golden_unswizzles_unpads_and_decodes_to_a_hand_derived_table() {
+        struct DeclaredShape;
+        impl LogicalKeyMapping for DeclaredShape {
+            fn mapping_id(&self) -> &'static str {
+                "declared-shape-test"
+            }
+            fn logical_key(&self, physical_key: &str) -> Option<String> {
+                physical_key.strip_prefix("model.").map(str::to_owned)
+            }
+            fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
+                (logical_key == "n.weight").then(|| vec![20, 50])
+            }
+        }
+        // The E2M1 grid and the E4M3 scale values, written out by hand from the format tables.
+        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        const SCALE_BYTES: [u8; 4] = [0x38, 0x40, 0x30, 0x3C];
+        const SCALE_VALUES: [f32; 4] = [1.0, 2.0, 0.5, 1.5];
+        const GLOBAL: f32 = 0.25;
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-padded.safetensors");
+        let stored = [32_usize, 64];
+        let logical = [20_usize, 50];
+        let row_bytes = stored[1] / 2;
+
+        // Real region: column c holds E2M1 code (c % 8). Padding keeps the zero code the format
+        // requires; the block scales covering padding-only blocks carry NaN poison instead.
+        let mut packed = vec![0_u8; stored[0] * row_bytes];
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                let code = (col % 8) as u8;
+                let byte = &mut packed[row * row_bytes + col / 2];
+                // ComfyUI packs the even element in the HIGH nibble.
+                if col.is_multiple_of(2) {
+                    *byte = (*byte & 0x0F) | (code << 4);
+                } else {
+                    *byte = (*byte & 0xF0) | code;
+                }
+            }
+        }
+        let scale_shape = gen_core::nvfp4_scale_shape(stored);
+        let mut scales = vec![0x7F_u8; scale_shape[0] * scale_shape[1]]; // E4M3 NaN poison
+        for row in 0..logical[0] {
+            for block in 0..logical[1].div_ceil(16) {
+                scales[gen_core::nvfp4_swizzled_scale_index(stored, row, block)] =
+                    SCALE_BYTES[(row + block) % 4];
+            }
+        }
+        write_safetensors(
+            &path,
+            &[
+                (
+                    "model.n.weight",
+                    "U8",
+                    &[stored[0], row_bytes],
+                    packed.clone(),
+                ),
+                ("model.n.weight_scale", "F8_E4M3", &scale_shape, scales),
+                (
+                    "model.n.weight_scale_2",
+                    "F32",
+                    &[],
+                    GLOBAL.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.n.comfy_quant",
+                    "U8",
+                    &[19],
+                    br#"{"format": "nvfp4"}"#.to_vec(),
+                ),
+            ],
+        );
+
+        let plan = plan_logical_weights(&path, &DeclaredShape).expect("plan");
+        assert_eq!(plan.codec_ids(), vec!["nvfp4-v1"]);
+        assert_eq!(plan.tensors[0].shape, logical.to_vec());
+        assert_eq!(
+            plan.tensors[0].residency,
+            PlannedResidency {
+                mode: ResidencyMode::Dense,
+                resident_bytes: (20 * 50 * 2) as u64
+            },
+            "MLX has no FP4 matmul on the codec seam: always the dense fallback"
+        );
+
+        let LogicalWeights { weights, receipt } = eager_read(&path, &plan);
+        assert_eq!(weights.require("n.weight").unwrap().shape(), [20, 50]);
+        let got = as_f32(&weights, "n.weight");
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                let expected = to_bf16(E2M1[col % 8] * SCALE_VALUES[(row + col / 16) % 4] * GLOBAL);
+                assert_eq!(got[row * logical[1] + col], expected, "row {row} col {col}");
+            }
+        }
+        assert!(
+            got.iter().all(|value| value.is_finite()),
+            "NaN poison from a padding-only block scale leaked into the logical tensor"
+        );
+        assert_eq!(receipt.resident_bytes(), plan.resident_bytes());
+    }
+
     /// The int8 per-row codec row — the former bespoke Krea arm's exact math, now engine-level.
     #[test]
     fn int8_per_row_golden_decodes_codes_times_row_scale() {
@@ -1455,7 +1624,7 @@ mod tests {
 
         // A malformed descriptor names the exact layer and defect, from the payload bytes.
         let bad = dir.path().join("bad-descriptor.safetensors");
-        let descriptor = br#"{"format": "nvfp4"}"#;
+        let descriptor = br#"{"format": "int4_awq"}"#;
         write_safetensors(
             &bad,
             &[
@@ -1472,7 +1641,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("\"model.q\"") && error.contains("nvfp4"),
+            error.contains("\"model.q\"") && error.contains("int4_awq"),
+            "{error}"
+        );
+
+        // sc-20641: `nvfp4` is no longer an unsupported format — it is a registered codec — but a
+        // layer that DECLARES nvfp4 while storing an fp8 weight is still refused, by dtype.
+        let mismatched = dir.path().join("nvfp4-dtype-mismatch.safetensors");
+        let nvfp4_descriptor = br#"{"format": "nvfp4"}"#;
+        write_safetensors(
+            &mismatched,
+            &[
+                ("model.q.weight", "F8_E4M3", &[16, 16], vec![0x38; 256]),
+                (
+                    "model.q.comfy_quant",
+                    "U8",
+                    &[nvfp4_descriptor.len()],
+                    nvfp4_descriptor.to_vec(),
+                ),
+            ],
+        );
+        let error = plan_logical_weights(&mismatched, &StripModel)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("model.q.weight")
+                && error.contains("nvfp4")
+                && error.contains("F8_E4M3"),
             "{error}"
         );
 

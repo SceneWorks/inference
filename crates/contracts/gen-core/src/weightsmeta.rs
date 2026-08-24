@@ -631,6 +631,25 @@ pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<Safet
     })
 }
 
+/// The file-level `__metadata__._quantization_metadata` string of one safetensors file, if it
+/// carries one (sc-20641).
+///
+/// Header-only — the data region is never touched — so it is safe on a multi-gigabyte checkpoint,
+/// which matters because this is exactly how a whole-file NVFP4 import declares its quantization
+/// (the ComfyUI Kitchen converters write no per-layer `.comfy_quant` tensors at all). Returns
+/// `Ok(None)` when the key is absent: the ordinary case for a checkpoint that is unquantized or
+/// uses the per-layer descriptor convention.
+pub fn safetensors_path_quantization_metadata(path: impl AsRef<Path>) -> Result<Option<String>> {
+    let layout = safetensors_file_tensor_locations(path)?;
+    let header: serde_json::Value = serde_json::from_slice(&layout.header_json)
+        .map_err(|error| Error::Msg(format!("safetensors header is not valid JSON: {error}")))?;
+    Ok(header
+        .get("__metadata__")
+        .and_then(|metadata| metadata.get("_quantization_metadata"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
 /// Read the raw payload bytes of the selected tensors from one safetensors file — nothing else is
 /// touched. Built for the *small* per-layer companions a codec plan needs before any backend array
 /// exists (ComfyUI `.comfy_quant` descriptor blobs); `max_bytes_each` bounds every selected payload

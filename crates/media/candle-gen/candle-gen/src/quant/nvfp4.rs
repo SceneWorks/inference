@@ -200,11 +200,27 @@ pub struct Nvfp4Tensor {
 impl Nvfp4Tensor {
     /// Build the canonical Candle NVFP4 container from a ComfyUI Kitchen serialization.
     ///
-    /// Kitchen already writes the FP8 block scales in the cuBLAS `to_blocked` layout consumed by
-    /// this crate, and its FP32 second-level scale has the same numeric convention. The one storage
-    /// difference is nibble order: Kitchen's default `hi_first=true` stores the even K element in
-    /// the high nibble, while [`Nvfp4Tensor`] stores it in the low nibble. Swapping every byte is
-    /// therefore a lossless representation conversion; no weight or scale is requantized.
+    /// Two lossless representation conversions happen here; no weight or scale is requantized, and
+    /// the FP32 second-level scale has the same numeric convention in both.
+    ///
+    /// 1. **Nibble order.** Kitchen's `hi_first=true` stores the even K element in the high nibble
+    ///    (`comfy.float.stochastic_float_to_fp4_e2m1`: `packed = (even << 4) | odd`), while
+    ///    [`Nvfp4Tensor`] stores it in the low nibble. Every byte is rotated.
+    ///
+    /// 2. **Block-scale atom order** (sc-20641). Both layouts are the cuBLAS 128×4 scale-factor
+    ///    swizzle with the *same* intra-atom slot, but they walk the atom grid differently:
+    ///    ComfyUI's `comfy.float.to_blocked` permutes `(R/128, 128, B/4, 4) → (R/128, B/4, 128, 4)`,
+    ///    i.e. **row-major** over atoms, while [`Self::scale_offset_for`] walks it **column-major**
+    ///    (CuTe `blocked_product` `LayoutLeft`). The two coincide only when the weight has a single
+    ///    atom in one dimension — which is why this constructor's original single-atom test could
+    ///    not see the difference, and why every real DiT projection was affected (a `[6144, 6144]`
+    ///    layer has 48 row atoms × 48 block atoms). Scales are therefore **permuted** into the
+    ///    container's own convention — read through [`gen_core::blocked_scale_index`], written
+    ///    through [`Self::scale_offset_for`] — rather than copied verbatim.
+    ///
+    ///    Going through both index functions keeps this correct if the atom order the [module
+    ///    docs](self) flag as "the one degree of freedom" is later flipped to match live cuBLASLt:
+    ///    the permutation collapses to the identity on its own, with no edit here.
     ///
     /// `rows` and `cols` are the logical (already 16-aligned) weight dimensions. The constructor is
     /// intentionally strict because imported checkpoints are untrusted input and a malformed scale
@@ -248,14 +264,25 @@ impl Nvfp4Tensor {
             .map(|byte| byte.rotate_left(4))
             .collect();
         let cols_padded = cols;
+        let blocks = cols / NVFP4_BLOCK;
         let sf_rows = round_up(rows, SF_ATOM_ROWS);
-        let sf_cols = round_up(cols / NVFP4_BLOCK, SF_ATOM_COLS);
+        let sf_cols = round_up(blocks, SF_ATOM_COLS);
+        // Permute the atom grid from Kitchen's `to_blocked` order into this container's — see the
+        // doc comment. Padded slots keep the 0x00 they are initialized with; both layouts pad the
+        // same `sf_rows * sf_cols` surface, so nothing is lost or invented.
+        let mut scales = vec![0u8; sf_rows * sf_cols];
+        for r in 0..rows {
+            for blk in 0..blocks {
+                scales[Self::scale_offset_for(r, blk, sf_rows)] =
+                    blocked_scales[gen_core::blocked_scale_index(rows, blocks, r, blk)];
+            }
+        }
         Ok(Self {
             rows,
             cols,
             cols_padded,
             packed,
-            scales: blocked_scales.to_vec(),
+            scales,
             sf_rows,
             sf_cols,
             global_scale,
@@ -503,11 +530,72 @@ mod tests {
         assert_eq!(tensor.packed[0], 0x21);
         assert_eq!(
             tensor.scales, scales,
-            "blocked scales must remain byte-exact"
+            "a single-atom weight's blocked scales are byte-exact: the atom-order permutation is \
+             the identity when there is only one atom"
         );
         let dense = tensor.dequantize_to_vec();
         assert_eq!(dense[0], 1.0); // E2M1(1) 0.5 * scale 1.0 * global 2.0
         assert_eq!(dense[1], 2.0); // E2M1(2) 1.0 * scale 1.0 * global 2.0
+        Ok(())
+    }
+
+    /// sc-20641. The case the single-atom test above structurally cannot reach: a weight with more
+    /// than one scale atom in **both** dimensions, where ComfyUI's row-major `to_blocked` atom walk
+    /// and this container's column-major [`Nvfp4Tensor::scale_offset_for`] disagree.
+    ///
+    /// Every real DiT projection is in this regime (`[6144, 6144]` → 48 × 48 atoms), so a verbatim
+    /// copy of Kitchen's scale buffer would hand cuBLASLt — and the dequant fallback — the right
+    /// bytes in the wrong slots. The guard is on the decoded value of a specific element whose
+    /// block scale moves under the permutation, not on the buffer as a whole.
+    #[test]
+    fn kitchen_parts_permute_block_scales_across_a_multi_atom_grid() -> Result<()> {
+        // 256 rows = 2 row atoms; 128 cols = 8 blocks = 2 block atoms.
+        let (rows, cols) = (256, 128);
+        let blocks = cols / NVFP4_BLOCK;
+        assert!(
+            rows / SF_ATOM_ROWS > 1 && blocks / SF_ATOM_COLS > 1,
+            "the fixture must have >1 atom in both dimensions or it proves nothing"
+        );
+
+        // Kitchen buffer: give each (row, block) a distinct, recoverable E4M3 code so a wrong slot
+        // is a wrong *value*, not just a wrong address. Codes 0x30..0x40 are 0.5..1.875.
+        let code_for = |r: usize, blk: usize| -> u8 { 0x30 + ((r / 32 + blk * 3) % 16) as u8 };
+        let mut kitchen_scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
+        for r in 0..rows {
+            for blk in 0..blocks {
+                kitchen_scales[gen_core::blocked_scale_index(rows, blocks, r, blk)] =
+                    code_for(r, blk);
+            }
+        }
+        // Every element code 2 (E2M1 1.0), so the decoded value *is* the block scale × global.
+        let packed = vec![0x22_u8; rows * cols / 2];
+        let global = 4.0_f32;
+
+        let tensor = Nvfp4Tensor::from_kitchen_parts(&packed, &kitchen_scales, global, rows, cols)?;
+
+        // The permutation is NOT the identity here — this is the assertion the old fixture could
+        // not make.
+        assert_ne!(
+            tensor.scales, kitchen_scales,
+            "a multi-atom grid must be permuted, not copied"
+        );
+        // Each scale landed in the container's own slot...
+        for r in 0..rows {
+            for blk in 0..blocks {
+                assert_eq!(
+                    tensor.scales[Nvfp4Tensor::scale_offset_for(r, blk, tensor.sf_rows)],
+                    code_for(r, blk),
+                    "scale for (row {r}, block {blk})"
+                );
+            }
+        }
+        // ...and the container's own dequant therefore recovers the value ComfyUI meant, element by
+        // element. Column 100 sits in block 6, whose scale moves atoms under the permutation.
+        let dense = tensor.dequantize_to_vec();
+        for (r, c) in [(0_usize, 0_usize), (5, 100), (200, 100), (255, 127)] {
+            let expected = e4m3_to_f32(code_for(r, c / NVFP4_BLOCK)) * global;
+            assert_eq!(dense[r * cols + c], expected, "element ({r}, {c})");
+        }
         Ok(())
     }
 

@@ -28,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::comfy_quant::{
-    parse_comfy_quant_descriptor, validate_mxfp8_geometry, ComfyQuantDescriptor,
-    ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
+    parse_comfy_quant_descriptor, validate_mxfp8_geometry, validate_nvfp4_geometry,
+    ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
+    Nvfp4GeometryError, QuantizationMetadataError,
 };
 use crate::weightsmeta::{Dtype, SafetensorsTensorHeader};
 
@@ -247,12 +248,31 @@ pub const INT8_PER_ROW_CODEC: CheckpointCodecRegistration = CheckpointCodecRegis
     resident_encoding: WeightEncoding::DenseBf16,
 };
 
-/// The ComfyUI descriptor-gated codec rows (sc-20385), registered alongside [`DENSE_CODECS`].
+/// ComfyUI **NVFP4** (sc-20641): E2M1 nibbles packed two per `U8` byte (even element in the high
+/// nibble), one FP8 **E4M3** micro-scale per 16-element block in the cuBLAS 128×4 `to_blocked`
+/// swizzle (`{layer}.weight_scale`), and one `F32` per-tensor scale (`{layer}.weight_scale_2`) —
+/// the two-level NVFP4 scaling. Storage is 16-padded on both axes.
+///
+/// Dense fallback dequantizes both levels and unpads to the logical shape. Candle's `Nvfp4Linear`
+/// (cuBLASLt `CUDA_R_4F_E2M1` + `VEC16_UE4M3`) is the packed-native path where the layout and the
+/// `sm_120` hardware contract both hold; every other device takes the dense fallback.
+pub const NVFP4_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+    codec_id: "nvfp4-v1",
+    stored: &[StoredTensorFormat::described(
+        WeightEncoding::UInt8,
+        ComfyQuantFormat::Nvfp4,
+    )],
+    resident_encoding: WeightEncoding::DenseBf16,
+};
+
+/// The ComfyUI descriptor-gated codec rows (sc-20385, sc-20641), registered alongside
+/// [`DENSE_CODECS`].
 pub const COMFY_QUANT_CODECS: &[CheckpointCodecRegistration] = &[
     FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC,
     MXFP8_CODEC,
     INT8_PER_ROW_CODEC,
+    NVFP4_CODEC,
 ];
 
 /// Validated, immutable set of codecs keyed by stored format. Built by
@@ -429,6 +449,28 @@ pub enum TensorCodecSpec {
         scale: String,
         full_precision_matrix_mult: bool,
     },
+    /// NVFP4: `U8` `[rows, cols/2]` E2M1 nibbles + `to_blocked` E4M3 block scales + one `F32`
+    /// per-tensor scale.
+    Nvfp4 {
+        /// `{layer}.weight_scale` — the swizzled per-16-block E4M3 micro-scales.
+        block_scale: String,
+        /// `{layer}.weight_scale_2` — the per-tensor `F32` second level.
+        global_scale: String,
+        /// Consumed activation-scale companion, irrelevant to weight decode.
+        input_scale: Option<String>,
+        /// The 16-padded **logical** `[rows, cols]` the payload holds (the on-disk byte shape is
+        /// `[rows, cols / 2]`).
+        stored_shape: [usize; 2],
+        /// The layer's true `[out_features, in_features]`. ComfyUI pads NVFP4 storage to 16, so
+        /// this is element-wise `≤ stored_shape`; the two are equal only when the layer's own
+        /// geometry needed no padding. A packed-native plan **requires** equality — repacking the
+        /// padded grid would hand `Nvfp4Linear` padding as real contraction elements (sc-20641).
+        logical_shape: [usize; 2],
+        /// Whether the logical shape came from the adapter (`true`) or is the stored shape because
+        /// the adapter declares none (`false`; the family's shape validation is the backstop).
+        logical_shape_declared: bool,
+        full_precision_matrix_mult: bool,
+    },
 }
 
 impl TensorCodecSpec {
@@ -444,6 +486,10 @@ impl TensorCodecSpec {
                 ..
             }
             | Self::Int8PerRow {
+                full_precision_matrix_mult,
+                ..
+            }
+            | Self::Nvfp4 {
                 full_precision_matrix_mult,
                 ..
             } => *full_precision_matrix_mult,
@@ -528,6 +574,9 @@ pub enum CompanionRole {
     WeightScale,
     /// `{layer}.input_scale` — activation scale; consumed (dense) or retained (packed).
     InputScale,
+    /// `{layer}.weight_scale_2` — NVFP4's `F32` per-tensor second-level scale; consumed by a dense
+    /// decode, retained by a packed-native load (cuBLASLt folds it into `alpha`).
+    GlobalScale,
 }
 
 impl CompanionRole {
@@ -536,6 +585,7 @@ impl CompanionRole {
             Self::Descriptor => "comfy_quant",
             Self::WeightScale => "weight_scale",
             Self::InputScale => "input_scale",
+            Self::GlobalScale => "weight_scale_2",
         }
     }
 }
@@ -657,6 +707,11 @@ impl LogicalWeightPlan {
                         },
                         match &tensor.codec {
                             TensorCodecSpec::Mxfp8 { stored_shape, .. } => stored_shape.to_vec(),
+                            // NVFP4's resident packed form is the on-disk `U8` byte matrix
+                            // `[rows, cols / 2]`, not the logical element grid.
+                            TensorCodecSpec::Nvfp4 { stored_shape, .. } => {
+                                vec![stored_shape[0], stored_shape[1] / 2]
+                            }
                             _ => tensor.shape.clone(),
                         },
                     ),
@@ -748,6 +803,28 @@ pub enum LogicalWeightPlanError {
     Mxfp8Geometry {
         physical_key: String,
         error: Mxfp8GeometryError,
+    },
+    /// NVFP4 block geometry (16-padding, packed byte shape, scale swizzle shape) is invalid.
+    Nvfp4Geometry {
+        physical_key: String,
+        error: Nvfp4GeometryError,
+    },
+    /// The file-level `__metadata__._quantization_metadata` table is malformed.
+    QuantizationMetadata { error: QuantizationMetadataError },
+    /// A `_quantization_metadata` layer name matches no `{layer}.weight` tensor under any single
+    /// state-dict prefix, or matches under more than one — the compiler will not guess which
+    /// tensors a header-declared quantization governs.
+    QuantizationMetadataLayer { layer: String, reason: String },
+    /// One layer is declared twice, by a `.comfy_quant` tensor and by the file-level metadata, with
+    /// two different descriptors. The whole descriptor is compared, not just its `format`:
+    /// `full_precision_matrix_mult` decides packed-vs-dense residency, so a silent resolution in
+    /// either declaration's favour would change how the layer is priced and run.
+    DescriptorConflict {
+        physical_key: String,
+        tensor: ComfyQuantDescriptor,
+        metadata: ComfyQuantDescriptor,
+        /// The descriptor field names that disagree, in declaration order.
+        disagreement: Vec<&'static str>,
     },
 }
 
@@ -849,6 +926,31 @@ impl fmt::Display for LogicalWeightPlanError {
                 physical_key,
                 error,
             } => write!(f, "weight {physical_key:?}: {error}"),
+            Self::Nvfp4Geometry {
+                physical_key,
+                error,
+            } => write!(f, "weight {physical_key:?}: {error}"),
+            Self::QuantizationMetadata { error } => write!(f, "{error}"),
+            Self::QuantizationMetadataLayer { layer, reason } => write!(
+                f,
+                "`_quantization_metadata` declares layer {layer:?} but {reason}"
+            ),
+            Self::DescriptorConflict {
+                physical_key,
+                tensor,
+                metadata,
+                disagreement,
+            } => write!(
+                f,
+                "weight {physical_key:?} is declared `{}` (full_precision_matrix_mult={}) by its \
+                 `.comfy_quant` tensor and `{}` (full_precision_matrix_mult={}) by \
+                 `__metadata__._quantization_metadata`; the two declarations disagree on {}",
+                tensor.format,
+                tensor.full_precision_matrix_mult,
+                metadata.format,
+                metadata.full_precision_matrix_mult,
+                disagreement.join(", ")
+            ),
         }
     }
 }
@@ -861,7 +963,7 @@ impl From<LogicalWeightPlanError> for crate::Error {
     }
 }
 
-/// The companion suffixes of the `.comfy_quant` convention plus the refused nvfp4/legacy names.
+/// The companion suffixes of the `.comfy_quant` convention plus the refused legacy names.
 const DESCRIPTOR_SUFFIX: &str = ".comfy_quant";
 const WEIGHT_SCALE_SUFFIX: &str = ".weight_scale";
 const INPUT_SCALE_SUFFIX: &str = ".input_scale";
@@ -888,6 +990,34 @@ pub fn compile_logical_weight_plan(
     codecs: &CheckpointCodecRegistry,
     residency: &dyn CodecResidencyPolicy,
 ) -> Result<LogicalWeightPlan, LogicalWeightPlanError> {
+    compile_logical_weight_plan_with_metadata(
+        headers,
+        descriptor_payloads,
+        None,
+        mapping,
+        codecs,
+        residency,
+    )
+}
+
+/// [`compile_logical_weight_plan`] plus the file-level
+/// `__metadata__._quantization_metadata` payload, when the checkpoint carries one instead of (or
+/// alongside) per-layer `.comfy_quant` tensors — the form the ComfyUI Kitchen NVFP4 converters write
+/// (sc-20641).
+///
+/// The metadata's layer names are commonly *relative* to the state-dict prefix its tensors carry
+/// (`blocks.0.attn.wq` for `model.diffusion_model.blocks.0.attn.wq.weight`). The prefix is resolved
+/// **once**, from the whole declared layer set, and must be unique and consistent across every
+/// declared layer; anything else refuses rather than guessing which tensors a declaration governs.
+/// A layer declared by both routes must agree, or the plan refuses.
+pub fn compile_logical_weight_plan_with_metadata(
+    headers: &[SafetensorsTensorHeader],
+    descriptor_payloads: &BTreeMap<String, Vec<u8>>,
+    quantization_metadata: Option<&str>,
+    mapping: &dyn LogicalKeyMapping,
+    codecs: &CheckpointCodecRegistry,
+    residency: &dyn CodecResidencyPolicy,
+) -> Result<LogicalWeightPlan, LogicalWeightPlanError> {
     if headers.is_empty() {
         return Err(LogicalWeightPlanError::EmptyCheckpoint);
     }
@@ -896,8 +1026,18 @@ pub fn compile_logical_weight_plan(
         .map(|header| (header.name.as_str(), header))
         .collect();
 
-    // ---- classify companions and validate descriptors, per layer ----------------------------
+    // ---- file-level descriptor table, resolved onto this file's layer bases ------------------
     let mut descriptors: BTreeMap<String, ComfyQuantDescriptor> = BTreeMap::new(); // by layer base
+    if let Some(payload) = quantization_metadata {
+        let table = crate::comfy_quant::parse_quantization_metadata(payload)
+            .map_err(|error| LogicalWeightPlanError::QuantizationMetadata { error })?;
+        let prefix = resolve_metadata_prefix(&by_name, &table)?;
+        for (layer, descriptor) in table {
+            descriptors.insert(format!("{prefix}{layer}"), descriptor);
+        }
+    }
+
+    // ---- classify companions and validate descriptors, per layer ----------------------------
     for header in by_name.values() {
         if header.name == LEGACY_MARKER_KEY
             || LEGACY_SCALE_SUFFIXES
@@ -906,13 +1046,6 @@ pub fn compile_logical_weight_plan(
         {
             return Err(LogicalWeightPlanError::LegacyScaledFp8 {
                 physical_key: header.name.clone(),
-            });
-        }
-        if header.name.ends_with(NVFP4_SCALE_2_SUFFIX) {
-            return Err(LogicalWeightPlanError::UnexpectedCompanion {
-                physical_key: header.name.clone(),
-                reason: "`weight_scale_2` belongs to the ComfyUI `nvfp4` format, which has no \
-                         registered codec yet (sc-20641)",
             });
         }
         let Some(base) = header.name.strip_suffix(DESCRIPTOR_SUFFIX) else {
@@ -941,18 +1074,33 @@ pub fn compile_logical_weight_plan(
                 defect,
             }
         })?;
-        descriptors.insert(base.to_owned(), descriptor);
+        if let Some(previous) = descriptors.insert(base.to_owned(), descriptor) {
+            if previous != descriptor {
+                let mut disagreement = Vec::new();
+                if previous.format != descriptor.format {
+                    disagreement.push("format");
+                }
+                if previous.full_precision_matrix_mult != descriptor.full_precision_matrix_mult {
+                    disagreement.push("full_precision_matrix_mult");
+                }
+                return Err(LogicalWeightPlanError::DescriptorConflict {
+                    physical_key: weight_key,
+                    tensor: descriptor,
+                    metadata: previous,
+                    disagreement,
+                });
+            }
+        }
     }
 
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
         if let Some(base) = name.strip_suffix(DESCRIPTOR_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::Descriptor));
         }
-        // `.weight_scale_2` ends with neither `.weight_scale` (different suffix) — check it first
-        // so the nvfp4 companion is named as such rather than mis-classified.
+        // `.weight_scale_2` does not end with `.weight_scale` (different suffix), but check it
+        // first anyway so the NVFP4 second-level scale is always named as such.
         if let Some(base) = name.strip_suffix(NVFP4_SCALE_2_SUFFIX) {
-            let _ = base;
-            return None; // handled as an explicit refusal below
+            return Some((base.to_owned(), CompanionRole::GlobalScale));
         }
         if let Some(base) = name.strip_suffix(WEIGHT_SCALE_SUFFIX) {
             return Some((base.to_owned(), CompanionRole::WeightScale));
@@ -1003,12 +1151,20 @@ pub fn compile_logical_weight_plan(
                     ComfyQuantFormat::Float8E4M3Fn
                         | ComfyQuantFormat::Float8E5M2
                         | ComfyQuantFormat::Mxfp8
+                        | ComfyQuantFormat::Nvfp4
                 )
             {
                 return Err(LogicalWeightPlanError::UnexpectedCompanion {
                     physical_key: header.name.clone(),
-                    reason: "`input_scale` is an fp8-format companion; this layer's format does \
-                             not use it",
+                    reason: "`input_scale` is an fp8/fp4-format companion; this layer's format \
+                             does not use it",
+                });
+            }
+            if role == CompanionRole::GlobalScale && descriptor.format != ComfyQuantFormat::Nvfp4 {
+                return Err(LogicalWeightPlanError::UnexpectedCompanion {
+                    physical_key: header.name.clone(),
+                    reason: "`weight_scale_2` is the NVFP4 second-level per-tensor scale; this \
+                             layer's format has only one scale level",
                 });
             }
             // Validated (dtype/shape) together with its weight below.
@@ -1043,6 +1199,8 @@ pub fn compile_logical_weight_plan(
                 ComfyQuantFormat::Int8TensorwisePerRow => Dtype::I8,
                 ComfyQuantFormat::Float8E4M3Fn | ComfyQuantFormat::Mxfp8 => Dtype::F8_E4M3,
                 ComfyQuantFormat::Float8E5M2 => Dtype::F8_E5M2,
+                // NVFP4 packs two E2M1 codes per byte; the file has no 4-bit dtype to declare.
+                ComfyQuantFormat::Nvfp4 => Dtype::U8,
             };
             if header.dtype != expected_dtype {
                 return Err(LogicalWeightPlanError::DescriptorDtypeMismatch {
@@ -1184,6 +1342,57 @@ pub fn compile_logical_weight_plan(
                             logical.to_vec(),
                         )
                     }
+                    ComfyQuantFormat::Nvfp4 => {
+                        if !matches!(scale.dtype, Dtype::F8_E4M3 | Dtype::U8) {
+                            return Err(LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: scale.name.clone(),
+                                defect: format!(
+                                    "nvfp4 weight_scale must be F8_E4M3 or U8 (E4M3 block scales), got {:?}",
+                                    scale.dtype
+                                ),
+                            });
+                        }
+                        let global_key = format!("{base}{NVFP4_SCALE_2_SUFFIX}");
+                        let global = *by_name.get(global_key.as_str()).ok_or_else(|| {
+                            LogicalWeightPlanError::MissingCompanion {
+                                physical_key: header.name.clone(),
+                                companion: global_key.clone(),
+                            }
+                        })?;
+                        if global.dtype != Dtype::F32 || !scalar_scale_shape_ok(&global.shape) {
+                            return Err(LogicalWeightPlanError::CompanionMalformed {
+                                physical_key: global.name.clone(),
+                                defect: format!(
+                                    "nvfp4 weight_scale_2 must be a scalar F32, got {:?} {:?}",
+                                    global.dtype, global.shape
+                                ),
+                            });
+                        }
+                        let declared = mapping.logical_shape(&logical_key);
+                        let (stored, logical) = validate_nvfp4_geometry(
+                            &header.shape,
+                            &scale.shape,
+                            declared.as_deref(),
+                        )
+                        .map_err(|error| {
+                            LogicalWeightPlanError::Nvfp4Geometry {
+                                physical_key: header.name.clone(),
+                                error,
+                            }
+                        })?;
+                        (
+                            TensorCodecSpec::Nvfp4 {
+                                block_scale: scale.name.clone(),
+                                global_scale: global.name.clone(),
+                                input_scale: input_scale.map(|header| header.name.clone()),
+                                stored_shape: stored,
+                                logical_shape: logical,
+                                logical_shape_declared: declared.is_some(),
+                                full_precision_matrix_mult: descriptor.full_precision_matrix_mult,
+                            },
+                            logical.to_vec(),
+                        )
+                    }
                     ComfyQuantFormat::Int8TensorwisePerRow => {
                         let rows = header.shape[0];
                         let scalar_single_row = rows == 1 && scale.shape.is_empty();
@@ -1277,6 +1486,29 @@ pub fn compile_logical_weight_plan(
                         );
                     }
                 }
+                TensorCodecSpec::Nvfp4 {
+                    block_scale,
+                    global_scale,
+                    input_scale,
+                    ..
+                } => {
+                    // NVFP4 keeps *both* scale levels resident on a packed-native load: cuBLASLt
+                    // reads the block scales as a device buffer and folds `weight_scale_2` into
+                    // `alpha`. A dense decode consumes both.
+                    for (key, role) in [
+                        (Some(block_scale.as_str()), CompanionRole::WeightScale),
+                        (Some(global_scale.as_str()), CompanionRole::GlobalScale),
+                        (input_scale.as_deref(), CompanionRole::InputScale),
+                    ] {
+                        let Some(key) = key else { continue };
+                        let companion_header = by_name[key];
+                        let retained = match mode {
+                            ResidencyMode::Packed => companion_header.data_bytes,
+                            ResidencyMode::Dense => 0,
+                        };
+                        consume_companion(companion_header, role, &header.name, retained);
+                    }
+                }
                 TensorCodecSpec::Mxfp8 { scale, .. }
                 | TensorCodecSpec::Int8PerRow { scale, .. } => {
                     let scale_header = by_name[scale.as_str()];
@@ -1348,6 +1580,75 @@ pub fn compile_logical_weight_plan(
         companions: consumed_companions.into_values().collect(),
         source_bytes,
     })
+}
+
+/// Resolve the single state-dict prefix under which every `_quantization_metadata` layer name has a
+/// `{prefix}{layer}.weight` tensor in this file.
+///
+/// Converters write the layer names the *model* uses, while the file may store them under a wrapper
+/// prefix (`model.diffusion_model.`). Candidates are derived from one declared layer, then the whole
+/// table must resolve under exactly one of them — a table that resolves under two prefixes, or under
+/// none, refuses instead of the compiler picking one.
+fn resolve_metadata_prefix(
+    by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
+    table: &BTreeMap<String, ComfyQuantDescriptor>,
+) -> Result<String, LogicalWeightPlanError> {
+    let (first, _) = table
+        .iter()
+        .next()
+        .expect("parse_quantization_metadata refuses an empty table");
+    let needle = format!("{first}.weight");
+    let candidates: Vec<String> = by_name
+        .keys()
+        .filter_map(|name| {
+            let prefix = name.strip_suffix(needle.as_str())?;
+            // A prefix is either empty or ends at a key boundary — `…q_proj` must not match
+            // `…attn.q_proj` by raw suffix.
+            (prefix.is_empty() || prefix.ends_with('.')).then(|| prefix.to_owned())
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+            layer: first.clone(),
+            reason: format!("no tensor in this checkpoint is named {needle:?} under any prefix"),
+        });
+    }
+    let resolved: Vec<&String> = candidates
+        .iter()
+        .filter(|prefix| {
+            table
+                .keys()
+                .all(|layer| by_name.contains_key(format!("{prefix}{layer}.weight").as_str()))
+        })
+        .collect();
+    match resolved.as_slice() {
+        [prefix] => Ok((*prefix).clone()),
+        [] => {
+            // At least one candidate matched the probe layer; name the first layer that does not
+            // resolve under it, which is the actionable fact.
+            let prefix = &candidates[0];
+            let missing = table
+                .keys()
+                .find(|layer| !by_name.contains_key(format!("{prefix}{layer}.weight").as_str()))
+                .expect("an unresolved candidate has at least one missing layer");
+            Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+                layer: missing.clone(),
+                reason: format!(
+                    "no tensor {:?} exists (prefix {prefix:?} was resolved from layer {first:?})",
+                    format!("{prefix}{missing}.weight")
+                ),
+            })
+        }
+        many => Err(LogicalWeightPlanError::QuantizationMetadataLayer {
+            layer: first.clone(),
+            reason: format!(
+                "its layer names resolve under {} different state-dict prefixes ({:?}); refusing to \
+                 guess which tensors the declaration governs",
+                many.len(),
+                many
+            ),
+        }),
+    }
 }
 
 /// What one codec left resident after a read.
@@ -1453,6 +1754,266 @@ mod tests {
                 .copied(),
         )
         .unwrap()
+    }
+
+    /// sc-20641. A checkpoint whose quantization is declared file-wide plans exactly as one declared
+    /// by per-layer `.comfy_quant` tensors, including when the metadata's layer names are relative
+    /// to the tensors' state-dict prefix — and the prefix is never guessed.
+    #[test]
+    fn header_declared_quantization_resolves_one_prefix_or_refuses() {
+        let nvfp4_layer = |base: &str| {
+            [
+                header(&format!("{base}.weight"), Dtype::U8, &[32, 32]),
+                header(&format!("{base}.weight_scale"), Dtype::F8_E4M3, &[128, 4]),
+                header(&format!("{base}.weight_scale_2"), Dtype::F32, &[]),
+            ]
+        };
+        let metadata = r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#;
+        let compile_meta = |headers: &[SafetensorsTensorHeader],
+                            metadata: Option<&str>|
+         -> Result<LogicalWeightPlan, LogicalWeightPlanError> {
+            compile_logical_weight_plan_with_metadata(
+                headers,
+                &no_descriptors(),
+                metadata,
+                &StripPrefix,
+                &full(),
+                &DenseResidencyPolicy,
+            )
+        };
+
+        // Relative layer name `q` under the file's `model.` prefix.
+        let headers = nvfp4_layer("model.q");
+        let plan = compile_meta(&headers, Some(metadata)).expect("header-declared nvfp4 plans");
+        assert_eq!(plan.codec_ids(), vec!["nvfp4-v1"]);
+        assert_eq!(
+            plan.tensors[0].shape,
+            vec![32, 64],
+            "U8 [32,32] → 64 codes/row"
+        );
+        assert!(matches!(
+            plan.tensors[0].codec,
+            TensorCodecSpec::Nvfp4 {
+                stored_shape: [32, 64],
+                ..
+            }
+        ));
+        // Without the declaration the same file has no codec for a bare U8 weight: the metadata is
+        // load-bearing, not decoration.
+        assert!(matches!(
+            compile_meta(&headers, None),
+            Err(LogicalWeightPlanError::UnsupportedFormat { .. })
+        ));
+
+        // A layer name matching nothing refuses instead of being ignored.
+        let error = compile_meta(
+            &headers,
+            Some(r#"{"format_version": "1.0", "layers": {"absent": {"format": "nvfp4"}}}"#),
+        )
+        .expect_err("an unmatched layer must refuse");
+        assert!(
+            matches!(&error, LogicalWeightPlanError::QuantizationMetadataLayer { layer, .. } if layer == "absent"),
+            "{error}"
+        );
+
+        // The same relative name under TWO prefixes is ambiguous: refuse rather than pick one.
+        let mut ambiguous: Vec<SafetensorsTensorHeader> = nvfp4_layer("model.a.q").into();
+        ambiguous.extend(nvfp4_layer("model.b.q"));
+        let error = compile_meta(&ambiguous, Some(metadata))
+            .expect_err("two candidate prefixes must refuse");
+        assert!(
+            matches!(&error, LogicalWeightPlanError::QuantizationMetadataLayer { reason, .. }
+                if reason.contains("2 different state-dict prefixes")),
+            "{error}"
+        );
+
+        // A prefix that resolves the probe layer but not every declared layer names the layer that
+        // does not resolve.
+        let mut partial: Vec<SafetensorsTensorHeader> = nvfp4_layer("model.q").into();
+        partial.extend(nvfp4_layer("model.k"));
+        let error = compile_meta(
+            &partial,
+            Some(r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}, "deep.k": {"format": "nvfp4"}}}"#),
+        )
+        .expect_err("a partially-resolving prefix must refuse");
+        assert!(
+            matches!(&error, LogicalWeightPlanError::QuantizationMetadataLayer { layer, .. } if layer == "deep.k"),
+            "{error}"
+        );
+
+        // A malformed table is a typed refusal, not a silently-unquantized plan.
+        assert!(matches!(
+            compile_meta(&headers, Some(r#"{"format_version": "9.9", "layers": {}}"#)),
+            Err(LogicalWeightPlanError::QuantizationMetadata { .. })
+        ));
+    }
+
+    /// sc-20641. A layer declared by BOTH routes must agree; a disagreement refuses rather than one
+    /// route silently winning.
+    #[test]
+    fn a_layer_declared_twice_must_agree() {
+        let descriptor = br#"{"format": "nvfp4"}"#;
+        let headers = [
+            header("model.q.weight", Dtype::U8, &[32, 32]),
+            header("model.q.weight_scale", Dtype::F8_E4M3, &[128, 4]),
+            header("model.q.weight_scale_2", Dtype::F32, &[]),
+            header("model.q.comfy_quant", Dtype::U8, &[descriptor.len()]),
+        ];
+        let descriptors: BTreeMap<String, Vec<u8>> =
+            [("model.q.comfy_quant".to_owned(), descriptor.to_vec())].into();
+        let compile_meta = |payload: &str| {
+            compile_logical_weight_plan_with_metadata(
+                &headers,
+                &descriptors,
+                Some(payload),
+                &StripPrefix,
+                &full(),
+                &DenseResidencyPolicy,
+            )
+        };
+        // Agreeing declarations plan.
+        assert!(
+            compile_meta(r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#)
+                .is_ok()
+        );
+        // Disagreeing formats refuse, naming the weight, both descriptors and the field.
+        let error = compile_meta(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "float8_e4m3fn"}}}"#,
+        )
+        .expect_err("two declarations that disagree must refuse");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::DescriptorConflict {
+                physical_key: "model.q.weight".to_owned(),
+                tensor: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: false,
+                },
+                metadata: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Float8E4M3Fn,
+                    full_precision_matrix_mult: false,
+                },
+                disagreement: vec!["format"],
+            }
+        );
+        assert!(error.to_string().contains("model.q.weight"), "{error}");
+
+        // The conflict check is over the WHOLE descriptor, not just `format`: agreeing on `nvfp4`
+        // while disagreeing on `full_precision_matrix_mult` decides packed-vs-dense residency, so it
+        // must refuse too rather than resolve in the tensor declaration's favour.
+        let error = compile_meta(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "full_precision_matrix_mult": true}}}"#,
+        )
+        .expect_err("a `full_precision_matrix_mult` disagreement must refuse");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::DescriptorConflict {
+                physical_key: "model.q.weight".to_owned(),
+                tensor: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: false,
+                },
+                metadata: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: true,
+                },
+                disagreement: vec!["full_precision_matrix_mult"],
+            }
+        );
+        assert!(
+            error.to_string().contains("full_precision_matrix_mult"),
+            "{error}"
+        );
+    }
+
+    /// sc-20641. Packed NVFP4 residency prices the stored nibbles and retains BOTH scale levels; the
+    /// dense fallback prices the logical bf16 grid and retains neither.
+    #[test]
+    fn nvfp4_prices_packed_and_dense_residency_independently() {
+        struct PackEverything;
+        impl CodecResidencyPolicy for PackEverything {
+            fn residency(
+                &self,
+                _codec: &CheckpointCodecRegistration,
+                spec: &TensorCodecSpec,
+                _stored_shape: &[usize],
+            ) -> ResidencyMode {
+                if spec.full_precision_matrix_mult() {
+                    ResidencyMode::Dense
+                } else {
+                    ResidencyMode::Packed
+                }
+            }
+        }
+        let descriptor = br#"{"format": "nvfp4"}"#;
+        let headers = [
+            header("model.q.weight", Dtype::U8, &[32, 32]),
+            header("model.q.weight_scale", Dtype::F8_E4M3, &[128, 4]),
+            header("model.q.weight_scale_2", Dtype::F32, &[]),
+            header("model.q.input_scale", Dtype::F32, &[]),
+            header("model.q.comfy_quant", Dtype::U8, &[descriptor.len()]),
+        ];
+        let descriptors: BTreeMap<String, Vec<u8>> =
+            [("model.q.comfy_quant".to_owned(), descriptor.to_vec())].into();
+        let plan = compile_logical_weight_plan(
+            &headers,
+            &descriptors,
+            &StripPrefix,
+            &full(),
+            &PackEverything,
+        )
+        .expect("packed plan");
+        assert_eq!(plan.tensors[0].residency.mode, ResidencyMode::Packed);
+        assert_eq!(
+            plan.tensors[0].residency.resident_bytes,
+            32 * 32,
+            "packed holds the stored 4-bit byte matrix"
+        );
+        let retained: BTreeMap<&str, u64> = plan
+            .companions
+            .iter()
+            .map(|companion| (companion.physical_key.as_str(), companion.resident_bytes))
+            .collect();
+        assert_eq!(
+            retained["model.q.weight_scale"],
+            128 * 4,
+            "block scales stay"
+        );
+        assert_eq!(
+            retained["model.q.weight_scale_2"], 4,
+            "the global scale stays"
+        );
+        assert_eq!(
+            retained["model.q.input_scale"], 4,
+            "the activation scale stays"
+        );
+        assert_eq!(
+            retained["model.q.comfy_quant"], 0,
+            "descriptors never reside"
+        );
+        assert_eq!(plan.resident_bytes(), 32 * 32 + 128 * 4 + 4 + 4);
+
+        // The dense fallback of the same file: bf16 over the logical grid, no companion retained.
+        let dense = compile_logical_weight_plan(
+            &headers,
+            &descriptors,
+            &StripPrefix,
+            &full(),
+            &DenseResidencyPolicy,
+        )
+        .expect("dense plan");
+        assert_eq!(dense.tensors[0].residency.resident_bytes, 32 * 64 * 2);
+        assert!(dense
+            .companions
+            .iter()
+            .all(|companion| companion.resident_bytes == 0));
+        assert_eq!(dense.resident_bytes(), 32 * 64 * 2);
+        // The packed form of a 4-bit weight is a quarter of its bf16 dense form, plus scales.
+        assert!(plan.resident_bytes() < dense.resident_bytes());
+
+        // The packed projection presents the stored byte matrix, the dense one the logical grid.
+        assert_eq!(plan.resident_tensor_headers()[0].shape, vec![32, 32]);
+        assert_eq!(dense.resident_tensor_headers()[0].shape, vec![32, 64]);
     }
 
     #[test]
@@ -1595,7 +2156,19 @@ mod tests {
     #[test]
     fn comfy_codec_table_separates_the_two_fp8_e4m3_rows_by_descriptor() {
         let registry = full();
-        assert_eq!(registry.len(), 7);
+        assert_eq!(registry.len(), 8);
+        // NVFP4 is the one `U8`-stored codec, separated from an undescribed `U8` tensor (which has
+        // no codec at all) by its descriptor half.
+        assert_eq!(
+            registry
+                .for_format(StoredTensorFormat::described(
+                    WeightEncoding::UInt8,
+                    ComfyQuantFormat::Nvfp4
+                ))
+                .map(|codec| codec.codec_id),
+            Some("nvfp4-v1")
+        );
+        assert_eq!(registry.for_encoding(WeightEncoding::UInt8), None);
         assert_eq!(
             registry
                 .for_format(StoredTensorFormat::described(
@@ -2072,14 +2645,14 @@ mod tests {
             .into();
             compile(&headers, &descriptors, &StripPrefix, &full())
         };
-        let error = make(r#"{"format": "nvfp4"}"#).unwrap_err();
+        let error = make(r#"{"format": "int4_awq"}"#).unwrap_err();
         assert_eq!(
             error,
             LogicalWeightPlanError::Descriptor {
                 layer: "model.q".to_owned(),
                 physical_key: "model.q.comfy_quant".to_owned(),
                 defect: ComfyQuantDescriptorError::UnsupportedFormat {
-                    format: "nvfp4".to_owned()
+                    format: "int4_awq".to_owned()
                 },
             }
         );
@@ -2171,13 +2744,24 @@ mod tests {
             compile(&marker, &no_descriptors(), &StripPrefix, &full),
             Err(LogicalWeightPlanError::LegacyScaledFp8 { physical_key }) if physical_key == "scaled_fp8"
         ));
-        // nvfp4's weight_scale_2 → refused by name.
+        // `weight_scale_2` is NVFP4's second scale level (sc-20641): without a descriptor it is an
+        // undescribed companion, and its `U8` weight has no codec either way.
         let nvfp4 = [
             header("model.q.weight", Dtype::U8, &[4, 4]),
             header("model.q.weight_scale_2", Dtype::F32, &[]),
         ];
         assert!(matches!(
             compile(&nvfp4, &no_descriptors(), &StripPrefix, &full),
+            Err(LogicalWeightPlanError::UnsupportedFormat { physical_key, .. })
+                if physical_key == "model.q.weight"
+        ));
+        // On a layer whose format is *not* nvfp4, the second scale level is refused by name.
+        let stray = [
+            header("model.q.weight", Dtype::BF16, &[4, 4]),
+            header("model.q.weight_scale_2", Dtype::F32, &[]),
+        ];
+        assert!(matches!(
+            compile(&stray, &no_descriptors(), &StripPrefix, &full),
             Err(LogicalWeightPlanError::UnexpectedCompanion { physical_key, .. })
                 if physical_key == "model.q.weight_scale_2"
         ));
