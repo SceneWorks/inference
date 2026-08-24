@@ -522,9 +522,11 @@ impl MiniMaxH3AudioVae {
         let decoder = BigVgan::from_weights(w, "decoder", cfg, dtype)?;
 
         let n = cfg.latent_channels;
-        let latents_mean =
-            Tensor::from_vec(cfg.latents_mean.clone(), n, device)?.to_dtype(dtype)?;
-        let latents_std = Tensor::from_vec(cfg.latents_std.clone(), n, device)?.to_dtype(dtype)?;
+        // These are normalization constants, not decoder weights. Keep their source f32 precision;
+        // `denormalize` casts them to the incoming latent's dtype at the arithmetic boundary. The
+        // joint denoiser emits f32 audio latents even when the decoder weights are stored bf16.
+        let latents_mean = Tensor::from_vec(cfg.latents_mean.clone(), n, device)?;
+        let latents_std = Tensor::from_vec(cfg.latents_std.clone(), n, device)?;
         Ok(Self {
             dec_in_w: dec_in.contiguous()?,
             dec_in_b,
@@ -562,8 +564,11 @@ impl MiniMaxH3AudioVae {
         }
         let mut shape = vec![1usize; rank];
         shape[rank - 2] = channels;
-        let mean = self.latents_mean.reshape(shape.clone())?;
-        let std = self.latents_std.reshape(shape)?;
+        let mean = self
+            .latents_mean
+            .reshape(shape.clone())?
+            .to_dtype(z.dtype())?;
+        let std = self.latents_std.reshape(shape)?.to_dtype(z.dtype())?;
         Ok(z.broadcast_mul(&std)?.broadcast_add(&mean)?)
     }
 
