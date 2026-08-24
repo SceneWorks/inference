@@ -1253,7 +1253,8 @@ mod tests {
             // sc-20799: the Resident animation receipt is dense-bf16 only, but that is a *memory*
             // surface — a packed VACE-Fun tier must still load and render, as it did before the
             // memory-ladder epic. It simply carries no memory contract.
-            let generator = load(&selected).expect("Q{bits} tier must be selectable");
+            let generator =
+                load(&selected).unwrap_or_else(|e| panic!("Q{bits} tier must be selectable: {e}"));
             assert!(
                 generator.memory_strategy_contract().is_none(),
                 "Q{bits}: a packed tier has no public memory evidence"

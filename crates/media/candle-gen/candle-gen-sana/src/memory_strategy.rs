@@ -1101,21 +1101,23 @@ pub fn surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
         .collect()
 }
 
-pub const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
-    provider_id: crate::MODEL_ID,
-    contract: |spec| provider_contract(SanaVariant::Base, spec),
-    safety_check: |spec, contract, context| {
-        registered_safety_check(SanaVariant::Base, spec, contract, context)
-    },
-};
+pub const CANDLE_BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: crate::MODEL_ID,
+        contract: |spec| provider_contract(SanaVariant::Base, spec),
+        safety_check: |spec, contract, context| {
+            registered_safety_check(SanaVariant::Base, spec, contract, context)
+        },
+    };
 
-pub const SPRINT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
-    provider_id: crate::SPRINT_MODEL_ID,
-    contract: |spec| provider_contract(SanaVariant::Sprint, spec),
-    safety_check: |spec, contract, context| {
-        registered_safety_check(SanaVariant::Sprint, spec, contract, context)
-    },
-};
+pub const CANDLE_SPRINT_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: crate::SPRINT_MODEL_ID,
+        contract: |spec| provider_contract(SanaVariant::Sprint, spec),
+        safety_check: |spec, contract, context| {
+            registered_safety_check(SanaVariant::Sprint, spec, contract, context)
+        },
+    };
 
 pub const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
