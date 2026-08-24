@@ -1182,8 +1182,10 @@ pub(crate) fn safety_check(
             }
             _ => {
                 return Err(CoreError::Unsupported(format!(
-                    "{}: Bernini memory evidence covers exact video_to_video/one-clip or \
-                     reference_to_video/1-8-image or reference_video_to_video/one-clip-plus-1-8-image routes",
+                    "{}: Bernini memory evidence covers exact video_to_video/one-clip, \
+                     reference_to_video/1-8-image, reference_video_to_video/one-clip-plus-1-8-image, \
+                     multi_video_to_video/2-8-clip, or \
+                     ads2v/source-plus-reference-clip-plus-1-8-image routes",
                     contract.provider_id
                 )))
             }

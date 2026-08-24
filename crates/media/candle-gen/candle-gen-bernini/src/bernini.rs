@@ -591,6 +591,9 @@ pub struct Bernini {
     components: Mutex<Option<Arc<RendererComponents>>>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
+    /// Why this load has no sealed memory receipt. Present exactly when `memory_strategy` is
+    /// `None`; it is the refusal the memory seams return instead of admitting an unsealed artifact.
+    memory_refusal: String,
     loaded_spec: LoadSpec,
 }
 
@@ -647,14 +650,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
+    // A crossed, corrupted, or unparseable snapshot yields no contract — but it must never yield a
+    // silent `Accept` at the memory seams, so carry the refusal with the load.
     #[cfg(any(feature = "cuda", test))]
-    let (memory_strategy, memory_tier) =
-        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID)? {
-            Some((contract, tier)) => (Some(contract), Some(tier)),
-            None => (None, None),
+    let (memory_strategy, memory_tier, memory_refusal) =
+        match crate::memory_strategy::contract_for_loaded(spec, MODEL_ID) {
+            Ok((contract, tier)) => (Some(contract), Some(tier), String::new()),
+            Err(reason) => (None, None, reason),
         };
     #[cfg(not(any(feature = "cuda", test)))]
-    let (memory_strategy, memory_tier) = (None, None);
+    let (memory_strategy, memory_tier, memory_refusal) = (
+        None,
+        None,
+        format!("{MODEL_ID}: this build has no Candle/CUDA memory-strategy support"),
+    );
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
         knobs,
@@ -664,6 +673,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         components: Mutex::new(None),
         memory_strategy,
         memory_tier,
+        memory_refusal,
         loaded_spec: spec.clone(),
     }))
 }
@@ -739,7 +749,9 @@ impl Generator for Bernini {
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
         let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
-            return gen_core::MemorySafetyDecision::Accept;
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: self.memory_refusal.clone(),
+            };
         };
         crate::memory_strategy::safety_check(contract, tier, context)
     }
@@ -749,7 +761,7 @@ impl Generator for Bernini {
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
         let (Some(contract), Some(tier)) = (&self.memory_strategy, self.memory_tier) else {
-            return Ok(None);
+            return Err(gen_core::Error::Unsupported(self.memory_refusal.clone()));
         };
         crate::memory_strategy::begin_request(contract, tier, self.device.clone(), context)
     }
