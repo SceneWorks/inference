@@ -653,6 +653,91 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
     }],
 };
 
+/// Portable Wan 2.2 ComfyUI adapter metadata (epic 20398, sc-20644).
+///
+/// # The dual-expert backbone this declares, and what it exposes
+///
+/// Wan 2.2's ComfyUI distribution is the one shipped family whose checkpoint has **two** backbones:
+/// a high-noise and a low-noise expert, both `blocks.N.{self_attn,cross_attn,ffn}` DiTs, selected
+/// per denoise step. That is why [`CheckpointAdapterRegistration::component_topology`] declares
+/// `transformer-high` and `transformer-low` as two distinct single-count roles rather than one
+/// `transformer` with `max_count: 2` — the two are not interchangeable, and a plan that recorded
+/// them as two instances of one role could not say which is which.
+///
+/// Declaring it here makes a real gap machine-readable rather than implicit: SceneWorks'
+/// `checkpoint_inspector` has no role vocabulary for these two — its path-role inference maps both
+/// `unet/` and `diffusion_models/` to the single role `transformer` — so a compiled Wan plan today
+/// carries two `transformer` layers and the plan route refuses it as an ambiguous primary. Closing
+/// that needs an inspector/plan-layer role vocabulary for a multi-expert backbone, which is a
+/// checkpoint-CONTRACT change rather than an adapter change. This registration is the declaration
+/// that change has to satisfy.
+///
+/// # One binding, and why not two
+///
+/// [`ImportedModelOperation`] has no video vocabulary: T2V and I2V are the same `Generate`
+/// operation distinguished by an `i2v` flag on the loader, not by the operation enum. So at most one
+/// binding is expressible for this (backend, source). Registering I2V as `Edit` would be a lie about
+/// what the enum means.
+pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
+    adapter_id: "wan-comfyui-v1",
+    family: "wan-video",
+    compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+        family: "wan-video",
+    },
+    signatures: &[CheckpointSignatureRegistration {
+        id: "wan-comfyui-v1",
+        dialect: "comfyui",
+        // The pair that separates Wan from its neighbours: a `self_attn` DiT block WITH an `ffn`
+        // (Anima has adaln modulation; LTX has attn1/attn2 and no ffn). Mirrors SceneWorks'
+        // `base_weights::detect_transformer_family` so the inspector and the adapter agree.
+        required_tensor_names: &["blocks.0.self_attn.q.weight", "blocks.0.ffn.0.weight"],
+    }],
+    dialects: &[CheckpointDialectRegistration {
+        id: "comfyui",
+        source: ImportedModelSource::ComfyUiTree,
+    }],
+    component_topology: &[
+        CheckpointComponentRegistration {
+            role: "transformer-high",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "transformer-low",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "base-snapshot",
+            min_count: 1,
+            max_count: 1,
+        },
+    ],
+    base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+        component_role: "base-snapshot",
+        compatible_families: &["wan-video"],
+    }],
+    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+        dialect: "comfyui",
+        mapping_id: "wan-comfyui-to-diffusers-v1",
+    }],
+    config_recovery: &[CheckpointConfigRecoveryRegistration {
+        field: "architecture",
+        recovery_id: "wan-signature-v1",
+    }],
+    eligible_backends: &[CheckpointBackend::Candle],
+    backend_bindings: &[],
+    operations: &[ImportedModelOperation::Generate],
+    capabilities: &[CheckpointAdapterCapabilityRegistration {
+        operation: ImportedModelOperation::Generate,
+        inherit_provider_capabilities: true,
+        // `load_from_comfyui_experts` takes no adapters: the ComfyUI expert pair loads in place with
+        // no LoRA seam, so inheriting the provider's adapter flags would advertise a capability the
+        // imported route does not have.
+        supports_adapter_inheritance: false,
+    }],
+};
+
 /// Provider-owned route from one imported source shape and operation to the ordinary generator
 /// registration that actually validates and loads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4714,6 +4799,70 @@ mod tests {
         );
     }
 
+    /// sc-20644 Wan row — the dual-expert backbone is DECLARED, distinctly, and the declaration is
+    /// what a later inspector/plan-layer change has to satisfy.
+    ///
+    /// The two experts are two single-count roles, not one role with `max_count: 2`. That
+    /// distinction is the whole point: a high-noise and a low-noise expert are selected per denoise
+    /// step and are not interchangeable, so a plan that recorded them as two instances of one role
+    /// could not say which is which — which is exactly the state SceneWorks' inspector is in today
+    /// (both map to the single path role `transformer`).
+    ///
+    /// Also pins the two things about this family that are easy to get wrong: it is Candle-only, and
+    /// it does NOT inherit adapter flags, because `load_from_comfyui_experts` has no LoRA seam.
+    ///
+    /// Failing mutations: collapse the two roles into one `transformer` with `max_count: 2`; set
+    /// `supports_adapter_inheritance: true`; add `CheckpointBackend::Mlx`.
+    #[test]
+    fn the_wan_adapter_declares_two_distinct_single_count_experts() {
+        let topology = WAN_CHECKPOINT_ADAPTER.component_topology;
+        let backbones: Vec<&CheckpointComponentRegistration> = topology
+            .iter()
+            .filter(|component| component.role.starts_with("transformer"))
+            .collect();
+        assert_eq!(
+            backbones.len(),
+            2,
+            "Wan declares TWO backbones; got {:?}",
+            topology.iter().map(|c| c.role).collect::<Vec<_>>()
+        );
+        for component in &backbones {
+            assert_eq!(
+                (component.min_count, component.max_count),
+                (1, 1),
+                "{}: each expert is exactly one artifact, not one role holding two",
+                component.role
+            );
+        }
+        let mut roles: Vec<&str> = backbones.iter().map(|c| c.role).collect();
+        roles.sort_unstable();
+        assert_eq!(roles, ["transformer-high", "transformer-low"]);
+
+        assert_eq!(
+            WAN_CHECKPOINT_ADAPTER.eligible_backends,
+            [CheckpointBackend::Candle],
+            "the ComfyUI Wan expert pair loads on Candle only"
+        );
+        assert_eq!(
+            WAN_CHECKPOINT_ADAPTER
+                .dialects
+                .iter()
+                .map(|dialect| dialect.source)
+                .collect::<Vec<_>>(),
+            [ImportedModelSource::ComfyUiTree]
+        );
+        let generate = WAN_CHECKPOINT_ADAPTER
+            .capabilities
+            .iter()
+            .find(|capability| capability.operation == ImportedModelOperation::Generate)
+            .expect("Wan binds Generate");
+        assert!(
+            !generate.supports_adapter_inheritance,
+            "`load_from_comfyui_experts` takes no adapters, so the imported route must not \
+             advertise the provider's LoRA flags"
+        );
+    }
+
     #[test]
     fn portable_adapter_families_and_legacy_projections_are_explicit_for_every_family() {
         let identities = [
@@ -4723,6 +4872,7 @@ mod tests {
             (&Z_IMAGE_CHECKPOINT_ADAPTER, "z-image", "z-image"),
             (&QWEN_IMAGE_CHECKPOINT_ADAPTER, "qwen-image", "qwen-image"),
             (&FLUX2_CHECKPOINT_ADAPTER, "flux2", "flux2"),
+            (&WAN_CHECKPOINT_ADAPTER, "wan-video", "wan-video"),
         ];
 
         for (adapter, portable_family, legacy_family) in identities {
