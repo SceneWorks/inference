@@ -2138,6 +2138,10 @@ const TRAINER_DIT_ENV: &str = "MINIMAX_H3_DIT";
 const SC21028_TRAINER_LORA_SHA256: &str =
     "1fd239662f6290255b0bb3a220764fb53aab2859378f7fd3024030c1e1991cb2";
 const SC21028_TRAINER_LORA_BYTES: u64 = 298_263_792;
+const SC21028_PROBE_DOWN: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight";
+const SC21028_PROBE_UP: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight";
+const SC21028_PROBE_ALPHA: &str = "lora_unet_blocks_0_attn_qkv_proj.alpha";
+const SC21028_RUNTIME_RESIDUAL_REL_MAX: f32 = 1e-3;
 
 /// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
 /// supplied. The optional digest and byte count bind a local receipt to a known artifact when the
@@ -2214,6 +2218,58 @@ fn trainer_dit_path() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Independent oracle for the exact probe residual. It operates directly on the raw fused-QKV
+/// trainer tensors and never calls either conversion or installer under test.
+fn exact_trainer_q_probe_residual(
+    path: &Path,
+    x: &Tensor,
+    cfg: &MiniMaxH3DitConfig,
+    device: &Device,
+) -> Tensor {
+    let raw = candle_gen::train::merge::read_adapter(path)
+        .expect("read exact trainer factors for independent oracle");
+    let down = raw
+        .tensors
+        .get(SC21028_PROBE_DOWN)
+        .expect("exact QKV down factor");
+    let fused_up = raw
+        .tensors
+        .get(SC21028_PROBE_UP)
+        .expect("exact fused QKV up factor");
+    let alpha = candle_gen::train::merge::read_scalar(
+        SC21028_PROBE_ALPHA,
+        "alpha",
+        raw.tensors
+            .get(SC21028_PROBE_ALPHA)
+            .expect("exact fused QKV alpha"),
+    )
+    .expect("read exact fused QKV alpha");
+    let rank = down.dim(0).expect("raw QKV rank");
+    assert_eq!(down.dims(), &[16, cfg.hidden_size], "raw QKV down shape");
+    assert_eq!(
+        fused_up.dims(),
+        &[3 * cfg.inner_dim(), 16],
+        "raw fused QKV up shape"
+    );
+    assert_eq!((rank, alpha), (16, 16.0), "raw probe rank/alpha");
+    let down = down.to_device(device).unwrap();
+    let q_up = fused_up
+        .narrow(0, 0, cfg.inner_dim())
+        .expect("take the Q row block independently")
+        .to_device(device)
+        .unwrap();
+    x.reshape((x.elem_count() / cfg.hidden_size, cfg.hidden_size))
+        .unwrap()
+        .matmul(&down.t().unwrap().contiguous().unwrap())
+        .unwrap()
+        .matmul(&q_up.t().unwrap().contiguous().unwrap())
+        .unwrap()
+        .affine((alpha / rank as f32) as f64, 0.0)
+        .unwrap()
+        .reshape((1, 3, cfg.inner_dim()))
+        .unwrap()
 }
 
 fn converted_lora_module(key: &str) -> Option<&str> {
@@ -2310,10 +2366,10 @@ fn exact_h3_trainer_file_receipt() {
 /// forward before and after install supplies the numerical gate: relative max-abs-diff, never
 /// shape or cosine.
 ///
-/// ```text
-/// set MINIMAX_H3_TRAINER_LORA=E:\path\deepthroat_v02.safetensors
-/// set MINIMAX_H3_DIT=E:\path\to\a\real\tier\transformer
-/// cargo test --release --locked --features cuda -p candle-gen-minimax-h3 --test integration \
+/// ```powershell
+/// $env:MINIMAX_H3_TRAINER_LORA = 'E:\path\deepthroat_v02.safetensors'
+/// $env:MINIMAX_H3_DIT = 'E:\path\to\a\real\tier\transformer'
+/// cargo test --release --locked --features cuda -p candle-gen-minimax-h3 --test integration `
 ///   turbo_lora::manual_cuda_exact_h3_trainer_runtime_receipt -- --ignored --exact --nocapture
 /// ```
 #[test]
@@ -2327,11 +2383,19 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
     assert_sc21028_trainer_artifact_identity(&lora, bytes, &sha256);
 
     let dit_dir = trainer_dit_path();
-    let cfg = MiniMaxH3DitConfig::from_diffusers_json(
-        &std::fs::read_to_string(dit_dir.join("config.json"))
-            .unwrap_or_else(|error| panic!("read {}/config.json: {error}", dit_dir.display())),
-    )
-    .expect("parse the real MiniMax-H3 transformer config");
+    let config_path = dit_dir.join("config.json");
+    let config_text = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
+    let config_sha256 = sha256_of(&config_path);
+    let config_json: serde_json::Value =
+        serde_json::from_str(&config_text).expect("parse transformer config JSON");
+    let tier = config_json
+        .get("quantization")
+        .and_then(|marker| marker.get("bits"))
+        .and_then(serde_json::Value::as_i64)
+        .map_or_else(|| "bf16".to_owned(), |bits| format!("q{bits}"));
+    let cfg = MiniMaxH3DitConfig::from_diffusers_json(&config_text)
+        .expect("parse the real MiniMax-H3 transformer config");
     assert_eq!(
         cfg,
         MiniMaxH3DitConfig::default(),
@@ -2356,13 +2420,18 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
     let x = tensor_on(&[1, 3, cfg.hidden_size], 0.21028, &device)
         .to_dtype(DType::BF16)
         .unwrap();
-    let base = dit
-        .adaptable_mut(&probe_segments)
-        .expect("resolve real probe projection before install")
-        .forward(&x)
-        .expect("real base projection forward")
-        .to_dtype(DType::F32)
-        .unwrap();
+    let (probe_packed, base_native) = {
+        let projection = dit
+            .adaptable_mut(&probe_segments)
+            .expect("resolve real probe projection before install");
+        (
+            projection.is_packed(),
+            projection
+                .forward(&x)
+                .expect("real base projection forward"),
+        )
+    };
+    let base = base_native.to_dtype(DType::F32).unwrap();
     let base_peak = max_abs(&base);
     assert!(
         base_peak.is_finite() && base_peak > 1e-6,
@@ -2386,26 +2455,53 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         "every trunk runtime leaf, and no fabricated refiner leaf, is adapted"
     );
 
-    let adapted = dit
+    let adapted_native = dit
         .adaptable_mut(&probe_segments)
         .expect("resolve real probe projection after install")
         .forward(&x)
-        .expect("real adapted projection forward")
+        .expect("real adapted projection forward");
+    let observed_delta = (&adapted_native - &base_native)
+        .unwrap()
         .to_dtype(DType::F32)
         .unwrap();
-    let relative_max_abs_diff = rel_max_abs(&adapted, &base);
+    let independent_residual = exact_trainer_q_probe_residual(&lora, &x, &cfg, &device);
+    let expected_adapted = (&base_native
+        + &independent_residual
+            .to_dtype(base_native.dtype())
+            .expect("independent residual at base output dtype"))
+        .unwrap();
+    let expected_delta = (&expected_adapted - &base_native)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+    let expected_peak = max_abs(&expected_delta);
+    let relative_max_abs_diff = expected_peak / base_peak;
     assert!(
         relative_max_abs_diff.is_finite() && relative_max_abs_diff > 1e-6,
         "the exact trainer LoRA did not measurably change the real {probe} forward: \
          relative-max-abs-diff={relative_max_abs_diff:.3e}"
     );
+    let residual_correctness_rel_max = rel_max_abs(&observed_delta, &expected_delta);
+    assert!(
+        residual_correctness_rel_max.is_finite()
+            && residual_correctness_rel_max <= SC21028_RUNTIME_RESIDUAL_REL_MAX,
+        "the installed {probe} residual disagrees with independent raw-factor math by \
+         relative-max-abs={residual_correctness_rel_max:.3e} (limit \
+         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation/alpha/scale"
+    );
 
     println!(
         "SC21028_TRAINER_RUNTIME_RECEIPT backend=candle accelerator=CUDA file={} bytes={bytes} \
-         sha256={sha256} dit={} blocks={} source_targets={} applied={} adapted_modules={} \
+         sha256={sha256} model_id={} dit={} config_sha256={} tier={} probe_packed={} \
+         device={:?} blocks={} source_targets={} applied={} adapted_modules={} \
          unmatched={} unique_ranks={:?} unique_alphas={:?} probe={} relative_max_abs_diff={:.6e}",
         lora.display(),
+        candle_gen_minimax_h3::MODEL_ID,
         dit_dir.display(),
+        config_sha256,
+        tier,
+        probe_packed,
+        device,
         dit.num_layers(),
         report.trainer_source_targets_applied,
         report.applied,
@@ -2415,5 +2511,10 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         report.trainer_alphas,
         probe,
         relative_max_abs_diff,
+    );
+    println!(
+        "SC21028_TRAINER_RUNTIME_CORRECTNESS backend=candle probe={} \
+         observed_vs_independent_expected_relative_max_abs={:.6e} limit={:.6e}",
+        probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
     );
 }

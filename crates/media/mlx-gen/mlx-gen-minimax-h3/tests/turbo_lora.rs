@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_rs::ops::{concatenate_axis, matmul, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Device, DeviceType, Dtype};
 use sha2::{Digest, Sha256};
 
 use mlx_gen::adapters::{AdaptableHost, Adapter};
@@ -2235,6 +2235,10 @@ const TRAINER_DIT_ENV: &str = "MINIMAX_H3_DIT";
 const SC21028_TRAINER_LORA_SHA256: &str =
     "1fd239662f6290255b0bb3a220764fb53aab2859378f7fd3024030c1e1991cb2";
 const SC21028_TRAINER_LORA_BYTES: u64 = 298_263_792;
+const SC21028_PROBE_DOWN: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight";
+const SC21028_PROBE_UP: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight";
+const SC21028_PROBE_ALPHA: &str = "lora_unet_blocks_0_attn_qkv_proj.alpha";
+const SC21028_RUNTIME_RESIDUAL_REL_MAX: f32 = 1e-3;
 
 /// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
 /// supplied. The optional digest and byte count bind a local receipt to a known artifact when the
@@ -2311,6 +2315,61 @@ fn trainer_dit_path() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Assert the runtime this receipt will actually dispatch through. MLX's public device model names
+/// the Apple accelerator `Gpu`; on macOS that backend is Metal. Checking only availability would
+/// still let a caller set the process default to CPU and publish a false Metal receipt.
+fn require_default_mlx_metal_device() -> (String, i32) {
+    assert!(
+        cfg!(target_os = "macos"),
+        "the MLX/Metal receipt is only valid on macOS"
+    );
+    let device = Device::try_default().expect("query the MLX process-default device");
+    let device_type = device
+        .get_type()
+        .expect("query the MLX default device type");
+    assert!(
+        matches!(device_type, DeviceType::Gpu),
+        "the MLX process-default device must be GPU/Metal, got {device}"
+    );
+    let index = device
+        .get_index()
+        .expect("query the MLX default device index");
+    (device.to_string(), index)
+}
+
+/// Independent oracle for the exact probe residual. It reads the trainer's raw fused-QKV factors,
+/// takes the Q row block itself, and evaluates `x·down^T·up_q^T·alpha/rank`; it never calls either
+/// trainer conversion or the adapter installer under test.
+fn exact_trainer_q_probe_residual(path: &Path, x: &Array, cfg: &MiniMaxH3DitConfig) -> Array {
+    let raw = Weights::from_file(path).expect("read exact trainer factors for independent oracle");
+    let down = raw
+        .require(SC21028_PROBE_DOWN)
+        .expect("exact QKV down factor");
+    let fused_up = raw
+        .require(SC21028_PROBE_UP)
+        .expect("exact fused QKV up factor");
+    let alpha = raw
+        .require(SC21028_PROBE_ALPHA)
+        .expect("exact fused QKV alpha")
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .item::<f32>();
+    let rank = down.shape()[0];
+    assert_eq!(down.shape(), &[16, cfg.hidden_size], "raw QKV down shape");
+    assert_eq!(
+        fused_up.shape(),
+        &[3 * cfg.inner_dim(), 16],
+        "raw fused QKV up shape"
+    );
+    assert_eq!((rank, alpha), (16, 16.0), "raw probe rank/alpha");
+    let q_up = mlx_gen_minimax_h3::tensor::slice_axis(fused_up, 0, 0, cfg.inner_dim())
+        .expect("take the Q row block independently");
+    let unscaled = matmul(matmul(x, down.t()).unwrap(), q_up.t()).unwrap();
+    unscaled
+        .multiply(Array::from_slice(&[alpha / rank as f32], &[1]))
+        .expect("scale independent exact trainer residual")
 }
 
 fn converted_lora_module(key: &str) -> Option<&str> {
@@ -2412,6 +2471,7 @@ fn exact_h3_trainer_file_receipt() {
 #[test]
 #[ignore = "manual MLX/Metal real-weight receipt; needs exact trainer LoRA and a 50-block DiT"]
 fn manual_metal_exact_h3_trainer_runtime_receipt() {
+    let (runtime_device, runtime_device_index) = require_default_mlx_metal_device();
     let lora = trainer_lora_path();
     let bytes = std::fs::metadata(&lora)
         .unwrap_or_else(|error| panic!("stat {}: {error}", lora.display()))
@@ -2420,17 +2480,24 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
     assert_sc21028_trainer_artifact_identity(&lora, bytes, &sha256);
 
     let dit_dir = trainer_dit_path();
-    let cfg = MiniMaxH3DitConfig::from_diffusers_json(
-        &std::fs::read_to_string(dit_dir.join("config.json"))
-            .unwrap_or_else(|error| panic!("read {}/config.json: {error}", dit_dir.display())),
-    )
-    .expect("parse the real MiniMax-H3 transformer config");
+    let config_path = dit_dir.join("config.json");
+    let config_text = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
+    let config_sha256 = sha256_of(&config_path);
+    let cfg = MiniMaxH3DitConfig::from_diffusers_json(&config_text)
+        .expect("parse the real MiniMax-H3 transformer config");
     assert_eq!(
         cfg,
         MiniMaxH3DitConfig::default(),
         "the runtime receipt requires the published 50-block MiniMax-H3 geometry"
     );
 
+    let tier = match mlx_gen::quant::packed_quant_bits_at(&dit_dir)
+        .unwrap_or_else(|error| panic!("read staged DiT tier {}: {error}", dit_dir.display()))
+    {
+        Some(bits) => format!("q{bits}"),
+        None => "bf16".to_owned(),
+    };
     let mut dit = MiniMaxH3Dit::load_dir(&dit_dir, Dtype::Bfloat16)
         .unwrap_or_else(|error| panic!("load real DiT {}: {error}", dit_dir.display()));
     assert_eq!(
@@ -2444,13 +2511,18 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
     let x = tensor(&[1, 3, cfg.hidden_size], 0.21028)
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
-    let base = dit
-        .adaptable_mut(&probe_segments)
-        .expect("resolve real probe projection before install")
-        .forward(&x)
-        .expect("real base projection forward")
-        .as_dtype(Dtype::Float32)
-        .unwrap();
+    let (probe_packed, base_native) = {
+        let projection = dit
+            .adaptable_mut(&probe_segments)
+            .expect("resolve real probe projection before install");
+        (
+            projection.is_quantized(),
+            projection
+                .forward(&x)
+                .expect("real base projection forward"),
+        )
+    };
+    let base = base_native.as_dtype(Dtype::Float32).unwrap();
     let base_peak = max_abs(&base);
     assert!(
         base_peak.is_finite() && base_peak > 1e-6,
@@ -2491,27 +2563,57 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         "the exact trunk-only artifact must not fabricate token-refiner targets"
     );
 
-    let adapted = dit
+    let adapted_native = dit
         .adaptable_mut(&probe_segments)
         .expect("resolve real probe projection after install")
         .forward(&x)
-        .expect("real adapted projection forward")
+        .expect("real adapted projection forward");
+    let observed_delta = subtract(&adapted_native, &base_native)
+        .unwrap()
         .as_dtype(Dtype::Float32)
         .unwrap();
-    let delta = subtract(&adapted, &base).expect("adapted minus base");
-    let relative_max_abs_diff = max_abs(&delta) / base_peak;
+    let independent_residual = exact_trainer_q_probe_residual(&lora, &x, &cfg);
+    // The production linear narrows the residual to the base output dtype before adding it. Build
+    // the oracle's expected *observed* delta through the same public dtype boundary so BF16 add
+    // rounding does not masquerade as a conversion error; factor selection/orientation/alpha above
+    // remains completely independent.
+    let expected_adapted = base_native
+        .add(&independent_residual.as_dtype(base_native.dtype()).unwrap())
+        .unwrap();
+    let expected_delta = subtract(&expected_adapted, &base_native)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let expected_peak = max_abs(&expected_delta);
+    let relative_max_abs_diff = expected_peak / base_peak;
     assert!(
         relative_max_abs_diff.is_finite() && relative_max_abs_diff > 1e-6,
         "the exact trainer LoRA did not measurably change the real {probe} forward: \
          relative-max-abs-diff={relative_max_abs_diff:.3e}"
     );
+    let residual_correctness_rel_max =
+        max_abs(&subtract(&observed_delta, &expected_delta).unwrap()) / expected_peak;
+    assert!(
+        residual_correctness_rel_max.is_finite()
+            && residual_correctness_rel_max <= SC21028_RUNTIME_RESIDUAL_REL_MAX,
+        "the installed {probe} residual disagrees with independent raw-factor math by \
+         relative-max-abs={residual_correctness_rel_max:.3e} (limit \
+         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation/alpha/scale"
+    );
 
     println!(
         "SC21028_TRAINER_RUNTIME_RECEIPT backend=mlx accelerator=Metal file={} bytes={bytes} \
-         sha256={sha256} dit={} blocks={} source_targets={} applied={} adapted_modules={} \
+         sha256={sha256} model_id={} dit={} config_sha256={} tier={} probe_packed={} \
+         runtime_device={} runtime_device_index={} blocks={} source_targets={} applied={} adapted_modules={} \
          unmatched={} unique_ranks={:?} unique_alphas={:?} probe={} relative_max_abs_diff={:.6e}",
         lora.display(),
+        mlx_gen_minimax_h3::MODEL_ID,
         dit_dir.display(),
+        config_sha256,
+        tier,
+        probe_packed,
+        runtime_device,
+        runtime_device_index,
         dit.num_layers(),
         report.trainer_source_targets_applied,
         report.applied,
@@ -2521,5 +2623,10 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         report.trainer_alphas,
         probe,
         relative_max_abs_diff,
+    );
+    println!(
+        "SC21028_TRAINER_RUNTIME_CORRECTNESS backend=mlx probe={} \
+         observed_vs_independent_expected_relative_max_abs={:.6e} limit={:.6e}",
+        probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
     );
 }
