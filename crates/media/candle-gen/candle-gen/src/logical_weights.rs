@@ -26,8 +26,9 @@
 //!     consumes. On a build without the `cuda` feature a `Packed` fp8 plan entry is a typed
 //!     refusal — never a silent dense substitution of what admission priced as packed.
 //!   * `nvfp4-v1` (sc-20641): a CUDA device at the sm_120 floor (via
-//!     [`crate::quant::NVFP4_COMPUTE_CAP_FLOOR`]) **and** a K/N-aligned stored layout
-//!     ([`nvfp4_layout_is_native`]). The reader repacks the checkpoint's nibbles and both scale
+//!     [`crate::quant::NVFP4_COMPUTE_CAP_FLOOR`]), a K/N-aligned stored layout
+//!     ([`nvfp4_layout_is_native`]) **and** a stored grid that is the layer itself (no ComfyUI
+//!     padding — the packed container carries no unpad). The reader repacks the checkpoint's nibbles and both scale
 //!     levels into the canonical [`Nvfp4Tensor`] container
 //!     ([`LogicalTensor::PackedNvfp4`]) that `Nvfp4Linear` consumes. That container is host-side,
 //!     so the repack itself compiles and is tested on every lane; only the residency *decision* is
@@ -146,6 +147,12 @@ impl CandleCodecResidency {
 /// ComfyUI pads NVFP4 storage only to 16, so a layer with `in_features = 48` is a legitimate NVFP4
 /// checkpoint this leg still cannot run; it takes the dense fallback at *plan* time (and is priced
 /// as dense) instead of failing at the first forward.
+///
+/// **Alignment is not the whole native contract.** ComfyUI's padding also means a layer can be
+/// stored wider than it is: `in_features = 60` stores `K = 64`, which *is* 32-aligned. Repacking
+/// that grid would hand `Nvfp4Linear` 4 columns of padding as real contraction elements, so
+/// [`CodecResidencyPolicy::residency`] additionally requires `logical_shape == stored_shape`
+/// (sc-20641). This predicate answers only the GEMM's alignment question.
 pub fn nvfp4_layout_is_native(stored_shape: [usize; 2]) -> bool {
     stored_shape[1].is_multiple_of(crate::quant::NVFP4_K_ALIGN)
         && stored_shape[0].is_multiple_of(crate::quant::NVFP4_N_ALIGN)
@@ -168,12 +175,20 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         if self.fp8_e4m3_native && codec.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id {
             return ResidencyMode::Packed;
         }
-        // NVFP4 needs the hardware floor *and* a layout the FP4 leg accepts. The compiler's
-        // `stored_shape` argument is the on-disk byte shape `[rows, cols / 2]`; the codec spec
-        // carries the logical one the alignment rule is written against.
+        // NVFP4 needs the hardware floor, a layout the FP4 leg accepts, *and* a stored grid that is
+        // the layer itself. The compiler's `stored_shape` argument is the on-disk byte shape
+        // `[rows, cols / 2]`; the codec spec carries both element shapes the rules are written
+        // against. `logical != stored` means ComfyUI padded the layer, and the packed container has
+        // nowhere to record the unpad — the repacked operand would contract over padding — so a
+        // padded layer takes the dense fallback no matter how well the padded grid aligns.
         if self.nvfp4_native && codec.codec_id == NVFP4_CODEC.codec_id {
-            if let TensorCodecSpec::Nvfp4 { stored_shape, .. } = spec {
-                if nvfp4_layout_is_native(*stored_shape) {
+            if let TensorCodecSpec::Nvfp4 {
+                stored_shape,
+                logical_shape,
+                ..
+            } = spec
+            {
+                if logical_shape == stored_shape && nvfp4_layout_is_native(*stored_shape) {
                     return ResidencyMode::Packed;
                 }
             }
@@ -670,8 +685,19 @@ fn decode(
                 ResidencyMode::Packed => {
                     // The repack into the container `Nvfp4Linear` consumes: nibble-order swap plus
                     // the block-scale atom-order permutation (see `Nvfp4Tensor::from_kitchen_parts`).
-                    // A packed plan is only ever produced for a 16-padded, K/N-aligned layer whose
-                    // logical shape equals the stored one, so this is the whole stored surface.
+                    // The container holds exactly the stored grid and carries no unpad, so a packed
+                    // decode is only sound when the layer *is* that grid. `CandleCodecResidency`
+                    // plans Dense otherwise; refuse here rather than trust it, because silently
+                    // repacking a padded layer widens it and feeds the GEMM padding as real
+                    // contraction elements (sc-20641).
+                    if tensor.shape.as_slice() != stored_shape.as_slice() {
+                        return Err(CandleError::Msg(format!(
+                            "codec {}: tensor {:?} planned packed-native NVFP4 residency but its \
+                             logical shape {:?} is not its stored shape {stored_shape:?}; ComfyUI \
+                             padded this layer and the packed container cannot express the unpad",
+                            tensor.codec_id, tensor.physical_key, tensor.shape
+                        )));
+                    }
                     let tensor_packed = Nvfp4Tensor::from_kitchen_parts(
                         view.data(),
                         scales,
@@ -1625,6 +1651,120 @@ mod tests {
         assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
     }
 
+    /// sc-20641 review. ComfyUI pads NVFP4 storage to 16, so a layer can be stored WIDER than it
+    /// is — `in_features = 60` stores `K = 64`, which passes the FP4 leg's 32-alignment rule. The
+    /// packed container holds the stored grid and carries no unpad, so repacking such a layer hands
+    /// `Nvfp4Linear` four columns of padding as real contraction elements.
+    ///
+    /// Two independent guards, tested separately: the residency policy plans **Dense** on sm_120
+    /// hardware, and the decoder's Packed arm **refuses** if a plan ever asks for it anyway.
+    #[test]
+    fn a_padded_nvfp4_layer_plans_dense_and_a_forced_packed_decode_refuses() {
+        struct DeclaresSixty;
+        impl LogicalKeyMapping for DeclaresSixty {
+            fn mapping_id(&self) -> &'static str {
+                "declares-sixty-test"
+            }
+            fn logical_key(&self, physical_key: &str) -> Option<String> {
+                physical_key.strip_prefix("model.").map(str::to_owned)
+            }
+            fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
+                (logical_key == "q.weight").then(|| vec![256, 60])
+            }
+        }
+        /// Ignores every layout fact — stands in for a residency policy that regresses.
+        struct ForcePacked;
+        impl CodecResidencyPolicy for ForcePacked {
+            fn residency(
+                &self,
+                _codec: &CheckpointCodecRegistration,
+                _spec: &TensorCodecSpec,
+                _stored_shape: &[usize],
+            ) -> ResidencyMode {
+                ResidencyMode::Packed
+            }
+        }
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-padded.safetensors");
+        let (rows, stored_cols, logical_cols) = (256_usize, 64_usize, 60_usize);
+        // The pad columns must hold the zero code, which is what the geometry validator demands.
+        let mut values = nvfp4_fixture_values(rows, stored_cols);
+        for row in 0..rows {
+            for col in logical_cols..stored_cols {
+                values[row * stored_cols + col] = 0.0;
+            }
+        }
+        let (packed, scales, global, _) = nvfp4_reference_quantize(&values, rows, stored_cols);
+        assert_eq!(scales.len(), 256 * 4, "2 row atoms × 1 block atom");
+        write_safetensors_with_metadata(
+            &path,
+            &[
+                (
+                    "model.q.weight",
+                    "U8",
+                    &[rows, stored_cols / 2],
+                    packed.clone(),
+                ),
+                ("model.q.weight_scale", "F8_E4M3", &[256, 4], scales),
+                (
+                    "model.q.weight_scale_2",
+                    "F32",
+                    &[],
+                    global.to_le_bytes().to_vec(),
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#,
+            )],
+        );
+
+        let native = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let plan = plan_logical_weights(&path, &DeclaresSixty, &native).expect("plan");
+        let tensor = &plan.tensors[0];
+        assert_eq!(tensor.shape, vec![rows, logical_cols], "the unpadded layer");
+        assert!(
+            matches!(
+                tensor.codec,
+                TensorCodecSpec::Nvfp4 {
+                    stored_shape: [256, 64],
+                    logical_shape: [256, 60],
+                    ..
+                }
+            ),
+            "the spec carries BOTH shapes: {:?}",
+            tensor.codec
+        );
+        assert_eq!(
+            tensor.residency.mode,
+            ResidencyMode::Dense,
+            "a padded layer takes the dense fallback even on sm_120 with an aligned stored grid"
+        );
+        // Dense is the honest plan and it reads back correctly at the logical width.
+        let weights = read_logical_weights(&path, &plan, &Device::Cpu).expect("dense read");
+        assert_eq!(
+            dense_f32(&weights, "q.weight").len(),
+            rows * logical_cols,
+            "the dense fallback unpads"
+        );
+
+        // The decoder does not trust the policy: a Packed plan for this layer is refused, naming
+        // both shapes, rather than silently widening the layer.
+        let forced = plan_logical_weights(&path, &DeclaresSixty, &ForcePacked).expect("plan");
+        assert_eq!(forced.tensors[0].residency.mode, ResidencyMode::Packed);
+        let Err(error) = read_logical_weights(&path, &forced, &Device::Cpu) else {
+            panic!("a packed decode of a padded NVFP4 layer must refuse");
+        };
+        let error = error.to_string();
+        assert!(error.contains("model.q.weight"), "{error}");
+        assert!(error.contains("[256, 60]"), "names the logical: {error}");
+        assert!(error.contains("[256, 64]"), "names the stored: {error}");
+    }
+
     /// AC2 (Candle). The `sm_120` floor has one definition, and a layer the FP4 leg cannot run
     /// takes the dense fallback rather than a packed plan that would fail at the first forward.
     #[test]
@@ -1658,14 +1798,21 @@ mod tests {
             "N must be a multiple of 16"
         );
 
-        // And the policy needs both halves: sm_120 hardware AND an accepted layout.
-        let spec = |stored_shape: [usize; 2], full_precision: bool| TensorCodecSpec::Nvfp4 {
+        // And the policy needs all three: sm_120 hardware, an accepted layout, AND an unpadded
+        // layer (`spec_padded` below covers the last one).
+        let spec_of = |stored_shape: [usize; 2],
+                       logical_shape: [usize; 2],
+                       full_precision: bool| TensorCodecSpec::Nvfp4 {
             block_scale: "q.weight_scale".to_owned(),
             global_scale: "q.weight_scale_2".to_owned(),
             input_scale: None,
             stored_shape,
+            logical_shape,
             logical_shape_declared: false,
             full_precision_matrix_mult: full_precision,
+        };
+        let spec = |stored_shape: [usize; 2], full_precision: bool| {
+            spec_of(stored_shape, stored_shape, full_precision)
         };
         let native = CandleCodecResidency {
             fp8_e4m3_native: false,
@@ -1685,6 +1832,19 @@ mod tests {
             native.residency(&NVFP4_CODEC, &spec([256, 128], true), &stored_bytes),
             ResidencyMode::Dense,
             "`full_precision_matrix_mult` never runs packed"
+        );
+        // sc-20641 review: ComfyUI pads to 16, so `in_features = 60` stores a 32-aligned K = 64.
+        // Alignment alone would plan Packed and hand `Nvfp4Linear` 4 columns of padding as real
+        // contraction elements; the logical-equals-stored condition is what keeps it dense.
+        assert!(nvfp4_layout_is_native([256, 64]), "the PADDED grid aligns");
+        assert_eq!(
+            native.residency(
+                &NVFP4_CODEC,
+                &spec_of([256, 64], [256, 60], false),
+                &[256, 32]
+            ),
+            ResidencyMode::Dense,
+            "a padded layer must not repack, however well the padded grid aligns"
         );
         assert_eq!(
             CandleCodecResidency::DENSE.residency(

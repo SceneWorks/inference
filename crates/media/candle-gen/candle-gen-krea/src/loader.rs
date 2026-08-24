@@ -446,9 +446,13 @@ impl Weights {
                 .is_ok_and(|view| view.dtype() == ::safetensors::Dtype::U8)
     }
 
-    /// Read one prepacked Kitchen NVFP4 triplet into Candle's canonical host container. The block
-    /// scales and global scale stay byte/numerically exact; [`Nvfp4Tensor::from_kitchen_parts`]
-    /// performs only Kitchen's high-even → Candle's low-even nibble swap.
+    /// Read one prepacked Kitchen NVFP4 triplet into Candle's canonical host container. The global
+    /// scale stays numerically exact and every block scale keeps its value, but the block-scale
+    /// buffer is **not** copied verbatim: [`Nvfp4Tensor::from_kitchen_parts`] performs Kitchen's
+    /// high-even → Candle's low-even nibble swap *and* permutes the `to_blocked` 128×4 block-scale
+    /// atoms from the row-major order Kitchen/ComfyUI write into the column-major order
+    /// `Nvfp4Tensor::scale_offset_for` reads (sc-20641). The two orders coincide only for a
+    /// single-atom weight, so the former verbatim copy mis-scaled every real multi-atom projection.
     fn get_native_nvfp4(&self, diffusers_weight: &str) -> Result<Nvfp4Tensor> {
         let native_weight = self.resolve(diffusers_weight);
         let weight = self.st.get(&native_weight)?;

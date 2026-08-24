@@ -180,13 +180,20 @@ fn kreamania_variant7_plans_decodes_and_prices_both_residencies() {
     };
     assert_eq!((tensor.rows, tensor.cols), (one.shape[0], one.shape[1]));
 
-    // Two independent routes over the same real bytes must agree exactly:
-    //  * the repacked container's own dequant, which indexes block scales through
-    //    `Nvfp4Tensor::scale_offset_for` (column-major atom walk), and
-    //  * the gen-core reference decode, which reads them straight out of ComfyUI's `to_blocked`
-    //    buffer (row-major atom walk).
-    // They agree only if `from_kitchen_parts`' atom-order permutation is right — on a fixture with
-    // 48 x 96 atoms, where any ordering mistake moves thousands of scales.
+    // The repack **round-trips against the reference** on 48 x 96 real atoms: the container's own
+    // dequant (block scales indexed through `Nvfp4Tensor::scale_offset_for`) must reproduce, element
+    // for element, what `gen_core::decode_nvfp4` reads out of the file's `to_blocked` buffer.
+    //
+    // These are NOT two independent determinations of the atom order, and this assertion must not be
+    // read as one: both routes resolve through `blocked_scale_index`, and the permutation
+    // `from_kitchen_parts` applies is undone by the one `scale_offset_for` applies on the way back
+    // out (the nibble rotate cancels the same way). What this DOES catch — and what it caught — is a
+    // repack that copies the scale buffer verbatim instead of permuting it, plus any mis-shaping of
+    // a real 6144x6144 layer. The independent check on the atom order itself is the
+    // `nvfp4_golden_decodes_exactly_on_the_dense_fallback` golden, whose expectation comes from
+    // `reference_to_blocked_index` — `comfy.float.to_blocked` transliterated from its definition,
+    // never calling the code under test. Which order the FP4 GEMM actually wants is resolvable only
+    // by sc-20651's live cuBLASLt run on Blackwell.
     let from_container = tensor.dequantize_to_vec();
     let st = unsafe {
         candle_gen::candle_core::safetensors::MmapedSafetensors::new(&path).expect("mmap")
@@ -219,7 +226,7 @@ fn kreamania_variant7_plans_decodes_and_prices_both_residencies() {
             container,
             reference,
             "element {index} (row {}, col {}): the repacked container and the reference decode \
-             disagree, so the block-scale atom permutation is wrong",
+             disagree, so the repack does not round-trip on real multi-atom scales",
             index / one.shape[1],
             index % one.shape[1]
         );

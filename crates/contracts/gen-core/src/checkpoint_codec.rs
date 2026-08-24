@@ -461,6 +461,11 @@ pub enum TensorCodecSpec {
         /// The 16-padded **logical** `[rows, cols]` the payload holds (the on-disk byte shape is
         /// `[rows, cols / 2]`).
         stored_shape: [usize; 2],
+        /// The layer's true `[out_features, in_features]`. ComfyUI pads NVFP4 storage to 16, so
+        /// this is element-wise `≤ stored_shape`; the two are equal only when the layer's own
+        /// geometry needed no padding. A packed-native plan **requires** equality — repacking the
+        /// padded grid would hand `Nvfp4Linear` padding as real contraction elements (sc-20641).
+        logical_shape: [usize; 2],
         /// Whether the logical shape came from the adapter (`true`) or is the stored shape because
         /// the adapter declares none (`false`; the family's shape validation is the backstop).
         logical_shape_declared: bool,
@@ -811,11 +816,15 @@ pub enum LogicalWeightPlanError {
     /// tensors a header-declared quantization governs.
     QuantizationMetadataLayer { layer: String, reason: String },
     /// One layer is declared twice, by a `.comfy_quant` tensor and by the file-level metadata, with
-    /// two different descriptors.
+    /// two different descriptors. The whole descriptor is compared, not just its `format`:
+    /// `full_precision_matrix_mult` decides packed-vs-dense residency, so a silent resolution in
+    /// either declaration's favour would change how the layer is priced and run.
     DescriptorConflict {
         physical_key: String,
-        tensor: ComfyQuantFormat,
-        metadata: ComfyQuantFormat,
+        tensor: ComfyQuantDescriptor,
+        metadata: ComfyQuantDescriptor,
+        /// The descriptor field names that disagree, in declaration order.
+        disagreement: Vec<&'static str>,
     },
 }
 
@@ -930,11 +939,17 @@ impl fmt::Display for LogicalWeightPlanError {
                 physical_key,
                 tensor,
                 metadata,
+                disagreement,
             } => write!(
                 f,
-                "weight {physical_key:?} is declared `{tensor}` by its `.comfy_quant` tensor and \
-                 `{metadata}` by `__metadata__._quantization_metadata`; refusing a checkpoint whose \
-                 two declarations disagree"
+                "weight {physical_key:?} is declared `{}` (full_precision_matrix_mult={}) by its \
+                 `.comfy_quant` tensor and `{}` (full_precision_matrix_mult={}) by \
+                 `__metadata__._quantization_metadata`; the two declarations disagree on {}",
+                tensor.format,
+                tensor.full_precision_matrix_mult,
+                metadata.format,
+                metadata.full_precision_matrix_mult,
+                disagreement.join(", ")
             ),
         }
     }
@@ -1060,11 +1075,19 @@ pub fn compile_logical_weight_plan_with_metadata(
             }
         })?;
         if let Some(previous) = descriptors.insert(base.to_owned(), descriptor) {
-            if previous.format != descriptor.format {
+            if previous != descriptor {
+                let mut disagreement = Vec::new();
+                if previous.format != descriptor.format {
+                    disagreement.push("format");
+                }
+                if previous.full_precision_matrix_mult != descriptor.full_precision_matrix_mult {
+                    disagreement.push("full_precision_matrix_mult");
+                }
                 return Err(LogicalWeightPlanError::DescriptorConflict {
                     physical_key: weight_key,
-                    tensor: descriptor.format,
-                    metadata: previous.format,
+                    tensor: descriptor,
+                    metadata: previous,
+                    disagreement,
                 });
             }
         }
@@ -1363,6 +1386,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                                 global_scale: global.name.clone(),
                                 input_scale: input_scale.map(|header| header.name.clone()),
                                 stored_shape: stored,
+                                logical_shape: logical,
                                 logical_shape_declared: declared.is_some(),
                                 full_precision_matrix_mult: descriptor.full_precision_matrix_mult,
                             },
@@ -1589,7 +1613,7 @@ fn resolve_metadata_prefix(
             reason: format!("no tensor in this checkpoint is named {needle:?} under any prefix"),
         });
     }
-    let mut resolved: Vec<&String> = candidates
+    let resolved: Vec<&String> = candidates
         .iter()
         .filter(|prefix| {
             table
@@ -1597,7 +1621,6 @@ fn resolve_metadata_prefix(
                 .all(|layer| by_name.contains_key(format!("{prefix}{layer}.weight").as_str()))
         })
         .collect();
-    resolved.dedup();
     match resolved.as_slice() {
         [prefix] => Ok((*prefix).clone()),
         [] => {
@@ -1853,7 +1876,7 @@ mod tests {
             compile_meta(r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#)
                 .is_ok()
         );
-        // Disagreeing ones refuse, naming the weight and both formats.
+        // Disagreeing formats refuse, naming the weight, both descriptors and the field.
         let error = compile_meta(
             r#"{"format_version": "1.0", "layers": {"q": {"format": "float8_e4m3fn"}}}"#,
         )
@@ -1862,11 +1885,45 @@ mod tests {
             error,
             LogicalWeightPlanError::DescriptorConflict {
                 physical_key: "model.q.weight".to_owned(),
-                tensor: ComfyQuantFormat::Nvfp4,
-                metadata: ComfyQuantFormat::Float8E4M3Fn,
+                tensor: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: false,
+                },
+                metadata: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Float8E4M3Fn,
+                    full_precision_matrix_mult: false,
+                },
+                disagreement: vec!["format"],
             }
         );
         assert!(error.to_string().contains("model.q.weight"), "{error}");
+
+        // The conflict check is over the WHOLE descriptor, not just `format`: agreeing on `nvfp4`
+        // while disagreeing on `full_precision_matrix_mult` decides packed-vs-dense residency, so it
+        // must refuse too rather than resolve in the tensor declaration's favour.
+        let error = compile_meta(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "full_precision_matrix_mult": true}}}"#,
+        )
+        .expect_err("a `full_precision_matrix_mult` disagreement must refuse");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::DescriptorConflict {
+                physical_key: "model.q.weight".to_owned(),
+                tensor: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: false,
+                },
+                metadata: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Nvfp4,
+                    full_precision_matrix_mult: true,
+                },
+                disagreement: vec!["full_precision_matrix_mult"],
+            }
+        );
+        assert!(
+            error.to_string().contains("full_precision_matrix_mult"),
+            "{error}"
+        );
     }
 
     /// sc-20641. Packed NVFP4 residency prices the stored nibbles and retains BOTH scale levels; the
