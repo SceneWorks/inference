@@ -664,13 +664,17 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
 /// `transformer` with `max_count: 2` — the two are not interchangeable, and a plan that recorded
 /// them as two instances of one role could not say which is which.
 ///
-/// Declaring it here makes a real gap machine-readable rather than implicit: SceneWorks'
-/// `checkpoint_inspector` has no role vocabulary for these two — its path-role inference maps both
-/// `unet/` and `diffusion_models/` to the single role `transformer` — so a compiled Wan plan today
-/// carries two `transformer` layers and the plan route refuses it as an ambiguous primary. Closing
-/// that needs an inspector/plan-layer role vocabulary for a multi-expert backbone, which is a
-/// checkpoint-CONTRACT change rather than an adapter change. This registration is the declaration
-/// that change has to satisfy.
+/// # Spelling: hyphens here, underscores in the plan
+///
+/// SceneWorks' `checkpoint_inspector` emits matching plan-layer roles for these two experts,
+/// spelled with UNDERSCORES (`transformer_high` / `transformer_low`) like every other layer role it
+/// emits. The hyphenated spelling here is this file's own topology convention — the same split that
+/// already exists between the `base-snapshot` topology role and the `base_snapshot` component id.
+/// The projection between the two vocabularies is `-` → `_`, and it is pinned from both sides in
+/// the `mapping_id` posture: the conformance test below asserts the projection of these roles, and
+/// SceneWorks asserts the projected literals are what its inspector actually emits. Nothing
+/// structural enforces the tie, so either side drifting alone would turn a compiled Wan plan into
+/// two roles no lane recognizes.
 ///
 /// # One binding, and why not two
 ///
@@ -680,7 +684,12 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
 /// what the enum means.
 pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
     adapter_id: "wan-comfyui-v1",
-    family: "wan-video",
+    // The PORTABLE family is the generator's own (`wan`) — the registry build refuses an adapter
+    // whose family does not match the generator it binds. The PROJECTION is `wan-video`, which is
+    // what `checkpoint_inspector::normalize_family` records in a compiled plan and what SceneWorks
+    // keys its adapter lookup on. Wan is the second family after Mage-Flow whose two spellings
+    // differ, and for the same reason.
+    family: "wan",
     compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
         family: "wan-video",
     },
@@ -715,7 +724,7 @@ pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdap
     ],
     base_compatibility: &[CheckpointBaseCompatibilityRegistration {
         component_role: "base-snapshot",
-        compatible_families: &["wan-video"],
+        compatible_families: &["wan"],
     }],
     canonical_mappings: &[CheckpointCanonicalMappingRegistration {
         dialect: "comfyui",
@@ -4857,6 +4866,26 @@ mod tests {
             [CheckpointBackend::Candle],
             "the ComfyUI Wan expert pair loads on Candle only"
         );
+
+        // The inference half of the cross-repo spelling tie (sc-20644 review minor 8). These
+        // topology roles are hyphenated; SceneWorks' plan-layer roles are underscored, and the two
+        // are joined by one projection that nothing structural enforces. Pinned in the `mapping_id`
+        // posture: this asserts the projection, SceneWorks asserts the projected literals are what
+        // its inspector emits. Either side drifting alone turns a Wan plan into two unrecognized
+        // roles.
+        let project = |topology_role: &str| topology_role.replace('-', "_");
+        assert_eq!(project("transformer-high"), "transformer_high");
+        assert_eq!(project("transformer-low"), "transformer_low");
+        assert_ne!(
+            "transformer-high", "transformer_high",
+            "fixture check: the two spellings genuinely differ, so the projection is not vacuous"
+        );
+        // The precedent this follows rather than invents — the component id both repos already
+        // share is spelled the same two ways.
+        assert_eq!(
+            project("base-snapshot"),
+            crate::runtime::BASE_SNAPSHOT_COMPONENT
+        );
         assert_eq!(
             WAN_CHECKPOINT_ADAPTER
                 .dialects
@@ -4886,7 +4915,7 @@ mod tests {
             (&Z_IMAGE_CHECKPOINT_ADAPTER, "z-image", "z-image"),
             (&QWEN_IMAGE_CHECKPOINT_ADAPTER, "qwen-image", "qwen-image"),
             (&FLUX2_CHECKPOINT_ADAPTER, "flux2", "flux2"),
-            (&WAN_CHECKPOINT_ADAPTER, "wan-video", "wan-video"),
+            (&WAN_CHECKPOINT_ADAPTER, "wan", "wan-video"),
         ];
 
         for (adapter, portable_family, legacy_family) in identities {
