@@ -123,9 +123,8 @@
 //! weights-free consumer, not gates. So flipping `supports_lora` to `true` grants nothing and
 //! flipping it to `false` would forbid nothing; the behaviour is entirely in
 //! [`crate::adapters::apply_minimax_h3_adapters`], which is strict about unmatched targets and
-//! about a file that folded nothing. Symmetrically, `supports_lokr: false` is enforced twice in
-//! real code — by kind in [`load`] and by file content in the installer — precisely because the
-//! flag itself cannot refuse anything.
+//! about a file that folded nothing. `supports_lokr: true` is likewise backed by the reachable
+//! structured Kronecker installer in the same seam rather than by the declaration alone.
 //!
 //! The quant tiers and every unread `LoadSpec` slot are still refused by [`load`]: the explicit
 //! `spec.quantize` check plus `reject_unread_slots` for the seven slots this provider does not
@@ -459,11 +458,11 @@ pub fn descriptor() -> ModelDescriptor {
             // consumer; the enforcement is `crate::adapters::apply_minimax_h3_adapters`, which is
             // strict about both unmatched targets and a file that matched nothing.
             supports_lora: true,
-            // **LoKr stays false, and here that is enforced twice.** This DiT's adapter seam
-            // installs `scale·((x·A)·B)` residuals only; a Kronecker delta is a different
-            // operation, so `load` refuses `AdapterKind::Lokr` and the installer refuses a file
-            // carrying `lokr_*` factors regardless of how it was declared.
-            supports_lokr: false,
+            // **LoKr is reachable** (sc-20757): the same job-local DiT seam installs structured
+            // Kronecker factors with the allocation-free vec-trick, including fused QKV output
+            // slices and the MiniMax-H3 FC1 half-order transform. The installer remains the real
+            // enforcement; this bit truthfully advertises that reachable path.
+            supports_lokr: true,
             // **The tier loader is ported** (sc-20267): the pre-quantized tiers are packed offline
             // by the MLX lane's `convert`, and this lane now *reads* them. `crate::tier` resolves
             // the per-tier component directories and reconciles the request against the on-disk
@@ -1787,21 +1786,20 @@ impl Generator for MiniMaxH3 {
 ///
 /// # The load-time refusals, and why the descriptor flags cannot stand in for them
 ///
-/// [`descriptor`] sets `supports_lokr` to `false` and `supported_quants` to `&[]`. **Those fields
+/// [`descriptor`] advertises LoRA/LoKr and the supported quant tiers. **Those fields
 /// are declarations that gen-core reads on no path.** `Capabilities::validate_request` gates the
 /// conditioning allowlist (which is what actually default-denies `VideoClip` — **not** the `ref2va`
 /// kinds, which [`descriptor`] advertises and `validate` admits since sc-17157 landed the port) but
-/// never looks at `supports_lora` or `supported_quants`, and `ProviderRegistryBuilder` does not inspect a
-/// `LoadSpec` either — so without the checks below, a spec carrying `quantize`, a LoKr adapter, or a
-/// per-pass / MoE adapter knob loaded clean and rendered with the caller's knob silently discarded.
+/// never looks at those declarations, and `ProviderRegistryBuilder` does not inspect a `LoadSpec`
+/// either — so the concrete installer and the checks below remain load-bearing.
 ///
 /// `reject_unknown_components` does not cover this: it validates `spec.components`, a different
 /// field from `spec.adapters` and `spec.quantize`.
 ///
 /// Since sc-18728 `spec.adapters` is **read** rather than refused — see
-/// [`MiniMaxH3::load_task_dit`] — so the checks here narrowed to the three adapter-shaped knobs this
-/// lane still cannot honor: `AdapterKind::Lokr`, `pass_scales` (LTX's two-stage schedule) and
-/// `moe_expert` (Wan's dual-expert selector). Each is a field a caller can set on an
+/// [`MiniMaxH3::load_task_dit`] — so the checks here narrowed to the two adapter-shaped knobs this
+/// lane still cannot honor: `pass_scales` (LTX's two-stage schedule) and `moe_expert` (Wan's
+/// dual-expert selector). Each is a field a caller can set on an
 /// otherwise-valid LoRA, and each would otherwise be dropped without a word.
 ///
 /// This is the `candle-gen-mochi` idiom — refuse at the registry entry point, which returns
@@ -1815,18 +1813,6 @@ impl Generator for MiniMaxH3 {
 /// that are **not** refused are each accounted for there rather than left to inference.
 pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
     for a in &spec.adapters {
-        // **LoKr is still refused**, by kind here and by file content in
-        // [`crate::adapters::apply_minimax_h3_adapters`]. This DiT's seam installs
-        // `scale·((x·A)·B)` residuals; a Kronecker delta is a different operation, so accepting one
-        // would be a wrong fold rather than a weak one. Refused at the registry entry point because
-        // that is the boundary carrying `Error::Unsupported`.
-        if a.kind == candle_gen::gen_core::AdapterKind::Lokr {
-            return Err(candle_gen::gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: {} is staged as LoKr; the candle lane installs LoRA residuals only. \
-                 Use a LoRA export of the same adapter.",
-                a.path.display()
-            )));
-        }
         // `pass_scales` is LTX's per-distilled-stage knob and `moe_expert` is Wan's dual-expert
         // selector. This checkpoint has one denoise pass and one expert, so either is a knob that
         // would be silently discarded — the exact class `reject_unread_slots` exists to close, one
@@ -1862,9 +1848,8 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
     // `Unsupported` variant, so the refusal reaches a registry caller as an opaque `Msg` unless the
     // typed check also runs at this boundary. It costs one `stat` per adapter.
     //
-    // It is deliberately **after** the three knob refusals above: a LoKr staged at an unsizable path
-    // must still be named as LoKr, which is what the last arm of
-    // `an_unsizable_adapter_is_refused_at_the_registry_boundary_with_the_typed_error` asserts.
+    // It is deliberately **after** the two foreign-knob refusals above, so those unread settings
+    // retain their specific diagnostics before the shared adapter-file sizing probe runs.
     crate::memory_strategy::adapter_overlay_bytes(spec)?;
     Ok(Box::new(MiniMaxH3::load(spec)?))
 }
@@ -2739,7 +2724,7 @@ mod tests {
         assert_eq!(model.adapters()[0].scale, 1.0);
     }
 
-    /// **The three adapter-shaped knobs this lane still cannot honor are refused by name.**
+    /// **The two foreign adapter-shaped knobs this lane still cannot honor are refused by name.**
     ///
     /// Each is a field a caller can set on an otherwise-valid LoRA spec, and each is read by nothing
     /// in this crate. They are asserted **individually**, not as a set: a single "some knob is
@@ -2748,7 +2733,7 @@ mod tests {
     /// The control at the top is what makes the arms attributable — the same path, the same scale,
     /// everything identical except the knob under test, loads cleanly.
     #[test]
-    fn lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually() {
+    fn the_two_foreign_adapter_knobs_are_each_refused_individually() {
         use candle_gen::gen_core::{AdapterKind, MoeExpert};
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
@@ -2766,10 +2751,6 @@ mod tests {
         .expect("the plain LoRA control must load — otherwise the arms prove nothing");
 
         for (spec, needle) in [
-            (
-                adapter_spec(lora.clone(), AdapterKind::Lokr, None, None),
-                "LoKr",
-            ),
             (
                 adapter_spec(lora.clone(), AdapterKind::Lora, Some(vec![1.0, 0.5]), None),
                 "pass_scales",
@@ -2808,10 +2789,7 @@ mod tests {
     /// only at the probe instant, while the contract is cached at load and the factors are installed
     /// per render.
     ///
-    /// The last arm pins the **ordering** against the knob refusals, which is the guard that moved
-    /// here when `lokr_and_the_two_foreign_adapter_knobs_are_each_refused_individually` started
-    /// staging a real file: a LoKr at an unsizable path must still be named as LoKr, not answered
-    /// with the sizing message.
+    /// The final arm pins the absent-file case independently from the malformed-file case above.
     #[test]
     fn an_unsizable_adapter_is_refused_at_the_registry_boundary_with_the_typed_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2870,18 +2848,6 @@ mod tests {
                 "the refusal must name the adapter it could not size; wanted {needle:?}, got {err}"
             );
         }
-
-        // The sizing probe runs AFTER the knob refusals, so an unsizable LoKr is still named LoKr.
-        let err = refusal(with(adapter_spec(
-            PathBuf::from("/turbo.safetensors"),
-            candle_gen::gen_core::AdapterKind::Lokr,
-            None,
-            None,
-        )));
-        assert!(
-            err.to_string().contains("LoKr"),
-            "the kind refusal must win over the sizing refusal: {err}"
-        );
     }
 
     /// A solid RGB image of the given extent, for the reference-request fixtures.
@@ -3887,9 +3853,9 @@ mod tests {
         // gen-core reads `supports_lora` on no path, so what a consumer can rely on is
         // `crate::adapters`, exercised end-to-end in `tests/turbo_lora.rs`.
         assert!(d.capabilities.supports_lora);
-        // LoKr stays false and is enforced twice in real code (by kind in `load`, by file content
-        // in the installer) precisely because this flag refuses nothing on its own.
-        assert!(!d.capabilities.supports_lokr);
+        // LoKr is backed by the same real DiT install seam as LoRA; this remains an advertisement,
+        // so `turbo_lora::` numerically exercises the reachable Kronecker path.
+        assert!(d.capabilities.supports_lokr);
         // **The tier loader IS ported** (sc-20267) — `crate::tier` resolves the per-tier component
         // dirs and `crate::quant` builds the packed bases. Like `supports_lora` this is only an
         // advertisement; the enforcement is the reconcile plus the `Nvfp4` refusal in `load`.

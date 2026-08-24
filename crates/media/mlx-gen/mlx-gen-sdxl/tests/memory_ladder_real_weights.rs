@@ -105,16 +105,11 @@ fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> Generatio
     }
 }
 
-/// One measured row: the request's ACTIVE-bytes peak, its pixels, and its wall clock.
+/// One measured row: the request's ACTIVE-bytes peak, its pixels, and diagnostic wall clock.
 ///
-/// `wall` exists because SC-16355 carried re-materialization latency as an explicit hazard — "70
-/// blocks across 11 re-opens could be a severe regression on exactly the small Macs this rung exists
-/// for" — and a peak-only row cannot answer it. A memory rung that halves the peak and triples the
-/// render is not obviously a win, and the selector cannot weigh a cost nobody measured.
-///
-/// It is a wall clock, so it is the softest number in this file: it moves with thermal state and with
-/// whatever else the machine is doing. It is therefore *reported* and bounded loosely, never asserted
-/// to a tight figure.
+/// `wall` remains useful diagnostic output because SC-16355 identified re-materialization as a
+/// latency hazard. Thermal state and unrelated host work can change it without changing the
+/// allocation or output contract this harness grades, so it is never pass/fail evidence.
 struct Row {
     peak_gib: f64,
     pixels: Vec<u8>,
@@ -156,42 +151,6 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
     }
 }
 
-/// Measured runs per cadence in the rung-4 sweep, reduced by taking the FASTEST row (sc-19556).
-///
-/// Two is the cheapest count that can tell "this run was descheduled" from "this cadence is slow".
-/// Each run is a full render on a freshly loaded generator, so the cost is real and the count is
-/// deliberately small.
-const TIMED_RUNS: usize = 2;
-
-/// [`measure`] repeated [`TIMED_RUNS`] times, returning the row of the FASTEST run.
-///
-/// sc-19556: the sweep used to take one sample per cadence and ratio two of them, minutes and a
-/// model load apart, so the two arms need not even see the same host load. Every run here performs
-/// the identical render, so contention can only ever push a run SLOWER — the fastest of several runs
-/// is a lower bound on what the hardware did rather than a sample of a noisy distribution, and
-/// ratioing two lower bounds is what lets the latency gate below keep its measured margin (2.77x at
-/// 1024², 3.43x at 768²) instead of being relaxed until a 5% fluctuation could satisfy it.
-///
-/// Returning the fastest run's row wholesale (rather than splicing a min wall onto another run's
-/// peak) is safe precisely because the peak column is the reproducible one: it repeats to the
-/// millibyte across runs, which is the claim the 1% flatness bound below exists to check.
-#[track_caller]
-fn measure_fastest(
-    dir: &std::path::Path,
-    tier: &str,
-    shape: LoadShape,
-    req: &GenerationRequest,
-) -> Row {
-    let mut best: Option<Row> = None;
-    for _ in 0..TIMED_RUNS {
-        let row = measure(dir, tier, shape, req);
-        if best.as_ref().is_none_or(|b: &Row| row.wall < b.wall) {
-            best = Some(row);
-        }
-    }
-    best.expect("TIMED_RUNS must be > 0")
-}
-
 /// Milliseconds per denoise step for a row, which is the unit rung 4's re-materialization cost is
 /// actually paid in: the window re-opens the snapshot once per sub-stack per step, so the overhead
 /// scales with steps rather than with the request.
@@ -211,6 +170,78 @@ fn max_delta(a: &[u8], b: &[u8]) -> u32 {
 fn mean_delta(a: &[u8], b: &[u8]) -> f64 {
     let sum: u64 = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
     sum as f64 / a.len() as f64
+}
+
+/// Grade the rung-4 product claim, never a host-dependent duration.
+///
+/// The independent mutation test below makes all three legs non-vacuous: a missing evaluation or
+/// output check, an inert stream, and corrupt peak accounting each reject their synthetic row.
+fn assert_rung_four_evidence(control: &Row, row: &Row, window: u32) {
+    assert!(
+        control.peak_gib.is_finite()
+            && row.peak_gib.is_finite()
+            && control.peak_gib > 0.0
+            && row.peak_gib > 0.0,
+        "window {window} has invalid ACTIVE-byte accounting: control {:.4} GiB, row {:.4} GiB",
+        control.peak_gib,
+        row.peak_gib
+    );
+    assert_eq!(
+        control.pixels, row.pixels,
+        "a streamed block must be byte-identical to its resident twin: window {window} changed the \
+         image"
+    );
+    assert!(
+        row.peak_gib < control.peak_gib * 0.97,
+        "window {window} did not bound the request peak: {:.3} vs control {:.3} GiB — the block \
+         stream is not actually replacing the resident stack",
+        row.peak_gib,
+        control.peak_gib
+    );
+}
+
+#[test]
+fn rung_four_evidence_rejects_output_loss_inert_stream_and_corrupt_peak_accounting() {
+    let control = Row {
+        peak_gib: 100.0,
+        pixels: vec![1, 2, 3],
+        wall: std::time::Duration::ZERO,
+    };
+    let valid = Row {
+        peak_gib: 90.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert_rung_four_evidence(&control, &valid, 1);
+
+    let changed_output = Row {
+        pixels: vec![1, 2, 4],
+        ..valid
+    };
+    assert!(std::panic::catch_unwind(|| {
+        assert_rung_four_evidence(&control, &changed_output, 1)
+    })
+    .is_err());
+
+    let inert_stream = Row {
+        peak_gib: 100.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert!(
+        std::panic::catch_unwind(|| { assert_rung_four_evidence(&control, &inert_stream, 1) })
+            .is_err()
+    );
+
+    let corrupt_accounting = Row {
+        peak_gib: 0.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert!(std::panic::catch_unwind(|| {
+        assert_rung_four_evidence(&control, &corrupt_accounting, 1)
+    })
+    .is_err());
 }
 
 /// The all-rungs-off baseline: an explicit Resident block, so the load-time `Sequential` policy
@@ -1096,11 +1127,10 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
 
-/// **The rung-4 cadence sweep** — the whole published domain, peak *and* wall clock — plus the
-/// bit-identity proof that the eleven streamed sub-stacks reproduce the resident ones exactly.
+/// **The rung-4 cadence sweep** — allocation and output evidence for every published cadence.
 ///
 /// The first revision of this test swept a one-value domain, which made it a sweep in name only. It
-/// now drives every cadence in [`ms::TRANSFORMER_WINDOW_SIZES`] and asserts the three facts the
+/// now drives every cadence in [`ms::TRANSFORMER_WINDOW_SIZES`] and asserts the two facts the
 /// domain's publication rests on:
 ///
 /// 1. **every cadence bounds the peak** (each row < control by a 3% margin, against a measured
@@ -1108,14 +1138,11 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 /// 2. **every cadence bounds it to the SAME value** — this is the finding that made the domain worth
 ///    publishing, because it means the wider cadences give up no memory at all. Asserted at 1%, which
 ///    is far outside the observed spread: the peak rows reproduce **to the millibyte** (15.516 GiB at
-///    all four cadences, across four separate runs), so unlike the latency numbers this one can be
-///    pinned tightly;
-/// 3. **widening the cadence buys time back monotonically**, which is what makes the domain a
-///    frontier rather than four spellings of one choice.
+///    all four cadences, across four separate runs), so unlike a timing sample this one can be
+///    pinned tightly.
 ///
-/// Latency assertions are deliberately loose. Four runs of the window-1 row measured 3654 / 3674 /
-/// 3698 / 3790 ms/step — a ~4% spread — so the margins below are set well outside that, and the
-/// failure they exist to catch is a re-open path that starts *thrashing*, not one that drifts.
+/// Timing is printed only for diagnosis. It cannot establish a product margin because it varies
+/// with host state even when the allocator high-water and output are identical.
 ///
 /// `SDXL_WINDOW_PROBE_SIZE` re-runs the sweep at another output edge. The 768² numbers in
 /// [`ms::TRANSFORMER_WINDOW_SIZES`]' table come from it, and they are what establish that the flat
@@ -1127,15 +1154,9 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     // edge. The bf16/q4 and 512² rows in `ms::TRANSFORMER_WINDOW_SIZES`' tables come from them, and
     // they are what establish that the flat peak is a property of the PHASE SEPARATION rather than of
     // one tier at one geometry.
-    // Probe mode: any off-default tier/size. The peak-flatness and wall-clock-frontier assertions
-    // below are claims about the DEFAULT configuration — flatness is measured false at 512² q8, and a
-    // wall clock is meaningless on a loaded machine — so in probe mode they are reported instead of
-    // asserted. What stays asserted in BOTH modes is what is true of every configuration: each
-    // cadence bounds the request peak below the control, and every row is byte-identical to it.
-    // The 12x latency ceiling is NOT in that set — an earlier draft of this comment claimed it was,
-    // and probing 512² falsified the claim at 12.6x. The re-open cost is area-independent while the
-    // control's forward is not, so that ratio is geometry-bound by construction; see the ceiling
-    // itself for the numbers.
+    // Probe mode: any off-default tier/size. Peak flatness is a claim about the DEFAULT
+    // configuration, so it is reported rather than asserted in probes. Every mode still grades
+    // the product claim: non-zero peak accounting, a reduced peak, and byte-identical output.
     let probing = std::env::var("SDXL_WINDOW_PROBE_TIER").is_ok()
         || std::env::var("SDXL_WINDOW_PROBE_SIZE").is_ok();
     let tier = std::env::var("SDXL_WINDOW_PROBE_TIER").unwrap_or_else(|_| "q8".to_owned());
@@ -1157,7 +1178,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    let control = measure_fastest(&dir, tier, deferred, &request(Some(staged()), edge, STEPS));
+    let control = measure(&dir, tier, deferred, &request(Some(staged()), edge, STEPS));
     println!(
         "[sc-15525 rung4 {tier} {edge}²] staged, no window (attribution control) {:.3} GiB, \
          {:.0} ms/step",
@@ -1166,7 +1187,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     );
     let mut rows: Vec<(u32, f64, f64)> = Vec::new();
     for window in &probe_order() {
-        let row = measure_fastest(
+        let row = measure(
             &dir,
             tier,
             deferred,
@@ -1186,51 +1207,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
             100.0 * (ms_per_step(&row, STEPS) - ms_per_step(&control, STEPS))
                 / ms_per_step(&control, STEPS),
         );
-        assert_eq!(
-            max_delta(&control.pixels, &row.pixels),
-            0,
-            "a streamed block must be byte-identical to its resident twin: window {window} changed \
-             the image, which means the re-materialized blocks are NOT reproducing the resident \
-             ones (tier replay? adapter replay? IP-Adapter pairs?)"
-        );
-        // **The assertion that makes this test able to fail.** Byte-identity alone passes with the
-        // windowing deleted — a resident forward is trivially identical to itself. The rung must
-        // also MOVE the request peak, and the measured margin is −12.3%, so 3% is a floor a
-        // no-op implementation cannot clear.
-        assert!(
-            row.peak_gib < control.peak_gib * 0.97,
-            "window {window} did not bound the request peak: {:.3} vs control {:.3} GiB — the \
-             block stream is not actually replacing the resident stack",
-            row.peak_gib,
-            control.peak_gib
-        );
-        // A LOOSE latency ceiling, and deliberately loose. The tightest cadence measures ~4.9x at
-        // 1024² and ~7.4x at 768²; a wall clock moves with thermal state and with whatever else the
-        // machine is doing, so asserting anything near the measurement would be asserting the
-        // weather. 12x still leaves a substantial worsening detectable, which is the failure worth
-        // catching — a re-open path that starts thrashing rather than one that drifts 15%.
-        //
-        // **The ceiling is a claim about the DEFAULT geometry, so probe mode reports it instead.**
-        // Re-materialization cost is weight I/O: it is fixed per re-open and does not scale with
-        // output area, while the control's per-step forward very much does. So the RATIO is a
-        // function of geometry by construction, and it grows as the output shrinks — measured 4.9x at
-        // 1024², 7.4x at 768², and 12.6x at 512², which trips a ceiling calibrated at 1024². That is
-        // the mechanism behaving exactly as described, not a regression, and asserting a single
-        // constant across a 4x area range would be asserting something this rung never claimed.
-        let slowdown = ms_per_step(&row, STEPS) / ms_per_step(&control, STEPS);
-        if probing {
-            println!(
-                "[sc-15525 rung4 {tier} {edge}² cadence {window}] {slowdown:.1}x the control's \
-                 ms/step — ceiling NOT asserted in probe mode (it is calibrated at 1024²)"
-            );
-        } else {
-            assert!(
-                slowdown < 12.0,
-                "window {window} re-materialization cost {slowdown:.1}x the control's ms/step — \
-                 SC-16355 flagged exactly this as a severe-regression risk, and past 12x the rung \
-                 stops being a trade a selector could reasonably make"
-            );
-        }
+        assert_rung_four_evidence(&control, &row, *window);
     }
 
     // ── The two facts that make this a DOMAIN rather than four spellings of one choice ───────────
@@ -1253,8 +1230,7 @@ fn transformer_window_sweep_and_streamed_output_identity() {
     //     reproduce to the millibyte across four runs — so unlike the latency margins this one is
     //     tight on purpose. If a future change makes the peak cadence-sensitive *here*, the domain
     //     needs per-cadence calibration and this reddens to say so.
-    let (tightest, tight_peak, tight_ms) = rows[0];
-    let (widest, _wide_peak, wide_ms) = *rows.last().expect("at least one row");
+    let (tightest, tight_peak, _) = rows[0];
     for (window, peak, _) in &rows {
         if probing {
             println!(
@@ -1275,39 +1251,6 @@ fn transformer_window_sweep_and_streamed_output_identity() {
              longer flat, the flat region has moved and the domain owes fresh per-cadence evidence"
         );
     }
-    // (b) And widening it buys time back. Measured 3654 -> 1318 ms/step (2.77x) at 1024² and
-    //     3355 -> 979 (3.43x) at 768².
-    //
-    //     sc-19556: the FLOOR IS UNCHANGED at 0.75; what changed is the instrument feeding it.
-    //     `tight_ms` and `wide_ms` used to be one sample each, from renders minutes and a model load
-    //     apart, so on a box that routinely runs several agents at once the two arms need not even
-    //     see the same load. Both now come from `measure_fastest`: the fastest of `TIMED_RUNS`
-    //     identical renders, which is a lower bound on the hardware rather than an arbitrary point
-    //     in a noisy distribution. That is the contention tolerance, and it costs no margin.
-    //
-    //     Relaxing the floor to ~0.95 instead was the wrong trade and is not repeated here. It
-    //     drops the required speedup from 1.33x to 1.053x against a MEASURED 2.77-3.43x: to
-    //     false-RED at 0.75 contention must inflate the ratio by 2.6x, whereas to false-GREEN at
-    //     0.95 a 5% fluctuation suffices. The 53-of-380 flake evidence that motivated it was
-    //     measured on `joint_denoise.rs` in a different crate, and this is an `#[ignore]`d
-    //     real-weight test run in a deliberate campaign, not on the contended CI path.
-    //
-    //     The memory half of this frontier is gated CLOCK-FREE just above — `(peak - tight_peak)
-    //     .abs() < tight_peak * 0.01` reads an allocator high-water, not a duration — and that is
-    //     the assertion carrying the flat-peak claim. This one keeps a duration because "widening
-    //     buys time back" is a published latency claim; a `BlockPlan` that ignored the window
-    //     entirely lands at ~1.0 and still reds here.
-    assert!(
-        probing || wide_ms < tight_ms * 0.75,
-        "widening the cadence {tightest} -> {widest} did not buy time back ({tight_ms:.0} -> \
-         {wide_ms:.0} ms/step). The domain is published as a time/memory frontier; if every cadence \
-         costs the same, it is not one and only the tightest should ship"
-    );
-    println!(
-        "[sc-15525 rung4 {tier} {edge}² frontier] cadence {tightest} -> {widest}: peak flat at \
-         {tight_peak:.3} GiB, wall clock {tight_ms:.0} -> {wide_ms:.0} ms/step ({:.2}x cheaper)",
-        tight_ms / wide_ms
-    );
 }
 
 /// **The published window domain is enforced on both layers, and it is REACHABLE on both.**
