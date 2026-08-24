@@ -37,7 +37,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
-    is_comfyui_key_space, resolve_alpha, resolve_rank, DEFAULT_LORA_ALPHA,
+    is_comfyui_key_space, resolve_alpha, resolve_rank, unflatten_minimax_h3_trainer_tensors,
+    DEFAULT_LORA_ALPHA,
 };
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
 
@@ -909,8 +910,9 @@ fn write_comfyui_twin(
     let alpha_str = alpha.to_string();
     let mut meta: Vec<(&str, &str)> = vec![("target_format", "ComfyUI generic LoRA")];
     match spelling {
-        // The in-band tensor is already written above; nothing goes in the header.
-        AlphaSpelling::InBand => {}
+        // A contradictory file-level value makes the precedence claim non-vacuous: the per-target
+        // tensor must win independently for qkv and fc1.
+        AlphaSpelling::InBand => meta.push(("alpha", "3")),
         // `r` equals the per-target factor rank on BOTH fused forms (a block-diagonal `[3r, in]` A
         // splits into three rank-`r` ones), so this blob is self-consistent and is not rejected by
         // the rank cross-check — it is the alpha, and only the alpha, that is under test.
@@ -920,6 +922,22 @@ fn write_comfyui_twin(
     }
     write_safetensors(&path, &arrays, &meta);
     path
+}
+
+/// Re-key the small raw-module fixture into the exact trainer spelling. Production validates the
+/// full 50×4 census before this rewrite; this weights-light fixture isolates the numerical seam.
+fn trainer_keys_from_comfyui(tensors: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+    tensors
+        .iter()
+        .map(|(source, tensor)| {
+            let target = source
+                .replace("blocks.0.attn.qkv_proj", "lora_unet_blocks_0_attn_qkv_proj")
+                .replace("blocks.0.mlp.fc1", "lora_unet_blocks_0_mlp_fc1")
+                .replace(".lora_A.weight", ".lora_down.weight")
+                .replace(".lora_B.weight", ".lora_up.weight");
+            (target, tensor.clone())
+        })
+        .collect()
 }
 
 /// Write the **diffusers** counterpart of [`write_comfyui_twin`]'s modules, from the same factors.
@@ -990,6 +1008,63 @@ fn twin_factors(cfg: &MiniMaxH3DitConfig) -> ([(Tensor, Tensor); 3], (Tensor, Te
         bf16(&tensor(&[2 * cfg.ffn_dim, r], 8.0)),
     );
     (qkv, fc1)
+}
+
+/// The exact trainer spelling reaches independently constructed diffusers-shaped factors.
+/// Q/K/V factors are position-distinct, FC1 halves are distinct, and qkv/fc1 alphas disagree, so a
+/// wrong slice, either half-order swap, or crossed/default alpha independently makes this red.
+#[test]
+fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+    let comfy_path = write_comfyui_twin(
+        dir.path(),
+        "trainer_source.safetensors",
+        &cfg,
+        FusedQkvSpec::new(AlphaSpelling::InBand, false),
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    let adapter = candle_gen::train::merge::read_adapter(&comfy_path).expect("raw fixture");
+    let trainer = trainer_keys_from_comfyui(&adapter.tensors);
+    let (raw, alphas) =
+        unflatten_minimax_h3_trainer_tensors(&trainer).expect("exact trainer unflatten");
+    assert_eq!(alphas, vec![FC1_ALPHA, FUSED_ALPHA]);
+
+    let got = convert_comfyui_key_space(&raw, &adapter.meta).expect("trainer conversion");
+    assert_eq!(got.len(), 12, "q/k/v and fc1 each carry A/B/alpha");
+    for (index, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+        for (suffix, expected) in [
+            ("lora_A.weight", &qkv[0].0),
+            ("lora_B.weight", &qkv[index].1),
+        ] {
+            let key = format!("transformer_blocks.0.attn.{name}.{suffix}");
+            let drift = rel_max_abs(got.get(&key).unwrap(), expected);
+            assert!(
+                drift <= 1e-6,
+                "{key}: trainer conversion drifted at relative max-abs {drift:.3e}"
+            );
+        }
+        let key = format!("transformer_blocks.0.attn.{name}.alpha");
+        let expected = Tensor::new(&[FUSED_ALPHA], &dev()).unwrap();
+        let drift = rel_max_abs(got.get(&key).unwrap(), &expected);
+        assert!(
+            drift <= 1e-6,
+            "{key}: trainer/raw conversion drifted at relative max-abs {drift:.3e}"
+        );
+    }
+    for (suffix, expected) in [("lora_A.weight", &fc1.0), ("lora_B.weight", &fc1.1)] {
+        let key = format!("transformer_blocks.0.ff.net.0.proj.{suffix}");
+        let drift = rel_max_abs(got.get(&key).unwrap(), expected);
+        assert!(drift <= 1e-6, "{key}: relative max-abs {drift:.3e}");
+    }
+    let expected = Tensor::new(&[FC1_ALPHA], &dev()).unwrap();
+    let drift = rel_max_abs(
+        got.get("transformer_blocks.0.ff.net.0.proj.alpha").unwrap(),
+        &expected,
+    );
+    assert!(drift <= 1e-6, "FC1 alpha drifted by {drift:.3e}");
 }
 
 /// **The detection is unchanged** — sc-19443 changed what happens after it, never the guard itself.

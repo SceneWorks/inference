@@ -16,7 +16,7 @@
 //! third-party LoKr/LoHa (`lokr_*`/`hada_*` factors, optional per-module `.alpha`), and kohya
 //! (`lora_unet_<flattened path>.lora_down/up.weight` + `.alpha`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -525,6 +525,244 @@ pub const LOHA_TP_SUFFIXES: [&str; 6] = [
 /// The kohya flattened-path namespace prefix (`lora_unet_<dotted-path-with-dots→underscores>`).
 pub const KOHYA_PREFIX: &str = "lora_unet_";
 
+/// The exact kohya network module used by the MiniMax-H3 trainer. This format is intentionally
+/// narrower than generic [`KOHYA_PREFIX`] handling: its four fused/raw leaves require numerical
+/// conversion before they can bind to the diffusers-shaped runtime DiT.
+pub const MINIMAX_H3_TRAINER_NETWORK_MODULE: &str = "networks.lora_minimax_h3";
+
+/// The metadata flag which makes a 50-block, trunk-only H3 adapter intentional rather than partial.
+pub const MINIMAX_H3_TOKEN_REFINER_METADATA_KEY: &str = "ss_h3_lora_token_refiner";
+
+/// One of the four raw MiniMax-H3 trainer targets in every transformer block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MiniMaxH3TrainerLeaf {
+    AttnQkvProj,
+    AttnOutProj,
+    MlpFc1,
+    MlpFc2,
+}
+
+impl MiniMaxH3TrainerLeaf {
+    /// The dotted raw-module spelling consumed by the H3 ComfyUI conversion.
+    pub const fn dotted(self) -> &'static str {
+        match self {
+            Self::AttnQkvProj => "attn.qkv_proj",
+            Self::AttnOutProj => "attn.out_proj",
+            Self::MlpFc1 => "mlp.fc1",
+            Self::MlpFc2 => "mlp.fc2",
+        }
+    }
+
+    const fn flattened(self) -> &'static str {
+        match self {
+            Self::AttnQkvProj => "attn_qkv_proj",
+            Self::AttnOutProj => "attn_out_proj",
+            Self::MlpFc1 => "mlp_fc1",
+            Self::MlpFc2 => "mlp_fc2",
+        }
+    }
+
+    const fn geometry(self) -> (usize, usize) {
+        match self {
+            Self::AttnQkvProj => (5_376, 21_504),
+            Self::AttnOutProj => (7_168, 5_376),
+            Self::MlpFc1 => (5_376, 28_672),
+            Self::MlpFc2 => (14_336, 5_376),
+        }
+    }
+}
+
+/// Which tensor in a raw MiniMax-H3 trainer target a key names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MiniMaxH3TrainerRole {
+    Down,
+    Up,
+    Alpha,
+}
+
+impl MiniMaxH3TrainerRole {
+    /// The equivalent suffix in the dotted ComfyUI-compatible intermediate key space.
+    pub const fn dotted_suffix(self) -> &'static str {
+        match self {
+            Self::Down => ".lora_down.weight",
+            Self::Up => ".lora_up.weight",
+            Self::Alpha => ".alpha",
+        }
+    }
+}
+
+/// Parsed identity of one tensor in the exact MiniMax-H3 trainer namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiniMaxH3TrainerKey {
+    pub block: usize,
+    pub leaf: MiniMaxH3TrainerLeaf,
+    pub role: MiniMaxH3TrainerRole,
+}
+
+/// Structural receipt for one validated MiniMax-H3 trainer adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MiniMaxH3TrainerLayout {
+    /// Source modules, before the fused QKV target expands to three runtime linears.
+    pub source_targets: usize,
+    /// Distinct factor ranks present in the file, sorted for stable receipts.
+    pub ranks: Vec<usize>,
+    /// This namespace is trunk-only by construction; the explicit metadata flag makes that intent
+    /// machine-readable and prevents an accidentally partial export from looking valid.
+    pub trunk_only: bool,
+}
+
+/// Parse one exact H3 trainer tensor name:
+/// `lora_unet_blocks_{0..49}_{attn_qkv_proj,attn_out_proj,mlp_fc1,mlp_fc2}` followed by
+/// `.lora_down.weight`, `.lora_up.weight`, or `.alpha`.
+pub fn parse_minimax_h3_trainer_key(key: &str) -> Option<MiniMaxH3TrainerKey> {
+    let rest = key.strip_prefix("lora_unet_blocks_")?;
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 || rest.as_bytes().get(digits_len) != Some(&b'_') {
+        return None;
+    }
+    let block = rest[..digits_len].parse::<usize>().ok()?;
+    let target_and_role = &rest[digits_len + 1..];
+    let (role, target) = [
+        (MiniMaxH3TrainerRole::Down, ".lora_down.weight"),
+        (MiniMaxH3TrainerRole::Up, ".lora_up.weight"),
+        (MiniMaxH3TrainerRole::Alpha, ".alpha"),
+    ]
+    .into_iter()
+    .find_map(|(role, suffix)| {
+        target_and_role
+            .strip_suffix(suffix)
+            .map(|target| (role, target))
+    })?;
+    let leaf = [
+        MiniMaxH3TrainerLeaf::AttnQkvProj,
+        MiniMaxH3TrainerLeaf::AttnOutProj,
+        MiniMaxH3TrainerLeaf::MlpFc1,
+        MiniMaxH3TrainerLeaf::MlpFc2,
+    ]
+    .into_iter()
+    .find(|leaf| target == leaf.flattened())?;
+    (block < 50).then_some(MiniMaxH3TrainerKey { block, leaf, role })
+}
+
+/// Whether the keys or metadata claim the exact MiniMax-H3 trainer namespace. Callers use this
+/// before generic kohya handling so the fused QKV and FC1 half-order transforms cannot be skipped.
+pub fn is_minimax_h3_trainer_key_space<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_module: Option<&str>,
+) -> bool {
+    network_module.is_some_and(|module| module.trim() == MINIMAX_H3_TRAINER_NETWORK_MODULE)
+        || keys
+            .into_iter()
+            .any(|key| key.starts_with("lora_unet_blocks_"))
+}
+
+/// Validate the complete 50-block × four-leaf H3 trainer surface without materializing tensors.
+///
+/// `entries` supplies `(key, shape)` pairs from either backend or a safetensors header. Every key is
+/// required to be in the exact namespace, every source target must carry down/up/alpha, factor
+/// geometry and rank must compose, and the intentionally absent token refiner must be declared with
+/// `ss_h3_lora_token_refiner=False`. This is deliberately strict only for this trainer namespace;
+/// existing diffusers/PEFT, ComfyUI, and LoKr paths never call it.
+pub fn validate_minimax_h3_trainer_layout(
+    entries: impl IntoIterator<Item = (String, Vec<usize>)>,
+    network_module: Option<&str>,
+    token_refiner: Option<&str>,
+) -> std::result::Result<MiniMaxH3TrainerLayout, String> {
+    match network_module.map(str::trim) {
+        Some(MINIMAX_H3_TRAINER_NETWORK_MODULE) => {}
+        Some(other) => {
+            return Err(format!(
+                "unsupported MiniMax-H3 trainer namespace {other:?}; expected __metadata__[\"ss_network_module\"] = {MINIMAX_H3_TRAINER_NETWORK_MODULE:?}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "MiniMax-H3 trainer keys require __metadata__[\"ss_network_module\"] = {MINIMAX_H3_TRAINER_NETWORK_MODULE:?}"
+            ));
+        }
+    }
+    if !token_refiner.is_some_and(|value| value.trim().eq_ignore_ascii_case("false")) {
+        return Err(format!(
+            "the 50-block MiniMax-H3 trainer adapter omits token-refiner targets, so __metadata__[\"{MINIMAX_H3_TOKEN_REFINER_METADATA_KEY}\"] must be False"
+        ));
+    }
+
+    let mut groups: BTreeMap<
+        (usize, MiniMaxH3TrainerLeaf),
+        BTreeMap<MiniMaxH3TrainerRole, Vec<usize>>,
+    > = BTreeMap::new();
+    for (key, shape) in entries {
+        let parsed = parse_minimax_h3_trainer_key(&key).ok_or_else(|| {
+            format!(
+                "unsupported or malformed MiniMax-H3 trainer tensor {key:?}; expected lora_unet_blocks_{{0..49}}_{{attn_qkv_proj,attn_out_proj,mlp_fc1,mlp_fc2}}.{{lora_down.weight,lora_up.weight,alpha}}"
+            )
+        })?;
+        if groups
+            .entry((parsed.block, parsed.leaf))
+            .or_default()
+            .insert(parsed.role, shape)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate MiniMax-H3 trainer tensor role in {key:?}"
+            ));
+        }
+    }
+
+    let mut ranks = BTreeSet::new();
+    for block in 0..50 {
+        for leaf in [
+            MiniMaxH3TrainerLeaf::AttnQkvProj,
+            MiniMaxH3TrainerLeaf::AttnOutProj,
+            MiniMaxH3TrainerLeaf::MlpFc1,
+            MiniMaxH3TrainerLeaf::MlpFc2,
+        ] {
+            let target = format!("lora_unet_blocks_{block}_{}", leaf.flattened());
+            let roles = groups.get(&(block, leaf)).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: missing target {target}")
+            })?;
+            let down = roles.get(&MiniMaxH3TrainerRole::Down).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing lora_down.weight")
+            })?;
+            let up = roles.get(&MiniMaxH3TrainerRole::Up).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing lora_up.weight")
+            })?;
+            let alpha = roles.get(&MiniMaxH3TrainerRole::Alpha).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing alpha")
+            })?;
+            let (in_dim, out_dim) = leaf.geometry();
+            if down.len() != 2 || down[0] == 0 || down[1] != in_dim {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.lora_down.weight: expected [rank, {in_dim}], got {down:?}"
+                ));
+            }
+            let rank = down[0];
+            if up.as_slice() != [out_dim, rank] {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.lora_up.weight: expected [{out_dim}, {rank}], got {up:?}"
+                ));
+            }
+            if !(alpha.is_empty() || alpha.as_slice() == [1]) {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.alpha: expected scalar [] or [1], got {alpha:?}"
+                ));
+            }
+            ranks.insert(rank);
+        }
+    }
+    if groups.len() != 200 {
+        return Err(format!(
+            "MiniMax-H3 trainer adapter must contain exactly 200 source targets (50 blocks × four leaves), found {}",
+            groups.len()
+        ));
+    }
+    Ok(MiniMaxH3TrainerLayout {
+        source_targets: groups.len(),
+        ranks: ranks.into_iter().collect(),
+        trunk_only: true,
+    })
+}
+
 /// Common LoRA namespace prefixes a PEFT/diffusers file may carry on its keys (LoKr keys are bare).
 pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
 
@@ -1031,6 +1269,111 @@ mod tests {
             Some("transformer.")
         );
         assert_eq!(detect_lora_prefix(["bare.key"].into_iter()), None);
+    }
+
+    fn minimax_h3_trainer_entries() -> Vec<(String, Vec<usize>)> {
+        let mut entries = Vec::new();
+        for block in 0..50 {
+            for (leaf, input, output) in [
+                ("attn_qkv_proj", 5_376, 21_504),
+                ("attn_out_proj", 7_168, 5_376),
+                ("mlp_fc1", 5_376, 28_672),
+                ("mlp_fc2", 14_336, 5_376),
+            ] {
+                let stem = format!("lora_unet_blocks_{block}_{leaf}");
+                entries.push((format!("{stem}.lora_down.weight"), vec![16, input]));
+                entries.push((format!("{stem}.lora_up.weight"), vec![output, 16]));
+                entries.push((format!("{stem}.alpha"), Vec::new()));
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn minimax_h3_trainer_parser_is_exact_and_layout_is_complete() {
+        assert_eq!(
+            parse_minimax_h3_trainer_key("lora_unet_blocks_49_attn_qkv_proj.lora_down.weight"),
+            Some(MiniMaxH3TrainerKey {
+                block: 49,
+                leaf: MiniMaxH3TrainerLeaf::AttnQkvProj,
+                role: MiniMaxH3TrainerRole::Down,
+            })
+        );
+        for malformed in [
+            "lora_unet_blocks_50_attn_qkv_proj.lora_down.weight",
+            "lora_unet_blocks_0_attn_q_proj.lora_down.weight",
+            "lora_unet_blocks_0_mlp_fc1.lora_mid.weight",
+            "lora_unet_blocks_x_mlp_fc2.alpha",
+        ] {
+            assert_eq!(
+                parse_minimax_h3_trainer_key(malformed),
+                None,
+                "{malformed} must not be widened into the exact trainer namespace"
+            );
+        }
+
+        let layout = validate_minimax_h3_trainer_layout(
+            minimax_h3_trainer_entries(),
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .expect("the exact 50-block trunk-only layout");
+        assert_eq!(layout.source_targets, 200);
+        assert_eq!(layout.ranks, vec![16]);
+        assert!(layout.trunk_only);
+    }
+
+    #[test]
+    fn minimax_h3_trainer_layout_rejects_independent_partial_shape_and_namespace_mutations() {
+        let base = minimax_h3_trainer_entries();
+
+        let mut partial = base.clone();
+        partial.retain(|(key, _)| key != "lora_unet_blocks_7_mlp_fc2.alpha");
+        let error = validate_minimax_h3_trainer_layout(
+            partial,
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("blocks_7_mlp_fc2") && error.contains("missing alpha"),
+            "{error}"
+        );
+
+        let mut wrong_shape = base.clone();
+        wrong_shape
+            .iter_mut()
+            .find(|(key, _)| key == "lora_unet_blocks_3_attn_qkv_proj.lora_up.weight")
+            .unwrap()
+            .1 = vec![21_503, 16];
+        let error = validate_minimax_h3_trainer_layout(
+            wrong_shape,
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("[21504, 16]") && error.contains("[21503, 16]"),
+            "{error}"
+        );
+
+        for (network, token_refiner, expected) in [
+            (Some("networks.lora"), Some("False"), "unsupported"),
+            (
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                None,
+                "must be False",
+            ),
+            (
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                Some("True"),
+                "must be False",
+            ),
+        ] {
+            let error = validate_minimax_h3_trainer_layout(base.clone(), network, token_refiner)
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

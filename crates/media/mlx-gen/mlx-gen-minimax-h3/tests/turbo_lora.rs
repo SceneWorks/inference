@@ -43,7 +43,8 @@ use mlx_gen::gen_core::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
-    is_comfyui_key_space, resolve_alpha, resolve_rank, DEFAULT_LORA_ALPHA,
+    is_comfyui_key_space, resolve_alpha, resolve_rank, unflatten_minimax_h3_trainer_tensors,
+    DEFAULT_LORA_ALPHA,
 };
 use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig, SMALLEST_LEGAL_FRAMES};
 
@@ -769,8 +770,12 @@ fn write_comfyui_twin(
     .into_iter()
     .collect();
     match spelling {
-        // The in-band tensor is already written above; nothing goes in the header.
-        AlphaSpelling::InBand | AlphaSpelling::Absent => {}
+        // A contradictory file-level value makes the precedence claim non-vacuous: the per-target
+        // tensor must win independently for qkv and fc1.
+        AlphaSpelling::InBand => {
+            meta.insert("alpha".to_string(), "3".to_string());
+        }
+        AlphaSpelling::Absent => {}
         // `r` equals the per-target factor rank on BOTH fused forms (a block-diagonal `[3r, in]` A
         // splits into three rank-`r` ones), so this blob is self-consistent and is not rejected by
         // the rank cross-check — it is the alpha, and only the alpha, that is under test.
@@ -787,6 +792,21 @@ fn write_comfyui_twin(
     let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(entries, Some(&meta), &path).expect("write the comfyui twin");
     path
+}
+
+/// Re-key the small raw-module fixture into the exact trainer spelling. Production validates the
+/// full 50×4 census before this rewrite; this weights-light fixture isolates the numerical seam.
+fn trainer_keys_from_comfyui(w: &Weights) -> Weights {
+    let mut trainer = Weights::empty();
+    for source in w.keys().map(str::to_string).collect::<Vec<_>>() {
+        let target = source
+            .replace("blocks.0.attn.qkv_proj", "lora_unet_blocks_0_attn_qkv_proj")
+            .replace("blocks.0.mlp.fc1", "lora_unet_blocks_0_mlp_fc1")
+            .replace(".lora_A.weight", ".lora_down.weight")
+            .replace(".lora_B.weight", ".lora_up.weight");
+        trainer.insert(target, w.require(&source).unwrap().clone());
+    }
+    trainer
 }
 
 /// Write the **diffusers** counterpart of [`write_comfyui_twin`]'s modules, from the same factors.
@@ -861,6 +881,74 @@ fn twin_factors(cfg: &MiniMaxH3DitConfig) -> ([(Array, Array); 3], (Array, Array
         bf16(&tensor(&[2 * cfg.ffn_dim, r], 8.0)),
     );
     (qkv, fc1)
+}
+
+/// The exact trainer spelling reaches independently constructed diffusers-shaped factors.
+/// Q/K/V factors are position-distinct, FC1 halves are distinct, and qkv/fc1 alphas disagree, so a
+/// wrong slice, either half-order swap, or crossed/default alpha independently makes this red.
+#[test]
+fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let (qkv, fc1) = twin_factors(&cfg);
+    let comfy_path = write_comfyui_twin(
+        dir.path(),
+        "trainer_source.safetensors",
+        &cfg,
+        FusedQkvSpec::new(AlphaSpelling::InBand, false),
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    let comfy = Weights::from_file(&comfy_path).expect("raw fixture");
+    let trainer = trainer_keys_from_comfyui(&comfy);
+    let (raw, alphas) =
+        unflatten_minimax_h3_trainer_tensors(&trainer).expect("exact trainer unflatten");
+    assert_eq!(alphas, vec![FC1_ALPHA, FUSED_ALPHA]);
+
+    let got = convert_comfyui_key_space(&raw).expect("trainer conversion");
+    assert_eq!(got.keys().count(), 12, "q/k/v and fc1 each carry A/B/alpha");
+    for (index, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+        for (suffix, expected) in [
+            ("lora_A.weight", &qkv[0].0),
+            ("lora_B.weight", &qkv[index].1),
+        ] {
+            let key = format!("transformer_blocks.0.attn.{name}.{suffix}");
+            let actual = got.require(&key).unwrap();
+            let drift =
+                max_abs(&subtract(actual, expected).unwrap()) / max_abs(expected).max(1e-12);
+            assert!(
+                drift <= 1e-6,
+                "{key}: trainer conversion drifted at relative max-abs {drift:.3e}"
+            );
+        }
+        let key = format!("transformer_blocks.0.attn.{name}.alpha");
+        let expected = Array::from_slice(&[FUSED_ALPHA], &[1]);
+        let actual = got.require(&key).unwrap();
+        let drift = max_abs(&subtract(actual, &expected).unwrap()) / max_abs(&expected);
+        assert!(
+            drift <= 1e-6,
+            "{key}: trainer/raw conversion drifted at relative max-abs {drift:.3e}"
+        );
+    }
+    for (suffix, expected) in [("lora_A.weight", &fc1.0), ("lora_B.weight", &fc1.1)] {
+        let key = format!("transformer_blocks.0.ff.net.0.proj.{suffix}");
+        let actual = got.require(&key).unwrap();
+        let drift = max_abs(&subtract(actual, expected).unwrap()) / max_abs(expected).max(1e-12);
+        assert!(drift <= 1e-6, "{key}: relative max-abs {drift:.3e}");
+    }
+    let expected = Array::from_slice(&[FC1_ALPHA], &[1]);
+    let drift = max_abs(
+        &subtract(
+            got.require("transformer_blocks.0.ff.net.0.proj.alpha")
+                .unwrap(),
+            &expected,
+        )
+        .unwrap(),
+    ) / max_abs(&expected);
+    assert!(
+        drift <= 1e-6,
+        "FC1 alpha drifted at relative max-abs {drift:.3e}"
+    );
 }
 
 /// **A converted ComfyUI file folds to the SAME residual as its diffusers twin**, gated on relative
