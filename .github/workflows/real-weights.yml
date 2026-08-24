@@ -6633,42 +6633,65 @@ jobs:
       # sm_90, sm_120 and `compute_120` PTX above it (sc-7544), so the Blackwell card IS covered.
       # The silent-zeros class was retired then, not merely deferred.
       #
-      # Two independent reasons this probe could not have hit it regardless: the lane advertises
-      # `supported_quants: &[]` and measures the DENSE bf16 checkpoint, so no quantized kernel is
-      # reachable; and the probe's `DEGENERATE_STD_FLOOR` middle-frame check would fail an
-      # all-zeros render anyway. sc-19545 closed the diagnosis but deliberately added no CI guard,
-      # so the general case is still covered only by `candle-gen/tests/cuda_quant_smoke.rs` -- which
-      # no workflow currently executes. See that file's header.
-      - name: Require the FULL MiniMax-H3 snapshot before measuring
+      # The q4 and q8 probes below now exercise the packed kernels too. Their `spec.quantize`
+      # assertions reject a mis-staged tier before rendering, and the probe's
+      # `DEGENERATE_STD_FLOOR` middle-frame check rejects an all-zeros render. sc-19545 deliberately
+      # added no general CUDA-quant smoke gate, so that broader check remains only in
+      # `candle-gen/tests/cuda_quant_smoke.rs`; the three real-weight records here are specifically
+      # the MiniMax-H3 shipped-geometry measurements.
+      - name: Require real MiniMax-H3 files and staged tier inputs before measuring
         if: inputs.minimax_h3_vram_probe
         shell: cmd
         run: |
-          rem The pinned `minimax-h3` row in release/real-weight-models.toml carries a `download_files`
-          rem ALLOW-LIST -- vae/, audio_vae/, FL2VA/audio_vae/, tokenizer/ and the TE shard INDEX,
-          rem ~11.6 GB total -- and deliberately EXCLUDES `transformer/` and the fourteen text-encoder
-          rem shards, because listing them would multiply that row's disk cost roughly sixfold. The
-          rem materialize step above therefore CANNOT supply what a render needs. Fail here, naming the
-          rem missing component, rather than inside `MiniMaxH3::load` after a dispatch has been queued.
-          for %%C in (text_encoder transformer vae audio_vae) do (
-            if not exist "%MINIMAX_H3_SNAPSHOT%\%%C" (
-              echo ::error::%MINIMAX_H3_SNAPSHOT%\%%C is missing. The VRAM probe RENDERS, so it needs the FULL snapshot - not the ~11.6 GB allow-listed slice the pinned row fetches. Provision the full snapshot on this runner.
-              exit /b 1
-            )
-          )
-          rem The shard index alone satisfies the directory check above, so probe for real shard bytes.
-          if not exist "%MINIMAX_H3_SNAPSHOT%\text_encoder\*.safetensors" (
-            echo ::error::text_encoder/ holds no .safetensors shards - only the shard INDEX is in the pinned allow-list, and the probe needs the ~62 GB of shards themselves.
-            exit /b 1
-          )
+          rem Validate every index-resolved file before Cargo creates a CUDA context. The live
+          rem CANDLE_MINIMAX_H3_SNAPSHOT is an HF cache tree, whose reparse-point blob links candle
+          rem cannot memmap; this requires hardlink/copy-staged real files instead.
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q4 --dit "${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q8 --dit "${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier bf16 --dit "%MINIMAX_H3_SNAPSHOT%\transformer" --te "%MINIMAX_H3_SNAPSHOT%\text_encoder" || exit /b 1
+      - name: Measure candle vramGbByTier (q4, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          set "name=minimax_h3_vram_q4"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-q4.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q4 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q4 --out "%RUNNER_TEMP%\minimax-h3-vram-q4.json" || exit /b 1
+          type "%RUNNER_TEMP%\minimax-h3-vram-q4.json"
+      - name: Measure candle vramGbByTier (q8, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          set "name=minimax_h3_vram_q8"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-q8.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q8 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q8 --out "%RUNNER_TEMP%\minimax-h3-vram-q8.json" || exit /b 1
+          type "%RUNNER_TEMP%\minimax-h3-vram-q8.json"
       - name: Measure candle vramGbByTier (bf16, shipped geometry)
         if: inputs.minimax_h3_vram_probe
         shell: cmd
         env:
-          # The probe reads its own dir variable; `MINIMAX_H3_SNAPSHOT` above is the same path, but
-          # naming it explicitly keeps the probe runnable against a hand-staged root without editing
-          # the job. Real files, not HF blob symlinks -- candle's memmap cannot traverse Windows
-          # reparse points.
           MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}\transformer
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}\text_encoder
           # Belt-and-braces: the provider FORCES `OffloadPolicy::Sequential` regardless (pinned by
           # `the_offload_policy_is_forced_sequential_even_when_resident_is_requested`). Set anyway so
           # the invocation matches the Wan runbook line for line.
@@ -6688,7 +6711,7 @@ jobs:
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           rem The machine-parseable datum is the whole point of the run; a green step that produced
           rem no `[[H3_VRAM]]` line has measured nothing anyone can transcribe into the manifest.
-          findstr /C:"[[H3_VRAM]]" "%log%" > "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || (echo ::error::the probe printed no [[H3_VRAM]] datum & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier bf16 --out "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || exit /b 1
           type "%RUNNER_TEMP%\minimax-h3-vram-bf16.json"
       - name: Keep the VRAM evidence
         if: inputs.minimax_h3_vram_probe && !cancelled()
@@ -6696,6 +6719,10 @@ jobs:
         with:
           name: minimax-h3-candle-vram-bf16
           path: |
+            ${{ runner.temp }}/minimax-h3-vram-q4.log
+            ${{ runner.temp }}/minimax-h3-vram-q4.json
+            ${{ runner.temp }}/minimax-h3-vram-q8.log
+            ${{ runner.temp }}/minimax-h3-vram-q8.json
             ${{ runner.temp }}/minimax-h3-vram-bf16.log
             ${{ runner.temp }}/minimax-h3-vram-bf16.json
           if-no-files-found: error
