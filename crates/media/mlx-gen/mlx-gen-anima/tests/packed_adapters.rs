@@ -2,7 +2,7 @@
 //!
 //! All `#[ignore]`d and real-weights-gated: they need the `circlestone-labs/Anima` base snapshot
 //! (DiT + TE + VAE) and the `Anima-Official-LoRAs` snapshot in the HF cache, plus Metal. Run with:
-//!   cargo test -p mlx-gen-anima --release --test packed_adapters -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration packed_adapters:: -- --ignored --nocapture
 //!
 //! CI runs none of these (no weights). The *math* — that a packed base installs the structured
 //! Kronecker form and that the residual matches the materialized one — is covered in CI by the shared
@@ -38,7 +38,7 @@
 //! and a scale-0 adapter is an exact no-op. A fold would break every one of those while leaving
 //! `rel_err` at ~0.
 
-mod common;
+use crate::common;
 
 #[path = "../../tests/support/atomic_cache.rs"]
 mod atomic_cache;

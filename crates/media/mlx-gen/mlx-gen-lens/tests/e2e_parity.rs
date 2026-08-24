@@ -14,7 +14,7 @@
 //! correct. The tokenizer is validated *inside* the e2e: the Rust render (with the golden's date) must
 //! reproduce the golden's `input_ids` byte-for-byte.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test e2e_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration e2e_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};

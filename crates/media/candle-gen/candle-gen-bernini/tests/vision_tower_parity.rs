@@ -6,7 +6,7 @@
 //! `out.tokens`. The f32 leg is CPU-only; sc-11150 (F-080) adds an f64-weight CPU leg and a bf16-weight
 //! CUDA leg that both feed f32 inputs to prove the tower casts inputs to its weight dtype.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

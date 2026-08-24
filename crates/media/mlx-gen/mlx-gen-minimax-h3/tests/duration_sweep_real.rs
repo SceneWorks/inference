@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<root> SCENEWORKS_GPU_ID=mlx \
-//!   cargo test -p mlx-gen-minimax-h3 --test duration_sweep_real -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration duration_sweep_real:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!
@@ -85,7 +85,7 @@
 //! [`the_four_second_row_is_structurally_unrenderable`] pins that rather than leaving a blank cell
 //! that reads like a missing measurement.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

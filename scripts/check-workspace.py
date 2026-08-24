@@ -34,8 +34,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
-    "mlx-sys": ("pmetal-mlx-sys", "7151a9b27921c6198fd8dfb493dee21db4dcdfcc"),
+    "mlx-rs": ("pmetal-mlx-rs", "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"),
+    "mlx-sys": ("pmetal-mlx-sys", "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
@@ -309,6 +309,21 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "the two backends ship different checkpoints of the family and register different ids: "
         "candle the single-stage `ltx_2_3_distilled`, mlx the two-stage `ltx_2_3`. Both doc "
         "comments state which."
+    ),
+    ("ltx", "CALIBRATION_FINGERPRINT"): (
+        "a calibration identity is backend-specific: Candle names the released CUDA q4 I2V cell, "
+        "while MLX names the Metal base/Eros I2V cell. Sharing a fingerprint would cross the "
+        "physical artifact and backend evidence domains."
+    ),
+    ("ltx", "MEMORY_REGISTRATION"): (
+        "the registration is structurally identical but resolves its provider id through each "
+        "backend's distinct MODEL_ID; the companion MODEL_ID exemption records the released "
+        "checkpoint split, so this aggregate necessarily differs too."
+    ),
+    ("ltx", "MEMORY_BEHAVIOR"): (
+        "the behavior registration is structurally identical but resolves its provider id through "
+        "each backend's distinct MODEL_ID; its differing identity is deliberate rather than a "
+        "cross-backend geometry disagreement."
     ),
     ("mage", "ATTENTION_CHUNK_SIZE"): (
         "candle takes the shared `gen_core::attention_budget::CONSTRAINED_ATTN_SCORES_BUDGET` "

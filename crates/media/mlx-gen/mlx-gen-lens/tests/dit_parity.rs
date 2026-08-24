@@ -12,7 +12,7 @@
 //! bugs (wrong RoPE axis, transposed weight, mis-ordered modulation). The golden + the ~16 GB f32
 //! weight load keep this `#[ignore]`d; the golden is gitignored.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test dit_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration dit_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};

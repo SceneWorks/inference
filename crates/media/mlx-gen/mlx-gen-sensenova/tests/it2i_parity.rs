@@ -9,7 +9,7 @@
 //! special-token ids, so the model is built with [`T2iModel::with_image_token_ids`] (10 / 11),
 //! mirroring the dump.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test it2i_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration it2i_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel, T2iOptions};

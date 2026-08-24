@@ -5,6 +5,7 @@ use gen_core::{
     MemoryContractFixtureRegistration, MemoryPhase, MemoryProviderContract, MemoryRegistration,
     MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyParameters, MemoryStrategySupport, Precision, ProviderRegistry,
+    ResidentOnlyMemoryContractRegistration,
 };
 
 /// Check the static declaration and the safety-critical runtime semantics every provider must share.
@@ -66,10 +67,20 @@ pub fn check_memory_strategy_registry(
         let contract_fixture = registry
             .memory_contract_fixture_registrations()
             .find(|fixture| fixture.provider_id == registration.provider_id);
+        let resident_only_witness = registry
+            .resident_only_memory_contract_registrations()
+            .find(|witness| witness.provider_id == registration.provider_id);
         let behavior = registry
             .memory_behavior_registrations()
             .find(|behavior| behavior.provider_id == registration.provider_id);
-        check_memory_registration(registration, contract_fixture, behavior, spec, &mut errors);
+        check_memory_registration(
+            registration,
+            contract_fixture,
+            resident_only_witness,
+            behavior,
+            spec,
+            &mut errors,
+        );
     }
     if errors.is_empty() {
         Ok(())
@@ -132,12 +143,14 @@ pub fn memory_contract_surface_registry_conformance(registry: &ProviderRegistry)
 fn check_memory_registration(
     registration: &MemoryRegistration,
     contract_fixture: Option<&MemoryContractFixtureRegistration>,
+    resident_only_witness: Option<&ResidentOnlyMemoryContractRegistration>,
     behavior: Option<&MemoryBehaviorRegistration>,
     spec: &LoadSpec,
     errors: &mut Vec<String>,
 ) {
     let contract_factory = contract_fixture
         .map(|fixture| fixture.contract)
+        .or_else(|| resident_only_witness.map(|witness| witness.contract))
         .unwrap_or(registration.contract);
     // A catalog can legitimately compose providers with opposite materialization requirements.
     // The caller-supplied spec carries all common fixture axes, but one global load shape cannot be
@@ -352,6 +365,7 @@ fn check_behavior_fixture(
     mut fixture: gen_core::MemoryBehaviorFixture,
     errors: &mut Vec<String>,
 ) {
+    let fixture_spec = fixture.load_spec.as_ref().unwrap_or(spec);
     if fixture.context.selection.strategy != strategy {
         errors.push(format!(
             "{}: {strategy:?} fixture selected {:?}",
@@ -373,7 +387,7 @@ fn check_behavior_fixture(
         ));
         return;
     }
-    let decision = (registration.safety_check)(spec, contract, &fixture.context);
+    let decision = (registration.safety_check)(fixture_spec, contract, &fixture.context);
     if !matches!(decision, MemorySafetyDecision::Accept) {
         errors.push(format!(
             "{}: implemented {strategy:?} rejects its provider-owned valid context: {decision:?}",
@@ -385,7 +399,7 @@ fn check_behavior_fixture(
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_abi),
+        (registration.safety_check)(fixture_spec, contract, &mutated_abi),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -398,7 +412,7 @@ fn check_behavior_fixture(
         .calibration_fingerprint
         .push_str("-mutated");
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_fingerprint),
+        (registration.safety_check)(fixture_spec, contract, &mutated_fingerprint),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -412,7 +426,7 @@ fn check_behavior_fixture(
         gen_core::LoadShape::DeferredMaterialization => gen_core::LoadShape::EagerMaterialization,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &mutated_shape),
+        (registration.safety_check)(fixture_spec, contract, &mutated_shape),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -427,7 +441,7 @@ fn check_behavior_fixture(
         _ => Precision::Bf16,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &tier),
+        (registration.safety_check)(fixture_spec, contract, &tier),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -445,7 +459,7 @@ fn check_behavior_fixture(
         reserved_headroom_bytes: 0,
     };
     if matches!(
-        (registration.safety_check)(spec, contract, &over_budget),
+        (registration.safety_check)(fixture_spec, contract, &over_budget),
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
@@ -455,7 +469,7 @@ fn check_behavior_fixture(
     }
 
     let expected_memory = contract.generation_memory(&fixture.context.selection);
-    let mut scope = match (behavior.begin_request)(spec, contract, &fixture.context) {
+    let mut scope = match (behavior.begin_request)(fixture_spec, contract, &fixture.context) {
         Ok(Some(scope)) => scope,
         Ok(None) => {
             errors.push(format!(
@@ -706,7 +720,7 @@ mod tests {
             .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
         let mut errors = Vec::new();
 
-        check_memory_registration(&registration, None, None, &spec, &mut errors);
+        check_memory_registration(&registration, None, None, None, &spec, &mut errors);
 
         assert_eq!(errors, Vec::<String>::new());
     }
@@ -893,6 +907,7 @@ mod tests {
         check_memory_registration(
             &registration,
             None,
+            None,
             Some(&PID_BEHAVIOR),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
             &mut errors,
@@ -924,8 +939,43 @@ mod tests {
         check_memory_registration(
             &registration,
             Some(&contract_fixture),
+            None,
             Some(&PID_BEHAVIOR),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+            &mut errors,
+        );
+        assert_eq!(errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn conformance_uses_the_explicit_resident_only_witness_factory() {
+        fn production_requires_assets(
+            _spec: &LoadSpec,
+        ) -> gen_core::Result<MemoryProviderContract> {
+            Err(gen_core::Error::Msg(
+                "production contract touched required assets".to_owned(),
+            ))
+        }
+
+        let registration = MemoryRegistration {
+            provider_id: "eager-only",
+            contract: production_requires_assets,
+            safety_check: always_reject_safety,
+        };
+        let witness = ResidentOnlyMemoryContractRegistration {
+            provider_id: "eager-only",
+            contract: eager_only_contract,
+            surface_specs: gen_core::mlx_memory_contract_surface_specs,
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        let mut errors = Vec::new();
+        check_memory_registration(
+            &registration,
+            None,
+            Some(&witness),
+            None,
+            &spec,
             &mut errors,
         );
         assert_eq!(errors, Vec::<String>::new());
@@ -952,6 +1002,7 @@ mod tests {
         let mut errors = Vec::new();
         check_memory_registration(
             &registration,
+            None,
             None,
             Some(&PID_BEHAVIOR),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
@@ -1209,6 +1260,7 @@ mod tests {
         let mut errors = Vec::new();
         check_memory_registration(
             &registration,
+            None,
             None,
             Some(&behavior),
             &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),

@@ -28,7 +28,7 @@
 //! left every gate far above its own noise floor. Each test prints its residual, so the real margin
 //! stays auditable rather than implied.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 

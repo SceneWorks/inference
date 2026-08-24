@@ -14,7 +14,7 @@
 //! (→ 2048² PiD) by default.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-kolors --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-kolors --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

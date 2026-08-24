@@ -14,6 +14,7 @@ from typing import Any
 
 
 PREFIX = "MEMORY_EVIDENCE_V1 "
+MEMORY_EVIDENCE_SCHEMA_VERSION = 2
 GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 KEBAB_TOKEN = re.compile(r"[a-z0-9]+\Z")
 VERSION_TOKEN = re.compile(r"v[1-9][0-9]*\Z")
@@ -59,13 +60,16 @@ TOP_KEYS = {
     "parity_result",
 }
 EVIDENCE_KEY_KEYS = {
+    "model_family",
     "resolved_route",
     "backend",
     "tier",
     "load_shape",
     "mode",
+    "reference_shape",
     "overlay",
     "geometry",
+    "frames_per_second",
     "strategy",
     "engaged_composition",
     "parameters",
@@ -257,10 +261,11 @@ def _validate_parity(payload: dict[str, Any]) -> None:
 def _validate_payload(payload: Any, expected_strategy: str | None) -> dict[str, Any]:
     payload = _require_object(payload, "record")
     _require_exact_keys(payload, TOP_KEYS, "record")
-    if payload["schema_version"] != 1:
-        raise RuntimeError("schema_version must be 1")
+    if payload["schema_version"] != MEMORY_EVIDENCE_SCHEMA_VERSION:
+        raise RuntimeError(f"schema_version must be {MEMORY_EVIDENCE_SCHEMA_VERSION}")
     key = _require_object(payload["key"], "key")
     _require_exact_keys(key, EVIDENCE_KEY_KEYS, "key")
+    _require_string(key["model_family"], "key.model_family")
     _require_string(key["resolved_route"], "key.resolved_route")
     if key["backend"] not in BACKENDS:
         raise RuntimeError("key.backend is not canonical")
@@ -268,9 +273,14 @@ def _validate_payload(payload: Any, expected_strategy: str | None) -> dict[str, 
     if key["load_shape"] not in LOAD_SHAPES:
         raise RuntimeError("key.load_shape is not canonical")
     _require_string(key["mode"], "key.mode")
+    reference_shape = _require_string(key["reference_shape"], "key.reference_shape")
     if key["overlay"] is not None:
         _require_string(key["overlay"], "key.overlay")
     _validate_geometry(key["geometry"])
+    if (reference_shape == "none") != (key["geometry"]["reference_count"] == 0):
+        raise RuntimeError("key.reference_shape must be none exactly when reference_count is zero")
+    if key["frames_per_second"] is not None:
+        _require_positive_int(key["frames_per_second"], "key.frames_per_second")
     if expected_strategy is not None and key["strategy"] != expected_strategy:
         raise RuntimeError(
             f"expected key.strategy={expected_strategy}, found {key['strategy']}"
@@ -361,13 +371,16 @@ def read_record(path: Path, expected_strategy: str) -> EvidenceRecord:
 def _invariant_projection(record: EvidenceRecord) -> dict[str, Any]:
     key = record.key
     return {
+        "model_family": key["model_family"],
         "resolved_route": key["resolved_route"],
         "backend": key["backend"],
         "tier": key["tier"],
         "load_shape": key["load_shape"],
         "mode": key["mode"],
+        "reference_shape": key["reference_shape"],
         "overlay": key["overlay"],
         "geometry": key["geometry"],
+        "frames_per_second": key["frames_per_second"],
         "declared_calibration": record.payload["declared_calibration"],
         "observed_calibration": record.payload["observed_calibration"],
         "inference_revision": record.payload["inference_revision"],

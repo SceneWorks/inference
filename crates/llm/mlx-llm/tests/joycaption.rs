@@ -26,7 +26,7 @@ use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::{load_for_model, prepare_snapshot};
 
-mod common;
+use crate::common;
 use common::{assert_fixture_is_a_guarded_entry, Fixture};
 
 /// Pure-greedy golden tokens for the gray-384 fixture + "Write a very short caption." (16 tokens).

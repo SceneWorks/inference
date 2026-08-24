@@ -14,7 +14,7 @@
 //! the row-major patch order, the two distinct index tensors, and the output heads' row selection.
 //! Each of those is a shape-identical mistake on its own.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 

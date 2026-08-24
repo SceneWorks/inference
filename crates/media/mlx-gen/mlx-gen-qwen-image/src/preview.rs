@@ -25,7 +25,7 @@ use crate::pipeline::unpack_latents;
 ///
 /// ```sh
 /// MLX_GEN_QWEN_SNAPSHOT=…/bf16 QWEN_LIGHTNING_SNAPSHOT=…/models--lightx2v--Qwen-Image-Lightning/snapshots/<rev> \
-///   cargo test -p mlx-gen-qwen-image --release --test fit_preview_rgb -- --ignored --nocapture
+///   cargo test -p mlx-gen-qwen-image --release --test integration fit_preview_rgb:: -- --ignored --nocapture
 /// ```
 ///
 /// Both variables, not one: the corpus renders through the 8-step Lightning **adapter**, because

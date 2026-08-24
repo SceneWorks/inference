@@ -6,7 +6,11 @@
 //! carry the patchified noise latents (`input_proj`). Both streams live in one sequence, mixed every
 //! block by full (segment-masked) attention + interleaved 3D MRoPE.
 
-use candle_gen::candle_core::{DType, Result, Tensor, D};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::gen_core::{AdapterSpec, CancelFlag};
 
 use super::block::Ideogram4Block;
 use super::mrope::Ideogram4MRoPE;
@@ -32,7 +36,7 @@ pub struct Ideogram4Transformer {
     adaln_proj: QLinear,
     embed_image_indicator: QEmbedding,
     rotary_emb: Ideogram4MRoPE,
-    layers: Vec<Ideogram4Block>,
+    layers: TransformerLayers,
     final_adaln: QLinear,
     final_linear: QLinear,
     /// Sinusoidal frequencies for the `t` embedding (`[1, emb_dim/2]`, f32).
@@ -46,6 +50,32 @@ pub struct Ideogram4Transformer {
     /// Cache them keyed on the (loop-invariant) inputs' host contents. `Mutex` (not `RefCell`): the DiT
     /// is used behind a shared cache and must stay `Send + Sync`.
     cond_cache: std::sync::Mutex<Option<PreparedCond>>,
+}
+
+enum TransformerLayers {
+    Resident(Vec<Ideogram4Block>),
+    Streamed(StreamedLayers),
+}
+
+struct StreamedLayers {
+    weights: Arc<Weights>,
+    config: Ideogram4DitConfig,
+    window_size: usize,
+    turbo_adapter: Option<PathBuf>,
+    user_adapters: Vec<AdapterSpec>,
+}
+
+struct MaterializedWindow {
+    layers: Vec<(usize, Ideogram4Block)>,
+    device: Device,
+}
+
+impl Drop for MaterializedWindow {
+    fn drop(&mut self) {
+        // Transfers and kernels may still reference the current window. Always synchronize before the
+        // device tensors are released, including error, cancellation, and panic unwinding.
+        let _ = self.device.synchronize();
+    }
 }
 
 /// The step-invariant conditioning tensors prepared once per render (sc-8992). `seg_mask = None` when
@@ -102,6 +132,72 @@ impl Ideogram4Transformer {
                 cfg.mrope_section,
                 w.device(),
             )?,
+            layers: TransformerLayers::Resident(layers),
+            final_adaln: linear_detect(w, "final_layer.adaln_modulation", true)?,
+            final_linear: linear_detect(w, "final_layer.linear", true)?,
+            t_freqs,
+            dtype: w.dtype(),
+            cond_cache: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Build the exact deferred-materialization form: top-level projections remain resident for the
+    /// denoise phase, while the 34 trunk blocks stay mmap-backed and are materialized in request-sized
+    /// windows. Adapter factors are reattached to every materialized subset in their original order.
+    pub(crate) fn load_streamed(
+        weights: Weights,
+        cfg: &Ideogram4DitConfig,
+        window_size: usize,
+        turbo_adapter: Option<&Path>,
+        user_adapters: &[AdapterSpec],
+    ) -> Result<Self> {
+        if window_size == 0 || window_size > cfg.num_layers {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: invalid transformer window {window_size} for {} layers",
+                cfg.num_layers
+            )));
+        }
+        let weights = Arc::new(weights);
+        let mut transformer = Self::load_top(
+            &weights,
+            cfg,
+            TransformerLayers::Streamed(StreamedLayers {
+                weights: Arc::clone(&weights),
+                config: *cfg,
+                window_size,
+                turbo_adapter: turbo_adapter.map(Path::to_path_buf),
+                user_adapters: user_adapters.to_vec(),
+            }),
+        )?;
+        transformer.install_top_adapters()?;
+        Ok(transformer)
+    }
+
+    fn load_top(w: &Weights, cfg: &Ideogram4DitConfig, layers: TransformerLayers) -> Result<Self> {
+        let head_dim = cfg.emb_dim / cfg.num_heads;
+        let half = cfg.emb_dim / 2;
+        let lf = (1e4f32).ln() / (half as f32 - 1.0);
+        let t_freqs = Tensor::from_vec(
+            (0..half)
+                .map(|d| (-lf * d as f32).exp())
+                .collect::<Vec<_>>(),
+            (1, half),
+            w.device(),
+        )?;
+        Ok(Self {
+            input_proj: linear_detect(w, "input_proj", true)?,
+            llm_cond_norm: w.get("llm_cond_norm.weight")?,
+            llm_cond_proj: linear_detect(w, "llm_cond_proj", true)?,
+            t_mlp_in: linear_detect(w, "t_embedding.mlp_in", true)?,
+            t_mlp_out: linear_detect(w, "t_embedding.mlp_out", true)?,
+            adaln_proj: linear_detect(w, "adaln_proj", true)?,
+            embed_image_indicator: embedding_detect(w, "embed_image_indicator")?,
+            rotary_emb: Ideogram4MRoPE::new(
+                head_dim,
+                cfg.rope_theta,
+                cfg.mrope_section,
+                w.device(),
+            )?,
             layers,
             final_adaln: linear_detect(w, "final_layer.adaln_modulation", true)?,
             final_linear: linear_detect(w, "final_layer.linear", true)?,
@@ -109,6 +205,55 @@ impl Ideogram4Transformer {
             dtype: w.dtype(),
             cond_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    fn visit_top_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f("input_proj", &mut self.input_proj)?;
+        f("llm_cond_proj", &mut self.llm_cond_proj)?;
+        f("t_embedding.mlp_in", &mut self.t_mlp_in)?;
+        f("t_embedding.mlp_out", &mut self.t_mlp_out)?;
+        f("adaln_proj", &mut self.adaln_proj)?;
+        f("final_layer.adaln_modulation", &mut self.final_adaln)?;
+        f("final_layer.linear", &mut self.final_linear)
+    }
+
+    fn install_top_adapters(&mut self) -> Result<()> {
+        let TransformerLayers::Streamed(streamed) = &self.layers else {
+            return Ok(());
+        };
+        let turbo = streamed
+            .turbo_adapter
+            .as_ref()
+            .filter(|path| adapter_targets(path, None).unwrap_or(true))
+            .cloned();
+        let adapters = streamed
+            .user_adapters
+            .iter()
+            .filter(|adapter| adapter_targets(&adapter.path, None).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device = self.device();
+        if let Some(path) = turbo {
+            crate::adapters::install_turbo_lora_additive_for_visitor(
+                &device,
+                &path,
+                crate::config::TURBO_LORA_SCALE,
+                |visitor| self.visit_top_adaptable_mut(visitor),
+            )?;
+        }
+        if !adapters.is_empty() {
+            candle_gen::quant::install_dotted_adapters(
+                "ideogram streamed top-level",
+                &adapters,
+                &device,
+                |visitor| self.visit_top_adaptable_mut(visitor),
+            )
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// The DiT's compute device (every weight loaded onto it) — the device a resolved additive residual
@@ -132,8 +277,10 @@ impl Ideogram4Transformer {
         f("t_embedding.mlp_in", &mut self.t_mlp_in)?;
         f("t_embedding.mlp_out", &mut self.t_mlp_out)?;
         f("adaln_proj", &mut self.adaln_proj)?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        if let TransformerLayers::Resident(layers) = &mut self.layers {
+            for (i, layer) in layers.iter_mut().enumerate() {
+                layer.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+            }
         }
         f("final_layer.adaln_modulation", &mut self.final_adaln)?;
         f("final_layer.linear", &mut self.final_linear)?;
@@ -161,6 +308,8 @@ impl Ideogram4Transformer {
         position_ids: &Tensor,
         segment_ids: &Tensor,
         indicator: &Tensor,
+        attention_budget: usize,
+        cancel: &CancelFlag,
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
         // The role masks, MRoPE tables, and segment mask are step-invariant (fixed packing geometry),
@@ -185,8 +334,63 @@ impl Ideogram4Transformer {
         let mut h = (&x + &llm)?;
         h = (h + self.embed_image_indicator.forward(&img_idx)?)?;
 
-        for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, seg_mask.as_ref(), &adaln_input)?;
+        match &self.layers {
+            TransformerLayers::Resident(layers) => {
+                for layer in layers {
+                    if cancel.is_cancelled() {
+                        return Err(candle_gen::candle_core::Error::Msg(
+                            "ideogram: generation canceled".into(),
+                        ));
+                    }
+                    h = layer.forward(
+                        &h,
+                        &cos,
+                        &sin,
+                        seg_mask.as_ref(),
+                        &adaln_input,
+                        attention_budget,
+                    )?;
+                }
+            }
+            TransformerLayers::Streamed(streamed) => {
+                for first in (0..streamed.config.num_layers).step_by(streamed.window_size) {
+                    if cancel.is_cancelled() {
+                        return Err(candle_gen::candle_core::Error::Msg(
+                            "ideogram: generation canceled".into(),
+                        ));
+                    }
+                    let count = streamed.window_size.min(streamed.config.num_layers - first);
+                    let mut window = MaterializedWindow {
+                        layers: Vec::with_capacity(count),
+                        device: streamed.weights.device().clone(),
+                    };
+                    for index in first..first + count {
+                        window.layers.push((
+                            index,
+                            Ideogram4Block::load(
+                                &streamed.weights,
+                                &format!("layers.{index}"),
+                                streamed.config.num_heads,
+                                streamed.config.head_dim,
+                                streamed.config.norm_eps,
+                            )?,
+                        ));
+                    }
+                    install_window_adapters(streamed, &mut window)?;
+                    for (_, layer) in &window.layers {
+                        h = layer.forward(
+                            &h,
+                            &cos,
+                            &sin,
+                            seg_mask.as_ref(),
+                            &adaln_input,
+                            attention_budget,
+                        )?;
+                    }
+                    // The drop guard synchronizes before releasing this window.
+                    drop(window);
+                }
+            }
         }
 
         // Final layer: scale = 1 + adaln(silu(c)); linear(layernorm_no_affine(h) · scale).
@@ -263,6 +467,82 @@ impl Ideogram4Transformer {
         });
         Ok((llm_mask, img_mask, img_idx, cos, sin, seg_mask))
     }
+}
+
+fn adapter_layer_index(name: &str) -> Option<usize> {
+    for marker in ["layers.", "layers_"] {
+        if let Some(rest) = name.split(marker).nth(1) {
+            let digits = rest
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn adapter_targets(path: &Path, window: Option<(usize, usize)>) -> Result<bool> {
+    let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+    Ok(headers
+        .iter()
+        .any(|header| match (window, adapter_layer_index(&header.name)) {
+            (None, None) => true,
+            (Some((first, count)), Some(index)) => (first..first + count).contains(&index),
+            _ => false,
+        }))
+}
+
+fn install_window_adapters(
+    streamed: &StreamedLayers,
+    window: &mut MaterializedWindow,
+) -> Result<()> {
+    let Some(first) = window.layers.first().map(|(first, _)| *first) else {
+        return Ok(());
+    };
+    let count = window.layers.len();
+    let device = window.device.clone();
+    if let Some(path) = streamed
+        .turbo_adapter
+        .as_ref()
+        .filter(|path| adapter_targets(path, Some((first, count))).unwrap_or(true))
+    {
+        crate::adapters::install_turbo_lora_additive_for_visitor(
+            &device,
+            path,
+            crate::config::TURBO_LORA_SCALE,
+            |visitor| {
+                for (index, layer) in &mut window.layers {
+                    layer.visit_adaptable_mut(&format!("layers.{index}"), visitor)?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    let adapters = streamed
+        .user_adapters
+        .iter()
+        .filter(|adapter| adapter_targets(&adapter.path, Some((first, count))).unwrap_or(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !adapters.is_empty() {
+        candle_gen::quant::install_dotted_adapters(
+            "ideogram streamed transformer window",
+            &adapters,
+            &device,
+            |visitor| {
+                for (index, layer) in &mut window.layers {
+                    layer.visit_adaptable_mut(&format!("layers.{index}"), visitor)?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// No-affine LayerNorm over the last dim (computed in f32 for stability, cast back to `x`'s dtype).
@@ -367,5 +647,35 @@ mod tests {
         assert_eq!(at(2, 3), 0.0);
         assert!(at(0, 2).is_infinite() && at(0, 2) < 0.0);
         assert!(at(3, 1).is_infinite() && at(3, 1) < 0.0);
+    }
+
+    #[test]
+    fn streamed_adapter_routing_covers_top_first_middle_and_last_windows() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("adapter.safetensors");
+        let mut tensors = HashMap::new();
+        for name in [
+            "input_proj.lora_A.weight",
+            "layers.0.attention.qkv.lora_A.weight",
+            "layers.16.feed_forward.w1.lora_A.weight",
+            "layers.33.attention.o.lora_A.weight",
+        ] {
+            tensors.insert(
+                name.to_owned(),
+                Tensor::ones((1, 1), DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        assert!(adapter_targets(&path, None).unwrap());
+        assert!(adapter_targets(&path, Some((0, 4))).unwrap());
+        assert!(adapter_targets(&path, Some((16, 4))).unwrap());
+        assert!(adapter_targets(&path, Some((32, 2))).unwrap());
+        assert!(!adapter_targets(&path, Some((4, 4))).unwrap());
+        assert_eq!(
+            adapter_layer_index("lora_unet_layers_33_attention_o"),
+            Some(33)
+        );
     }
 }

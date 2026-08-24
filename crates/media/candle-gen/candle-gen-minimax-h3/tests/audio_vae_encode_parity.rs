@@ -37,7 +37,7 @@
 //! and `logs` peaks around 5 here. The closed form `std == exp(logs)` is checked separately at
 //! [`UNIT_TOL`] on this port's own tensors, where no amplification applies.
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeSet, HashMap};
 

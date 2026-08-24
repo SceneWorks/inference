@@ -7,7 +7,7 @@
 //!
 //! These are exact host/tensor ops → bit-for-bit equality. CPU, no cuda/weights.
 
-mod common;
+use crate::common;
 
 use common::{
     errors, flat_f32, Golden, SHARED_FIXTURE_ASSEMBLY_HEAD_DIM,

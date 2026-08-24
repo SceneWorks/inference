@@ -29,7 +29,7 @@
 //! key a different AdaLN cache. This is also the test that proves the bitwise-linspace claim on
 //! *this* lane rather than inheriting the MLX lane's verification.
 
-mod common;
+use crate::common;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::CancelFlag;

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! set QWEN_IMAGE_SNAPSHOT=C:\Users\…\models--Qwen--Qwen-Image\snapshots\<hash>
-//! cargo test -p candle-gen-qwen-image --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-qwen-image --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 #![cfg(feature = "cuda")]
 
@@ -55,8 +55,8 @@ fn qwen_image_conformance() {
 /// The 2512 snapshot is a multi-tens-of-GB download and is NOT present in CI; run on-device:
 /// ```text
 /// set QWEN_2512_SNAPSHOT=…\models--Qwen--Qwen-Image-2512\snapshots\<hash>
-/// cargo test -p candle-gen-qwen-image --features cuda --release --test conformance \
-///     qwen_image_2512_t2i_smoke -- --ignored --nocapture
+/// cargo test -p candle-gen-qwen-image --features cuda --release --test integration \
+///     conformance::qwen_image_2512_t2i_smoke -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs the Qwen/Qwen-Image-2512 base snapshot (~40 GB) + a CUDA GPU (Phase-B on-device, sc-8246)"]

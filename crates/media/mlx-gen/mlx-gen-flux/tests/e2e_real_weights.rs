@@ -5,7 +5,7 @@
 //! (default schnell) selects the variant for both the dumper and this harness — the golden path,
 //! model id, guidance, mu-shift, and T5 seq-length all follow. Run with:
 //!   FLUX_VARIANT=dev MLX_GEN_FLUX_SNAPSHOT=<matching snapshot> \
-//!     cargo test -p mlx-gen-flux --test e2e_real_weights -- --ignored --nocapture
+//!     cargo test -p mlx-gen-flux --test integration e2e_real_weights:: -- --ignored --nocapture
 //!
 //! Stage tests feed the fork's own intermediates into each Rust stage to isolate it; the final
 //! test drives the public `load(id, spec).generate(req)` API and compares the rendered image to

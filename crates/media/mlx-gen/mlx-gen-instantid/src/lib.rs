@@ -14,6 +14,7 @@
 //! handling and the canonical multi-view landmark sets.
 
 pub mod kps;
+pub mod memory_strategy;
 pub mod model;
 pub mod openpose;
 pub mod restore;

@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set WAN_T2V_14B_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-T2V-A14B-Diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-wan --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-wan --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! The profile is forced to **bf16** (the cheap default is f32; two 14B experts at f32 would be ~56 GB).

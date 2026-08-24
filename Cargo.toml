@@ -45,16 +45,21 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. The pinned rev is 7151a9b2 = a858aaa1 + three tier-3 Apple
-# cross-build fixes (mlx-sys bindgen stops binding the SDK's libc malloc/realloc, which nightly
-# build-std rejects under suspicious_runtime_symbol_definitions; the cross-apple workflow asserts the
-# emitted metallib triples and selects the completed build output). Rust API and MLX core are
+# MLX fork pinned by commit SHA. The pinned rev is bd8f0e3c = 7151a9b2 + the sc-21382 prebuilt
+# seam (build.rs links a prebuilt libmlx from PMETAL_MLX_PREBUILT_DIR after verifying its
+# manifest key, declares rerun-if-env-changed on the deployment target, and the fork's
+# prebuilt-mlx workflow publishes per-commit `prebuilt-<sha12>` releases —
+# scripts/fetch-prebuilt-mlx.sh here consumes them; libmlx bytes are unchanged). 7151a9b2 was
+# a858aaa1 + three tier-3 Apple cross-build fixes (mlx-sys bindgen stops binding the SDK's libc
+# malloc/realloc, which nightly build-std rejects under suspicious_runtime_symbol_definitions;
+# the cross-apple workflow asserts the emitted metallib triples and selects the completed build
+# output). Rust API and MLX core are
 # unchanged from a858aaa1, which adds P3's exact phase-1 epilogues, complete
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "7151a9b27921c6198fd8dfb493dee21db4dcdfcc" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

@@ -12,7 +12,7 @@
 //! reference (`tools/dump_qwen_lightning_golden.py render`) as PPMs for a side-by-side visual check.
 //!
 //! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot + the cached lightx2v Lightning LoRA:
-//!   cargo test -p mlx-gen-qwen-image --release --test lightning_render_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration lightning_render_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
@@ -321,8 +321,8 @@ fn edit_lightning_render_is_coherent() {
 /// Example:
 /// `QWEN_EDIT_REPRO_REF_PPM=/tmp/source_1024_crop.ppm \
 ///  QWEN_EDIT_REPRO_LORA=/path/to/user_lora.safetensors \
-///  cargo test -p mlx-gen-qwen-image --release --test lightning_render_real_weights \
-///    edit_lightning_user_lora_reference_repro -- --ignored --nocapture`
+///  cargo test -p mlx-gen-qwen-image --release --test integration \
+///    lightning_render_real_weights::edit_lightning_user_lora_reference_repro -- --ignored --nocapture`
 #[test]
 #[ignore = "needs real Qwen-Image-Edit-2511 weights, 4-step Lightning LoRA, reference PPM, and user LoRA"]
 fn edit_lightning_user_lora_reference_repro() {

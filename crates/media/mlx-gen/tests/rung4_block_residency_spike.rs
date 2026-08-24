@@ -10,7 +10,7 @@
 //! Env-gated. Point `MLX_GEN_BLOCK_WEIGHTS` at a packed-quantized transformer `.safetensors` whose
 //! blocks are keyed `layers.<n>.…`, then:
 //!   MLX_GEN_BLOCK_WEIGHTS=/path/to/transformer/model.safetensors \
-//!     cargo test -p mlx-gen --release --test rung4_block_residency_spike -- --ignored --nocapture
+//!     cargo test -p mlx-gen --release --test integration rung4_block_residency_spike:: -- --ignored --nocapture
 //!
 //! The path is supplied, never derived: inference does not resolve HF caches itself — the caller owns
 //! artifact resolution and hands down a concrete path. `scripts/check-workspace.py` enforces that.

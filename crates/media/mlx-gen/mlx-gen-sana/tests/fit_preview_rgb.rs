@@ -10,7 +10,7 @@
 //! SANA_PREVIEW_VARIANT=base \
 //! SANA_PREVIEW_SNAPSHOT=/path/to/sana/tier \
 //! SANA_PREVIEW_ARTIFACT_DIR=/path/to/artifacts \
-//!   cargo test --release -p mlx-gen-sana --test fit_preview_rgb -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-sana --test integration fit_preview_rgb:: -- --ignored --nocapture
 //! ```
 
 use std::fmt::Write as _;

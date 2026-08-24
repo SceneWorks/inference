@@ -9,7 +9,7 @@
 //! Two gates: (1) the MoE alone (router + clamped-SwiGLU experts) on a fresh input; (2) the full
 //! decoder layer (RMSNorm + attention + MoE + residuals).
 //!
-//! Run: `cargo test -p mlx-gen-lens --test gptoss_layer_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration gptoss_layer_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};

@@ -1069,6 +1069,10 @@ pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurface
 pub struct MemoryBehaviorFixture {
     pub context: crate::MemoryRunContext,
     pub request: crate::GenerationRequest,
+    /// Exact provider-owned load identity used by executable conformance. `None` reuses the
+    /// catalog's common weights-free spec; providers with route/path-sensitive admission attach a
+    /// synthetic but canonical receipt so their positive control exercises production validation.
+    pub load_spec: Option<LoadSpec>,
 }
 
 impl MemoryBehaviorFixture {
@@ -1121,7 +1125,17 @@ impl MemoryBehaviorFixture {
                 strength: Some(1.0),
             });
         }
-        Self { context, request }
+        Self {
+            context,
+            request,
+            load_spec: None,
+        }
+    }
+
+    /// Bind this positive-control fixture to its provider-owned exact load identity.
+    pub fn with_load_spec(mut self, load_spec: LoadSpec) -> Self {
+        self.load_spec = Some(load_spec);
+        self
     }
 }
 

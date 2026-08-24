@@ -14,7 +14,7 @@
 //!
 //! `#[ignore]` (needs a 128 GB Mac + the snapshots). Run one config per process for clean counters:
 //!   BOOGU_BASE_DIR=<base> [BOOGU_TURBO_DIR=<turbo>] CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-boogu --test quant_profile profile_base_q4 -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration quant_profile::profile_base_q4 -- --ignored --nocapture
 
 use std::path::PathBuf;
 

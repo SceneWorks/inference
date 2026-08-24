@@ -130,6 +130,10 @@ use sha2::{Digest, Sha256};
 /// model-memory calibration matrix.
 pub const MEMORY_CALIBRATION_ABI: u32 = 3;
 
+/// ABI for canonical, load-exact structural evidence used to admit an estimate-backed Resident
+/// route without misrepresenting that estimate as measured calibration.
+pub const MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI: u32 = 1;
+
 /// Current ABI of production-latent tiled-decode quality records.
 ///
 /// This identity is deliberately independent from [`MEMORY_CALIBRATION_ABI`]: decode quality is a
@@ -154,6 +158,9 @@ const MEMORY_DECODE_QUALITY_CANONICAL_FIXTURE_SHA256: &str =
 /// The payload after this prefix is compact JSON. Keeping the version outside the JSON makes mixed
 /// test output cheap to scan without accepting a legacy `SEQ_AB` line by accident.
 pub const MEMORY_EVIDENCE_V1_PREFIX: &str = "MEMORY_EVIDENCE_V1 ";
+/// Wire schema for [`MemoryEvidenceLogRecord`] payloads. The V1 line prefix is retained for log
+/// discovery; version 2 is required because the evidence cell gained family/reference/FPS axes.
+pub const MEMORY_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// The normative least-cost memory-strategy ladder, in selection order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -799,6 +806,30 @@ pub fn adapter_stack_resident_bytes(
     })
 }
 
+/// Exact ordered identity of the load-time adapter stack used by provider request handshakes.
+///
+/// The digest binds every adapter's native path representation, LoRA/LoKr kind, and exact IEEE-754
+/// scale bits. It deliberately does not inspect mutable file contents: callers that require byte
+/// identity must prepare/pin those files separately before constructing the [`AdapterSpec`].
+pub fn adapter_stack_identity(adapters: &[AdapterSpec]) -> Option<String> {
+    if adapters.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"gen-core-adapter-stack-v1");
+    for adapter in adapters {
+        let path = format!("{:?}", adapter.path.as_os_str());
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update([match adapter.kind {
+            crate::AdapterKind::Lora => 0,
+            crate::AdapterKind::Lokr => 1,
+        }]);
+        digest.update(adapter.scale.to_bits().to_le_bytes());
+    }
+    Some(format!("adapters:{:x}", digest.finalize()))
+}
+
 impl MemoryComponentKind {
     pub const fn is_auxiliary(self) -> bool {
         matches!(
@@ -889,6 +920,172 @@ pub struct MemoryAssetFacts {
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
+}
+
+/// Immutable provider-owned facts for a narrowly pinned Resident route.
+///
+/// This is intentionally separate from [`MemoryCalibrationIdentity`]: it proves what was loaded and
+/// how many bytes it contains, but makes no measured-peak claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryStructuralResidentEvidence {
+    pub abi: u32,
+    pub provider_id: String,
+    pub repository: String,
+    pub revision: String,
+    pub variant: String,
+    pub receipt_sha256: String,
+    pub tier: MemoryNumericTier,
+    pub load_shape: LoadShape,
+    pub asset_facts: MemoryAssetFacts,
+    /// Request-scoped bytes needed while adapters are folded. These are not steady overlay bytes.
+    pub request_transient_bytes: u64,
+    pub direct_file_count: u32,
+    pub adapter_count: u32,
+}
+
+/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`].
+///
+/// `source_digest` is an opaque 64-hex digest produced by the caller, so this contract does not
+/// depend on SceneWorks assets or on any particular notion of a "source id". Both SCAIL-2 providers
+/// derive it from the **carrier bytes** of the request (the character image, mask and driving
+/// frames) rather than from an asset identifier; a different provider is free to digest whatever
+/// makes its execution identity exact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryStructuralResidentRequestIdentity {
+    pub source_digest: String,
+    pub mode: String,
+    pub carrier_shape: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub fps: u32,
+    pub reference_count: u32,
+    pub seed: Option<u64>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f32>,
+    pub scheduler_shift: Option<f32>,
+    pub selection: MemorySelection,
+}
+
+impl MemoryStructuralResidentEvidence {
+    pub fn validate(&self) -> Result<()> {
+        if self.abi != MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI
+            || self.provider_id.is_empty()
+            || self.repository.is_empty()
+            || self.revision.is_empty()
+            || self.variant.is_empty()
+            || self.receipt_sha256.len() != 64
+            || !self
+                .receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.asset_facts.base_bytes == 0
+            || self.direct_file_count == 0
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident evidence".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Domain prefix of SCAIL-2's structural Resident receipt.
+    ///
+    /// The domain is a **caller-supplied** parameter of
+    /// [`evidence_revision_in_domain`](Self::evidence_revision_in_domain), not a property of this
+    /// generic contract: the contract itself knows nothing about SCAIL-2. This constant names the
+    /// value SCAIL-2 has always used so the two provider crates keep parsing `parts[0]` unchanged,
+    /// and so a second adopter is forced to mint its own domain rather than share this one.
+    pub const SCAIL2_RESIDENT_EVIDENCE_DOMAIN: &'static str = "scail2-resident-v1";
+
+    /// SCAIL-2's structural Resident receipt — [`Self::evidence_revision_in_domain`] at
+    /// [`Self::SCAIL2_RESIDENT_EVIDENCE_DOMAIN`].
+    pub fn evidence_revision(
+        &self,
+        request: &MemoryStructuralResidentRequestIdentity,
+    ) -> Result<String> {
+        self.evidence_revision_in_domain(Self::SCAIL2_RESIDENT_EVIDENCE_DOMAIN, request)
+    }
+
+    /// Structural Resident receipt for one execution identity, namespaced to `domain`.
+    ///
+    /// `domain` is both the plain-text prefix and a hashed input, so two providers that share this
+    /// contract can never mint the same digest for the same request identity.
+    ///
+    /// Every `Option` knob is **tag-hashed**: a discriminant byte (`0` absent / `1` present)
+    /// precedes the value bytes. Hashing `unwrap_or_default()` instead would collapse `None` onto
+    /// `Some(0)`, `Some(0.0)` and `Some("")` — the same absent-versus-zero collapse the Wan video
+    /// receipt is written to avoid — which would let a request that dropped a knob reuse the
+    /// receipt of a request that set it to zero.
+    pub fn evidence_revision_in_domain(
+        &self,
+        domain: &str,
+        request: &MemoryStructuralResidentRequestIdentity,
+    ) -> Result<String> {
+        self.validate()?;
+        if domain.is_empty() || domain.contains(':') {
+            return Err(Error::Unsupported(
+                "structural Resident evidence domain must be a non-empty colon-free token"
+                    .to_owned(),
+            ));
+        }
+        if request.source_digest.len() != 64
+            || !request
+                .source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Unsupported(
+                "invalid structural Resident source identity".to_owned(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        for value in [
+            domain,
+            self.provider_id.as_str(),
+            self.repository.as_str(),
+            self.revision.as_str(),
+            self.receipt_sha256.as_str(),
+            request.source_digest.as_str(),
+            request.mode.as_str(),
+            request.carrier_shape.as_str(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        // `variant` stays a distinct field rather than joining the loop above: it is part of the
+        // artifact identity, and the loop's `0` separator already keeps neighbours from sliding
+        // into one another.
+        hasher.update(self.variant.as_bytes());
+        hasher.update([0]);
+        for value in [request.sampler.as_deref(), request.scheduler.as_deref()] {
+            hasher.update([u8::from(value.is_some())]);
+            hasher.update(value.unwrap_or_default().as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(request.width.to_le_bytes());
+        hasher.update(request.height.to_le_bytes());
+        hasher.update(request.frames.to_le_bytes());
+        hasher.update(request.fps.to_le_bytes());
+        hasher.update(request.reference_count.to_le_bytes());
+        hasher.update([u8::from(request.seed.is_some())]);
+        hasher.update(request.seed.unwrap_or_default().to_le_bytes());
+        hasher.update([u8::from(request.steps.is_some())]);
+        hasher.update(request.steps.unwrap_or_default().to_le_bytes());
+        for value in [request.guidance, request.scheduler_shift] {
+            hasher.update([u8::from(value.is_some())]);
+            hasher.update(value.unwrap_or_default().to_bits().to_le_bytes());
+        }
+        hasher.update(format!("{:?}", request.selection));
+        Ok(format!(
+            "{domain}:{}:{}:{:x}",
+            self.receipt_sha256,
+            request.source_digest,
+            hasher.finalize()
+        ))
+    }
 }
 
 /// Request-level cache keys must include every axis that can change residency or execution.
@@ -2652,6 +2849,38 @@ pub struct MemoryGeometry {
     pub reference_count: u32,
 }
 
+/// Shape of the reference input consumed by one provider request.
+///
+/// This is intentionally separate from [`MemoryGeometry::reference_count`].  A count says how
+/// many references are present; it does not say whether the provider consumed images, a clip, a
+/// mask, or another conditioning carrier.  Evidence for one carrier must never price another.
+/// `Other` keeps the contract extensible without silently collapsing future shapes into one key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryReferenceShape {
+    None,
+    Image,
+    Video,
+    Mask,
+    Other(String),
+}
+
+impl MemoryReferenceShape {
+    /// Stable spelling at the persisted evidence/protocol boundary.
+    pub fn as_key(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Mask => "mask",
+            Self::Other(shape) => shape,
+        }
+    }
+
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// One deterministic production latent used to judge a tiled-decode policy.
 ///
 /// `production_latent_provenance` names the immutable model revision, prompt fixture, denoise
@@ -3214,14 +3443,21 @@ impl MemoryEvidenceDimensions {
 /// Fully-qualified key for one evidence cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryEvidenceKey {
+    /// Resolved catalog family.  Engines shared by two catalog families must not share evidence.
+    pub model_family: String,
     pub resolved_route: String,
     pub backend: MemoryBackend,
     pub tier: MemoryNumericTier,
     /// Exact intra-phase materialization shape measured by this evidence cell.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
+    /// Carrier shape for the exact number of references in [`Self::geometry`].
+    pub reference_shape: MemoryReferenceShape,
     pub overlay: Option<String>,
     pub geometry: MemoryGeometry,
+    /// Exact output frame rate when the request has temporal output. `None` is the non-temporal
+    /// identity; it is not interchangeable with an arbitrary numeric rate.
+    pub frames_per_second: Option<u32>,
     pub strategy: MemoryStrategy,
     /// Exact, canonically ordered strategy set active when this evidence was measured.
     pub engaged_composition: Vec<MemoryStrategy>,
@@ -3235,6 +3471,27 @@ impl MemoryEvidenceKey {
                 .engaged_composition
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
+    }
+
+    fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.model_family.trim().is_empty() {
+            errors.push("evidence model family must be non-empty".to_owned());
+        }
+        if self.reference_shape.is_none() != (self.geometry.reference_count == 0) {
+            errors.push(
+                "evidence reference shape must be none exactly when reference count is zero"
+                    .to_owned(),
+            );
+        }
+        if matches!(&self.reference_shape, MemoryReferenceShape::Other(shape) if shape.trim().is_empty())
+        {
+            errors.push("evidence other reference shape must be non-empty".to_owned());
+        }
+        if self.frames_per_second == Some(0) {
+            errors.push("evidence frame rate must be positive when present".to_owned());
+        }
+        errors
     }
 }
 
@@ -3331,6 +3588,7 @@ impl MemoryEvidenceLogRecord {
     /// Validate the persisted protocol invariants before emitting a line.
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        errors.extend(self.key.validation_errors());
         if !self.key.has_canonical_engaged_composition() {
             errors.push(
                 "evidence engaged composition must be a non-empty canonical strategy set"
@@ -3440,7 +3698,7 @@ impl MemoryEvidenceLogRecord {
         }
 
         let json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": MEMORY_EVIDENCE_SCHEMA_VERSION,
             "key": evidence_key_json(&self.key),
             "declared_calibration": calibration_identity_json(&self.declared_calibration),
             "observed_calibration": calibration_identity_json(&self.observed_calibration),
@@ -3522,6 +3780,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     serde_json::json!({
+        "model_family": key.model_family,
         "resolved_route": key.resolved_route,
         "backend": key.backend.as_key(),
         "tier": {
@@ -3531,6 +3790,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
         },
         "load_shape": load_shape_key(key.load_shape),
         "mode": key.mode.as_key(),
+        "reference_shape": key.reference_shape.as_key(),
         "overlay": key.overlay,
         "geometry": {
             "width": key.geometry.width,
@@ -3539,6 +3799,7 @@ fn evidence_key_json(key: &MemoryEvidenceKey) -> serde_json::Value {
             "frames": key.geometry.frames,
             "reference_count": key.geometry.reference_count,
         },
+        "frames_per_second": key.frames_per_second,
         "strategy": memory_strategy_key(key.strategy),
         "engaged_composition": key.engaged_composition.iter().copied().map(memory_strategy_key).collect::<Vec<_>>(),
         "parameters": {
@@ -3783,6 +4044,49 @@ mod tests {
             adapter_stack_resident_bytes(&missing, AdapterResidencyMode::Additive),
             None
         );
+    }
+
+    #[test]
+    fn adapter_stack_identity_binds_order_path_kind_and_exact_scale() {
+        let first = AdapterSpec::new(
+            "/adapters/first.safetensors".into(),
+            1.0,
+            crate::AdapterKind::Lora,
+        );
+        let second = AdapterSpec::new(
+            "/adapters/second.safetensors".into(),
+            0.5,
+            crate::AdapterKind::Lokr,
+        );
+        let expected = adapter_stack_identity(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            adapter_stack_identity(&[first.clone(), second.clone()]),
+            Some(expected.clone())
+        );
+        assert_ne!(
+            adapter_stack_identity(&[second.clone(), first.clone()]),
+            Some(expected.clone())
+        );
+
+        let mut changed_path = first.clone();
+        changed_path.path = "/adapters/other.safetensors".into();
+        assert_ne!(
+            adapter_stack_identity(&[changed_path, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_kind = first.clone();
+        changed_kind.kind = crate::AdapterKind::Lokr;
+        assert_ne!(
+            adapter_stack_identity(&[changed_kind, second.clone()]),
+            Some(expected.clone())
+        );
+        let mut changed_scale = first;
+        changed_scale.scale = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert_ne!(
+            adapter_stack_identity(&[changed_scale, second]),
+            Some(expected)
+        );
+        assert_eq!(adapter_stack_identity(&[]), None);
     }
 
     fn mlx_backend() -> MemoryBackendRealization {
@@ -5087,6 +5391,7 @@ mod tests {
         let contract = adopted_contract();
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
@@ -5096,6 +5401,7 @@ mod tests {
                 },
                 load_shape: contract.load_shape,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
@@ -5104,6 +5410,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
@@ -5556,6 +5863,7 @@ mod tests {
         let contract = adopted_contract();
         let mut evidence = MemoryEvidence {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: MemoryNumericTier {
@@ -5565,6 +5873,7 @@ mod tests {
                 },
                 load_shape: contract.load_shape,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 512,
@@ -5573,6 +5882,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::BoundedDecode,
                 engaged_composition: contract.engaged_composition(MemoryStrategy::BoundedDecode),
                 parameters: MemoryStrategyParameters {
@@ -6116,11 +6426,13 @@ mod tests {
             MemoryCalibrationIdentity::new("test-layout-v1", LoadShape::EagerMaterialization);
         MemoryEvidenceLogRecord {
             key: MemoryEvidenceKey {
+                model_family: "test-family".to_owned(),
                 resolved_route: "test_provider".to_owned(),
                 backend: MemoryBackend::Mlx,
                 tier: bf16(),
                 load_shape: LoadShape::EagerMaterialization,
                 mode: MemoryMode::TextToImage,
+                reference_shape: MemoryReferenceShape::None,
                 overlay: None,
                 geometry: MemoryGeometry {
                     width: 1024,
@@ -6129,6 +6441,7 @@ mod tests {
                     frames: 1,
                     reference_count: 0,
                 },
+                frames_per_second: None,
                 strategy: MemoryStrategy::StagedResidency,
                 engaged_composition: vec![
                     MemoryStrategy::Resident,
@@ -6157,9 +6470,12 @@ mod tests {
         assert!(line.starts_with(MEMORY_EVIDENCE_V1_PREFIX));
         let value: serde_json::Value =
             serde_json::from_str(&line[MEMORY_EVIDENCE_V1_PREFIX.len()..]).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], MEMORY_EVIDENCE_SCHEMA_VERSION);
         assert_eq!(value["key"]["backend"], "mlx");
+        assert_eq!(value["key"]["model_family"], "test-family");
         assert_eq!(value["key"]["mode"], "text_to_image");
+        assert_eq!(value["key"]["reference_shape"], "none");
+        assert_eq!(value["key"]["frames_per_second"], serde_json::Value::Null);
         assert_eq!(value["key"]["load_shape"], "eager_materialization");
         assert_eq!(value["key"]["geometry"]["reference_count"], 0);
         assert_eq!(value["key"]["strategy"], "staged_residency");
@@ -6178,6 +6494,22 @@ mod tests {
 
     #[test]
     fn evidence_writer_rejects_identity_revision_and_fingerprint_drift() {
+        let mut record = evidence_log_record();
+        record.key.reference_shape = MemoryReferenceShape::Image;
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("reference shape"));
+
+        let mut record = evidence_log_record();
+        record.key.frames_per_second = Some(0);
+        assert!(record
+            .to_json_line()
+            .unwrap_err()
+            .to_string()
+            .contains("frame rate"));
+
         let mut record = evidence_log_record();
         record.key.engaged_composition = vec![MemoryStrategy::Resident];
         assert!(record
@@ -6235,5 +6567,121 @@ mod tests {
         for valid in ["layout-v1", "sc-16594-layout-v2", "layout-q4-512-v3"] {
             validate_calibration_fingerprint(valid).unwrap();
         }
+    }
+
+    /// sc-20799: the structural Resident receipt is a **generic** contract. Its domain is a caller
+    /// parameter (SCAIL-2's spelling is preserved for its existing parsers), and every optional
+    /// request knob is tag-hashed so an absent knob cannot borrow the receipt of a zero-valued one.
+    #[test]
+    fn structural_resident_receipt_is_domain_scoped_and_separates_absent_from_zero() {
+        let evidence = MemoryStructuralResidentEvidence {
+            abi: MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
+            provider_id: "provider".to_owned(),
+            repository: "org/repo".to_owned(),
+            revision: "f".repeat(40),
+            variant: "q4".to_owned(),
+            receipt_sha256: "a".repeat(64),
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+            load_shape: LoadShape::EagerMaterialization,
+            asset_facts: MemoryAssetFacts {
+                base_bytes: 4,
+                conditioning_bytes: 1,
+                transformer_bytes: 2,
+                decoder_bytes: 1,
+                overlay_bytes: 0,
+            },
+            request_transient_bytes: 0,
+            direct_file_count: 1,
+            adapter_count: 0,
+        };
+        let base = MemoryStructuralResidentRequestIdentity {
+            source_digest: "b".repeat(64),
+            mode: "replacement".to_owned(),
+            carrier_shape: "replacement:reference:16x16:control:16x16x4".to_owned(),
+            width: 832,
+            height: 480,
+            frames: 45,
+            fps: 16,
+            reference_count: 1,
+            seed: None,
+            sampler: None,
+            scheduler: None,
+            steps: None,
+            guidance: None,
+            scheduler_shift: None,
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+        };
+
+        // SCAIL-2's two provider crates parse `parts[0]`; that spelling must not move.
+        let scail2 = evidence.evidence_revision(&base).unwrap();
+        assert_eq!(
+            scail2.split(':').next(),
+            Some(MemoryStructuralResidentEvidence::SCAIL2_RESIDENT_EVIDENCE_DOMAIN)
+        );
+        assert_eq!(
+            scail2,
+            evidence
+                .evidence_revision_in_domain(
+                    MemoryStructuralResidentEvidence::SCAIL2_RESIDENT_EVIDENCE_DOMAIN,
+                    &base
+                )
+                .unwrap()
+        );
+
+        // A second adopter of this generic contract gets a disjoint namespace, digest included.
+        let other = evidence
+            .evidence_revision_in_domain("other-resident-v1", &base)
+            .unwrap();
+        assert_eq!(other.split(':').next(), Some("other-resident-v1"));
+        assert_ne!(
+            scail2.rsplit(':').next(),
+            other.rsplit(':').next(),
+            "the domain must be hashed, not merely prefixed"
+        );
+        for bad in ["", "has:colon"] {
+            assert!(evidence.evidence_revision_in_domain(bad, &base).is_err());
+        }
+
+        // Absent must never collide with the zero/empty value of the same knob.
+        let mut digests = vec![scail2.clone()];
+        type Cross = Box<dyn Fn(&mut MemoryStructuralResidentRequestIdentity)>;
+        let mutations: Vec<Cross> = vec![
+            Box::new(|request| request.seed = Some(0)),
+            Box::new(|request| request.steps = Some(0)),
+            Box::new(|request| request.guidance = Some(0.0)),
+            Box::new(|request| request.scheduler_shift = Some(0.0)),
+            Box::new(|request| request.sampler = Some(String::new())),
+            Box::new(|request| request.scheduler = Some(String::new())),
+        ];
+        for mutate in &mutations {
+            let mut crossed = base.clone();
+            mutate(&mut crossed);
+            digests.push(evidence.evidence_revision(&crossed).unwrap());
+        }
+        let unique = digests.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            digests.len(),
+            "an absent knob shares a receipt with its zero/empty value"
+        );
+
+        // A neighbouring-field slide must not be reachable either: moving a character from the mode
+        // into the carrier shape has to change the digest.
+        let mut slid = base.clone();
+        slid.mode = "replacemen".to_owned();
+        slid.carrier_shape = format!("t{}", base.carrier_shape);
+        assert_ne!(scail2, evidence.evidence_revision(&slid).unwrap());
     }
 }

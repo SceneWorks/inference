@@ -23,6 +23,7 @@
 pub mod adapters;
 pub mod config;
 pub mod loader;
+mod memory_strategy;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
@@ -46,6 +47,24 @@ pub use adapters::TurboLoraReport;
 /// literal.
 pub use config::SIZE_MULTIPLE;
 
+/// Release a component only after the backend fence succeeds. On a failed fence the allocation is
+/// intentionally retained because queued device work may still reference it.
+pub(crate) fn synchronized_release<T, E>(
+    component: T,
+    synchronize: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    match synchronize() {
+        Ok(()) => {
+            drop(component);
+            Ok(())
+        }
+        Err(error) => {
+            std::mem::forget(component);
+            Err(error)
+        }
+    }
+}
+
 use config::{MODEL_ID, MODEL_ID_TURBO, RES_MAX, RES_MIN};
 use pipeline::Components;
 
@@ -62,6 +81,10 @@ pub struct Ideogram4Generator {
     pid_spec: Option<PidWeights>,
     adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Arc<Components>>>,
+    lifecycle: Mutex<()>,
+    memory_contract: gen_core::MemoryProviderContract,
+    load_receipt: Option<memory_strategy::IdeogramLoadReceipt>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 impl Ideogram4Generator {
@@ -90,6 +113,81 @@ impl Ideogram4Generator {
 impl Generator for Ideogram4Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        if let Some(receipt) = &self.load_receipt {
+            if let Err(error) = receipt.ensure_unchanged() {
+                self.memory_admission.clear_approval();
+                return gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                };
+            }
+        }
+        match memory_strategy::validate_context(
+            self.descriptor.id,
+            &self.memory_contract,
+            context,
+            self.load_receipt
+                .as_ref()
+                .map(|receipt| receipt.route.tier)
+                .unwrap_or_else(
+                    || match self.root.file_name().and_then(|name| name.to_str()) {
+                        Some("q4") => Some(Quant::Q4),
+                        Some("q8") => Some(Quant::Q8),
+                        _ => None,
+                    },
+                ),
+        ) {
+            Ok(()) => match self.memory_admission.approve(context) {
+                Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                Err(error) => gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                },
+            },
+            Err(error) => {
+                self.memory_admission.clear_approval();
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
+        let tier = self
+            .load_receipt
+            .as_ref()
+            .map(|receipt| receipt.route.tier)
+            .unwrap_or(None);
+        memory_strategy::validate_context(
+            self.descriptor.id,
+            &self.memory_contract,
+            context,
+            tier,
+        )?;
+        Ok(Some(Box::new(
+            memory_strategy::IdeogramMemoryScope::new_bound(
+                self.descriptor.id,
+                self.device.clone(),
+                &self.memory_contract,
+                context,
+                self.memory_admission.clone(),
+            )?,
+        )))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -140,8 +238,30 @@ impl Generator for Ideogram4Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let comps = self.components()?;
-        let images = pipeline::render(&comps, req, &self.device, on_progress)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
+        let memory = req.memory.unwrap_or_default();
+        let images = if memory.stage_residency {
+            if let Some(warm) = candle_gen::lock_recover(&self.components).take() {
+                synchronized_release(warm, || self.device.synchronize())
+                    .map_err(gen_core::Error::backend)?;
+            }
+            pipeline::render_staged(
+                &self.root,
+                self.turbo,
+                self.pid_spec.as_ref(),
+                &self.adapters,
+                req,
+                &self.device,
+                on_progress,
+            )?
+        } else {
+            let comps = self.components()?;
+            pipeline::render(&comps, req, &self.device, on_progress)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -199,6 +319,7 @@ fn build(
     descriptor: ModelDescriptor,
     turbo: bool,
 ) -> gen_core::Result<Box<dyn Generator>> {
+    let provider_id = descriptor.id;
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -228,6 +349,23 @@ fn build(
         )));
     }
     let device = candle_gen::default_device()?;
+    let (load_receipt, memory_contract) =
+        match memory_strategy::IdeogramLoadReceipt::capture(provider_id, spec) {
+            Ok(receipt) => {
+                let contract = memory_strategy::contract_from_receipt(provider_id, spec, &receipt);
+                (Some(receipt), contract)
+            }
+            #[cfg(test)]
+            Err(_) if !root.exists() => {
+                let mut fixture_spec = spec.clone();
+                fixture_spec.resolved_route = Some(provider_id.to_owned());
+                (
+                    None,
+                    memory_strategy::uncalibrated_contract(provider_id, &fixture_spec)?,
+                )
+            }
+            Err(error) => return Err(error),
+        };
     Ok(Box::new(Ideogram4Generator {
         descriptor,
         root,
@@ -239,6 +377,10 @@ fn build(
         pid_spec: spec.pid.clone(),
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        memory_contract,
+        load_receipt,
+        memory_admission: memory_strategy::AdmissionRegistry::new(provider_id),
     }))
 }
 
@@ -265,9 +407,104 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(QUALITY_REGISTRATION)
-        .register_generator(TURBO_REGISTRATION)
+        .register_generator(TURBO_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_memory_behavior(QUALITY_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+}
+
+fn quality_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(MODEL_ID, spec)
+}
+
+fn turbo_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::provider_contract(MODEL_ID_TURBO, spec)
+}
+
+fn quality_weights_free_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_contract(MODEL_ID, spec)
+}
+
+fn turbo_weights_free_contract(
+    spec: &LoadSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_contract(MODEL_ID_TURBO, spec)
+}
+
+fn quality_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(MODEL_ID, surface)
+}
+
+fn turbo_surface_contract(
+    surface: &gen_core::MemoryContractSurfaceSpec,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    memory_strategy::weights_free_surface_contract(MODEL_ID_TURBO, surface)
+}
+
+const QUALITY_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID,
+    contract: quality_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: MODEL_ID_TURBO,
+    contract: turbo_memory_contract,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+const QUALITY_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(MODEL_ID, spec, contract, context)
+        },
+    };
+
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: MODEL_ID_TURBO,
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: |spec, contract, context| {
+            memory_strategy::registered_begin_request(MODEL_ID_TURBO, spec, contract, context)
+        },
+    };
+
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(QUALITY_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: quality_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: quality_surface_contract,
+            },
+        )
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID_TURBO,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: turbo_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID_TURBO,
+                contract: turbo_surface_contract,
+            },
+        )
 }
 
 /// Build the complete explicit Candle Ideogram provider catalog.
@@ -287,12 +524,64 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit, ["ideogram_4", "ideogram_4_turbo"]);
     }
+
+    /// The registry-level memory lifecycle seams must be reachable on a build with no CUDA
+    /// feature: building the provider catalog is contract-only (no device, no weights), so
+    /// `register_providers` publishes the memory-strategy, weights-free contract-fixture and
+    /// memory-behavior rows on every platform. Gating these behind `cuda` left registry
+    /// lifecycle conformance running on no CPU CI configuration at all.
+    #[test]
+    fn register_providers_publishes_memory_lifecycle_seams_without_cuda() {
+        let registry = super::provider_registry().unwrap();
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(strategies, ["ideogram_4", "ideogram_4_turbo"]);
+        assert_eq!(fixtures, ["ideogram_4", "ideogram_4_turbo"]);
+        assert_eq!(behaviors, ["ideogram_4", "ideogram_4_turbo"]);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn synchronized_release_drops_after_success_and_retains_after_failed_fence() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        synchronized_release(DropProbe(Arc::clone(&dropped)), || Ok::<_, ()>(())).unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+        let error = synchronized_release(DropProbe(Arc::clone(&dropped)), || Err::<(), _>("fence"))
+            .expect_err("failed synchronization must surface");
+        assert_eq!(error, "fence");
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "in-flight storage must be retained rather than dropped"
+        );
+    }
 
     #[test]
     fn registers_both_ids_as_candle() {
@@ -477,9 +766,26 @@ mod tests {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let file = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         assert!(load(&file).is_err());
-        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
-            AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
-        ]);
+        // `/snap` exists on Ubuntu hosts, which accidentally turns this weights-free loader
+        // fixture into a physical-receipt probe. Use a guaranteed-missing path with the exact
+        // Ideogram bf16 repository/revision/tier and provider identity instead.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(format!(
+                "models--SceneWorks--{}",
+                memory_strategy::BF16_REPOSITORY
+            ))
+            .join("snapshots")
+            .join(memory_strategy::BF16_REVISION)
+            .join("bf16");
+        let lora = LoadSpec::new(WeightsSource::Dir(root))
+            .with_resolved_route(MODEL_ID)
+            .with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
         assert!(load(&lora).is_ok());
     }
 }

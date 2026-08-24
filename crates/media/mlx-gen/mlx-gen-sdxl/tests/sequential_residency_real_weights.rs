@@ -1,7 +1,7 @@
 //! sc-10839 (epic 10834 Phase 1): the `Sequential` component-residency A/B on real SDXL weights.
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot (`SDXL_SNAPSHOT`, else the HF cache). Run:
-//!   cargo test -p mlx-gen-sdxl --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Proves the epic's two claims for the image lane:
 //!
@@ -19,7 +19,7 @@
 //! Optional: set `SDXL_SEQ_Q8=1` to run the epic table's `illustrious q8`-class case (Q8 weights),
 //! and `SDXL_SEQ_STEPS` / `SDXL_SEQ_SIZE` to tune the (quality-irrelevant) probe generation.
 
-mod common;
+use crate::common;
 
 use common::snapshot;
 use mlx_gen::{

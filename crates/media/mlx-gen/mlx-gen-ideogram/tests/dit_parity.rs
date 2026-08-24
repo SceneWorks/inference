@@ -5,7 +5,7 @@
 //!
 //! `#[ignore]` — needs the converted snapshot + the golden (`tools/dump_ideogram4_dit_golden.py`):
 //!   CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
-//!     cargo test -p mlx-gen-ideogram --test dit_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration dit_parity:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 
