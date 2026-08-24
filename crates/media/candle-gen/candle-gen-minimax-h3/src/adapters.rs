@@ -31,7 +31,7 @@
 //!   or dense, and the residual composes over either without asking which. So a tier-selected branch
 //!   would now be reachable *and* still pointless.
 //!
-//! # Key space: **diffusers**, plus a converted ComfyUI (sc-19443)
+//! # Key spaces: Diffusers/PEFT, ComfyUI, and the exact MiniMax-H3 trainer namespace
 //!
 //! `lightx2v/Minimax-h3-Turbo` publishes each adapter twice. The **diffusers** export is the native
 //! key space:
@@ -101,6 +101,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::weightsmeta::{
+    is_minimax_h3_trainer_key_space, parse_minimax_h3_trainer_key,
+    validate_minimax_h3_trainer_layout, MiniMaxH3TrainerLayout, MiniMaxH3TrainerRole,
+    MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
+};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::LoraAdapterMeta;
 use candle_gen::train::merge::{read_adapter, read_scalar};
@@ -172,7 +177,7 @@ pub const SUFFIXES: [(&str, Role); 9] = [
 ];
 
 /// Outcome of applying the MiniMax-H3 adapter specs.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct MiniMaxH3LoraReport {
     /// Target modules that received a residual.
     pub applied: usize,
@@ -182,6 +187,14 @@ pub struct MiniMaxH3LoraReport {
     /// How many of the applied specs arrived in the ComfyUI key space and were converted
     /// (sc-19443). Zero for every published diffusers file.
     pub converted_from_comfyui: usize,
+    /// How many specs arrived in the exact `networks.lora_minimax_h3` trainer namespace.
+    pub converted_from_trainer: usize,
+    /// Source trainer targets applied before fused QKV expands into q/k/v runtime modules.
+    pub trainer_source_targets_applied: usize,
+    /// Distinct source factor ranks observed across trainer adapters, sorted for stable receipts.
+    pub trainer_ranks: Vec<usize>,
+    /// Distinct per-target alphas observed across trainer adapters, sorted for stable receipts.
+    pub trainer_alphas: Vec<f32>,
 }
 
 /// Every module path a MiniMax-H3 adapter can address, at `cfg`'s geometry: `num_layers`
@@ -477,9 +490,11 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 /// The container prefix is normalized too (`blocks.{i}` → `transformer_blocks.{i}`), leaving an
 /// export that already spells the trunk or the refiner the diffusers way alone.
 ///
-/// **What this does not do.** It does not claim any *other* key space. A kohya (`lora_unet_`) or BFL
-/// export still reaches the strict install and fails there, loudly, naming the paths that matched no
-/// module — never a partial fold.
+/// **What this does not do.** It does not claim any *other* key space. The exact
+/// `networks.lora_minimax_h3` / `lora_unet_blocks_*` trainer namespace is converted by
+/// [`convert_minimax_h3_trainer_key_space`]; any other kohya (`lora_unet_`) or BFL export still
+/// reaches the strict install and fails there, loudly, naming paths that matched no module — never
+/// a partial fold.
 pub fn convert_comfyui_key_space(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
@@ -628,6 +643,68 @@ pub fn convert_comfyui_key_space(
     Ok(converted)
 }
 
+/// Convert the exact `networks.lora_minimax_h3` / `lora_unet_blocks_*` trainer namespace through
+/// the same raw-module conversion used by ComfyUI. The shared contract validates the complete
+/// 50×4 census and geometry first; this backend only materializes the key rewrite and tensors.
+pub fn convert_minimax_h3_trainer_key_space(
+    tensors: &HashMap<String, Tensor>,
+    meta: &HashMap<String, String>,
+) -> Result<(HashMap<String, Tensor>, MiniMaxH3TrainerLayout, Vec<f32>)> {
+    let entries = tensors
+        .iter()
+        .map(|(key, tensor)| (key.clone(), tensor.dims().to_vec()))
+        .collect::<Vec<_>>();
+    let layout = validate_minimax_h3_trainer_layout(
+        entries,
+        meta.get("ss_network_module").map(String::as_str),
+        meta.get(MINIMAX_H3_TOKEN_REFINER_METADATA_KEY)
+            .map(String::as_str),
+    )
+    .map_err(|error| CandleError::Msg(format!("minimax_h3 trainer adapter: {error}")))?;
+
+    let (raw, alphas) = unflatten_minimax_h3_trainer_tensors(tensors)?;
+    Ok((convert_comfyui_key_space(&raw, meta)?, layout, alphas))
+}
+
+/// Rewrite already-validated trainer tensor names into the dotted raw-module intermediate. Kept
+/// public for weights-light numerical fixtures; production always calls it through
+/// [`convert_minimax_h3_trainer_key_space`], after the complete layout validator.
+#[doc(hidden)]
+pub fn unflatten_minimax_h3_trainer_tensors(
+    tensors: &HashMap<String, Tensor>,
+) -> Result<(HashMap<String, Tensor>, Vec<f32>)> {
+    let mut raw = HashMap::with_capacity(tensors.len());
+    let mut alphas = Vec::new();
+    for (key, tensor) in tensors {
+        let parsed = parse_minimax_h3_trainer_key(key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax_h3 trainer adapter: unsupported or malformed tensor {key:?}"
+            ))
+        })?;
+        if parsed.role == MiniMaxH3TrainerRole::Alpha {
+            let alpha = read_scalar(key, "alpha", tensor)?;
+            if !alpha.is_finite() {
+                return Err(CandleError::Msg(format!(
+                    "minimax_h3 adapter '{key}': .alpha {alpha} is not finite"
+                )));
+            }
+            alphas.push(alpha);
+        }
+        raw.insert(
+            format!(
+                "blocks.{}.{}{}",
+                parsed.block,
+                parsed.leaf.dotted(),
+                parsed.role.dotted_suffix()
+            ),
+            tensor.clone(),
+        );
+    }
+    alphas.sort_by(f32::total_cmp);
+    alphas.dedup_by(|left, right| *left == *right);
+    Ok((raw, alphas))
+}
+
 /// The three parts of one fused `attn.qkv_proj` module, collected before the split.
 #[derive(Default)]
 struct FusedQkv {
@@ -764,8 +841,26 @@ pub fn apply_minimax_h3_adapters(
                 spec.path.display()
             )));
         }
-        let comfy = is_comfyui_key_space(af.tensors.keys().map(String::as_str));
-        let tensors = if comfy {
+        let trainer = is_minimax_h3_trainer_key_space(
+            af.tensors.keys().map(String::as_str),
+            af.meta.get("ss_network_module").map(String::as_str),
+        );
+        let comfy = !trainer && is_comfyui_key_space(af.tensors.keys().map(String::as_str));
+        let tensors = if trainer {
+            let (converted, layout, alphas) =
+                convert_minimax_h3_trainer_key_space(&af.tensors, &af.meta)?;
+            if is_comfyui_key_space(converted.keys().map(String::as_str)) {
+                return Err(CandleError::Msg(format!(
+                    "minimax_h3 adapter {}: the trainer conversion left a fused or unrenamed module behind",
+                    spec.path.display()
+                )));
+            }
+            report.converted_from_trainer += 1;
+            report.trainer_source_targets_applied += layout.source_targets;
+            report.trainer_ranks.extend(layout.ranks);
+            report.trainer_alphas.extend(alphas);
+            converted
+        } else if comfy {
             // `af.meta` is the ORIGINAL file's header: the converted map is rebuilt key by key and
             // carries no metadata of its own, so the alpha the conversion divides has to come from
             // the file the user supplied.
@@ -789,7 +884,7 @@ pub fn apply_minimax_h3_adapters(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
                  `.lora_A.default.weight` / `.lora_B.default.weight`), or a ComfyUI export this \
-                 lane can convert",
+                 lane can convert, or the exact `networks.lora_minimax_h3` trainer namespace",
                 spec.path.display()
             )));
         }
@@ -802,6 +897,12 @@ pub fn apply_minimax_h3_adapters(
             report.unmatched_paths
         )));
     }
+    report.trainer_ranks.sort_unstable();
+    report.trainer_ranks.dedup();
+    report.trainer_alphas.sort_by(f32::total_cmp);
+    report
+        .trainer_alphas
+        .dedup_by(|left, right| *left == *right);
     Ok(report)
 }
 

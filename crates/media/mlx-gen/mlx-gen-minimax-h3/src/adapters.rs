@@ -7,7 +7,7 @@
 //! turbo LoRA at the same strength the `bf16` one does. Quant tier is a creative choice in this
 //! product, so an adapter whose result varied with it would be a real defect.
 //!
-//! # Key space: **diffusers**, and only diffusers
+//! # Key spaces: Diffusers/PEFT, ComfyUI, and the exact MiniMax-H3 trainer namespace
 //!
 //! `lightx2v/Minimax-h3-Turbo` publishes each adapter twice. The **diffusers** export is the one this
 //! crate consumes:
@@ -100,7 +100,11 @@ use mlx_rs::Array;
 use mlx_gen::adapters::loader::{apply_lokr, is_lokr, is_lokr_keys, ApplyReport};
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
+use mlx_gen::gen_core::weightsmeta::{
+    classify_minimax_h3_trainer_namespace, parse_minimax_h3_trainer_key,
+    validate_minimax_h3_trainer_layout, LoraAdapterMeta, MiniMaxH3TrainerLayout,
+    MiniMaxH3TrainerRole, LORA_ADAPTER_METADATA_KEY, MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
+};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::{to_f32, Weights};
 use mlx_gen::{Error, Result};
@@ -174,7 +178,7 @@ pub const BLOCK_TARGETS: [&str; 6] = [
 ];
 
 /// Outcome of applying the MiniMax-H3 adapter specs.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct MiniMaxH3LoraReport {
     /// Target modules that received a residual.
     pub applied: usize,
@@ -184,6 +188,14 @@ pub struct MiniMaxH3LoraReport {
     /// How many specs arrived in the ComfyUI key space and were converted (sc-19443). Zero for
     /// every published diffusers file.
     pub converted_from_comfyui: usize,
+    /// How many specs arrived in the exact `networks.lora_minimax_h3` trainer namespace.
+    pub converted_from_trainer: usize,
+    /// Source trainer targets applied before fused QKV expands into q/k/v runtime modules.
+    pub trainer_source_targets_applied: usize,
+    /// Distinct source factor ranks observed across trainer adapters, sorted for stable receipts.
+    pub trainer_ranks: Vec<usize>,
+    /// Distinct per-target alphas observed across trainer adapters, sorted for stable receipts.
+    pub trainer_alphas: Vec<f32>,
 }
 
 /// Every module path a MiniMax-H3 adapter can address, at `cfg`'s geometry: `num_layers` transformer
@@ -466,8 +478,10 @@ fn is_block_diagonal(up: &Array, out: i32, r: i32) -> Result<bool> {
 /// and every converted qkv target carries its own explicit `.alpha`, which wins over that file-level
 /// value at the install and is the only thing keeping the split-adjusted number reachable.
 ///
-/// **What this does not do.** It does not claim any *other* key space. A kohya (`lora_unet_`) or BFL
-/// export still reaches the strict install and fails there, loudly.
+/// **What this does not do.** It does not claim any *other* key space. The exact
+/// `networks.lora_minimax_h3` / `lora_unet_blocks_*` trainer namespace is converted by
+/// [`convert_minimax_h3_trainer_key_space`]; any other kohya (`lora_unet_`) or BFL export still
+/// reaches the strict install and fails there, loudly.
 pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
     // The file-level alpha sources, resolved ONCE, off the ORIGINAL header — `w` is the file the
     // user supplied, so the conversion needs no second parameter to reach them. `resolve_alpha`
@@ -604,6 +618,73 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
     Ok(converted)
 }
 
+/// Convert the exact `networks.lora_minimax_h3` / `lora_unet_blocks_*` trainer namespace through
+/// the same raw-module conversion used by ComfyUI. The shared contract validates the complete
+/// 50×4 census and geometry first; this backend only materializes the key rewrite and tensors.
+pub fn convert_minimax_h3_trainer_key_space(
+    w: &Weights,
+) -> Result<(Weights, MiniMaxH3TrainerLayout, Vec<f32>)> {
+    let keys = w.keys().map(str::to_string).collect::<Vec<_>>();
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let tensor = w.require(key)?;
+        let shape = tensor
+            .shape()
+            .iter()
+            .map(|&dim| {
+                usize::try_from(dim).map_err(|_| {
+                    Error::Msg(format!(
+                        "minimax_h3 trainer tensor {key:?} has a negative dimension {dim}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.push((key.clone(), shape));
+    }
+    let layout = validate_minimax_h3_trainer_layout(
+        entries,
+        w.metadata("ss_network_module"),
+        w.metadata(MINIMAX_H3_TOKEN_REFINER_METADATA_KEY),
+    )
+    .map_err(|error| Error::Msg(format!("minimax_h3 trainer adapter: {error}")))?;
+
+    let (raw, alphas) = unflatten_minimax_h3_trainer_tensors(w)?;
+    Ok((convert_comfyui_key_space(&raw)?, layout, alphas))
+}
+
+/// Rewrite already-validated trainer tensor names into the dotted raw-module intermediate. Kept
+/// public for weights-light numerical fixtures; production always calls it through
+/// [`convert_minimax_h3_trainer_key_space`], after the complete layout validator.
+#[doc(hidden)]
+pub fn unflatten_minimax_h3_trainer_tensors(w: &Weights) -> Result<(Weights, Vec<f32>)> {
+    let keys = w.keys().map(str::to_string).collect::<Vec<_>>();
+    let mut raw = Weights::empty();
+    let mut alphas = Vec::new();
+    for key in keys {
+        let parsed = parse_minimax_h3_trainer_key(&key).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax_h3 trainer adapter: unsupported or malformed tensor {key:?}"
+            ))
+        })?;
+        let tensor = w.require(&key)?.clone();
+        if parsed.role == MiniMaxH3TrainerRole::Alpha {
+            alphas.push(read_alpha_tensor(&key, &tensor)?);
+        }
+        raw.insert(
+            format!(
+                "blocks.{}.{}{}",
+                parsed.block,
+                parsed.leaf.dotted(),
+                parsed.role.dotted_suffix()
+            ),
+            tensor,
+        );
+    }
+    alphas.sort_by(f32::total_cmp);
+    alphas.dedup_by(|left, right| *left == *right);
+    Ok((raw, alphas))
+}
+
 /// The three parts of one fused `attn.qkv_proj` module, collected before the split.
 #[derive(Default)]
 struct FusedQkv {
@@ -623,11 +704,18 @@ struct LoraParts {
 /// Read a scalar `.alpha` tensor as f32 regardless of its on-disk dtype (real files ship it f32 or
 /// bf16; a direct `as_slice::<f32>()` would panic on a mismatch). `[]`- and `[1]`-shaped both read.
 fn read_alpha_tensor(path: &str, a: &Array) -> Result<f32> {
-    a.as_dtype(mlx_rs::Dtype::Float32)?
+    let alpha = a
+        .as_dtype(mlx_rs::Dtype::Float32)?
         .as_slice::<f32>()
         .first()
         .copied()
-        .ok_or_else(|| Error::Msg(format!("minimax_h3 adapter '{path}': empty .alpha tensor")))
+        .ok_or_else(|| Error::Msg(format!("minimax_h3 adapter '{path}': empty .alpha tensor")))?;
+    if !alpha.is_finite() {
+        return Err(Error::Msg(format!(
+            "minimax_h3 adapter '{path}': .alpha {alpha} is not finite"
+        )));
+    }
+    Ok(alpha)
 }
 
 /// Install one diffusers-key-space LoRA file's residuals onto `host` at `spec.scale`.
@@ -746,11 +834,12 @@ fn apply_one_lora(
 /// nor an `unmatched_path`, so only a per-spec check can see it. Downstream, the aggregate form
 /// reaches a user as "my second LoRA did nothing, and there was no error".
 ///
-/// Routing is by the **file**, not by
-/// `spec.kind`: a genuine LoKr (`networkType=lokr`, or bare `lokr_*` keys) goes to the shared
-/// LyCORIS seam, and everything else goes to the diffusers LoRA path above. That ordering is what
-/// keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an `alpha` string and no
-/// `networkType`, so classifying them as LoKr would fold them 128× too strong.
+/// Routing is by the **file**, not by `spec.kind`. An exact H3 trainer claim is classified before
+/// the generic LoKr predicate so trainer keys cannot be ignored by adding one valid `lokr_*`
+/// factor; a mixed claim is rejected. A genuine standalone LoKr (`networkType=lokr`, or bare
+/// `lokr_*` keys) then goes to the shared LyCORIS seam, and everything else goes to the diffusers
+/// LoRA path above. This also keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an
+/// `alpha` string and no `networkType`, so classifying them as LoKr would fold them 128× too strong.
 pub fn apply_minimax_h3_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -759,11 +848,52 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let w = Weights::from_file(&spec.path)?;
+        let trainer = classify_minimax_h3_trainer_namespace(
+            w.keys(),
+            w.metadata("ss_network_module"),
+            w.metadata("networkType"),
+        )
+        .map_err(|error| {
+            Error::Msg(format!(
+                "minimax_h3 adapter {}: {error}",
+                spec.path.display()
+            ))
+        })?;
+        let lokr = is_lokr(&w) || is_lokr_keys(&w);
+        if lokr {
+            let ApplyReport {
+                applied,
+                unmatched_paths,
+                ..
+            } = apply_lokr(host, &w, spec.scale)?;
+            report.applied += applied;
+            report.unmatched_paths.extend(unmatched_paths);
+            if report.applied == before {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter {}: no target modules matched in this file",
+                    spec.path.display()
+                )));
+            }
+            continue;
+        }
         // sc-19443: a `_comfyui_` export is CONVERTED, not refused. Folding it un-converted would
         // be shape-valid and numerically wrong (the sc-18740 class), so the conversion — and its
         // re-check below — is what stands between the user and a silently corrupt render.
-        let comfy = is_comfyui_key_space(&w);
-        let converted = if comfy {
+        let comfy = !trainer && is_comfyui_key_space(&w);
+        let converted = if trainer {
+            let (converted, layout, alphas) = convert_minimax_h3_trainer_key_space(&w)?;
+            if is_comfyui_key_space(&converted) {
+                return Err(Error::Msg(format!(
+                    "minimax_h3 adapter {}: the trainer conversion left a fused or unrenamed module behind",
+                    spec.path.display()
+                )));
+            }
+            report.converted_from_trainer += 1;
+            report.trainer_source_targets_applied += layout.source_targets;
+            report.trainer_ranks.extend(layout.ranks);
+            report.trainer_alphas.extend(alphas);
+            Some(converted)
+        } else if comfy {
             let c = convert_comfyui_key_space(&w)?;
             if is_comfyui_key_space(&c) {
                 return Err(Error::Msg(format!(
@@ -778,31 +908,22 @@ pub fn apply_minimax_h3_adapters(
             None
         };
         let factors = converted.as_ref().unwrap_or(&w);
-        if is_lokr(&w) || is_lokr_keys(&w) {
-            let ApplyReport {
-                applied,
-                unmatched_paths,
-                ..
-            } = apply_lokr(host, &w, spec.scale)?;
-            report.applied += applied;
-            report.unmatched_paths.extend(unmatched_paths);
-        } else {
-            if spec.kind == AdapterKind::Lokr {
-                return Err(Error::Msg(format!(
-                    "minimax_h3 adapter {}: declared LoKr but the file carries no `lokr_*` factors \
-                     and no `networkType=lokr` stamp",
-                    spec.path.display()
-                )));
-            }
-            apply_one_lora(host, factors, &w, spec, &mut report)?;
+        if spec.kind == AdapterKind::Lokr {
+            return Err(Error::Msg(format!(
+                "minimax_h3 adapter {}: declared LoKr but the file carries no `lokr_*` factors \
+                 and no `networkType=lokr` stamp",
+                spec.path.display()
+            )));
         }
+        apply_one_lora(host, factors, &w, spec, &mut report)?;
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something. See the
         // doc comment — an aggregate check passes a junk file riding alongside a good one.
         if report.applied == before {
             return Err(Error::Msg(format!(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
-                 `.lora_A.default.weight` / `.lora_B.default.weight`)",
+                 `.lora_A.default.weight` / `.lora_B.default.weight`), ComfyUI, or the exact \
+                 `networks.lora_minimax_h3` trainer namespace",
                 spec.path.display()
             )));
         }
@@ -815,6 +936,12 @@ pub fn apply_minimax_h3_adapters(
             report.unmatched_paths
         )));
     }
+    report.trainer_ranks.sort_unstable();
+    report.trainer_ranks.dedup();
+    report.trainer_alphas.sort_by(f32::total_cmp);
+    report
+        .trainer_alphas
+        .dedup_by(|left, right| *left == *right);
     Ok(report)
 }
 
