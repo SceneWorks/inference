@@ -125,14 +125,6 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
 pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<ProviderRegistry> {
     let registry = register_providers(ProviderRegistryBuilder::new());
     #[cfg(not(feature = "cuda"))]
-    let registry = candle_gen_anima::register_memory_contract_surfaces(registry);
-    #[cfg(not(feature = "cuda"))]
-    let registry = candle_gen_boogu::register_memory_contract_surfaces(registry);
-    #[cfg(not(feature = "cuda"))]
-    let registry = candle_gen_chroma::register_memory_contract_surfaces(registry);
-    #[cfg(not(feature = "cuda"))]
-    let registry = candle_gen_ideogram::register_memory_contract_surfaces(registry);
-    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_flux2::register_memory_contract_surfaces(registry);
@@ -148,8 +140,6 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
-    #[cfg(not(feature = "cuda"))]
-    let registry = candle_gen_sd3::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
@@ -3429,6 +3419,12 @@ mod preview_advertising {
             resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
+            dir: "candle-gen-kolors",
+            register_providers: candle_gen_kolors::register_providers,
+            register_surfaces: Some(candle_gen_kolors::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-krea",
             register_providers: candle_gen_krea::register_providers,
             register_surfaces: Some(candle_gen_krea::register_memory_contract_surfaces),
@@ -3462,6 +3458,12 @@ mod preview_advertising {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sana",
+            register_providers: candle_gen_sana::register_providers,
+            register_surfaces: Some(candle_gen_sana::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
         MemoryRouteCrate {

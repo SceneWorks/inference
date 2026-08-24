@@ -336,9 +336,49 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION);
+    // Unconditional (no `cfg(feature = "cuda")`): the memory seams below construct on any platform
+    // and open no device, so a selector can price Kolors before load on CPU catalogs too.
+    register_memory_contract_surfaces(registry)
+}
+
+/// Register every Kolors memory route's weights-free contract and behavior surface.
+///
+/// Three routes, two shapes. The registered `kolors` generator takes an ordinary
+/// `register_memory_strategy`. The bespoke IP-Adapter and strict-pose compositions are assembled
+/// from typed path structs by the worker and have no generator descriptor, so they take
+/// `register_composed_memory_strategy` — the seam gen-core provides for a generator-less route
+/// (`z_image_control` is the same shape). An ordinary registration would make
+/// `ProviderRegistryBuilder::build` fail with "has no matching generator registration", and the
+/// catalog's `BESPOKE_MEMORY_ROUTE_WAIVERS` cannot hold them either: that table is keyed on
+/// `BESPOKE_UTILITY_CRATES` (descriptor-less crates), and `candle-gen-kolors` ships a descriptor.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::memory_registration())
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_composed_memory_strategy(memory_strategy::IP_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: memory_strategy::IP_PROVIDER_ID,
+            contract: memory_strategy::ip_composed_contract,
+        })
+        .register_memory_behavior(memory_strategy::IP_MEMORY_BEHAVIOR)
+        .register_composed_memory_strategy(memory_strategy::CONTROL_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: memory_strategy::CONTROL_PROVIDER_ID,
+            contract: memory_strategy::control_composed_contract,
+        })
+        .register_memory_behavior(memory_strategy::CONTROL_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle Kolors provider catalog.
@@ -362,6 +402,50 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
         assert_eq!(trainers, ["kolors"]);
+    }
+
+    /// sc-20762 review (BLOCKER 4): the crate used to register **no** memory route, so a selector
+    /// could not price any Kolors route before load. `register_providers` alone — no CUDA gate, no
+    /// catalog help — must now carry all three routes with their weights-free contract fixtures and
+    /// behavior seams, and every one must survive executable conformance.
+    #[test]
+    fn register_providers_alone_carries_every_kolors_memory_route() {
+        use candle_gen::gen_core::{LoadSpec, WeightsSource};
+        use std::collections::BTreeSet;
+
+        let expected = BTreeSet::from([
+            super::MODEL_ID,
+            super::memory_strategy::IP_PROVIDER_ID,
+            super::memory_strategy::CONTROL_PROVIDER_ID,
+        ]);
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            registry
+                .memory_contract_fixture_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            registry
+                .memory_behavior_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+
+        gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
+        gen_core_testkit::memory_strategy_registry_conformance(
+            &registry,
+            &LoadSpec::new(WeightsSource::Dir("/__weights_free__".into())),
+        );
     }
 }
 

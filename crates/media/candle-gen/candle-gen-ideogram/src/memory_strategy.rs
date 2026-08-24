@@ -17,7 +17,6 @@ use candle_gen::gen_core::{
     MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization, Precision,
     Quant, TransformerComponent, WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1825,7 +1824,6 @@ fn request_scope(
     ))
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) fn registered_begin_request(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1842,7 +1840,6 @@ pub(crate) fn registered_begin_request(
     )?)))
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1909,7 +1906,6 @@ pub(crate) fn registered_valid_fixture(
     Ok(Vec::new())
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
     if !matches!(provider_id, MODEL_ID | MODEL_ID_TURBO) {
         return Err(gen_core::Error::Unsupported(format!(
@@ -1932,7 +1928,6 @@ fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::R
     Ok(exact)
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn estimated_behavior_context(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,

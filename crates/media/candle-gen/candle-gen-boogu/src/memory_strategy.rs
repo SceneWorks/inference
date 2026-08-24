@@ -14,9 +14,7 @@ use candle_gen::gen_core::{
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
     Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
-#[cfg(feature = "cuda")]
 use candle_gen::gen_core::{MemoryBehaviorFixture, MemoryBehaviorRoute};
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{MemoryBudget, MemoryCacheState, MemoryOptimizationAuthority};
 use sha2::{Digest, Sha256};
 
@@ -602,7 +600,6 @@ fn tier(quant: Option<Quant>) -> MemoryNumericTier {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn estimated_behavior_context(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
@@ -1306,7 +1303,6 @@ pub fn registered_safety_check(
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn weights_free_spec(provider: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
     validate_load_spec(provider, spec)?;
     let route = Route::for_provider(provider)?;
@@ -1350,7 +1346,6 @@ pub fn registered_edit(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContra
     provider_contract(BOOGU_IMAGE_EDIT_ID, spec)
 }
 
-#[cfg(feature = "cuda")]
 pub fn valid_fixtures(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1410,7 +1405,6 @@ pub fn valid_fixtures(
         .collect()
 }
 
-#[cfg(feature = "cuda")]
 pub fn registered_begin(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,

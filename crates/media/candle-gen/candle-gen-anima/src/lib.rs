@@ -602,9 +602,9 @@ pub fn register_providers(
         .register_generator(AESTHETIC_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION);
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry);
-    registry
+    // Registration is unconditional: none of these surfaces needs a CUDA device to *construct*, and
+    // gating them on `cuda` hid the whole memory-behavior seam from every CPU conformance config.
+    register_memory_contract_surfaces(registry)
 }
 
 /// Register the weights-free contracts on non-CUDA catalog builds and the executable contracts on
@@ -618,31 +618,28 @@ pub fn register_memory_contract_surfaces(
         .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
             provider_id: "anima_base",
-            contract: |spec| memory_strategy::contract("anima_base", spec),
+            contract: |spec| memory_strategy::weights_free_contract("anima_base", spec),
         })
         .register_memory_strategy(memory_strategy::AESTHETIC_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
             provider_id: "anima_aesthetic",
-            contract: |spec| memory_strategy::contract("anima_aesthetic", spec),
+            contract: |spec| memory_strategy::weights_free_contract("anima_aesthetic", spec),
         })
         .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(
             candle_gen::gen_core::MemoryContractFixtureRegistration {
                 surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
                 provider_id: "anima_turbo",
-                contract: |spec| memory_strategy::contract("anima_turbo", spec),
+                contract: |spec| memory_strategy::weights_free_contract("anima_turbo", spec),
             },
         );
-    #[cfg(feature = "cuda")]
-    let registry = registry
+    registry
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
         .register_memory_behavior(AESTHETIC_MEMORY_BEHAVIOR)
-        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR);
-    registry
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
 }
 
-#[cfg(feature = "cuda")]
 const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "anima_base",
@@ -650,7 +647,6 @@ const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: memory_strategy::registered_begin_request,
     };
 
-#[cfg(feature = "cuda")]
 const AESTHETIC_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "anima_aesthetic",
@@ -658,7 +654,6 @@ const AESTHETIC_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: memory_strategy::registered_begin_request,
     };
 
-#[cfg(feature = "cuda")]
 const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: "anima_turbo",
@@ -682,6 +677,24 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["anima_base", "anima_aesthetic", "anima_turbo"]);
+    }
+
+    /// The memory-behavior seam used to sit behind `#[cfg(feature = "cuda")]`, so registry-level
+    /// lifecycle conformance never saw it on any CPU config. Nothing here needs a CUDA device to
+    /// construct, so every build must register all three.
+    #[test]
+    fn every_route_registers_its_memory_behavior_on_a_non_cuda_build() {
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(
+            registered,
+            ["anima_base", "anima_aesthetic", "anima_turbo"],
+            "registration must not require a CUDA device"
+        );
     }
 }
 
@@ -793,6 +806,22 @@ mod tests {
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
     }
 
+    /// Write the sibling `text_encoders/` + `vae/` shards every real split_files root carries. The
+    /// memory contract prices them (sc-20785 review), so a fixture without them is not a root.
+    fn write_sibling_components(root: &std::path::Path) {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        for relative in [loader::TEXT_ENCODER_FILE, loader::VAE_FILE] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "x.weight".to_string(),
+                Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+            );
+            candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
+        }
+    }
+
     /// Write a minimal **dense** DiT split_files layout (one anchor tensor, NO `.scales` codes) so the
     /// quant-guard can header-detect it as dense. Returns the split_files root.
     fn write_dense_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
@@ -800,6 +829,7 @@ mod tests {
         let root = tmp.path().join("anima_quant_guard");
         let dm = root.join("diffusion_models");
         std::fs::create_dir_all(&dm).unwrap();
+        write_sibling_components(&root);
         let mut m = std::collections::HashMap::new();
         m.insert(
             "net.x_embedder.proj.1.weight".to_string(),
@@ -817,6 +847,7 @@ mod tests {
         let root = tmp.path().join(format!("anima_packed_guard_{quant:?}"));
         let dm = root.join("diffusion_models");
         std::fs::create_dir_all(&dm).unwrap();
+        write_sibling_components(&root);
         let mut m = std::collections::HashMap::new();
         let packed_columns = match quant {
             Quant::Q4 => 8,
@@ -1053,7 +1084,7 @@ mod tests {
         use std::rc::Rc;
 
         let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/anima".into()));
-        let contract = memory_strategy::contract("anima_base", &spec).unwrap();
+        let contract = memory_strategy::weights_free_contract("anima_base", &spec).unwrap();
         let context = memory_strategy::registered_valid_fixture(
             &spec,
             &contract,
