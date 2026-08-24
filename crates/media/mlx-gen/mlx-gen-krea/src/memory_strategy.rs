@@ -417,8 +417,17 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     )?;
     let decoder_bytes =
         stored(&base_snapshot_dir.join("vae"), "base VAE")?.saturating_add(alternate_decoder_bytes);
+    // Same declared logical shapes the load will use (sc-20644) — see
+    // `block_memory_strategy::base_architecture_config`.
+    let base_cfg =
+        crate::block_memory_strategy::base_architecture_config(provider_id, base_snapshot_dir)?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
-        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p, spec.quantize)
+        crate::block_memory_strategy::native_dit_transformer_bytes(
+            provider_id,
+            p,
+            spec.quantize,
+            crate::native_remap::DeclaredLogicalShapes::from_base(base_cfg.as_ref()),
+        )
     })?;
     let branch_bits =
         crate::memory::control_branch_quant_bits(spec.quantize.map(mlx_gen::Quant::bits));

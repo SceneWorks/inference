@@ -177,7 +177,8 @@ pub use registry::{
     ProviderRegistryBuilder, ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration,
     TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
     FLUX2_CHECKPOINT_ADAPTER, KREA_2_CHECKPOINT_ADAPTER, MAGE_FLOW_CHECKPOINT_ADAPTER,
-    QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
+    QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER, WAN_CHECKPOINT_ADAPTER,
+    Z_IMAGE_CHECKPOINT_ADAPTER,
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{

@@ -442,7 +442,7 @@ mod tests {
             .find(|adapter| adapter.adapter_id == KREA_2_CHECKPOINT_ADAPTER.adapter_id)
             .expect("the Krea 2 adapter is registered");
         let implementations: &[&dyn LogicalKeyMapping] = &[
-            &mlx_gen_krea::KreaNativeToDiffusersMapping,
+            &mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(),
             &IdentityKeyMapping,
         ];
         for mapping in krea.canonical_mappings {
@@ -457,13 +457,14 @@ mod tests {
         }
         // And the native mapping really is the remap the provider loads through.
         assert_eq!(
-            mlx_gen_krea::KreaNativeToDiffusersMapping
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
                 .logical_key("model.diffusion_model.blocks.0.attn.wq.weight")
                 .as_deref(),
             Some("transformer_blocks.0.attn.to_q.weight")
         );
         assert_eq!(
-            mlx_gen_krea::KreaNativeToDiffusersMapping.logical_key("foreign.weight"),
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
+                .logical_key("foreign.weight"),
             None
         );
     }

@@ -41,36 +41,107 @@
 //! `scale_shift_table` from the single file's flat `[6·hidden]` to the diffusers `[6, hidden]`), which
 //! the single-file loader runs between the remap and `validate_transformer`.
 
+use crate::config::Krea2Config;
 use mlx_gen::gen_core::LogicalKeyMapping;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+/// Factors in the final continuous-AdaLN layer's `scale_shift_table`.
+///
+/// Architectural, not a published-model dimension: the reference `LastLayer`'s `SimpleModulation`
+/// emits exactly `(scale, shift)` — two streams — where a single-stream block's
+/// `DoubleSharedModulation` emits [`Krea2Config::MOD_FACTORS`] (6: pre/post × scale/shift/gate).
+/// Both counts are fixed by the module code, so neither is a config field.
+const FINAL_MOD_FACTORS: usize = 2;
+
+/// Whether a [`KreaNativeToDiffusersMapping`] can declare the architecture's true logical shapes,
+/// and — when it cannot — that this is a deliberate state rather than an accident (sc-20644).
+///
+/// MXFP8 storage is 32-padded on both axes and the file does not record the true shape, so the plan
+/// compiler asks the adapter. A declared shape lets it unpad exactly; no declaration leaves it at
+/// the **stored** padded shape, which the DiT's own [`crate::convert::validate_transformer`] then
+/// refuses. Only a `Krea2Config` knows the architecture's dimensions, so a mapping with no config in
+/// scope cannot answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeclaredLogicalShapes<'cfg> {
+    /// **No config is in scope at this call site** — a header-only key-mapping check, or a plan
+    /// compiled before the base tier (which owns `transformer/config.json`) has been resolved.
+    ///
+    /// `logical_shape` returns `None`, which is exactly the pre-sc-20644 behaviour: an MXFP8 plan
+    /// unpads to the stored padded shape and `validate_transformer` is the backstop that refuses
+    /// it, naming the tensor and the mismatch. This variant exists so "no config" is a named,
+    /// documented state and never a guessed default architecture — and never a config-read error
+    /// degraded into one. A call site that HAS a config must pass it; a call site whose config read
+    /// fails must propagate that error rather than fall back here.
+    NotInScope,
+    /// The architecture config of the base tier this single file is being loaded against. Every
+    /// declared shape is derived from it by [`diffusers_logical_shape`].
+    FromConfig(&'cfg Krea2Config),
+}
+
+impl<'cfg> DeclaredLogicalShapes<'cfg> {
+    /// [`FromConfig`](Self::FromConfig) when the base tier supplied an architecture config,
+    /// [`NotInScope`](Self::NotInScope) when it carries none at all.
+    ///
+    /// The `None` here means **absent**, a checked condition the caller established by looking —
+    /// never a config read that failed. A failed read is an error the caller must propagate; if it
+    /// arrived here as `None` the plan would quietly fall back to padded shapes.
+    pub const fn from_base(cfg: Option<&'cfg Krea2Config>) -> Self {
+        match cfg {
+            Some(cfg) => Self::FromConfig(cfg),
+            None => Self::NotInScope,
+        }
+    }
+}
 
 /// The Krea 2 adapter's canonical key-mapping authority for the `krea-native` dialect (sc-20634):
 /// the [`LogicalKeyMapping`] the mapped logical-weight reader consults, backed by
 /// [`native_dit_key_to_diffusers`]. Its id is the one the portable
 /// [`KREA_2_CHECKPOINT_ADAPTER`](mlx_gen::gen_core::KREA_2_CHECKPOINT_ADAPTER) row registers for
-/// that dialect; the crate's conformance test proves the two agree.
+/// that dialect; the crate's conformance test proves the two agree. The id is a property of the
+/// *key* correspondence, which carries no config, so it is identical in both
+/// [`DeclaredLogicalShapes`] states.
 ///
-/// # No `logical_shape`: a real MXFP8 Krea DiT fails architecture validation (sc-20644)
+/// # `logical_shape`: what lets a real MXFP8 Krea DiT load (sc-20644)
 ///
-/// This mapping does not override `LogicalKeyMapping::logical_shape`, so it declares no true
-/// (unpadded) shape for any key. MXFP8 storage is 32-padded on both axes and the file does not
-/// record the logical shape, so with no declaration the plan can only unpad to the **stored**
-/// padded shape. A genuine MXFP8 Krea DiT would therefore decode at the 32-padded shape and be
-/// refused by the DiT's own architecture validation.
-///
-/// That is **fail-closed and intended here**: the refusal names the tensor and the shape mismatch,
-/// and nothing loads at a silently wrong geometry. Declaring the per-key logical shapes that would
-/// let MXFP8 Krea load belongs to sc-20644, not to this story — no Krea checkpoint in the wild
-/// ships MXFP8 today (the community variants are bf16, plain fp8 cast, or int8-per-row).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KreaNativeToDiffusersMapping;
-
-impl KreaNativeToDiffusersMapping {
-    pub const MAPPING_ID: &'static str = "krea-native-to-diffusers-v1";
+/// Constructed with [`for_config`](Self::for_config), the mapping declares every diffusers logical
+/// key's true **unpadded** shape, derived from the `Krea2Config` by [`diffusers_logical_shape`], so
+/// an MXFP8 layer's 32-padded storage unpads to the architecture's real geometry and the DiT loads.
+/// Constructed with [`without_config`](Self::without_config) it declares nothing and the previous
+/// fail-closed behaviour stands unchanged — see [`DeclaredLogicalShapes::NotInScope`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KreaNativeToDiffusersMapping<'cfg> {
+    shapes: DeclaredLogicalShapes<'cfg>,
 }
 
-impl LogicalKeyMapping for KreaNativeToDiffusersMapping {
+impl<'cfg> KreaNativeToDiffusersMapping<'cfg> {
+    pub const MAPPING_ID: &'static str = "krea-native-to-diffusers-v1";
+
+    /// The key mapping with the architecture config in scope: `logical_shape` declares the true
+    /// unpadded shape of every key the [`Krea2Transformer`](crate::transformer::Krea2Transformer)
+    /// loads.
+    pub const fn for_config(cfg: &'cfg Krea2Config) -> Self {
+        Self {
+            shapes: DeclaredLogicalShapes::FromConfig(cfg),
+        }
+    }
+
+    /// The key mapping with **no** config in scope — `logical_shape` declares nothing. See
+    /// [`DeclaredLogicalShapes::NotInScope`] for when that is the correct choice.
+    pub const fn without_config() -> Self {
+        Self {
+            shapes: DeclaredLogicalShapes::NotInScope,
+        }
+    }
+
+    /// Build from an already-decided [`DeclaredLogicalShapes`] — the form the loader threads from
+    /// its callers, so the "config or not" decision is made once at the entry point.
+    pub const fn new(shapes: DeclaredLogicalShapes<'cfg>) -> Self {
+        Self { shapes }
+    }
+}
+
+impl LogicalKeyMapping for KreaNativeToDiffusersMapping<'_> {
     fn mapping_id(&self) -> &'static str {
         Self::MAPPING_ID
     }
@@ -78,6 +149,139 @@ impl LogicalKeyMapping for KreaNativeToDiffusersMapping {
     fn logical_key(&self, physical_key: &str) -> Option<String> {
         native_dit_key_to_diffusers(physical_key)
     }
+
+    fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
+        match self.shapes {
+            DeclaredLogicalShapes::NotInScope => None,
+            DeclaredLogicalShapes::FromConfig(cfg) => diffusers_logical_shape(cfg, logical_key),
+        }
+    }
+}
+
+/// The architecture's true (unpadded) shape for one **diffusers** logical key, derived entirely from
+/// `cfg` — the shape the [`Krea2Transformer`](crate::transformer::Krea2Transformer) module tree
+/// constructs for that key and [`crate::convert::validate_transformer`] enforces.
+///
+/// Returns `None` for any key the architecture does not contain — including a recognized leaf on a
+/// block index beyond the config's stack depth. `None` means "not declared", which leaves an MXFP8
+/// layer at its stored padded shape and the DiT's own validation as the backstop; nothing is guessed.
+///
+/// Linear weights are `[out, in]`. The derivation, all from `cfg`:
+/// * image stream width `hidden_size`, GQA projections [`Krea2Config::q_dim`] / [`Krea2Config::kv_dim`],
+///   FFN inner `intermediate_size`;
+/// * text-fusion stream width `text_hidden_dim`, its projections
+///   `text_num_{attention,kv}_heads · attention_head_dim`, FFN inner `text_intermediate_size`;
+/// * per-head QK RMSNorm scales are `[attention_head_dim]` (shared head dim across both streams);
+/// * modulation tables are `[MOD_FACTORS, hidden]` per block and `[FINAL_MOD_FACTORS, hidden]` at
+///   the output layer.
+pub fn diffusers_logical_shape(cfg: &Krea2Config, logical_key: &str) -> Option<Vec<usize>> {
+    let hidden = cfg.hidden_size;
+    let text = cfg.text_hidden_dim;
+
+    // Top-level (non-block) tensors.
+    let top: Option<Vec<usize>> = match logical_key {
+        "img_in.weight" => Some(vec![hidden, cfg.in_channels]),
+        "img_in.bias" => Some(vec![hidden]),
+        "txt_in.norm.weight" => Some(vec![text]),
+        "txt_in.linear_1.weight" => Some(vec![hidden, text]),
+        "txt_in.linear_2.weight" => Some(vec![hidden, hidden]),
+        "txt_in.linear_1.bias" | "txt_in.linear_2.bias" => Some(vec![hidden]),
+        "time_embed.linear_1.weight" => Some(vec![hidden, cfg.timestep_embed_dim]),
+        "time_embed.linear_2.weight" => Some(vec![hidden, hidden]),
+        "time_embed.linear_1.bias" | "time_embed.linear_2.bias" => Some(vec![hidden]),
+        "time_mod_proj.weight" => Some(vec![cfg.time_mod_dim(), hidden]),
+        "time_mod_proj.bias" => Some(vec![cfg.time_mod_dim()]),
+        // The layer aggregator collapses the `num_text_layers` selected TE layers to one.
+        "text_fusion.projector.weight" => Some(vec![1, cfg.num_text_layers]),
+        "final_layer.linear.weight" => Some(vec![cfg.in_channels, hidden]),
+        "final_layer.linear.bias" => Some(vec![cfg.in_channels]),
+        "final_layer.norm.weight" => Some(vec![hidden]),
+        "final_layer.scale_shift_table" => Some(vec![FINAL_MOD_FACTORS, hidden]),
+        _ => None,
+    };
+    if top.is_some() {
+        return top;
+    }
+
+    // `transformer_blocks.N.<leaf>` — the single-stream (GQA) stack.
+    if let Some(rest) = logical_key.strip_prefix("transformer_blocks.") {
+        let (index, leaf) = split_index(rest)?;
+        if index >= cfg.num_layers {
+            return None;
+        }
+        return block_leaf_shape(
+            leaf,
+            hidden,
+            cfg.q_dim(),
+            cfg.kv_dim(),
+            cfg.intermediate_size,
+            cfg.attention_head_dim,
+            true,
+        );
+    }
+
+    // `text_fusion.{layerwise,refiner}_blocks.N.<leaf>` — the full-attention text stacks.
+    if let Some(rest) = logical_key.strip_prefix("text_fusion.") {
+        for (kind, depth) in [
+            ("layerwise_blocks.", cfg.num_layerwise_text_blocks),
+            ("refiner_blocks.", cfg.num_refiner_text_blocks),
+        ] {
+            let Some(after) = rest.strip_prefix(kind) else {
+                continue;
+            };
+            let (index, leaf) = split_index(after)?;
+            if index >= depth {
+                return None;
+            }
+            return block_leaf_shape(
+                leaf,
+                text,
+                cfg.text_num_attention_heads * cfg.attention_head_dim,
+                cfg.text_num_kv_heads * cfg.attention_head_dim,
+                cfg.text_intermediate_size,
+                cfg.attention_head_dim,
+                // Text-fusion blocks are un-modulated: no per-block `scale_shift_table`.
+                false,
+            );
+        }
+    }
+
+    None
+}
+
+/// Split `"<digits>.<leaf>"` into the parsed index and the leaf; `None` for anything else.
+fn split_index(rest: &str) -> Option<(usize, &str)> {
+    let (index, leaf) = rest.split_once('.')?;
+    if index.is_empty() || !index.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((index.parse().ok()?, leaf))
+}
+
+/// One block leaf's shape, parameterized by the block's stream width and projection widths so the
+/// single-stream (GQA, image width) and text-fusion (full attention, text width) stacks share the
+/// one derivation.
+fn block_leaf_shape(
+    leaf: &str,
+    width: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    ffn: usize,
+    head_dim: usize,
+    modulated: bool,
+) -> Option<Vec<usize>> {
+    Some(match leaf {
+        // Per-head QK RMSNorm scale — one weight per head dim, not per stream width.
+        "attn.norm_q.weight" | "attn.norm_k.weight" => vec![head_dim],
+        "attn.to_q.weight" | "attn.to_gate.weight" => vec![q_dim, width],
+        "attn.to_k.weight" | "attn.to_v.weight" => vec![kv_dim, width],
+        "attn.to_out.0.weight" => vec![width, q_dim],
+        "ff.gate.weight" | "ff.up.weight" => vec![ffn, width],
+        "ff.down.weight" => vec![width, ffn],
+        "norm1.weight" | "norm2.weight" => vec![width],
+        "scale_shift_table" if modulated => vec![Krea2Config::MOD_FACTORS, width],
+        _ => return None,
+    })
 }
 
 /// Translate a **native-mmdit** single-file DiT tensor key to the **diffusers** key the MLX
@@ -251,9 +455,9 @@ pub fn normalize_modulation_tables(w: &mut Weights) -> Result<()> {
         // 6-factor (pre/post × scale/shift/gate). Matches `Krea2Config::MOD_FACTORS` (6) and the DiT's
         // `final_layer` reshape to `[1, 2, hidden]`.
         let factors: i32 = if key == "final_layer.scale_shift_table" {
-            2
+            FINAL_MOD_FACTORS as i32
         } else {
-            6
+            Krea2Config::MOD_FACTORS as i32
         };
         // `remove` → own the tensor so the re-insert doesn't fight the read borrow.
         let tensor = w
@@ -295,10 +499,39 @@ fn preview(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Krea2Config;
     use crate::convert::expected_transformer_keys;
     use mlx_rs::Array;
     use std::collections::BTreeSet;
+
+    /// A deliberately *non*-published architecture: every derived width is a different number, so a
+    /// shape rule that reached for the wrong config field (or hardcoded a Turbo dimension) produces
+    /// a visibly wrong answer instead of accidentally matching. hidden 128 (8×16), GQA 8Q/2KV,
+    /// text 64 (4×16) with 3 text KV heads, and distinct FFN / in-channel / timestep widths.
+    fn asymmetric_config() -> Krea2Config {
+        let cfg = Krea2Config {
+            in_channels: 8,
+            patch_size: 2,
+            hidden_size: 128,
+            num_attention_heads: 8,
+            num_kv_heads: 2,
+            attention_head_dim: 16,
+            num_layers: 3,
+            intermediate_size: 192,
+            norm_eps: 1e-5,
+            axes_dims_rope: [4, 6, 6],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 24,
+            num_text_layers: 5,
+            num_layerwise_text_blocks: 2,
+            num_refiner_text_blocks: 1,
+            text_hidden_dim: 64,
+            text_intermediate_size: 80,
+            text_num_attention_heads: 4,
+            text_num_kv_heads: 3,
+        };
+        cfg.validate().expect("the test architecture is coherent");
+        cfg
+    }
 
     /// The real native-mmdit key set captured from `kreamania_variant5.safetensors` (430 tensors) — the
     /// committed fixture (the 26 GB weights file itself is not committed). Comment/blank lines dropped.
@@ -569,5 +802,175 @@ mod tests {
             .expect_err("indivisible flat table must fail closed")
             .to_string();
         assert!(err.contains("not divisible"), "unexpected error: {err}");
+    }
+
+    // ── sc-20644: the declared logical shapes ──────────────────────────────────────────────────
+
+    /// **With no config in scope the mapping declares nothing** — the explicit
+    /// [`DeclaredLogicalShapes::NotInScope`] state, which is exactly the pre-sc-20644 behaviour
+    /// (an MXFP8 plan stays at the stored padded shape and `validate_transformer` refuses it).
+    /// The key correspondence and the registered mapping id are unaffected by the state.
+    #[test]
+    fn without_a_config_no_logical_shape_is_declared() {
+        let mapping = KreaNativeToDiffusersMapping::without_config();
+        for key in expected_transformer_keys(&asymmetric_config()) {
+            assert_eq!(
+                mapping.logical_shape(&key),
+                None,
+                "`{key}` must not be declared with no config in scope"
+            );
+        }
+        assert_eq!(
+            mapping.mapping_id(),
+            KreaNativeToDiffusersMapping::MAPPING_ID
+        );
+        let cfg = asymmetric_config();
+        assert_eq!(
+            mapping.logical_key("model.diffusion_model.blocks.0.attn.wq.weight"),
+            KreaNativeToDiffusersMapping::for_config(&cfg)
+                .logical_key("model.diffusion_model.blocks.0.attn.wq.weight"),
+            "the key correspondence carries no config and cannot depend on the state"
+        );
+    }
+
+    /// **With a config in scope EVERY logical key the transformer loads has a declared shape** —
+    /// driven by the loader's own `expected_transformer_keys`, so a key the module tree consumes
+    /// can never be left undeclared (which would silently keep it at its padded storage).
+    #[test]
+    fn every_expected_transformer_key_has_a_declared_shape() {
+        let cfg = asymmetric_config();
+        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        for key in expected_transformer_keys(&cfg) {
+            assert!(
+                mapping.logical_shape(&key).is_some(),
+                "`{key}` is loaded by the module tree but has no declared logical shape"
+            );
+        }
+    }
+
+    /// **The declared shapes ARE the architecture the DiT validates against.** A weight set built
+    /// purely from `logical_shape` declarations passes `validate_transformer` — the DiT's own
+    /// coverage + shape check — so a declaration can never be a geometry the loader then refuses.
+    #[test]
+    fn declared_shapes_satisfy_the_dit_architecture_validation() {
+        let cfg = asymmetric_config();
+        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        let mut w = Weights::empty();
+        for key in expected_transformer_keys(&cfg) {
+            let shape = mapping
+                .logical_shape(&key)
+                .unwrap_or_else(|| panic!("no declared shape for {key}"));
+            let dims: Vec<i32> = shape.iter().map(|d| *d as i32).collect();
+            w.insert(key, mlx_rs::ops::zeros::<f32>(&dims).unwrap());
+        }
+        crate::convert::validate_transformer(&w, &cfg)
+            .expect("a DiT built from the declared shapes is the architecture the DiT expects");
+    }
+
+    /// **The shapes are DERIVED from the config, not hardcoded.** Two different architectures give
+    /// different declarations for the same key, and each matches that architecture's own widths.
+    #[test]
+    fn declared_shapes_track_the_config_rather_than_a_published_model() {
+        let tiny = asymmetric_config();
+        let turbo = Krea2Config::turbo();
+        let a = KreaNativeToDiffusersMapping::for_config(&tiny);
+        let b = KreaNativeToDiffusersMapping::for_config(&turbo);
+
+        // Single-stream GQA: Q spans all heads, K/V only the KV heads.
+        assert_eq!(
+            a.logical_shape("transformer_blocks.0.attn.to_q.weight"),
+            Some(vec![tiny.q_dim(), tiny.hidden_size])
+        );
+        assert_eq!(
+            a.logical_shape("transformer_blocks.0.attn.to_k.weight"),
+            Some(vec![tiny.kv_dim(), tiny.hidden_size])
+        );
+        assert_eq!(
+            b.logical_shape("transformer_blocks.0.attn.to_q.weight"),
+            Some(vec![turbo.q_dim(), turbo.hidden_size])
+        );
+        assert_ne!(
+            a.logical_shape("transformer_blocks.0.attn.to_q.weight"),
+            b.logical_shape("transformer_blocks.0.attn.to_q.weight"),
+            "two architectures must not declare the same shape"
+        );
+        // The shared modulation projection and the per-block table both carry MOD_FACTORS.
+        assert_eq!(
+            a.logical_shape("time_mod_proj.weight"),
+            Some(vec![
+                Krea2Config::MOD_FACTORS * tiny.hidden_size,
+                tiny.hidden_size
+            ])
+        );
+        assert_eq!(
+            a.logical_shape("transformer_blocks.0.scale_shift_table"),
+            Some(vec![Krea2Config::MOD_FACTORS, tiny.hidden_size])
+        );
+        // The output layer's SimpleModulation is 2-factor, not 6.
+        assert_eq!(
+            a.logical_shape("final_layer.scale_shift_table"),
+            Some(vec![FINAL_MOD_FACTORS, tiny.hidden_size])
+        );
+        // Text-fusion blocks run at the TEXT width with their own KV head count, and are
+        // un-modulated (no per-block table).
+        assert_eq!(
+            a.logical_shape("text_fusion.refiner_blocks.0.attn.to_k.weight"),
+            Some(vec![
+                tiny.text_num_kv_heads * tiny.attention_head_dim,
+                tiny.text_hidden_dim
+            ])
+        );
+        assert_eq!(
+            a.logical_shape("text_fusion.refiner_blocks.0.ff.down.weight"),
+            Some(vec![tiny.text_hidden_dim, tiny.text_intermediate_size])
+        );
+        assert_eq!(
+            a.logical_shape("text_fusion.refiner_blocks.0.scale_shift_table"),
+            None,
+            "text-fusion blocks have no modulation table"
+        );
+        // Per-head QK norms are head-dim wide in BOTH streams, never the stream width.
+        assert_eq!(
+            a.logical_shape("transformer_blocks.0.attn.norm_q.weight"),
+            Some(vec![tiny.attention_head_dim])
+        );
+        assert_eq!(
+            a.logical_shape("text_fusion.layerwise_blocks.0.attn.norm_k.weight"),
+            Some(vec![tiny.attention_head_dim])
+        );
+    }
+
+    /// **Nothing outside the architecture is declared** — a foreign key, an unrecognized leaf, and a
+    /// block index past the config's stack depth all return `None` rather than a guessed shape.
+    #[test]
+    fn keys_outside_the_architecture_are_not_declared() {
+        let cfg = asymmetric_config();
+        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        for key in [
+            "foreign.weight",
+            "transformer_blocks.0.attn.bogus.weight",
+            "transformer_blocks.x.attn.to_q.weight",
+            "text_fusion.unknown_blocks.0.norm1.weight",
+        ] {
+            assert_eq!(mapping.logical_shape(key), None, "`{key}` must not declare");
+        }
+        // One past each stack's depth.
+        for key in [
+            format!("transformer_blocks.{}.attn.to_q.weight", cfg.num_layers),
+            format!(
+                "text_fusion.layerwise_blocks.{}.norm1.weight",
+                cfg.num_layerwise_text_blocks
+            ),
+            format!(
+                "text_fusion.refiner_blocks.{}.norm1.weight",
+                cfg.num_refiner_text_blocks
+            ),
+        ] {
+            assert_eq!(
+                mapping.logical_shape(&key),
+                None,
+                "`{key}` is past the configured stack depth"
+            );
+        }
     }
 }

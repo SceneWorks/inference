@@ -90,7 +90,8 @@ pub use multiphase::{
     ResolvedPhaseAdapter,
 };
 pub use native_remap::{
-    native_dit_key_to_diffusers, remap_native_dit_to_diffusers, KreaNativeToDiffusersMapping,
+    diffusers_logical_shape, native_dit_key_to_diffusers, remap_native_dit_to_diffusers,
+    DeclaredLogicalShapes, KreaNativeToDiffusersMapping,
 };
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
