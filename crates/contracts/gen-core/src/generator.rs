@@ -991,15 +991,36 @@ impl GenerationRequest {
     /// Conceptual reference count used by memory evidence and request scopes. SCAIL-2's physical
     /// `Reference + Mask + ControlClip` list describes one character identity, not two images (or
     /// three generic conditioning entries); every other carrier retains the generic image count.
+    ///
+    /// This is the **execution-side** half of a pair: the admission side computes the same quantity
+    /// from the request via
+    /// [`wan_i2v_memory::geometry_from_request`](crate::wan_i2v_memory::geometry_from_request), and
+    /// both request-scope cores reject a request whose `memory_reference_count()` differs from the
+    /// admitted `MemoryGeometry::reference_count`. The two therefore have to agree carrier for
+    /// carrier or the mode is unreachable by construction — admission and execution can never both
+    /// pass. The temporal-carrier arms below exist to close exactly that gap:
+    ///
+    /// * `video_bridge` owns two immutable source boundaries — two `Keyframe`s (Wan2.2 Ti2V-5B) or
+    ///   one masked `ControlClip` (Wan-VACE) — and generates only the middle. Those are execution
+    ///   inputs, not conceptual image references, so a bridge cannot borrow a still-image /
+    ///   first-last memory row. Admission already declares this as zero.
+    /// * `extend_clip` carries exactly one source: a boundary `Keyframe` (Ti2V-5B, already counted
+    ///   as one image) or the whole source clip as one masked `ControlClip` (VACE). The generic
+    ///   image count scores the VACE carrier as zero while admission scores it as one, so the VACE
+    ///   arm is spelled out here.
     pub fn memory_reference_count(&self) -> u32 {
-        if matches!(
-            self.video_mode.as_deref(),
-            Some("animation" | "replacement")
-        ) && self.scail2_animation_conditioning().is_ok()
-        {
-            1
-        } else {
-            self.image_reference_count()
+        match self.video_mode.as_deref() {
+            Some("animation" | "replacement") if self.scail2_animation_conditioning().is_ok() => 1,
+            Some("video_bridge") => 0,
+            Some("extend_clip")
+                if matches!(
+                    self.conditioning.as_slice(),
+                    [Conditioning::ControlClip { .. }]
+                ) =>
+            {
+                1
+            }
+            _ => self.image_reference_count(),
         }
     }
 

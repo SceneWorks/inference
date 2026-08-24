@@ -245,16 +245,27 @@ pub fn selected_strategy(request: &GenerationRequest) -> Option<MemoryStrategy> 
 /// it must override that load default and use the cached resident renderer. Staged and the
 /// cumulative BoundedDecode rung keep the sequential renderer. An unadmitted request has no memory
 /// block and therefore preserves the load-time policy.
+///
+/// The rung→policy mapping itself is **not** restated here: it is
+/// [`gen_core::wan_i2v_memory::load_policy_for_selection`], the shared declaration both backends
+/// read. A hand-written `match` on the memory block drifted from it — `stage_residency` was routed
+/// to `Sequential` but `tile_vae_decode` fell through to the `Resident` arm, so an admitted
+/// BoundedDecode request ran the resident renderer while the doc above and the shared declaration
+/// both said sequential.
 pub fn selected_offload_policy(
     loaded: OffloadPolicy,
     explicit_resident: bool,
     request: &GenerationRequest,
 ) -> OffloadPolicy {
-    match request.memory {
-        Some(memory) if memory.stage_residency => OffloadPolicy::Sequential,
-        Some(_) if explicit_resident => OffloadPolicy::Resident,
-        None => loaded,
-        Some(_) => loaded,
+    let Some(strategy) = selected_strategy(request) else {
+        return loaded;
+    };
+    match gen_core::wan_i2v_memory::load_policy_for_selection(strategy) {
+        OffloadPolicy::Sequential => OffloadPolicy::Sequential,
+        // The shared declaration says this rung is resident; only an explicitly admitted Resident
+        // route may override the conservative load default to say so.
+        OffloadPolicy::Resident if explicit_resident => OffloadPolicy::Resident,
+        OffloadPolicy::Resident => loaded,
     }
 }
 
@@ -312,6 +323,54 @@ mod tests {
             selected_offload_policy(OffloadPolicy::Sequential, true, &resident),
             OffloadPolicy::Sequential
         );
+
+        resident.memory = Some(gen_core::GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(gen_core::wan_i2v_memory::DECODE_TILE_EDGES[0]),
+            decode_overlap: Some(gen_core::wan_i2v_memory::DECODE_OVERLAPS[0]),
+            ..Default::default()
+        });
+        assert_eq!(
+            selected_strategy(&resident),
+            Some(MemoryStrategy::BoundedDecode)
+        );
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Sequential, true, &resident),
+            OffloadPolicy::Sequential,
+            "the cumulative BoundedDecode rung keeps the sequential renderer even on an explicitly \
+             Resident-capable route — it must not inherit the Resident override"
+        );
+        assert_eq!(
+            selected_offload_policy(OffloadPolicy::Resident, true, &resident),
+            OffloadPolicy::Sequential,
+            "BoundedDecode overrides a Resident load default rather than preserving it"
+        );
+        for strategy in MemoryStrategy::ALL {
+            let memory = match strategy {
+                MemoryStrategy::Resident => gen_core::GenerationMemory::default(),
+                MemoryStrategy::StagedResidency => gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                },
+                MemoryStrategy::BoundedDecode => gen_core::GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                },
+                // Wan declares these rungs Missing; `selected_strategy` cannot report them.
+                MemoryStrategy::BoundedAttention | MemoryStrategy::BoundedTransformerResidency => {
+                    continue
+                }
+            };
+            let request = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            assert_eq!(
+                selected_offload_policy(OffloadPolicy::Sequential, true, &request),
+                gen_core::wan_i2v_memory::load_policy_for_selection(strategy),
+                "{strategy:?} must agree with the shared rung -> load-policy declaration"
+            );
+        }
 
         resident.memory = None;
         assert_eq!(selected_strategy(&resident), None);

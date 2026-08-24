@@ -943,8 +943,13 @@ pub struct MemoryStructuralResidentEvidence {
     pub adapter_count: u32,
 }
 
-/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`]. Source ids are
-/// represented by a caller-produced digest so this contract does not depend on SceneWorks assets.
+/// Exact execution identity paired with [`MemoryStructuralResidentEvidence`].
+///
+/// `source_digest` is an opaque 64-hex digest produced by the caller, so this contract does not
+/// depend on SceneWorks assets or on any particular notion of a "source id". Both SCAIL-2 providers
+/// derive it from the **carrier bytes** of the request (the character image, mask and driving
+/// frames) rather than from an asset identifier; a different provider is free to digest whatever
+/// makes its execution identity exact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryStructuralResidentRequestIdentity {
     pub source_digest: String,
@@ -986,11 +991,46 @@ impl MemoryStructuralResidentEvidence {
         Ok(())
     }
 
+    /// Domain prefix of SCAIL-2's structural Resident receipt.
+    ///
+    /// The domain is a **caller-supplied** parameter of
+    /// [`evidence_revision_in_domain`](Self::evidence_revision_in_domain), not a property of this
+    /// generic contract: the contract itself knows nothing about SCAIL-2. This constant names the
+    /// value SCAIL-2 has always used so the two provider crates keep parsing `parts[0]` unchanged,
+    /// and so a second adopter is forced to mint its own domain rather than share this one.
+    pub const SCAIL2_RESIDENT_EVIDENCE_DOMAIN: &'static str = "scail2-resident-v1";
+
+    /// SCAIL-2's structural Resident receipt — [`Self::evidence_revision_in_domain`] at
+    /// [`Self::SCAIL2_RESIDENT_EVIDENCE_DOMAIN`].
     pub fn evidence_revision(
         &self,
         request: &MemoryStructuralResidentRequestIdentity,
     ) -> Result<String> {
+        self.evidence_revision_in_domain(Self::SCAIL2_RESIDENT_EVIDENCE_DOMAIN, request)
+    }
+
+    /// Structural Resident receipt for one execution identity, namespaced to `domain`.
+    ///
+    /// `domain` is both the plain-text prefix and a hashed input, so two providers that share this
+    /// contract can never mint the same digest for the same request identity.
+    ///
+    /// Every `Option` knob is **tag-hashed**: a discriminant byte (`0` absent / `1` present)
+    /// precedes the value bytes. Hashing `unwrap_or_default()` instead would collapse `None` onto
+    /// `Some(0)`, `Some(0.0)` and `Some("")` — the same absent-versus-zero collapse the Wan video
+    /// receipt is written to avoid — which would let a request that dropped a knob reuse the
+    /// receipt of a request that set it to zero.
+    pub fn evidence_revision_in_domain(
+        &self,
+        domain: &str,
+        request: &MemoryStructuralResidentRequestIdentity,
+    ) -> Result<String> {
         self.validate()?;
+        if domain.is_empty() || domain.contains(':') {
+            return Err(Error::Unsupported(
+                "structural Resident evidence domain must be a non-empty colon-free token"
+                    .to_owned(),
+            ));
+        }
         if request.source_digest.len() != 64
             || !request
                 .source_digest
@@ -1003,18 +1043,26 @@ impl MemoryStructuralResidentEvidence {
         }
         let mut hasher = Sha256::new();
         for value in [
+            domain,
             self.provider_id.as_str(),
             self.repository.as_str(),
             self.revision.as_str(),
-            self.variant.as_str(),
             self.receipt_sha256.as_str(),
             request.source_digest.as_str(),
             request.mode.as_str(),
             request.carrier_shape.as_str(),
-            request.sampler.as_deref().unwrap_or(""),
-            request.scheduler.as_deref().unwrap_or(""),
         ] {
             hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        // `variant` stays a distinct field rather than joining the loop above: it is part of the
+        // artifact identity, and the loop's `0` separator already keeps neighbours from sliding
+        // into one another.
+        hasher.update(self.variant.as_bytes());
+        hasher.update([0]);
+        for value in [request.sampler.as_deref(), request.scheduler.as_deref()] {
+            hasher.update([u8::from(value.is_some())]);
+            hasher.update(value.unwrap_or_default().as_bytes());
             hasher.update([0]);
         }
         hasher.update(request.width.to_le_bytes());
@@ -1022,25 +1070,17 @@ impl MemoryStructuralResidentEvidence {
         hasher.update(request.frames.to_le_bytes());
         hasher.update(request.fps.to_le_bytes());
         hasher.update(request.reference_count.to_le_bytes());
+        hasher.update([u8::from(request.seed.is_some())]);
         hasher.update(request.seed.unwrap_or_default().to_le_bytes());
+        hasher.update([u8::from(request.steps.is_some())]);
         hasher.update(request.steps.unwrap_or_default().to_le_bytes());
-        hasher.update(
-            request
-                .guidance
-                .map(f32::to_bits)
-                .unwrap_or_default()
-                .to_le_bytes(),
-        );
-        hasher.update(
-            request
-                .scheduler_shift
-                .map(f32::to_bits)
-                .unwrap_or_default()
-                .to_le_bytes(),
-        );
+        for value in [request.guidance, request.scheduler_shift] {
+            hasher.update([u8::from(value.is_some())]);
+            hasher.update(value.unwrap_or_default().to_bits().to_le_bytes());
+        }
         hasher.update(format!("{:?}", request.selection));
         Ok(format!(
-            "scail2-resident-v1:{}:{}:{:x}",
+            "{domain}:{}:{}:{:x}",
             self.receipt_sha256,
             request.source_digest,
             hasher.finalize()
@@ -6527,5 +6567,121 @@ mod tests {
         for valid in ["layout-v1", "sc-16594-layout-v2", "layout-q4-512-v3"] {
             validate_calibration_fingerprint(valid).unwrap();
         }
+    }
+
+    /// sc-20799: the structural Resident receipt is a **generic** contract. Its domain is a caller
+    /// parameter (SCAIL-2's spelling is preserved for its existing parsers), and every optional
+    /// request knob is tag-hashed so an absent knob cannot borrow the receipt of a zero-valued one.
+    #[test]
+    fn structural_resident_receipt_is_domain_scoped_and_separates_absent_from_zero() {
+        let evidence = MemoryStructuralResidentEvidence {
+            abi: MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
+            provider_id: "provider".to_owned(),
+            repository: "org/repo".to_owned(),
+            revision: "f".repeat(40),
+            variant: "q4".to_owned(),
+            receipt_sha256: "a".repeat(64),
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(Quant::Q4),
+                component_precision_floors: &[],
+            },
+            load_shape: LoadShape::EagerMaterialization,
+            asset_facts: MemoryAssetFacts {
+                base_bytes: 4,
+                conditioning_bytes: 1,
+                transformer_bytes: 2,
+                decoder_bytes: 1,
+                overlay_bytes: 0,
+            },
+            request_transient_bytes: 0,
+            direct_file_count: 1,
+            adapter_count: 0,
+        };
+        let base = MemoryStructuralResidentRequestIdentity {
+            source_digest: "b".repeat(64),
+            mode: "replacement".to_owned(),
+            carrier_shape: "replacement:reference:16x16:control:16x16x4".to_owned(),
+            width: 832,
+            height: 480,
+            frames: 45,
+            fps: 16,
+            reference_count: 1,
+            seed: None,
+            sampler: None,
+            scheduler: None,
+            steps: None,
+            guidance: None,
+            scheduler_shift: None,
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: Some(Quant::Q4),
+                    component_precision_floors: &[],
+                },
+            },
+        };
+
+        // SCAIL-2's two provider crates parse `parts[0]`; that spelling must not move.
+        let scail2 = evidence.evidence_revision(&base).unwrap();
+        assert_eq!(
+            scail2.split(':').next(),
+            Some(MemoryStructuralResidentEvidence::SCAIL2_RESIDENT_EVIDENCE_DOMAIN)
+        );
+        assert_eq!(
+            scail2,
+            evidence
+                .evidence_revision_in_domain(
+                    MemoryStructuralResidentEvidence::SCAIL2_RESIDENT_EVIDENCE_DOMAIN,
+                    &base
+                )
+                .unwrap()
+        );
+
+        // A second adopter of this generic contract gets a disjoint namespace, digest included.
+        let other = evidence
+            .evidence_revision_in_domain("other-resident-v1", &base)
+            .unwrap();
+        assert_eq!(other.split(':').next(), Some("other-resident-v1"));
+        assert_ne!(
+            scail2.rsplit(':').next(),
+            other.rsplit(':').next(),
+            "the domain must be hashed, not merely prefixed"
+        );
+        for bad in ["", "has:colon"] {
+            assert!(evidence.evidence_revision_in_domain(bad, &base).is_err());
+        }
+
+        // Absent must never collide with the zero/empty value of the same knob.
+        let mut digests = vec![scail2.clone()];
+        type Cross = Box<dyn Fn(&mut MemoryStructuralResidentRequestIdentity)>;
+        let mutations: Vec<Cross> = vec![
+            Box::new(|request| request.seed = Some(0)),
+            Box::new(|request| request.steps = Some(0)),
+            Box::new(|request| request.guidance = Some(0.0)),
+            Box::new(|request| request.scheduler_shift = Some(0.0)),
+            Box::new(|request| request.sampler = Some(String::new())),
+            Box::new(|request| request.scheduler = Some(String::new())),
+        ];
+        for mutate in &mutations {
+            let mut crossed = base.clone();
+            mutate(&mut crossed);
+            digests.push(evidence.evidence_revision(&crossed).unwrap());
+        }
+        let unique = digests.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            digests.len(),
+            "an absent knob shares a receipt with its zero/empty value"
+        );
+
+        // A neighbouring-field slide must not be reachable either: moving a character from the mode
+        // into the carrier shape has to change the digest.
+        let mut slid = base.clone();
+        slid.mode = "replacemen".to_owned();
+        slid.carrier_shape = format!("t{}", base.carrier_shape);
+        assert_ne!(scail2, evidence.evidence_revision(&slid).unwrap());
     }
 }

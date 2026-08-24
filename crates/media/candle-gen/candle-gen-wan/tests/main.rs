@@ -17,6 +17,9 @@ mod conformance;
 #[path = "conformance_14b.rs"]
 mod conformance_14b;
 
+#[path = "memory_evidence_axes.rs"]
+mod memory_evidence_axes;
+
 #[path = "trainer_conformance.rs"]
 mod trainer_conformance;
 
@@ -40,3 +43,6 @@ mod vae_tiling_cuda;
 
 #[path = "vram_probe.rs"]
 mod vram_probe;
+
+#[path = "wan_i2v_scope_roundtrip.rs"]
+mod wan_i2v_scope_roundtrip;

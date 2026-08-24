@@ -448,8 +448,10 @@ fn overlay_matches_loaded_route(actual: Option<&str>, expected: Option<&str>) ->
             .filter(|axis| {
                 !axis.starts_with("provider_video_mode:")
                     && !axis.starts_with("reference:image:")
+                    && !axis.starts_with("reference:sheet:")
                     && !axis.starts_with("keyframe:")
                     && !axis.starts_with("clip:append:")
+                    && !axis.starts_with("clip:replace:")
                     && axis != &"enhancer:standard"
             })
             .map(str::to_owned)
@@ -480,6 +482,130 @@ fn extend_clip_axis(frames: u32, width: u32, height: u32) -> String {
 }
 fn bridge_clip_axes(frames: u32, width: u32, height: u32) -> [String; 2] {
     [extend_clip_axis(frames, width, height), format!("clip:append:frames:{frames}:image:{width}x{height}:frame:-1:strength:{I2V_STRENGTH_BITS:08x}")]
+}
+
+/// The ordered replace-person receipt: the masked control clip, then the character contact sheet.
+///
+/// Byte-identical to the Candle sibling in `candle-gen-ltx`. Two axes rather than one because the
+/// carriers are independently variable — the clip's mask mode and blend weight move without
+/// changing the reference count, and a fifth reference changes the composite grid without touching
+/// the clip. The reference axis names the **composite** the provider actually encodes (see
+/// [`crate::conditioning::compose_ordered_character_references`]), so 1–4 sources at any input size
+/// collapse to one target-sized image latent — the count is what changes the grid, not the sizes.
+fn replace_person_axes(
+    frames: u32,
+    width: u32,
+    height: u32,
+    references: usize,
+    masking_strength: f32,
+    mode: gen_core::ReplacementMode,
+) -> [String; 2] {
+    [
+        format!(
+            "clip:replace:frames:{frames}:image:{width}x{height}:frame:0:mode:{}:mask:{:08x}",
+            mode as u8,
+            masking_strength.to_bits()
+        ),
+        format!("reference:sheet:{references}:image:{width}x{height}"),
+    ]
+}
+
+/// Pull the exact LTX replace-person carrier out of a request: one masked `ControlClip` plus one
+/// ordered 1–4 image `MultiReference`, in either order (the generator accepts both).
+fn replace_person_receipt(request: &GenerationRequest) -> Option<String> {
+    let (clip, images) = match request.conditioning.as_slice() {
+        [gen_core::Conditioning::ControlClip { .. }, gen_core::Conditioning::MultiReference { images }]
+        | [gen_core::Conditioning::MultiReference { images }, gen_core::Conditioning::ControlClip { .. }] => {
+            (request.control_clip()?, images)
+        }
+        _ => return None,
+    };
+    let frames = request.frames.unwrap_or(0);
+    let fitted =
+        |image: &gen_core::Image| image.width == request.width && image.height == request.height;
+    if clip.frames.len() != frames as usize
+        || clip.mask.len() != clip.frames.len()
+        || clip.frames.is_empty()
+        || clip.start_frame != 0
+        || !clip.masking_strength.is_finite()
+        || !(0.0..=1.0).contains(&clip.masking_strength)
+        || !clip.frames.iter().all(fitted)
+        || !clip.mask.iter().all(fitted)
+        || !(1..=4).contains(&images.len())
+    {
+        return None;
+    }
+    // The composite is the actual VAE input; refusing here keeps a degenerate reference (zero-sized
+    // or short buffer) from being admitted and then failing mid-render.
+    crate::conditioning::compose_ordered_character_references(
+        images,
+        request.width,
+        request.height,
+    )
+    .ok()?;
+    Some(
+        replace_person_axes(
+            frames,
+            request.width,
+            request.height,
+            images.len(),
+            clip.masking_strength,
+            clip.mode,
+        )
+        .join("+"),
+    )
+}
+
+/// The replace-person axes an overlay actually carries, in receipt order.
+fn admitted_replace_person_axes(overlay: Option<&str>) -> String {
+    overlay
+        .into_iter()
+        .flat_map(|value| value.split('+'))
+        .filter(|axis| axis.starts_with("clip:replace:") || axis.starts_with("reference:sheet:"))
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Does `axes` spell exactly the two replace-person axes this `geometry` can carry?
+///
+/// The mask blend weight and the [`gen_core::ReplacementMode`] have no geometry counterpart, so
+/// they are checked structurally rather than reconstructed. Everything the geometry *does* fix —
+/// frame count, output size, clip start and reference cardinality — is compared exactly, and the
+/// request scope then compares the whole receipt string byte-for-byte.
+fn replace_person_axes_shape_ok(axes: &str, geometry: gen_core::MemoryGeometry) -> bool {
+    let axes = axes.split('+').collect::<Vec<_>>();
+    let [clip, sheet] = axes.as_slice() else {
+        return false;
+    };
+    if *sheet
+        != format!(
+            "reference:sheet:{}:image:{}x{}",
+            geometry.reference_count, geometry.width, geometry.height
+        )
+    {
+        return false;
+    }
+    let Some(tail) = clip.strip_prefix(&format!(
+        "clip:replace:frames:{}:image:{}x{}:frame:0:mode:",
+        geometry.frames, geometry.width, geometry.height
+    )) else {
+        return false;
+    };
+    let Some((mode, mask)) = tail.split_once(":mask:") else {
+        return false;
+    };
+    if !matches!(mode, "0" | "1" | "2")
+        || mask.len() != 8
+        || !mask
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    u32::from_str_radix(mask, 16)
+        .ok()
+        .map(f32::from_bits)
+        .is_some_and(|weight| weight.is_finite() && (0.0..=1.0).contains(&weight))
 }
 
 fn admitted_reference_axis(overlay: Option<&str>) -> Option<&str> {
@@ -737,12 +863,15 @@ pub(crate) fn safety_check(
         let bridge = context.mode.as_key() == "video_bridge"
             && context.geometry.reference_count == 0
             && !context.has_reference;
-        if (!t2v && !i2v && !first_last && !extend && !bridge)
+        let replace_person = context.mode.as_key() == "replace_person"
+            && (1..=4).contains(&context.geometry.reference_count)
+            && context.has_reference;
+        if (!t2v && !i2v && !first_last && !extend && !bridge && !replace_person)
             || context.use_pid
             || context.has_phases
         {
             return Err(gen_core::Error::Unsupported(
-                "ltx_2_3: memory admission requires exact text_to_video/no-reference, image_to_video/one-reference, or first_last_frame/two-keyframe identity without PiD/phases"
+                "ltx_2_3: memory admission requires exact text_to_video/no-reference, image_to_video/one-reference, first_last_frame/two-keyframe, extend_clip or video_bridge IC-LoRA clip, or replace_person/masked-clip + 1-4 ordered references identity without PiD/phases"
                     .into(),
             ));
         }
@@ -821,6 +950,17 @@ pub(crate) fn safety_check(
                         .into(),
                 ));
             }
+        }
+        if replace_person
+            && !replace_person_axes_shape_ok(
+                &admitted_replace_person_axes(context.overlay.as_deref()),
+                geometry,
+            )
+        {
+            return Err(gen_core::Error::Unsupported(
+                "ltx_2_3: replace_person admission requires the exact masked-clip + ordered character-sheet receipt"
+                    .into(),
+            ));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
@@ -1038,7 +1178,60 @@ pub(crate) fn registered_valid_fixtures(
             strength: 1.0,
         },
     ];
-    Ok(vec![t2v, i2v, first_last, extend, bridge])
+    let replace_references = 2_usize;
+    let replace_mask = 1.0_f32;
+    let replace_mode = gen_core::ReplacementMode::FullPersonKeepOutfit;
+    let replace_receipt = replace_person_axes(
+        153,
+        768,
+        512,
+        replace_references,
+        replace_mask,
+        replace_mode,
+    )
+    .join("+");
+    let replace_overlay = match route_overlay(spec) {
+        Some(load) => format!("{load}+{replace_receipt}"),
+        None => replace_receipt,
+    };
+    let mut replace_context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        MemoryBehaviorRoute {
+            mode: MemoryMode::Other("replace_person".into()),
+            reference_count: replace_references as u32,
+            use_pid: false,
+            has_phases: false,
+            overlay: Some(replace_overlay),
+        },
+    )?;
+    replace_context.geometry.width = 768;
+    replace_context.geometry.height = 512;
+    replace_context.geometry.frames = 153;
+    let mut replace_person = MemoryBehaviorFixture::new(replace_context);
+    replace_person.request.width = 768;
+    replace_person.request.height = 512;
+    replace_person.request.frames = Some(153);
+    replace_person.request.fps = Some(25);
+    let plate = gen_core::Image {
+        width: 768,
+        height: 512,
+        pixels: vec![0; 768 * 512 * 3],
+    };
+    replace_person.request.conditioning = vec![
+        gen_core::Conditioning::ControlClip {
+            frames: vec![plate.clone(); 153],
+            mask: vec![plate.clone(); 153],
+            masking_strength: replace_mask,
+            start_frame: 0,
+            mode: replace_mode,
+        },
+        gen_core::Conditioning::MultiReference {
+            images: vec![plate; replace_references],
+        },
+    ];
+    Ok(vec![t2v, i2v, first_last, extend, bridge, replace_person])
 }
 
 fn begin_with_cleanup(
@@ -1189,6 +1382,19 @@ impl LtxMemoryRequestScope {
             ("extend_clip", None, None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: extend_clip admission requires one fitted IC-LoRA VideoClip at frame 0 with strength 1.0".into())),
             ("video_bridge", None, None, None, Some(actual)) if admitted_overlay.into_iter().flat_map(|overlay| overlay.split('+')).filter(|axis| axis.starts_with("clip:append:")).collect::<Vec<_>>().join("+") == actual => {},
             ("video_bridge", None, None, None, None) => return Err(gen_core::Error::Unsupported("ltx_2_3: video_bridge admission requires ordered fitted IC-LoRA clips at 0 and -1 with strength 1.0".into())),
+            // The receipt is rebuilt from the executing request and compared to the admitted
+            // overlay, so the mask blend weight, mask mode and reference cardinality cannot change
+            // after admission even though the geometry cannot see them.  Carrier order is free:
+            // the generator accepts `ControlClip + MultiReference` in either order.
+            ("replace_person", None, None, None, None)
+                if replace_person_receipt(request).is_some_and(|actual| {
+                    actual == admitted_replace_person_axes(admitted_overlay)
+                }) => {}
+            ("replace_person", None, None, None, None) => {
+                return Err(gen_core::Error::Unsupported(
+                    "ltx_2_3: replace_person admission requires one fitted masked ControlClip at frame 0 plus one ordered 1-4 image MultiReference matching the admitted receipt".into(),
+                ))
+            }
             _ => {
                 return Err(gen_core::Error::Unsupported(
                     "ltx_2_3: request mode/reference receipt crossed the admitted memory identity"
@@ -1615,6 +1821,161 @@ mod tests {
             .to_string();
         assert!(error.contains("ordered fitted IC-LoRA clips"), "{error}");
         assert_eq!(crossed.memory, None);
+    }
+
+    /// sc-20799: `replace_person` is implemented and advertised by this provider's generator, so it
+    /// must also be admissible. It previously fell to `validate_request`'s catch-all, which made
+    /// the mode unreachable behind an admitted memory rung. Mirrors the Candle sibling test.
+    #[test]
+    fn replace_person_fixture_binds_the_masked_clip_and_character_sheet_identity() {
+        let spec = fixture_spec();
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "replace_person")
+            .expect("replace_person ships a behavior fixture");
+        assert_eq!(fixture.context.geometry.reference_count, 2);
+        assert!(fixture.context.has_reference);
+        // The shared scope core compares this against the admitted geometry; if the two counters
+        // disagreed the mode would be unreachable no matter what the arms below accept.
+        assert_eq!(
+            fixture.request.memory_reference_count(),
+            fixture.context.geometry.reference_count
+        );
+        let mut scope = registered_begin_request(&spec, &contract, &fixture.context)
+            .unwrap()
+            .unwrap();
+        let mut accepted = fixture.request.clone();
+        scope.configure_request(&mut accepted).unwrap();
+        assert!(accepted.memory.unwrap().stage_residency);
+
+        // Carrier order is free (the generator accepts either), so swapping must NOT fail.
+        let mut swapped = fixture.request.clone();
+        swapped.conditioning.swap(0, 1);
+        scope.configure_request(&mut swapped).unwrap();
+
+        for (label, cross) in [
+            (
+                "reference cardinality",
+                Box::new(|request: &mut GenerationRequest| {
+                    if let Conditioning::MultiReference { images } = &mut request.conditioning[1] {
+                        images.push(images[0].clone());
+                    }
+                }) as Box<dyn Fn(&mut GenerationRequest)>,
+            ),
+            (
+                "mask blend weight",
+                Box::new(|request: &mut GenerationRequest| {
+                    if let Conditioning::ControlClip {
+                        masking_strength, ..
+                    } = &mut request.conditioning[0]
+                    {
+                        *masking_strength = 0.5;
+                    }
+                }),
+            ),
+            (
+                "replacement mode",
+                Box::new(|request: &mut GenerationRequest| {
+                    if let Conditioning::ControlClip { mode, .. } = &mut request.conditioning[0] {
+                        *mode = gen_core::ReplacementMode::FaceOnly;
+                    }
+                }),
+            ),
+            (
+                "clip start frame",
+                Box::new(|request: &mut GenerationRequest| {
+                    if let Conditioning::ControlClip { start_frame, .. } =
+                        &mut request.conditioning[0]
+                    {
+                        *start_frame = 1;
+                    }
+                }),
+            ),
+        ] {
+            let mut crossed = fixture.request.clone();
+            cross(&mut crossed);
+            let error = scope
+                .configure_request(&mut crossed)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("replace_person admission requires"),
+                "crossing the {label} must not be admitted: {error}"
+            );
+            assert_eq!(crossed.memory, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn replace_person_admission_refuses_a_crossed_or_missing_receipt() {
+        let spec = fixture_spec();
+        let contract = weights_free_memory_strategy_contract(&spec).unwrap();
+        let fixture = registered_valid_fixtures(&spec, &contract, MemoryStrategy::StagedResidency)
+            .unwrap()
+            .into_iter()
+            .find(|fixture| fixture.context.mode.as_key() == "replace_person")
+            .unwrap();
+        let geometry = fixture.context.geometry;
+        assert!(replace_person_axes_shape_ok(
+            &admitted_replace_person_axes(fixture.context.overlay.as_deref()),
+            geometry
+        ));
+        let load = route_overlay(&spec);
+        let with_load = |receipt: &str| match &load {
+            Some(load) => format!("{load}+{receipt}"),
+            None => receipt.to_owned(),
+        };
+        for crossed in [
+            None,
+            Some(with_load("")),
+            // One axis only.
+            Some(with_load(&format!(
+                "reference:sheet:2:image:{}x{}",
+                geometry.width, geometry.height
+            ))),
+            // A sheet that claims a different cardinality than the admitted geometry.
+            Some(with_load(&format!(
+                "clip:replace:frames:{}:image:{}x{}:frame:0:mode:1:mask:{:08x}+reference:sheet:3:image:{}x{}",
+                geometry.frames,
+                geometry.width,
+                geometry.height,
+                1.0_f32.to_bits(),
+                geometry.width,
+                geometry.height
+            ))),
+            // An out-of-range mask blend weight.
+            Some(with_load(&format!(
+                "clip:replace:frames:{}:image:{}x{}:frame:0:mode:1:mask:{:08x}+reference:sheet:2:image:{}x{}",
+                geometry.frames,
+                geometry.width,
+                geometry.height,
+                2.0_f32.to_bits(),
+                geometry.width,
+                geometry.height
+            ))),
+            // An undeclared replacement mode ordinal.
+            Some(with_load(&format!(
+                "clip:replace:frames:{}:image:{}x{}:frame:0:mode:9:mask:{:08x}+reference:sheet:2:image:{}x{}",
+                geometry.frames,
+                geometry.width,
+                geometry.height,
+                1.0_f32.to_bits(),
+                geometry.width,
+                geometry.height
+            ))),
+        ] {
+            let mut context = fixture.context.clone();
+            context.overlay = crossed.clone();
+            assert!(
+                matches!(
+                    registered_safety_check(&spec, &contract, &context),
+                    MemorySafetyDecision::Reject { .. }
+                ),
+                "{crossed:?} must not be admitted"
+            );
+        }
     }
 
     #[test]
