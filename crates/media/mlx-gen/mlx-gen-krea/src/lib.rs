@@ -91,7 +91,7 @@ pub use multiphase::{
 };
 pub use native_remap::{
     diffusers_logical_shape, native_dit_key_to_diffusers, remap_native_dit_to_diffusers,
-    DeclaredLogicalShapes, KreaNativeToDiffusersMapping,
+    DeclaredLogicalShapes, KreaDiffusersKeyMapping, KreaNativeToDiffusersMapping,
 };
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
