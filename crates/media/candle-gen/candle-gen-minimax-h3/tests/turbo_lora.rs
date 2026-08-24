@@ -62,11 +62,15 @@ fn dev() -> Device {
 
 /// A deterministic host-built tensor — no RNG stream, so every arm sees identical bytes.
 fn tensor(shape: &[usize], seed: f32) -> Tensor {
+    tensor_on(shape, seed, &dev())
+}
+
+fn tensor_on(shape: &[usize], seed: f32, device: &Device) -> Tensor {
     let n: usize = shape.iter().product();
     let v: Vec<f32> = (0..n)
         .map(|i| ((i as f32 * 0.013 + seed).sin()) * 0.25)
         .collect();
-    Tensor::from_vec(v, shape, &dev()).expect("fixture tensor")
+    Tensor::from_vec(v, shape, device).expect("deterministic tensor")
 }
 
 /// Cast to `bf16` — the dtype **every** tensor in **every** published turbo file carries.
@@ -2130,6 +2134,10 @@ fn a_malformed_fused_qkv_is_refused_by_name() {
 const TRAINER_LORA_ENV: &str = "MINIMAX_H3_TRAINER_LORA";
 const TRAINER_LORA_SHA256_ENV: &str = "MINIMAX_H3_TRAINER_LORA_SHA256";
 const TRAINER_LORA_BYTES_ENV: &str = "MINIMAX_H3_TRAINER_LORA_BYTES";
+const TRAINER_DIT_ENV: &str = "MINIMAX_H3_DIT";
+const SC21028_TRAINER_LORA_SHA256: &str =
+    "1fd239662f6290255b0bb3a220764fb53aab2859378f7fd3024030c1e1991cb2";
+const SC21028_TRAINER_LORA_BYTES: u64 = 298_263_792;
 
 /// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
 /// supplied. The optional digest and byte count bind a local receipt to a known artifact when the
@@ -2174,6 +2182,38 @@ fn assert_optional_trainer_artifact_identity(path: &Path, bytes: u64, sha256: &s
         );
         assert_eq!(sha256, expected, "{} SHA-256", path.display());
     }
+}
+
+fn assert_sc21028_trainer_artifact_identity(path: &Path, bytes: u64, sha256: &str) {
+    assert_eq!(
+        bytes,
+        SC21028_TRAINER_LORA_BYTES,
+        "{} is not the exact SC-21028 trainer artifact: byte count",
+        path.display()
+    );
+    assert_eq!(
+        sha256,
+        SC21028_TRAINER_LORA_SHA256,
+        "{} is not the exact SC-21028 trainer artifact: SHA-256",
+        path.display()
+    );
+    assert_optional_trainer_artifact_identity(path, bytes, sha256);
+}
+
+fn trainer_dit_path() -> PathBuf {
+    let raw = std::env::var(TRAINER_DIT_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{TRAINER_DIT_ENV}=<real MiniMax-H3 transformer component directory> is required; \
+             this ignored runtime receipt never skips"
+        )
+    });
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_dir() && path.join("config.json").is_file(),
+        "{TRAINER_DIT_ENV}={} must be a real transformer component directory with config.json",
+        path.display()
+    );
+    path
 }
 
 fn converted_lora_module(key: &str) -> Option<&str> {
@@ -2261,5 +2301,119 @@ fn exact_h3_trainer_file_receipt() {
     println!(
         "SC21028_TRAINER_RUNTIME_RECEIPT_REQUIRED backend=candle full_model=MINIMAX_H3 transformer \
          blocks=50 accelerator=CUDA status=not_run"
+    );
+}
+
+/// Manual Candle/CUDA receipt for the exact SC-21028 trainer artifact against a real 50-block DiT.
+///
+/// Installation is audited over all 300 trunk projections. A deterministic real projection
+/// forward before and after install supplies the numerical gate: relative max-abs-diff, never
+/// shape or cosine.
+///
+/// ```text
+/// set MINIMAX_H3_TRAINER_LORA=E:\path\deepthroat_v02.safetensors
+/// set MINIMAX_H3_DIT=E:\path\to\a\real\tier\transformer
+/// cargo test --release --locked --features cuda -p candle-gen-minimax-h3 --test integration \
+///   turbo_lora::manual_cuda_exact_h3_trainer_runtime_receipt -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "manual Candle/CUDA real-weight receipt; needs exact trainer LoRA and a 50-block DiT"]
+fn manual_cuda_exact_h3_trainer_runtime_receipt() {
+    let lora = trainer_lora_path();
+    let bytes = std::fs::metadata(&lora)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", lora.display()))
+        .len();
+    let sha256 = sha256_of(&lora);
+    assert_sc21028_trainer_artifact_identity(&lora, bytes, &sha256);
+
+    let dit_dir = trainer_dit_path();
+    let cfg = MiniMaxH3DitConfig::from_diffusers_json(
+        &std::fs::read_to_string(dit_dir.join("config.json"))
+            .unwrap_or_else(|error| panic!("read {}/config.json: {error}", dit_dir.display())),
+    )
+    .expect("parse the real MiniMax-H3 transformer config");
+    assert_eq!(
+        cfg,
+        MiniMaxH3DitConfig::default(),
+        "the runtime receipt requires the published 50-block MiniMax-H3 geometry"
+    );
+
+    let device = candle_gen::default_device().expect("initialize Candle CUDA device");
+    assert!(
+        device.is_cuda(),
+        "this receipt requires --features cuda and a live CUDA device, got {device:?}"
+    );
+    let mut dit = MiniMaxH3Dit::load_from_dir(&dit_dir, &device, DType::BF16)
+        .unwrap_or_else(|error| panic!("load real DiT {}: {error}", dit_dir.display()));
+    assert_eq!(
+        dit.num_layers(),
+        50,
+        "the real DiT must contain all 50 blocks"
+    );
+
+    let probe = "transformer_blocks.0.attn.to_q";
+    let probe_segments = probe.split('.').collect::<Vec<_>>();
+    let x = tensor_on(&[1, 3, cfg.hidden_size], 0.21028, &device)
+        .to_dtype(DType::BF16)
+        .unwrap();
+    let base = dit
+        .adaptable_mut(&probe_segments)
+        .expect("resolve real probe projection before install")
+        .forward(&x)
+        .expect("real base projection forward")
+        .to_dtype(DType::F32)
+        .unwrap();
+    let base_peak = max_abs(&base);
+    assert!(
+        base_peak.is_finite() && base_peak > 1e-6,
+        "real base projection is non-finite or vacuous: max|y|={base_peak:.3e}"
+    );
+
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(lora.clone(), 1.0)])
+        .expect("install the exact trainer LoRA into the real 50-block DiT");
+    assert_eq!(report.applied, 300, "50 blocks × six runtime leaves");
+    assert!(report.unmatched_paths.is_empty(), "zero unmatched targets");
+    assert_eq!(report.converted_from_trainer, 1, "exact trainer namespace");
+    assert_eq!(
+        report.trainer_source_targets_applied, 200,
+        "50 × four source leaves"
+    );
+    assert_eq!(report.trainer_ranks, vec![16], "exact source rank");
+    assert_eq!(report.trainer_alphas, vec![16.0], "exact per-target alpha");
+    assert_eq!(
+        dit.adapted_module_count(),
+        300,
+        "every trunk runtime leaf, and no fabricated refiner leaf, is adapted"
+    );
+
+    let adapted = dit
+        .adaptable_mut(&probe_segments)
+        .expect("resolve real probe projection after install")
+        .forward(&x)
+        .expect("real adapted projection forward")
+        .to_dtype(DType::F32)
+        .unwrap();
+    let relative_max_abs_diff = rel_max_abs(&adapted, &base);
+    assert!(
+        relative_max_abs_diff.is_finite() && relative_max_abs_diff > 1e-6,
+        "the exact trainer LoRA did not measurably change the real {probe} forward: \
+         relative-max-abs-diff={relative_max_abs_diff:.3e}"
+    );
+
+    println!(
+        "SC21028_TRAINER_RUNTIME_RECEIPT backend=candle accelerator=CUDA file={} bytes={bytes} \
+         sha256={sha256} dit={} blocks={} source_targets={} applied={} adapted_modules={} \
+         unmatched={} unique_ranks={:?} unique_alphas={:?} probe={} relative_max_abs_diff={:.6e}",
+        lora.display(),
+        dit_dir.display(),
+        dit.num_layers(),
+        report.trainer_source_targets_applied,
+        report.applied,
+        dit.adapted_module_count(),
+        report.unmatched_paths.len(),
+        report.trainer_ranks,
+        report.trainer_alphas,
+        probe,
+        relative_max_abs_diff,
     );
 }
