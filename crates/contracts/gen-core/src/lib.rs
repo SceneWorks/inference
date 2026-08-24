@@ -192,8 +192,9 @@ pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContra
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
     read_safetensors_tensor_payloads, safetensors_dir_bytes, safetensors_file_tensor_locations,
-    safetensors_path_bytes, safetensors_path_tensor_headers, SafetensorsFileLayout,
-    SafetensorsTensorHeader, SafetensorsTensorLocation,
+    safetensors_path_bytes, safetensors_path_quantization_metadata,
+    safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
+    SafetensorsTensorLocation,
 };
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The

@@ -1378,7 +1378,8 @@ mod tests {
         );
         // A non-zero padding element refuses rather than being trimmed away.
         let mut padded = packed.clone();
-        padded[0 * row_bytes + 41 / 2] |= 0x07;
+        // Row 0, column 41 — an odd column, so the low nibble of byte 20.
+        padded[41 / 2] |= 0x07;
         assert_eq!(
             decode_nvfp4(&padded, &scales, global, stored, logical, &mut out),
             Err(Nvfp4GeometryError::PaddingNotZero {

@@ -92,12 +92,14 @@ pub use repack::{
 pub use sidecar::PackedWeightSidecars;
 
 pub use cublaslt::{
-    compute_cap_meets_fp8_floor, quantize_activation_fp8, quantize_activation_int8,
-    quantize_weight_fp8, quantize_weight_int8, quantize_weight_int8_per_channel, Int8Context,
-    PerChannelInt8Weight, QuantizedActivation, F8E4M3_MAX, FP8_COMPUTE_CAP_FLOOR, I8_MAX,
+    compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,
+    quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
+    quantize_weight_int8_per_channel, Int8Context, PerChannelInt8Weight, QuantizedActivation,
+    F8E4M3_MAX, FP8_COMPUTE_CAP_FLOOR, I8_MAX, NVFP4_COMPUTE_CAP_FLOOR, NVFP4_K_ALIGN,
+    NVFP4_N_ALIGN,
 };
 #[cfg(feature = "cuda")]
-pub use cublaslt::{CublasLt, DevNvfp4, NVFP4_K_ALIGN};
+pub use cublaslt::{CublasLt, DevNvfp4};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
