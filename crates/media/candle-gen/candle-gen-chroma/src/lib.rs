@@ -362,12 +362,10 @@ pub fn register_providers(
         .register_generator(HD_REGISTRATION)
         .register_generator(BASE_REGISTRATION)
         .register_generator(FLASH_REGISTRATION);
-    #[cfg(feature = "cuda")]
-    let registry = register_memory_contract_surfaces(registry)
+    register_memory_contract_surfaces(registry)
         .register_memory_behavior(HD_MEMORY_BEHAVIOR)
         .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
-        .register_memory_behavior(FLASH_MEMORY_BEHAVIOR);
-    registry
+        .register_memory_behavior(FLASH_MEMORY_BEHAVIOR)
 }
 
 fn hd_memory_contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
@@ -428,7 +426,6 @@ const FLASH_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Memory
 
 macro_rules! memory_behavior {
     ($name:ident, $id:expr) => {
-        #[cfg(feature = "cuda")]
         const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
             provider_id: $id,
             valid_fixtures: memory_strategy::registered_valid_fixture,
@@ -516,6 +513,33 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+    }
+
+    /// The registry-level memory lifecycle seams must be reachable on a build with no CUDA
+    /// feature: building the provider catalog is contract-only (no device, no weights), so
+    /// `register_providers` publishes the memory-strategy, weights-free contract-fixture and
+    /// memory-behavior rows on every platform. Gating these behind `cuda` left registry
+    /// lifecycle conformance running on no CPU CI configuration at all.
+    #[test]
+    fn register_providers_publishes_memory_lifecycle_seams_without_cuda() {
+        let registry = super::provider_registry().unwrap();
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(strategies, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+        assert_eq!(fixtures, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
+        assert_eq!(behaviors, ["chroma1_hd", "chroma1_base", "chroma1_flash"]);
     }
 }
 

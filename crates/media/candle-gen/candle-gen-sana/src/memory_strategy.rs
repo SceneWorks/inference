@@ -368,6 +368,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Whether this load can actually execute [`MemoryStrategy::BoundedTransformerResidency`].
+///
+/// Block windowing runs through [`crate::transformer::SanaTransformer::from_files_windowed`], which
+/// pins every transformer shard with `PinnedWeightsFile::pin` and **re-opens** it once per denoise
+/// forward to materialize the selected block window. An eager load has already bulk-materialized the
+/// stack and holds no re-openable pinned files, so the rung is not executable there and must not be
+/// advertised as `Implemented`. Mirrors `candle-gen-qwen-image` and `candle-gen-sensenova`.
+fn streamable(spec: &LoadSpec) -> bool {
+    matches!(
+        spec.load_shape,
+        gen_core::LoadShape::DeferredMaterialization
+    ) && matches!(spec.weights, WeightsSource::Dir(_))
+}
+
 fn build_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
@@ -386,19 +400,67 @@ fn build_contract(
         assembly.update(pin.loader_path().to_string_lossy().as_bytes());
         assembly.update(digest);
     }
-    let receipt = format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex(&assembly.finalize()));
+    Ok(assemble_contract(
+        variant,
+        spec,
+        format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex(&assembly.finalize())),
+        MemoryAssetFacts {
+            base_bytes: conditioning
+                .saturating_add(transformer)
+                .saturating_add(decoder),
+            conditioning_bytes: conditioning,
+            transformer_bytes: transformer,
+            decoder_bytes: decoder,
+            overlay_bytes: 0,
+        },
+    ))
+}
+
+/// The registry-only, weights-free contract: the exact route declaration the sealed contract
+/// publishes, with zero asset facts injected and no filesystem traversal.
+///
+/// The physical receipt is deliberately absent rather than synthesized — it is a digest OF the
+/// pinned assets, and a stand-in would be a machine-independent-looking value standing for facts
+/// nobody measured. The route stays distinguishable through `contract.calibration`, which is keyed
+/// on the variant.
+pub fn weights_free_contract(
+    variant: SanaVariant,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    validate_load_spec(variant, spec)?;
+    Ok(assemble_contract(
+        variant,
+        spec,
+        String::new(),
+        MemoryAssetFacts::default(),
+    ))
+}
+
+fn assemble_contract(
+    variant: SanaVariant,
+    spec: &LoadSpec,
+    receipt: String,
+    asset_facts: MemoryAssetFacts,
+) -> MemoryProviderContract {
+    let transformer = asset_facts.transformer_bytes;
+    let streamable = streamable(spec);
     let mut contract = MemoryProviderContract::compatibility_default(
         variant.provider_id(),
         MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
-            host_to_device_block_materialization: true,
+            host_to_device_block_materialization: streamable,
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
     contract.load_shape = spec.load_shape;
     for capability in &mut contract.strategies {
-        capability.support = MemoryStrategySupport::Implemented;
+        capability.support =
+            if capability.strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
+                MemoryStrategySupport::Missing
+            } else {
+                MemoryStrategySupport::Implemented
+            };
         capability.parameters = match capability.strategy {
             MemoryStrategy::BoundedDecode => MemoryParameterRanges {
                 decode_tile_edges: vec![DECODE_TILE_EDGE],
@@ -409,7 +471,7 @@ fn build_contract(
                 attention_chunk_sizes: ATTENTION_CHUNK_SIZES.to_vec(),
                 ..Default::default()
             },
-            MemoryStrategy::BoundedTransformerResidency => MemoryParameterRanges {
+            MemoryStrategy::BoundedTransformerResidency if streamable => MemoryParameterRanges {
                 transformer_window_sizes: TRANSFORMER_WINDOW_SIZES.to_vec(),
                 transformer_window_components: vec![TransformerComponent::Dit],
                 ..Default::default()
@@ -423,6 +485,7 @@ fn build_contract(
         MemoryStrategy::BoundedTransformerResidency,
     ]
     .into_iter()
+    .filter(|strategy| streamable || *strategy != MemoryStrategy::BoundedTransformerResidency)
     .map(|strategy| {
         (
             strategy,
@@ -442,7 +505,7 @@ fn build_contract(
         synchronized_phase_release: true,
         decode_tiling: true,
         attention_chunking: true,
-        transformer_window_materialization: true,
+        transformer_window_materialization: streamable,
     };
     contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
@@ -455,13 +518,20 @@ fn build_contract(
             MemoryFormulaVariable::AttentionChunkSize,
             MemoryFormulaVariable::TransformerWindowSize,
         ],
-        resident_components: vec![MemoryResidentComponent {
-            id: receipt,
-            kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
-            resident_bytes: transformer,
-            bounded_by: Some(MemoryStrategy::StagedResidency),
-            residency: MemoryComponentResidency::WholeRender,
-        }],
+        // A resident component must declare non-zero bytes, so the weights-free fixture — which
+        // injects zero asset facts by construction — publishes none. The physical receipt it would
+        // have carried is an asset digest and has no meaning without the assets.
+        resident_components: if transformer == 0 {
+            Vec::new()
+        } else {
+            vec![MemoryResidentComponent {
+                id: receipt,
+                kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+                resident_bytes: transformer,
+                bounded_by: Some(MemoryStrategy::StagedResidency),
+                residency: MemoryComponentResidency::WholeRender,
+            }]
+        },
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         format!(
@@ -473,16 +543,8 @@ fn build_contract(
         ),
         spec.load_shape,
     ));
-    contract.asset_facts = MemoryAssetFacts {
-        base_bytes: conditioning
-            .saturating_add(transformer)
-            .saturating_add(decoder),
-        conditioning_bytes: conditioning,
-        transformer_bytes: transformer,
-        decoder_bytes: decoder,
-        overlay_bytes: 0,
-    };
-    Ok(contract)
+    contract.asset_facts = asset_facts;
+    contract
 }
 
 pub fn resolved_numeric_tier() -> MemoryNumericTier {
@@ -510,7 +572,16 @@ fn supported_route(context: &MemoryRunContext) -> bool {
 
 pub fn validate_context(seal: &SanaLoadSeal, context: &MemoryRunContext) -> gen_core::Result<()> {
     seal.ensure_unchanged()?;
-    let contract = seal.contract();
+    validate_context_axes(seal.contract(), context)
+}
+
+/// Every route/tier/evidence axis check the sealed admission runs, minus the on-disk snapshot
+/// re-verification. Split out so the weights-free registry seam runs the *same* admission logic
+/// against a fixture contract instead of a parallel, weaker reimplementation.
+fn validate_context_axes(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
     if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
@@ -785,6 +856,9 @@ impl MemoryRequestScope for Scope {
         }
     }
     fn leave_phase(&mut self, _: MemoryPhase) -> gen_core::Result<()> {
+        if self.finished {
+            return Err(gen_core::Error::Unsupported("SANA scope finished".into()));
+        }
         self.device.synchronize().map_err(gen_core::Error::backend)
     }
     fn configure_decode(
@@ -793,6 +867,9 @@ impl MemoryRequestScope for Scope {
         overlap: u32,
         geometry: MemoryGeometry,
     ) -> gen_core::Result<()> {
+        if self.finished {
+            return Err(gen_core::Error::Unsupported("SANA scope finished".into()));
+        }
         if geometry != self.geometry || edge != DECODE_TILE_EDGE || overlap != DECODE_OVERLAP {
             Err(gen_core::Error::Unsupported(
                 "SANA decode parameters or geometry were not admitted".into(),
@@ -802,6 +879,9 @@ impl MemoryRequestScope for Scope {
         }
     }
     fn configure_attention(&mut self, size: u32) -> gen_core::Result<()> {
+        if self.finished {
+            return Err(gen_core::Error::Unsupported("SANA scope finished".into()));
+        }
         if ATTENTION_CHUNK_SIZES.contains(&size) {
             Ok(())
         } else {
@@ -811,6 +891,9 @@ impl MemoryRequestScope for Scope {
         }
     }
     fn materialize_transformer_window(&mut self, first: u32, count: u32) -> gen_core::Result<()> {
+        if self.finished {
+            return Err(gen_core::Error::Unsupported("SANA scope finished".into()));
+        }
         let window = self
             .memory
             .and_then(|memory| memory.transformer_window_size)
@@ -827,6 +910,11 @@ impl MemoryRequestScope for Scope {
         }
     }
     fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+        if self.finished {
+            return Err(gen_core::Error::Unsupported(
+                "SANA scope was already finished".into(),
+            ));
+        }
         self.device
             .synchronize()
             .map_err(gen_core::Error::backend)?;
@@ -892,6 +980,160 @@ pub fn registered_valid_fixture(
     context.evidence_revision = REQUEST_EVIDENCE_REVISION.to_owned();
     Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
 }
+
+// -------------------------------------------------------------------------------------------------
+// Pre-load registry seams (sc-19753 feature review, BLOCKER 4)
+//
+// Without these a selector cannot price SANA before weights land: the crate registered two
+// generators and nothing else, so `ProviderRegistry` memory resolution had no SANA route at all.
+// Construction is deliberately CUDA-free — everything below runs on a host with no GPU, so
+// `register_memory_contract_surfaces` is called unconditionally from `register_providers`.
+// -------------------------------------------------------------------------------------------------
+
+/// Production, pre-load contract for one variant: seals the immutable snapshot exactly as `load`
+/// does, so the registered contract is the one the loaded generator will publish.
+pub fn provider_contract(
+    variant: SanaVariant,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    Ok(SanaLoadSeal::capture(variant, spec)?.contract().clone())
+}
+
+/// The loaded generator's real admission check, reachable before weights are opened.
+///
+/// Weights-free fixture contracts (zero [`MemoryAssetFacts`]) take the axis-only path; a real
+/// contract re-seals the snapshot, so this is the same decision [`safety_check`] returns.
+pub fn registered_safety_check(
+    variant: SanaVariant,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    let result = if contract.asset_facts == MemoryAssetFacts::default() {
+        validate_context_axes(contract, context)
+    } else {
+        SanaLoadSeal::capture(variant, spec).and_then(|seal| validate_context(&seal, context))
+    };
+    match result {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Executable conformance entry point. Only rungs this contract actually declares `Implemented`
+/// produce a fixture, so a non-streamable spec yields none for
+/// [`MemoryStrategy::BoundedTransformerResidency`].
+pub fn registered_valid_fixtures(
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let mut context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        resolved_numeric_tier(),
+        gen_core::MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )?;
+    context.evidence_revision = REQUEST_EVIDENCE_REVISION.to_owned();
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+/// Open a conformance request scope through the same admission state machine production uses:
+/// validate, `approve`, then `begin`. `Device::Cpu` keeps construction GPU-free — the scope's only
+/// device interaction is a `synchronize()` on `finish`, a no-op on CPU.
+pub fn registered_begin_request(
+    variant: SanaVariant,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    let admission = AdmissionRegistry::new(variant.provider_id());
+    if contract.asset_facts == MemoryAssetFacts::default() {
+        validate_context_axes(contract, context)?;
+        admission.approve(context)?;
+        let token = admission.begin(contract, context)?;
+        return Ok(Some(Box::new(Scope {
+            device: Device::Cpu,
+            admission,
+            token,
+            geometry: context.geometry,
+            memory: contract.generation_memory(&context.selection),
+            finished: false,
+        })));
+    }
+    let seal = SanaLoadSeal::capture(variant, spec)?;
+    validate_context(&seal, context)?;
+    admission.approve(context)?;
+    begin_request(&seal, admission, Device::Cpu, context)
+}
+
+/// Complete weights-free registry-load surface for a SANA route.
+///
+/// The common Candle surface publishes bf16/q4/q8, but Candle SANA is **dense-only**:
+/// this crate's private `validate_load_spec` rejects any `quantize`, so a q4/q8 witness would name
+/// a route this crate cannot load and the registry would fail the whole surface. Filter the shared helper rather than
+/// hand-rolling the offload/load-shape cross product, so a future axis added to gen-core still
+/// reaches this provider.
+pub fn surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| {
+            surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Bf16
+        })
+        .collect()
+}
+
+pub const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: crate::MODEL_ID,
+    contract: |spec| provider_contract(SanaVariant::Base, spec),
+    safety_check: |spec, contract, context| {
+        registered_safety_check(SanaVariant::Base, spec, contract, context)
+    },
+};
+
+pub const SPRINT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: crate::SPRINT_MODEL_ID,
+    contract: |spec| provider_contract(SanaVariant::Sprint, spec),
+    safety_check: |spec, contract, context| {
+        registered_safety_check(SanaVariant::Sprint, spec, contract, context)
+    },
+};
+
+pub const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::MODEL_ID,
+        valid_fixtures: registered_valid_fixtures,
+        begin_request: |spec, contract, context| {
+            registered_begin_request(SanaVariant::Base, spec, contract, context)
+        },
+    };
+
+pub const SPRINT_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::SPRINT_MODEL_ID,
+        valid_fixtures: registered_valid_fixtures,
+        begin_request: |spec, contract, context| {
+            registered_begin_request(SanaVariant::Sprint, spec, contract, context)
+        },
+    };
 
 #[cfg(test)]
 pub(crate) fn fixture_snapshot(variant: SanaVariant) -> (tempfile::TempDir, PathBuf) {
@@ -988,6 +1230,171 @@ mod tests {
         .unwrap();
         context.evidence_revision = REQUEST_EVIDENCE_REVISION.to_owned();
         context
+    }
+
+    /// sc-19753 feature review, MAJOR 10 — rung 4 is only executable when the load can re-open its
+    /// transformer shards.
+    ///
+    /// `SanaTransformer::from_files_windowed` pins every transformer file and re-opens it per
+    /// denoise forward to materialize the selected block window. An eager load has already
+    /// bulk-materialized the stack, so the rung is not executable there and declaring it
+    /// `Implemented` would let a selector price and then select a window SANA cannot honor. Both
+    /// arms use the identical snapshot; only `load_shape` differs, so the rung declaration is
+    /// attributable to streamability alone.
+    #[test]
+    fn block_windowing_is_declared_only_for_a_streamable_load() {
+        for variant in [SanaVariant::Base, SanaVariant::Sprint] {
+            let (_temp, root) = fixture_snapshot(variant);
+            let capability = |shape| {
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+                spec.load_shape = shape;
+                let contract = SanaLoadSeal::capture(variant, &spec)
+                    .unwrap()
+                    .contract()
+                    .clone();
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{:?}",
+                    contract.conformance_errors()
+                );
+                contract
+            };
+
+            let eager = capability(LoadShape::EagerMaterialization);
+            let rung = eager
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert_eq!(
+                rung.support,
+                MemoryStrategySupport::Missing,
+                "{}: an eager load holds no re-openable pinned shards, so block windowing is not \
+                 executable and must not be advertised",
+                variant.provider_id()
+            );
+            assert!(
+                rung.parameters.transformer_window_sizes.is_empty()
+                    && rung.parameters.transformer_window_components.is_empty(),
+                "{}: a Missing rung must not publish a selectable window menu",
+                variant.provider_id()
+            );
+            assert!(
+                !eager.lifecycle.transformer_window_materialization,
+                "{}: the lifecycle hook must agree with the rung declaration",
+                variant.provider_id()
+            );
+            assert!(
+                !eager
+                    .additional_prerequisites
+                    .iter()
+                    .any(|(strategy, _)| *strategy == MemoryStrategy::BoundedTransformerResidency),
+                "{}: an undeclared rung must not carry a prerequisite",
+                variant.provider_id()
+            );
+            // Every other optimized rung is unaffected by load shape.
+            for strategy in [
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+            ] {
+                assert_eq!(
+                    eager.capability(strategy).unwrap().support,
+                    MemoryStrategySupport::Implemented,
+                    "{}: {strategy:?} does not depend on streamability",
+                    variant.provider_id()
+                );
+            }
+
+            let deferred = capability(LoadShape::DeferredMaterialization);
+            let rung = deferred
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap();
+            assert_eq!(
+                rung.support,
+                MemoryStrategySupport::Implemented,
+                "{}: a deferred load CAN re-open its shards, so the rung must stay available",
+                variant.provider_id()
+            );
+            assert_eq!(
+                rung.parameters.transformer_window_sizes,
+                TRANSFORMER_WINDOW_SIZES.to_vec()
+            );
+            assert!(deferred.lifecycle.transformer_window_materialization);
+        }
+    }
+
+    /// sc-19753 feature review, BLOCKER 4 — the fixture contract must be usable with no weights and
+    /// no filesystem, and must still publish the same route declaration as the sealed contract.
+    #[test]
+    fn the_weights_free_contract_needs_no_snapshot_and_keeps_the_route_declaration() {
+        for variant in [SanaVariant::Base, SanaVariant::Sprint] {
+            let missing = tempfile::tempdir().unwrap().path().join("never-created");
+            assert!(!missing.exists());
+            let mut spec = LoadSpec::new(WeightsSource::Dir(missing));
+            spec.load_shape = LoadShape::DeferredMaterialization;
+
+            let fixture = weights_free_contract(variant, &spec).unwrap();
+            assert_eq!(fixture.provider_id, variant.provider_id());
+            assert_eq!(
+                fixture.asset_facts,
+                MemoryAssetFacts::default(),
+                "a fixture must inject zero asset facts"
+            );
+            assert!(
+                fixture.conformance_errors().is_empty(),
+                "{:?}",
+                fixture.conformance_errors()
+            );
+            for strategy in MemoryStrategy::ALL {
+                assert_eq!(
+                    fixture.capability(strategy).unwrap().support,
+                    MemoryStrategySupport::Implemented,
+                    "{}: {strategy:?}",
+                    variant.provider_id()
+                );
+            }
+            assert_eq!(
+                fixture
+                    .capability(MemoryStrategy::BoundedDecode)
+                    .unwrap()
+                    .parameters
+                    .decode_tile_edges,
+                vec![DECODE_TILE_EDGE]
+            );
+
+            // An eager fixture drops rung 4 exactly as the sealed contract does.
+            let mut eager = spec.clone();
+            eager.load_shape = LoadShape::EagerMaterialization;
+            assert_eq!(
+                weights_free_contract(variant, &eager)
+                    .unwrap()
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing
+            );
+        }
+
+        // The two routes must stay distinguishable without assets, and must not silently claim a
+        // physical receipt they never measured.
+        let mut spec = LoadSpec::new(WeightsSource::Dir("unused".into()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let base = weights_free_contract(SanaVariant::Base, &spec).unwrap();
+        let sprint = weights_free_contract(SanaVariant::Sprint, &spec).unwrap();
+        assert_ne!(base.provider_id, sprint.provider_id);
+        assert_ne!(base.calibration, sprint.calibration);
+        for contract in [&base, &sprint] {
+            let MemoryFormulaKind::ComponentPhaseEnvelope {
+                resident_components,
+                ..
+            } = &contract.formula
+            else {
+                panic!("SANA publishes a component-phase envelope");
+            };
+            assert!(
+                resident_components.is_empty(),
+                "{}: a weights-free contract has no measured resident bytes to attest",
+                contract.provider_id
+            );
+        }
     }
 
     #[test]

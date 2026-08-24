@@ -1325,19 +1325,36 @@ mod tests {
     /// hand-composed head/tail pair, so the policy that decides *what* gets tiled is under test too.
     /// An 80²-head is required for the production `spatial_only(192, 48)` gate to actually split.
     ///
-    /// At the released 192/48 physical domain, this fixture holds the shipped path to the ≥40 dB
-    /// seam-free floor, the whole-decoder defect below the ≥34.75 dB no-measurable-seam bar, and a
-    /// ≥20 dB separation between them. That separation is a tenfold RMS-error margin, so the test
-    /// still distinguishes the head-whole/tail-tiled implementation from the forbidden
-    /// whole-decoder tiling rather than merely accepting any tiled decode.
+    /// Measured on this fixture (80² latent, 640² output, CPU f32, `Device::Cpu`) at the released
+    /// 192/48 physical domain — the same singleton `mlx-gen-sana` ships as its decode default
+    /// (`mlx-gen-sana/src/pipeline.rs` `DECODE_TILE_EDGE`/`DECODE_OVERLAP`):
+    ///  - shipped (`decode_with(force_tile = true)`): **52.45 dB**
+    ///  - defect (whole-decoder quadrant crops, stitched): **31.47 dB**
+    ///  - separation: **20.98 dB**, i.e. ~11× the RMS error, and the defect sits below the ≥34.75 dB
+    ///    "no measurable seam" bar this codebase uses.
+    ///
+    /// (The 41.96 dB separation recorded here before sc-19753's geometry alignment was measured at
+    /// the *pre-alignment* `spatial_only(512, 128)` domain, which advertised a request shape Candle
+    /// does not execute. The narrower separation below is the true 192/48 number, not a relaxation.)
+    ///
+    /// Mutation-discrimination of the `>= 20.0` separation guard specifically (measured, not
+    /// assumed) — note the guard has bite the `>= 40.0` floor does **not**:
+    ///  - overlap → 0 (`spatial_only(DECODE_TILE_EDGE, 0)`, so abutting tiles each zero-pad at their
+    ///    own edge with nothing to blend): shipped collapses to **29.32 dB**, separation **-2.15 dB**
+    ///    — fires both the floor and the separation guard.
+    ///  - overlap → 16 (`spatial_only(DECODE_TILE_EDGE, 16)`, a *partially* degraded blend cell):
+    ///    shipped **44.72 dB**, which still **passes** the ≥40 dB floor, but the separation falls to
+    ///    **13.25 dB** and only the `>= 20.0` guard catches it. This is why the separation bound is
+    ///    load-bearing at 20.0 (0.98 dB of slack) rather than a nominal number.
     ///
     /// Two notes on what this test deliberately does **not** claim. The *sharp* guard on head globality
     /// is `decoder_tail_is_crop_decomposable_but_the_head_is_not` above: with overlap and blending,
     /// tiling this fixture's attention costs only ~1-6 dB, so a blended-PSNR bound is **not** relied on
-    /// to catch it. And deleting the final `broadcast_div` by the accumulated weights is a no-op here —
-    /// the trapezoidal masks really do sum to exactly 1.0
-    /// under full coverage, so that division normalizes nothing at these dims and is not a guard this
-    /// test can hold.
+    /// to catch it. And deleting the final `broadcast_div` by the accumulated weights was re-measured
+    /// at 192/48 to be a *no-op* here (`output.broadcast_div(..)` → `Ok(output)`: shipped stays
+    /// **52.45 dB**, bit-identical to the unmutated run) — the trapezoidal masks really do sum to
+    /// exactly 1.0 under full coverage, so that division normalizes nothing at these dims and is not
+    /// a guard this test can hold.
     #[test]
     fn head_tail_split_is_load_bearing_vs_whole_decoder_tiling() {
         let dev = Device::Cpu;

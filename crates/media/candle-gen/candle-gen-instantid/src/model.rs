@@ -169,6 +169,28 @@ pub struct SdxlComponents {
 }
 
 impl SdxlComponents {
+    /// The resolved fp16-fix VAE source. Read by [`crate::memory_strategy::asset_facts`], which
+    /// lives outside this module and so cannot reach the private field.
+    pub fn vae_fp16_fix(&self) -> &WeightsSource {
+        &self.vae_fp16_fix
+    }
+
+    /// Fixture constructor for the sibling test modules, which cannot reach the private fields.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        tokenizer_clip_l: WeightsSource,
+        tokenizer_clip_bigg: WeightsSource,
+        vae_fp16_fix: WeightsSource,
+    ) -> Self {
+        Self {
+            tokenizer_clip_l,
+            tokenizer_clip_bigg,
+            vae_fp16_fix,
+        }
+    }
+}
+
+impl SdxlComponents {
     /// Resolve + validate the three SDXL components from a [`LoadSpec`] at load time (epic 13657,
     /// sc-13739) — the same gate `candle_gen_sdxl::load` runs, via the shared gen-core validators.
     /// Rejects any component key InstantID does not declare ([`reject_unknown_components`], typed
@@ -666,7 +688,8 @@ impl InstantId {
         identity: crate::memory_strategy::InstantIdMemoryIdentity,
         context: MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract();
+        let contract = crate::memory_strategy::provider_contract_for_paths(paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         crate::memory_strategy::validate_context(&contract, &identity, &context)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         let staged_residency = context.selection.strategy == MemoryStrategy::StagedResidency;
@@ -1606,18 +1629,12 @@ mod tests {
             context.evidence_revision = crate::memory_strategy::REQUEST_EVIDENCE_REVISION.into();
             context
         };
-        let missing = PathBuf::from("/definitely-missing/instantid");
-        let paths = InstantIdPaths {
-            sdxl_base: missing.clone(),
-            identitynet: WeightsSource::Dir(missing.clone()),
-            ip_adapter: missing.clone(),
-            adapters: Vec::new(),
-            sdxl: SdxlComponents {
-                tokenizer_clip_l: WeightsSource::Dir(missing.clone()),
-                tokenizer_clip_bigg: WeightsSource::Dir(missing.clone()),
-                vae_fp16_fix: WeightsSource::Dir(missing),
-            },
-        };
+        // The composition is a synthetic tree of tiny safetensors rather than a missing path: the
+        // memory contract now prices its declared asset/overlay bytes from the inventory (header
+        // reads only). Its tensors are still nothing SDXL can build, so the resident reload below
+        // remains a genuine load failure.
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, ..) = crate::memory_strategy::tests::priced_paths(&temp);
         let mut model = InstantId::load_with_memory_context(
             &paths,
             identity.clone(),
@@ -1626,6 +1643,11 @@ mod tests {
         .expect("staged construction must not touch weights");
         assert!(model.staged_residency);
         assert!(model.conditioner.is_none() && model.unet.is_none() && model.vae.is_none());
+        assert_eq!(
+            model.memory_contract.as_ref().unwrap().asset_facts,
+            crate::memory_strategy::asset_facts(&paths).unwrap(),
+            "the retained contract must carry the priced inventory, not a zeroed placeholder"
+        );
 
         let error = model.begin_memory_request(
             &make_context(MemoryStrategy::Resident),

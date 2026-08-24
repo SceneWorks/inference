@@ -201,7 +201,7 @@ impl SdxlEdit {
         context: MemoryRunContext,
     ) -> Result<Self> {
         crate::memory_strategy::validate_edit_spec(paths, spec)?;
-        let seal = SdxlArtifactSeal::capture(spec)?;
+        let seal = SdxlArtifactSeal::capture_for(spec, crate::SdxlSurface::Bespoke)?;
         crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
         crate::memory_strategy::validate_bespoke_context(&context)?;
         let mut model = Self::load(paths)?;
@@ -349,9 +349,7 @@ impl SdxlEdit {
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        let tiling = memory
-            .map(|memory| memory.tile_vae_decode)
-            .unwrap_or_else(crate::vae_tiling_enabled);
+        let tiling = crate::denoise::decode_tiling(memory);
         decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
 

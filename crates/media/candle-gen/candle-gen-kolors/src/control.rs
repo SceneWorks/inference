@@ -232,7 +232,9 @@ impl KolorsControl {
             &contract,
             &paths.kolors_base,
             &context,
-            false,
+            // The strict-pose route always consumes the rendered skeleton as its one conditioning
+            // reference (sc-20762 review); admission must state it rather than claim none.
+            true,
             context.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -251,7 +253,7 @@ impl KolorsControl {
             &contract,
             &paths.kolors_base,
             &context,
-            false,
+            true,
             pid.is_some(),
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -480,6 +482,8 @@ impl KolorsControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        use candle_gen::gen_core::MemoryRequestScope as _;
+
         let admitted = self
             .admitted_context
             .as_ref()
@@ -497,7 +501,7 @@ impl KolorsControl {
             contract,
             &self.source_root,
             context,
-            false,
+            true,
             req.use_pid,
         )
         .map_err(|error| CandleError::Msg(error.to_string()))?;
@@ -506,6 +510,19 @@ impl KolorsControl {
             .ok_or_else(|| CandleError::Msg("kolors-control: missing artifact seal".into()))?
             .ensure_unchanged()
             .map_err(|error| CandleError::Msg(error.to_string()))?;
+        // sc-20762 review: bind the request to the admitted memory key and run it inside the shared
+        // Candle request lifecycle, so cancellation/error cleanup and double-finish rejection are
+        // the same contract every peer route implements.
+        let mut scope = crate::memory_strategy::bespoke_request_scope(
+            crate::memory_strategy::CONTROL_PROVIDER_ID,
+            self.device.clone(),
+            contract,
+            context,
+            req.width,
+            req.height,
+            req.use_pid,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         let result = if context.selection.strategy
             == candle_gen::gen_core::MemoryStrategy::StagedResidency
         {
@@ -513,8 +530,18 @@ impl KolorsControl {
         } else {
             self.generate_inner(req, skeleton, on_progress)
         };
-        let sync = self.device.synchronize().map_err(CandleError::Candle);
-        match (result, sync) {
+        let outcome = match &result {
+            Ok(_) => candle_gen::gen_core::MemoryRunOutcome::Complete,
+            Err(CandleError::Canceled) => candle_gen::gen_core::MemoryRunOutcome::Canceled,
+            Err(error) => candle_gen::gen_core::MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        // `finish` performs the device synchronization the contract's cleanup semantics promise.
+        let cleanup = scope
+            .finish(outcome)
+            .map_err(|error| CandleError::Msg(error.to_string()));
+        match (result, cleanup) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Ok(image), Ok(())) => Ok(image),

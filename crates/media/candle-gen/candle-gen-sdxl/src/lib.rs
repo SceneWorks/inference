@@ -208,8 +208,8 @@ use pipeline::{Components, Pipeline, SdxlComponents};
 pub const MODEL_ID: &str = "sdxl";
 
 pub use memory_strategy::{
-    provider_contract_for_spec, resolved_numeric_tier, SdxlArtifactSeal, REQUEST_EVIDENCE_REVISION,
-    SDXL_ROUTES,
+    provider_contract_for_spec, resolved_numeric_tier, SdxlArtifactSeal, SdxlSurface,
+    REQUEST_EVIDENCE_REVISION, SDXL_ROUTES,
 };
 
 /// SDXL works in latent space at /8: both dims must be multiples of 8. Exposed as the pinned-engine

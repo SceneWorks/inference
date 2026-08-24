@@ -919,15 +919,16 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> gen_core::Result<Box<dyn Generator
         None
     };
     let device = candle_gen::default_device()?;
-    // Eager loads remain lazy until the first generation request and therefore do not require a
-    // populated snapshot merely to construct the generator. Deferred materialization, on the
-    // other hand, depends on a pinned inventory and must fail closed here when an existing root is
-    // incomplete or mutates.
-    let memory_strategy = if memory_strategy::streamable_spec(id, spec) {
-        memory_strategy::provider_contract(id, spec)?
-    } else {
-        memory_strategy::uncalibrated_contract(id, spec)?
-    };
+    // ONE contract for the loaded spec, on every load shape and from every entry point (this
+    // generator seam and `load_understanding_with_spec`). `provider_contract` reads the component
+    // bytes off the same on-disk inventory an eager load already captured above, so an eager load
+    // advertises the same real `asset_facts` as a deferred one for the same weights. Load shape is
+    // still honored *inside* the contract: `build_contract` declares
+    // `BoundedTransformerResidency` `Missing` on a non-streamable spec. Eager loads remain lazy
+    // until the first generation request, so a not-yet-populated root is still contract-legal (no
+    // inventory, zero bytes); an *existing* root must be complete and tier-consistent on both
+    // shapes.
+    let memory_strategy = memory_strategy::provider_contract(id, spec)?;
     Ok(Box::new(SenseNovaGenerator {
         descriptor: descriptor_for(id),
         root,
@@ -1202,6 +1203,73 @@ mod tests {
         for crossed in [0, 3, 5, 11] {
             assert!(validate_interleave_count(&request, crossed).is_err());
         }
+    }
+
+    /// One model, one set of bytes. The eager (non-streamable) load must publish the same real
+    /// component bytes as the deferred load for the same weights — previously the eager branch
+    /// built an `uncalibrated_contract` whose `asset_facts` were all zero, so an eager load of a
+    /// ~35GB checkpoint advertised 0 bytes while the registry advertised full size.
+    #[test]
+    fn eager_and_deferred_contracts_publish_the_same_real_asset_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sensenova-u1-8b-mlx").join("bf16");
+        std::fs::create_dir_all(&root).unwrap();
+        write_minimal_dense_checkpoint(&root);
+        // The real value: the shard bytes actually on disk, not a placeholder.
+        let on_disk = std::fs::metadata(root.join("model.safetensors"))
+            .unwrap()
+            .len();
+        assert!(on_disk > 0);
+
+        let eager = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_resolved_route("sensenova_u1_8b")
+            .with_load_shape(gen_core::LoadShape::EagerMaterialization);
+        let deferred = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_resolved_route("sensenova_u1_8b")
+            .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
+        assert!(!memory_strategy::streamable_spec(MODEL_ID, &eager));
+        assert!(memory_strategy::streamable_spec(MODEL_ID, &deferred));
+
+        let facts = |spec: &LoadSpec| {
+            load(spec)
+                .unwrap()
+                .memory_strategy_contract()
+                .expect("SenseNova publishes a memory contract")
+                .asset_facts
+        };
+        let eager_facts = facts(&eager);
+        let deferred_facts = facts(&deferred);
+        assert_eq!(eager_facts.base_bytes, on_disk);
+        assert_eq!(eager_facts.transformer_bytes, on_disk);
+        assert_eq!(eager_facts.conditioning_bytes, on_disk);
+        assert_eq!(eager_facts, deferred_facts);
+        // ...and the registry's own answer for the same spec is that same number.
+        assert_eq!(
+            memory_strategy::provider_contract(MODEL_ID, &eager)
+                .unwrap()
+                .asset_facts,
+            eager_facts
+        );
+        // The load shape still shows up *inside* the contract, not as a different byte count.
+        let rung = |spec: &LoadSpec| {
+            load(spec)
+                .unwrap()
+                .memory_strategy_contract()
+                .unwrap()
+                .strategies
+                .iter()
+                .find(|capability| {
+                    capability.strategy == gen_core::MemoryStrategy::BoundedTransformerResidency
+                })
+                .unwrap()
+                .support
+                .clone()
+        };
+        assert_eq!(rung(&eager), gen_core::MemoryStrategySupport::Missing);
+        assert_eq!(
+            rung(&deferred),
+            gen_core::MemoryStrategySupport::Implemented
+        );
     }
 
     #[test]

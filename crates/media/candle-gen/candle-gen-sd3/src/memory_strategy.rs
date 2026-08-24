@@ -16,7 +16,6 @@ use candle_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
     MemoryOptimizationAuthority,
@@ -1477,7 +1476,6 @@ pub fn begin_request<'a>(
     )?)))
 }
 
-#[cfg(feature = "cuda")]
 pub fn registered_begin_request(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1502,7 +1500,6 @@ pub fn registered_begin_request(
     )?)))
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1574,7 +1571,6 @@ pub fn registered_valid_fixture(
     .collect()
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn weights_free_behavior_spec(route: Sd35Route, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {
     let tier = match physical_tier_hint(spec) {
         Some(Quant::Q4) => "q4",

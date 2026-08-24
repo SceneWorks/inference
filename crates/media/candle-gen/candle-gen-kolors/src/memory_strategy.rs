@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::{
-    self, AdapterKind, AdapterSpec, GenerationMemory, GenerationRequest, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    self, AdapterKind, AdapterSpec, GenerationMemory, GenerationRequest, LoadSpec,
+    MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
@@ -22,7 +22,11 @@ use candle_gen::gen_core::{
 use sha2::{Digest, Sha256};
 
 pub const REQUEST_EVIDENCE_REVISION: &str = "kolors-candle-request-contract-v1";
-const CALIBRATION_FINGERPRINT: &str = "kolors-candle-staged-chatglm-unet-f32-vae-v1";
+/// Bespoke IP-Adapter-Plus composition id. It owns a contract but no registered generator, so the
+/// catalog reconciles it through an explicit `BespokeMemoryRouteWaiver` rather than a registration.
+pub const IP_PROVIDER_ID: &str = "candle_kolors_ipadapter";
+/// Bespoke strict-pose ControlNet composition id. Waived for the same reason as [`IP_PROVIDER_ID`].
+pub const CONTROL_PROVIDER_ID: &str = "candle_kolors_control";
 pub const KOLORS_REPOSITORY: &str = "SceneWorks/kolors-mlx";
 pub const KOLORS_REVISION: &str = "aadbd49f53b66a33ef1be09384eac409cbc44061";
 pub const IP_REPOSITORY: &str = "Kwai-Kolors/Kolors-IP-Adapter-Plus";
@@ -751,7 +755,7 @@ pub fn provider_contract_for_ip(
     paths: &crate::IpAdapterKolorsPaths,
 ) -> gen_core::Result<MemoryProviderContract> {
     sealed_contract(
-        "candle_kolors_ipadapter",
+        IP_PROVIDER_ID,
         &paths.kolors_base,
         &paths.adapters,
         Some((
@@ -771,7 +775,7 @@ pub fn provider_contract_for_control(
     pid: Option<&PidWeights>,
 ) -> gen_core::Result<MemoryProviderContract> {
     sealed_contract(
-        "candle_kolors_control",
+        CONTROL_PROVIDER_ID,
         &paths.kolors_base,
         &paths.adapters,
         Some((
@@ -805,6 +809,22 @@ pub fn provider_overlay_identity(contract: &MemoryProviderContract) -> Option<St
         .map(|component| component.id.as_str())
         .collect::<Vec<_>>();
     (!identities.is_empty()).then(|| identities.join("+"))
+}
+
+/// Per-provider calibration fingerprint.
+///
+/// The three Kolors contracts share one physical base but are deliberately independent evidence
+/// identities (base T2I/edit, IP-Adapter, strict-pose ControlNet). A single shared fingerprint let
+/// any one of them satisfy another's calibration check, so each mints its own route suffix — the
+/// same shape SDXL/Anima use (`sdxl-candle-{route}-...`).
+fn calibration_fingerprint(provider_id: &str) -> String {
+    let route = match provider_id {
+        IP_PROVIDER_ID => "ipadapter",
+        CONTROL_PROVIDER_ID => "control",
+        // The registered base id (and any future route) names itself; no two ids can collide.
+        other => other,
+    };
+    format!("kolors-candle-{route}-staged-chatglm-unet-f32-vae-v1")
 }
 
 pub fn provider_contract() -> MemoryProviderContract {
@@ -847,7 +867,7 @@ pub fn provider_contract_for(provider_id: &str) -> MemoryProviderContract {
         ],
     };
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(provider_id),
         gen_core::LoadShape::EagerMaterialization,
     ));
     for capability in &mut contract.strategies {
@@ -1087,6 +1107,27 @@ pub fn validate_bespoke_context(
     require_reference: bool,
     require_pid: bool,
 ) -> gen_core::Result<()> {
+    validate_bespoke_context_with_tier(
+        contract,
+        context,
+        physical_tier(root)?,
+        require_reference,
+        require_pid,
+    )
+}
+
+/// The bespoke admission with the numeric tier supplied rather than read off disk.
+///
+/// The loaded providers pass the physically detected tier; the registry's composed pre-load probe
+/// passes the tier its [`LoadSpec`] states, because a bespoke composition is assembled from typed
+/// path structs the registry never sees.
+fn validate_bespoke_context_with_tier(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: MemoryNumericTier,
+    require_reference: bool,
+    require_pid: bool,
+) -> gen_core::Result<()> {
     if context.evidence_revision != REQUEST_EVIDENCE_REVISION {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: evidence revision {} does not match {}",
@@ -1106,15 +1147,21 @@ pub fn validate_bespoke_context(
         )));
     }
     let route_matches = match contract.provider_id.as_str() {
-        "candle_kolors_ipadapter" => {
+        IP_PROVIDER_ID => {
             context.mode == MemoryMode::Other("character_image".to_owned())
                 && context.geometry.reference_count == 1
         }
-        "candle_kolors_control" => {
+        // sc-20762 review: the strict-pose route consumes exactly one conditioning image — the
+        // rendered OpenPose skeleton `KolorsControl::generate` takes by value and embeds once. The
+        // memory key must state that image, so this route is admitted at `reference_count == 1`
+        // (never 0, which claimed a conditioning-free render the provider cannot perform). The
+        // control branch's own identity travels on `context.overlay`, checked above against the
+        // sealed `kolors.control.sha256:` receipt component.
+        CONTROL_PROVIDER_ID => {
             (context.mode == MemoryMode::TextToImage
                 || matches!(&context.mode, MemoryMode::Other(mode)
                     if mode == "style_variations" || mode == "character_image"))
-                && context.geometry.reference_count == 0
+                && context.geometry.reference_count == 1
         }
         _ => false,
     };
@@ -1124,12 +1171,7 @@ pub fn validate_bespoke_context(
             contract.provider_id
         )));
     }
-    match gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(physical_tier(root)?),
-        None,
-    ) {
+    match gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
         MemorySafetyDecision::Accept => Ok(()),
         MemorySafetyDecision::Reject { reason } => Err(gen_core::Error::Unsupported(reason)),
     }
@@ -1141,6 +1183,372 @@ pub fn request_memory(
 ) -> Option<GenerationMemory> {
     contract.generation_memory(&context.selection)
 }
+
+/// Open the shared Candle request lifecycle for one bespoke IP-Adapter / ControlNet run.
+///
+/// The bespoke routes are driven directly by the worker rather than through the registry, so they
+/// previously ran with no [`MemoryRequestScope`] at all: no geometry bind between the admitted
+/// memory key and the request actually rendered, no cancellation/error cleanup contract, and no
+/// double-finish rejection. Routing them through
+/// [`CandleRequestScopeCore`](candle_gen::request_scope::CandleRequestScopeCore) — the same core the
+/// registered route and every SDXL bespoke route use — closes all three (sc-20762 review).
+///
+/// The caller binds the exact request axes here, then finishes the returned scope with the run's
+/// [`MemoryRunOutcome`]; `finish` performs the device synchronization the contract's cleanup
+/// semantics promise, and `Drop` performs it for an early return.
+pub fn bespoke_request_scope(
+    provider_id: &'static str,
+    device: candle_gen::candle_core::Device,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    width: u32,
+    height: u32,
+    use_pid: bool,
+) -> gen_core::Result<candle_gen::request_scope::CandleRequestScopeCore> {
+    if contract.provider_id != provider_id {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: admitted contract belongs to {}",
+            contract.provider_id
+        )));
+    }
+    if context.geometry.width != width
+        || context.geometry.height != height
+        || context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || context.use_pid != use_pid
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: request {width}x{height} pid={use_pid} does not equal the admitted \
+             {}x{}x{} frames={} pid={}",
+            context.geometry.width,
+            context.geometry.height,
+            context.geometry.batch,
+            context.geometry.frames,
+            context.use_pid
+        )));
+    }
+    route_request_scope(provider_id, device, contract, context)
+}
+
+/// The shared scope core every Kolors route opens: bounded decode is `Missing` on all three, so the
+/// decode validator refuses every tile rather than silently accepting one.
+fn route_request_scope(
+    provider_id: &'static str,
+    device: candle_gen::candle_core::Device,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<candle_gen::request_scope::CandleRequestScopeCore> {
+    let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+        provider_id,
+        device,
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        context.use_pid,
+        1,
+        move |_pid, edge, overlap| {
+            Err(gen_core::Error::Unsupported(format!(
+                "{provider_id}: bounded decode is Missing; tile {edge}/{overlap} was never admitted"
+            )))
+        },
+    )?;
+    Ok(candle_gen::request_scope::CandleRequestScopeCore::new(
+        config,
+    ))
+}
+
+// -------------------------------------------------------------------------------------------
+// Registry seams (sc-20762 review).
+//
+// The crate previously registered no memory route at all, so a selector could not price Kolors
+// before load: the contract existed only on an already-constructed `KolorsGenerator`. These
+// functions are the weights-free, CUDA-free half of the same admission the loaded generator runs.
+// -------------------------------------------------------------------------------------------
+
+/// The numeric tier a weights-free probe can state without opening a single weight file.
+///
+/// A packed tier is auto-detected from disk at load (sc-10819), so `LoadSpec::quantize` is only
+/// advisory on a real snapshot; with no snapshot present it is the sole tier evidence there is.
+fn weights_free_tier(spec: &LoadSpec) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: spec.quantize,
+        component_precision_floors: &[],
+    }
+}
+
+/// The registered route's authoritative load seal, or `None` when the lazy root is absent.
+///
+/// This mirrors `crate::load` exactly: a present directory is sealed and priced from its real
+/// bytes; a missing one is the registry-introspection case the loader also permits.
+fn registered_seal(spec: &LoadSpec) -> gen_core::Result<Option<KolorsLoadSeal>> {
+    match &spec.weights {
+        WeightsSource::Dir(root) if root.exists() => Ok(Some(KolorsLoadSeal::capture_load(
+            root,
+            &spec.adapters,
+            spec.pid.as_ref(),
+        )?)),
+        _ => Ok(None),
+    }
+}
+
+/// Reproduce the loaded generator's contract from a [`LoadSpec`] alone.
+pub fn registered_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(match registered_seal(spec)? {
+        Some(seal) => seal.contract().clone(),
+        None => provider_contract(),
+    })
+}
+
+/// The exact admission `KolorsGenerator::memory_strategy_safety_check` runs, callable pre-load.
+pub fn registered_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    let result = registered_seal(spec).and_then(|seal| match seal {
+        Some(seal) => {
+            seal.ensure_unchanged()?;
+            validate_context(contract, context, seal.tier())
+        }
+        None => validate_context(contract, context, weights_free_tier(spec)),
+    });
+    match result {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub fn registered_valid_fixtures(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let mut context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        weights_free_tier(spec),
+        gen_core::MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: false,
+            overlay: provider_overlay_identity(contract),
+        },
+    )?;
+    // The shared builder stamps its own revision string; Kolors admission is bound to the
+    // provider's own, so state it rather than let the fixture be rejected for the wrong reason.
+    context.evidence_revision = REQUEST_EVIDENCE_REVISION.to_owned();
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+pub fn registered_begin_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    match registered_seal(spec)? {
+        Some(seal) => {
+            seal.ensure_unchanged()?;
+            validate_context(contract, context, seal.tier())?;
+        }
+        None => validate_context(contract, context, weights_free_tier(spec))?,
+    }
+    Ok(Some(Box::new(route_request_scope(
+        crate::MODEL_ID,
+        candle_gen::candle_core::Device::Cpu,
+        contract,
+        context,
+    )?)))
+}
+
+pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::MODEL_ID,
+        valid_fixtures: registered_valid_fixtures,
+        begin_request: registered_begin_request,
+    };
+
+pub(crate) const fn memory_registration() -> gen_core::MemoryRegistration {
+    gen_core::MemoryRegistration {
+        provider_id: crate::MODEL_ID,
+        contract: registered_contract,
+        safety_check: registered_safety_check,
+    }
+}
+
+pub(crate) fn surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+}
+
+/// The declaration-only contract catalog conformance uses when no snapshot is on disk. It carries
+/// the same route/strategy declaration as the sealed contract and injects zero asset facts.
+pub fn weights_free_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(provider_contract())
+}
+
+// -------------------------------------------------------------------------------------------
+// Composed (generator-less) routes: IP-Adapter-Plus and strict-pose ControlNet.
+//
+// Both are assembled from typed path structs by the worker rather than resolved through
+// `load(id, spec)`, so neither has — or should invent — a generator descriptor.
+// `ProviderRegistryBuilder::register_composed_memory_strategy` is the seam gen-core provides for
+// exactly that shape (the same one `z_image_control` uses); an ordinary
+// `register_memory_strategy` would be rejected by `build` for having no matching generator.
+// -------------------------------------------------------------------------------------------
+
+/// The PiD identity the registry can read off a contract, matching `validate_context`'s rule.
+fn contract_carries_pid(contract: &MemoryProviderContract) -> bool {
+    contract
+        .resident_components()
+        .iter()
+        .any(|component| component.id.starts_with(PID_RECEIPT_PREFIX))
+}
+
+fn composed_route_id(contract: &MemoryProviderContract) -> gen_core::Result<&'static str> {
+    match contract.provider_id.as_str() {
+        IP_PROVIDER_ID => Ok(IP_PROVIDER_ID),
+        CONTROL_PROVIDER_ID => Ok(CONTROL_PROVIDER_ID),
+        other => Err(gen_core::Error::Unsupported(format!(
+            "kolors: {other} is not a bespoke Kolors composition"
+        ))),
+    }
+}
+
+/// The declaration-only pre-load contract for a bespoke composition.
+///
+/// The sealed contract with real asset facts is minted at load by [`provider_contract_for_ip`] /
+/// [`provider_contract_for_control`] from the caller's typed paths — a `LoadSpec` cannot name them —
+/// so the registry's answer is the route/strategy declaration with zero asset facts.
+pub fn ip_composed_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(provider_contract_for(IP_PROVIDER_ID))
+}
+
+pub fn control_composed_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(provider_contract_for(CONTROL_PROVIDER_ID))
+}
+
+/// The bespoke admission, callable before any weight file exists. Both routes consume exactly one
+/// conditioning image, so `require_reference` is unconditionally true.
+pub fn composed_safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    let result = composed_route_id(contract).and_then(|_| {
+        validate_bespoke_context_with_tier(
+            contract,
+            context,
+            weights_free_tier(spec),
+            true,
+            contract_carries_pid(contract),
+        )
+    });
+    match result {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub fn composed_valid_fixtures(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if !strategy.is_optimized()
+        || !matches!(
+            contract
+                .capability(strategy)
+                .map(|capability| &capability.support),
+            Some(MemoryStrategySupport::Implemented)
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let mode = match composed_route_id(contract)? {
+        // The IP route is reached only through the worker's character-image stream; the pose route
+        // conditions an otherwise text-to-image render.
+        IP_PROVIDER_ID => MemoryMode::Other("character_image".to_owned()),
+        _ => MemoryMode::TextToImage,
+    };
+    let mut context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        weights_free_tier(spec),
+        gen_core::MemoryBehaviorRoute {
+            mode,
+            // The IP reference image / the rendered pose skeleton.
+            reference_count: 1,
+            use_pid: contract_carries_pid(contract),
+            has_phases: false,
+            overlay: provider_overlay_identity(contract),
+        },
+    )?;
+    context.evidence_revision = REQUEST_EVIDENCE_REVISION.to_owned();
+    Ok(vec![gen_core::MemoryBehaviorFixture::new(context)])
+}
+
+pub fn composed_begin_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope>>> {
+    let provider_id = composed_route_id(contract)?;
+    validate_bespoke_context_with_tier(
+        contract,
+        context,
+        weights_free_tier(spec),
+        true,
+        contract_carries_pid(contract),
+    )?;
+    Ok(Some(Box::new(route_request_scope(
+        provider_id,
+        candle_gen::candle_core::Device::Cpu,
+        contract,
+        context,
+    )?)))
+}
+
+pub(crate) const IP_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: IP_PROVIDER_ID,
+        contract: ip_composed_contract,
+        safety_check: composed_safety_check,
+    };
+
+pub(crate) const CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: CONTROL_PROVIDER_ID,
+        contract: control_composed_contract,
+        safety_check: composed_safety_check,
+    };
+
+pub(crate) const IP_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: IP_PROVIDER_ID,
+        valid_fixtures: composed_valid_fixtures,
+        begin_request: composed_begin_request,
+    };
+
+pub(crate) const CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: CONTROL_PROVIDER_ID,
+        valid_fixtures: composed_valid_fixtures,
+        begin_request: composed_begin_request,
+    };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RequestBinding {
@@ -1600,14 +2008,16 @@ mod tests {
                 MemoryOptimizationAuthority::Estimated
             },
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: CALIBRATION_FINGERPRINT.to_owned(),
-            mode: if provider == "candle_kolors_ipadapter" {
+            calibration_fingerprint: calibration_fingerprint(provider),
+            mode: if provider == IP_PROVIDER_ID {
                 MemoryMode::Other("character_image".into())
             } else {
                 MemoryMode::TextToImage
             },
             load_shape: gen_core::LoadShape::EagerMaterialization,
-            has_reference: provider == "candle_kolors_ipadapter",
+            // Both bespoke routes consume exactly one conditioning image (the IP reference / the
+            // rendered pose skeleton); only the registered base T2I route has none.
+            has_reference: provider != crate::MODEL_ID,
             use_pid: false,
             has_phases: false,
             geometry: MemoryGeometry {
@@ -1615,7 +2025,7 @@ mod tests {
                 height: 1024,
                 batch: 1,
                 frames: 1,
-                reference_count: u32::from(provider == "candle_kolors_ipadapter"),
+                reference_count: u32::from(provider != crate::MODEL_ID),
             },
             overlay: None,
             budget: MemoryBudget {
@@ -1698,17 +2108,190 @@ mod tests {
             adapters: vec![],
         };
         let contract = provider_contract_for_control(&paths, None).unwrap();
-        let mut crossed = context("candle_kolors_control", MemoryStrategy::StagedResidency);
+        let mut crossed = context(CONTROL_PROVIDER_ID, MemoryStrategy::StagedResidency);
         crossed.overlay = provider_overlay_identity(&contract);
-        crossed.has_reference = true;
-        crossed.geometry.reference_count = 1;
-        assert!(validate_bespoke_context(&contract, &base, &crossed, false, false).is_err());
-        crossed.has_reference = false;
-        crossed.geometry.reference_count = 0;
+        // The IP route's mode with the control route's contract is still crossed.
         crossed.mode = MemoryMode::Other("character_image".into());
-        assert!(validate_bespoke_context(&contract, &base, &crossed, false, false).is_ok());
+        assert!(validate_bespoke_context(&contract, &base, &crossed, true, false).is_ok());
+        crossed.mode = MemoryMode::Edit;
+        assert!(validate_bespoke_context(&contract, &base, &crossed, true, false).is_err());
+        crossed.mode = MemoryMode::TextToImage;
         crossed.evidence_revision = "crossed-family".into();
-        assert!(validate_bespoke_context(&contract, &base, &crossed, false, false).is_err());
+        assert!(validate_bespoke_context(&contract, &base, &crossed, true, false).is_err());
+    }
+
+    /// sc-20762 review (MAJOR 9): the strict-pose route consumes a rendered OpenPose skeleton on
+    /// every render, so its memory key must state that conditioning image. It previously demanded
+    /// `reference_count == 0` — a key that claimed a conditioning-free render.
+    #[test]
+    fn control_route_requires_the_pose_conditioning_reference_it_consumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = canonical_base(&temp);
+        let control = temp
+            .path()
+            .join(CONTROL_CACHE_NAMESPACE)
+            .join(CONTROL_REVISION)
+            .join("control.safetensors");
+        write_tensor(&control, "BF16", &[4, 4]);
+        let paths = crate::KolorsControlPaths {
+            kolors_base: base.clone(),
+            controlnet: control,
+            adapters: vec![],
+        };
+        let contract = provider_contract_for_control(&paths, None).unwrap();
+
+        let mut admitted = context(CONTROL_PROVIDER_ID, MemoryStrategy::StagedResidency);
+        admitted.overlay = provider_overlay_identity(&contract);
+        assert!(admitted.has_reference);
+        assert_eq!(admitted.geometry.reference_count, 1);
+        validate_bespoke_context(&contract, &base, &admitted, true, false).unwrap();
+
+        // The exact pre-fix shape: no typed reference at all.
+        let mut unconditioned = admitted.clone();
+        unconditioned.has_reference = false;
+        unconditioned.geometry.reference_count = 0;
+        assert!(validate_bespoke_context(&contract, &base, &unconditioned, false, false).is_err());
+
+        // A count that does not match the single skeleton is refused in the other direction too.
+        let mut doubled = admitted;
+        doubled.geometry.reference_count = 2;
+        assert!(validate_bespoke_context(&contract, &base, &doubled, true, false).is_err());
+    }
+
+    /// sc-20762 review (MINOR): the three Kolors contracts share one physical base but are
+    /// independent evidence identities; one shared fingerprint let any of them satisfy another's
+    /// calibration check.
+    #[test]
+    fn each_kolors_route_mints_its_own_calibration_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = canonical_base(&temp);
+        let ip = temp.path().join(IP_CACHE_NAMESPACE).join(IP_REVISION);
+        write_tensor(
+            &ip.join("ip_adapter_plus_general.safetensors"),
+            "BF16",
+            &[3, 5],
+        );
+        write_tensor(&ip.join("image_encoder/model.safetensors"), "BF16", &[7, 2]);
+        let control = temp
+            .path()
+            .join(CONTROL_CACHE_NAMESPACE)
+            .join(CONTROL_REVISION)
+            .join("control.safetensors");
+        write_tensor(&control, "BF16", &[4, 4]);
+
+        let sealed = [
+            provider_contract_for_load(&base, &[], None).unwrap(),
+            provider_contract_for_ip(&crate::IpAdapterKolorsPaths {
+                kolors_base: base.clone(),
+                ip_adapter: ip,
+                adapters: vec![],
+            })
+            .unwrap(),
+            provider_contract_for_control(
+                &crate::KolorsControlPaths {
+                    kolors_base: base,
+                    controlnet: control,
+                    adapters: vec![],
+                },
+                None,
+            )
+            .unwrap(),
+        ];
+        let fingerprints = sealed
+            .iter()
+            .map(|contract| {
+                contract
+                    .calibration
+                    .as_ref()
+                    .expect("every Kolors contract carries a calibration identity")
+                    .fingerprint
+                    .clone()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fingerprints.len(),
+            3,
+            "the three sealed Kolors contracts must not share a calibration fingerprint: {fingerprints:?}"
+        );
+    }
+
+    /// sc-20762 review (MAJOR 14): the bespoke routes ran with no request scope at all — nothing
+    /// bound the admitted geometry to the request rendered, and nothing rejected a second finish.
+    #[test]
+    fn bespoke_request_scope_binds_geometry_and_owns_the_run_lifecycle() {
+        use candle_gen::candle_core::Device;
+        use gen_core::MemoryRequestScope as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = canonical_base(&temp);
+        let control = temp
+            .path()
+            .join(CONTROL_CACHE_NAMESPACE)
+            .join(CONTROL_REVISION)
+            .join("control.safetensors");
+        write_tensor(&control, "BF16", &[4, 4]);
+        let contract = provider_contract_for_control(
+            &crate::KolorsControlPaths {
+                kolors_base: base,
+                controlnet: control,
+                adapters: vec![],
+            },
+            None,
+        )
+        .unwrap();
+        let mut admitted = context(CONTROL_PROVIDER_ID, MemoryStrategy::StagedResidency);
+        admitted.overlay = provider_overlay_identity(&contract);
+
+        // A request that does not equal the admitted geometry never opens a scope.
+        assert!(bespoke_request_scope(
+            CONTROL_PROVIDER_ID,
+            Device::Cpu,
+            &contract,
+            &admitted,
+            512,
+            1024,
+            false
+        )
+        .is_err());
+        // Nor does a crossed provider identity.
+        assert!(bespoke_request_scope(
+            IP_PROVIDER_ID,
+            Device::Cpu,
+            &contract,
+            &admitted,
+            1024,
+            1024,
+            false
+        )
+        .is_err());
+        // Nor a PiD request against a non-PiD admission.
+        assert!(bespoke_request_scope(
+            CONTROL_PROVIDER_ID,
+            Device::Cpu,
+            &contract,
+            &admitted,
+            1024,
+            1024,
+            true
+        )
+        .is_err());
+
+        let mut scope = bespoke_request_scope(
+            CONTROL_PROVIDER_ID,
+            Device::Cpu,
+            &contract,
+            &admitted,
+            1024,
+            1024,
+            false,
+        )
+        .unwrap();
+        // Bounded decode is Missing on this route; no tile was ever admitted.
+        assert!(scope.configure_decode(512, 64, admitted.geometry).is_err());
+        // A canceled run still gets the contract's cleanup, exactly once.
+        scope.finish(MemoryRunOutcome::Canceled).unwrap();
+        assert!(scope.finish(MemoryRunOutcome::Canceled).is_err());
+        assert!(scope.enter_phase(MemoryPhase::Denoise).is_err());
     }
 
     #[test]
