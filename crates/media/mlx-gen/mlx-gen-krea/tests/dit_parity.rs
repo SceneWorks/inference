@@ -157,6 +157,48 @@ fn text_fusion_matches_reference() {
     );
 }
 
+/// **sc-20644 — the adapter's declared logical shapes are the shapes the real module tree loads.**
+///
+/// `dit_golden.safetensors` is the committed reference dump: every tensor is at the shape the
+/// reference `SingleStreamDiT` actually constructs for `tiny_dit_config()` (the same bytes
+/// `dit_matches_reference` loads and runs). Checking `logical_shape` against that header — not
+/// against a shape this test invents — is what makes the declaration trustworthy for an MXFP8
+/// unpad. `in.*` / `out.*` are the golden's forward inputs, not model weights.
+#[test]
+fn declared_logical_shapes_match_the_reference_dit_header() {
+    use mlx_gen::gen_core::LogicalKeyMapping;
+
+    let w = load("dit_golden.safetensors");
+    let cfg = tiny_dit_config();
+    let mapping = mlx_gen_krea::KreaNativeToDiffusersMapping::for_config(&cfg);
+
+    let mut checked = 0usize;
+    for key in w.keys() {
+        if key.starts_with("in.") || key.starts_with("out.") {
+            continue;
+        }
+        let want: Vec<usize> = w
+            .require(key)
+            .unwrap()
+            .shape()
+            .iter()
+            .map(|d| *d as usize)
+            .collect();
+        assert_eq!(
+            mapping.logical_shape(key),
+            Some(want),
+            "declared logical shape disagrees with the reference dump for `{key}`"
+        );
+        checked += 1;
+    }
+    // The golden holds the whole module tree; a silently shrunken fixture must not pass vacuously.
+    assert_eq!(
+        checked,
+        mlx_gen_krea::convert::expected_transformer_keys(&cfg).len(),
+        "the golden must cover every transformer key"
+    );
+}
+
 /// Full `SingleStreamDiT` forward: img patch-embed, the custom timestep embedding + shared modulation,
 /// text fusion + `txt_in`, the joint single-stream stack under 3-axis RoPE, the final layer, and
 /// unpatchify — end to end vs the reference velocity.

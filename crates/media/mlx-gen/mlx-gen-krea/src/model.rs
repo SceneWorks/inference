@@ -1828,10 +1828,17 @@ pub(crate) fn component_footprint_for(
             // `LoadSpec`, and `ProviderRegistry::footprint` already wraps the call in
             // `read_prepared_files_unchanged` — so it is left uncached rather than carrying a
             // second cache alongside that pin.
+            // The base tier's architecture config declares the logical shapes an MXFP8 layer unpads
+            // to (sc-20644), so the footprint prices what the load will actually make resident; see
+            // `block_memory_strategy::base_architecture_config` for the no-config case.
             dit: crate::block_memory_strategy::native_dit_transformer_bytes(
                 provider_id,
                 dit,
                 None,
+                crate::native_remap::DeclaredLogicalShapes::from_base(
+                    crate::block_memory_strategy::base_architecture_config(provider_id, base)?
+                        .as_ref(),
+                ),
             )?,
             vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
         }),
@@ -2989,9 +2996,12 @@ mod tests {
         assert!(receipt.tensor_count > 0);
         // Measured residency equals the plan's prediction for whatever codec mix the file uses:
         // a dense bf16 file leaves exactly its source bytes resident, an fp8 cast twice them.
+        // Same declared logical shapes the render's own load used, so the two plans are comparable.
+        let base_cfg = crate::config::Krea2Config::from_snapshot(&base)
+            .expect("the base snapshot carries the architecture config");
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&base_cfg),
         )
         .expect("the rendered file compiles a codec plan");
         assert_eq!(

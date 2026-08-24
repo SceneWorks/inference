@@ -11,6 +11,7 @@ use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_boogu::VisionTower;
 
 use crate::config::Krea2Config;
+use crate::native_remap::DeclaredLogicalShapes;
 use crate::text_encoder::{krea_vision_config, KreaTeConfig, KreaTextEncoder};
 use crate::transformer::Krea2Transformer;
 
@@ -135,8 +136,17 @@ pub(crate) fn load_transformer_with_stream(
 /// per layer through their codec rows. The remapped set then receives the same architecture
 /// coverage/shape validation and transformer assembly as the published snapshot. `cfg` comes from
 /// the resident base snapshot because the single file has no `config.json`.
-pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
-    normalized_native_weights_with_receipt(dit_file).map(|(weights, _)| weights)
+///
+/// `shapes` carries that same architecture into the plan compiler (sc-20644): MXFP8 storage is
+/// 32-padded and records no true shape, so the adapter must declare one for the layer to unpad to
+/// the geometry the DiT then validates. Callers holding a `Krea2Config` pass
+/// [`DeclaredLogicalShapes::FromConfig`]; a caller with none passes
+/// [`DeclaredLogicalShapes::NotInScope`] and gets the fail-closed padded-shape behaviour.
+pub(crate) fn normalized_native_weights(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
+) -> Result<Weights> {
+    normalized_native_weights_with_receipt(dit_file, shapes).map(|(weights, _)| weights)
 }
 
 /// [`normalized_native_weights`], additionally returning the logical-weight receipt of the read.
@@ -148,8 +158,9 @@ pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
 /// clobber each other's observation.
 pub(crate) fn normalized_native_weights_with_receipt(
     dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
 ) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
-    normalized_native_weights_with_materializer(dit_file, |weights| {
+    normalized_native_weights_with_materializer(dit_file, shapes, |weights| {
         #[cfg(test)]
         run_native_materialize_test_hook(NativeMaterializeTestStage::Before, weights)?;
         weights.materialize()?;
@@ -192,22 +203,27 @@ fn run_native_materialize_test_hook(
 /// Normalize the native namespace without evaluating the complete checkpoint. The bounded block
 /// loader consumes only its accessed window under a separate pin guard; eagerly evaluating here
 /// would retain the full DiT and invalidate that implementation's residency bound.
-pub(crate) fn normalized_native_weights_lazy(dit_file: &Path) -> Result<Weights> {
-    normalized_native_weights_lazy_with_receipt(dit_file).map(|(weights, _)| weights)
+pub(crate) fn normalized_native_weights_lazy(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
+) -> Result<Weights> {
+    normalized_native_weights_lazy_with_receipt(dit_file, shapes).map(|(weights, _)| weights)
 }
 
 /// [`normalized_native_weights_lazy`], additionally returning the receipt of the read.
 pub(crate) fn normalized_native_weights_lazy_with_receipt(
     dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
 ) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
-    normalized_native_weights_with_options(dit_file, false, |_| Ok(()))
+    normalized_native_weights_with_options(dit_file, shapes, false, |_| Ok(()))
 }
 
 fn normalized_native_weights_with_materializer(
     dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
     materialize: impl FnOnce(&Weights) -> Result<()>,
 ) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
-    normalized_native_weights_with_options(dit_file, true, materialize)
+    normalized_native_weights_with_options(dit_file, shapes, true, materialize)
 }
 
 /// The receipt of the most recent native-file read that went through the mapped logical-weight
@@ -250,6 +266,7 @@ fn record_native_file_receipt(receipt: mlx_gen::gen_core::LogicalWeightReceipt) 
 
 fn normalized_native_weights_with_options(
     dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
     eager: bool,
     materialize: impl FnOnce(&Weights) -> Result<()>,
 ) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
@@ -263,7 +280,7 @@ fn normalized_native_weights_with_options(
     // engine's `int8-per-row-v1` implementation now.
     let plan = mlx_gen::logical_weights::plan_logical_weights(
         dit_file,
-        &crate::native_remap::KreaNativeToDiffusersMapping,
+        &crate::native_remap::KreaNativeToDiffusersMapping::new(shapes),
     )?;
     let mut materialize = Some(materialize);
     let mut eager_materializer = |weights: &mut Weights| -> Result<()> {
@@ -320,7 +337,8 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
 ) -> Result<Krea2Transformer> {
     pinned.read_unchanged(|path| {
         if streamable {
-            let remapped = normalized_native_weights_lazy(path)?;
+            let remapped =
+                normalized_native_weights_lazy(path, DeclaredLogicalShapes::FromConfig(cfg))?;
             // Validation reads representative shapes only. Keep that access bookkeeping on a clone
             // so the pin-bound evaluation below contains exactly the static model tensors retained by
             // the deferred constructor, not a representative transformer block.
@@ -332,7 +350,7 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
             remapped.materialize_accessed()?;
             Ok(transformer.with_native_block_stream(pinned.clone()))
         } else {
-            let remapped = normalized_native_weights(path)?;
+            let remapped = normalized_native_weights(path, DeclaredLogicalShapes::FromConfig(cfg))?;
             crate::convert::validate_transformer(&remapped, cfg)?;
             Krea2Transformer::from_weights(&remapped, cfg)
         }
@@ -349,7 +367,8 @@ pub(crate) fn load_transformer_from_pinned_native_file_bounded(
     prepare: impl FnOnce(&mut Krea2Transformer) -> Result<()>,
 ) -> Result<Krea2Transformer> {
     pinned.read_unchanged(|path| {
-        let remapped = normalized_native_weights_lazy(path)?;
+        let remapped =
+            normalized_native_weights_lazy(path, DeclaredLogicalShapes::FromConfig(cfg))?;
         crate::convert::validate_transformer(&remapped.clone(), cfg)?;
         let mut transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
         // `from_weights` clones the lazy Array handles it retains. Drop the normalized source map
@@ -392,7 +411,8 @@ mod tests {
                 Ok(())
             }));
         });
-        let normalized = normalized_native_weights_lazy(&source).unwrap();
+        let normalized =
+            normalized_native_weights_lazy(&source, DeclaredLogicalShapes::NotInScope).unwrap();
         NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
 
         assert!(normalized.get("img_in.weight").is_some());
@@ -583,7 +603,9 @@ mod tests {
                 ),
             ],
         );
-        let (normalized, receipt) = normalized_native_weights_with_receipt(&source).unwrap();
+        let (normalized, receipt) =
+            normalized_native_weights_with_receipt(&source, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         let mut keys: Vec<&str> = normalized.keys().collect();
         keys.sort_unstable();
         assert_eq!(
@@ -627,7 +649,9 @@ mod tests {
         assert_eq!(receipt.resident_bytes(), 32);
 
         // The deferred (block-stream / bounded) entry keeps payloads lazy and says so.
-        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&source).unwrap();
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&source, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         assert_eq!(
             lazy.require("transformer_blocks.0.scale_shift_table")
                 .unwrap()
@@ -669,7 +693,9 @@ mod tests {
                 ),
             ],
         );
-        let (weights, receipt) = normalized_native_weights_with_receipt(&fp8).unwrap();
+        let (weights, receipt) =
+            normalized_native_weights_with_receipt(&fp8, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         let weight = mlx_gen::weights::to_f32(weights.require("img_in.weight").unwrap()).unwrap();
         assert_eq!(weight.as_slice::<f32>(), [1.0, 2.0]);
         let bias = mlx_gen::weights::to_f32(weights.require("img_in.bias").unwrap()).unwrap();
@@ -690,7 +716,7 @@ mod tests {
                 bf16_le(&[0.25]),
             )],
         );
-        let error = normalized_native_weights(&foreign)
+        let error = normalized_native_weights(&foreign, DeclaredLogicalShapes::NotInScope)
             .err()
             .expect("foreign key must refuse")
             .to_string();
@@ -719,7 +745,7 @@ mod tests {
                 ),
             ],
         );
-        let error = normalized_native_weights(&packed)
+        let error = normalized_native_weights(&packed, DeclaredLogicalShapes::NotInScope)
             .err()
             .expect("packed u8 must refuse")
             .to_string();
@@ -756,7 +782,9 @@ mod tests {
                 ),
             ],
         );
-        let (dequantized, receipt) = normalized_native_weights_with_receipt(&int8).unwrap();
+        let (dequantized, receipt) =
+            normalized_native_weights_with_receipt(&int8, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         let projection = mlx_gen::weights::to_f32(
             dequantized
                 .require("transformer_blocks.0.attn.to_q.weight")
@@ -822,7 +850,9 @@ mod tests {
             &[2, 1],
             two_scales.clone(),
         );
-        let (weights, _) = normalized_native_weights_with_receipt(&good).unwrap();
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&good, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         let got = mlx_gen::weights::to_f32(
             weights
                 .require("transformer_blocks.0.attn.to_q.weight")
@@ -862,7 +892,7 @@ mod tests {
             ),
         ] {
             let path = write_int8(name, descriptor, scale_shape, scale_payload);
-            let error = normalized_native_weights(&path)
+            let error = normalized_native_weights(&path, DeclaredLogicalShapes::NotInScope)
                 .err()
                 .unwrap_or_else(|| panic!("{name} must refuse"))
                 .to_string();
@@ -902,7 +932,9 @@ mod tests {
                 ),
             ],
         );
-        let (weights, _) = normalized_native_weights_with_receipt(&path).unwrap();
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&path, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
         let got = mlx_gen::weights::to_f32(
             weights
                 .require("transformer_blocks.0.attn.to_q.weight")
@@ -910,6 +942,136 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.as_slice::<f32>(), [0.5, -1.0, 1.5]);
+    }
+
+    /// A deliberately non-32-aligned architecture: hidden 40 (2 heads × 20), so a single-stream
+    /// `to_q` is logically `[40, 40]` and MXFP8 stores it 32-padded at `[64, 64]`. Padding is
+    /// therefore observable — an undeclared plan lands on 64s, a declared one on 40s.
+    fn unaligned_config() -> Krea2Config {
+        let cfg = Krea2Config {
+            in_channels: 12,
+            patch_size: 2,
+            hidden_size: 40,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            attention_head_dim: 20,
+            num_layers: 1,
+            intermediate_size: 44,
+            norm_eps: 1e-5,
+            axes_dims_rope: [4, 8, 8],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 12,
+            num_text_layers: 3,
+            num_layerwise_text_blocks: 1,
+            num_refiner_text_blocks: 1,
+            text_hidden_dim: 40,
+            text_intermediate_size: 44,
+            text_num_attention_heads: 2,
+            text_num_kv_heads: 1,
+        };
+        cfg.validate().expect("the test architecture is coherent");
+        cfg
+    }
+
+    /// **sc-20644 — a real MXFP8 Krea DiT plans and decodes at the LOGICAL (unpadded) shape when a
+    /// config is in scope, and at the stored padded shape when none is.**
+    ///
+    /// A synthetic MXFP8 layer: a `[64, 64]` E4M3 payload (the 32-padded storage of a logical
+    /// `[40, 40]` `to_q`) plus its swizzled E8M0 `weight_scale` companion and the `mxfp8` descriptor.
+    /// The padded rows/columns carry poison (E4M3 448 under a NaN exponent), so a wrong unpad or a
+    /// missing declaration cannot pass by accident.
+    #[test]
+    fn mxfp8_plans_at_the_declared_logical_shape_and_at_stored_padding_without_a_config() {
+        let cfg = unaligned_config();
+        let logical = [cfg.q_dim(), cfg.hidden_size]; // [40, 40] — the `to_q` the DiT builds.
+        let stored = [64_usize, 64]; // 32-padded on both axes.
+        let scale_shape = mlx_gen::gen_core::mxfp8_scale_shape(stored);
+
+        let mut values = vec![0x7E_u8; stored[0] * stored[1]]; // 448 poison in the padding
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                values[row * stored[1] + col] = 0x38 + ((row + col) % 4) as u8;
+            }
+        }
+        let mut scales = vec![0xFF_u8; scale_shape[0] * scale_shape[1]]; // NaN exponent poison
+        for row in 0..logical[0] {
+            for block in 0..logical[1].div_ceil(32) {
+                scales[mlx_gen::gen_core::mxfp8_swizzled_scale_index(stored, row, block)] =
+                    126 + ((row + block) % 3) as u8;
+            }
+        }
+
+        let dir = native_fixture_dir();
+        let path = dir.path().join("mxfp8-native.safetensors");
+        let descriptor = br#"{"format": "mxfp8"}"#;
+        write_native_safetensors(
+            &path,
+            &[
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight",
+                    "F8_E4M3",
+                    &stored,
+                    values,
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                    "U8",
+                    &scale_shape,
+                    scales,
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+
+        // With the architecture config in scope the plan unpads to the DiT's real geometry.
+        let declared = mlx_gen::logical_weights::plan_logical_weights(
+            &path,
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&cfg),
+        )
+        .expect("the mxfp8 layer plans through the Krea native mapping");
+        assert_eq!(declared.tensors.len(), 1);
+        assert_eq!(
+            declared.tensors[0].shape,
+            logical.to_vec(),
+            "a declared logical shape must unpad the 32-padded storage"
+        );
+        // Dense residency is priced from the LOGICAL element count, not the padded one.
+        assert_eq!(
+            declared.resident_bytes(),
+            (logical[0] * logical[1] * 2) as u64
+        );
+
+        // ...and the decoded array really is that shape, so the DiT's own architecture validation
+        // (which is what refused a genuine MXFP8 Krea before sc-20644) now accepts the tensor.
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&path, DeclaredLogicalShapes::FromConfig(&cfg))
+                .expect("the mxfp8 layer decodes through the codec seam");
+        assert_eq!(
+            weights
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap()
+                .shape(),
+            &[logical[0] as i32, logical[1] as i32],
+        );
+
+        // With no config in scope the pre-sc-20644 behaviour is unchanged: the stored padded shape.
+        let undeclared = mlx_gen::logical_weights::plan_logical_weights(
+            &path,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("an undeclared mxfp8 layer still plans");
+        assert_eq!(
+            undeclared.tensors[0].shape,
+            stored.to_vec(),
+            "with no declaration the plan can only use the stored padded shape"
+        );
+        // Which is exactly the geometry the DiT refuses — the fail-closed backstop is intact.
+        assert_ne!(undeclared.tensors[0].shape, logical.to_vec());
     }
 
     /// sc-20634 review: `LAST_NATIVE_FILE_RECEIPT` is process-global and its
@@ -955,7 +1117,7 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
         )
         .expect("variant5 plans through the Krea native mapping");
         // variant5 is 415 bf16 + 15 f32 tensors (in/out projections and biases): both dense rows.
@@ -978,8 +1140,9 @@ mod tests {
             .logical_keys()
             .any(|key| key == "transformer_blocks.0.attn.to_q.weight"));
 
-        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
-            .expect("deferred read through the seam");
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
         assert!(lazy.get("img_in.weight").is_some());
         assert_eq!(
             receipt.mapping_id,
@@ -1026,7 +1189,7 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
         )
         .expect("the fp8 cast plans through the Krea native mapping");
         // ComfyUI's UNETLoader cast converts the big linear weights and leaves norms/biases alone,
@@ -1077,8 +1240,9 @@ mod tests {
             2 * fp8_source + dense_source,
             "fp8 → bf16 doubles; dense rows are byte-preserving"
         );
-        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
-            .expect("deferred read through the seam");
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
         assert!(lazy.get("img_in.weight").is_some());
         assert_eq!(receipt.tensor_count, headers.len());
         assert_eq!(
@@ -1108,7 +1272,7 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
         )
         .expect("variant4 plans through the registry int8 codec");
         assert!(plan.codec_ids().contains(&"int8-per-row-v1"));
@@ -1126,8 +1290,9 @@ mod tests {
         let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
-        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
-            .expect("deferred read through the seam");
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
         assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
         assert!(
             lazy.keys()
@@ -1167,7 +1332,7 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
         )
         .expect("the published scaled fp8 artifact plans through the Krea native mapping");
 
@@ -1211,8 +1376,9 @@ mod tests {
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
 
-        let (lazy, receipt) = normalized_native_weights_lazy_with_receipt(&dit)
-            .expect("deferred read through the seam");
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
         assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
         assert!(
             lazy.keys()
@@ -1278,7 +1444,7 @@ mod tests {
 
         let error = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
         )
         .expect_err("an nvfp4 checkpoint has no registered codec and must refuse");
         let error = error.to_string();
