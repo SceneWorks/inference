@@ -524,6 +524,44 @@ fn decode(
                 device,
             )?))
         }
+        TensorCodecSpec::Nvfp4 {
+            block_scale,
+            global_scale,
+            stored_shape,
+            ..
+        } => {
+            // The on-disk byte matrix is `[rows, cols / 2]` — two E2M1 codes per `U8`.
+            let packed_shape = [stored_shape[0], stored_shape[1] / 2];
+            guard_stored(
+                tensor,
+                view.dtype(),
+                view.shape(),
+                StDtype::U8,
+                &packed_shape,
+            )?;
+            let scales = companion_bytes(st, tensor, block_scale)?;
+            let global = scalar_f32(companion_bytes(st, tensor, global_scale)?, global_scale)?;
+            let mut values = Vec::new();
+            gen_core::decode_nvfp4(
+                view.data(),
+                scales,
+                global,
+                *stored_shape,
+                [tensor.shape[0], tensor.shape[1]],
+                &mut values,
+            )
+            .map_err(|error| {
+                CandleError::Msg(format!(
+                    "codec {}: tensor {:?}: {error}",
+                    tensor.codec_id, tensor.physical_key
+                ))
+            })?;
+            Ok(LogicalTensor::Dense(upload_bf16(
+                values,
+                &tensor.shape,
+                device,
+            )?))
+        }
         TensorCodecSpec::Int8PerRow { scale, .. } => {
             guard_stored(
                 tensor,

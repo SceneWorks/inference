@@ -432,6 +432,57 @@ fn decode(
             let logical = dense.index((..tensor.shape[0] as i32, ..tensor.shape[1] as i32));
             Ok(logical.as_dtype(Dtype::Bfloat16)?)
         }
+        TensorCodecSpec::Nvfp4 {
+            block_scale,
+            global_scale,
+            stored_shape,
+            ..
+        } => {
+            // NVFP4 is decoded on the host through the gen-core reference: MLX has no 4-bit
+            // element type to view the packed nibbles as, so the same reference decode both
+            // backends share is the honest single implementation rather than a second
+            // bit-twiddling path that could drift from it.
+            let packed_shape = [stored_shape[0], stored_shape[1] / 2];
+            guard_shape(tensor, &array, &packed_shape)?;
+            guard_dtype(tensor, &array, Dtype::Uint8)?;
+            let scales = companion(tensor, physical, block_scale)?;
+            if scales.dtype() != Dtype::Uint8 {
+                return Err(Error::Msg(format!(
+                    "codec {}: companion {block_scale:?} must load as U8 E4M3 block-scale bytes, \
+                     got {:?}",
+                    tensor.codec_id,
+                    scales.dtype()
+                )));
+            }
+            let global = companion(tensor, physical, global_scale)?;
+            if global.dtype() != Dtype::Float32 || global.size() != 1 {
+                return Err(Error::Msg(format!(
+                    "codec {}: companion {global_scale:?} must load as one F32 scalar, got {:?} \
+                     with {} elements",
+                    tensor.codec_id,
+                    global.dtype(),
+                    global.size()
+                )));
+            }
+            let mut values = Vec::new();
+            gen_core::decode_nvfp4(
+                array.as_slice::<u8>(),
+                scales.as_slice::<u8>(),
+                global.as_slice::<f32>()[0],
+                *stored_shape,
+                [tensor.shape[0], tensor.shape[1]],
+                &mut values,
+            )
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "codec {}: tensor {:?}: {error}",
+                    tensor.codec_id, tensor.physical_key
+                ))
+            })?;
+            let dense =
+                Array::from_slice(&values, &[tensor.shape[0] as i32, tensor.shape[1] as i32]);
+            Ok(dense.as_dtype(Dtype::Bfloat16)?)
+        }
         TensorCodecSpec::Int8PerRow { scale, .. } => {
             guard_shape(tensor, &array, &tensor.shape)?;
             guard_dtype(tensor, &array, Dtype::Int8)?;
