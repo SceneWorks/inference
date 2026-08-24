@@ -112,6 +112,9 @@ const DEGENERATE_STD_FLOOR: f64 = 3.0;
 /// see — the video VAE alone is 10.42 GB — while being above nvidia-smi's sampling jitter.
 const DECODE_OWNER_THRESHOLD_GB: f64 = 0.5;
 
+/// Force the structured receipt onto its own line after libtest's `test ...` prefix.
+const H3_VRAM_RECEIPT_PREFIX: &str = "\n[[H3_VRAM]] ";
+
 /// The long edge of the shipped canvas: `768 · 16/9` snapped to the 32 stride.
 const CANVAS_LONG_EDGE: u32 = 1344;
 
@@ -337,7 +340,7 @@ fn measure(tier: &str, quant: Option<Quant>) {
     // attributable rather than guessed. `preDecodeGb` is over the idle baseline, like `peakGb`;
     // `preDecodeAbsGb` is the raw device sample it came from, kept as provenance for the scrape.
     println!(
-        "[[H3_VRAM]] {{\"model\":\"{MODEL_ID}\",\"tier\":\"{tier}\",\"peakGb\":{:.3},\
+        "{H3_VRAM_RECEIPT_PREFIX}{{\"model\":\"{MODEL_ID}\",\"tier\":\"{tier}\",\"peakGb\":{:.3},\
          \"trueMemHighGib\":{true_mem_high_gib:.2},\"denoiseMemHighGib\":{denoise_high_gib:.2},\
          \"decodeMemHighGib\":{decode_high_gib:.2},\"peakOwner\":\"{owner}\",\
          \"preDecodeGb\":{pre_decode_gb:.1},\"preDecodeAbsGb\":{pre_decode_abs_gb:.1},\
@@ -352,6 +355,11 @@ fn measure(tier: &str, quant: Option<Quant>) {
         u64::from(width) * u64::from(height),
         out_frames.len(),
     );
+}
+
+#[test]
+fn vram_receipt_prefix_forces_a_fresh_log_line() {
+    assert_eq!(H3_VRAM_RECEIPT_PREFIX, "\n[[H3_VRAM]] ");
 }
 
 /// The dense bf16 checkpoint at the shipped 768x1344 canvas and the 124-frame lattice floor.
