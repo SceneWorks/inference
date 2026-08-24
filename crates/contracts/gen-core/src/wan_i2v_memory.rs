@@ -2294,10 +2294,7 @@ fn request_evidence_revision_for_selection(
 ///
 /// Returned as `(fps, tail)` where `tail` is everything after `…:fps<fps>:` — the artifact identity,
 /// selection receipt and digest. `None` when the revision is not a receipt of this version and mode.
-fn receipt_rate_and_tail<'a>(
-    evidence_revision: &'a str,
-    mode: WanPublicMode,
-) -> Option<(u32, &'a str)> {
+fn receipt_rate_and_tail(evidence_revision: &str, mode: WanPublicMode) -> Option<(u32, &str)> {
     let rest = evidence_revision.strip_prefix(RECEIPT_VERSION)?;
     let rest = rest.strip_prefix(':')?;
     let rest = rest.strip_prefix(mode.key())?;

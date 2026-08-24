@@ -38,7 +38,7 @@ fn write_safetensors(path: &std::path::Path, name: &str) {
         }
     });
     let mut json = serde_json::to_vec(&header).unwrap();
-    while json.len() % 8 != 0 {
+    while !json.len().is_multiple_of(8) {
         json.push(b' ');
     }
     let mut out = (json.len() as u64).to_le_bytes().to_vec();

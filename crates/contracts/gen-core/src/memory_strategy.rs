@@ -6651,7 +6651,8 @@ mod tests {
 
         // Absent must never collide with the zero/empty value of the same knob.
         let mut digests = vec![scail2.clone()];
-        let mutations: Vec<Box<dyn Fn(&mut MemoryStructuralResidentRequestIdentity)>> = vec![
+        type Cross = Box<dyn Fn(&mut MemoryStructuralResidentRequestIdentity)>;
+        let mutations: Vec<Cross> = vec![
             Box::new(|request| request.seed = Some(0)),
             Box::new(|request| request.steps = Some(0)),
             Box::new(|request| request.guidance = Some(0.0)),
