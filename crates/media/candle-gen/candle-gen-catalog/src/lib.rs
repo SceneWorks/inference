@@ -4414,8 +4414,13 @@ mod tests {
         );
         assert_eq!(
             binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
-            [ImportedModelOperation::Generate],
-            "Candle truthfully omits the MLX-only fused SDXL edit route"
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+            ],
+            "Candle implements the fused SDXL edit route: main's 0d7eafb4b sealed the Candle \
+             SDXL edit provider's memory-strategy routes and registered the fused-checkpoint \
+             Edit operation, so the route is no longer MLX-only"
         );
         for adapter in &adapters {
             if adapter.eligible_backends == [CheckpointBackend::Candle] {
@@ -4476,6 +4481,14 @@ mod tests {
                 family: "sdxl",
                 source: ImportedModelSource::FusedCheckpoint,
                 operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_sdxl::MODEL_ID,
+                required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Edit,
                 provider_id: candle_gen_sdxl::MODEL_ID,
                 required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
                 inherit_adapters: true,

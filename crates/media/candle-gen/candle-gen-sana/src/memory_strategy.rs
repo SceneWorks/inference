@@ -293,7 +293,7 @@ fn exact_inventory(variant: SanaVariant, root: &Path) -> gen_core::Result<Vec<Pa
 fn validate_component_dtype(
     path: &Path,
     label: &str,
-    allowed: &[safetensors::Dtype],
+    allowed: &[gen_core::weightsmeta::Dtype],
 ) -> gen_core::Result<u64> {
     let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     if headers.is_empty() {
@@ -329,18 +329,18 @@ fn selected_component_bytes(
     let transformer = crate::pipeline::resolve_component_files(&root.join("transformer"))?;
     let vae = crate::pipeline::resolve_component_files(&root.join("vae"))?;
     let te_bytes = te.iter().try_fold(0_u64, |sum, file| {
-        validate_component_dtype(file, "text encoder", &[safetensors::Dtype::BF16])
+        validate_component_dtype(file, "text encoder", &[gen_core::weightsmeta::Dtype::BF16])
             .map(|n| sum.saturating_add(n))
     })?;
     let trunk_dtype = match variant {
-        SanaVariant::Base => &[safetensors::Dtype::F32][..],
-        SanaVariant::Sprint => &[safetensors::Dtype::BF16][..],
+        SanaVariant::Base => &[gen_core::weightsmeta::Dtype::F32][..],
+        SanaVariant::Sprint => &[gen_core::weightsmeta::Dtype::BF16][..],
     };
     let transformer_bytes = transformer.iter().try_fold(0_u64, |sum, file| {
         validate_component_dtype(file, "transformer", trunk_dtype).map(|n| sum.saturating_add(n))
     })?;
     let vae_bytes = vae.iter().try_fold(0_u64, |sum, file| {
-        validate_component_dtype(file, "VAE", &[safetensors::Dtype::F32])
+        validate_component_dtype(file, "VAE", &[gen_core::weightsmeta::Dtype::F32])
             .map(|n| sum.saturating_add(n))
     })?;
     Ok((te_bytes, transformer_bytes, vae_bytes))
