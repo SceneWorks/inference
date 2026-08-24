@@ -6643,41 +6643,12 @@ jobs:
         if: inputs.minimax_h3_vram_probe
         shell: cmd
         run: |
-          rem A Hugging Face cache snapshot is made of reparse-point links into blobs. Candle's
-          rem memmaps need hardlink/copy-staged real files instead, so refuse the cache layout before
-          rem cargo creates a CUDA context. The vram allow-list row records the exact upstream files
-          rem an operator must stage, but this lane deliberately never materializes 130+ GB itself.
-          call :require_real_dir "%MINIMAX_H3_SNAPSHOT%" "CANDLE_MINIMAX_H3_SNAPSHOT" || exit /b 1
-          call :require_real_dir "%MINIMAX_H3_SNAPSHOT%\transformer" "dense transformer" || exit /b 1
-          call :require_real_dir "%MINIMAX_H3_SNAPSHOT%\text_encoder" "dense text encoder" || exit /b 1
-          for %%F in (config.json diffusion_pytorch_model.safetensors.index.json) do call :require_real_file "%MINIMAX_H3_SNAPSHOT%\transformer\%%F" "dense transformer %%F" || exit /b 1
-          for %%F in (config.json model.safetensors.index.json) do call :require_real_file "%MINIMAX_H3_SNAPSHOT%\text_encoder\%%F" "dense text encoder %%F" || exit /b 1
-          for %%N in (01 02 03 04 05 06 07 08 09 10 11 12 13 14) do call :require_real_file "%MINIMAX_H3_SNAPSHOT%\text_encoder\model-000%%N-of-00014.safetensors" "dense text encoder shard %%N" || exit /b 1
-          call :require_stage "CANDLE_MINIMAX_H3_Q4_DIT_DIR" "CANDLE_MINIMAX_H3_Q4_TE_DIR" q4 || exit /b 1
-          call :require_stage "CANDLE_MINIMAX_H3_Q8_DIT_DIR" "CANDLE_MINIMAX_H3_Q8_TE_DIR" q8 || exit /b 1
-          exit /b 0
-
-          :require_stage
-          call set "DIT=%%%~1%%"
-          call set "TE=%%%~2%%"
-          if "%DIT%"=="" (echo ::error::Missing repository variable %~1. Stage the %~3 transformer as real files and set this absolute directory. & exit /b 1)
-          if "%TE%"=="" (echo ::error::Missing repository variable %~2. Stage the %~3 text encoder as real files and set this absolute directory. & exit /b 1)
-          call :require_real_dir "%DIT%" "%~3 transformer" || exit /b 1
-          call :require_real_dir "%TE%" "%~3 text encoder" || exit /b 1
-          for %%F in (config.json diffusion_pytorch_model.safetensors.index.json) do call :require_real_file "%DIT%\%%F" "%~3 transformer %%F" || exit /b 1
-          for %%F in (config.json model.safetensors.index.json) do call :require_real_file "%TE%\%%F" "%~3 text encoder %%F" || exit /b 1
-          for %%N in (01 02 03 04 05 06 07 08 09 10 11 12 13 14) do call :require_real_file "%TE%\model-000%%N-of-00014.safetensors" "%~3 text encoder shard %%N" || exit /b 1
-          exit /b 0
-
-          :require_real_dir
-          if not exist "%~1\NUL" (echo ::error::%~2 directory is missing: %~1 & exit /b 1)
-          fsutil reparsepoint query "%~1" >nul 2>&1 && (echo ::error::%~2 is a Windows reparse point: %~1. Candle needs a hardlink/copy-staged real directory, not a Hugging Face cache link. & exit /b 1)
-          exit /b 0
-
-          :require_real_file
-          if not exist "%~1" (echo ::error::%~2 file is missing: %~1 & exit /b 1)
-          fsutil reparsepoint query "%~1" >nul 2>&1 && (echo ::error::%~2 is a Windows reparse point: %~1. Candle needs hardlink/copy-staged real files, not Hugging Face blob links. & exit /b 1)
-          exit /b 0
+          rem Validate every index-resolved file before Cargo creates a CUDA context. The live
+          rem CANDLE_MINIMAX_H3_SNAPSHOT is an HF cache tree, whose reparse-point blob links candle
+          rem cannot memmap; this requires hardlink/copy-staged real files instead.
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q4 --dit "${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q8 --dit "${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier bf16 --dit "%MINIMAX_H3_SNAPSHOT%\transformer" --te "%MINIMAX_H3_SNAPSHOT%\text_encoder" || exit /b 1
       - name: Measure candle vramGbByTier (q4, shipped geometry)
         if: inputs.minimax_h3_vram_probe
         shell: cmd
@@ -6694,10 +6665,7 @@ jobs:
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q4 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
-          findstr /C:"[[H3_VRAM]]" "%log%" > "%RUNNER_TEMP%\minimax-h3-vram-q4.json" || (echo ::error::the q4 probe printed no [[H3_VRAM]] datum & exit /b 1)
-          findstr /C:"\"tier\":\"q4\"" "%RUNNER_TEMP%\minimax-h3-vram-q4.json" >nul || (echo ::error::the q4 probe reported the wrong tier & exit /b 1)
-          findstr /C:"\"baselineGb\":" "%RUNNER_TEMP%\minimax-h3-vram-q4.json" >nul || (echo ::error::the q4 probe omitted its idle baseline & exit /b 1)
-          findstr /C:"\"peakOwner\":\"" "%RUNNER_TEMP%\minimax-h3-vram-q4.json" >nul || (echo ::error::the q4 probe omitted peakOwner & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q4 --out "%RUNNER_TEMP%\minimax-h3-vram-q4.json" || exit /b 1
           type "%RUNNER_TEMP%\minimax-h3-vram-q4.json"
       - name: Measure candle vramGbByTier (q8, shipped geometry)
         if: inputs.minimax_h3_vram_probe
@@ -6715,10 +6683,7 @@ jobs:
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q8 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
-          findstr /C:"[[H3_VRAM]]" "%log%" > "%RUNNER_TEMP%\minimax-h3-vram-q8.json" || (echo ::error::the q8 probe printed no [[H3_VRAM]] datum & exit /b 1)
-          findstr /C:"\"tier\":\"q8\"" "%RUNNER_TEMP%\minimax-h3-vram-q8.json" >nul || (echo ::error::the q8 probe reported the wrong tier & exit /b 1)
-          findstr /C:"\"baselineGb\":" "%RUNNER_TEMP%\minimax-h3-vram-q8.json" >nul || (echo ::error::the q8 probe omitted its idle baseline & exit /b 1)
-          findstr /C:"\"peakOwner\":\"" "%RUNNER_TEMP%\minimax-h3-vram-q8.json" >nul || (echo ::error::the q8 probe omitted peakOwner & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q8 --out "%RUNNER_TEMP%\minimax-h3-vram-q8.json" || exit /b 1
           type "%RUNNER_TEMP%\minimax-h3-vram-q8.json"
       - name: Measure candle vramGbByTier (bf16, shipped geometry)
         if: inputs.minimax_h3_vram_probe
@@ -6746,10 +6711,7 @@ jobs:
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           rem The machine-parseable datum is the whole point of the run; a green step that produced
           rem no `[[H3_VRAM]]` line has measured nothing anyone can transcribe into the manifest.
-          findstr /C:"[[H3_VRAM]]" "%log%" > "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || (echo ::error::the probe printed no [[H3_VRAM]] datum & exit /b 1)
-          findstr /C:"\"tier\":\"bf16\"" "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" >nul || (echo ::error::the bf16 probe reported the wrong tier & exit /b 1)
-          findstr /C:"\"baselineGb\":" "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" >nul || (echo ::error::the bf16 probe omitted its idle baseline & exit /b 1)
-          findstr /C:"\"peakOwner\":\"" "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" >nul || (echo ::error::the bf16 probe omitted peakOwner & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier bf16 --out "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || exit /b 1
           type "%RUNNER_TEMP%\minimax-h3-vram-bf16.json"
       - name: Keep the VRAM evidence
         if: inputs.minimax_h3_vram_probe && !cancelled()

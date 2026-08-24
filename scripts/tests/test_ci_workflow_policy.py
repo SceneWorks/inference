@@ -308,22 +308,22 @@ def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
         for required in (
             "nvidia-smi --query-gpu=index,name,memory.total,memory.used",
             'findstr /C:"test result: ok. 1 passed"',
-            'findstr /C:"[[H3_VRAM]]"',
-            f'findstr /C:"\\\"tier\\\":\\\"{tier}\\\""',
-            'findstr /C:"\\\"baselineGb\\\":"',
-            'findstr /C:"\\\"peakOwner\\\":\\\""',
+            "validate_h3_vram_receipt.py",
+            f"--tier {tier}",
         ):
             if required not in run:
                 errors.append(f"{tier}: missing result guard {required}")
 
     preflight = next((step.get("run", "") for step in steps if step.get("name") == "Require real MiniMax-H3 files and staged tier inputs before measuring"), "")
-    for required in ("fsutil reparsepoint query", "hardlink/copy-staged real directory", "hardlink/copy-staged real files", "CANDLE_MINIMAX_H3_Q4_DIT_DIR", "CANDLE_MINIMAX_H3_Q4_TE_DIR", "CANDLE_MINIMAX_H3_Q8_DIT_DIR", "CANDLE_MINIMAX_H3_Q8_TE_DIR"):
+    if preflight.count("validate_h3_vram_staging.py") != 3:
+        errors.append("preflight: every q4/q8/bf16 process must validate its complete staged payload")
+    for required in ("validate_h3_vram_staging.py", "CANDLE_MINIMAX_H3_Q4_DIT_DIR", "CANDLE_MINIMAX_H3_Q4_TE_DIR", "CANDLE_MINIMAX_H3_Q8_DIT_DIR", "CANDLE_MINIMAX_H3_Q8_TE_DIR"):
         if required not in preflight:
             errors.append(f"preflight: missing {required}")
     for shard in range(1, 15):
         name = f"model-000{shard:02}-of-00014.safetensors"
-        if name not in manifest or "01 02 03 04 05 06 07 08 09 10 11 12 13 14" not in preflight:
-            errors.append(f"preflight/manifest: does not require text encoder shard {shard:02}")
+        if name not in manifest:
+            errors.append(f"manifest: does not require text encoder shard {shard:02}")
 
     models = {model["key"]: model for model in tomllib.loads(manifest)["models"]}
     vram = models.get("minimax-h3-vram", {})
@@ -3537,7 +3537,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "q8 process removed": workflow.replace("      - name: Measure candle vramGbByTier (q8, shipped geometry)", "      - name: Measure another H3 check", 1),
             "q4 uses the bf16 test": workflow.replace("set \"name=minimax_h3_vram_q4\"", "set \"name=minimax_h3_vram_bf16\"", 1),
             "q8 text-encoder override removed": workflow.replace("          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}\n", "", 1),
-            "reparse-point refusal removed": workflow.replace("          fsutil reparsepoint query \"%~1\" >nul 2>&1 && (echo ::error::%~2 is a Windows reparse point: %~1. Candle needs a hardlink/copy-staged real directory, not a Hugging Face cache link. & exit /b 1)\n", "", 1),
+            "staging preflight removed": workflow.replace("scripts/ci/validate_h3_vram_staging.py", "scripts/ci/missing.py", 1),
         }
         for label, mutated in mutations.items():
             with self.subTest(mutation=label):
