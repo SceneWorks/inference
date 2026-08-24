@@ -2322,10 +2322,8 @@ fn trainer_dit_path() -> PathBuf {
 /// the Apple accelerator `Gpu`; on macOS that backend is Metal. Checking only availability would
 /// still let a caller set the process default to CPU and publish a false Metal receipt.
 fn require_default_mlx_metal_device() -> (String, i32) {
-    assert!(
-        cfg!(target_os = "macos"),
-        "the MLX/Metal receipt is only valid on macOS"
-    );
+    #[cfg(not(target_os = "macos"))]
+    panic!("the MLX/Metal receipt is only valid on macOS");
     let device = Device::try_default().expect("query the MLX process-default device");
     let device_type = device
         .get_type()
@@ -2591,7 +2589,7 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
     // `trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs` because this
     // exact artifact's alpha/rank is 16/16 = 1.
     let expected_adapted = base_native
-        .add(&independent_residual.as_dtype(base_native.dtype()).unwrap())
+        .add(independent_residual.as_dtype(base_native.dtype()).unwrap())
         .unwrap();
     let expected_delta = subtract(&expected_adapted, &base_native)
         .unwrap()
