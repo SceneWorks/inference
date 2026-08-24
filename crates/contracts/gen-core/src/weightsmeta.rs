@@ -656,6 +656,27 @@ pub fn is_minimax_h3_trainer_key_space<'a>(
             .any(|key| key.starts_with("lora_unet_blocks_"))
 }
 
+/// Classify an exact MiniMax-H3 trainer claim while keeping it disjoint from LoKr.
+///
+/// Call this before generic LoKr routing. Otherwise a file stamped as the H3 trainer namespace can
+/// add one valid `lokr_*` factor, take the LoKr branch, and have all of its unvalidated trainer keys
+/// ignored while the adapter reports success.
+pub fn classify_minimax_h3_trainer_namespace<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_module: Option<&str>,
+    network_type: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let trainer = is_minimax_h3_trainer_key_space(keys.iter().copied(), network_module);
+    let lokr = is_lokr_network_type(network_type) || keys_contain_lokr(keys.iter().copied());
+    if trainer && lokr {
+        return Err(format!(
+            "the {MINIMAX_H3_TRAINER_NETWORK_MODULE} trainer namespace cannot be mixed with LoKr metadata or factors"
+        ));
+    }
+    Ok(trainer)
+}
+
 /// Validate the complete 50-block × four-leaf H3 trainer surface without materializing tensors.
 ///
 /// `entries` supplies `(key, shape)` pairs from either backend or a safetensors header. Every key is
@@ -1321,6 +1342,32 @@ mod tests {
         assert_eq!(layout.source_targets, 200);
         assert_eq!(layout.ranks, vec![16]);
         assert!(layout.trunk_only);
+    }
+
+    #[test]
+    fn minimax_h3_trainer_claim_rejects_lokr_before_generic_routing() {
+        for network_type in [None, Some("lokr")] {
+            let keys = if network_type.is_some() {
+                vec!["lora_unet_blocks_0_attn_qkv_proj.lora_down.weight"]
+            } else {
+                vec!["transformer_blocks.0.attn.to_q.lokr_w1"]
+            };
+            let error = classify_minimax_h3_trainer_namespace(
+                keys,
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                network_type,
+            )
+            .unwrap_err();
+            assert!(error.contains(MINIMAX_H3_TRAINER_NETWORK_MODULE), "{error}");
+            assert!(error.contains("LoKr") && error.contains("mixed"), "{error}");
+        }
+
+        assert!(!classify_minimax_h3_trainer_namespace(
+            ["transformer_blocks.0.attn.to_q.lokr_w1"],
+            None,
+            None,
+        )
+        .expect("a plain LoKr remains available to its existing route"));
     }
 
     #[test]

@@ -468,6 +468,45 @@ fn a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not() {
     );
 }
 
+/// An exact H3 trainer namespace claim owns the whole file: a valid LoKr factor must not be allowed
+/// to route around trainer validation and make the malformed mixed file look successfully applied.
+#[test]
+fn h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let path = dir.path().join("mixed-h3-trainer-lokr.safetensors");
+    let w1 = tensor(&[8, 8], 1.0);
+    let w2 = tensor(&[12, 8], 2.0);
+    let meta: HashMap<String, String> = [
+        (
+            "ss_network_module".to_string(),
+            "networks.lora_minimax_h3".to_string(),
+        ),
+        ("ss_h3_lora_token_refiner".to_string(), "False".to_string()),
+        ("rank".to_string(), "8".to_string()),
+        ("alpha".to_string(), "8".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    Array::save_safetensors(
+        vec![
+            ("transformer_blocks.0.attn.to_q.lokr_w1", &w1),
+            ("transformer_blocks.0.attn.to_q.lokr_w2", &w2),
+        ],
+        Some(&meta),
+        &path,
+    )
+    .expect("write the mixed adapter");
+
+    let mut dit = tiny_dit(&cfg);
+    let err = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
+        .expect_err("mixed H3 trainer and LoKr namespaces must fail before LoKr application");
+    let msg = err.to_string();
+    assert!(msg.contains("networks.lora_minimax_h3"), "got {msg}");
+    assert!(msg.contains("LoKr"), "got {msg}");
+    assert!(msg.contains("mixed"), "got {msg}");
+}
+
 /// A file that matches nothing at all names the key space it expected — **per file**, including when
 /// it rides alongside a file that matched everything.
 ///

@@ -101,7 +101,7 @@ use mlx_gen::adapters::loader::{apply_lokr, is_lokr, is_lokr_keys, ApplyReport};
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{
-    is_minimax_h3_trainer_key_space, parse_minimax_h3_trainer_key,
+    classify_minimax_h3_trainer_namespace, parse_minimax_h3_trainer_key,
     validate_minimax_h3_trainer_layout, LoraAdapterMeta, MiniMaxH3TrainerLayout,
     MiniMaxH3TrainerRole, LORA_ADAPTER_METADATA_KEY, MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
 };
@@ -834,11 +834,12 @@ fn apply_one_lora(
 /// nor an `unmatched_path`, so only a per-spec check can see it. Downstream, the aggregate form
 /// reaches a user as "my second LoRA did nothing, and there was no error".
 ///
-/// Routing is by the **file**, not by
-/// `spec.kind`: a genuine LoKr (`networkType=lokr`, or bare `lokr_*` keys) goes to the shared
-/// LyCORIS seam, and everything else goes to the diffusers LoRA path above. That ordering is what
-/// keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an `alpha` string and no
-/// `networkType`, so classifying them as LoKr would fold them 128× too strong.
+/// Routing is by the **file**, not by `spec.kind`. An exact H3 trainer claim is classified before
+/// the generic LoKr predicate so trainer keys cannot be ignored by adding one valid `lokr_*`
+/// factor; a mixed claim is rejected. A genuine standalone LoKr (`networkType=lokr`, or bare
+/// `lokr_*` keys) then goes to the shared LyCORIS seam, and everything else goes to the diffusers
+/// LoRA path above. This also keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an
+/// `alpha` string and no `networkType`, so classifying them as LoKr would fold them 128× too strong.
 pub fn apply_minimax_h3_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -847,6 +848,17 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let w = Weights::from_file(&spec.path)?;
+        let trainer = classify_minimax_h3_trainer_namespace(
+            w.keys(),
+            w.metadata("ss_network_module"),
+            w.metadata("networkType"),
+        )
+        .map_err(|error| {
+            Error::Msg(format!(
+                "minimax_h3 adapter {}: {error}",
+                spec.path.display()
+            ))
+        })?;
         let lokr = is_lokr(&w) || is_lokr_keys(&w);
         if lokr {
             let ApplyReport {
@@ -867,7 +879,6 @@ pub fn apply_minimax_h3_adapters(
         // sc-19443: a `_comfyui_` export is CONVERTED, not refused. Folding it un-converted would
         // be shape-valid and numerically wrong (the sc-18740 class), so the conversion — and its
         // re-check below — is what stands between the user and a silently corrupt render.
-        let trainer = is_minimax_h3_trainer_key_space(w.keys(), w.metadata("ss_network_module"));
         let comfy = !trainer && is_comfyui_key_space(&w);
         let converted = if trainer {
             let (converted, layout, alphas) = convert_minimax_h3_trainer_key_space(&w)?;
