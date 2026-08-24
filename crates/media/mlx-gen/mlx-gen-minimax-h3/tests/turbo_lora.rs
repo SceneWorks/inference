@@ -2238,6 +2238,7 @@ const SC21028_TRAINER_LORA_BYTES: u64 = 298_263_792;
 const SC21028_PROBE_DOWN: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight";
 const SC21028_PROBE_UP: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight";
 const SC21028_PROBE_ALPHA: &str = "lora_unet_blocks_0_attn_qkv_proj.alpha";
+const SC21028_RUNTIME_ADAPTER_SCALE: f32 = 0.5;
 const SC21028_RUNTIME_RESIDUAL_REL_MAX: f32 = 1e-3;
 
 /// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
@@ -2340,8 +2341,12 @@ fn require_default_mlx_metal_device() -> (String, i32) {
 }
 
 /// Independent oracle for the exact probe residual. It reads the trainer's raw fused-QKV factors,
-/// takes the Q row block itself, and evaluates `x·down^T·up_q^T·alpha/rank`; it never calls either
-/// trainer conversion or the adapter installer under test.
+/// takes the Q row block itself, and evaluates
+/// `x·down^T·up_q^T·alpha/rank·SC21028_RUNTIME_ADAPTER_SCALE`; it never calls either trainer
+/// conversion or the adapter installer under test. The exact file's alpha/rank is the identity
+/// 16/16, so the non-identity alpha-formula proof remains the independent mutation fixture
+/// `trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs`; this oracle's
+/// independent non-unit term is the runtime adapter scale.
 fn exact_trainer_q_probe_residual(path: &Path, x: &Array, cfg: &MiniMaxH3DitConfig) -> Array {
     let raw = Weights::from_file(path).expect("read exact trainer factors for independent oracle");
     let down = raw
@@ -2368,7 +2373,10 @@ fn exact_trainer_q_probe_residual(path: &Path, x: &Array, cfg: &MiniMaxH3DitConf
         .expect("take the Q row block independently");
     let unscaled = matmul(matmul(x, down.t()).unwrap(), q_up.t()).unwrap();
     unscaled
-        .multiply(Array::from_slice(&[alpha / rank as f32], &[1]))
+        .multiply(Array::from_slice(
+            &[(alpha / rank as f32) * SC21028_RUNTIME_ADAPTER_SCALE],
+            &[1],
+        ))
         .expect("scale independent exact trainer residual")
 }
 
@@ -2529,8 +2537,11 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         "real base projection is non-finite or vacuous: max|y|={base_peak:.3e}"
     );
 
-    let report = apply_minimax_h3_adapters(&mut dit, &[spec(lora.clone(), 1.0)])
-        .expect("install the exact trainer LoRA into the real 50-block DiT");
+    let report = apply_minimax_h3_adapters(
+        &mut dit,
+        &[spec(lora.clone(), SC21028_RUNTIME_ADAPTER_SCALE)],
+    )
+    .expect("install the exact trainer LoRA into the real 50-block DiT");
     assert_eq!(report.applied, 300, "50 blocks × six runtime leaves");
     assert!(report.unmatched_paths.is_empty(), "zero unmatched targets");
     assert_eq!(report.converted_from_trainer, 1, "exact trainer namespace");
@@ -2575,8 +2586,10 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
     let independent_residual = exact_trainer_q_probe_residual(&lora, &x, &cfg);
     // The production linear narrows the residual to the base output dtype before adding it. Build
     // the oracle's expected *observed* delta through the same public dtype boundary so BF16 add
-    // rounding does not masquerade as a conversion error; factor selection/orientation/alpha above
-    // remains completely independent.
+    // rounding does not masquerade as a conversion error. QKV selection/orientation and the
+    // non-unit runtime scale above remain independent; non-identity alpha/rank coverage belongs to
+    // `trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs` because this
+    // exact artifact's alpha/rank is 16/16 = 1.
     let expected_adapted = base_native
         .add(&independent_residual.as_dtype(base_native.dtype()).unwrap())
         .unwrap();
@@ -2598,13 +2611,14 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
             && residual_correctness_rel_max <= SC21028_RUNTIME_RESIDUAL_REL_MAX,
         "the installed {probe} residual disagrees with independent raw-factor math by \
          relative-max-abs={residual_correctness_rel_max:.3e} (limit \
-         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation/alpha/scale"
+         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation or runtime scale \
+         (non-identity alpha/rank is covered by the independent trainer mutation fixture)"
     );
 
     println!(
-        "SC21028_TRAINER_RUNTIME_RECEIPT backend=mlx accelerator=Metal file={} bytes={bytes} \
+         "SC21028_TRAINER_RUNTIME_RECEIPT backend=mlx accelerator=Metal file={} bytes={bytes} \
          sha256={sha256} model_id={} dit={} config_sha256={} tier={} probe_packed={} \
-         runtime_device={} runtime_device_index={} blocks={} source_targets={} applied={} adapted_modules={} \
+         runtime_device={} runtime_device_index={} adapter_scale={} blocks={} source_targets={} applied={} adapted_modules={} \
          unmatched={} unique_ranks={:?} unique_alphas={:?} probe={} relative_max_abs_diff={:.6e}",
         lora.display(),
         mlx_gen_minimax_h3::MODEL_ID,
@@ -2614,6 +2628,7 @@ fn manual_metal_exact_h3_trainer_runtime_receipt() {
         probe_packed,
         runtime_device,
         runtime_device_index,
+        SC21028_RUNTIME_ADAPTER_SCALE,
         dit.num_layers(),
         report.trainer_source_targets_applied,
         report.applied,

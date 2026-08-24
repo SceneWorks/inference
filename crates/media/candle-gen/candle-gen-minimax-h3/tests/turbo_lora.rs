@@ -2141,6 +2141,7 @@ const SC21028_TRAINER_LORA_BYTES: u64 = 298_263_792;
 const SC21028_PROBE_DOWN: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight";
 const SC21028_PROBE_UP: &str = "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight";
 const SC21028_PROBE_ALPHA: &str = "lora_unet_blocks_0_attn_qkv_proj.alpha";
+const SC21028_RUNTIME_ADAPTER_SCALE: f32 = 0.5;
 const SC21028_RUNTIME_RESIDUAL_REL_MAX: f32 = 1e-3;
 
 /// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
@@ -2221,7 +2222,10 @@ fn trainer_dit_path() -> PathBuf {
 }
 
 /// Independent oracle for the exact probe residual. It operates directly on the raw fused-QKV
-/// trainer tensors and never calls either conversion or installer under test.
+/// trainer tensors and applies the non-unit runtime adapter strength itself, never calling either
+/// conversion or installer under test. This artifact's alpha/rank is the identity 16/16; the
+/// non-identity alpha-formula proof remains
+/// `trainer_namespace_converts_to_independent_expected_factors_at_relative_max_abs`.
 fn exact_trainer_q_probe_residual(
     path: &Path,
     x: &Tensor,
@@ -2266,7 +2270,10 @@ fn exact_trainer_q_probe_residual(
         .unwrap()
         .matmul(&q_up.t().unwrap().contiguous().unwrap())
         .unwrap()
-        .affine((alpha / rank as f32) as f64, 0.0)
+        .affine(
+            ((alpha / rank as f32) * SC21028_RUNTIME_ADAPTER_SCALE) as f64,
+            0.0,
+        )
         .unwrap()
         .reshape((1, 3, cfg.inner_dim()))
         .unwrap()
@@ -2438,8 +2445,11 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         "real base projection is non-finite or vacuous: max|y|={base_peak:.3e}"
     );
 
-    let report = apply_minimax_h3_adapters(&mut dit, &[spec(lora.clone(), 1.0)])
-        .expect("install the exact trainer LoRA into the real 50-block DiT");
+    let report = apply_minimax_h3_adapters(
+        &mut dit,
+        &[spec(lora.clone(), SC21028_RUNTIME_ADAPTER_SCALE)],
+    )
+    .expect("install the exact trainer LoRA into the real 50-block DiT");
     assert_eq!(report.applied, 300, "50 blocks × six runtime leaves");
     assert!(report.unmatched_paths.is_empty(), "zero unmatched targets");
     assert_eq!(report.converted_from_trainer, 1, "exact trainer namespace");
@@ -2487,13 +2497,14 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
             && residual_correctness_rel_max <= SC21028_RUNTIME_RESIDUAL_REL_MAX,
         "the installed {probe} residual disagrees with independent raw-factor math by \
          relative-max-abs={residual_correctness_rel_max:.3e} (limit \
-         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation/alpha/scale"
+         {SC21028_RUNTIME_RESIDUAL_REL_MAX:.3e}); wrong QKV slice/orientation or runtime scale \
+         (non-identity alpha/rank is covered by the independent trainer mutation fixture)"
     );
 
     println!(
         "SC21028_TRAINER_RUNTIME_RECEIPT backend=candle accelerator=CUDA file={} bytes={bytes} \
          sha256={sha256} model_id={} dit={} config_sha256={} tier={} probe_packed={} \
-         device={:?} blocks={} source_targets={} applied={} adapted_modules={} \
+         device={:?} adapter_scale={} blocks={} source_targets={} applied={} adapted_modules={} \
          unmatched={} unique_ranks={:?} unique_alphas={:?} probe={} relative_max_abs_diff={:.6e}",
         lora.display(),
         candle_gen_minimax_h3::MODEL_ID,
@@ -2502,6 +2513,7 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         tier,
         probe_packed,
         device,
+        SC21028_RUNTIME_ADAPTER_SCALE,
         dit.num_layers(),
         report.trainer_source_targets_applied,
         report.applied,
