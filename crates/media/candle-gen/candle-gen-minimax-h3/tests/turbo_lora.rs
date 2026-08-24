@@ -30,17 +30,20 @@
 
 use crate::common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
-    is_comfyui_key_space, resolve_alpha, resolve_rank, unflatten_minimax_h3_trainer_tensors,
-    DEFAULT_LORA_ALPHA,
+    convert_minimax_h3_trainer_key_space, is_comfyui_key_space, resolve_alpha, resolve_rank,
+    unflatten_minimax_h3_trainer_tensors, DEFAULT_LORA_ALPHA,
 };
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
+use sha2::{Digest, Sha256};
 
 use common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
 
@@ -1709,4 +1712,143 @@ fn a_malformed_fused_qkv_is_refused_by_name() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("needs both"), "{err}");
+}
+
+// ─── exact external trainer receipt (sc-21028) ─────────────────────────────────────────────────
+
+const TRAINER_LORA_ENV: &str = "MINIMAX_H3_TRAINER_LORA";
+const TRAINER_LORA_SHA256_ENV: &str = "MINIMAX_H3_TRAINER_LORA_SHA256";
+const TRAINER_LORA_BYTES_ENV: &str = "MINIMAX_H3_TRAINER_LORA_BYTES";
+
+/// An explicitly selected exact-file receipt must fail closed when the proprietary file was not
+/// supplied. The optional digest and byte count bind a local receipt to a known artifact when the
+/// operator has them; absent values are reported, never invented.
+fn trainer_lora_path() -> PathBuf {
+    let raw = std::env::var(TRAINER_LORA_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{TRAINER_LORA_ENV}=<exact networks.lora_minimax_h3 safetensors file> is required \
+             when this ignored receipt test is selected"
+        )
+    });
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_file(),
+        "{TRAINER_LORA_ENV}={} is not a readable safetensors file",
+        path.display()
+    );
+    path
+}
+
+fn sha256_of(path: &Path) -> String {
+    let mut file =
+        File::open(path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .unwrap_or_else(|error| panic!("hash {}: {error}", path.display()));
+    format!("{:x}", hasher.finalize())
+}
+
+fn assert_optional_trainer_artifact_identity(path: &Path, bytes: u64, sha256: &str) {
+    if let Ok(expected) = std::env::var(TRAINER_LORA_BYTES_ENV) {
+        let expected = expected.parse::<u64>().unwrap_or_else(|error| {
+            panic!("{TRAINER_LORA_BYTES_ENV}={expected:?} is not an unsigned byte count: {error}")
+        });
+        assert_eq!(bytes, expected, "{} byte count", path.display());
+    }
+    if let Ok(expected) = std::env::var(TRAINER_LORA_SHA256_ENV) {
+        let expected = expected.trim().to_ascii_lowercase();
+        assert!(
+            expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{TRAINER_LORA_SHA256_ENV} must be a 64-character SHA-256 hex digest"
+        );
+        assert_eq!(sha256, expected, "{} SHA-256", path.display());
+    }
+}
+
+fn converted_lora_module(key: &str) -> Option<&str> {
+    key.strip_suffix(".lora_A.weight")
+        .or_else(|| key.strip_suffix(".lora_B.weight"))
+        .or_else(|| key.strip_suffix(".alpha"))
+}
+
+/// Header and conversion receipt for one exact `networks.lora_minimax_h3` artifact.
+///
+/// Run this only with the supplied proprietary file:
+///
+/// ```text
+/// MINIMAX_H3_TRAINER_LORA=/absolute/path/adapter.safetensors \
+///   cargo test -p candle-gen-minimax-h3 --test integration \
+///   turbo_lora::exact_h3_trainer_file_receipt -- --ignored --nocapture
+/// ```
+///
+/// This is deliberately **not** a substitute for the full-model Candle/CUDA receipt: that
+/// separate run must install this same digest into a real 50-block transformer and exercise every
+/// target.
+#[test]
+#[ignore = "needs MINIMAX_H3_TRAINER_LORA=<exact trainer safetensors>; run with --ignored"]
+fn exact_h3_trainer_file_receipt() {
+    let path = trainer_lora_path();
+    let bytes = std::fs::metadata(&path)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+        .len();
+    let sha256 = sha256_of(&path);
+    assert_optional_trainer_artifact_identity(&path, bytes, &sha256);
+
+    let adapter = candle_gen::train::merge::read_adapter(&path)
+        .unwrap_or_else(|error| panic!("read exact trainer file {}: {error}", path.display()));
+    let (converted, layout, mut alphas) =
+        convert_minimax_h3_trainer_key_space(&adapter.tensors, &adapter.meta).unwrap_or_else(
+            |error| panic!("validate exact trainer file {}: {error}", path.display()),
+        );
+    assert_eq!(layout.source_targets, 200, "50 blocks × four source leaves");
+    assert_eq!(layout.ranks, vec![16], "unique source factor ranks");
+    assert!(layout.trunk_only, "the exact trainer export is trunk-only");
+    alphas.sort_by(f32::total_cmp);
+    alphas.dedup_by(|left, right| *left == *right);
+    assert_eq!(alphas, vec![16.0], "unique per-target alphas");
+
+    let runtime_targets = adapter_target_paths(&MiniMaxH3DitConfig::default())
+        .into_iter()
+        .filter(|target| target.starts_with("transformer_blocks."))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(runtime_targets.len(), 300, "50 blocks × six runtime leaves");
+    let runtime_modules = converted
+        .keys()
+        .map(String::as_str)
+        .map(|key| {
+            converted_lora_module(key)
+                .unwrap_or_else(|| panic!("trainer conversion emitted unexpected key {key}"))
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(converted.len(), 900, "300 runtime leaves × down/up/alpha");
+    assert_eq!(
+        runtime_modules.len(),
+        300,
+        "fused QKV expands 200 source targets to 300 leaves"
+    );
+    let unmatched = runtime_modules
+        .difference(&runtime_targets)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        unmatched.is_empty(),
+        "unmatched runtime targets: {unmatched:?}"
+    );
+
+    println!(
+        "SC21028_TRAINER_RECEIPT backend=candle file={} bytes={bytes} sha256={sha256} \
+         source_targets={} runtime_leaves={} unmatched={} unique_ranks={:?} unique_alphas={:?} \
+         parser_layout_only=true",
+        path.display(),
+        layout.source_targets,
+        runtime_modules.len(),
+        unmatched.len(),
+        layout.ranks,
+        alphas,
+    );
+    println!(
+        "SC21028_TRAINER_RUNTIME_RECEIPT_REQUIRED backend=candle full_model=MINIMAX_H3 transformer \
+         blocks=50 accelerator=CUDA status=not_run"
+    );
 }
