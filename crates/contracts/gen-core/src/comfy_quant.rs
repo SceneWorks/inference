@@ -27,9 +27,19 @@
 //! | `float8_e5m2`     | `F8_E5M2` `[out,in]` | `F32` scalar                                          | `fp8_e5m2_to_f32(v) · scale`                 |
 //! | `mxfp8`           | `F8_E4M3` `[⌈out/32⌉·32, ⌈in/32⌉·32]` | `F8_E8M0`/`U8` `[⌈rows/128⌉·128, ⌈(cols/32)/4⌉·4]` in cuBLAS 128×4 swizzle | per 32-block `e4m3 · 2^(e8m0−127)`, unpadded |
 //! | `int8_tensorwise` | `I8` `[out,in]`    | `F32` `[out]` / `[out,1]` (scalar when `out == 1`)    | `code · scale[row]` (the MLX/Candle arm)     |
+//! | `nvfp4`           | `U8` `[out, in/2]` (E2M1 nibbles, **even element in the high nibble**) | `F8_E4M3` `[⌈out/128⌉·128, ⌈(in/16)/4⌉·4]` in the same cuBLAS 128×4 swizzle, **plus** a scalar `F32` `{layer}.weight_scale_2` | per 16-block `e2m1 · e4m3(block) · global`, unpadded |
 //!
-//! `nvfp4` (`{layer}.weight_scale_2` + E2M1 nibbles) is named and refused here — sc-20641.
+//! # Header-declared quantization (sc-20641)
+//!
+//! Not every ComfyUI-lineage checkpoint carries per-layer `.comfy_quant` tensors. The NVFP4
+//! converters write a **file-level** `__metadata__._quantization_metadata` JSON object instead —
+//! `{"format_version": "1.0", "layers": {"<layer>": {"format": "nvfp4"}, …}}` — whose layer names
+//! are often *relative* to the state-dict prefix the tensors carry (`blocks.0.attn.wq` for
+//! `model.diffusion_model.blocks.0.attn.wq.weight`). [`parse_quantization_metadata`] validates that
+//! object into the same [`ComfyQuantDescriptor`] values a `.comfy_quant` tensor would yield, and the
+//! plan compiler resolves the prefix exactly once and fails closed when it is not unique.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Block length of one MXFP8 shared exponent (OCP MX spec; `comfy_kitchen.MXFP8_BLOCK_SIZE`).
@@ -39,6 +49,13 @@ pub const MXFP8_PAD: usize = 32;
 /// cuBLAS block-scale swizzle tile: 128 rows × 4 scale columns (`comfy_kitchen.float_utils.to_blocked`).
 pub const MXFP8_SCALE_ROW_TILE: usize = 128;
 pub const MXFP8_SCALE_COL_TILE: usize = 4;
+
+/// Block length of one NVFP4 FP8 micro-scale (`comfy.quant_ops.QUANT_ALGOS["nvfp4"].group_size`,
+/// `comfy.float.stochastic_round_quantize_nvfp4_block`'s `block_size`).
+pub const NVFP4_BLOCK: usize = 16;
+/// ComfyUI pads NVFP4 storage to multiples of 16 on both axes
+/// (`TensorCoreNVFP4Layout.get_padded_shape` / `pad_16x`).
+pub const NVFP4_PAD: usize = 16;
 
 /// The `.comfy_quant` `format` names this workspace can plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,6 +68,9 @@ pub enum ComfyQuantFormat {
     Float8E5M2,
     /// `mxfp8` — fp8 E4M3FN values + E8M0 shared exponents per 32-element block along the last axis.
     Mxfp8,
+    /// `nvfp4` — E2M1 nibbles (two per `U8` byte) + one FP8 E4M3 micro-scale per 16-element block
+    /// **and** one `F32` per-tensor `weight_scale_2` (the two-level NVFP4 scaling).
+    Nvfp4,
 }
 
 impl ComfyQuantFormat {
@@ -61,6 +81,7 @@ impl ComfyQuantFormat {
             Self::Float8E4M3Fn => "float8_e4m3fn",
             Self::Float8E5M2 => "float8_e5m2",
             Self::Mxfp8 => "mxfp8",
+            Self::Nvfp4 => "nvfp4",
         }
     }
 
@@ -70,6 +91,7 @@ impl ComfyQuantFormat {
             "float8_e4m3fn" => Self::Float8E4M3Fn,
             "float8_e5m2" => Self::Float8E5M2,
             "mxfp8" => Self::Mxfp8,
+            "nvfp4" => Self::Nvfp4,
             _ => return None,
         })
     }
@@ -102,7 +124,7 @@ pub enum ComfyQuantDescriptorError {
     NotAnObject,
     MissingFormat,
     /// A `format` this workspace has no codec for (a future/unknown ComfyUI format fails closed,
-    /// never best-effort: `nvfp4` lands here until sc-20641 registers it).
+    /// never best-effort).
     UnsupportedFormat {
         format: String,
     },
@@ -133,7 +155,7 @@ impl fmt::Display for ComfyQuantDescriptorError {
             Self::UnsupportedFormat { format } => write!(
                 f,
                 "descriptor format {format:?} has no registered codec on this workspace (known: \
-                 int8_tensorwise, float8_e4m3fn, float8_e5m2, mxfp8)"
+                 int8_tensorwise, float8_e4m3fn, float8_e5m2, mxfp8, nvfp4)"
             ),
             Self::ConvRot => write!(
                 f,
@@ -167,6 +189,16 @@ pub fn parse_comfy_quant_descriptor(
         serde_json::from_str(text).map_err(|error| ComfyQuantDescriptorError::NotJson {
             detail: error.to_string(),
         })?;
+    descriptor_from_json(&json)
+}
+
+/// The shared validation half of [`parse_comfy_quant_descriptor`]: one already-parsed JSON value
+/// describing a single layer. The file-level `_quantization_metadata` form
+/// ([`parse_quantization_metadata`]) carries the *same* per-layer objects, so both routes accept and
+/// refuse exactly the same descriptors rather than each growing its own rules.
+pub fn descriptor_from_json(
+    json: &serde_json::Value,
+) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let object = json
         .as_object()
         .ok_or(ComfyQuantDescriptorError::NotAnObject)?;
@@ -210,6 +242,106 @@ pub fn parse_comfy_quant_descriptor(
         format,
         full_precision_matrix_mult,
     })
+}
+
+// =================================================================================================
+// File-level `__metadata__._quantization_metadata` descriptors (sc-20641).
+// =================================================================================================
+
+/// Why a `__metadata__._quantization_metadata` blob is not a descriptor table this workspace
+/// accepts. Layer-level defects carry the layer name the fault appears on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuantizationMetadataError {
+    NotJson {
+        detail: String,
+    },
+    NotAnObject,
+    /// `format_version` absent or not the `"1.0"` this workspace models.
+    FormatVersion {
+        found: Option<String>,
+    },
+    /// `layers` absent or not a JSON object.
+    Layers,
+    /// The table declares no layer at all — an empty declaration is a producer defect, not a
+    /// "nothing is quantized" statement (an unquantized file carries no metadata key).
+    NoLayers,
+    /// One layer's descriptor object is malformed or names a format without a codec.
+    Layer {
+        layer: String,
+        defect: ComfyQuantDescriptorError,
+    },
+}
+
+impl fmt::Display for QuantizationMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotJson { detail } => write!(
+                f,
+                "`__metadata__._quantization_metadata` is not valid JSON: {detail}"
+            ),
+            Self::NotAnObject => write!(
+                f,
+                "`__metadata__._quantization_metadata` is not a JSON object"
+            ),
+            Self::FormatVersion { found } => write!(
+                f,
+                "`_quantization_metadata.format_version` must be the string \"1.0\", got {found:?}"
+            ),
+            Self::Layers => write!(
+                f,
+                "`_quantization_metadata.layers` must be a JSON object of layer → descriptor"
+            ),
+            Self::NoLayers => write!(
+                f,
+                "`_quantization_metadata.layers` declares no layer; refusing a quantization \
+                 declaration that governs nothing"
+            ),
+            Self::Layer { layer, defect } => write!(f, "layer {layer:?}: {defect}"),
+        }
+    }
+}
+
+impl std::error::Error for QuantizationMetadataError {}
+
+/// Parse a file-level `__metadata__._quantization_metadata` payload into the per-layer descriptor
+/// table the plan compiler consumes, keyed by the metadata's own layer names (which may be relative
+/// to the tensors' state-dict prefix — the compiler resolves that).
+///
+/// Every layer object goes through [`descriptor_from_json`], so an `nvfp4` layer that also declares
+/// an unmodelled key is refused here exactly as a `.comfy_quant` tensor would be.
+pub fn parse_quantization_metadata(
+    payload: &str,
+) -> Result<BTreeMap<String, ComfyQuantDescriptor>, QuantizationMetadataError> {
+    let json: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| QuantizationMetadataError::NotJson {
+            detail: error.to_string(),
+        })?;
+    let object = json
+        .as_object()
+        .ok_or(QuantizationMetadataError::NotAnObject)?;
+    let version = object.get("format_version").and_then(|v| v.as_str());
+    if version != Some("1.0") {
+        return Err(QuantizationMetadataError::FormatVersion {
+            found: version.map(str::to_owned),
+        });
+    }
+    let layers = object
+        .get("layers")
+        .and_then(|v| v.as_object())
+        .ok_or(QuantizationMetadataError::Layers)?;
+    if layers.is_empty() {
+        return Err(QuantizationMetadataError::NoLayers);
+    }
+    let mut table = BTreeMap::new();
+    for (layer, value) in layers {
+        let descriptor =
+            descriptor_from_json(value).map_err(|defect| QuantizationMetadataError::Layer {
+                layer: layer.clone(),
+                defect,
+            })?;
+        table.insert(layer.clone(), descriptor);
+    }
+    Ok(table)
 }
 
 // =================================================================================================
@@ -285,6 +417,18 @@ pub fn decode_fp8_e5m2_scalar(values: &[u8], scale: f32, out: &mut Vec<f32>) {
     out.extend(values.iter().map(|&byte| fp8_e5m2_to_f32(byte) * scale));
 }
 
+/// OCP **E2M1** (FP4) code → value: sign in bit 3, 2 exponent bits (bias 1), 1 mantissa bit; no
+/// infinities and no NaN — all 16 codes are finite. `exponent == 0` is subnormal (`mantissa · 2^-1`).
+/// This is the grid ComfyUI's `stochastic_float_to_fp4_e2m1` emits as `(sign << 3) | (exp << 1) | m`.
+pub const E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Decode one E2M1 nibble (`0..16`; the high bits of a larger value are ignored by the mask).
+pub fn e2m1_to_f32(code: u8) -> f32 {
+    E2M1_LUT[(code & 0x0F) as usize]
+}
+
 // =================================================================================================
 // MXFP8 geometry.
 // =================================================================================================
@@ -297,31 +441,44 @@ pub fn mxfp8_padded_shape(logical: [usize; 2]) -> [usize; 2] {
     ]
 }
 
-/// The swizzled block-scale tensor shape for a stored (padded) `[rows, cols]` MXFP8 weight:
-/// `[⌈rows/128⌉·128, ⌈(cols/32)/4⌉·4]`. `cols` must already be a multiple of 32.
-pub fn mxfp8_scale_shape(stored: [usize; 2]) -> [usize; 2] {
-    let blocks = stored[1] / MXFP8_BLOCK;
+/// The shape `comfy.float.to_blocked` gives a `[rows, blocks]` block-scale matrix:
+/// `[⌈rows/128⌉·128, ⌈blocks/4⌉·4]`. The 128×4 tiling is a property of the cuBLAS block-scale
+/// layout, not of the element format, so MXFP8 (block 32) and NVFP4 (block 16) share it.
+pub fn blocked_scale_shape(rows: usize, blocks: usize) -> [usize; 2] {
     [
-        stored[0].div_ceil(MXFP8_SCALE_ROW_TILE) * MXFP8_SCALE_ROW_TILE,
+        rows.div_ceil(MXFP8_SCALE_ROW_TILE) * MXFP8_SCALE_ROW_TILE,
         blocks.div_ceil(MXFP8_SCALE_COL_TILE) * MXFP8_SCALE_COL_TILE,
     ]
 }
 
-/// Index into the cuBLAS-swizzled (`to_blocked`) scale buffer of the scale for `(row, block)`, where
-/// the swizzled buffer is `mxfp8_scale_shape(stored)` row-major and `blocks = stored_cols / 32`.
+/// Index into a `to_blocked` scale buffer of shape [`blocked_scale_shape`]`(rows, blocks)` (read
+/// row-major / flat) of the scale belonging to logical `(row, block)`.
 ///
 /// `to_blocked` views the padded `[R, B]` scale matrix as `(R/128, 128, B/4, 4)`, permutes to
-/// `(R/128, B/4, 128, 4)`, splits the 128 rows into `(4, 32)`, transposes those two, and flattens —
-/// so element `(row, block)` lands at
-/// `(((row/128)·(B/4) + block/4)·32 + row%32)·16 + ((row%128)/32)·4 + block%4`.
-pub fn mxfp8_swizzled_scale_index(stored: [usize; 2], row: usize, block: usize) -> usize {
-    let scale_shape = mxfp8_scale_shape(stored);
-    let col_tiles = scale_shape[1] / MXFP8_SCALE_COL_TILE;
+/// `(R/128, B/4, 128, 4)` — so the **atom grid is walked row-major**, `atom = (row/128)·(B/4) +
+/// block/4` — splits the 128 rows into `(4, 32)`, transposes those two, and flattens; the intra-atom
+/// slot is `(row%32)·16 + ((row%128)/32)·4 + block%4`.
+///
+/// This is the single derivation of the swizzle; every format-specific helper delegates here rather
+/// than re-spelling the arithmetic.
+pub fn blocked_scale_index(rows: usize, blocks: usize, row: usize, block: usize) -> usize {
+    let col_tiles = blocked_scale_shape(rows, blocks)[1] / MXFP8_SCALE_COL_TILE;
     let row_tile = row / MXFP8_SCALE_ROW_TILE;
     let row_in_tile = row % MXFP8_SCALE_ROW_TILE;
-    (((row_tile * col_tiles + block / MXFP8_SCALE_COL_TILE) * 32) + row_in_tile % 32) * 16
-        + (row_in_tile / 32) * 4
-        + block % MXFP8_SCALE_COL_TILE
+    let atom = row_tile * col_tiles + block / MXFP8_SCALE_COL_TILE;
+    (atom * 32 + row_in_tile % 32) * 16 + (row_in_tile / 32) * 4 + block % MXFP8_SCALE_COL_TILE
+}
+
+/// The swizzled block-scale tensor shape for a stored (padded) `[rows, cols]` MXFP8 weight:
+/// `[⌈rows/128⌉·128, ⌈(cols/32)/4⌉·4]`. `cols` must already be a multiple of 32.
+pub fn mxfp8_scale_shape(stored: [usize; 2]) -> [usize; 2] {
+    blocked_scale_shape(stored[0], stored[1] / MXFP8_BLOCK)
+}
+
+/// [`blocked_scale_index`] for an MXFP8 weight whose stored shape is `stored` (`blocks =
+/// stored_cols / 32`).
+pub fn mxfp8_swizzled_scale_index(stored: [usize; 2], row: usize, block: usize) -> usize {
+    blocked_scale_index(stored[0], stored[1] / MXFP8_BLOCK, row, block)
 }
 
 /// Why an MXFP8 layer's geometry is not decodable.
@@ -493,6 +650,269 @@ pub fn decode_mxfp8(
     Ok(())
 }
 
+// =================================================================================================
+// NVFP4 geometry + reference decode (sc-20641).
+// =================================================================================================
+
+/// ComfyUI's stored (16-padded) logical shape of an NVFP4 weight
+/// (`TensorCoreNVFP4Layout.get_padded_shape` / `pad_16x`). The **byte** shape on disk is
+/// `[rows, cols / 2]` — two E2M1 codes per `U8`.
+pub fn nvfp4_padded_shape(logical: [usize; 2]) -> [usize; 2] {
+    [
+        logical[0].div_ceil(NVFP4_PAD) * NVFP4_PAD,
+        logical[1].div_ceil(NVFP4_PAD) * NVFP4_PAD,
+    ]
+}
+
+/// The `to_blocked` block-scale shape for a stored (16-padded) `[rows, cols]` NVFP4 weight:
+/// `[⌈rows/128⌉·128, ⌈(cols/16)/4⌉·4]`. `cols` must already be a multiple of 16.
+pub fn nvfp4_scale_shape(stored: [usize; 2]) -> [usize; 2] {
+    blocked_scale_shape(stored[0], stored[1] / NVFP4_BLOCK)
+}
+
+/// [`blocked_scale_index`] for an NVFP4 weight whose stored shape is `stored` (`blocks =
+/// stored_cols / 16`).
+pub fn nvfp4_swizzled_scale_index(stored: [usize; 2], row: usize, block: usize) -> usize {
+    blocked_scale_index(stored[0], stored[1] / NVFP4_BLOCK, row, block)
+}
+
+/// Why an NVFP4 layer's geometry is not decodable. Every variant is a per-layer fact; the plan
+/// compiler attaches the tensor name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Nvfp4GeometryError {
+    /// The stored `U8` weight is not rank-2 `[rows, cols/2]`.
+    StoredRank { rank: usize },
+    /// A stored axis is not a multiple of 16 (ComfyUI pads both axes; an unpadded file is not this
+    /// format). `stored` is the **logical** `[rows, cols]` the byte shape implies.
+    StoredNotPadded { stored: [usize; 2] },
+    /// The declared logical shape does not pad to the stored shape.
+    LogicalDoesNotPadToStored {
+        logical: [usize; 2],
+        stored: [usize; 2],
+        expected_stored: [usize; 2],
+    },
+    /// The block-scale tensor's shape is not the swizzled shape the stored weight needs.
+    ScaleShape {
+        stored: [usize; 2],
+        scale: Vec<usize>,
+        expected: [usize; 2],
+    },
+    /// Payload byte counts disagree with the shapes — a truncated nibble payload lands here.
+    PayloadLength {
+        what: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    /// The `weight_scale_2` per-tensor scale is not a usable multiplier. Carried as raw bits so the
+    /// error type stays `Eq` alongside its siblings (a NaN scale is exactly one of the cases).
+    GlobalScale { bits: u32 },
+    /// A block scale that governs real (non-padding) elements is the E4M3 NaN code. ComfyUI clamps
+    /// block scales to 448, so this is corruption, and multiplying through it would quietly poison
+    /// 16 weights instead of failing.
+    BlockScaleNaN { row: usize, block: usize },
+    /// A padding element (row ≥ logical rows, or column ≥ logical cols) is not the E2M1 zero code
+    /// ComfyUI's `F.pad` writes. A non-zero pad means the shapes are being read wrong — the values
+    /// would be dropped silently otherwise.
+    PaddingNotZero { row: usize, col: usize, code: u8 },
+}
+
+impl fmt::Display for Nvfp4GeometryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StoredRank { rank } => write!(
+                f,
+                "nvfp4 weight must be a rank-2 U8 [out, in/2] matrix, got rank {rank}"
+            ),
+            Self::StoredNotPadded { stored } => write!(
+                f,
+                "nvfp4 weight logical shape {stored:?} is not a multiple of {NVFP4_PAD} on both axes"
+            ),
+            Self::LogicalDoesNotPadToStored {
+                logical,
+                stored,
+                expected_stored,
+            } => write!(
+                f,
+                "nvfp4 logical shape {logical:?} pads to {expected_stored:?} but the stored weight is {stored:?}"
+            ),
+            Self::ScaleShape {
+                stored,
+                scale,
+                expected,
+            } => write!(
+                f,
+                "nvfp4 weight_scale shape {scale:?} is not the swizzled {expected:?} a stored {stored:?} weight needs"
+            ),
+            Self::PayloadLength {
+                what,
+                expected,
+                actual,
+            } => write!(f, "nvfp4 {what} payload is {actual} bytes, expected {expected}"),
+            Self::GlobalScale { bits } => write!(
+                f,
+                "nvfp4 `weight_scale_2` must be finite and non-negative, got {}",
+                f32::from_bits(*bits)
+            ),
+            Self::BlockScaleNaN { row, block } => write!(
+                f,
+                "nvfp4 block scale at (row {row}, block {block}) is the E4M3 NaN code 0x7F"
+            ),
+            Self::PaddingNotZero { row, col, code } => write!(
+                f,
+                "nvfp4 padding element at (row {row}, col {col}) holds E2M1 code {code:#x}, not zero"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Nvfp4GeometryError {}
+
+/// Validate NVFP4 per-layer geometry from the header: the stored `U8` `[rows, cols/2]` byte shape,
+/// the block-scale tensor shape, and (when the adapter declares it) the logical shape. Returns
+/// `(stored_logical, logical)` — the 16-padded `[rows, cols]` the payload holds, and the shape the
+/// decode unpads to (the declared one, or the stored one when no logical shape is declared).
+pub fn validate_nvfp4_geometry(
+    packed: &[usize],
+    scale_shape: &[usize],
+    logical: Option<&[usize]>,
+) -> Result<([usize; 2], [usize; 2]), Nvfp4GeometryError> {
+    let [rows, packed_cols] = packed else {
+        return Err(Nvfp4GeometryError::StoredRank { rank: packed.len() });
+    };
+    let stored = [*rows, packed_cols.saturating_mul(2)];
+    if stored[0] == 0
+        || stored[1] == 0
+        || !stored[0].is_multiple_of(NVFP4_PAD)
+        || !stored[1].is_multiple_of(NVFP4_PAD)
+    {
+        return Err(Nvfp4GeometryError::StoredNotPadded { stored });
+    }
+    let expected_scale = nvfp4_scale_shape(stored);
+    if scale_shape != expected_scale.as_slice() {
+        return Err(Nvfp4GeometryError::ScaleShape {
+            stored,
+            scale: scale_shape.to_vec(),
+            expected: expected_scale,
+        });
+    }
+    match logical {
+        None => Ok((stored, stored)),
+        Some(logical) => {
+            let [l_rows, l_cols] = logical else {
+                return Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                    logical: [0, 0],
+                    stored,
+                    expected_stored: [0, 0],
+                });
+            };
+            let logical = [*l_rows, *l_cols];
+            let expected_stored = nvfp4_padded_shape(logical);
+            if expected_stored != stored {
+                return Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                    logical,
+                    stored,
+                    expected_stored,
+                });
+            }
+            Ok((stored, logical))
+        }
+    }
+}
+
+/// Reference NVFP4 dequantization — the two-level decode, in plain f32.
+///
+/// `packed` is the stored `[rows, cols/2]` byte payload (row-major, **even column in the high
+/// nibble**, per `comfy.float.stochastic_float_to_fp4_e2m1`'s `(even << 4) | odd`), `scales` the
+/// `to_blocked` E4M3 payload of shape [`nvfp4_scale_shape`]`(stored)`, `global_scale` the layer's
+/// `weight_scale_2`. The result is the **logical** matrix, row-major:
+///
+/// ```text
+/// out[r][c] = e2m1(code[r][c]) · e4m3(scale[r][c / 16]) · global_scale
+/// ```
+///
+/// Padding elements outside the logical shape are validated to be zero rather than merely dropped.
+pub fn decode_nvfp4(
+    packed: &[u8],
+    scales: &[u8],
+    global_scale: f32,
+    stored: [usize; 2],
+    logical: [usize; 2],
+    out: &mut Vec<f32>,
+) -> Result<(), Nvfp4GeometryError> {
+    let row_bytes = stored[1] / 2;
+    let expected_packed = stored[0] * row_bytes;
+    if packed.len() != expected_packed {
+        return Err(Nvfp4GeometryError::PayloadLength {
+            what: "weight",
+            expected: expected_packed,
+            actual: packed.len(),
+        });
+    }
+    let scale_shape = nvfp4_scale_shape(stored);
+    let expected_scales = scale_shape[0] * scale_shape[1];
+    if scales.len() != expected_scales {
+        return Err(Nvfp4GeometryError::PayloadLength {
+            what: "weight_scale",
+            expected: expected_scales,
+            actual: scales.len(),
+        });
+    }
+    if !global_scale.is_finite() || global_scale < 0.0 {
+        return Err(Nvfp4GeometryError::GlobalScale {
+            bits: global_scale.to_bits(),
+        });
+    }
+    if logical[0] > stored[0] || logical[1] > stored[1] {
+        return Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+            logical,
+            stored,
+            expected_stored: nvfp4_padded_shape(logical),
+        });
+    }
+
+    let code_at = |row: usize, col: usize| -> u8 {
+        let byte = packed[row * row_bytes + col / 2];
+        if col.is_multiple_of(2) {
+            byte >> 4
+        } else {
+            byte & 0x0F
+        }
+    };
+    // Padding must be the zero code ComfyUI's `F.pad` writes — checked before anything is emitted so
+    // a mis-read shape cannot be silently trimmed away.
+    for row in 0..stored[0] {
+        let col_start = if row < logical[0] { logical[1] } else { 0 };
+        for col in col_start..stored[1] {
+            let code = code_at(row, col);
+            if code != 0 {
+                return Err(Nvfp4GeometryError::PaddingNotZero { row, col, code });
+            }
+        }
+    }
+
+    let blocks = stored[1] / NVFP4_BLOCK;
+    out.clear();
+    out.reserve(logical[0] * logical[1]);
+    for row in 0..logical[0] {
+        for block in 0..blocks {
+            let block_start = block * NVFP4_BLOCK;
+            if block_start >= logical[1] {
+                break;
+            }
+            let scale_byte = scales[nvfp4_swizzled_scale_index(stored, row, block)];
+            if scale_byte & 0x7F == 0x7F {
+                return Err(Nvfp4GeometryError::BlockScaleNaN { row, block });
+            }
+            let element_scale = fp8_e4m3fn_to_f32(scale_byte) * global_scale;
+            let block_end = (block_start + NVFP4_BLOCK).min(logical[1]);
+            for col in block_start..block_end {
+                out.push(e2m1_to_f32(code_at(row, col)) * element_scale);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reference int8 per-row dequantization: `codes` is `[rows, cols]` row-major, `scales` has one
 /// entry per row. Shared by the backend arms' tests.
 pub fn decode_int8_per_row(codes: &[i8], scales: &[f32], cols: usize, out: &mut Vec<f32>) {
@@ -639,7 +1059,11 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_parser_accepts_the_four_formats_and_refuses_every_defect_by_name() {
+    fn descriptor_parser_accepts_the_five_formats_and_refuses_every_defect_by_name() {
+        assert_eq!(
+            parse_comfy_quant_descriptor(br#"{"format": "nvfp4"}"#).map(|d| d.format),
+            Ok(ComfyQuantFormat::Nvfp4)
+        );
         assert_eq!(
             parse_comfy_quant_descriptor(br#"{"format": "float8_e4m3fn"}"#),
             Ok(ComfyQuantDescriptor {
@@ -679,9 +1103,9 @@ mod tests {
                 ComfyQuantDescriptorError::MissingFormat,
             ),
             (
-                br#"{"format": "nvfp4"}"#,
+                br#"{"format": "int4_awq"}"#,
                 ComfyQuantDescriptorError::UnsupportedFormat {
-                    format: "nvfp4".to_owned(),
+                    format: "int4_awq".to_owned(),
                 },
             ),
             (
@@ -729,6 +1153,328 @@ mod tests {
                 _ => assert_eq!(&got, expected, "{:?}", String::from_utf8_lossy(bytes)),
             }
             assert!(!got.to_string().is_empty());
+        }
+    }
+
+    /// E2M1 per the OCP MX spec, computed from the bit fields — sign bit 3, 2 exponent bits at
+    /// bias 1, 1 mantissa bit — with no LUT in sight. This is the second derivation the shipped
+    /// [`E2M1_LUT`] is checked against; it is also exactly the inverse of the encoder ComfyUI
+    /// writes (`(sign << 3) | (exp << 1) | mantissa`).
+    fn spec_e2m1(code: u8) -> f32 {
+        let s = ((code >> 3) & 1) as i32;
+        let e = ((code >> 1) & 0x3) as i32;
+        let m = (code & 0x1) as i32;
+        let value = if e == 0 {
+            (m as f64) / 2.0 // subnormal: 0.m × 2^(1-1)
+        } else {
+            (1.0 + (m as f64) / 2.0) * 2f64.powi(e - 1)
+        };
+        (if s == 1 { -value } else { value }) as f32
+    }
+
+    #[test]
+    fn e2m1_decoder_matches_the_spec_for_all_16_codes_and_the_canonical_grid() {
+        for code in 0..16_u8 {
+            assert!(
+                same_value(e2m1_to_f32(code), spec_e2m1(code)),
+                "code {code:#x}: got {} want {}",
+                e2m1_to_f32(code),
+                spec_e2m1(code)
+            );
+        }
+        // The canonical NVFP4 grid, hand-written (NVIDIA NVFP4 / OCP MX E2M1 Table): the eight
+        // positive magnitudes and their negations, in code order.
+        assert_eq!(
+            E2M1_LUT,
+            [
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
+                -6.0
+            ]
+        );
+        // E2M1 has no NaN and no infinity: every code is finite, and 6.0 is the max magnitude.
+        assert!(E2M1_LUT.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            E2M1_LUT
+                .iter()
+                .fold(0.0_f32, |max, value| max.max(value.abs())),
+            6.0
+        );
+        // Sign bit is bit 3 and nothing else: code and code|8 differ only in sign.
+        for code in 0..8_u8 {
+            assert_eq!(
+                e2m1_to_f32(code | 0x08),
+                -e2m1_to_f32(code),
+                "code {code:#x}"
+            );
+        }
+        // High bits above the nibble are masked off (the packer hands whole bytes through).
+        assert_eq!(e2m1_to_f32(0xF7), e2m1_to_f32(0x07));
+    }
+
+    #[test]
+    fn nvfp4_geometry_pads_both_axes_to_16_and_sizes_the_swizzled_scale_tile() {
+        assert_eq!(nvfp4_padded_shape([40, 70]), [48, 80]);
+        assert_eq!(nvfp4_padded_shape([16, 32]), [16, 32]);
+        // The shipped kreamania_variant7 shapes: U8 [6144, 3072] → logical [6144, 6144], scale
+        // [6144, 384]; U8 [16384, 3072] → scale [16384, 384]; U8 [6144, 8192] → scale [6144, 1024].
+        assert_eq!(nvfp4_scale_shape([6144, 6144]), [6144, 384]);
+        assert_eq!(nvfp4_scale_shape([16384, 6144]), [16384, 384]);
+        assert_eq!(nvfp4_scale_shape([6144, 16384]), [6144, 1024]);
+        assert_eq!(nvfp4_scale_shape([1536, 6144]), [1536, 384]);
+        // Padding of the scale tile itself: 48 rows → 128, 5 blocks → 8.
+        assert_eq!(nvfp4_scale_shape([48, 80]), [128, 8]);
+
+        assert_eq!(
+            validate_nvfp4_geometry(&[6144, 3072], &[6144, 384], None),
+            Ok(([6144, 6144], [6144, 6144]))
+        );
+        assert_eq!(
+            validate_nvfp4_geometry(&[48, 40], &[128, 8], Some(&[40, 70])),
+            Ok(([48, 80], [40, 70]))
+        );
+        assert_eq!(
+            validate_nvfp4_geometry(&[48, 40], &[128, 8], Some(&[40, 90])),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                logical: [40, 90],
+                stored: [48, 80],
+                expected_stored: [48, 96]
+            })
+        );
+        // Byte shape whose doubled columns are not 16-aligned, and a non-16 row count.
+        assert_eq!(
+            validate_nvfp4_geometry(&[32, 20], &[128, 4], None),
+            Err(Nvfp4GeometryError::StoredNotPadded { stored: [32, 40] })
+        );
+        assert_eq!(
+            validate_nvfp4_geometry(&[20, 32], &[128, 4], None),
+            Err(Nvfp4GeometryError::StoredNotPadded { stored: [20, 64] })
+        );
+        assert_eq!(
+            validate_nvfp4_geometry(&[48, 40], &[48, 5], None),
+            Err(Nvfp4GeometryError::ScaleShape {
+                stored: [48, 80],
+                scale: vec![48, 5],
+                expected: [128, 8]
+            })
+        );
+        assert_eq!(
+            validate_nvfp4_geometry(&[6144], &[6144, 384], None),
+            Err(Nvfp4GeometryError::StoredRank { rank: 1 })
+        );
+    }
+
+    /// The NVFP4 swizzle is the *same* cuBLAS 128×4 `to_blocked` layout MXFP8 uses — only the block
+    /// width differs — so both delegate to one derivation and the pinned `to_blocked` table pins
+    /// both.
+    #[test]
+    fn nvfp4_and_mxfp8_share_one_blocked_scale_derivation() {
+        // A [256, 256] MXFP8 weight and a [256, 128] NVFP4 weight both have 8 blocks per row, so
+        // every (row, block) must land at the same flat slot under either helper.
+        for row in 0..256 {
+            for block in 0..8 {
+                let shared = blocked_scale_index(256, 8, row, block);
+                assert_eq!(mxfp8_swizzled_scale_index([256, 256], row, block), shared);
+                assert_eq!(nvfp4_swizzled_scale_index([256, 128], row, block), shared);
+            }
+        }
+        assert_eq!(blocked_scale_shape(256, 8), [256, 8]);
+        assert_eq!(mxfp8_scale_shape([256, 256]), blocked_scale_shape(256, 8));
+        assert_eq!(nvfp4_scale_shape([256, 128]), blocked_scale_shape(256, 8));
+        // Bijection over a multi-atom grid (2 row atoms × 2 block atoms) — the case where a
+        // row-major vs column-major atom walk would differ.
+        let (rows, blocks) = (256, 8);
+        let shape = blocked_scale_shape(rows, blocks);
+        let mut seen = vec![false; shape[0] * shape[1]];
+        for row in 0..rows {
+            for block in 0..blocks {
+                let index = blocked_scale_index(rows, blocks, row, block);
+                assert!(!seen[index], "({row},{block}) collides at {index}");
+                seen[index] = true;
+            }
+        }
+        assert!(seen.iter().all(|slot| *slot));
+        // The atom grid is walked ROW-major (`permute(0, 2, 1, 3)` in `to_blocked`): logical
+        // (row 0, block 4) is in atom 1, i.e. flat 512 — not atom 2 (1024), which a column-major
+        // atom walk would give for this 2×2 grid.
+        assert_eq!(blocked_scale_index(256, 8, 0, 4), 512);
+        assert_eq!(blocked_scale_index(256, 8, 128, 0), 1024);
+    }
+
+    #[test]
+    fn nvfp4_decode_applies_both_scale_levels_unpads_and_refuses_corruption() {
+        // Stored [16, 64] (4 blocks per row), logical [10, 40]: a non-block-aligned tail (cols
+        // 32..40 share block 1's scale, 40..64 are padding) and padded rows 10..16.
+        let stored = [16_usize, 64];
+        let logical = [10_usize, 40];
+        let row_bytes = stored[1] / 2;
+        let mut packed = vec![0_u8; stored[0] * row_bytes];
+        // Real region: column c holds E2M1 code (c % 8) — walks the whole positive grid.
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                let code = (col % 8) as u8;
+                let index = row * row_bytes + col / 2;
+                if col.is_multiple_of(2) {
+                    packed[index] = (packed[index] & 0x0F) | (code << 4);
+                } else {
+                    packed[index] = (packed[index] & 0xF0) | code;
+                }
+            }
+        }
+        let scale_shape = nvfp4_scale_shape(stored);
+        let mut scales = vec![0x7F_u8; scale_shape[0] * scale_shape[1]]; // NaN poison everywhere
+        let exponents = [0x38_u8, 0x40, 0x30, 0x3C]; // 1.0, 2.0, 0.5, 1.5
+                                                     // Blocks 0..3 govern real columns (block 2 covers the partial tail 32..40); block 3 is pure
+                                                     // padding and keeps its NaN poison, which a correct decode never reads.
+        for row in 0..logical[0] {
+            for block in 0..3 {
+                scales[nvfp4_swizzled_scale_index(stored, row, block)] =
+                    exponents[(row + block) % 4];
+            }
+        }
+        let global = 0.25_f32;
+
+        let mut out = Vec::new();
+        decode_nvfp4(&packed, &scales, global, stored, logical, &mut out).unwrap();
+        assert_eq!(out.len(), logical[0] * logical[1]);
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                let block = col / NVFP4_BLOCK;
+                let expected =
+                    E2M1_LUT[col % 8] * fp8_e4m3fn_to_f32(exponents[(row + block) % 4]) * global;
+                assert_eq!(out[row * logical[1] + col], expected, "row {row} col {col}");
+            }
+        }
+
+        // Truncated nibble payload / truncated scales.
+        assert!(matches!(
+            decode_nvfp4(&packed[..10], &scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::PayloadLength { what: "weight", .. })
+        ));
+        assert!(matches!(
+            decode_nvfp4(&packed, &scales[..10], global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::PayloadLength {
+                what: "weight_scale",
+                ..
+            })
+        ));
+        // A non-finite / negative global scale.
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(matches!(
+                decode_nvfp4(&packed, &scales, bad, stored, logical, &mut out),
+                Err(Nvfp4GeometryError::GlobalScale { .. })
+            ));
+        }
+        // A logical shape wider than storage.
+        assert!(matches!(
+            decode_nvfp4(&packed, &scales, global, stored, [10, 65], &mut out),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored { .. })
+        ));
+        // A NaN block scale over real elements refuses instead of poisoning 16 weights.
+        let mut nan_scales = scales.clone();
+        nan_scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0x7F;
+        assert_eq!(
+            decode_nvfp4(&packed, &nan_scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::BlockScaleNaN { row: 3, block: 1 })
+        );
+        // A non-zero padding element refuses rather than being trimmed away.
+        let mut padded = packed.clone();
+        // Row 0, column 41 — an odd column, so the low nibble of byte 20.
+        padded[41 / 2] |= 0x07;
+        assert_eq!(
+            decode_nvfp4(&padded, &scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::PaddingNotZero {
+                row: 0,
+                col: 41,
+                code: 7
+            })
+        );
+        let mut padded_row = packed.clone();
+        padded_row[12 * row_bytes] |= 0x50;
+        assert_eq!(
+            decode_nvfp4(&padded_row, &scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::PaddingNotZero {
+                row: 12,
+                col: 0,
+                code: 5
+            })
+        );
+    }
+
+    #[test]
+    fn quantization_metadata_parses_the_layer_table_and_refuses_every_defect() {
+        let table = parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"blocks.0.attn.wq": {"format": "nvfp4"},
+                "blocks.0.mlp.up": {"format": "float8_e4m3fn", "full_precision_matrix_mult": true}}}"#,
+        )
+        .expect("valid table");
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table["blocks.0.attn.wq"],
+            ComfyQuantDescriptor {
+                format: ComfyQuantFormat::Nvfp4,
+                full_precision_matrix_mult: false
+            }
+        );
+        assert!(table["blocks.0.mlp.up"].full_precision_matrix_mult);
+
+        assert!(matches!(
+            parse_quantization_metadata("{"),
+            Err(QuantizationMetadataError::NotJson { .. })
+        ));
+        assert_eq!(
+            parse_quantization_metadata("[1]"),
+            Err(QuantizationMetadataError::NotAnObject)
+        );
+        assert_eq!(
+            parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#),
+            Err(QuantizationMetadataError::FormatVersion { found: None })
+        );
+        assert_eq!(
+            parse_quantization_metadata(
+                r#"{"format_version": "2.0", "layers": {"a": {"format": "nvfp4"}}}"#
+            ),
+            Err(QuantizationMetadataError::FormatVersion {
+                found: Some("2.0".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_quantization_metadata(r#"{"format_version": "1.0"}"#),
+            Err(QuantizationMetadataError::Layers)
+        );
+        assert_eq!(
+            parse_quantization_metadata(r#"{"format_version": "1.0", "layers": {}}"#),
+            Err(QuantizationMetadataError::NoLayers)
+        );
+        // A layer defect is named by layer and carries the descriptor-level reason, unchanged.
+        assert_eq!(
+            parse_quantization_metadata(
+                r#"{"format_version": "1.0", "layers": {"blocks.3.attn.wq": {"format": "fp6"}}}"#
+            ),
+            Err(QuantizationMetadataError::Layer {
+                layer: "blocks.3.attn.wq".to_owned(),
+                defect: ComfyQuantDescriptorError::UnsupportedFormat {
+                    format: "fp6".to_owned()
+                }
+            })
+        );
+        assert_eq!(
+            parse_quantization_metadata(
+                r#"{"format_version": "1.0", "layers": {"blocks.3.attn.wq": {"format": "nvfp4", "group_size": 32}}}"#
+            ),
+            Err(QuantizationMetadataError::Layer {
+                layer: "blocks.3.attn.wq".to_owned(),
+                defect: ComfyQuantDescriptorError::UnknownField {
+                    field: "group_size".to_owned()
+                }
+            })
+        );
+        for error in [
+            QuantizationMetadataError::NotAnObject,
+            QuantizationMetadataError::Layers,
+            QuantizationMetadataError::NoLayers,
+            QuantizationMetadataError::FormatVersion { found: None },
+        ] {
+            assert!(!error.to_string().is_empty());
         }
     }
 
