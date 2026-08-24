@@ -4362,7 +4362,7 @@ mod tests {
             CheckpointBackend, ImportedModelOperation, ImportedModelRegistration,
             ImportedModelSource, BASE_SNAPSHOT_COMPONENT, FLUX2_CHECKPOINT_ADAPTER,
             KREA_2_CHECKPOINT_ADAPTER, QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER,
-            Z_IMAGE_CHECKPOINT_ADAPTER,
+            WAN_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
         };
 
         let registry = super::provider_registry().unwrap();
@@ -4371,6 +4371,10 @@ mod tests {
             &KREA_2_CHECKPOINT_ADAPTER,
             &QWEN_IMAGE_CHECKPOINT_ADAPTER,
             &SDXL_CHECKPOINT_ADAPTER,
+            // The Wan 2.2 ComfyUI expert pair (sc-20644). Registering it widened this frozen
+            // corpus by one row; the corpus is a SHAPE assertion, so it is rewritten here in the
+            // same change rather than exempted.
+            &WAN_CHECKPOINT_ADAPTER,
             &Z_IMAGE_CHECKPOINT_ADAPTER,
         ];
         let adapters: Vec<_> = registry.checkpoint_adapters().collect();
@@ -4492,6 +4496,18 @@ mod tests {
                 provider_id: candle_gen_sdxl::MODEL_ID,
                 required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
                 inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                // Wan's imported route takes NO caller-staged components: the UMT5 encoder, VAE
+                // and tokenizer come from a resident snapshot tier the caller resolves, not from
+                // `LoadSpec::components`. And `inherit_adapters` is false because
+                // `load_from_comfyui_experts` has no adapter seam (sc-20644).
+                family: "wan-video",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_wan::config::MODEL_ID_T2V_14B,
+                required_components: None,
+                inherit_adapters: false,
             },
             ImportedModelRegistration {
                 family: "z-image",
