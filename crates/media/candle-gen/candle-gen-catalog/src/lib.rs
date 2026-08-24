@@ -3595,6 +3595,76 @@ mod preview_advertising {
             panic!("{function:?} has an unterminated body");
         }
 
+        /// Whether a `cfg` predicate changes with the `cuda` feature. This deliberately treats
+        /// `any`, `all`, and `not` alike: a provider registration whose branch depends on CUDA in
+        /// any boolean position needs the catalog to forward that feature rather than selecting an
+        /// accidental fallback branch.
+        fn predicate_mentions_cuda(predicate: &str) -> bool {
+            let predicate = predicate.trim();
+            if let Some(rest) = predicate.strip_prefix("feature") {
+                return rest
+                    .trim_start()
+                    .strip_prefix('=')
+                    .is_some_and(|value| value.trim().trim_matches('"') == "cuda");
+            }
+            for combinator in ["all", "any", "not"] {
+                if let Some(inner) = strip_call(predicate, combinator) {
+                    return split_top_level(inner)
+                        .iter()
+                        .any(|part| predicate_mentions_cuda(part));
+                }
+            }
+            false
+        }
+
+        /// Every `cfg` predicate attached inside the registration body that mentions CUDA.
+        /// `module_tree` has already removed comments and test-only modules, so this reads only
+        /// compiled source rather than prose which happens to quote a cfg expression.
+        fn has_cuda_gated_registration(source: &str) -> bool {
+            const OPEN: &str = "#[cfg(";
+            let mut rest = source;
+            while let Some(offset) = rest.find(OPEN) {
+                let predicate = &rest[offset + OPEN.len()..];
+                let mut depth = 1usize;
+                for (end, ch) in predicate.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                if predicate_mentions_cuda(&predicate[..end]) {
+                                    return true;
+                                }
+                                rest = &predicate[end + 1..];
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(depth, 0, "unterminated cfg predicate in registration body");
+            }
+            false
+        }
+
+        // Parser controls: these are all valid CUDA-dependent registration predicates, including
+        // Wan's `any(feature = "cuda", test)` form and a negated fallback branch.
+        for predicate in [
+            "feature = \"cuda\"",
+            "any(feature = \"cuda\", test)",
+            "all(unix, feature = \"cuda\")",
+            "not(feature = \"cuda\")",
+        ] {
+            assert!(
+                predicate_mentions_cuda(predicate),
+                "CUDA predicate parser missed {predicate:?}"
+            );
+        }
+        assert!(
+            !predicate_mentions_cuda("any(feature = \"metal\", test)"),
+            "CUDA predicate parser must not match another feature"
+        );
+
         let catalog_src = candle_gen_root().join("candle-gen-catalog/src");
         let catalog_tree = module_tree("candle-gen-catalog", &catalog_src);
         let catalog_registration = function_body(
@@ -3633,17 +3703,17 @@ mod preview_advertising {
                     .expect("provider lib.rs is shipped"),
                 "pub fn register_providers",
             );
-            let compact: String = provider_registration
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect();
-            if compact.contains("#[cfg(feature=\"cuda\")]") {
+            if has_cuda_gated_registration(provider_registration) {
                 cuda_gated_catalog_providers.insert(dir);
             }
         }
         assert!(
             !cuda_gated_catalog_providers.is_empty(),
             "the CUDA registration scan found no catalog providers; its forwarding assertion would be vacuous"
+        );
+        assert!(
+            cuda_gated_catalog_providers.contains("candle-gen-wan"),
+            "Wan's cfg(any(feature = \"cuda\", test)) registration branch must be covered"
         );
 
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
