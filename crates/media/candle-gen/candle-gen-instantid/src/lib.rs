@@ -26,6 +26,7 @@
 mod resample;
 
 pub mod kps;
+pub mod memory_strategy;
 pub mod model;
 pub mod openpose;
 pub mod restore;

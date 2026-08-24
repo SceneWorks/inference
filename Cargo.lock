@@ -475,6 +475,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -491,6 +492,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -651,6 +653,7 @@ dependencies = [
  "candle-gen-sdxl",
  "image",
  "rand",
+ "tempfile",
 ]
 
 [[package]]
@@ -859,6 +862,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -923,6 +927,7 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -939,6 +944,8 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2193,6 +2200,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.21.4",
 ]
@@ -2401,6 +2409,7 @@ dependencies = [
  "mlx-gen-wan",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2543,8 +2552,10 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2611,6 +2622,8 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 

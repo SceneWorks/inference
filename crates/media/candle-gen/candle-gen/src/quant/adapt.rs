@@ -248,6 +248,16 @@ pub struct LokrFactors {
 }
 
 impl LokrFactors {
+    /// Bytes retained by the structured residual after source factors are converted to f32 and any
+    /// low-rank inner products are materialized. This is the device allocation installed on an
+    /// [`AdaptLinear`], not the adapter container payload.
+    pub fn resident_f32_bytes(&self) -> usize {
+        self.w1
+            .elem_count()
+            .saturating_add(self.w2.elem_count())
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
+
     /// Build the small `[a,c]`/`[b,d]` Kronecker factors from a LoKr module's factors (full `w1`/`w2`
     /// or a low-rank `w_a·w_b` product — that product is bounded by the factor dims, NEVER `out×in`),
     /// baking the FULL `scale` into `w2`. The allocation-free counterpart to

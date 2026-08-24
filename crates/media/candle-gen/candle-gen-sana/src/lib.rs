@@ -52,6 +52,7 @@
 
 pub mod config;
 pub mod dc_ae;
+pub mod memory_strategy;
 pub mod model;
 pub mod nvfp4_dit;
 pub mod pipeline;
@@ -59,8 +60,10 @@ pub mod preview;
 pub mod text_encoder;
 pub mod transformer;
 
+pub use candle_gen::gen_core;
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
+pub use memory_strategy::SanaVariant;
 pub use model::{
     descriptor, load, load_sprint, sprint_descriptor, MODEL_ID, RES_MULTIPLE, SPRINT_MODEL_ID,
 };
@@ -79,12 +82,106 @@ pub use transformer::SanaTransformer;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(model::REGISTRATION)
-        .register_generator(model::SPRINT_REGISTRATION)
+        .register_generator(model::SPRINT_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(memory_strategy::SPRINT_MEMORY_BEHAVIOR)
+}
+
+/// Register SANA's pre-load memory contract and its weights-free contract fixture for both routes.
+///
+/// Called unconditionally from [`register_providers`] — nothing here requires a CUDA device, so a
+/// selector can price SANA on a host with no GPU and before any weight file is opened. Composition
+/// roots that assemble their own catalog must NOT call this a second time; `register_providers`
+/// already covers it.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::CANDLE_BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_contract(SanaVariant::Base, spec),
+        })
+        .register_memory_strategy(memory_strategy::CANDLE_SPRINT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: SPRINT_MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_contract(SanaVariant::Sprint, spec),
+        })
 }
 
 /// Build the complete explicit Candle SANA provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+#[cfg(test)]
+mod explicit_registry_tests {
+    use super::gen_core;
+
+    /// sc-19753 feature review, BLOCKER 4 — before this, `register_providers` registered two
+    /// generators and NOTHING for the memory registry, so a selector could not price either SANA
+    /// route pre-load. The registrations must come from `register_providers` alone (no catalog
+    /// help) and must be constructible with no CUDA device and no weight files.
+    #[test]
+    fn register_providers_alone_publishes_both_memory_routes() {
+        let registry = super::provider_registry().unwrap();
+
+        let generators: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(generators, [super::MODEL_ID, super::SPRINT_MODEL_ID]);
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert_eq!(
+            strategies,
+            [super::MODEL_ID, super::SPRINT_MODEL_ID],
+            "a selector cannot price a route with no memory-strategy registration"
+        );
+
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert_eq!(fixtures, [super::MODEL_ID, super::SPRINT_MODEL_ID]);
+
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert_eq!(behaviors, [super::MODEL_ID, super::SPRINT_MODEL_ID]);
+
+        // The fixture contract really is weights-free: resolve it through the registered seam over
+        // every published surface spec, against a path that does not exist.
+        for registration in registry.memory_contract_fixture_registrations() {
+            let specs = (registration.surface_specs)();
+            assert!(!specs.is_empty());
+            for surface in specs {
+                assert_eq!(
+                    surface.resolved_artifact_tier(),
+                    gen_core::MemoryContractSurfaceTier::Bf16,
+                    "Candle SANA is dense-only; a packed witness names a route it cannot load"
+                );
+                // Point the witness at a path that does not exist: resolving must not touch disk.
+                let mut spec = surface.spec.clone();
+                spec.weights = gen_core::WeightsSource::Dir("/nonexistent/sana/snapshot".into());
+                let contract = (registration.contract)(&spec).unwrap();
+                assert_eq!(contract.provider_id, registration.provider_id);
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{}: {:?}",
+                    registration.provider_id,
+                    contract.conformance_errors()
+                );
+            }
+        }
+    }
 }

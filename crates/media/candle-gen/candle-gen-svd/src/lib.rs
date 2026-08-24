@@ -24,6 +24,7 @@ pub mod config;
 pub mod conv3d;
 pub mod embeddings;
 pub mod image_encoder;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preprocess;
 pub mod scheduler;
@@ -244,7 +245,7 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 
 /// Upper bound on a `Reference` image's dimensions (caps host allocations on the input buffer + the
 /// resize's f32 intermediates). 8192 is far above any real photo (F-164).
-const MAX_REFERENCE_DIM: u32 = 8192;
+pub(crate) const MAX_REFERENCE_DIM: u32 = 8192;
 /// Upper bound on requested output `frames` — SVD-XT is the 25-frame variant; per-frame latents +
 /// `added_time_ids` scale linearly, so cap the allocation.
 const MAX_FRAMES: u32 = 64;
@@ -295,6 +296,7 @@ pub struct SvdGenerator {
     /// conditioner → UNet → VAE in disjoint phases through the shared Candle lifecycle.
     offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
+    memory: Option<memory_strategy::PreparedSvdMemory>,
 }
 
 /// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
@@ -359,19 +361,22 @@ fn validate_reference_image(img: &Image) -> gen_core::Result<()> {
 impl SvdGenerator {
     /// Resolve the single conditioning reference image (image→video input).
     fn reference<'a>(&self, req: &'a GenerationRequest) -> gen_core::Result<&'a Image> {
-        req.conditioning
-            .iter()
-            .find_map(|c| match c {
-                Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                gen_core::Error::Msg("svd_xt: image→video requires a Reference image".into())
-            })
+        match req.conditioning.as_slice() {
+            [Conditioning::Reference {
+                image,
+                strength: None,
+            }] => Ok(image),
+            _ => Err(gen_core::Error::Msg(
+                "svd_xt: image→video requires exactly one strength-free Reference image".into(),
+            )),
+        }
     }
 
     /// Lazily load + cache the SVD components. `cached` recovers a poisoned lock (sc-9015) internally.
     fn components(&self) -> CResult<Components> {
+        if let Some(memory) = &self.memory {
+            memory.ensure_unchanged()?;
+        }
         candle_gen::cached(&self.components, || {
             Components::load(&self.root, &self.device)
         })
@@ -484,6 +489,15 @@ impl Generator for SvdGenerator {
         validate_output_params(req)?;
         let img = self.reference(req)?;
         validate_reference_image(img)?;
+        if req.memory.is_some() {
+            let memory = self.memory.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "svd_xt: memory request requires a sealed physical receipt".into(),
+                )
+            })?;
+            memory_strategy::validate_memory_request(req)?;
+            memory_strategy::validate_active_request(memory, req)?;
+        }
         Ok(())
     }
 
@@ -712,9 +726,42 @@ impl Generator for SvdGenerator {
             audio: None,
         })
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "svd_xt: loaded generator has no sealed memory receipt".into(),
+            )
+        })?;
+        memory_strategy::begin_request(memory, self.device.clone(), context)
+    }
 }
 
 fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -735,18 +782,38 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
             "candle svd does not support quantization".into(),
         ));
     }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
         return Err(gen_core::Error::Unsupported(
             "candle svd does not support control / IP-adapter overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
+    // The public prepared route advertises request-scoped Resident authority. Materialize its
+    // sealed components inside the admitted cache load transaction so the cache's before/after
+    // device snapshots attribute the actual F32 residency. Direct callers without a prepared
+    // receipt retain the historical lazy Resident/Sequential behavior.
+    let components = if memory.is_some() {
+        Some(Components::load(&root, &device)?)
+    } else {
+        None
+    };
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
     Ok(SvdGenerator {
         descriptor: descriptor(),
         root,
         device,
         offload: spec.offload_policy,
-        components: Mutex::new(None),
+        components: Mutex::new(components),
+        memory,
     })
 }
 
@@ -766,7 +833,16 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+}
+
+/// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle SVD provider catalog.

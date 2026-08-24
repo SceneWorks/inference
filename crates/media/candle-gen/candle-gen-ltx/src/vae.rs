@@ -579,6 +579,29 @@ impl LtxVideoVae {
             None => self.decode(latent),
         }
     }
+
+    /// Execute the request-scoped bounded-decode rung.  The selected spatial cap is never merely
+    /// telemetry: it forces the same shared tiling driver used by automatic safety budgeting.
+    pub fn decode_budgeted_with_spatial_cap(
+        &self,
+        latent: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let (_b, _c, f, h, w) = latent.dims5()?;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale;
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale;
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        let mut cfg =
+            plan_ltx_tiling(out_h, out_w, out_f, ltx_vae_safe_budget_gib())?.unwrap_or_default();
+        // A one-tile result is still materialized through `decode_tiled`, preserving the selected
+        // control rather than silently falling back to ordinary decode.
+        cfg.spatial = Some(candle_gen::gen_core::tiling::SpatialTiling {
+            tile_px: tile_edge as i32,
+            overlap_px: overlap as i32,
+        });
+        self.decode_tiled(latent, &cfg)
+    }
 }
 
 // --- sc-7076 / sc-6894: budgeted LTX VAE decode (candle) ------------------------------------------

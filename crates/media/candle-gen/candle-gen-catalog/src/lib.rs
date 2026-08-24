@@ -133,6 +133,8 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
@@ -140,6 +142,10 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
     registry.build()
 }
 
@@ -940,14 +946,15 @@ mod preview_advertising {
             dir: "candle-gen-boogu",
             register: candle_gen_boogu::register_providers,
             denoise: Denoise::Shared,
-            // sc-17218's inventory. Base, Turbo's curated/img2img lane, and Edit each drive one
-            // hooked flow-sampler site. Turbo's default route owns a four-step DMD loop and emits
-            // directly at the top of each iteration, before prediction and re-noise. No dark site:
-            // every user-reachable denoise lane now has a live sink seam.
+            // sc-17218's resident inventory plus sc-20787's exact staged twin. Base, Turbo's
+            // curated/img2img lane, and Edit each drive one hooked flow-sampler site per residency
+            // path. Turbo's default route owns one direct four-step DMD loop per residency path and
+            // emits before prediction and re-noise. No dark site: every user-reachable denoise lane
+            // has a live sink seam.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
-                hooked: 3,
-                direct: 1,
+                hooked: 6,
+                direct: 2,
                 dark: &[],
             }],
         },
@@ -1060,11 +1067,10 @@ mod preview_advertising {
             dir: "candle-gen-kolors",
             register: candle_gen_kolors::register_providers,
             denoise: Denoise::Shared,
-            // sc-16954's inventory. Kolors has one hooked driver call — the registered route's curated
-            // lane in `pipeline.rs` — and three bespoke leading-Euler loops, one per entry point, each
-            // emitting directly: the registered route's native lane (`pipeline.rs`), the pose-control
-            // provider (`control.rs`) and the IP-Adapter provider (`ip_provider.rs`). The two
-            // providers' CURATED lanes are invisible here by construction: they reach
+            // sc-16954/sc-20790 inventory. Kolors has one hooked driver call — the registered route's
+            // curated resident lane in `pipeline.rs` — and resident plus request-staged leading-Euler
+            // loops in each of `pipeline.rs`, `control.rs`, and `ip_provider.rs`, all emitting directly.
+            // The two providers' CURATED lanes are invisible here by construction: they reach
             // `candle_gen_sdxl::denoise_curated` rather than a driver of their own, so the hook they
             // build is counted in `candle-gen-sdxl`'s `denoise.rs` row. No dark site — this crate has
             // no trainer.
@@ -1072,19 +1078,19 @@ mod preview_advertising {
                 FileRoutes {
                     file: "control.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "ip_provider.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 1,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
             ],
@@ -1249,19 +1255,16 @@ mod preview_advertising {
             dir: "candle-gen-sd3",
             register: candle_gen_sd3::register_providers,
             denoise: Denoise::Shared,
-            // sc-16958's inventory, and the first in this table that is simply the plain shape: ONE
-            // hooked `run_flow_sampler` site, in `pipeline.rs`'s `render_core`, which is the only
-            // shared-driver call the whole crate contains. It carries all SIX user-reachable lanes —
-            // the three registered descriptors each reached through txt2img and through
-            // img2img / `Reference` — because the img2img fork blends its reference into `x_t` and
-            // shortens the σ schedule before the driver call rather than opening a second one.
+            // Two hooked `run_flow_sampler` sites: the warm Resident `render_core` and the
+            // request-local Staged denoise phase. Each carries all six route/mode lanes (three
+            // descriptors x T2I/I2I) through the same schedule, CFG, seed, and preview contract.
             // No dark site: `load_variant` refuses control / IP-adapter overlays, so this crate ships
             // no descriptor-less render lane, and it has no trainer. No direct emission either —
             // `preview.rs` holds only the reused epic-16624 16-channel fit and a layout check, since
             // SD3.5's running latent is already the `[1, C, h, w]` contract with nothing to unpack.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
-                hooked: 1,
+                hooked: 2,
                 direct: 0,
                 dark: &[],
             }],
@@ -3364,55 +3367,146 @@ mod preview_advertising {
         register_providers: fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder,
         /// `Some` for a crate that publishes weights-free contract surfaces on every platform.
         /// `None` marks a route reachable only through a CUDA-gated `register_providers` — the
-        /// asymmetry the old `24`/`23` registration pin used to encode.
+        /// asymmetry the old `24`/`23` registration pin used to encode, unless it publishes a
+        /// resident-only witness directly from `register_providers`.
         register_surfaces: Option<fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder>,
+        /// A resident-only route can be registered on every platform without publishing optimized
+        /// contract surfaces; this keeps that intentional asymmetry explicit.
+        resident_only_on_cpu: bool,
     }
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
         MemoryRouteCrate {
+            dir: "candle-gen-anima",
+            register_providers: candle_gen_anima::register_providers,
+            register_surfaces: Some(candle_gen_anima::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-bernini",
+            register_providers: candle_gen_bernini::register_providers,
+            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-boogu",
+            register_providers: candle_gen_boogu::register_providers,
+            register_surfaces: Some(candle_gen_boogu::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-chroma",
+            register_providers: candle_gen_chroma::register_providers,
+            register_surfaces: Some(candle_gen_chroma::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-ideogram",
+            register_providers: candle_gen_ideogram::register_providers,
+            register_surfaces: Some(candle_gen_ideogram::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-flux2",
             register_providers: candle_gen_flux2::register_providers,
             register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-kolors",
+            register_providers: candle_gen_kolors::register_providers,
+            register_surfaces: Some(candle_gen_kolors::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-krea",
             register_providers: candle_gen_krea::register_providers,
             register_surfaces: Some(candle_gen_krea::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-lens",
             register_providers: candle_gen_lens::register_providers,
             register_surfaces: Some(candle_gen_lens::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-ltx",
+            register_providers: candle_gen_ltx::register_providers,
+            register_surfaces: Some(candle_gen_ltx::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-mage",
             register_providers: candle_gen_mage::register_providers,
             register_surfaces: Some(candle_gen_mage::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-minimax-h3",
             register_providers: candle_gen_minimax_h3::register_providers,
             register_surfaces: Some(candle_gen_minimax_h3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sana",
+            register_providers: candle_gen_sana::register_providers,
+            register_surfaces: Some(candle_gen_sana::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-scail2",
+            register_providers: candle_gen_scail2::register_providers,
+            register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sd3",
+            register_providers: candle_gen_sd3::register_providers,
+            register_surfaces: Some(candle_gen_sd3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sdxl",
+            register_providers: candle_gen_sdxl::register_providers,
+            register_surfaces: Some(candle_gen_sdxl::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sensenova",
+            register_providers: candle_gen_sensenova::register_providers,
+            register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-svd",
+            register_providers: candle_gen_svd::register_providers,
+            register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",
             register_providers: candle_gen_wan::register_providers,
             register_surfaces: None,
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-z-image",
             register_providers: candle_gen_z_image::register_providers,
             register_surfaces: Some(candle_gen_z_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
     ];
 
@@ -3526,12 +3620,21 @@ mod preview_advertising {
         let mut expected_ids = BTreeSet::new();
         for owner in MEMORY_ROUTE_CRATES {
             let mut builder = (owner.register_providers)(ProviderRegistryBuilder::new());
-            // Mirror `memory_contract_surface_registry`: the weights-free surfaces are appended only
-            // off CUDA, because on a CUDA build `register_providers` already carries the same ids and
-            // registering both would be a duplicate.
+            // Mirror `memory_contract_surface_registry`: append weights-free surfaces off CUDA only
+            // when `register_providers` does not already carry them. Most Candle image routes add
+            // their memory surface only on CUDA; SenseNova publishes the same surface on every
+            // platform, so registering it twice would be a duplicate.
             if !cfg!(feature = "cuda") {
                 if let Some(register) = owner.register_surfaces {
-                    builder = register(builder);
+                    let provider_ids = (owner.register_providers)(ProviderRegistryBuilder::new())
+                        .build()
+                        .unwrap_or_else(|error| panic!("{}: {error}", owner.dir))
+                        .memory_strategy_registrations()
+                        .map(|registration| registration.provider_id)
+                        .collect::<BTreeSet<_>>();
+                    if provider_ids.is_empty() {
+                        builder = register(builder);
+                    }
                 }
             }
             let ids = builder
@@ -3540,7 +3643,9 @@ mod preview_advertising {
                 .memory_strategy_registrations()
                 .map(|registration| registration.provider_id)
                 .collect::<BTreeSet<_>>();
-            let reachable = owner.register_surfaces.is_some() || cfg!(feature = "cuda");
+            let reachable = owner.register_surfaces.is_some()
+                || owner.resident_only_on_cpu
+                || cfg!(feature = "cuda");
             assert_eq!(
                 !ids.is_empty(),
                 reachable,

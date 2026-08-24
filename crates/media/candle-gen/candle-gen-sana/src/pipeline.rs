@@ -212,13 +212,54 @@ pub fn denoise_cfg_from(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
+    denoise_cfg_from_memory(
+        transformer,
+        sigmas,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_from_memory(
+    transformer: &SanaTransformer,
+    sigmas: &[f32],
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    uncond: Option<&Tensor>,
+    guidance_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
+    let attention_budget = memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map(|value| value as usize);
     let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Tensor::from_vec(vec![timestep * NUM_TRAIN_TIMESTEPS], (1,), device)?;
-        let pred_cond = transformer.forward(x, cond, &t)?;
+        let pred_cond =
+            transformer.forward_with_guidance_memory(x, cond, &t, None, attention_budget)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
-                let pred_uncond = transformer.forward(x, uc, &t)?;
+                let pred_uncond =
+                    transformer.forward_with_guidance_memory(x, uc, &t, None, attention_budget)?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = (&pred_cond - &pred_uncond)?;
                 Ok((&pred_uncond + (delta * guidance_scale as f64)?)?)
@@ -243,12 +284,24 @@ pub fn denoise_cfg_from(
 /// divides by `vae.config.scaling_factor` before decode; the decoder emits NCHW `[1, 3, H, W]` in
 /// `[-1, 1]`, mapped to `[0, 255]` u8.
 pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Tensor) -> Result<Image> {
+    decode_to_image_memory(decoder, cfg, latents, None)
+}
+
+pub fn decode_to_image_memory(
+    decoder: &DcAeDecoder,
+    cfg: &DcAeConfig,
+    latents: &Tensor,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Image> {
     // diffusers: latents / scaling_factor.
     let unscaled = (latents / cfg.scaling_factor as f64)?;
     // VRAM-fit gate (sc-11804): single-pass on a card with headroom (the Blackwell target), tiled tail
     // on a small card whose f32 decode peak (~17.7 GB at 1024²) would OOM. Byte-identical to `decode`
     // when it fits; seam-free when it tiles.
-    let decoded = decoder.decode_fit(&unscaled)?; // [1, 3, H, W] NCHW, f32 in [-1, 1]
+    let decoded = match memory {
+        Some(memory) => decoder.decode_with(&unscaled, memory.tile_vae_decode)?,
+        None => decoder.decode_fit(&unscaled)?,
+    }; // [1, 3, H, W] NCHW, f32 in [-1, 1]
     let rgb = (((decoded * 0.5)? + 0.5)?.clamp(0f32, 1f32)? * 255.0)?;
     let rgb = candle_gen::round_rgb8(&rgb)?
         .i(0)?
@@ -411,6 +464,28 @@ impl SanaPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
+        self.generate_with_conditioning_memory(
+            req,
+            conditioning,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &SanaConditioning,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -435,7 +510,7 @@ impl SanaPipeline {
         } else {
             noise
         };
-        let latents = denoise_cfg_from(
+        let latents = denoise_cfg_from_memory(
             &self.transformer,
             &sigmas,
             req.sampler,
@@ -449,9 +524,10 @@ impl SanaPipeline {
             cancel,
             on_progress,
             preview,
+            memory,
         )?;
         on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+        decode_to_image_memory(&self.decoder, &self.dc_ae_cfg, &latents, memory)
     }
 
     /// Convenience [`SanaPipeline::generate_with`] with a no-op cancel + progress (examples / tests).
@@ -467,6 +543,145 @@ impl SanaPipeline {
         let preview = crate::preview::base_hook(&inert);
         self.generate_with(req, device, &cancel, &mut noop, &preview)
     }
+}
+
+fn revalidate_before_load(
+    check: &mut impl FnMut() -> candle_gen::gen_core::Result<()>,
+) -> Result<()> {
+    check().map_err(|error| CandleError::Msg(error.to_string()))
+}
+
+fn load_vae_encoder(root: &Path, device: &Device, cfg: &DcAeConfig) -> Result<DcAeEncoder> {
+    let files = resolve_component_files(&root.join("vae"))?;
+    let weights = Weights::from_files_filtered(&files, device, DType::F32, &["encoder."])?;
+    DcAeEncoder::from_weights(&weights, cfg)
+}
+
+fn load_vae_decoder(root: &Path, device: &Device, cfg: &DcAeConfig) -> Result<DcAeDecoder> {
+    let files = resolve_component_files(&root.join("vae"))?;
+    let weights = Weights::from_files_filtered(&files, device, DType::F32, &["decoder."])?;
+    DcAeDecoder::from_weights(&weights, cfg.clone())
+}
+
+fn load_staged_transformer(
+    root: &Path,
+    device: &Device,
+    cfg: SanaTransformerConfig,
+    memory: candle_gen::gen_core::GenerationMemory,
+) -> Result<SanaTransformer> {
+    let files = resolve_component_files(&root.join("transformer"))?;
+    if memory.stream_transformer_blocks {
+        let window = memory.transformer_window_size.unwrap_or(1) as usize;
+        SanaTransformer::from_files_windowed(&files, cfg, window, device)
+    } else {
+        let weights = Weights::from_files(&files, device, DType::F32)?;
+        SanaTransformer::from_weights(&weights, cfg)
+    }
+}
+
+/// Execute true per-request Base phase residency: Gemma conditioning, optional DC-AE encode,
+/// Linear-DiT denoise, then DC-AE decode. Each load is preceded by immutable seal revalidation and
+/// each component is synchronized and dropped before the next is opened.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_base_staged(
+    root: &Path,
+    req: &SanaGenerateRequest<'_>,
+    seeds: &[u64],
+    memory: candle_gen::gen_core::GenerationMemory,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    mut check: impl FnMut() -> candle_gen::gen_core::Result<()>,
+) -> Result<Vec<Image>> {
+    revalidate_before_load(&mut check)?;
+    let text = load_text_encoder(root, device)?;
+    let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+    let conditioning = SanaConditioning {
+        cond: text.encode(req.prompt)?,
+        uncond: if guidance > 1.0 {
+            Some(text.encode(req.negative_prompt.unwrap_or(""))?)
+        } else {
+            None
+        },
+    };
+    device.synchronize()?;
+    drop(text);
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+
+    let cfg = DcAeConfig::sana_f32c32();
+    let steps = req.steps.unwrap_or(DEFAULT_STEPS);
+    let start_step = resolve_init_start(req.init_image, steps, req.strength);
+    let clean = if start_step > 0 {
+        revalidate_before_load(&mut check)?;
+        let encoder = load_vae_encoder(root, device, &cfg)?;
+        let clean = encode_init_latents(
+            &encoder,
+            &cfg,
+            req.init_image.expect("positive start requires init image"),
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?;
+        device.synchronize()?;
+        drop(encoder);
+        Some(clean)
+    } else {
+        None
+    };
+
+    revalidate_before_load(&mut check)?;
+    let transformer =
+        load_staged_transformer(root, device, SanaTransformerConfig::sana_1600m(), memory)?;
+    let sigmas = sana_sigmas(req.scheduler, steps);
+    let mut latents = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let noise = create_noise(device, *seed, req.width, req.height)?;
+        let initial = match &clean {
+            Some(clean) => blend_flow_init(clean, &noise, &sigmas, start_step)?,
+            None => noise,
+        };
+        latents.push(denoise_cfg_from_memory(
+            &transformer,
+            &sigmas,
+            req.sampler,
+            start_step,
+            *seed,
+            initial,
+            &conditioning.cond,
+            conditioning.uncond.as_ref(),
+            guidance,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            Some(memory),
+        )?);
+    }
+    device.synchronize()?;
+    drop(transformer);
+    drop(conditioning);
+
+    revalidate_before_load(&mut check)?;
+    let decoder = load_vae_decoder(root, device, &cfg)?;
+    let mut images = Vec::with_capacity(latents.len());
+    for latent in latents {
+        on_progress(Progress::Decoding);
+        images.push(decode_to_image_memory(
+            &decoder,
+            &cfg,
+            &latent,
+            Some(memory),
+        )?);
+    }
+    device.synchronize()?;
+    Ok(images)
 }
 
 /// Load the gemma-2-2b-it caption encoder from a diffusers SANA snapshot. The gemma **weights** live in
@@ -605,6 +820,37 @@ pub fn denoise_sprint(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
+    denoise_sprint_memory(
+        transformer,
+        scheduler,
+        seed,
+        latents,
+        cond,
+        guidance_scale,
+        guidance_embeds_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
     // The embedded guidance scalar (CFG-free): guidance_scale · guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
     let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
@@ -612,8 +858,12 @@ pub fn denoise_sprint(
         // The trunk embeds `scm_t` as its timestep (NOT the raw angle) + the embedded guidance scalar;
         // ONE forward per step (Sprint is CFG-free — no uncond branch).
         let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
+        let budget = memory
+            .filter(|memory| memory.chunk_attention)
+            .and_then(|memory| memory.attention_chunk_size)
+            .map(|value| value as usize);
         transformer
-            .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
+            .forward_with_guidance_memory(lat_in, cond, &t, Some(&guidance), budget)
             .map_err(CandleError::from)
     };
     run_scm_sampler(
@@ -724,6 +974,28 @@ impl SanaSprintPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
+        self.generate_with_conditioning_memory(
+            req,
+            cond,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cond: &Tensor,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -745,7 +1017,7 @@ impl SanaSprintPipeline {
         } else {
             noise.affine(scheduler.sigma_data as f64, 0.0)?
         };
-        let latents = denoise_sprint_from(
+        let latents = denoise_sprint_from_memory(
             &self.transformer,
             &scheduler,
             start_step,
@@ -758,9 +1030,10 @@ impl SanaSprintPipeline {
             cancel,
             on_progress,
             preview,
+            memory,
         )?;
         on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+        decode_to_image_memory(&self.decoder, &self.dc_ae_cfg, &latents, memory)
     }
 
     /// Convenience [`SanaSprintPipeline::generate_with`] with a no-op cancel + progress.
@@ -774,6 +1047,103 @@ impl SanaSprintPipeline {
         let preview = crate::preview::sprint_hook(&inert);
         self.generate_with(req, device, &cancel, &mut noop, &preview)
     }
+}
+
+/// Sprint's phase-separated twin. It preserves the CFG-free single-forward SCM identity and keeps
+/// the embedded guidance scalar in the denoise phase; no unconditional caption is created.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_sprint_staged(
+    root: &Path,
+    req: &SanaGenerateRequest<'_>,
+    seeds: &[u64],
+    memory: candle_gen::gen_core::GenerationMemory,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    mut check: impl FnMut() -> candle_gen::gen_core::Result<()>,
+) -> Result<Vec<Image>> {
+    revalidate_before_load(&mut check)?;
+    let text = load_text_encoder(root, device)?;
+    let conditioning = text.encode(req.prompt)?;
+    device.synchronize()?;
+    drop(text);
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+
+    let cfg = DcAeConfig::sana_f32c32();
+    let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
+    let scheduler = ScmScheduler::new(steps);
+    let start_step = resolve_init_start(req.init_image, steps, req.strength);
+    let clean = if start_step > 0 {
+        revalidate_before_load(&mut check)?;
+        let encoder = load_vae_encoder(root, device, &cfg)?;
+        let clean = encode_init_latents(
+            &encoder,
+            &cfg,
+            req.init_image.expect("positive start requires init image"),
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?;
+        device.synchronize()?;
+        drop(encoder);
+        Some(clean)
+    } else {
+        None
+    };
+
+    revalidate_before_load(&mut check)?;
+    let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
+    let embedded_scale = trunk_cfg.guidance_embeds_scale;
+    let transformer = load_staged_transformer(root, device, trunk_cfg, memory)?;
+    let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
+    let mut latents = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        let noise = create_noise(device, *seed, req.width, req.height)?;
+        let initial = match &clean {
+            Some(clean) => renoise_sprint_init(clean, &noise, &scheduler, start_step)?,
+            None => noise.affine(scheduler.sigma_data as f64, 0.0)?,
+        };
+        latents.push(denoise_sprint_from_memory(
+            &transformer,
+            &scheduler,
+            start_step,
+            *seed,
+            initial,
+            &conditioning,
+            guidance,
+            embedded_scale,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            Some(memory),
+        )?);
+    }
+    device.synchronize()?;
+    drop(transformer);
+    drop(conditioning);
+
+    revalidate_before_load(&mut check)?;
+    let decoder = load_vae_decoder(root, device, &cfg)?;
+    let mut images = Vec::with_capacity(latents.len());
+    for latent in latents {
+        on_progress(Progress::Decoding);
+        images.push(decode_to_image_memory(
+            &decoder,
+            &cfg,
+            &latent,
+            Some(memory),
+        )?);
+    }
+    device.synchronize()?;
+    Ok(images)
 }
 
 /// RGB8 init image -> denoise-space DC-AE latent, matching the MLX SANA contract.
@@ -850,11 +1220,48 @@ pub fn denoise_sprint_from(
     on_progress: &mut dyn FnMut(Progress),
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
+    denoise_sprint_from_memory(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        guidance_scale,
+        guidance_embeds_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_from_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
     let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
     let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
         let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
+        let budget = memory
+            .filter(|memory| memory.chunk_attention)
+            .and_then(|memory| memory.attention_chunk_size)
+            .map(|value| value as usize);
         transformer
-            .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
+            .forward_with_guidance_memory(lat_in, cond, &t, Some(&guidance), budget)
             .map_err(CandleError::from)
     };
     run_scm_sampler_from(

@@ -110,6 +110,21 @@ fn lazy_encoder_matches_eager() {
         pr, 0.0,
         "lazy encoder must be byte-identical to the eager encoder"
     );
+    assert!(
+        lazy.release_encoder(),
+        "the first conditioned request materialized an encoder to release"
+    );
+    assert!(
+        !lazy.release_encoder(),
+        "releasing an already-empty request scope is idempotent"
+    );
+    let got_reloaded = lazy.encode(enc_in).expect("reloaded lazy encode");
+    assert_eq!(
+        peak_rel(&got_reloaded, &got_eager),
+        0.0,
+        "a later conditioned request reconstructs the exact encoder"
+    );
+    assert!(lazy.release_encoder());
 }
 
 #[test]

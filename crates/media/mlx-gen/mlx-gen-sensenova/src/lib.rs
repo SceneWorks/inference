@@ -62,7 +62,8 @@ pub use fm::{
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
 pub use model::{
-    descriptor, descriptor_fast, load, load_fast, SenseNova, CELL, MODEL_ID, MODEL_ID_FAST,
+    descriptor, descriptor_fast, load, load_fast, load_runtime, load_runtime_fast, SenseNova, CELL,
+    MODEL_ID, MODEL_ID_FAST,
 };
 pub use qwen3::{KvCache, Path, Qwen3Backbone};
 pub use runtime::{Sampler, ThinkRollout};
