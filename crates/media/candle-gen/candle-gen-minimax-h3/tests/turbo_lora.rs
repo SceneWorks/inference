@@ -226,6 +226,57 @@ fn max_abs(t: &Tensor) -> f32 {
         .expect("scalar")
 }
 
+/// Independent row-major Kronecker construction used only by the LoKr oracle. This deliberately
+/// does not call `LokrFactors` or `reconstruct_lokr_delta`: sharing either implementation would let
+/// a factor-order/orientation defect cancel between the installer and the reference.
+fn explicit_kron(w1: &Tensor, w2: &Tensor, scale: f32) -> Tensor {
+    let (a, c) = w1.dims2().expect("w1 matrix");
+    let (b, d) = w2.dims2().expect("w2 matrix");
+    let left = w1.to_vec2::<f32>().expect("w1 values");
+    let right = w2.to_vec2::<f32>().expect("w2 values");
+    let mut dense = vec![0.0f32; a * b * c * d];
+    for i in 0..a {
+        for k in 0..b {
+            for j in 0..c {
+                for l in 0..d {
+                    dense[(i * b + k) * (c * d) + j * d + l] = scale * left[i][j] * right[k][l];
+                }
+            }
+        }
+    }
+    Tensor::from_vec(dense, (a * b, c * d), &dev()).expect("explicit kron")
+}
+
+fn explicit_dense_residual(x: &Tensor, delta: &Tensor) -> Tensor {
+    let dims = x.dims().to_vec();
+    let inn = *dims.last().unwrap();
+    let rows = x.elem_count() / inn;
+    let y = x
+        .reshape((rows, inn))
+        .unwrap()
+        .matmul(&delta.t().unwrap().contiguous().unwrap())
+        .unwrap();
+    let mut out = dims;
+    *out.last_mut().unwrap() = delta.dim(0).unwrap();
+    y.reshape(out).unwrap()
+}
+
+fn write_lokr(
+    dir: &Path,
+    name: &str,
+    arrays: Vec<(String, Tensor)>,
+    rank: &str,
+    alpha: &str,
+) -> PathBuf {
+    let path = dir.join(name);
+    write_safetensors(
+        &path,
+        &arrays,
+        &[("networkType", "lokr"), ("rank", rank), ("alpha", alpha)],
+    );
+    path
+}
+
 /// `y_with_lora(x) − y_base(x)` at [`PROBE`] — the residual the install actually added.
 fn probe_residual(cfg: &MiniMaxH3DitConfig, lora: &Path, scale: f32, x: &Tensor) -> Tensor {
     let segs: Vec<&str> = PROBE.split('.').collect();
@@ -606,27 +657,387 @@ fn an_unmatched_target_is_surfaced_by_name() {
     assert!(err.contains("transformer_blocks.77.attn.to_q"), "{err}");
 }
 
-/// LoKr is refused **by file content**, not only by the declared `AdapterKind`. A file carrying
-/// `lokr_*` factors while claiming to be a LoRA must not reach the `(x·A)·B` path.
+/// A genuine LoKr installs through the reachable Kronecker seam and equals an independently
+/// constructed dense reference. Asymmetric factors and a non-unit `alpha/rank·strength` make the
+/// assertion discriminate the plausible factor transpose, factor swap, and dropped-scale mutants.
 #[test]
-fn a_lokr_file_is_refused_even_when_declared_as_lora() {
+fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lokr.safetensors");
-    write_safetensors(
-        &path,
-        &[
-            (format!("{PROBE}.lokr_w1"), bf16(&tensor(&[8, 8], 1.0))),
-            (format!("{PROBE}.lokr_w2"), bf16(&tensor(&[12, 8], 2.0))),
+    // kron([8,8], [12,8]) = [96,64], the exact to_q projection shape. Both factors are
+    // asymmetric in value; swapping them preserves the overall shape and is therefore a dangerous
+    // shape-correct mutation rather than a test-construction error.
+    let w1 = tensor(&[8, 8], 0.17);
+    let w2 = tensor(&[12, 8], 1.31);
+    let path = write_lokr(
+        dir.path(),
+        "lokr.safetensors",
+        vec![
+            (format!("{PROBE}.lokr_w1"), w1.clone()),
+            (format!("{PROBE}.lokr_w2"), w2.clone()),
         ],
-        &[("format", "pt")],
+        "5",
+        "7",
     );
-    let mut dit = tiny_dit(&cfg);
-    // Declared as a LoRA — the file is what refuses it.
-    let err = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
-        .expect_err("a lokr file must be refused")
+    let strength = 0.3;
+    let x = tensor(&[2, 3, cfg.hidden_size], 0.71);
+    let segments = PROBE.split('.').collect::<Vec<_>>();
+    let mut base = tiny_dit(&cfg);
+    let y0 = base.adaptable_mut(&segments).unwrap().forward(&x).unwrap();
+    let mut adapted = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut adapted, &[spec(path, strength)]).unwrap();
+    assert_eq!(report.applied, 1);
+    let y1 = adapted
+        .adaptable_mut(&segments)
+        .unwrap()
+        .forward(&x)
+        .unwrap();
+    let actual = (y1 - y0).unwrap();
+    let effective = 7.0 / 5.0 * strength;
+    let expected = explicit_dense_residual(&x, &explicit_kron(&w1, &w2, effective));
+    let drift = rel_max_abs(&actual, &expected);
+    assert!(
+        drift < 2e-5,
+        "structured vs explicit kron drift {drift:.3e}"
+    );
+
+    let transposed_w1 = explicit_dense_residual(
+        &x,
+        &explicit_kron(&w1.t().unwrap().contiguous().unwrap(), &w2, effective),
+    );
+    let swapped = explicit_dense_residual(&x, &explicit_kron(&w2, &w1, effective));
+    let dropped_scale = explicit_dense_residual(&x, &explicit_kron(&w1, &w2, 1.0));
+    for (name, mutant) in [
+        ("transpose-w1", transposed_w1),
+        ("swap-w1-w2", swapped),
+        ("drop-alpha-rank-strength", dropped_scale),
+    ] {
+        let separation = rel_max_abs(&actual, &mutant);
+        assert!(
+            separation > 1e-2,
+            "the oracle must fail the plausible {name} mutation, separation was only {separation:.3e}"
+        );
+    }
+}
+
+/// The raw MiniMax-H3 module surface is four leaves: fused QKV, attention output, and both MLP
+/// projections. It expands to the six runtime leaves without dense adapter materialization; FC1's
+/// `[gate|value]` source ordering is swapped to the runtime's `[value|gate]` ordering.
+#[test]
+fn fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().unwrap();
+    let source_shapes = [
+        ("attn.qkv_proj", 3 * cfg.inner_dim(), cfg.hidden_size, 0.11),
+        ("attn.out_proj", cfg.hidden_size, cfg.inner_dim(), 0.37),
+        ("mlp.fc1", 2 * cfg.ffn_dim, cfg.hidden_size, 0.73),
+        ("mlp.fc2", cfg.hidden_size, cfg.ffn_dim, 1.19),
+    ];
+    let mut arrays = Vec::new();
+    let mut factors = HashMap::new();
+    for (leaf, out, inn, seed) in source_shapes {
+        assert_eq!(out % 8, 0);
+        assert_eq!(inn % 8, 0);
+        let w1 = tensor(&[out / 8, inn / 8], seed);
+        let w2 = tensor(&[8, 8], seed + 0.29);
+        arrays.push((format!("blocks.0.{leaf}.lokr_w1"), w1.clone()));
+        arrays.push((format!("blocks.0.{leaf}.lokr_w2"), w2.clone()));
+        factors.insert(leaf, (w1, w2));
+    }
+    let path = write_lokr(dir.path(), "raw-surface-lokr.safetensors", arrays, "9", "4");
+    let strength = 0.45;
+    let effective = 4.0 / 9.0 * strength;
+    let mut base = tiny_dit(&cfg);
+    let mut adapted = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut adapted, &[spec(path, strength)]).unwrap();
+    assert_eq!(
+        report.applied, 6,
+        "fused qkv expands to three plus out/fc1/fc2"
+    );
+    assert!(report.unmatched_paths.is_empty());
+
+    for runtime in [
+        "attn.to_q",
+        "attn.to_k",
+        "attn.to_v",
+        "attn.to_out.0",
+        "ff.net.0.proj",
+        "ff.net.2",
+    ] {
+        let target = format!("transformer_blocks.0.{runtime}");
+        let segments = target.split('.').collect::<Vec<_>>();
+        let (_, inn) = target_shape(&cfg, &target);
+        let x = tensor(&[2, 5, inn], target.len() as f32 * 0.07);
+        let y0 = base.adaptable_mut(&segments).unwrap().forward(&x).unwrap();
+        let y1 = adapted
+            .adaptable_mut(&segments)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let actual = (y1 - y0).unwrap();
+
+        let (source, slice, swap_halves) = match runtime {
+            "attn.to_q" => ("attn.qkv_proj", Some(0), false),
+            "attn.to_k" => ("attn.qkv_proj", Some(1), false),
+            "attn.to_v" => ("attn.qkv_proj", Some(2), false),
+            "attn.to_out.0" => ("attn.out_proj", None, false),
+            "ff.net.0.proj" => ("mlp.fc1", None, true),
+            "ff.net.2" => ("mlp.fc2", None, false),
+            _ => unreachable!(),
+        };
+        let (w1, w2) = factors.get(source).unwrap();
+        let mut delta = explicit_kron(w1, w2, effective);
+        if let Some(index) = slice {
+            delta = delta
+                .narrow(0, index * cfg.inner_dim(), cfg.inner_dim())
+                .unwrap()
+                .contiguous()
+                .unwrap();
+        }
+        if swap_halves {
+            let half = delta.dim(0).unwrap() / 2;
+            delta = Tensor::cat(
+                &[
+                    &delta.narrow(0, half, half).unwrap(),
+                    &delta.narrow(0, 0, half).unwrap(),
+                ],
+                0,
+            )
+            .unwrap();
+        }
+        let expected = explicit_dense_residual(&x, &delta);
+        let drift = rel_max_abs(&actual, &expected);
+        assert!(drift < 2e-5, "{target}: rel-max-abs {drift:.3e}");
+    }
+}
+
+#[test]
+fn lokr_rejects_unknown_partial_unmatched_and_false_kind_claims() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().unwrap();
+    let w1 = tensor(&[8, 8], 0.2);
+    let w2 = tensor(&[12, 8], 0.4);
+    for (name, arrays, needle) in [
+        (
+            "partial.safetensors",
+            vec![(format!("{PROBE}.lokr_w1"), w1.clone())],
+            "lokr_w2 is missing",
+        ),
+        (
+            "unknown.safetensors",
+            vec![
+                (format!("{PROBE}.lokr_w1"), w1.clone()),
+                (format!("{PROBE}.lokr_w2"), w2.clone()),
+                (
+                    format!("{PROBE}.mystery"),
+                    Tensor::new(&[1.0f32], &dev()).unwrap(),
+                ),
+            ],
+            "unknown tensor key",
+        ),
+        (
+            "unmatched.safetensors",
+            vec![
+                ("transformer_blocks.99.attn.to_q.lokr_w1".into(), w1.clone()),
+                ("transformer_blocks.99.attn.to_q.lokr_w2".into(), w2.clone()),
+            ],
+            "no target modules matched",
+        ),
+    ] {
+        let path = write_lokr(dir.path(), name, arrays, "1", "1");
+        let error = apply_minimax_h3_adapters(&mut tiny_dit(&cfg), &[spec(path, 1.0)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(needle),
+            "{name}: expected {needle:?}, got {error}"
+        );
+    }
+
+    let lora = write_lora(dir.path(), "plain-lora.safetensors", &cfg, Some("8"));
+    let claimed = AdapterSpec::new(lora, 1.0, AdapterKind::Lokr);
+    let error = apply_minimax_h3_adapters(&mut tiny_dit(&cfg), &[claimed])
+        .unwrap_err()
         .to_string();
-    assert!(err.contains("LoKr is not supported"), "{err}");
+    assert!(error.contains("declared LoKr"), "{error}");
+}
+
+#[test]
+fn direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().unwrap();
+    let mut arrays = Vec::new();
+    for (index, target) in adapter_target_paths(&cfg).into_iter().enumerate() {
+        let (out, inn) = target_shape(&cfg, &target);
+        assert_eq!(out % 8, 0, "{target} output factorization");
+        assert_eq!(inn % 8, 0, "{target} input factorization");
+        arrays.push((
+            format!("{target}.lokr_w1"),
+            tensor(&[out / 8, inn / 8], index as f32 * 0.13 + 0.1),
+        ));
+        arrays.push((
+            format!("{target}.lokr_w2"),
+            tensor(&[8, 8], index as f32 * 0.17 + 0.2),
+        ));
+    }
+    let path = write_lokr(dir.path(), "complete.safetensors", arrays, "4", "3");
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(path, 0.6)]).unwrap();
+    let expected = adapter_target_paths(&cfg).len();
+    assert_eq!(report.applied, expected);
+    assert_eq!(dit.adapted_module_count(), expected);
+    assert!(report.unmatched_paths.is_empty());
+}
+
+/// Manual Windows/CUDA acceptance entrypoint for the exact user-supplied LoKr. It validates the
+/// adapter file before mapping the 66 GB text encoder, renders a real T2VA clip, and writes first/
+/// last-frame PPMs, raw f32 audio, and a JSON receipt. It is intentionally not wired to CI.
+///
+/// ```text
+/// set MINIMAX_H3_CUDA_LOKR_SNAPSHOT=E:\path\to\MiniMax-H3
+/// set MINIMAX_H3_CUDA_LOKR_ADAPTER=E:\path\to\adapter.safetensors
+/// set MINIMAX_H3_CUDA_LOKR_OUT=E:\receipts\sc-20757
+/// cargo test --release --features cuda -p candle-gen-minimax-h3 --test integration turbo_lora::manual_cuda_real_lokr_render_receipt -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "manual Windows/CUDA real-LoKr render; requires snapshot, exact adapter, and receipt dir"]
+fn manual_cuda_real_lokr_render_receipt() {
+    let device = candle_gen::default_device().expect("initialize candle device");
+    assert!(
+        device.is_cuda(),
+        "default candle device is not CUDA: {device:?}"
+    );
+    let required = |name: &str| {
+        std::env::var(name).unwrap_or_else(|_| panic!("set {name}; this entrypoint never skips"))
+    };
+    let snapshot = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_SNAPSHOT"));
+    let adapter = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_ADAPTER"));
+    let out_dir = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_OUT"));
+    for component in ["text_encoder", "transformer", "vae", "audio_vae"] {
+        assert!(
+            snapshot.join(component).is_dir(),
+            "{} has no {component}/ component",
+            snapshot.display()
+        );
+    }
+    assert!(adapter.is_file(), "{} is not a file", adapter.display());
+
+    // Fail before real-weight mapping if the exact artifact is not a strict LoKr file.
+    let inspected = candle_gen::train::merge::read_adapter(&adapter).expect("read exact LoKr");
+    assert!(
+        inspected.declares_lokr() || inspected.tensors.keys().any(|key| key.contains(".lokr_w")),
+        "{} has neither networkType=lokr nor lokr_* factors",
+        adapter.display()
+    );
+    assert!(
+        inspected.tensors.keys().all(|key| key.contains(".lokr_w")),
+        "{} contains non-LoKr tensor keys; the strict installer will reject a partial file",
+        adapter.display()
+    );
+    std::fs::create_dir_all(&out_dir).expect("create receipt directory");
+
+    let strength = std::env::var("MINIMAX_H3_CUDA_LOKR_SCALE")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<f32>()
+                .expect("MINIMAX_H3_CUDA_LOKR_SCALE f32")
+        })
+        .unwrap_or(1.0);
+    let steps = std::env::var("MINIMAX_H3_CUDA_LOKR_STEPS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .expect("MINIMAX_H3_CUDA_LOKR_STEPS u32")
+        })
+        .unwrap_or(4);
+    let prompt = std::env::var("MINIMAX_H3_CUDA_LOKR_PROMPT").unwrap_or_else(|_| {
+        "a brass automaton crossing a rain-slick bridge at blue hour, cinematic tracking shot"
+            .into()
+    });
+    let load = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
+        snapshot.clone(),
+    ))
+    .with_adapters(vec![AdapterSpec::new(
+        adapter.clone(),
+        strength,
+        AdapterKind::Lokr,
+    )]);
+    let registry = candle_gen_minimax_h3::provider_registry().expect("provider registry");
+    let generator = registry
+        .load(candle_gen_minimax_h3::MODEL_ID, &load)
+        .expect("load MiniMax-H3 with exact LoKr");
+    let request = candle_gen::gen_core::GenerationRequest {
+        prompt: prompt.clone(),
+        width: candle_gen_minimax_h3::CANVAS_SHORT_EDGE * 16
+            / 9
+            / candle_gen_minimax_h3::SPATIAL_STRIDE
+            * candle_gen_minimax_h3::SPATIAL_STRIDE,
+        height: candle_gen_minimax_h3::CANVAS_SHORT_EDGE,
+        frames: Some(candle_gen_minimax_h3::SMALLEST_LEGAL_FRAMES as u32),
+        steps: Some(steps),
+        seed: Some(20757),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let output = generator
+        .generate(&request, &mut |progress| {
+            eprintln!("[sc-20757-lokr] {progress:?}")
+        })
+        .expect("real CUDA LoKr render");
+    let candle_gen::gen_core::GenerationOutput::Video { frames, fps, audio } = output else {
+        panic!("MiniMax-H3 must produce joint video/audio")
+    };
+    assert_eq!(frames.len(), candle_gen_minimax_h3::SMALLEST_LEGAL_FRAMES);
+    assert!(!frames.is_empty());
+    let audio = audio.expect("MiniMax-H3 render must carry synchronized audio");
+    assert!(!audio.samples.is_empty());
+    assert!(audio.samples.iter().all(|sample| sample.is_finite()));
+    let write_ppm = |name: &str, image: &candle_gen::gen_core::Image| {
+        let mut bytes = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+        bytes.extend_from_slice(&image.pixels);
+        std::fs::write(out_dir.join(name), bytes).expect("write PPM receipt artifact");
+    };
+    write_ppm("first.ppm", frames.first().unwrap());
+    write_ppm("last.ppm", frames.last().unwrap());
+    let audio_bytes = audio
+        .samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(out_dir.join("audio.f32le"), audio_bytes).expect("write audio receipt");
+    let checksum = |bytes: &[u8]| {
+        bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    };
+    let receipt = serde_json::json!({
+        "story": "sc-20757",
+        "backend": "candle-cuda",
+        "snapshot": snapshot,
+        "adapter": adapter,
+        "adapterScale": strength,
+        "prompt": prompt,
+        "seed": 20757,
+        "steps": steps,
+        "width": frames[0].width,
+        "height": frames[0].height,
+        "frames": frames.len(),
+        "fps": fps,
+        "firstFrameFnv64": format!("{:016x}", checksum(&frames[0].pixels)),
+        "lastFrameFnv64": format!("{:016x}", checksum(&frames.last().unwrap().pixels)),
+        "audioSamples": audio.samples.len(),
+        "audioSampleRate": audio.sample_rate,
+        "audioChannels": audio.channels,
+        "elapsedSeconds": started.elapsed().as_secs_f64(),
+    });
+    std::fs::write(
+        out_dir.join("receipt.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .expect("write JSON receipt");
+    eprintln!("[sc-20757-lokr] receipt={}", out_dir.display());
 }
 
 /// **The PEFT `lora_adapter_metadata` blob is the middle link of the alpha chain — and its `r` is a

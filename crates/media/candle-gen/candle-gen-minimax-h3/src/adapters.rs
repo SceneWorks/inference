@@ -98,16 +98,17 @@
 //! FFN. Since **no published file for this family carries an in-band `.alpha` at all**, that was the
 //! dominant path, not an edge case.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::weightsmeta::{
-    is_minimax_h3_trainer_key_space, parse_minimax_h3_trainer_key,
+    classify_minimax_h3_trainer_namespace, parse_minimax_h3_trainer_key,
     validate_minimax_h3_trainer_layout, MiniMaxH3TrainerLayout, MiniMaxH3TrainerRole,
     MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
 };
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::LoraAdapterMeta;
+use candle_gen::quant::LokrFactors;
+use candle_gen::train::lora::{parse_lokr_metadata, LoraAdapterMeta};
 use candle_gen::train::merge::{read_adapter, read_scalar};
 use candle_gen::{CandleError, Result};
 
@@ -174,6 +175,23 @@ pub const SUFFIXES: [(&str, Role); 9] = [
     (".lora_down.weight", Role::Down),
     (".lora_up.weight", Role::Up),
     (".alpha", Role::Alpha),
+];
+
+/// LoKr factor suffixes, longest-first. Both LyCORIS' bare spelling and PEFT-style `.weight`
+/// exports are accepted; the stem before the suffix remains the MiniMax-H3 module path.
+const LOKR_SUFFIXES: [(&str, &str); 12] = [
+    (".lokr_w1_a.weight", "lokr_w1_a"),
+    (".lokr_w1_b.weight", "lokr_w1_b"),
+    (".lokr_w2_a.weight", "lokr_w2_a"),
+    (".lokr_w2_b.weight", "lokr_w2_b"),
+    (".lokr_w1.weight", "lokr_w1"),
+    (".lokr_w2.weight", "lokr_w2"),
+    (".lokr_w1_a", "lokr_w1_a"),
+    (".lokr_w1_b", "lokr_w1_b"),
+    (".lokr_w2_a", "lokr_w2_a"),
+    (".lokr_w2_b", "lokr_w2_b"),
+    (".lokr_w1", "lokr_w1"),
+    (".lokr_w2", "lokr_w2"),
 ];
 
 /// Outcome of applying the MiniMax-H3 adapter specs.
@@ -723,6 +741,238 @@ struct LoraParts {
     alpha: Option<f32>,
 }
 
+/// The six tensors that can describe one 2-D LoKr module. Each Kronecker leg is either a complete
+/// factor or the product of its `_a`/`_b` pair; ambiguous and half-present legs are rejected.
+#[derive(Default)]
+struct LokrParts {
+    w1: Option<Tensor>,
+    w1_a: Option<Tensor>,
+    w1_b: Option<Tensor>,
+    w2: Option<Tensor>,
+    w2_a: Option<Tensor>,
+    w2_b: Option<Tensor>,
+}
+
+#[derive(Clone, Copy)]
+enum LokrRoute {
+    Direct,
+    OutputSlice { start: usize, len: usize },
+    SwapOutputHalves,
+}
+
+struct LokrCandidate {
+    key: String,
+    route: LokrRoute,
+}
+
+fn classify_lokr_key(key: &str) -> Option<(String, &'static str)> {
+    LOKR_SUFFIXES.iter().find_map(|(suffix, factor)| {
+        key.strip_suffix(suffix)
+            .map(|stem| (normalize_minimax_h3_key(stem), *factor))
+    })
+}
+
+fn block_parts<'a>(path: &'a str, root: &str) -> Option<(usize, &'a str)> {
+    let rest = path.strip_prefix(root)?.strip_prefix('.')?;
+    let (index, suffix) = rest.split_once('.')?;
+    Some((index.parse().ok()?, suffix))
+}
+
+/// Candidate source modules for one runtime projection. The direct diffusers path is always first.
+/// The raw MiniMax-H3 spelling then maps fused QKV to three output slices and maps MLP FC1 through
+/// its required gate/value half swap. All routes retain structured factors; none forms `[out, in]`.
+fn lokr_candidates(path: &str, out_features: usize) -> Vec<LokrCandidate> {
+    let mut candidates = vec![
+        LokrCandidate {
+            key: path.to_string(),
+            route: LokrRoute::Direct,
+        },
+        LokrCandidate {
+            key: format!("lora_unet_{}", path.replace('.', "_")),
+            route: LokrRoute::Direct,
+        },
+    ];
+
+    let block = block_parts(path, "transformer_blocks")
+        .map(|(index, suffix)| (format!("blocks.{index}"), suffix))
+        .or_else(|| {
+            block_parts(path, "token_refiner.refiner_blocks")
+                .map(|(index, suffix)| (format!("token_refiner.refiner_blocks.{index}"), suffix))
+        });
+    let Some((container, suffix)) = block else {
+        return candidates;
+    };
+
+    let mut add = |key: String, route| candidates.push(LokrCandidate { key, route });
+    match suffix {
+        "attn.to_q" | "attn.to_k" | "attn.to_v" => {
+            let index = match suffix {
+                "attn.to_q" => 0,
+                "attn.to_k" => 1,
+                _ => 2,
+            };
+            let route = LokrRoute::OutputSlice {
+                start: index * out_features,
+                len: out_features,
+            };
+            add(format!("{container}.attn.qkv_proj"), route);
+        }
+        "attn.to_out.0" => {
+            add(format!("{container}.attn.out_proj"), LokrRoute::Direct);
+        }
+        "ff.net.0.proj" => {
+            add(format!("{container}.mlp.fc1"), LokrRoute::SwapOutputHalves);
+        }
+        "ff.net.2" => {
+            add(format!("{container}.mlp.fc2"), LokrRoute::Direct);
+        }
+        _ => {}
+    }
+    candidates
+}
+
+fn validate_lokr_leg(
+    path: &str,
+    leg: &str,
+    full: &Option<Tensor>,
+    a: &Option<Tensor>,
+    b: &Option<Tensor>,
+) -> Result<()> {
+    match (full.is_some(), a.is_some(), b.is_some()) {
+        (true, false, false) | (false, true, true) => Ok(()),
+        (false, false, false) => Err(CandleError::Msg(format!(
+            "minimax_h3 LoKr '{path}': {leg} is missing (need full {leg} or {leg}_a·{leg}_b)"
+        ))),
+        _ => Err(CandleError::Msg(format!(
+            "minimax_h3 LoKr '{path}': {leg} is ambiguous or partial; provide exactly the full factor or both {leg}_a/{leg}_b"
+        ))),
+    }
+}
+
+/// Install one LoKr file over the complete MiniMax-H3 adaptable surface. Direct diffusers targets,
+/// raw fused QKV/out/MLP targets, and the token-refiner counterparts all resolve through the same
+/// bounded Kronecker vec-trick.
+fn apply_one_lokr(
+    host: &mut MiniMaxH3Dit,
+    tensors: &HashMap<String, Tensor>,
+    meta: &HashMap<String, String>,
+    scale: f32,
+    report: &mut MiniMaxH3LoraReport,
+) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "minimax_h3 LoKr adapter scale must be finite, got {scale}"
+        )));
+    }
+    let (rank, alpha) = parse_lokr_metadata(
+        meta.get(RANK_METADATA_KEY).map(String::as_str),
+        meta.get(ALPHA_METADATA_KEY).map(String::as_str),
+    )?;
+    let full_scale = (alpha as f64 / rank as f64) * scale as f64;
+    let mut groups: BTreeMap<String, LokrParts> = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for (key, tensor) in tensors {
+        let Some((path, factor)) = classify_lokr_key(key) else {
+            unknown.push(key.clone());
+            continue;
+        };
+        let parts = groups.entry(path).or_default();
+        let slot = match factor {
+            "lokr_w1" => &mut parts.w1,
+            "lokr_w1_a" => &mut parts.w1_a,
+            "lokr_w1_b" => &mut parts.w1_b,
+            "lokr_w2" => &mut parts.w2,
+            "lokr_w2_a" => &mut parts.w2_a,
+            "lokr_w2_b" => &mut parts.w2_b,
+            _ => unreachable!("LOKR_SUFFIXES has a closed factor set"),
+        };
+        if slot.replace(tensor.clone()).is_some() {
+            return Err(CandleError::Msg(format!(
+                "minimax_h3 LoKr file supplies duplicate spellings for factor {factor:?}"
+            )));
+        }
+    }
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(CandleError::Msg(format!(
+            "minimax_h3 LoKr file contains {} unknown tensor key(s); refusing a partial install: {:?}",
+            unknown.len(),
+            unknown
+        )));
+    }
+    if groups.is_empty() {
+        return Err(CandleError::Msg(
+            "minimax_h3 LoKr file declares no lokr_w1/w2 factor groups".into(),
+        ));
+    }
+    for (path, parts) in &groups {
+        validate_lokr_leg(path, "lokr_w1", &parts.w1, &parts.w1_a, &parts.w1_b)?;
+        validate_lokr_leg(path, "lokr_w2", &parts.w2, &parts.w2_a, &parts.w2_b)?;
+    }
+
+    let device = host.device().clone();
+    let paths = adapter_target_paths(&host.config().clone());
+    let mut matched = BTreeSet::new();
+    for path in paths {
+        let segments = path.split('.').collect::<Vec<_>>();
+        let Some(linear) = host.adaptable_mut(&segments) else {
+            return Err(CandleError::Msg(format!(
+                "minimax_h3 internal adapter target {path:?} no longer resolves through the model tree"
+            )));
+        };
+        let (out_features, in_features) = linear.base_shape()?;
+        for candidate in lokr_candidates(&path, out_features) {
+            let Some(parts) = groups.get(&candidate.key) else {
+                continue;
+            };
+            let built = match candidate.route {
+                LokrRoute::Direct | LokrRoute::SwapOutputHalves => LokrFactors::build(
+                    full_scale,
+                    (out_features, in_features),
+                    parts.w1.as_ref(),
+                    parts.w1_a.as_ref(),
+                    parts.w1_b.as_ref(),
+                    parts.w2.as_ref(),
+                    None,
+                    parts.w2_a.as_ref(),
+                    parts.w2_b.as_ref(),
+                ),
+                LokrRoute::OutputSlice { start, len } => LokrFactors::build_sliced(
+                    full_scale,
+                    in_features,
+                    (start, len),
+                    parts.w1.as_ref(),
+                    parts.w1_a.as_ref(),
+                    parts.w1_b.as_ref(),
+                    parts.w2.as_ref(),
+                    None,
+                    parts.w2_a.as_ref(),
+                    parts.w2_b.as_ref(),
+                ),
+            }?;
+            let Some(factors) = built else {
+                return Err(CandleError::Msg(format!(
+                    "minimax_h3 LoKr target {:?} cannot compose onto runtime projection {path:?} with shape [{out_features}, {in_features}] without materializing a dense delta",
+                    candidate.key
+                )));
+            };
+            linear.push_lokr(
+                factors.to_device(&device)?,
+                matches!(candidate.route, LokrRoute::SwapOutputHalves),
+                scale as f64,
+            );
+            matched.insert(candidate.key);
+            report.applied += 1;
+        }
+    }
+    for path in groups.keys() {
+        if !matched.contains(path) {
+            report.unmatched_paths.push(path.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Install one diffusers-key-space LoRA file's residuals onto `host` at `scale`.
 fn apply_one_lora(
     host: &mut MiniMaxH3Dit,
@@ -822,9 +1072,9 @@ fn apply_one_lora(
 /// (sc-19443), and the conversion's own result is re-checked against [`is_comfyui_key_space`] so a
 /// conversion that left a fused module behind fails here instead of reaching the fold.
 ///
-/// LoKr is **not** supported on this lane. `AdapterKind::Lokr`, or a file carrying `lokr_*` factors,
-/// is refused by name rather than run through the LoRA path — a LoKr's factors do not compose as
-/// `(x·A)·B`, so treating one as a LoRA is a different operation rather than a weaker fold.
+/// A genuine LoKr file routes by its contents through the structured Kronecker seam before the LoRA
+/// path. The exact H3 trainer namespace is classified first so a mixed trainer/LoKr file cannot use
+/// one valid factor pair to route around the trainer's complete-layout validation.
 pub fn apply_minimax_h3_adapters(
     host: &mut MiniMaxH3Dit,
     specs: &[AdapterSpec],
@@ -833,18 +1083,34 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let af = read_adapter(&spec.path)?;
-        if spec.kind == AdapterKind::Lokr || af.declares_lokr() || has_lokr_keys(&af.tensors) {
+        let trainer = classify_minimax_h3_trainer_namespace(
+            af.tensors.keys().map(String::as_str),
+            af.meta.get("ss_network_module").map(String::as_str),
+            af.meta.get("networkType").map(String::as_str),
+        )
+        .map_err(|error| {
+            CandleError::Msg(format!(
+                "minimax_h3 adapter {}: {error}",
+                spec.path.display()
+            ))
+        })?;
+        let lokr = af.declares_lokr() || has_lokr_keys(&af.tensors);
+        if lokr {
+            apply_one_lokr(host, &af.tensors, &af.meta, spec.scale, &mut report)?;
+            if report.applied == before {
+                return Err(CandleError::Msg(format!(
+                    "minimax_h3 adapter {}: no target modules matched in this LoKr file",
+                    spec.path.display()
+                )));
+            }
+            continue;
+        }
+        if spec.kind == AdapterKind::Lokr {
             return Err(CandleError::Msg(format!(
-                "minimax_h3 adapter {}: LoKr is not supported on the candle lane — this DiT's \
-                 adapter seam installs `scale·((x·A)·B)` residuals only, and a Kronecker delta is \
-                 a different operation rather than a weaker one. Use a LoRA export.",
+                "minimax_h3 adapter {}: declared LoKr but the file carries no `lokr_*` factors and no `networkType=lokr` stamp",
                 spec.path.display()
             )));
         }
-        let trainer = is_minimax_h3_trainer_key_space(
-            af.tensors.keys().map(String::as_str),
-            af.meta.get("ss_network_module").map(String::as_str),
-        );
         let comfy = !trainer && is_comfyui_key_space(af.tensors.keys().map(String::as_str));
         let tensors = if trainer {
             let (converted, layout, alphas) =
@@ -883,8 +1149,9 @@ pub fn apply_minimax_h3_adapters(
             return Err(CandleError::Msg(format!(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
-                 `.lora_A.default.weight` / `.lora_B.default.weight`), or a ComfyUI export this \
-                 lane can convert, or the exact `networks.lora_minimax_h3` trainer namespace",
+                 `.lora_A.default.weight` / `.lora_B.default.weight`), a PEFT-stamped LoKr, a \
+                 ComfyUI export this lane can convert, or the exact `networks.lora_minimax_h3` \
+                 trainer namespace",
                 spec.path.display()
             )));
         }
