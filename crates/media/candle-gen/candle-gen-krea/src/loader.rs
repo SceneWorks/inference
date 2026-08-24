@@ -22,9 +22,15 @@
 //! [`dequant_packed_base`] is the reconstruction the merge uses to build a mergeable dense base off the
 //! packed triple.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+
+use candle_gen::gen_core::checkpoint_codec::{
+    CodecResidencyReport, LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan,
+    LogicalWeightReceipt, TensorCodecSpec, NVFP4_CODEC,
+};
+use candle_gen::logical_weights::{plan_logical_weights, CandleCodecResidency};
 
 use candle_gen::candle_core::quantized::QTensor;
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
@@ -35,6 +41,7 @@ use candle_gen::quant::{
     Nvfp4Tensor, PackedConfig, PackedWeightSidecars,
 };
 
+use crate::native_mapping::{DeclaredLogicalShapes, KreaNativeToDiffusersMapping};
 use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
 use crate::quant::{QEmbedding, QLinear};
 
@@ -88,10 +95,32 @@ pub struct Weights {
     /// either the weight or the activation. [`from_native_file`](Self::from_native_file) sets this
     /// only after validating every descriptor and per-row scale from the safetensors data section.
     plain_int8: bool,
-    /// True only for a native-keyed ComfyUI Kitchen NVFP4 checkpoint. Every U8 projection is
-    /// validated as an exact `{weight, weight_scale, weight_scale_2}` triplet before this flag is
-    /// set. This is distinct from the MLX affine [`packed`](Self::packed) tier and inline FP8.
+    /// True only for a native-keyed ComfyUI Kitchen NVFP4 checkpoint.
+    ///
+    /// Since sc-20651 this is a **plan** fact, not a dtype guess: it is set when
+    /// [`logical_plan`](Self::logical_plan) contains at least one tensor whose planned codec is
+    /// `nvfp4-v1`, i.e. when the checkpoint's own `.comfy_quant` / `_quantization_metadata`
+    /// descriptor says NVFP4. The structural triplet validation
+    /// ([`validate_native_nvfp4`]) still runs on top of it as the data-section contract. This is
+    /// distinct from the MLX affine [`packed`](Self::packed) tier and inline FP8.
     native_nvfp4: bool,
+    /// The compiled mapped-read plan for a **single-file native** checkpoint (`None` for the
+    /// directory/packed-tier path, which is diffusers-keyed and has its own tier machinery).
+    ///
+    /// This is the descriptor authority the NVFP4 import reads: which layers are NVFP4, which
+    /// companion tensors carry their two scale levels, and what stored/logical geometry each has.
+    /// Before sc-20651 all four of those were re-derived at the read site from `dtype == U8` plus
+    /// string concatenation, which is why the Candle import could not see a descriptor at all.
+    logical_plan: Option<LogicalWeightPlan>,
+    /// Measured resident bytes per logical key, recorded as each planned NVFP4 layer is actually
+    /// materialized into its [`Nvfp4Tensor`] container. The receipt
+    /// ([`logical_weight_receipt`](Self::logical_weight_receipt)) is summed from this, so it
+    /// reports what the import **built**, never what the plan predicted.
+    ///
+    /// A `Mutex` because materialization happens through `&Weights` (the DiT's module tree loads
+    /// projection by projection) and this weight set is shared behind an `Arc` on the streamed
+    /// path.
+    nvfp4_measured: Mutex<BTreeMap<String, u64>>,
     /// **One** cuBLASLt handle shared by every INT8-ConvRot projection loaded from this weight set
     /// (sc-12301) — see [`Weights::int8_context`]. `OnceLock` because [`linear_detect`] takes `&Weights`
     /// and the handle must be built at most once for the whole trunk, on first int8 projection.
@@ -191,6 +220,8 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
+            logical_plan: None,
+            nvfp4_measured: Mutex::new(BTreeMap::new()),
             int8: OnceLock::new(),
         })
     }
@@ -216,6 +247,8 @@ impl Weights {
             convrot: false,
             plain_int8: false,
             native_nvfp4: false,
+            logical_plan: None,
+            nvfp4_measured: Mutex::new(BTreeMap::new()),
             int8: OnceLock::new(),
         })
     }
@@ -245,6 +278,8 @@ impl Weights {
             convrot: true,
             plain_int8: false,
             native_nvfp4: false,
+            logical_plan: None,
+            nvfp4_measured: Mutex::new(BTreeMap::new()),
             int8: OnceLock::new(),
         })
     }
@@ -264,18 +299,50 @@ impl Weights {
     /// [`from_convrot_file`](Self::from_convrot_file), preventing the old group-size-256 fallback from
     /// silently rotating a plain file.
     pub fn from_native_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::from_native_file_for(path, device, dtype, DeclaredLogicalShapes::NotInScope)
+    }
+
+    /// [`from_native_file`](Self::from_native_file) with the architecture config in scope, so the
+    /// compiled plan can unpad a block-padded (NVFP4/MXFP8) layer to its true geometry.
+    ///
+    /// A **padded** import needs this form: with no declared logical shape the plan can only carry
+    /// the padded stored grid forward, and `gen_core` refuses to materialize that rather than turn
+    /// pad rows/columns into weights.
+    pub fn from_native_file_for(
+        path: &Path,
+        device: &Device,
+        dtype: DType,
+        shapes: DeclaredLogicalShapes<'_>,
+    ) -> Result<Self> {
         let pinned_source = candle_gen::gen_core::PinnedWeightsFile::pin(path)
             .map_err(|error| Error::Msg(error.to_string()))?;
-        Self::from_pinned_native_file(&pinned_source, device, dtype)
+        Self::from_pinned_native_file_for(&pinned_source, device, dtype, shapes)
     }
 
     /// Open a native Krea file through a caller-owned pin. Registry-backed lazy/sequential loads keep
     /// this exact pin from generator construction through every later materialization instead of
     /// re-pinning whatever happens to occupy the path at request time.
-    pub(crate) fn from_pinned_native_file(
+    /// Open a native Krea file through a caller-owned pin, with the architecture config in scope.
+    ///
+    /// # The plan is compiled here, before any tensor is read (sc-20651)
+    ///
+    /// A single-file native checkpoint is a **checkpoint import**, so it goes through the epic's
+    /// one import seam: [`plan_logical_weights`] reads the header plus this file's `.comfy_quant` /
+    /// `__metadata__._quantization_metadata` descriptors and compiles them against the engine's
+    /// codec registry and residency policy. That is what decides which layers are NVFP4 — the
+    /// producer's own declaration — and it refuses, by name and before any tensor exists, on an
+    /// unmapped key, a key collision, a descriptor that disagrees with the stored dtype, a missing
+    /// or mis-shaped scale companion, or bad NVFP4 block geometry.
+    ///
+    /// The plan is compiled for **every** native file, not only NVFP4 ones: a dense or int8
+    /// checkpoint that plans is a checkpoint whose whole key surface the dialect recognises, which
+    /// is the same property `validate_native_transformer` enforces later — just established before
+    /// the first read instead of after.
+    pub(crate) fn from_pinned_native_file_for(
         pinned_source: &candle_gen::gen_core::PinnedWeightsFile,
         device: &Device,
         dtype: DType,
+        shapes: DeclaredLogicalShapes<'_>,
     ) -> Result<Self> {
         pinned_source
             .ensure_unchanged()
@@ -283,8 +350,36 @@ impl Weights {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(pinned_source.loader_path())? };
         let native_prefix = detect_native_prefix(&st);
+        let mapping = KreaNativeToDiffusersMapping::new(&native_prefix, shapes);
+        // The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the
+        // packed rows packed, everything else prices the dense fallback. Passing the real device
+        // (rather than a fixed policy) keeps the plan's pricing the pricing of *this* load.
+        let residency = CandleCodecResidency::probe(device);
+        let logical_plan = plan_logical_weights(pinned_source.loader_path(), &mapping, &residency)
+            .map_err(|error| Error::Msg(error.to_string()))?;
         let plain_int8 = validate_plain_int8_tensorwise(&st)?;
-        let native_nvfp4 = validate_native_nvfp4(&st)?;
+        // The descriptor is the authority on NVFP4-ness; `validate_native_nvfp4` then holds the
+        // data-section contract (blocked-scale buffer size, non-negative finite scales) the plan's
+        // header-level checks cannot see.
+        let planned_nvfp4 = logical_plan
+            .tensors
+            .iter()
+            .any(|tensor| tensor.codec_id == NVFP4_CODEC.codec_id);
+        let structural_nvfp4 = validate_native_nvfp4(&st)?;
+        if planned_nvfp4 != structural_nvfp4 {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: the checkpoint's descriptors {} NVFP4 layers but its tensor structure \
+                 {} the Kitchen `{{weight, weight_scale, weight_scale_2}}` triplet; refusing an \
+                 import whose declaration and payload disagree",
+                if planned_nvfp4 { "declare" } else { "declare no" },
+                if structural_nvfp4 {
+                    "does carry"
+                } else {
+                    "does not carry"
+                },
+            )));
+        }
+        let native_nvfp4 = planned_nvfp4;
         if plain_int8 && native_nvfp4 {
             return Err(Error::Msg(
                 "krea native checkpoint mixes plain int8 and NVFP4 projection formats".into(),
@@ -303,12 +398,98 @@ impl Weights {
             convrot: false,
             plain_int8,
             native_nvfp4,
+            logical_plan: Some(logical_plan),
+            nvfp4_measured: Mutex::new(BTreeMap::new()),
             int8: OnceLock::new(),
         };
         pinned_source
             .ensure_unchanged()
             .map_err(|error| Error::Msg(error.to_string()))?;
         Ok(result)
+    }
+
+    /// The compiled mapped-read plan for a single-file native checkpoint — the descriptor authority
+    /// the NVFP4 import consults. `None` for the directory/packed-tier path.
+    pub fn logical_plan(&self) -> Option<&LogicalWeightPlan> {
+        self.logical_plan.as_ref()
+    }
+
+    /// The planned entry for one **diffusers** (logical) key, or `None` when the file has no plan or
+    /// the plan does not contain that key.
+    fn planned(&self, logical_key: &str) -> Option<&LogicalTensorPlan> {
+        self.logical_plan
+            .as_ref()?
+            .tensors
+            .iter()
+            .find(|tensor| tensor.logical_key == logical_key)
+    }
+
+    /// A [`LogicalWeightReceipt`] **measured** from what this import actually materialized.
+    ///
+    /// Only the packed NVFP4 rows are reported: they are the rows this loader materializes through
+    /// the plan (every other row is read by the DiT's own dense/int8 arms, which the plan describes
+    /// but does not own). `resident_bytes` is summed from the [`Nvfp4Tensor`] containers that were
+    /// really built — nibbles plus block scales plus the retained `F32` global scale — never copied
+    /// from `plan.resident_bytes()`, so the pair stays an independent cross-check rather than a
+    /// restatement.
+    ///
+    /// `None` when the file has no plan. An NVFP4 file none of whose projections has been
+    /// materialized yet reports zero tensors, which is the truth about this instant, not a claim
+    /// that the load was free.
+    pub fn logical_weight_receipt(&self) -> Option<LogicalWeightReceipt> {
+        let plan = self.logical_plan.as_ref()?;
+        let measured = self
+            .nvfp4_measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut report = CodecResidencyReport {
+            codec_id: NVFP4_CODEC.codec_id,
+            tensor_count: 0,
+            source_bytes: 0,
+            resident_bytes: 0,
+        };
+        for tensor in &plan.tensors {
+            if tensor.codec_id != NVFP4_CODEC.codec_id {
+                continue;
+            }
+            let Some(bytes) = measured.get(&tensor.logical_key) else {
+                continue;
+            };
+            report.tensor_count += 1;
+            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+            report.resident_bytes = report.resident_bytes.saturating_add(*bytes);
+        }
+        for companion in &plan.companions {
+            if measured.contains_key(companion.owner_physical_key.as_str())
+                || self
+                    .planned_logical_key_for_physical(&companion.owner_physical_key)
+                    .is_some_and(|logical| measured.contains_key(logical))
+            {
+                report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
+            }
+        }
+        Some(LogicalWeightReceipt {
+            mapping_id: plan.mapping_id,
+            tensor_count: report.tensor_count,
+            source_bytes: report.source_bytes,
+            materialization: LogicalReadMaterialization::Materialized,
+            residency: if report.tensor_count == 0 {
+                Vec::new()
+            } else {
+                vec![report]
+            },
+        })
+    }
+
+    /// The logical key one physical key was planned under, for attributing a companion's source
+    /// bytes to the layer that owns it.
+    fn planned_logical_key_for_physical(&self, physical_key: &str) -> Option<&str> {
+        self.logical_plan
+            .as_ref()?
+            .tensors
+            .iter()
+            .find(|tensor| tensor.physical_key == physical_key)
+            .map(|tensor| tensor.logical_key.as_str())
     }
 
     /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
@@ -437,13 +618,18 @@ impl Weights {
         }
     }
 
-    /// True when `diffusers_weight` resolves to one of this file's validated packed NVFP4 weights.
+    /// True when `diffusers_weight` is one of this file's **descriptor-declared** NVFP4 weights.
+    ///
+    /// The authority is the compiled plan: the producer's `.comfy_quant` /
+    /// `_quantization_metadata` declaration for that layer resolved to the `nvfp4-v1` codec row.
+    /// The predicate this replaced was `dtype == U8`, which is not a format at all — every packed
+    /// container, every byte buffer and every future `U8`-stored codec answers it — and which, by
+    /// construction, could never see `full_precision_matrix_mult` or any other descriptor field.
     fn is_native_nvfp4_weight(&self, diffusers_weight: &str) -> bool {
         self.native_nvfp4
             && self
-                .st
-                .get(&self.resolve(diffusers_weight))
-                .is_ok_and(|view| view.dtype() == ::safetensors::Dtype::U8)
+                .planned(diffusers_weight)
+                .is_some_and(|tensor| tensor.codec_id == NVFP4_CODEC.codec_id)
     }
 
     /// Read one prepacked Kitchen NVFP4 triplet into Candle's canonical host container. The global
@@ -454,42 +640,84 @@ impl Weights {
     /// `Nvfp4Tensor::scale_offset_for` reads (sc-20641). The two orders coincide only for a
     /// single-atom weight, so the former verbatim copy mis-scaled every real multi-atom projection.
     fn get_native_nvfp4(&self, diffusers_weight: &str) -> Result<Nvfp4Tensor> {
-        let native_weight = self.resolve(diffusers_weight);
-        let weight = self.st.get(&native_weight)?;
-        if weight.dtype() != ::safetensors::Dtype::U8 {
+        // (1) The descriptor decides, and it must be in the plan. A weight reaching here without a
+        //     planned NVFP4 row is a caller that skipped `is_native_nvfp4_weight`, not a layer to
+        //     guess about.
+        let tensor = self.planned(diffusers_weight).ok_or_else(|| {
+            Error::Msg(format!(
+                "krea NVFP4: `{diffusers_weight}` has no entry in this checkpoint's compiled \
+                 logical-weight plan; a Kitchen NVFP4 import must be opened through \
+                 `Weights::from_native_file*`/`from_pinned_native_file_for`, which compiles one"
+            ))
+        })?;
+        let TensorCodecSpec::Nvfp4 {
+            block_scale,
+            global_scale,
+            stored_shape,
+            logical_shape,
+            full_precision_matrix_mult,
+            ..
+        } = &tensor.codec
+        else {
             return Err(Error::Msg(format!(
-                "krea NVFP4: `{native_weight}` must be U8, got {:?}",
-                weight.dtype()
-            )));
-        }
-        let [rows, packed_cols] = weight.shape() else {
-            return Err(Error::Msg(format!(
-                "krea NVFP4: `{native_weight}` must be rank-2 [out,in/2], got {:?}",
-                weight.shape()
+                "krea NVFP4: `{diffusers_weight}` is planned as codec `{}`, not `{}`; refusing to \
+                 read a non-NVFP4 layer as a Kitchen NVFP4 triplet",
+                tensor.codec_id, NVFP4_CODEC.codec_id
             )));
         };
-        let base = native_weight.strip_suffix(".weight").ok_or_else(|| {
-            Error::Msg(format!("krea NVFP4: invalid weight key `{native_weight}`"))
-        })?;
-        let block_scale = self.st.get(&format!("{base}.weight_scale"))?;
-        let global_scale = self.st.get(&format!("{base}.weight_scale_2"))?;
-        let global_bytes: [u8; 4] = global_scale.data().try_into().map_err(|_| {
+        // (2) The descriptor fields the dtype heuristic could not see. `full_precision_matrix_mult`
+        //     is the producer saying "this layer must not run a quantized matmul"; handing its
+        //     packed nibbles to `Nvfp4Linear` would do exactly that.
+        if *full_precision_matrix_mult {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{diffusers_weight}` declares `full_precision_matrix_mult`, so its \
+                 packed form must not be fed to the NVFP4 GEMM; load it through the dense fallback"
+            )));
+        }
+        // (3) A padded stored grid the adapter could not unpad — gen-core's own refusal, so both
+        //     engines say the same thing about the same checkpoint.
+        if let Some(refusal) = tensor.undeclared_padded_storage_refusal() {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: {refusal} (open the checkpoint with \
+                 `Weights::from_native_file_for(.., DeclaredLogicalShapes::FromConfig(cfg))`)"
+            )));
+        }
+        // (4) The container holds exactly the stored grid and carries no unpad, so a packed read is
+        //     only sound when the layer *is* that grid.
+        if logical_shape != stored_shape {
+            return Err(Error::Msg(format!(
+                "krea NVFP4: `{diffusers_weight}` has logical shape {logical_shape:?} inside a \
+                 padded stored grid {stored_shape:?}; the Kitchen packed container cannot express \
+                 the unpad, so this layer must take the dense fallback"
+            )));
+        }
+
+        // (5) Read exactly the tensors the plan named — no key concatenation at the read site.
+        let weight = self.st.get(&tensor.physical_key)?;
+        let block = self.st.get(block_scale)?;
+        let global = self.st.get(global_scale)?;
+        let global_bytes: [u8; 4] = global.data().try_into().map_err(|_| {
             Error::Msg(format!(
-                "krea NVFP4: `{base}.weight_scale_2` must contain one F32 value"
+                "krea NVFP4: `{global_scale}` must contain one F32 value"
             ))
         })?;
-        let cols = packed_cols.checked_mul(2).ok_or_else(|| {
-            Error::Msg(format!(
-                "krea NVFP4: logical column count overflows for `{native_weight}`"
-            ))
-        })?;
-        Nvfp4Tensor::from_kitchen_parts(
+        let packed = Nvfp4Tensor::from_kitchen_parts(
             weight.data(),
-            block_scale.data(),
+            block.data(),
             f32::from_le_bytes(global_bytes),
-            *rows,
-            cols,
-        )
+            stored_shape[0],
+            stored_shape[1],
+        )?;
+        // (6) Measure what was built, for the receipt. Both scale levels are owned by the
+        //     container (block scales as its byte buffer, `weight_scale_2` as its `f32`), which is
+        //     what makes this an independent measurement of the plan's packed pricing.
+        const GLOBAL_SCALE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+        let resident = (packed.packed.len() + packed.scales.len()) as u64 + GLOBAL_SCALE_BYTES;
+        self.nvfp4_measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(tensor.logical_key.clone(), resident);
+        Ok(packed)
     }
 
     /// Load `name` at the component dtype — from the `overlay` if present
@@ -2285,14 +2513,61 @@ mod tests {
         ::safetensors::serialize_to_file(tensors, None, path).unwrap();
     }
 
+    /// A small but **architecturally coherent** Krea 2 config the NVFP4 fixture below is built to.
+    ///
+    /// Coherence is load-bearing since sc-20651: the import declares its logical shapes from a
+    /// config, so a fixture whose tensors do not belong to one architecture cannot be planned at
+    /// all. `hidden = heads · head_dim = 4 · 16`, `head_dim = sum(axes_dims_rope)`, `heads % kv_heads
+    /// == 0`, `text_hidden = text_heads · head_dim` — every invariant `Krea2Config::validate`
+    /// enforces, at the smallest widths that are still NVFP4-legal (both stored axes 16-aligned).
+    fn kitchen_nvfp4_config() -> crate::Krea2Config {
+        let cfg = crate::Krea2Config {
+            in_channels: 16,
+            patch_size: 2,
+            hidden_size: 64,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            attention_head_dim: 16,
+            num_layers: 1,
+            intermediate_size: 128,
+            norm_eps: 1e-5,
+            axes_dims_rope: [4, 6, 6],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 32,
+            num_text_layers: 2,
+            num_layerwise_text_blocks: 1,
+            num_refiner_text_blocks: 1,
+            text_hidden_dim: 32,
+            text_intermediate_size: 64,
+            text_num_attention_heads: 2,
+            text_num_kv_heads: 1,
+        };
+        cfg.validate()
+            .expect("the fixture architecture is coherent");
+        cfg
+    }
+
+    /// A single-projection Kitchen NVFP4 native file plus one dense sibling, carrying the
+    /// **descriptor** a real Kitchen export carries (`__metadata__._quantization_metadata`).
+    ///
+    /// The descriptor is not decoration: it is what makes the layer NVFP4. Before sc-20651 this
+    /// fixture had none and the Candle import still took the NVFP4 path — off `dtype == U8` alone —
+    /// which is exactly the defect the epic's codec seam exists to remove.
     fn write_kitchen_nvfp4_native_file(path: &Path) {
-        let (rows, cols) = (128usize, 64usize);
+        let cfg = kitchen_nvfp4_config();
+        // `attn.to_q` is `[q_dim, hidden]`, and Krea's `q_dim == hidden_size`, so the projection is
+        // square at the fixture's width. Both axes are 16-aligned, so the stored grid IS the layer
+        // (no ComfyUI padding) and the packed container can express it.
+        let (rows, cols) = (cfg.q_dim(), cfg.hidden_size);
         let mut packed = vec![0u8; rows * cols / 2];
         packed[0] = 0x12; // Kitchen hi-first: even code 1, odd code 2.
         let mut block_scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
         block_scales[Nvfp4Tensor::scale_offset_for(0, 0, rows)] = 0x38; // E4M3 1.0.
         let global_scale = 2.0f32.to_le_bytes();
-        let dense = vec![0u8; 16 * 16 * 4];
+        // The swizzled `to_blocked` scale grid, not `[rows, blocks]`: the plan validates the stored
+        // companion against `gen_core::nvfp4_scale_shape`, which is the 128×4-atom padded shape.
+        let scale_shape = candle_gen::gen_core::nvfp4_scale_shape([rows, cols]).to_vec();
+        let dense = vec![0u8; cfg.hidden_size * cfg.in_channels * 4];
 
         let mut tensors = std::collections::BTreeMap::new();
         tensors.insert(
@@ -2308,7 +2583,7 @@ mod tests {
             "model.diffusion_model.blocks.0.attn.wq.weight_scale",
             ::safetensors::tensor::TensorView::new(
                 ::safetensors::Dtype::F8_E4M3,
-                vec![rows, cols / 16],
+                scale_shape,
                 &block_scales,
             )
             .unwrap(),
@@ -2324,11 +2599,22 @@ mod tests {
         );
         tensors.insert(
             "model.diffusion_model.first.weight",
-            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::F32, vec![16, 16], &dense)
-                .unwrap(),
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::F32,
+                vec![cfg.hidden_size, cfg.in_channels],
+                &dense,
+            )
+            .unwrap(),
         );
+        // Kitchen declares NVFP4 file-wide rather than per-tensor; the layer names are the file's
+        // own (native, prefixed) `{layer}` bases.
+        let metadata = std::collections::HashMap::from([(
+            "_quantization_metadata".to_string(),
+            r#"{"format_version": "1.0", "layers": {"model.diffusion_model.blocks.0.attn.wq": {"format": "nvfp4"}}}"#
+                .to_string(),
+        )]);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        ::safetensors::serialize_to_file(tensors, None, path).unwrap();
+        ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
     }
 
     #[test]
@@ -2339,15 +2625,39 @@ mod tests {
         let path = path_tmp.path().join("kreamania_variant7.safetensors");
         write_kitchen_nvfp4_native_file(&path);
 
-        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
+        let cfg = kitchen_nvfp4_config();
+        let w = Weights::from_native_file_for(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
         assert!(w.uses_native_keys());
         assert!(w.is_native_nvfp4());
         assert!(!w.is_plain_int8());
         assert!(!w.is_convrot());
         assert_eq!(
             w.shape("transformer_blocks.0.attn.to_q.weight"),
-            Some(vec![128, 64]),
+            Some(vec![cfg.q_dim(), cfg.hidden_size]),
             "architecture validation must see the logical, not packed, shape"
+        );
+
+        // sc-20651: the DESCRIPTOR is what makes this layer NVFP4, and the plan is where that lives.
+        let planned = w
+            .logical_plan()
+            .expect("a native single file compiles a plan")
+            .tensors
+            .iter()
+            .find(|t| t.logical_key == "transformer_blocks.0.attn.to_q.weight")
+            .expect("the projection is planned");
+        assert_eq!(planned.codec_id, NVFP4_CODEC.codec_id);
+        assert!(
+            matches!(&planned.codec, TensorCodecSpec::Nvfp4 { block_scale, global_scale, .. }
+                if block_scale == "model.diffusion_model.blocks.0.attn.wq.weight_scale"
+                    && global_scale == "model.diffusion_model.blocks.0.attn.wq.weight_scale_2"),
+            "the companion keys must come from the plan, not from concatenation at the read site: \
+             {:?}",
+            planned.codec
         );
 
         let packed = w.get_native_nvfp4("transformer_blocks.0.attn.to_q.weight")?;
@@ -2357,6 +2667,18 @@ mod tests {
         );
         let dense = packed.dequantize_to_vec();
         assert_eq!(&dense[..2], &[1.0, 2.0]);
+
+        // The receipt is MEASURED off the container that was really built — nibbles + block scales
+        // + the retained global scale — not copied from the plan.
+        let receipt = w
+            .logical_weight_receipt()
+            .expect("the plan yields a receipt");
+        assert_eq!(receipt.mapping_id, "krea-native-to-diffusers-v1");
+        assert_eq!(receipt.tensor_count, 1);
+        assert_eq!(
+            receipt.resident_bytes(),
+            (packed.packed.len() + packed.scales.len()) as u64 + 4,
+        );
 
         let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
         let quantized = linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan)?;
@@ -2368,6 +2690,65 @@ mod tests {
             "Kitchen profile's dense BF16/F32 projections must not be requantized"
         );
         Ok(())
+    }
+
+    /// **A dense sibling is not NVFP4 just because the file is.** `img_in` carries no descriptor, so
+    /// the plan gives it a dense codec and the NVFP4 read site refuses it by name — where the old
+    /// `dtype == U8` predicate answered on storage alone and would have taken any `U8` payload.
+    #[test]
+    fn nvfp4_read_refuses_a_layer_the_descriptor_does_not_declare() {
+        let dev = Device::Cpu;
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+        let cfg = kitchen_nvfp4_config();
+        let w = Weights::from_native_file_for(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("the fixture plans");
+
+        assert!(!w.is_native_nvfp4_weight("img_in.weight"));
+        let error = w
+            .get_native_nvfp4("img_in.weight")
+            .expect_err("a dense-planned layer must not be read as an NVFP4 triplet")
+            .to_string();
+        assert!(
+            error.contains("img_in.weight") && error.contains("nvfp4-v1"),
+            "the refusal must name the layer and the codec it is not: {error}"
+        );
+    }
+
+    /// **Materializing a padded NVFP4 layer without a declared logical shape is refused.** With no
+    /// architecture config the plan can only carry the stored grid forward, and decoding that grid
+    /// would turn ComfyUI's pad columns into weights. Planning still succeeds (a plan is also a
+    /// pricing artifact); the *read* is where it stops.
+    #[test]
+    fn nvfp4_read_refuses_an_undeclared_logical_shape() {
+        let dev = Device::Cpu;
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+
+        // No config in scope: the same file, planned with nothing declared.
+        let w = Weights::from_native_file(&path, &dev, DType::F32)
+            .expect("an undeclared padded checkpoint still PLANS — pricing is not materialization");
+        assert!(w.is_native_nvfp4(), "the descriptor still declares NVFP4");
+
+        let error = w
+            .get_native_nvfp4("transformer_blocks.0.attn.to_q.weight")
+            .expect_err("materializing an undeclared padded grid must be refused")
+            .to_string();
+        assert!(
+            error.contains("block-padded") && error.contains("declares no logical shape"),
+            "the refusal must be gen-core's padded-storage one: {error}"
+        );
+        assert!(
+            error.contains("DeclaredLogicalShapes::FromConfig"),
+            "the refusal must name the fix the caller controls: {error}"
+        );
     }
 
     /// sc-14023: the non-rotated descriptor arm reconstructs exactly `codes * row_scale` through the
