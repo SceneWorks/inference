@@ -1851,9 +1851,11 @@ mod preview_advertising {
                         skipped.clear();
                         continue;
                     }
-                    // A cfg that also ships stays: emit its `#` and let the rest parse normally.
-                    out.push(ch);
-                    i += 1;
+                    // A cfg that also ships stays. Preserve the whole attribute rather than
+                    // letting the ordinary literal stripper erase its feature value: source-based
+                    // catalog tests must distinguish `feature = "cuda"` from another feature.
+                    out.extend(chars[i..end].iter());
+                    i = end;
                     continue;
                 }
             }
@@ -3555,6 +3557,220 @@ mod preview_advertising {
             catalog_ids, expected_ids,
             "the catalog's memory-strategy set must be exactly what the memory-route crates \
              contribute on this build"
+        );
+    }
+
+    /// Every catalog provider whose registration changes under CUDA must receive that feature from
+    /// the composition crate. Otherwise Cargo enables `candle-gen-catalog/cuda` while leaving the
+    /// provider on its non-CUDA registration path: neither side of a `cfg(feature = "cuda")` /
+    /// `cfg(not(feature = "cuda"))` split owns the registration.
+    ///
+    /// The provider set is derived from the shipped module trees and the catalog's actual
+    /// `register_providers` body. In particular, this does not search comments or test modules,
+    /// and it does not use a hand-maintained list that could miss the next CUDA-gated provider.
+    #[test]
+    fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
+        fn function_body<'a>(source: &'a str, function: &str) -> &'a str {
+            let start = source
+                .find(function)
+                .unwrap_or_else(|| panic!("missing {function:?}"));
+            let rest = &source[start..];
+            let open = rest
+                .find('{')
+                .unwrap_or_else(|| panic!("{function:?} has no body"));
+            let body_start = open + 1;
+            let mut depth = 1usize;
+            for (offset, ch) in rest[body_start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &rest[body_start..body_start + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{function:?} has an unterminated body");
+        }
+
+        /// Whether a `cfg` predicate changes with the `cuda` feature. This deliberately treats
+        /// `any`, `all`, and `not` alike: a provider registration whose branch depends on CUDA in
+        /// any boolean position needs the catalog to forward that feature rather than selecting an
+        /// accidental fallback branch.
+        fn predicate_mentions_cuda(predicate: &str) -> bool {
+            let predicate = predicate.trim();
+            if let Some(rest) = predicate.strip_prefix("feature") {
+                return rest
+                    .trim_start()
+                    .strip_prefix('=')
+                    .is_some_and(|value| value.trim().trim_matches('"') == "cuda");
+            }
+            for combinator in ["all", "any", "not"] {
+                if let Some(inner) = strip_call(predicate, combinator) {
+                    return split_top_level(inner)
+                        .iter()
+                        .any(|part| predicate_mentions_cuda(part));
+                }
+            }
+            false
+        }
+
+        /// Every `cfg` predicate attached inside the registration body that mentions CUDA.
+        /// `module_tree` has already removed comments and test-only modules, so this reads only
+        /// compiled source rather than prose which happens to quote a cfg expression.
+        fn has_cuda_gated_registration(source: &str) -> bool {
+            const OPEN: &str = "#[cfg(";
+            let mut rest = source;
+            while let Some(offset) = rest.find(OPEN) {
+                let predicate = &rest[offset + OPEN.len()..];
+                let mut depth = 1usize;
+                for (end, ch) in predicate.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                if predicate_mentions_cuda(&predicate[..end]) {
+                                    return true;
+                                }
+                                rest = &predicate[end + 1..];
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(depth, 0, "unterminated cfg predicate in registration body");
+            }
+            false
+        }
+
+        // Parser controls: these are all valid CUDA-dependent registration predicates, including
+        // Wan's `any(feature = "cuda", test)` form and a negated fallback branch.
+        for predicate in [
+            "feature = \"cuda\"",
+            "any(feature = \"cuda\", test)",
+            "all(unix, feature = \"cuda\")",
+            "not(feature = \"cuda\")",
+        ] {
+            assert!(
+                predicate_mentions_cuda(predicate),
+                "CUDA predicate parser missed {predicate:?}"
+            );
+        }
+        assert!(
+            !predicate_mentions_cuda("any(feature = \"metal\", test)"),
+            "CUDA predicate parser must not match another feature"
+        );
+
+        let catalog_src = candle_gen_root().join("candle-gen-catalog/src");
+        let catalog_tree = module_tree("candle-gen-catalog", &catalog_src);
+        let catalog_registration = function_body(
+            catalog_tree
+                .shipped
+                .get("lib.rs")
+                .expect("catalog lib.rs is shipped"),
+            "pub fn register_providers",
+        );
+
+        let mut cuda_gated_catalog_providers = BTreeSet::new();
+        let mut crate_dirs: Vec<_> = std::fs::read_dir(candle_gen_root())
+            .expect("crates/media/candle-gen is readable")
+            .map(|entry| entry.expect("readable directory entry").path())
+            .filter(|path| path.join("src/lib.rs").is_file())
+            .collect();
+        crate_dirs.sort();
+        for crate_dir in crate_dirs {
+            let dir = crate_dir
+                .file_name()
+                .expect("a crate directory has a name")
+                .to_string_lossy()
+                .into_owned();
+            if dir == "candle-gen-catalog" {
+                continue;
+            }
+            let provider_call = format!("{}::register_providers(", dir.replace('-', "_"));
+            if !catalog_registration.contains(&provider_call) {
+                continue;
+            }
+            let provider_tree = module_tree(&dir, &crate_dir.join("src"));
+            let provider_registration = function_body(
+                provider_tree
+                    .shipped
+                    .get("lib.rs")
+                    .expect("provider lib.rs is shipped"),
+                "pub fn register_providers",
+            );
+            if has_cuda_gated_registration(provider_registration) {
+                cuda_gated_catalog_providers.insert(dir);
+            }
+        }
+        assert!(
+            !cuda_gated_catalog_providers.is_empty(),
+            "the CUDA registration scan found no catalog providers; its forwarding assertion would be vacuous"
+        );
+        assert!(
+            cuda_gated_catalog_providers.contains("candle-gen-wan"),
+            "Wan's cfg(any(feature = \"cuda\", test)) registration branch must be covered"
+        );
+
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(4)
+            .expect("candle-gen-catalog sits four levels below the workspace root");
+        let output = std::process::Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(workspace_root.join("Cargo.toml"))
+            .output()
+            .unwrap_or_else(|error| panic!("cargo metadata: {error}"));
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+        let features = metadata["packages"]
+            .as_array()
+            .expect("cargo metadata reports packages")
+            .iter()
+            .find(|package| package["name"] == "candle-gen-catalog")
+            .expect("candle-gen-catalog is a workspace member")["features"]
+            .as_object()
+            .expect("catalog package reports features");
+        let feature_members = |feature: &str| {
+            features[feature]
+                .as_array()
+                .unwrap_or_else(|| panic!("catalog has no {feature:?} feature"))
+                .iter()
+                .map(|member| member.as_str().expect("feature member is a string"))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let cuda_forwarded = feature_members("cuda");
+        for provider in &cuda_gated_catalog_providers {
+            let forwarding = format!("{provider}/cuda");
+            assert!(
+                cuda_forwarded.contains(forwarding.as_str()),
+                "{provider} has a CUDA-gated register_providers branch, so candle-gen-catalog's \
+                 cuda feature must forward {forwarding:?}"
+            );
+        }
+
+        // The MiniMax-H3 seam has both backend paths. CUDA is covered by the class check above;
+        // Metal has no analogous gated registration branch, so pin its forwarding explicitly.
+        assert!(
+            feature_members("metal").contains("candle-gen-minimax-h3/metal"),
+            "candle-gen-catalog's metal feature must forward candle-gen-minimax-h3/metal"
         );
     }
 
