@@ -4418,13 +4418,17 @@ mod tests {
         );
         assert_eq!(
             binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
-            [
-                ImportedModelOperation::Generate,
-                ImportedModelOperation::Edit,
-            ],
-            "Candle implements the fused SDXL edit route: main's 0d7eafb4b sealed the Candle \
-             SDXL edit provider's memory-strategy routes and registered the fused-checkpoint \
-             Edit operation, so the route is no longer MLX-only"
+            [ImportedModelOperation::Generate],
+            "Candle truthfully omits the fused SDXL edit route (sc-20651 review). The previous \
+             expectation here asserted that Candle 'implements' it; it did not. The binding \
+             existed, but it named the txt2img `sdxl` provider, whose descriptor declares no \
+             `Reference` conditioning — so the capability floor refused every request the route \
+             admitted. The Candle SDXL edit stack (`edit_provider::SdxlEdit`) is a name-driven \
+             provider that needs a diffusers snapshot dir and a staged fp16-fix VAE; it has no \
+             `LdmComponents`-fed constructor and so cannot serve a fused single-file import. \
+             `SDXL_CHECKPOINT_ADAPTER.eligible_backends` is `[Mlx, Candle]`, so the per-operation \
+             completeness check does not oblige Candle to bind Edit — exactly as Candle Krea \
+             omits the MLX-only pose route above. MLX keeps its Edit binding and honors it."
         );
         for adapter in &adapters {
             if adapter.eligible_backends == [CheckpointBackend::Candle] {
@@ -4489,14 +4493,8 @@ mod tests {
                 required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
                 inherit_adapters: true,
             },
-            ImportedModelRegistration {
-                family: "sdxl",
-                source: ImportedModelSource::FusedCheckpoint,
-                operation: ImportedModelOperation::Edit,
-                provider_id: candle_gen_sdxl::MODEL_ID,
-                required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
-                inherit_adapters: true,
-            },
+            // No `sdxl` + `FusedCheckpoint` + `Edit` row: Candle does not bind that operation
+            // (sc-20651 review). See the `binding_operations` expectation above for why.
             ImportedModelRegistration {
                 // Wan's imported route takes NO caller-staged components: the UMT5 encoder, VAE
                 // and tokenizer come from a resident snapshot tier the caller resolves, not from
