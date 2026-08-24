@@ -50,6 +50,19 @@ use mlx_gen::{Error, Result};
 /// [`native_dit_key_to_diffusers`]. Its id is the one the portable
 /// [`KREA_2_CHECKPOINT_ADAPTER`](mlx_gen::gen_core::KREA_2_CHECKPOINT_ADAPTER) row registers for
 /// that dialect; the crate's conformance test proves the two agree.
+///
+/// # No `logical_shape`: a real MXFP8 Krea DiT fails architecture validation (sc-20644)
+///
+/// This mapping does not override `LogicalKeyMapping::logical_shape`, so it declares no true
+/// (unpadded) shape for any key. MXFP8 storage is 32-padded on both axes and the file does not
+/// record the logical shape, so with no declaration the plan can only unpad to the **stored**
+/// padded shape. A genuine MXFP8 Krea DiT would therefore decode at the 32-padded shape and be
+/// refused by the DiT's own architecture validation.
+///
+/// That is **fail-closed and intended here**: the refusal names the tensor and the shape mismatch,
+/// and nothing loads at a silently wrong geometry. Declaring the per-key logical shapes that would
+/// let MXFP8 Krea load belongs to sc-20644, not to this story — no Krea checkpoint in the wild
+/// ships MXFP8 today (the community variants are bf16, plain fp8 cast, or int8-per-row).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KreaNativeToDiffusersMapping;
 

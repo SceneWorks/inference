@@ -83,6 +83,10 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
 
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    // The engine's checkpoint codec table is registered here, exactly once, before any family
+    // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
+    // register one, and the builder refuses a duplicate row outright.
+    let registry = candle_gen::logical_weights::register_checkpoint_codecs(registry);
     let registry = candle_gen_anima::register_providers(registry);
     let registry = candle_gen_bernini::register_providers(registry);
     let registry = candle_gen_boogu::register_providers(registry);
@@ -4217,6 +4221,35 @@ mod preview_advertising {
 #[cfg(test)]
 mod tests {
     use candle_gen::gen_core::ConditioningKind;
+
+    #[test]
+    fn checkpoint_codecs_register_once_and_every_row_has_an_engine_implementation() {
+        use candle_gen::logical_weights::{BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS};
+
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<_> = registry.checkpoint_codecs().codecs().copied().collect();
+        assert_eq!(
+            registered, BASELINE_CODECS,
+            "the composed Candle catalog must carry the engine codec table exactly once; no \
+             family crate may add or repeat a row"
+        );
+        let mut registered_ids: Vec<&str> = registered.iter().map(|codec| codec.codec_id).collect();
+        registered_ids.sort_unstable();
+        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS.to_vec();
+        implemented.sort_unstable();
+        assert_eq!(
+            registered_ids, implemented,
+            "every registered codec row needs a decode implementation and vice versa"
+        );
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::DenseBf16)
+            .is_some());
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::Fp8E4M3)
+            .is_some());
+    }
 
     #[test]
     fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bindings() {

@@ -493,8 +493,12 @@ pub(crate) fn native_memory_strategy_contract(
     native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
-/// Resident bytes of a community single-file native DiT: I8 projections materialize to bf16, their
-/// scale/descriptor companion tensors are consumed and dropped, everything else is stored as-is.
+/// Resident bytes of a community single-file native DiT, priced from the compiled logical-weight
+/// plan (sc-20385): each layer's planned dense-fallback residency — I8 codes and fp8 values
+/// materialize to bf16 (MXFP8 unpadded to its logical shape), scale/descriptor companions are
+/// consumed — with the optional load-time group quantization projected onto the quant-target
+/// projections. A file the plan compiler refuses (unregistered format, malformed descriptor)
+/// cannot be priced and fails closed here, exactly as the load itself would.
 /// The SINGLE projection both native contracts read (the t2i one above and the pose-control one in
 /// `crate::memory_strategy`), so the two can never disagree about what a native file costs resident.
 pub(crate) fn native_dit_transformer_bytes(
@@ -502,19 +506,28 @@ pub(crate) fn native_dit_transformer_bytes(
     dit_file: &std::path::Path,
     quant: Option<mlx_gen::Quant>,
 ) -> CoreResult<u64> {
-    projected_safetensors_bytes(dit_file, |tensor| {
-        if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
-            ResidentProjection::Omit
-        } else if let Some(quant) = quant.filter(|_| {
-            crate::native_remap::native_dit_key_to_diffusers(&tensor.name)
-                .is_some_and(|name| crate::convert::is_transformer_quant_target(&name))
-        }) {
+    let plan = mlx_gen::logical_weights::plan_logical_weights(
+        dit_file,
+        &crate::native_remap::KreaNativeToDiffusersMapping,
+    )
+    .map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
+    // The plan's resident headers are logical-keyed (diffusers names) at the dense resident dtype,
+    // so the quant-target predicate applies directly and `Stored` means "the planned resident
+    // bytes", not the on-disk packing.
+    let resident = plan.resident_tensor_headers();
+    mlx_gen::asset_facts::projected_tensor_headers_bytes(&resident, |tensor| {
+        if let Some(quant) =
+            quant.filter(|_| crate::convert::is_transformer_quant_target(&tensor.name))
+        {
             ResidentProjection::GroupQuantized {
                 bits: quant.bits(),
                 group_size: crate::quant::GROUP_SIZE as usize,
             }
-        } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
-            ResidentProjection::Bfloat16
         } else {
             ResidentProjection::Stored
         }
@@ -836,7 +849,7 @@ mod tests {
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
@@ -847,17 +860,27 @@ mod tests {
     }
 
     fn write_native_i8_safetensors(path: &std::path::Path) {
-        let mut header = br#"{
-            "model.diffusion_model.proj.weight":{"dtype":"I8","shape":[2,64],"data_offsets":[0,128]},
-            "model.diffusion_model.proj.weight_scale":{"dtype":"F32","shape":[2],"data_offsets":[128,136]},
-            "model.diffusion_model.proj.comfy_quant":{"dtype":"U8","shape":[2],"data_offsets":[136,138]}
-        }"#.to_vec();
+        // A real (tiny) int8-per-row layer: since sc-20385 the resident pricing compiles the
+        // logical-weight plan, so the descriptor payload must be the genuine ComfyUI JSON, not
+        // filler bytes.
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#;
+        let mut header = format!(
+            concat!(
+                r#"{{"model.diffusion_model.blocks.0.attn.wq.weight":{{"dtype":"I8","shape":[2,64],"data_offsets":[0,128]}},"#,
+                r#""model.diffusion_model.blocks.0.attn.wq.weight_scale":{{"dtype":"F32","shape":[2],"data_offsets":[128,136]}},"#,
+                r#""model.diffusion_model.blocks.0.attn.wq.comfy_quant":{{"dtype":"U8","shape":[{len}],"data_offsets":[136,{end}]}}}}"#
+            ),
+            len = descriptor.len(),
+            end = 136 + descriptor.len()
+        )
+        .into_bytes();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
-        bytes.extend([0_u8; 138]);
+        bytes.extend([0_u8; 136]);
+        bytes.extend(descriptor);
         std::fs::write(path, bytes).unwrap();
     }
 

@@ -770,6 +770,21 @@ mod tests {
         Precision, Quant, WeightsSource,
     };
 
+    /// A native-keyed imported DiT fixture (one dense bf16 tensor, 256 payload bytes) -- the plan
+    /// compiler (sc-20385) refuses foreign keys, so the imported-file fixtures must carry a real
+    /// Krea native key.
+    fn write_native_dit(path: &std::path::Path) {
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
+            .to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 256]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn write_control(path: &std::path::Path) {
         let mut header =
             br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
@@ -807,7 +822,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported-dit.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
 
@@ -914,7 +929,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported-dit.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
         let spec = LoadSpec::new(WeightsSource::File(dit))
@@ -1125,7 +1140,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         let spec = LoadSpec::new(WeightsSource::File(dit))
             .with_component(
@@ -1164,7 +1179,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
         let valid = LoadSpec::new(WeightsSource::File(dit))
