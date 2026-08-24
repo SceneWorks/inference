@@ -146,19 +146,16 @@ pub fn register_providers(
     let registry = registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
         .register_generator(bernini::FULL_REGISTRATION);
-    #[cfg(any(feature = "cuda", test))]
-    let registry = memory_strategy::register_memory_strategy(registry)
-        .register_memory_behavior(memory_strategy::RENDERER_MEMORY_BEHAVIOR)
-        .register_memory_behavior(memory_strategy::FULL_MEMORY_BEHAVIOR);
-    registry
+    memory_strategy::register_memory_strategy(registry)
 }
 
 /// Register Bernini's weights-free memory-contract declarations in the catalog-only registry.
 pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    // The non-CUDA catalog still needs the provider-owned registration callbacks as well as the
-    // weights-free fixtures; the callbacks fail closed until terminal CUDA evidence exists.
+    // The non-CUDA catalog still needs the provider-owned registration callbacks, the weights-free
+    // fixtures, and the lifecycle behaviors; the callbacks fail closed until terminal CUDA evidence
+    // exists.
     memory_strategy::register_memory_strategy(registry)
 }
 
@@ -178,6 +175,28 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["bernini_renderer", "bernini"]);
+    }
+
+    /// The lifecycle behaviors must reach the *catalog-only* (non-CUDA) registry, as SenseNova and
+    /// LTX already do. Gated behind `cfg(cuda)` they left non-CUDA catalog conformance walking the
+    /// Bernini surface with no lifecycle fixtures at all.
+    #[test]
+    fn catalog_only_surface_registers_both_lifecycle_behaviors() {
+        let catalog_only = super::register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(super::pipeline::RENDERER_REGISTRATION)
+                .register_generator(super::bernini::FULL_REGISTRATION),
+        )
+        .build()
+        .unwrap();
+        for registry in [catalog_only, super::provider_registry().unwrap()] {
+            let mut behaviors: Vec<&str> = registry
+                .memory_behavior_registrations()
+                .map(|registration| registration.provider_id)
+                .collect();
+            behaviors.sort_unstable();
+            assert_eq!(behaviors, ["bernini", "bernini_renderer"]);
+        }
     }
 
     #[test]

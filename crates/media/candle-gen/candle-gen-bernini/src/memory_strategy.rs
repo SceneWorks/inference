@@ -24,7 +24,6 @@ use candle_gen::gen_core::{
     MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
     ResidentRequestMemory,
 };
-#[cfg(any(feature = "cuda", test))]
 use candle_gen::gen_core::{MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryMode};
 use candle_gen::{CandleError, Result as CandleResult};
 
@@ -1520,7 +1519,7 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
         "ads2v" if (3..=10).contains(&context.geometry.reference_count) => "provider_video_mode:ads2v",
         _ => {
             return Err(gen_core::Error::Unsupported(format!(
-                "{} memory evidence covers exact video_to_video/one-clip, reference_to_video/1-8-image, or reference_video_to_video/one-clip-plus-1-8-image routes",
+                "{} memory evidence covers exact video_to_video/one-clip, reference_to_video/1-8-image, reference_video_to_video/one-clip-plus-1-8-image, multi_video_to_video/2-8-clip, or ads2v/source-plus-reference-clip-plus-1-8-image routes",
                 contract.provider_id
             )))
         }
@@ -1955,22 +1954,28 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
+/// Seal the load-exact memory contract, or report *why* no contract exists.
+///
+/// Bernini's provider `load` is lazy (F-097) — a weights-free registry walk resolves the descriptor
+/// without touching a snapshot — so a missing or unreadable snapshot must not fail the load. It must
+/// however fail *closed* at the memory seams: the `Err(reason)` carried here is the refusal a
+/// crossed, corrupted, or unparseable artifact returns from `memory_strategy_safety_check` and
+/// `begin_memory_strategy_request`, instead of the previous silent `Accept`.
 pub fn contract_for_loaded(
     spec: &LoadSpec,
     provider_id: &str,
-) -> gen_core::Result<Option<(MemoryProviderContract, MemoryNumericTier)>> {
-    let (facts, loaded_tier, adapter_identity) = match production_assets(provider_id, spec) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    Ok(Some((
-        contract(provider_id, spec, None, facts, adapter_identity),
-        loaded_tier,
-    )))
+) -> Result<(MemoryProviderContract, MemoryNumericTier), String> {
+    match production_assets(provider_id, spec) {
+        Ok((facts, loaded_tier, adapter_identity)) => Ok((
+            contract(provider_id, spec, None, facts, adapter_identity),
+            loaded_tier,
+        )),
+        Err(error) => Err(format!(
+            "{provider_id}: no sealed memory receipt for the loaded artifact ({error})"
+        )),
+    }
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub fn registered_valid_fixtures(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -2101,6 +2106,47 @@ pub fn registered_valid_fixtures(
         mv2v_axes.push(adapter_axis);
     }
     mv2v_context.overlay = Some(mv2v_axes.join("+"));
+    // ADS2V is the one admitted mode whose source ordering this branch changed, so it needs a
+    // positive control of its own: [source clip, reference clip, 1-8 ordered images].
+    let mut ads2v_request = fixture.request.clone();
+    ads2v_request.prompt = "weights-free Bernini ads2v memory behavior".to_owned();
+    ads2v_request.video_mode = Some("ads2v".to_owned());
+    ads2v_request.width = 848;
+    ads2v_request.height = 480;
+    ads2v_request.frames = Some(45);
+    let ads2v_frame = gen_core::Image {
+        width: ads2v_request.width,
+        height: ads2v_request.height,
+        pixels: vec![5; ads2v_request.width as usize * ads2v_request.height as usize * 3],
+    };
+    ads2v_request.conditioning = vec![
+        Conditioning::VideoClip {
+            frames: vec![ads2v_frame.clone(); 45],
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        Conditioning::VideoClip {
+            frames: vec![ads2v_frame; 45],
+            frame_idx: 0,
+            strength: 1.0,
+        },
+        Conditioning::MultiReference {
+            images: vec![gen_core::Image {
+                width: 40,
+                height: 24,
+                pixels: vec![6; 40 * 24 * 3],
+            }],
+        },
+    ];
+    let ads2v_axis = ads2v_source_receipt(&contract.provider_id, &ads2v_request)?;
+    let mut ads2v_context = fixture.context.clone();
+    ads2v_context.mode = MemoryMode::Other("ads2v".to_owned());
+    ads2v_context.geometry.reference_count = 3;
+    let mut ads2v_axes = vec!["provider_video_mode:ads2v".to_owned(), ads2v_axis];
+    if let Some(adapter_axis) = adapter_receipt_axis(contract) {
+        ads2v_axes.push(adapter_axis);
+    }
+    ads2v_context.overlay = Some(ads2v_axes.join("+"));
     let load_spec = fixture.load_spec.clone();
     Ok(vec![
         fixture,
@@ -2117,12 +2163,16 @@ pub fn registered_valid_fixtures(
         MemoryBehaviorFixture {
             context: mv2v_context,
             request: mv2v_request,
+            load_spec: load_spec.clone(),
+        },
+        MemoryBehaviorFixture {
+            context: ads2v_context,
+            request: ads2v_request,
             load_spec,
         },
     ])
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub fn registered_begin_request(
     provider_id: &str,
     spec: &LoadSpec,
@@ -2260,7 +2310,6 @@ pub const FULL_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Mem
     safety_check: registered_safety_check,
 };
 
-#[cfg(any(feature = "cuda", test))]
 pub const RENDERER_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: crate::pipeline::MODEL_ID,
@@ -2270,7 +2319,6 @@ pub const RENDERER_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         },
     };
 
-#[cfg(any(feature = "cuda", test))]
 pub const FULL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: crate::bernini::MODEL_ID,
@@ -2291,6 +2339,11 @@ pub fn register_memory_contract_surfaces(
 }
 
 /// Provider-owned registration hook used by the CUDA catalog and source-derived wiring checks.
+///
+/// The lifecycle behaviors register unconditionally (as SenseNova and LTX already do): the
+/// weights-free fixtures and `begin_request` callback need no CUDA, and gating them behind
+/// `cfg(cuda)` left non-CUDA catalog conformance walking a Bernini surface with no lifecycle
+/// coverage at all.
 pub fn register_memory_strategy(
     registry: gen_core::ProviderRegistryBuilder,
 ) -> gen_core::ProviderRegistryBuilder {
@@ -2299,6 +2352,8 @@ pub fn register_memory_strategy(
         .register_memory_strategy(FULL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(RENDERER_MEMORY_FIXTURE)
         .register_memory_contract_fixture(FULL_MEMORY_FIXTURE)
+        .register_memory_behavior(RENDERER_MEMORY_BEHAVIOR)
+        .register_memory_behavior(FULL_MEMORY_BEHAVIOR)
 }
 
 #[cfg(test)]
@@ -2959,38 +3014,111 @@ mod tests {
             .unwrap();
     }
 
+    /// A crossed / corrupted / unparseable snapshot seals no memory contract. That must refuse at
+    /// the provider's memory seams — the previous `Accept` admitted *any* strategy at *any*
+    /// geometry on exactly the artifact whose identity could not be read. SVD and SCAIL-2 already
+    /// `Reject` here.
     #[test]
-    fn candle_implemented_rungs_expose_v2v_r2v_rv2v_and_mv2v_lifecycle_fixtures() {
+    fn a_corrupted_snapshot_refuses_every_admitted_memory_context() {
+        for provider_id in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+            let root = tempfile::tempdir().unwrap();
+            write_full_snapshot(root.path(), ComponentPacking::Q4);
+            let spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.path().to_owned()))
+                .with_quant(gen_core::Quant::Q4);
+            // Baseline: the intact snapshot does seal a contract.
+            assert!(
+                contract_for_loaded(&spec, provider_id).is_ok(),
+                "{provider_id}"
+            );
+
+            // The exact context a sealed receipt admits.
+            let weights_free = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            let fixtures =
+                registered_valid_fixtures(&spec, &weights_free, MemoryStrategy::BoundedDecode)
+                    .unwrap();
+            let context = fixtures[0].context.clone();
+            assert_eq!(
+                safety_check(&weights_free, tier(&spec), &context),
+                MemorySafetyDecision::Accept,
+                "{provider_id}"
+            );
+
+            std::fs::write(
+                root.path().join("transformer_2/model.safetensors"),
+                b"not safetensors",
+            )
+            .unwrap();
+            assert!(
+                contract_for_loaded(&spec, provider_id).is_err(),
+                "{provider_id}"
+            );
+            let generator = crate::provider_registry()
+                .unwrap()
+                .load(provider_id, &spec)
+                .unwrap();
+            assert!(
+                generator.memory_strategy_contract().is_none(),
+                "{provider_id}"
+            );
+            match generator.memory_strategy_safety_check(&context) {
+                MemorySafetyDecision::Reject { reason } => assert!(
+                    reason.contains("no sealed memory receipt"),
+                    "{provider_id}: {reason}"
+                ),
+                decision => {
+                    panic!("{provider_id}: unsealed artifact admitted {decision:?}")
+                }
+            }
+            assert!(
+                generator.begin_memory_strategy_request(&context).is_err(),
+                "{provider_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn candle_implemented_rungs_expose_every_admitted_video_route_lifecycle_fixture() {
         let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/missing".into()));
         for provider_id in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
             let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
             let fixtures =
                 registered_valid_fixtures(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
-            assert_eq!(fixtures.len(), 4, "{provider_id}");
-            assert_eq!(fixtures[1].context.mode.as_key(), "reference_to_video");
-            assert_eq!(fixtures[1].context.geometry.reference_count, 2);
+            // Shape, not a pinned count: every mode `route_ok` admits owns exactly one positive
+            // control, so adding an admission arm without its fixture reds here.
+            let covered: Vec<&str> = fixtures
+                .iter()
+                .map(|fixture| fixture.context.mode.as_key())
+                .collect();
             assert_eq!(
-                fixtures[2].context.mode.as_key(),
-                "reference_video_to_video"
-            );
-            assert_eq!(fixtures[2].context.geometry.reference_count, 3);
-            assert_eq!(fixtures[3].context.mode.as_key(), "multi_video_to_video");
-            assert_eq!(fixtures[3].context.geometry.reference_count, 2);
-            assert_eq!(
-                safety_check(&contract, tier(&spec), &fixtures[1].context),
-                MemorySafetyDecision::Accept,
+                covered,
+                [
+                    "video_to_video",
+                    "reference_to_video",
+                    "reference_video_to_video",
+                    "multi_video_to_video",
+                    "ads2v",
+                ],
                 "{provider_id}"
             );
-            assert_eq!(
-                safety_check(&contract, tier(&spec), &fixtures[2].context),
-                MemorySafetyDecision::Accept,
-                "{provider_id}/rv2v"
-            );
-            assert_eq!(
-                safety_check(&contract, tier(&spec), &fixtures[3].context),
-                MemorySafetyDecision::Accept,
-                "{provider_id}/mv2v"
-            );
+            assert_eq!(fixtures[1].context.geometry.reference_count, 2);
+            assert_eq!(fixtures[2].context.geometry.reference_count, 3);
+            assert_eq!(fixtures[3].context.geometry.reference_count, 2);
+            assert_eq!(fixtures[4].context.geometry.reference_count, 3);
+            for fixture in &fixtures {
+                assert_eq!(
+                    safety_check(&contract, tier(&spec), &fixture.context),
+                    MemorySafetyDecision::Accept,
+                    "{provider_id}/{}",
+                    fixture.context.mode.as_key()
+                );
+                let mut scope =
+                    registered_begin_request(provider_id, &spec, &contract, &fixture.context)
+                        .unwrap()
+                        .expect("positive-control scope");
+                let mut request = fixture.request.clone();
+                scope.configure_request(&mut request).unwrap();
+                scope.finish(MemoryRunOutcome::Complete).unwrap();
+            }
 
             for outcome in [
                 MemoryRunOutcome::Complete,
@@ -3355,9 +3483,8 @@ mod tests {
         write_full_snapshot(q4.path(), ComponentPacking::Q4);
         let q4_spec = LoadSpec::new(gen_core::WeightsSource::Dir(q4.path().to_owned()))
             .with_quant(gen_core::Quant::Q4);
-        let (q4_contract, q4_tier) = contract_for_loaded(&q4_spec, crate::pipeline::MODEL_ID)
-            .unwrap()
-            .unwrap();
+        let (q4_contract, q4_tier) =
+            contract_for_loaded(&q4_spec, crate::pipeline::MODEL_ID).unwrap();
         assert_eq!(q4_tier.quant, Some(gen_core::Quant::Q4));
         assert_eq!(q4_contract.asset_facts.transformer_bytes, 320);
 
@@ -3365,9 +3492,8 @@ mod tests {
         write_full_snapshot(q8.path(), ComponentPacking::Q8);
         let q8_spec = LoadSpec::new(gen_core::WeightsSource::Dir(q8.path().to_owned()))
             .with_quant(gen_core::Quant::Q8);
-        let (q8_contract, q8_tier) = contract_for_loaded(&q8_spec, crate::pipeline::MODEL_ID)
-            .unwrap()
-            .unwrap();
+        let (q8_contract, q8_tier) =
+            contract_for_loaded(&q8_spec, crate::pipeline::MODEL_ID).unwrap();
         assert_eq!(q8_tier.quant, Some(gen_core::Quant::Q8));
         assert_eq!(q8_contract.asset_facts.transformer_bytes, 544);
         assert!(
@@ -3403,9 +3529,7 @@ mod tests {
             0.5,
             gen_core::AdapterKind::Lora,
         ));
-        let (sealed, tier) = contract_for_loaded(&spec, crate::pipeline::MODEL_ID)
-            .unwrap()
-            .unwrap();
+        let (sealed, tier) = contract_for_loaded(&spec, crate::pipeline::MODEL_ID).unwrap();
         validate_loaded_contract(crate::pipeline::MODEL_ID, &spec, &sealed, tier).unwrap();
 
         // Same path and still-loadable LoRA, but different bytes after provider construction. The

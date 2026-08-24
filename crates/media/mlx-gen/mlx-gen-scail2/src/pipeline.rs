@@ -137,16 +137,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             root.display()
         )));
     }
-    let memory_strategy = crate::memory_strategy::PreparedMemory::prepare(spec)?;
+    // A snapshot outside the canonical public-animation artifact — a non-canonical revision, or a
+    // packed Q4/Q8 tier this provider still advertises in `supported_quants` — carries no public
+    // memory evidence, but it must still load and render. A hard `?` here made every such load
+    // fail. The memory seams fail closed on `None` (`memory_strategy_safety_check` Rejects, and
+    // `validate` refuses a request that asks for memory), so dropping the receipt admits nothing.
+    let memory_strategy = crate::memory_strategy::PreparedMemory::prepare(spec).ok();
     let config = Scail2Config::from_model_dir(&root)?;
-    memory_strategy.ensure_unchanged(&spec.adapters)?;
+    if let Some(memory) = &memory_strategy {
+        memory.ensure_unchanged(&spec.adapters)?;
+    }
     Ok(Box::new(Scail2 {
         descriptor: descriptor(),
         config,
         root,
         quant: spec.quantize,
         adapters: spec.adapters.clone(),
-        memory_strategy: Some(memory_strategy),
+        memory_strategy,
     }))
 }
 
@@ -160,8 +167,18 @@ impl Generator for Scail2 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        if self.memory_strategy.is_some() {
+        // Gate on `req.memory`, mirroring the Candle sibling and SVD. Running the exact Resident
+        // envelope for *every* request hard-rejected the documented `0x0` resolve-from-clip
+        // sentinel and the multi-character Reference/Mask pairs this pipeline still accepts.
+        if req.memory.is_some() {
+            let memory = self.memory_strategy.as_ref().ok_or_else(|| {
+                mlx_gen::gen_core::Error::Unsupported(format!(
+                    "{MODEL_ID}: memory request requires the sealed canonical receipt"
+                ))
+            })?;
             crate::memory_strategy::validate_generation_request(req)?;
+            // The executing request must be the one the admitted scope opened.
+            crate::memory_strategy::validate_active_request(memory, req)?;
         }
         self.descriptor
             .capabilities
@@ -629,6 +646,32 @@ fn replace_flag_for_request(req: &GenerationRequest) -> bool {
 mod tests {
     use super::*;
     use mlx_gen::ReplacementMode;
+
+    /// sc-20799: the Resident receipt is one exact canonical dense-bf16 artifact, but that is a
+    /// *memory* surface. Hard-`?`-ing `PreparedMemory::prepare` in `load` made every other
+    /// snapshot — a non-canonical revision, and every packed Q4/Q8 tier this provider still
+    /// advertises in `supported_quants` — unloadable.
+    #[test]
+    fn a_non_canonical_or_packed_snapshot_still_loads_without_memory_evidence() {
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
+            let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+            spec.quantize = quant;
+            let generator = load(&spec).expect("non-canonical snapshot must stay loadable");
+            assert!(
+                generator.memory_strategy_contract().is_none(),
+                "{quant:?}: an unsealed snapshot has no public memory evidence"
+            );
+            // ...and it fails closed: a request that asks for memory is refused, not admitted.
+            let mut memory_request = GenerationRequest {
+                video_mode: Some("animation".to_owned()),
+                ..Default::default()
+            };
+            memory_request.memory = Some(mlx_gen::gen_core::GenerationMemory::default());
+            assert!(generator.validate(&memory_request).is_err(), "{quant:?}");
+        }
+    }
 
     #[test]
     fn provider_mode_selects_the_exact_engine_replace_flag() {

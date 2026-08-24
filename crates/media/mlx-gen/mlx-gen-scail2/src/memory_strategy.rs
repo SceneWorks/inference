@@ -20,6 +20,8 @@ pub const CANONICAL_REPOSITORY: &str = "SceneWorks/scail2-mlx";
 pub const CANONICAL_REVISION: &str = "ce88cfdb1008f395e9c820e525e6db7b6695f7b3";
 pub const PUBLIC_BUCKETS: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 704), (704, 1280)];
 pub const PUBLIC_FRAMES: &[u32] = &[45, 61, 77];
+/// Domain separator for the provider-side animation-carrier content digest.
+const CARRIER_DIGEST_DOMAIN: &str = "scail2-mlx-carrier-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdapterRealization {
@@ -418,10 +420,14 @@ impl PreparedMemory {
     }
 }
 
-fn structural_source_digest<'a>(
+/// Shape-only check of an admitted `evidence_revision`. Admission sees no [`GenerationRequest`], so
+/// this is all that can be verified there — it deliberately does **not** return the embedded source
+/// digest for reuse, because feeding that digest back into [`request_evidence_revision`] validated
+/// the engine's own claim against itself and bound no carrier bytes at all.
+fn validate_context_revision_shape(
     evidence: &MemoryStructuralResidentEvidence,
-    context: &'a MemoryRunContext,
-) -> gen_core::Result<&'a str> {
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
     let parts = context.evidence_revision.split(':').collect::<Vec<_>>();
     if parts.len() != 4
         || parts[0] != "scail2-resident-v1"
@@ -435,28 +441,61 @@ fn structural_source_digest<'a>(
             "{PROVIDER_ID}: request evidence identity does not match the sealed artifact"
         )));
     }
-    Ok(parts[2])
-}
-
-fn validate_context_identity(
-    memory: &PreparedMemory,
-    context: &MemoryRunContext,
-) -> gen_core::Result<()> {
-    memory.structural_evidence.validate()?;
-    let _ = structural_source_digest(&memory.structural_evidence, context)?;
     Ok(())
 }
 
-fn validate_request_identity(
-    memory: &PreparedMemory,
-    context: &MemoryRunContext,
+/// Provider-owned digest of the *actual* animation carrier bytes: the character image, its paired
+/// color mask, and every driving frame/mask pair, each bound by geometry **and** pixel content.
+pub fn carrier_source_digest(request: &GenerationRequest) -> gen_core::Result<String> {
+    let carrier = request.scail2_animation_conditioning()?;
+    let mut hasher = Sha256::new();
+    hasher.update(CARRIER_DIGEST_DOMAIN.as_bytes());
+    hasher.update(request.video_mode.as_deref().unwrap_or_default().as_bytes());
+    for (role, image) in [
+        ("character", carrier.character),
+        ("character-mask", carrier.character_mask),
+    ] {
+        hasher.update(role.as_bytes());
+        hasher.update(image.width.to_le_bytes());
+        hasher.update(image.height.to_le_bytes());
+        hasher.update(Sha256::digest(&image.pixels));
+    }
+    if carrier.driving_frames.len() != carrier.driving_masks.len() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{PROVIDER_ID}: driving frames and masks are not a one-to-one sequence"
+        )));
+    }
+    hasher.update((carrier.driving_frames.len() as u64).to_le_bytes());
+    for (index, (frame, mask)) in carrier
+        .driving_frames
+        .iter()
+        .zip(carrier.driving_masks)
+        .enumerate()
+    {
+        hasher.update((index as u64).to_le_bytes());
+        hasher.update(frame.width.to_le_bytes());
+        hasher.update(frame.height.to_le_bytes());
+        hasher.update(Sha256::digest(&frame.pixels));
+        hasher.update(mask.width.to_le_bytes());
+        hasher.update(mask.height.to_le_bytes());
+        hasher.update(Sha256::digest(&mask.pixels));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The one place the executing identity is derived, for both this provider and any admitting
+/// caller. The carrier digest comes from the request's own bytes, never from the revision being
+/// checked.
+pub fn request_evidence_revision(
+    evidence: &MemoryStructuralResidentEvidence,
     request: &GenerationRequest,
-) -> gen_core::Result<()> {
-    let source_digest = structural_source_digest(&memory.structural_evidence, context)?.to_owned();
+    selection: gen_core::MemorySelection,
+) -> gen_core::Result<String> {
+    validate_generation_request(request)?;
     let mode = request.video_mode.as_deref().unwrap_or_default();
     let carrier = request.scail2_animation_conditioning()?;
     let identity = gen_core::MemoryStructuralResidentRequestIdentity {
-        source_digest,
+        source_digest: carrier_source_digest(request)?,
         mode: mode.to_owned(),
         carrier_shape: carrier.identity_shape(mode)?,
         width: request.width,
@@ -470,14 +509,51 @@ fn validate_request_identity(
         steps: request.steps,
         guidance: request.guidance,
         scheduler_shift: request.scheduler_shift,
-        selection: context.selection,
+        selection,
     };
-    if memory.structural_evidence.evidence_revision(&identity)? != context.evidence_revision {
+    evidence.evidence_revision(&identity)
+}
+
+fn validate_context_identity(
+    memory: &PreparedMemory,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    memory.structural_evidence.validate()?;
+    validate_context_revision_shape(&memory.structural_evidence, context)
+}
+
+fn validate_request_identity(
+    memory: &PreparedMemory,
+    context: &MemoryRunContext,
+    request: &GenerationRequest,
+) -> gen_core::Result<()> {
+    validate_context_revision_shape(&memory.structural_evidence, context)?;
+    let actual =
+        request_evidence_revision(&memory.structural_evidence, request, context.selection)?;
+    if actual != context.evidence_revision {
         return Err(gen_core::Error::Unsupported(format!(
             "{PROVIDER_ID}: actual generation request crossed its admitted identity"
         )));
     }
     Ok(())
+}
+
+/// Refuse a memory-managed generate whose request is not the one the admitted scope opened.
+/// `active_context` was armed and cleared but never read.
+pub(crate) fn validate_active_request(
+    memory: &PreparedMemory,
+    request: &GenerationRequest,
+) -> gen_core::Result<()> {
+    if request.memory.is_none() {
+        return Ok(());
+    }
+    let active = memory.active_context.lock().expect("SCAIL active context");
+    let Some(context) = active.as_ref() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{PROVIDER_ID}: memory-managed generation requires an admitted memory scope"
+        )));
+    };
+    validate_request_identity(memory, context, request)
 }
 
 struct Scail2MemoryScope<'a> {
@@ -713,6 +789,15 @@ pub(crate) fn safety_check(
     }
 }
 
+/// A declared geometry backed by exactly `width * height * 3` RGB8 bytes.
+fn is_exact_rgb8(image: &gen_core::Image) -> bool {
+    u64::from(image.width)
+        .checked_mul(u64::from(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .is_some_and(|bytes| bytes != 0 && bytes == image.pixels.len())
+}
+
 pub(crate) fn validate_generation_request(request: &GenerationRequest) -> gen_core::Result<()> {
     let carrier = request.scail2_animation_conditioning()?;
     let frames = request.frames.unwrap_or_default();
@@ -725,10 +810,19 @@ pub(crate) fn validate_generation_request(request: &GenerationRequest) -> gen_co
         || !PUBLIC_FRAMES.contains(&frames)
         || request.fps != Some(16)
         || u32::try_from(carrier.driving_frames.len()).unwrap_or(u32::MAX) != frames
+        || carrier.driving_masks.len() != carrier.driving_frames.len()
         || carrier
             .driving_frames
             .iter()
+            .chain(carrier.driving_masks)
             .any(|frame| (frame.width, frame.height) != (request.width, request.height))
+        // A declared `WxH` with an empty or short buffer is not a carrier. SVD and Wan both verify
+        // `w*h*3 == pixels.len()`; without it a carrier of empty buffers validated.
+        || [carrier.character, carrier.character_mask]
+            .into_iter()
+            .chain(carrier.driving_frames)
+            .chain(carrier.driving_masks)
+            .any(|image| !is_exact_rgb8(image))
         || request.count != 1
         || request.use_pid
         || request.phases.is_some()
@@ -809,10 +903,14 @@ mod tests {
     use mlx_gen::{Conditioning, GenerationRequest, Image, ReplacementMode};
 
     fn image(width: u32, height: u32) -> Image {
+        tinted_image(width, height, 7)
+    }
+
+    fn tinted_image(width: u32, height: u32, tint: u8) -> Image {
         Image {
             width,
             height,
-            pixels: Vec::new(),
+            pixels: vec![tint; width as usize * height as usize * 3],
         }
     }
 
@@ -1054,30 +1152,7 @@ mod tests {
             parameters: gen_core::MemoryStrategyParameters::default(),
             tier: prepared.tier,
         };
-        let source_digest = format!("{:x}", Sha256::digest(b"character\0driving"));
         let mode = request.video_mode.as_deref().unwrap();
-        let carrier_shape = request
-            .scail2_animation_conditioning()
-            .unwrap()
-            .identity_shape(mode)
-            .unwrap();
-        let identity = gen_core::MemoryStructuralResidentRequestIdentity {
-            source_digest,
-            mode: mode.to_owned(),
-            carrier_shape,
-            width: request.width,
-            height: request.height,
-            frames: request.frames.unwrap(),
-            fps: request.fps.unwrap(),
-            reference_count: 1,
-            seed: request.seed,
-            sampler: request.sampler.clone(),
-            scheduler: request.scheduler.clone(),
-            steps: request.steps,
-            guidance: request.guidance,
-            scheduler_shift: request.scheduler_shift,
-            selection,
-        };
         MemoryRunContext {
             selection,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Resident,
@@ -1104,11 +1179,91 @@ mod tests {
             },
             predicted_peak_bytes: prepared.contract.total_resident_bytes(),
             cache_state,
-            evidence_revision: prepared
-                .structural_evidence
-                .evidence_revision(&identity)
-                .unwrap(),
+            evidence_revision: request_evidence_revision(
+                &prepared.structural_evidence,
+                request,
+                selection,
+            )
+            .unwrap(),
         }
+    }
+
+    /// The admitted identity must bind the carrier's *bytes*, not just its declared `WxH`, and the
+    /// executing generate must consult the admitted scope (`active_context` was armed and cleared
+    /// but never read).
+    #[test]
+    fn crossed_carrier_pixels_refuse_the_admitted_identity() {
+        let (_temp, spec) = fixture_spec("bf16", None);
+        let prepared = PreparedMemory::prepare(&spec).unwrap();
+        let admitted = request("animation", 832, 480, 45);
+        let context = admitted_context(&prepared, &admitted, gen_core::MemoryCacheState::Cold);
+
+        let mut crossed = admitted.clone();
+        let Conditioning::ControlClip { frames, .. } = &mut crossed.conditioning[2] else {
+            unreachable!()
+        };
+        frames[0] = tinted_image(832, 480, 9);
+        assert_eq!(
+            crossed
+                .scail2_animation_conditioning()
+                .unwrap()
+                .identity_shape("animation")
+                .unwrap(),
+            admitted
+                .scail2_animation_conditioning()
+                .unwrap()
+                .identity_shape("animation")
+                .unwrap(),
+            "the crossed carrier must be shape-identical, or this proves nothing"
+        );
+        assert_ne!(
+            carrier_source_digest(&crossed).unwrap(),
+            carrier_source_digest(&admitted).unwrap()
+        );
+
+        let mut scope = begin_request(&prepared, &context).unwrap().unwrap();
+        assert!(scope.configure_request(&mut crossed.clone()).is_err());
+        scope.configure_request(&mut admitted.clone()).unwrap();
+
+        let mut executing = crossed;
+        executing.memory = Some(gen_core::GenerationMemory::default());
+        assert!(validate_active_request(&prepared, &executing).is_err());
+        let mut exact = admitted;
+        exact.memory = Some(gen_core::GenerationMemory::default());
+        validate_active_request(&prepared, &exact).unwrap();
+        scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        assert!(validate_active_request(&prepared, &exact).is_err());
+        let plain = request("animation", 832, 480, 45);
+        assert!(plain.memory.is_none());
+        validate_active_request(&prepared, &plain).unwrap();
+    }
+
+    /// A declared `WxH` with an empty or short buffer is not a carrier.
+    #[test]
+    fn carrier_images_must_carry_exact_rgb8_bytes() {
+        validate_generation_request(&request("animation", 832, 480, 45)).unwrap();
+        for index in [0_usize, 1] {
+            let mut empty = request("animation", 832, 480, 45);
+            match &mut empty.conditioning[index] {
+                Conditioning::Reference { image, .. } | Conditioning::Mask { image } => {
+                    image.pixels.clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(validate_generation_request(&empty).is_err(), "{index}");
+        }
+        let mut short_frame = request("animation", 832, 480, 45);
+        let Conditioning::ControlClip { frames, .. } = &mut short_frame.conditioning[2] else {
+            unreachable!()
+        };
+        frames[3].pixels.truncate(832 * 480 * 3 - 1);
+        assert!(validate_generation_request(&short_frame).is_err());
+        let mut empty_mask = request("animation", 832, 480, 45);
+        let Conditioning::ControlClip { mask, .. } = &mut empty_mask.conditioning[2] else {
+            unreachable!()
+        };
+        mask[2].pixels.clear();
+        assert!(validate_generation_request(&empty_mask).is_err());
     }
 
     #[test]

@@ -14,13 +14,12 @@
 //! (env: `SCAIL2_SNAPSHOT_DIR`, `SCAIL2_SMOKE_SIZE`=256, `SCAIL2_SMOKE_FRAMES`=13,
 //! `SCAIL2_SMOKE_STEPS`=8).
 
-use std::path::{Path, PathBuf};
-
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
     WeightsSource,
 };
-use mlx_gen_scail2::{memory_strategy::CANONICAL_REVISION, pipeline::MODEL_ID};
+use mlx_gen_scail2::pipeline::MODEL_ID;
+use std::path::PathBuf;
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("SCAIL2_SNAPSHOT_DIR")
@@ -76,49 +75,25 @@ fn color_mask(w: usize, h: usize, split: usize) -> Image {
     }
 }
 
-fn write_fixture_tensor(path: &Path) {
-    use safetensors::{serialize, tensor::TensorView, Dtype};
-
-    let data = [7_u8];
-    let view = TensorView::new(Dtype::U8, vec![data.len()], &data).unwrap();
-    std::fs::write(path, serialize([("weight", view)], None).unwrap()).unwrap();
-}
-
-fn canonical_fixture_dir(temp: &tempfile::TempDir) -> PathBuf {
-    let root = temp
-        .path()
-        .join("models--SceneWorks--scail2-mlx")
-        .join("snapshots")
-        .join(CANONICAL_REVISION)
-        .join("bf16");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("config.json"), "{}").unwrap();
-    std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
-    for name in [
-        "dit.safetensors",
-        "t5_encoder.safetensors",
-        "clip.safetensors",
-        "vae.safetensors",
-    ] {
-        write_fixture_tensor(&root.join(name));
-    }
-    root
-}
-
 #[test]
 fn missing_reference_errors() {
-    // The provider seals canonical artifacts before constructing its generator. Use a minimal,
-    // exact tier fixture so this test reaches the pre-load conditioning guard rather than weakening
-    // the immutable receipt just to exercise a missing-reference refusal.
+    // load() only needs an existing dir (config.json is optional → defaults) and no sealed memory
+    // receipt (sc-20799). The conditioning extraction runs before any weight load, so an empty
+    // request fails fast. Use a per-process empty dir rather than the shared `$TMPDIR` itself, so
+    // nothing another concurrent `cargo test` process leaves lying around is ever inside this
+    // provider's weights root.
     let dir_tmp = tempfile::tempdir().unwrap();
-    let mut spec = LoadSpec::new(WeightsSource::Dir(canonical_fixture_dir(&dir_tmp)));
-    spec.resolved_route = Some(MODEL_ID.to_owned());
+    let spec = LoadSpec::new(WeightsSource::Dir(dir_tmp.path().to_path_buf()));
     let gen = mlx_gen_scail2::provider_registry()
         .unwrap()
         .load(MODEL_ID, &spec)
         .expect("load scail2 provider");
+    // An explicit in-envelope geometry, so the missing carrier is what refuses rather than the
+    // default 1024×1024 tripping the shared area gate first.
     let req = GenerationRequest {
         prompt: "a person dancing".into(),
+        width: 832,
+        height: 480,
         ..Default::default()
     };
     let err = gen
