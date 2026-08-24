@@ -7,7 +7,7 @@
 //! MINIMAX_H3_SNAPSHOT=<upstream snapshot root> \
 //! MINIMAX_H3_DIT=<tier>/transformer \
 //! MINIMAX_H3_TIER=q4 \
-//!   cargo test -p mlx-gen-minimax-h3 --test quant_tiers_real -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration quant_tiers_real:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!

@@ -17,7 +17,7 @@
 //! distinctions that are shape-identical and therefore silent — the class this crate's `layout`
 //! module exists for.
 
-mod common;
+use crate::common;
 
 use mlx_rs::{Array, Dtype};
 

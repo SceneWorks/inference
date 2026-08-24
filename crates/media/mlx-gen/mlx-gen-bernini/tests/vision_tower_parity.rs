@@ -8,7 +8,7 @@
 //! f32 floor accumulated over the patch-embed matmul + 4 attention blocks (RoPE + f32 softmax) + the
 //! merger.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test vision_tower_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration vision_tower_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::vision::{VisionConfig, VisionTower};

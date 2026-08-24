@@ -3,7 +3,7 @@
 //! snapshot). Run:
 //!
 //!   MLX_GEN_FLUX2_KV_SNAPSHOT=... \
-//!   cargo test -p mlx-gen-flux2 --test kv_cache_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration kv_cache_real_weights:: -- --ignored --nocapture
 //!
 //! **A/B isolation.** Both ids load the *same* `-kv` checkpoint, so the only difference is the
 //! cache: `flux2_klein_9b_kv_edit` runs the cache (step-0 extract, steps 1+ cached);

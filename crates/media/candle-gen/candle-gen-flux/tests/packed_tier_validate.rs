@@ -12,7 +12,7 @@
 //! ```text
 //! set FLUX_SCHNELL_PACKED_Q4=D:\.cache\huggingface\hub\models--SceneWorks--flux1-schnell-mlx\snapshots\<hash>\q4
 //! set FLUX_SCHNELL_PACKED_Q8=...\q8    (optional)
-//! cargo test -p candle-gen-flux --features cuda --release --test packed_tier_validate -- --ignored --nocapture
+//! cargo test -p candle-gen-flux --features cuda --release --test integration packed_tier_validate:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

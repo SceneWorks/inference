@@ -7,16 +7,16 @@
 //! position to produce the logits for the token after it. This module ports the reference's pieces
 //! (`modeling_neo_chat.py`):
 //!
-//! * [`Qwen3Backbone::decode_logits`] — one cached single-token forward → next-token logits.
-//! * [`Qwen3Backbone::generate`] — greedy/sampled rollout to an EOS or token budget (the runtime
-//!   under `chat` / `answer_question`).
+//! * budgeted single-token cached forwards that produce next-token logits; and
+//! * greedy/sampled rollout to an EOS or token budget (the runtime under `chat` /
+//!   `answer_question`).
 //!
 //! Positions: text tokens advance the temporal axis by one per token (`h = w = 0`), matching the
 //! reference. The understanding path ([`Path::Und`]) drives text decode. The interleave rollout
-//! drives its own loop directly over [`decode_logits`](Qwen3Backbone::decode_logits) (it alternates
-//! text decode and gen-path image generation), so only these two primitives live here.
+//! drives its own loop directly over the budgeted decode primitive (it alternates text decode and
+//! gen-path image generation), so only these two primitives live here.
 
-use candle_gen::candle_core::Result as CResult;
+use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result};
 
@@ -60,27 +60,32 @@ impl Sampler {
 }
 
 impl Qwen3Backbone {
-    /// One cached single-token forward on the understanding path: embed `token`, run it at temporal
-    /// position `pos_t` (`h = w = 0`), persist its K/V, and return the `[vocab]` next-token logits.
-    pub fn decode_logits(&self, token: i32, pos_t: i32, cache: &mut KvCache) -> CResult<Vec<f32>> {
-        let embeds = self.embed(&[token])?; // [1, 1, hidden]
-        let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
-        let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
+    pub(crate) fn decode_logits_planned(
+        &self,
+        token: i32,
+        pos_t: i32,
+        cache: &mut KvCache,
+        attention: AttentionPlan<'_>,
+    ) -> Result<Vec<f32>> {
+        let embeds = self.embed(&[token])?;
+        let hidden = self.forward_cached_planned(
+            &embeds,
+            &[pos_t],
+            &[0],
+            &[0],
+            Path::Und,
+            cache,
+            true,
+            attention,
+            None,
+        )?;
+        let logits = self.lm_head(&hidden)?;
         let vocab = logits.dim(2)?;
-        logits.reshape((vocab,))?.to_vec1::<f32>()
+        Ok(logits.reshape((vocab,))?.to_vec1::<f32>()?)
     }
 
-    /// Greedy/sampled AR text rollout. `first_logits` are the prefix's last-position logits (the
-    /// distribution over the first generated token); `t_idx` is the prefix's max temporal index.
-    /// Decoding stops at any id in `eos` (not emitted) or after `max_new_tokens`. Returns the
-    /// generated token ids.
-    ///
-    /// `cancel` is the cooperative cancellation handle (sc-9123, the candle sibling of mlx-gen's
-    /// F-037/sc-9093 change): checked before each decoded token so a worker-consumed multi-minute
-    /// VQA / understanding rollout is cancellable per token, not only at its natural end. Returns
-    /// the typed [`CandleError::Canceled`] on trip so the worker can key off it.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate(
+    pub(crate) fn generate_planned(
         &self,
         first_logits: &[f32],
         cache: &mut KvCache,
@@ -89,6 +94,7 @@ impl Qwen3Backbone {
         max_new_tokens: usize,
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
     ) -> Result<Vec<i32>> {
         let mut rng = SplitMix64::new(sampler.seed());
         let mut logits = first_logits.to_vec();
@@ -104,7 +110,7 @@ impl Qwen3Backbone {
             }
             out.push(next);
             t += 1;
-            logits = self.decode_logits(next, t, cache)?;
+            logits = self.decode_logits_planned(next, t, cache, attention)?;
         }
         Ok(out)
     }

@@ -22,11 +22,11 @@
 //!
 //! ```sh
 //! MLX_GEN_ZIMAGE_SNAPSHOT=<tier dir, e.g. …/bf16> \
-//!   cargo test -p mlx-gen-z-image --release --test component_scope_real_weights \
+//!   cargo test -p mlx-gen-z-image --release --test integration component_scope_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
-mod common;
+use crate::common;
 
 use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
 use mlx_gen::{

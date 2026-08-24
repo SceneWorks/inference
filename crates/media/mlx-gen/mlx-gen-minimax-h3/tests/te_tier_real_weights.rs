@@ -6,12 +6,12 @@
 //! ```sh
 //! # one stage, one tier, one process — the peak is only meaningful per process
 //! MINIMAX_H3_TE=<text_encoder dir> \
-//!   cargo test -p mlx-gen-minimax-h3 --test te_tier_real_weights -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration te_tier_real_weights:: -- --ignored --nocapture \
 //!   --test-threads=1 --exact conditioning_stage_peak_is_the_staged_tier
 //!
 //! # the packed tier against the dense one it was built from, in one process
 //! MINIMAX_H3_TE_DENSE=<dense text_encoder> MINIMAX_H3_TE_PACKED=<tier text_encoder> \
-//!   cargo test -p mlx-gen-minimax-h3 --test te_tier_real_weights -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration te_tier_real_weights:: -- --ignored --nocapture \
 //!   --test-threads=1 --exact the_packed_context_tracks_the_dense_one
 //! ```
 //!

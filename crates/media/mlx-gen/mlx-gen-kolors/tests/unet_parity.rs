@@ -9,9 +9,9 @@
 //! cross-backend U-Net floor — a wiring bug (wrong projection, bad add_embedding width) diverges
 //! orders of magnitude past it.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test unet_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration unet_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_kolors::unet::load_unet_kolors_dtype;

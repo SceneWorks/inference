@@ -5,7 +5,7 @@
 //! ```text
 //! set SEEDVR2_CKPT=D:\sceneworks-seedvr2-validate\ckpt
 //! set SEEDVR2_DTYPE=bf16
-//! cargo test -p candle-gen-seedvr2 --features cuda --release --test cuda_quant_smoke -- --ignored --nocapture
+//! cargo test -p candle-gen-seedvr2 --features cuda --release --test integration cuda_quant_smoke:: -- --ignored --nocapture
 //! ```
 //! `SEEDVR2_CKPT` is a dir holding `ema_vae_fp16.safetensors` + the 3B/7B DiT files. `SEEDVR2_DTYPE`
 //! defaults to bf16 here (the worker's production dtype — the quant path's f32 QMatMul must round-trip

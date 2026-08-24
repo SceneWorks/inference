@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs `h94/IP-Adapter` (ViT-H `models/image_encoder` + `sdxl_models/
 //! ip-adapter-plus_sdxl_vit-h.safetensors`) and the golden from `tools/dump_ip_adapter_golden.py`.
 //! Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test ip_adapter_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration ip_adapter_real_weights:: -- --ignored --nocapture
 //!
 //! Validates the two net-new image-path modules in f32, isolated from CLIP preprocessing (the
 //! golden feeds a deterministic `pixel_values`):
@@ -11,7 +11,7 @@
 //!   2. Resampler image tokens `[1, 16, 2048]` (from both the golden penultimate — isolating the
 //!      Resampler — and the Rust encoder's own penultimate — the full image→tokens chain).
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

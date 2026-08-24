@@ -13,12 +13,12 @@
 //!
 //! Run (base transformer for the routing map):
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test turbo turbo_host_map -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration turbo::turbo_host_map -- --ignored --nocapture
 //! Run (turbo render — the snapshot dir must contain `turbo_lora.safetensors`):
 //!   IDEOGRAM4_TURBO_MLX=~/.cache/ideogram4-mlx-turbo \
-//!     cargo test -p mlx-gen-ideogram --test turbo turbo_generates -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration turbo::turbo_generates -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

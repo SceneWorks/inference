@@ -2,7 +2,7 @@
 //! — needs the real `black-forest-labs/FLUX.2-dev` snapshot (~105 GB) **and** the
 //! `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union` checkpoint (~8 GB), both in the HF cache:
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test control_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration control_real_weights:: -- --ignored --nocapture
 //!
 //! Proves the dev control vertical end to end: assemble a pre-quantized Q4 dev snapshot (shared with
 //! `dev_e2e_real_weights`), load it through the registry as `flux2_dev_control` with the control
@@ -22,8 +22,7 @@ use mlx_gen::{
 };
 use mlx_gen_flux2::{quantize_flux2_dit, quantize_flux2_text_encoder_dir};
 
-#[path = "../../tests/support/atomic_cache.rs"]
-mod atomic_cache;
+use crate::atomic_cache;
 
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;

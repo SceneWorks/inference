@@ -5,7 +5,7 @@
 //! needs the model's `tokenizer.json` + the goldens, so it is gated on env vars and skips cleanly:
 //!   LENS_TOKENIZER_JSON — the Lens `tokenizer/tokenizer.json`
 //!   LENS_TOK_GOLDENS    — tokenizer_goldens.safetensors
-//! Run: cargo test -p candle-gen-lens --test tokenizer_parity -- --nocapture
+//! Run: cargo test -p candle-gen-lens --test integration tokenizer_parity:: -- --nocapture
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen_lens::text::{LensTokenizer, TXT_OFFSET};

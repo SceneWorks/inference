@@ -6,7 +6,7 @@
 //! Runs in CI on the tiny seeded S5 weights (no real checkpoint). It also exercises the cached path
 //! (`prepare_cross_kv` / `prepare_rope` / `forward_cached`) against the legacy recompute `forward`.
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;

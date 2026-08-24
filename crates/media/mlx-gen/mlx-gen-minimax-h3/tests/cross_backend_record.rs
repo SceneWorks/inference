@@ -16,7 +16,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_CROSS_BACKEND_OUT=/tmp/mlx_cross_backend.safetensors \
-//!   cargo test -p mlx-gen-minimax-h3 --test cross_backend_record -- --ignored --nocapture
+//!   cargo test -p mlx-gen-minimax-h3 --test integration cross_backend_record:: -- --ignored --nocapture
 //! cp /tmp/mlx_cross_backend.safetensors \
 //!   crates/media/candle-gen/candle-gen-minimax-h3/tests/fixtures/
 //! ```
@@ -26,7 +26,7 @@
 //! stale MLX record in place, which would turn the cross-backend gate into a comparison against
 //! history.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

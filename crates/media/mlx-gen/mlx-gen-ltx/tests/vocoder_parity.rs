@@ -5,7 +5,7 @@
 //! holds the reference **f32** 48 kHz waveform for a synthetic mel; the Rust `LtxVocoder` loads the
 //! SAME weights (config-selected = VocoderWithBWE) and must reproduce it.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test vocoder_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration vocoder_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

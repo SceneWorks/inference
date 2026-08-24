@@ -85,7 +85,7 @@ fn gen_frame_count(model_dir: &std::path::Path, trim: Option<u32>) -> usize {
 ///
 /// ```text
 /// WAN_A14B_MODEL_DIR=~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16 \
-///   cargo test -p mlx-gen-wan --test trim -- --ignored --nocapture
+///   cargo test -p mlx-gen-wan --test integration trim:: -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs the converted Wan2.2-T2V-A14B checkpoint (WAN_A14B_MODEL_DIR)"]

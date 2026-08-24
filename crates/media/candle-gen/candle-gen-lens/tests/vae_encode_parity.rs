@@ -13,7 +13,7 @@
 //!   LENS_VAE_ENCODE_GOLDENS — lens_vae_encode_golden.safetensors
 //!                             (default: .scratch/lens-vae-encode-goldens/…)
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
-//!   cargo test -p candle-gen-lens --features cuda --test vae_encode_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration vae_encode_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;

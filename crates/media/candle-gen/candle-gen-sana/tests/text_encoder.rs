@@ -20,9 +20,9 @@
 //!    correctness) plus a cosine gate on the caption embedding vs the SANA reference.
 //!
 //! ```sh
-//! cargo test -p candle-gen-sana --test text_encoder            # default (CHI + selection contract)
+//! cargo test -p candle-gen-sana --test integration text_encoder::            # default (CHI + selection contract)
 //! PID_GEMMA_DIR=/path/to/gemma-2-2b-it \
-//!   cargo test -p candle-gen-sana --release --test text_encoder -- --ignored --nocapture
+//!   cargo test -p candle-gen-sana --release --test integration text_encoder:: -- --ignored --nocapture
 //! ```
 
 use candle_gen_sana::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};

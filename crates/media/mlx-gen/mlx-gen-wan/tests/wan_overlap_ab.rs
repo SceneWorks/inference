@@ -14,12 +14,12 @@
 //! WAN_OVERLAP_AB_FAMILY=z16 WAN_OVERLAP_AB_VAE=/path/to/z16/vae.safetensors \
 //! WAN_OVERLAP_AB_W=640 WAN_OVERLAP_AB_H=384 WAN_OVERLAP_AB_FRAMES=81 \
 //! WAN_OVERLAP_AB_TILE_FRAMES=32 \
-//!   cargo test -p mlx-gen-wan --release --test wan_overlap_ab -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --release --test integration wan_overlap_ab:: -- --ignored --nocapture
 //!
 //! WAN_OVERLAP_AB_FAMILY=z48 WAN_OVERLAP_AB_VAE=/path/to/z48/vae.safetensors \
 //! WAN_OVERLAP_AB_W=832 WAN_OVERLAP_AB_H=480 WAN_OVERLAP_AB_FRAMES=121 \
 //! WAN_OVERLAP_AB_TILE_FRAMES=48 \
-//!   cargo test -p mlx-gen-wan --release --test wan_overlap_ab -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --release --test integration wan_overlap_ab:: -- --ignored --nocapture
 //! ```
 //!
 //! Each row warms both A/B paths once, then reports the median and range of three alternating

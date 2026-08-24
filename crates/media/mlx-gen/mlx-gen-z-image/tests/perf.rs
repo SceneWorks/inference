@@ -14,7 +14,7 @@
 //!
 //! Run it:
 //! ```text
-//! cargo test --release -p mlx-gen-z-image --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-z-image --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `ZIMAGE_PERF_SIZE` (square px, default 1024) / `ZIMAGE_PERF_CAP` (cap len, 64).
 
@@ -25,7 +25,7 @@ use mlx_gen::WeightsSource;
 use mlx_gen_z_image::{load_control_transformer, load_transformer, set_compile_glue};
 use mlx_rs::{random, Array, Dtype};
 
-mod common;
+use crate::common;
 use common::snapshot_opt as snapshot;
 
 /// The Fun-Controlnet-Union checkpoint: env `CONTROL_WEIGHTS`, else the first `.safetensors` in the

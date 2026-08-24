@@ -26,10 +26,10 @@
 //!
 //! ```text
 //! MINIMAX_H3_TURBO_LORA=<dir of lightx2v/Minimax-h3-Turbo> \
-//!   cargo test -p mlx-gen-minimax-h3 --test turbo_lora -- --ignored --nocapture
+//!   cargo test -p mlx-gen-minimax-h3 --test integration turbo_lora:: -- --ignored --nocapture
 //! ```
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1896,7 +1896,7 @@ fn clip_stats(frames: &[mlx_gen::gen_core::Image]) -> (f64, f64) {
 /// MINIMAX_H3_RENDER_STEPS=4 MINIMAX_H3_RENDER_SHIFT=6 \
 /// MINIMAX_H3_RENDER_WIDTH=1344 MINIMAX_H3_RENDER_HEIGHT=768 \
 /// MINIMAX_H3_RENDER_OUT=<dir> MINIMAX_H3_RENDER_LABEL=turbo4-768p \
-///   cargo test -p mlx-gen-minimax-h3 --test turbo_lora -- --ignored --nocapture \
+///   cargo test -p mlx-gen-minimax-h3 --test integration turbo_lora:: -- --ignored --nocapture \
 ///   --test-threads=1 turbo_render_records_a_measured_clip
 /// ```
 ///

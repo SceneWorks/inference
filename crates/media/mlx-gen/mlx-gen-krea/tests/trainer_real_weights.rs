@@ -2,7 +2,7 @@
 //! (`#[ignore]`): drives the PUBLIC [`Trainer`] surface (`load_trainer` → `Trainer::train`) on the real
 //! `krea/Krea-2-Raw` snapshot, a short run that must produce a **loadable PEFT adapter** — the story AC.
 //!
-//!   cargo test -p mlx-gen-krea --release --test trainer_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration trainer_real_weights:: -- --ignored --nocapture
 //!
 //! Set `KREA_RAW_DIR` to override the snapshot location (else the newest HF-cache `krea/Krea-2-Raw`).
 

@@ -21,7 +21,7 @@
 //! SC16096_REPEATS=3                                     SC-16096 samples (minimum three)
 //! SC16154_Q4=<...>/q4/transformer/model.safetensors     SC-16154 post-sidecar window timing
 //! SC16154_REPEATS=12                                    SC-16154 samples per window (must be 12)
-//! cargo test -p candle-gen --features cuda --release --test rung4_block_streaming_spike \
+//! cargo test -p candle-gen --features cuda --release --test integration rung4_block_streaming_spike:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -71,7 +71,7 @@ use candle_gen::quant::{
     MLX_GROUP_SIZE,
 };
 
-mod rung4_support;
+use crate::rung4_support;
 use rung4_support::{
     compute, compute_into, disclose_host as disclose, env_path_opt as env_opt, env_path_req,
     env_usize, linear_fit, materialize, median, pool_open, quiesce_and_reset, windows, Block, Tier,

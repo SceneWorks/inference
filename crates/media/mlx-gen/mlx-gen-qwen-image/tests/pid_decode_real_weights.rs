@@ -11,7 +11,7 @@
 //! memory-heavy; defaults to Q8 + 512² (→ 2048² PiD) + the few-step Lightning path to bound cost.
 //!
 //! ```sh
-//! cargo test -p mlx-gen-qwen-image --release --test pid_decode_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-qwen-image --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

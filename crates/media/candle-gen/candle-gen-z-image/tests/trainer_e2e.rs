@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set Z_IMAGE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>
-//! cargo test -p candle-gen-z-image --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-z-image --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 //!
 //! What it proves:

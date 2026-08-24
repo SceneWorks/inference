@@ -25,7 +25,7 @@
 //! ```sh
 //! CHROMA_PREVIEW_SNAPSHOT=E:\huggingface\hub\models--SceneWorks--chroma1-hd-mlx\snapshots\<rev>\q4 \
 //! CHROMA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16956 \
-//!   cargo test -p candle-gen-chroma --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-chroma --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

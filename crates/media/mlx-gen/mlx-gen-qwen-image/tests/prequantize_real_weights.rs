@@ -10,7 +10,7 @@
 //!
 //! `#[ignore]`d — needs a real `Qwen/Qwen-Image` snapshot (the ~40 GB bf16 transformer + ~15 GB
 //! Qwen2.5-VL TE + VAE). Run with:
-//!   cargo test -p mlx-gen-qwen-image --release --test prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Env knobs:
 //!   SC8670_SRC    source snapshot dir (default: the first HF-cache Qwen-Image snapshot)
@@ -33,8 +33,8 @@ fn qwen_image_snapshot() -> Option<PathBuf> {
 /// (so it is variant-agnostic and fast). The hosted bf16 tier is the dense source mirrored directly
 /// (no conversion); this harness produces the Q4/Q8 tiers. Run per tier:
 ///   SC8670_SRC=<snapshot> SC8670_OUT=<staging/q4> SC8670_BITS=4 \
-///     cargo test -p mlx-gen-qwen-image --release --test prequantize_real_weights \
-///     -- --ignored build_tier_only --nocapture
+///     cargo test -p mlx-gen-qwen-image --release --test integration \
+///     -- --ignored prequantize_real_weights::build_tier_only --nocapture
 #[test]
 #[ignore = "build-only tier producer for hosting; set SC8670_SRC/OUT/BITS"]
 fn build_tier_only() {

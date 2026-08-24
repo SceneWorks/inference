@@ -10,7 +10,7 @@
 //!
 //! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT` or the HF
 //! cache):
-//!   cargo test -p mlx-gen-qwen-image --release --test unified_sampler_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration unified_sampler_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

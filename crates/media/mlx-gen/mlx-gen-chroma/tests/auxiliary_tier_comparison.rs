@@ -24,8 +24,8 @@
 //!
 //! Run (≈15 GB baseline tier, Apple Silicon + Metal):
 //!   SC16462_BASELINE=<shipped q4 tier dir> SC16462_OUT=<scratch dir> \
-//!     cargo test -p mlx-gen-chroma --release --test auxiliary_tier_comparison \
-//!       -- --ignored --nocapture compare_auxiliary_widths
+//!     cargo test -p mlx-gen-chroma --release --test integration \
+//!       -- --ignored --nocapture auxiliary_tier_comparison::compare_auxiliary_widths
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use std::path::{Path, PathBuf};

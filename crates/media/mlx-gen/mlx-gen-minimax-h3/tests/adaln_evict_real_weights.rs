@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MINIMAX_H3_SNAPSHOT=/path/to/MiniMaxAI--MiniMax-H3/snapshot \
-//!   cargo test --release -p mlx-gen-minimax-h3 --test adaln_evict_real_weights \
+//!   cargo test --release -p mlx-gen-minimax-h3 --test integration adaln_evict_real_weights:: \
 //!   -- --ignored --nocapture
 //! ```
 //!
@@ -44,7 +44,7 @@
 //! for** — copy it onto the story. Measured at bf16 on the real `transformer/`: `gap` is 0.995x
 //! the 26.02 GB evicted and the precompute's own transient 1.331x the table it retains.
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

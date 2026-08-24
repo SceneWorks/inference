@@ -8,7 +8,7 @@
 //! quantized backbone — drops between iterations) so only one FLUX is resident at a time.
 //!
 //! Run:
-//!   cargo test -p mlx-gen-pulid --release --test pulid_flux_quant -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pulid --release --test integration pulid_flux_quant:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 use std::time::Instant;

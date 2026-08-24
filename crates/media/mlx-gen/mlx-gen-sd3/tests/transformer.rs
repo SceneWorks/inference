@@ -276,7 +276,7 @@ fn missing_tensor_surfaces_as_error_not_panic() {
 // ----------------------------------------------------------------------------------------------
 // Real-weight forward (shape / finite / stats). #[ignore]: needs licensed multi-GB weights + Metal.
 //   SD3_TRANSFORMER=/path/to/stable-diffusion-3.5-large/transformer \
-//     cargo test -p mlx-gen-sd3 --release --test transformer real_weight_forward -- --ignored --nocapture
+//     cargo test -p mlx-gen-sd3 --release --test integration transformer::real_weight_forward -- --ignored --nocapture
 // ----------------------------------------------------------------------------------------------
 
 #[test]
@@ -344,7 +344,7 @@ fn real_weight_forward_shape_finite_stats() {
 // torch/diffusers env (NOT present in this workspace). The dump is a single safetensors with
 // `latent [B,16,H,W]`, `context [B,S,4096]`, `pooled [B,2048]`, `timestep [B]`, `out [B,16,H,W]`.
 //   SD3_TRANSFORMER=/path/to/transformer SD3_REF_DUMP=/path/to/ref.safetensors \
-//     cargo test -p mlx-gen-sd3 --release --test transformer numeric_parity -- --ignored --nocapture
+//     cargo test -p mlx-gen-sd3 --release --test integration transformer::numeric_parity -- --ignored --nocapture
 // ----------------------------------------------------------------------------------------------
 
 #[test]

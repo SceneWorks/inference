@@ -52,7 +52,7 @@
 //! `flip_sin_to_cos` error in this family moves output by 9.999e-1 at *unchanged* norm. Only the
 //! relative max-abs-diff moves for every defect class this epic has actually shipped.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

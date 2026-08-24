@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! SC16091_Q4=<...>/q4/transformer/model.safetensors   (only the rung-4 arm needs it)
-//! cargo test -p candle-gen --features cuda --release --test capped_pool_vram_ceiling \
+//! cargo test -p candle-gen --features cuda --release --test integration capped_pool_vram_ceiling:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -41,7 +41,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 
-mod rung4_support;
+use crate::rung4_support;
 use rung4_support::{CappedPool, GIB, MIB};
 
 // ---------------------------------------------------------------------------------------------------

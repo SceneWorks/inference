@@ -6,7 +6,7 @@
 //! `mid_block_add_attention=False` — see the dump-script / `AudioVaeConfig` note on the reference's
 //! random-attn bug). The Rust `AudioDecoder` loads the SAME weights and must reproduce the mel.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test audio_vae_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration audio_vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

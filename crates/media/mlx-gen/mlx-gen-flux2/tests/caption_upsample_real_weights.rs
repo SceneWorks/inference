@@ -10,7 +10,7 @@
 //! packed (~13 GB) instead of the ~45 GB bf16 transient; override with `MLX_GEN_FLUX2_DEV_PREQUANT`
 //! or fall back to the stock HF snapshot (dense bf16) via `MLX_GEN_FLUX2_DEV_SNAPSHOT`.
 //!
-//!   cargo test -p mlx-gen-flux2 --test caption_upsample_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration caption_upsample_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

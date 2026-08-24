@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the converter output (`tools/convert_instantid.py` →
 //! `tools/golden/instantid/ip-adapter.safetensors`) and the InstantID `ControlNetModel` snapshot.
 //! Run:
-//!   cargo test -p mlx-gen-sdxl --release --test instantid_convert_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration instantid_convert_smoke:: -- --ignored --nocapture
 //!
 //! Proves the converted tensors load cleanly with the right shapes into all three consumers
 //! (the acceptance for sc-3112), without a deep golden:

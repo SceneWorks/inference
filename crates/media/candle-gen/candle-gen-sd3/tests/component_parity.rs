@@ -54,7 +54,7 @@
 //!     --model stabilityai/stable-diffusion-3.5-medium --tag sd35_medium \
 //!     --out candle-gen-sd3/tests/parity/reference
 //! # then, from the workspace root, one variant at a time:
-//! cargo test -p candle-gen-sd3 --test component_parity sd35_medium_component_parity -- --ignored --nocapture
+//! cargo test -p candle-gen-sd3 --test integration component_parity::sd35_medium_component_parity -- --ignored --nocapture
 //! ```
 //!
 //! The encoder / conditioning checks run in **f32 on CPU** to match the reference precision exactly.
@@ -467,8 +467,8 @@ fn run_parity(variant: &Variant) {
 /// MMDiT). Requires the `sc9581-ab` feature (the `encode_with_pad_g` hook). Run:
 /// ```text
 /// export SD35_LARGE_SNAPSHOT=/snapshots/stable-diffusion-3.5-large
-/// cargo test -p candle-gen-sd3 --features sc9581-ab,cuda --test component_parity \
-///     sd35_bigg_pad_token_ab -- --ignored --nocapture
+/// cargo test -p candle-gen-sd3 --features sc9581-ab,cuda --test integration \
+///     component_parity::sd35_bigg_pad_token_ab -- --ignored --nocapture
 /// ```
 #[test]
 #[cfg(feature = "sc9581-ab")]
@@ -613,7 +613,7 @@ fn read_timestep(tag: &str) -> f32 {
 
 // -- Per-variant real-weight parity tests. Each is `#[ignore]`d — opt in with `--ignored`. Dispatch
 //    into the shared `run_parity`; select one variant by name, e.g.
-//    `cargo test -p candle-gen-sd3 --test component_parity sd35_medium_component_parity -- --ignored`.
+//    `cargo test -p candle-gen-sd3 --test integration component_parity::sd35_medium_component_parity -- --ignored`.
 
 /// SD3.5-large parity (the original sc-9076 coverage).
 #[test]

@@ -18,7 +18,7 @@
 //! ```text
 //! KREA_REALTIME_SNAPSHOT_DIR=~/.cache/krea-realtime-mlx-snapshot/q4 \
 //! KREA_SMOKE_OUT=/tmp/krea_smoke \
-//!   cargo test -p mlx-gen-krea-realtime --test generate_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea-realtime --test integration generate_smoke:: -- --ignored --nocapture
 //! ```
 //!
 //! ⚠️ **`--ignored` is a blanket, and one of the tests it selects is not a smoke.**
@@ -441,11 +441,32 @@ fn decode_tiling_never_starves_the_temporal_receptive_field() {
 /// patch×stride alignment — fails here in CI instead of after a 20 GB load.
 #[test]
 fn smoke_request_is_within_the_advertised_surface() {
-    // A per-process empty dir, not the shared `$TMPDIR` itself: the provider only needs the root to
-    // exist, and this keeps whatever another concurrent `cargo test` process left in `$TMPDIR` out
-    // of this weights root.
+    fn tiny_safetensors(path: &Path, fill: u8) {
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "weight": {"dtype": "U8", "shape": [8], "data_offsets": [0, 8]}
+        }))
+        .unwrap();
+        let padding = (8 - header.len() % 8) % 8;
+        header.extend(std::iter::repeat_n(b' ', padding));
+        let mut bytes = Vec::with_capacity(8 + header.len() + 8);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend(std::iter::repeat_n(fill, 8));
+        std::fs::write(path, bytes).unwrap();
+    }
+    // The provider now seals the complete physical receipt before construction, so this
+    // weights-free validation uses a structurally valid tiny q4 inventory rather than an empty dir.
     let dir_tmp = tempfile::tempdir().unwrap();
     let dir = dir_tmp.path().to_path_buf();
+    std::fs::write(
+        dir.join("config.json"),
+        br#"{"quantization":{"bits":4,"group_size":64}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+    tiny_safetensors(&dir.join("dit.safetensors"), 1);
+    tiny_safetensors(&dir.join("t5_encoder.safetensors"), 2);
+    tiny_safetensors(&dir.join("vae.safetensors"), 3);
     let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_krea_realtime::provider_registry()
         .unwrap()
@@ -3236,8 +3257,8 @@ fn long_clip_coherence_under_the_bounded_window() {
 ///
 /// ```text
 /// cat run-A.tsv run-B.tsv ... > all-cells.tsv
-/// KREA_S18_CELLS=$PWD/all-cells.tsv cargo test -p mlx-gen-krea-realtime --test generate_smoke \
-///   s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture
+/// KREA_S18_CELLS=$PWD/all-cells.tsv cargo test -p mlx-gen-krea-realtime --test integration \
+///   generate_smoke::s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture
 /// ```
 ///
 /// `-p` is not optional: two workspace crates carry a `generate_smoke` test target, and without it
@@ -5331,8 +5352,8 @@ fn the_kv_tier_comparison_can_fail_the_quantized_arm() {
 ///
 /// ```text
 /// KREA_S18_CELLS=$PWD/cells-bf16.tsv KREA_S18_Q8_CELLS=$PWD/cells-q8.tsv \
-///   cargo test -p mlx-gen-krea-realtime --test generate_smoke \
-///   s18_kv_tier_ab_from_accumulated_cells -- --exact --ignored --nocapture
+///   cargo test -p mlx-gen-krea-realtime --test integration \
+///   generate_smoke::s18_kv_tier_ab_from_accumulated_cells -- --exact --ignored --nocapture
 /// ```
 ///
 /// **Both arms must come from the same host.** The recorded `MEASURED_640` baseline was measured on
@@ -5653,7 +5674,7 @@ fn the_kv_per_token_figure_in_crate_prose_is_the_computed_one() {
 // documented conclusion is gated by the data rather than by prose. Regenerate with:
 //
 //   KREA_REALTIME_SNAPSHOT_DIR=... KREA_SMOKE_W=640 KREA_SMOKE_H=384 KREA_S18_SEEDS=7,11,23 \
-//     cargo test -p mlx-gen-krea-realtime --test generate_smoke -- --ignored --nocapture \
+//     cargo test -p mlx-gen-krea-realtime --test integration generate_smoke:: -- --ignored --nocapture \
 //     long_clip_coherence_under_the_bounded_window
 //
 // and paste the `S18CELL` lines below.

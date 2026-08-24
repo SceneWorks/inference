@@ -9,15 +9,15 @@
 //! bf16 snapshot at load; this ships the packs).
 //!
 //! `#[ignore]` (needs the real ~33 GB bf16 DiT). Run on macOS:
-//! `cargo test -p mlx-gen-scail2 --test quantize_snapshot -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-scail2 --test integration quantize_snapshot:: -- --ignored --nocapture`
 //! Env: `SCAIL2_SNAPSHOT_DIR` (dense src, default `~/.cache/scail2-mlx-convert`),
 //! `SCAIL2_Q4_DIR` (packed dst, default `~/.cache/scail2-mlx-q4`),
 //! `SCAIL2_QUANT_BITS` (4 = Q4 default, 8 = Q8).
 //!
 //! To then run the full `generate()` pipeline against the *pre-quantized* snapshot (and measure its
 //! real peak footprint — the sc-5445 `minMemoryGb` input), point the generate smoke at the dst:
-//! `SCAIL2_SNAPSHOT_DIR=~/.cache/scail2-mlx-q4 cargo test -p mlx-gen-scail2 --test generate_smoke \
-//!   -- --ignored generate_animation_smoke --nocapture`  (the snapshot carries its own quant manifest,
+//! `SCAIL2_SNAPSHOT_DIR=~/.cache/scail2-mlx-q4 cargo test -p mlx-gen-scail2 --test integration \
+//!   -- --ignored generate_smoke::generate_animation_smoke --nocapture`  (the snapshot carries its own quant manifest,
 //! so no `with_quant` is needed — `None` loads the packs straight off disk).
 
 use std::path::PathBuf;
