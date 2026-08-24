@@ -6,7 +6,7 @@
 //! `video_grid_thw`, `token_type`, `token_segment_ids`, and the reference `position_ids` (3, L) +
 //! mask visibility (L, L). These are integer / boolean outputs, so the match is **exact**.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test process_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration process_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::process::{build_attention_mask_4d, mrope_position_ids, MRopeConfig};

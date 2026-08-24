@@ -15,7 +15,7 @@ use candle_gen::preview::PreviewHook;
 use candle_gen::{ScmScheduler, Weights};
 use candle_gen_sana::{denoise_sprint, SanaTransformer};
 
-mod common;
+use crate::common;
 
 use common::tiny_sprint_config;
 

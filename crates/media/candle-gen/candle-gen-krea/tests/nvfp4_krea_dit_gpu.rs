@@ -49,7 +49,7 @@
 //! KREA_TURBO_BF16_DIR=E:\huggingface\hub\models--SceneWorks--krea-2-turbo-mlx\snapshots\<rev>\bf16 \
 //! KREA_TURBO_Q4_DIR=E:\huggingface\hub\models--SceneWorks--krea-2-turbo-mlx\snapshots\<rev>\q4 \
 //! CUDA_VISIBLE_DEVICES=0 CUDA_COMPUTE_CAP=120 \
-//!   cargo test -p candle-gen-krea --release --features cuda --test nvfp4_krea_dit_gpu -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration nvfp4_krea_dit_gpu:: -- --ignored --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 

@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! set SDXL_SNAPSHOT=C:\Users\…\models--stabilityai--stable-diffusion-xl-base-1.0\snapshots\<hash>
-//! cargo test -p candle-gen-sdxl --features cuda --release --test trainer_e2e -- --ignored --nocapture
+//! cargo test -p candle-gen-sdxl --features cuda --release --test integration trainer_e2e:: -- --ignored --nocapture
 //! ```
 //!
 //! What it proves:

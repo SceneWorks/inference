@@ -1,6 +1,6 @@
 //! Fixed-image/instruction parity against the frozen Torch Mage-Flow-Edit pipeline.
 
-mod common;
+use crate::common;
 
 use common::{error, require_golden};
 use image::RgbImage;

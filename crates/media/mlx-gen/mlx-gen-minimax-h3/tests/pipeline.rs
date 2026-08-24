@@ -42,7 +42,7 @@
 //! clock is involved, so no amount of host load can move any of it — see [`is_materialized`] for
 //! the one production property that guarantee rests on.
 
-mod common;
+use crate::common;
 
 use mlx_rs::ops::matmul;
 use mlx_rs::Array;

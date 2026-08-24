@@ -25,7 +25,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::weights::Weights;
 use mlx_gen_sana::{SanaTransformer, SanaTransformerConfig};
 
-mod common;
+use crate::common;
 
 use common::{tiny_config, tiny_sprint_config};
 

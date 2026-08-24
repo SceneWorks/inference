@@ -33,7 +33,7 @@ use crate::candle_core::{Device, Tensor};
 use crate::gen_core::{
     Image, LoadShape, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
     MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
-    MemoryParityResult, MemoryStrategy, MemoryStrategyParameters,
+    MemoryParityResult, MemoryReferenceShape, MemoryStrategy, MemoryStrategyParameters,
 };
 
 /// Typed inputs for one real-weight calibration observation.
@@ -52,6 +52,24 @@ pub struct MemoryEvidenceProbe<'a> {
     pub observed_peak_bytes: u64,
     pub harness_version: &'a str,
     pub output_bytes: &'a [u8],
+}
+
+/// The typed E2 evidence axes a probe can carry beyond its geometry.
+///
+/// Both default to "not supplied", which reproduces the pre-E2 record exactly: no frame rate, and
+/// an opaque `legacy-untyped-reference-count-N` carrier shape. That default is only honest for a
+/// **still-image** probe. A video probe (`geometry.frames > 1`) that leaves
+/// [`frames_per_second`](Self::frames_per_second) unset would fold two genuinely different
+/// calibration cells — e.g. Wan2.2 Ti2V-5B at 16 fps and at 24 fps, which admit disjoint frame
+/// menus and different peaks — into a single key, so the emitters below refuse it rather than
+/// stamp an ambiguous record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryEvidenceAxes {
+    /// The request's public frame rate. Required for a video probe; meaningless for a still.
+    pub frames_per_second: Option<u32>,
+    /// The typed carrier shape behind `geometry.reference_count`. `None` keeps the opaque legacy
+    /// spelling, which is distinct from every typed shape and from a different count.
+    pub reference_shape: Option<MemoryReferenceShape>,
 }
 
 /// Emit one strict `MEMORY_EVIDENCE_V1` line from a Candle real-weight probe.
@@ -75,16 +93,59 @@ pub fn memory_evidence_v1_line_with_parity(
     parity: MemoryParityContract,
     parity_result: MemoryParityResult,
 ) -> String {
+    memory_evidence_v1_line_with_axes(probe, parity, parity_result, MemoryEvidenceAxes::default())
+}
+
+/// Emit one strict observation with explicit typed E2 axes. See [`MemoryEvidenceAxes`].
+///
+/// # Panics
+/// When a video probe (`geometry.frames > 1`) supplies no frame rate: the resulting record would
+/// silently share one calibration cell with every other rate at the same geometry.
+pub fn memory_evidence_v1_line_with_axes(
+    probe: MemoryEvidenceProbe<'_>,
+    parity: MemoryParityContract,
+    parity_result: MemoryParityResult,
+    axes: MemoryEvidenceAxes,
+) -> String {
+    assert!(
+        probe.geometry.frames <= 1 || axes.frames_per_second.is_some(),
+        "a {}-frame probe must supply MemoryEvidenceAxes::frames_per_second: without it the record \
+         shares one evidence cell with every other frame rate at this geometry",
+        probe.geometry.frames
+    );
+    assert!(
+        axes.reference_shape
+            .as_ref()
+            .is_none_or(|shape| shape.is_none() == (probe.geometry.reference_count == 0)),
+        "typed reference shape {:?} contradicts reference_count={}",
+        axes.reference_shape,
+        probe.geometry.reference_count
+    );
     let output_sha256 = format!("{:x}", Sha256::digest(probe.output_bytes));
     MemoryEvidenceLogRecord {
         key: MemoryEvidenceKey {
+            // Older probe call sites carry a resolved route but not a catalog-family token. Keeping
+            // the route as this legacy record's family is conservative: it cannot share evidence
+            // across routes, and new collectors can mint a distinct explicit family key directly.
+            model_family: probe.resolved_route.to_owned(),
             resolved_route: probe.resolved_route.to_owned(),
             backend: MemoryBackend::Candle,
             tier: probe.tier,
             load_shape: probe.load_shape,
             mode: probe.mode,
+            reference_shape: match axes.reference_shape {
+                Some(shape) => shape,
+                None if probe.geometry.reference_count == 0 => MemoryReferenceShape::None,
+                // Do not silently label an old, shape-less probe as an image reference. The opaque
+                // carrier keeps it distinct from every newly typed shape and from a different count.
+                None => MemoryReferenceShape::Other(format!(
+                    "legacy-untyped-reference-count-{}",
+                    probe.geometry.reference_count
+                )),
+            },
             overlay: probe.overlay,
             geometry: probe.geometry,
+            frames_per_second: axes.frames_per_second,
             strategy: probe.strategy,
             engaged_composition: probe.engaged_composition,
             parameters: probe.parameters,

@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! WAN_TI2V_5B_MODEL_DIR=/path/to/models--SceneWorks--wan2.2-ti2v-5b-mlx/snapshots/<h>/q4 \
-//!   cargo test -p mlx-gen-wan --test te_quant_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration te_quant_parity:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

@@ -118,6 +118,7 @@ pub mod config;
 pub mod convert;
 pub mod generate;
 pub mod load;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod scheduler;
 pub mod t2v;
@@ -162,6 +163,8 @@ pub use load::{
     load_krea_realtime_transformer_with_quant, probe_packed_quant, resolve_load_time_quant,
     resolve_snapshot_quant, verify_transformer_tensors, TensorSpec, PACKED_LINEARS_PER_BLOCK,
 };
+pub use memory_strategy::resolved_numeric_tier;
+pub use memory_strategy::{canonical_artifact_identity, memory_strategy_contract};
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{
@@ -179,7 +182,10 @@ pub use mlx_gen_wan::config::{WanModelConfig, WanQuant};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(pipeline::REGISTRATION)
+    registry
+        .register_generator(pipeline::REGISTRATION)
+        .register_memory_strategy(memory_strategy::REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit MLX Krea Realtime provider catalog.
@@ -246,5 +252,18 @@ mod explicit_registry_tests {
             Some((322_633_728, 0))
         );
         assert_eq!(super::vae_tiling("not_krea_realtime"), None);
+    }
+
+    #[test]
+    fn resident_only_memory_surface_is_explicit_and_weights_free() {
+        let registry = super::provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .resident_only_memory_contract_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<Vec<_>>(),
+            [super::MODEL_ID]
+        );
+        assert!(registry.memory_contract_surfaces().unwrap().is_empty());
     }
 }

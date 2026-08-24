@@ -9,7 +9,7 @@
 //!
 //! `#[ignore]` — needs the Base snapshot (`mllm/`) + the golden + the test image:
 //!   BOOGU_BASE_DIR=<snapshot> BOOGU_VISION_GOLDEN=<safetensors> BOOGU_VISION_TEST_IMAGE=<png> \
-//!     cargo test -p mlx-gen-boogu --test vision_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --test integration vision_parity:: -- --ignored --nocapture
 //!
 //! `BOOGU_VISION_TEST_IMAGE` is required rather than defaulted; `BOOGU_VISION_GOLDEN` still falls
 //! back to a path in one developer's worktree, which is the same unreproducibility this repo tracks

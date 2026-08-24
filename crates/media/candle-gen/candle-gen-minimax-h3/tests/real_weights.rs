@@ -6,7 +6,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<root> \
-//!   cargo test -p candle-gen-minimax-h3 --test real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-minimax-h3 --test integration real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! On the self-hosted Windows CUDA runner (sc-18677) the snapshot is provisioned at
@@ -26,7 +26,7 @@
 //! the model actually executed — the published tensor count, the decoded shape, and the fact that
 //! the output is finite and non-constant. None of those can hold unless real weights were read.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 

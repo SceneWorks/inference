@@ -2,9 +2,9 @@
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the golden from `tools/dump_sdxl_vae_golden.py`.
 //! Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test vae_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration vae_real_weights:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder};

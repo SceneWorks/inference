@@ -12,7 +12,7 @@
 //! KREA_EDIT_LORA=D:\models\krea2-identity-edit.safetensors \
 //! KREA_EDIT_SOURCE=D:\fixtures\person.png \
 //! KREA_EDIT_DISTILLED=1 \
-//!   cargo test -p candle-gen-krea --release --features cuda --test edit_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration edit_real_weights:: -- --ignored --nocapture
 //! ```
 //! `KREA_EDIT_DISTILLED=1` drives the CFG-free distilled **Turbo** edit (`krea_2_turbo_edit`, sc-11640:
 //! guidance forced to 0, ~8-step `turbo_schedule`) against the Turbo turnkey; unset (or `0`) drives the

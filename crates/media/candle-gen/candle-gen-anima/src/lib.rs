@@ -34,6 +34,7 @@ pub mod adapters;
 pub mod conditioner;
 pub mod config;
 pub mod loader;
+pub mod memory_strategy;
 pub mod nn;
 pub mod pipeline;
 // Per-step latent previews (epic 16948, sc-16953). Anima carries no fit of its own: it reuses the
@@ -56,12 +57,12 @@ pub use text_encoder::AnimaQwen3;
 pub use transformer::CosmosDiT;
 pub use vae::{load_vae, QwenVae};
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, Progress, Quant,
 };
 
 /// The candle quant tiers Anima advertises — Q4 + Q8 (the counterpart of MLX sc-10517). The DiT loads
@@ -133,17 +134,170 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 pub struct Anima {
     descriptor: ModelDescriptor,
     variant: Variant,
-    root: WeightsSource,
     device: Device,
     /// LoRA/LoKr adapters to bake onto the DiT + conditioner at pipeline build (empty for the plain
     /// model). Captured at load; folded lazily when the pipeline is first assembled.
     adapters: Vec<gen_core::AdapterSpec>,
-    /// Lazily-built, shared pipeline behind the shared read-through cache ([`candle_gen::cached`],
-    /// sc-7792). The slot holds an `Arc<AnimaPipeline>` — cheap to clone — so `pipeline()` can return
-    /// an owned handle and **release the cache lock before the denoise** (see [`Anima::pipeline`]),
-    /// matching every sibling candle-gen provider. Before sc-10608 this was a bespoke
-    /// `Mutex<Option<AnimaPipeline>>` whose guard was held *across* the whole generation.
-    pipeline: Mutex<Option<Arc<AnimaPipeline>>>,
+    /// The physical numeric tier is derived from the loaded DiT header before any components are
+    /// materialized; it is the generator-side admission identity.
+    memory_tier: gen_core::MemoryNumericTier,
+    /// The request-scoped owner keeps the warm resident pipeline correct after a staged request:
+    /// staging evicts it, and a subsequent resident request rebuilds the exact same variant.
+    residency: candle_gen::Residency<AnimaTextPhase, AnimaHeavyPhase>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+}
+
+enum AnimaTextPhase {
+    Resident(Arc<AnimaPipeline>),
+    Staged(Box<loader::AnimaConditioningComponents>),
+}
+
+enum AnimaHeavyPhase {
+    Resident(Arc<AnimaPipeline>),
+    Staged(Box<loader::AnimaRenderComponents>),
+}
+
+struct AnimaMemoryScope {
+    memory: Option<gen_core::GenerationMemory>,
+    geometry: gen_core::MemoryGeometry,
+    use_pid: bool,
+    has_phases: bool,
+    cleanup: Box<dyn FnMut() -> gen_core::Result<()>>,
+    lifecycle: AnimaMemoryLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnimaMemoryLifecycle {
+    Active,
+    CleanupPending,
+    Complete,
+}
+
+impl AnimaMemoryScope {
+    fn new(
+        contract: &gen_core::MemoryProviderContract,
+        context: &gen_core::MemoryRunContext,
+        device: Device,
+    ) -> Self {
+        Self::with_cleanup(
+            contract,
+            context,
+            Box::new(move || device.synchronize().map_err(gen_core::Error::backend)),
+        )
+    }
+
+    fn with_cleanup(
+        contract: &gen_core::MemoryProviderContract,
+        context: &gen_core::MemoryRunContext,
+        cleanup: Box<dyn FnMut() -> gen_core::Result<()>>,
+    ) -> Self {
+        Self {
+            memory: contract.generation_memory(&context.selection),
+            geometry: context.geometry,
+            use_pid: context.use_pid,
+            has_phases: context.has_phases,
+            cleanup,
+            lifecycle: AnimaMemoryLifecycle::Active,
+        }
+    }
+
+    fn active(&self) -> gen_core::Result<()> {
+        if self.lifecycle != AnimaMemoryLifecycle::Active {
+            Err(gen_core::Error::Msg(
+                "anima memory request scope is already finished".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cleanup_pending(&mut self) -> gen_core::Result<()> {
+        debug_assert_eq!(self.lifecycle, AnimaMemoryLifecycle::CleanupPending);
+        match (self.cleanup)() {
+            Ok(()) => {
+                self.lifecycle = AnimaMemoryLifecycle::Complete;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl gen_core::MemoryRequestScope for AnimaMemoryScope {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
+        self.active()?;
+        let geometry = gen_core::MemoryGeometry {
+            width: request.width,
+            height: request.height,
+            batch: request.count,
+            frames: request.frames.unwrap_or(1),
+            reference_count: request.image_reference_count(),
+        };
+        let phases_present = request.phases.is_some();
+        let has_phases = request
+            .phases
+            .as_ref()
+            .is_some_and(|phases| !phases.is_empty());
+        if geometry != self.geometry
+            || !request.conditioning.is_empty()
+            || request.use_pid != self.use_pid
+            || phases_present != self.has_phases
+            || has_phases != self.has_phases
+        {
+            return Err(gen_core::Error::Unsupported(
+                "anima: request route, geometry, or conditioning changed after memory admission"
+                    .to_owned(),
+            ));
+        }
+        request.memory = self.memory;
+        Ok(())
+    }
+
+    fn enter_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.active()
+    }
+    fn leave_phase(&mut self, _phase: gen_core::MemoryPhase) -> gen_core::Result<()> {
+        self.active()
+    }
+    fn configure_decode(
+        &mut self,
+        _: u32,
+        _: u32,
+        _: gen_core::MemoryGeometry,
+    ) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: bounded decode is not implemented".to_owned(),
+        ))
+    }
+    fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: bounded attention is not implemented".to_owned(),
+        ))
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+        self.active()?;
+        Err(gen_core::Error::Unsupported(
+            "anima: transformer block streaming is not implemented".to_owned(),
+        ))
+    }
+    fn finish(&mut self, _outcome: gen_core::MemoryRunOutcome) -> gen_core::Result<()> {
+        self.active()?;
+        self.lifecycle = AnimaMemoryLifecycle::CleanupPending;
+        self.cleanup_pending()
+    }
+}
+
+impl Drop for AnimaMemoryScope {
+    fn drop(&mut self) {
+        if self.lifecycle == AnimaMemoryLifecycle::Active {
+            self.lifecycle = AnimaMemoryLifecycle::CleanupPending;
+        }
+        if self.lifecycle == AnimaMemoryLifecycle::CleanupPending {
+            let _ = self.cleanup_pending();
+        }
+    }
 }
 
 pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
@@ -175,73 +329,129 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     // DENSE DiT would silently build bf16 and return success (a tier downgrade the caller never sees).
     // Assert the DiT is packed; otherwise reject naming the requested tier and what was found. Same
     // runtime-lie class as sc-10515 (advertising a tier the load can't honor).
-    if let Some(q) = spec.quantize {
-        if !loader::dit_is_packed(&spec.weights, variant).map_err(gen_core::Error::from)? {
+    let physical_quant =
+        loader::dit_quant_tier(&spec.weights, variant).map_err(gen_core::Error::from)?;
+    match (spec.quantize, physical_quant) {
+        (None, None) => {}
+        (Some(requested), Some(actual)) if requested == actual => {}
+        (Some(requested), None) => {
             return Err(gen_core::Error::Unsupported(format!(
-                "{id}: {q:?} tier requested but the DiT checkpoint is DENSE (no packed `.scales` \
-                 tensors) — Anima ships no packed Q4/Q8 tier yet; load the dense tier (no quantize)"
+                "{id}: {requested:?} tier requested but the DiT checkpoint is DENSE (no packed `.scales` tensors)"
+            )));
+        }
+        (Some(requested), Some(actual)) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: {requested:?} tier requested but the physical DiT codes are {actual:?}"
+            )));
+        }
+        (None, Some(actual)) => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: physical DiT codes are {actual:?}, but LoadSpec selected the dense tier"
             )));
         }
     }
+    let memory_tier = memory_strategy::resolved_numeric_tier(spec, physical_quant)?;
     // LoRA/LoKr adapters (`spec.adapters`) are accepted — folded onto the DiT + conditioner when the
     // pipeline is assembled (`adapters::apply_anima_adapters`).
+    let root = spec.weights.clone();
     let device = candle_gen::default_device().map_err(gen_core::Error::from)?;
+    let resident_root = root.clone();
+    let resident_device = device.clone();
+    let resident_adapters = spec.adapters.clone();
+    let text_root = root.clone();
+    let text_device = device.clone();
+    let heavy_root = root.clone();
+    let heavy_device = device.clone();
+    let staged_adapters = spec.adapters.clone();
+    let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
+        move |_| {
+            let pipeline = AnimaPipeline::from_source(
+                &resident_root,
+                variant,
+                &resident_device,
+                &resident_adapters,
+            )
+            .map(Arc::new)?;
+            Ok((
+                AnimaTextPhase::Resident(pipeline.clone()),
+                AnimaHeavyPhase::Resident(pipeline),
+            ))
+        },
+        move |_, cancel| {
+            candle_gen::check_cancel(cancel)?;
+            if !staged_adapters.is_empty() {
+                return Err(candle_gen::CandleError::Msg(
+                    "anima: staged residency does not support adapter overlays".to_owned(),
+                ));
+            }
+            loader::AnimaConditioningComponents::load(&text_root, variant, &text_device)
+                .map(Box::new)
+                .map(AnimaTextPhase::Staged)
+        },
+        move |_, _, cancel| {
+            candle_gen::check_cancel(cancel)?;
+            loader::AnimaRenderComponents::load(&heavy_root, variant, &heavy_device)
+                .map(Box::new)
+                .map(AnimaHeavyPhase::Staged)
+        },
+    );
+    #[cfg(any(feature = "cuda", test))]
+    let memory_contract = Some(memory_strategy::contract(id, spec)?);
+    #[cfg(not(any(feature = "cuda", test)))]
+    let memory_contract = None;
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,
-        root: spec.weights.clone(),
         device,
         adapters: spec.adapters.clone(),
-        pipeline: Mutex::new(None),
+        memory_tier,
+        residency,
+        memory_contract,
     }))
-}
-
-impl Anima {
-    /// Lazily assemble (and cache) the pipeline on first `generate`, returning a **shared owned
-    /// handle**.
-    ///
-    /// ## Concurrency decision (sc-10608)
-    ///
-    /// This adopts the shared [`candle_gen::cached`] read-through cache (sc-7792) that every sibling
-    /// candle-gen provider uses. The consequence — the whole point of the story — is a deliberate
-    /// change to the lock/denoise relationship:
-    ///
-    /// - **Before:** a bespoke `Mutex<Option<AnimaPipeline>>` whose guard was held **across the entire
-    ///   denoise**. A second `generate` on the same loaded model blocked on the cache mutex until the
-    ///   first finished all its steps — concurrent generation was serialized *by accident*.
-    /// - **Now:** `cached()` holds the lock only across the (idempotent) build and a cheap `Arc` clone,
-    ///   then drops the guard. `generate` runs the denoise on the returned `Arc<AnimaPipeline>`
-    ///   **outside the lock**, so a second caller only waits to clone the `Arc`, not for the first
-    ///   generation to finish.
-    ///
-    /// Running the denoise outside the lock is **safe** here — this is verified deliberately, not
-    /// inherited from the siblings:
-    /// 1. `AnimaPipeline` / `AnimaComponents` are stateless forwards over **immutable, `Arc`-backed
-    ///    candle weights** — every `forward`/`encode`/`decode` in the generate path takes `&self`. The
-    ///    only `&mut self` methods (`visit_adaptable_mut` adapter installers) run at load, never during
-    ///    generation. No `RefCell`/`Cell`/scratch buffer is mutated per step, and each `generate` draws
-    ///    its own noise + tensors. There is therefore no shared mutable state for two concurrent
-    ///    generations to race on.
-    /// 2. `Arc<AnimaPipeline>: Send + Sync` is compiler-enforced: the cache is `Mutex<Option<Arc<…>>>`,
-    ///    and `Anima` must be `Sync` to satisfy the `Generator` bound, which requires the pipeline to be
-    ///    `Send + Sync` (pinned by `pipeline_handle_is_send_and_sync`).
-    /// 3. The candle `Device` internally synchronizes GPU submission, so concurrent forwards are
-    ///    serialized at the driver — safe, never corrupting.
-    ///
-    /// The lock-release contract is pinned by `cache_lock_is_released_before_generation` below;
-    /// returning an owned `Arc` (not a `MutexGuard`) makes "hold the lock across the denoise"
-    /// structurally impossible to reintroduce without changing this signature.
-    fn pipeline(&self) -> gen_core::Result<Arc<AnimaPipeline>> {
-        Ok(candle_gen::cached(&self.pipeline, || {
-            AnimaPipeline::from_source(&self.root, self.variant, &self.device, &self.adapters)
-                .map(Arc::new)
-        })?)
-    }
 }
 
 impl Generator for Anima {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory_contract
+            .as_ref()
+            .map_or(gen_core::MemorySafetyDecision::Accept, |contract| {
+                memory_strategy::loaded_safety_check(
+                    gen_core::adapter_stack_identity(&self.adapters).as_deref(),
+                    self.memory_tier,
+                    contract,
+                    context,
+                )
+            })
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        if let gen_core::MemorySafetyDecision::Reject { reason } =
+            self.memory_strategy_safety_check(context)
+        {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
+        Ok(Some(Box::new(AnimaMemoryScope::new(
+            contract,
+            context,
+            self.device.clone(),
+        ))))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -254,10 +464,6 @@ impl Generator for Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        // Build-or-clone the shared pipeline, then run the denoise on the returned `Arc` **outside**
-        // the cache lock (sc-10608 — see `Anima::pipeline` for the concurrency decision).
-        let pipeline = self.pipeline()?;
-
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = if self.variant.uses_cfg() {
@@ -270,6 +476,13 @@ impl Generator for Anima {
         // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
         // derivation + `Vec` collect that every provider repeats. The model body stays hand-written in
         // the closure (captures `on_progress` + the borrowed pipeline).
+        let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        if stage_residency && !self.adapters.is_empty() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: staged residency refuses LoRA/LoKr overlays because their conditioner and DiT loads are one atomic artifact",
+                self.descriptor.id
+            )));
+        }
         let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let opts = GenOptions {
                 width: req.width,
@@ -282,13 +495,56 @@ impl Generator for Anima {
                 // an absent sink is inert and the denoise never projects anything.
                 preview: req.preview.clone(),
             };
-            pipeline.generate(
-                &req.prompt,
-                &negative,
-                self.variant,
-                &opts,
+            self.residency.run_request_scoped(
+                stage_residency,
+                false,
                 &req.cancel,
+                false,
                 on_progress,
+                |text| match text {
+                    AnimaTextPhase::Resident(pipeline) => {
+                        let cond = pipeline.encode_prompt(&req.prompt)?;
+                        let uncond = self
+                            .variant
+                            .uses_cfg()
+                            .then(|| pipeline.encode_prompt(&negative))
+                            .transpose()?;
+                        Ok((cond, uncond))
+                    }
+                    AnimaTextPhase::Staged(components) => {
+                        let cond =
+                            AnimaPipeline::encode_staged(components, &self.device, &req.prompt)?;
+                        let uncond = self
+                            .variant
+                            .uses_cfg()
+                            .then(|| {
+                                AnimaPipeline::encode_staged(components, &self.device, &negative)
+                            })
+                            .transpose()?;
+                        Ok((cond, uncond))
+                    }
+                },
+                |_| Ok(self.device.synchronize()?),
+                |heavy, (cond, uncond), progress| match heavy {
+                    AnimaHeavyPhase::Resident(pipeline) => AnimaPipeline::render_encoded(
+                        pipeline.components(),
+                        &self.device,
+                        cond,
+                        uncond,
+                        &opts,
+                        &req.cancel,
+                        progress,
+                    ),
+                    AnimaHeavyPhase::Staged(components) => AnimaPipeline::render_encoded(
+                        components.as_ref(),
+                        &self.device,
+                        cond,
+                        uncond,
+                        &opts,
+                        &req.cancel,
+                        progress,
+                    ),
+                },
             )
         })?;
         Ok(GenerationOutput::Images(images))
@@ -341,12 +597,69 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(AESTHETIC_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION);
+    // Registration is unconditional: none of these surfaces needs a CUDA device to *construct*, and
+    // gating them on `cuda` hid the whole memory-behavior seam from every CPU conformance config.
+    register_memory_contract_surfaces(registry)
 }
+
+/// Register the weights-free contracts on non-CUDA catalog builds and the executable contracts on
+/// CUDA builds.  The three ids deliberately receive independent registrations: they share code but
+/// have distinct checkpoint, tier, mode, and calibration identities.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    let registry = registry
+        .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: "anima_base",
+            contract: |spec| memory_strategy::weights_free_contract("anima_base", spec),
+        })
+        .register_memory_strategy(memory_strategy::AESTHETIC_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+            provider_id: "anima_aesthetic",
+            contract: |spec| memory_strategy::weights_free_contract("anima_aesthetic", spec),
+        })
+        .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(
+            candle_gen::gen_core::MemoryContractFixtureRegistration {
+                surface_specs: candle_gen::gen_core::candle_memory_contract_surface_specs,
+                provider_id: "anima_turbo",
+                contract: |spec| memory_strategy::weights_free_contract("anima_turbo", spec),
+            },
+        );
+    registry
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(AESTHETIC_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+}
+
+const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_base",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+const AESTHETIC_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_aesthetic",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
+
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: "anima_turbo",
+        valid_fixtures: memory_strategy::registered_valid_fixture,
+        begin_request: memory_strategy::registered_begin_request,
+    };
 
 /// Build the complete explicit Candle Anima provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -365,6 +678,24 @@ mod explicit_registry_tests {
 
         assert_eq!(explicit, ["anima_base", "anima_aesthetic", "anima_turbo"]);
     }
+
+    /// The memory-behavior seam used to sit behind `#[cfg(feature = "cuda")]`, so registry-level
+    /// lifecycle conformance never saw it on any CPU config. Nothing here needs a CUDA device to
+    /// construct, so every build must register all three.
+    #[test]
+    fn every_route_registers_its_memory_behavior_on_a_non_cuda_build() {
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(
+            registered,
+            ["anima_base", "anima_aesthetic", "anima_turbo"],
+            "registration must not require a CUDA device"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -382,18 +713,21 @@ mod tests {
 
     #[test]
     fn three_variants_registered_as_candle() {
-        for id in ["anima_base", "anima_aesthetic", "anima_turbo"] {
-            let g = crate::provider_registry()
-                .unwrap()
-                .load(
-                    id,
-                    &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
-                )
-                .unwrap_or_else(|_| panic!("id {id} not registered"));
-            assert_eq!(g.descriptor().id, id);
-            assert_eq!(g.descriptor().family, "anima");
-            assert_eq!(g.descriptor().backend, "candle");
-        }
+        let registry = crate::provider_registry().unwrap();
+        let descriptors: Vec<_> = registry
+            .generators()
+            .map(|entry| (entry.descriptor)())
+            .collect();
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>(),
+            ["anima_base", "anima_aesthetic", "anima_turbo"]
+        );
+        assert!(descriptors
+            .iter()
+            .all(|descriptor| descriptor.family == "anima" && descriptor.backend == "candle"));
     }
 
     #[test]
@@ -472,6 +806,22 @@ mod tests {
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
     }
 
+    /// Write the sibling `text_encoders/` + `vae/` shards every real split_files root carries. The
+    /// memory contract prices them (sc-20785 review), so a fixture without them is not a root.
+    fn write_sibling_components(root: &std::path::Path) {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        for relative in [loader::TEXT_ENCODER_FILE, loader::VAE_FILE] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "x.weight".to_string(),
+                Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+            );
+            candle_gen::candle_core::safetensors::save(&m, &path).unwrap();
+        }
+    }
+
     /// Write a minimal **dense** DiT split_files layout (one anchor tensor, NO `.scales` codes) so the
     /// quant-guard can header-detect it as dense. Returns the split_files root.
     fn write_dense_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
@@ -479,6 +829,7 @@ mod tests {
         let root = tmp.path().join("anima_quant_guard");
         let dm = root.join("diffusion_models");
         std::fs::create_dir_all(&dm).unwrap();
+        write_sibling_components(&root);
         let mut m = std::collections::HashMap::new();
         m.insert(
             "net.x_embedder.proj.1.weight".to_string(),
@@ -489,19 +840,24 @@ mod tests {
         root
     }
 
-    /// Write a minimal **packed** DiT split_files layout (an anchor tensor WITH a `.scales`/`.biases`
-    /// sibling) so the quant-guard header-detects it as packed. Returns the split_files root.
-    fn write_packed_split_files(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    /// Write a minimal physically self-describing packed DiT layout. The code/scales shapes encode
+    /// the requested Q4 or Q8 width at the canonical group size 64.
+    fn write_packed_split_files(tmp: &tempfile::TempDir, quant: Quant) -> std::path::PathBuf {
         use candle_gen::candle_core::{DType, Device, Tensor};
-        let root = tmp.path().join("anima_packed_guard");
+        let root = tmp.path().join(format!("anima_packed_guard_{quant:?}"));
         let dm = root.join("diffusion_models");
         std::fs::create_dir_all(&dm).unwrap();
+        write_sibling_components(&root);
         let mut m = std::collections::HashMap::new();
-        // The anchor `.weight` (u32 codes) + `.scales`/`.biases` — enough for the header-only packed
-        // detect (`dit_path_is_packed` looks only for a `.scales` sibling).
+        let packed_columns = match quant {
+            Quant::Q4 => 8,
+            Quant::Q8 => 16,
+            Quant::Nvfp4 => unreachable!("Anima does not advertise NVFP4"),
+        };
+        // `[out, in·bits/32]` codes + `[out, in/64]` scales derive the physical bit width.
         m.insert(
             "net.x_embedder.proj.1.weight".to_string(),
-            Tensor::zeros((2, 2), DType::U32, &Device::Cpu).unwrap(),
+            Tensor::zeros((2, packed_columns), DType::U32, &Device::Cpu).unwrap(),
         );
         m.insert(
             "net.x_embedder.proj.1.scales".to_string(),
@@ -521,7 +877,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let root = write_dense_split_files(&tmp);
-        let base = WeightsSource::Dir(root.clone());
+        let base = gen_core::WeightsSource::Dir(root.clone());
         let lora_spec = || {
             vec![AdapterSpec::new(
                 "/lora.safetensors".into(),
@@ -567,8 +923,8 @@ mod tests {
 
         // sc-10640: Q4/Q8 + LoRA on a **packed** checkpoint is now ACCEPTED at load (built lazily; the
         // residual install runs at first generate). This is exactly the combo that used to be rejected.
-        let packed_root = write_packed_split_files(&tmp);
-        let packed = WeightsSource::Dir(packed_root.clone());
+        let packed_root = write_packed_split_files(&tmp, Quant::Q8);
+        let packed = gen_core::WeightsSource::Dir(packed_root.clone());
         assert!(
             load_base(
                 &LoadSpec::new(packed)
@@ -579,8 +935,20 @@ mod tests {
             "packed tier + LoRA must be accepted at load (sc-10640) — no combo rejection"
         );
 
+        let q4_root = write_packed_split_files(&tmp, Quant::Q4);
+        let mismatch = load_base(
+            &LoadSpec::new(gen_core::WeightsSource::Dir(q4_root.clone())).with_quant(Quant::Q8),
+        )
+        .err()
+        .expect("Q8 request must reject physical Q4 codes");
+        assert!(
+            mismatch.to_string().contains("physical DiT codes are Q4"),
+            "expected physical tier mismatch, got: {mismatch}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&packed_root);
+        let _ = std::fs::remove_dir_all(&q4_root);
     }
 
     /// The pipeline handle must be `Send + Sync` so the denoise can run outside the cache lock
@@ -595,67 +963,197 @@ mod tests {
         assert_send_sync::<Anima>();
     }
 
-    /// Pins the concurrency decision of sc-10608: the pipeline cache lock is **released before the
-    /// denoise**, so a second request can obtain the pipeline while the first is mid-generation. Before
-    /// sc-10608, `Anima` held the cache guard **across** the whole generation, serializing concurrent
-    /// callers by accident; adopting [`candle_gen::cached`] (which returns an owned `Arc` and drops the
-    /// guard) removes that.
-    ///
-    /// This drives the exact mechanism `Anima::pipeline` now uses — `candle_gen::cached()` over a
-    /// `Mutex<Option<Arc<T>>>` — with a stand-in payload, because building a real `AnimaPipeline` needs
-    /// full weights (exercised on the gated real-weights lane, not this CPU unit test). Returning an
-    /// owned `Arc` (not a `MutexGuard`) is what makes the pre-sc-10608 "hold the lock across the
-    /// denoise" shape structurally impossible to reintroduce without changing `pipeline()`'s signature.
+    /// Exercise Anima's actual production lifecycle owner, rather than the removed `cached` stand-in.
+    /// The sequence proves warm → staged → warm rebuilding, text-before-heavy ordering, and that
+    /// cancellation/error exits leave the owner usable for the next admitted request.
     #[test]
-    fn cache_lock_is_released_before_generation() {
-        use std::sync::mpsc;
-        use std::sync::{Arc, Barrier, Mutex};
-        use std::time::Duration;
+    fn residency_warm_staged_warm_and_failed_requests_leave_no_poisoned_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
 
-        // The shared read-through cache anima uses (`Mutex<Option<Arc<T>>>`); `u32` stands in for
-        // `Arc<AnimaPipeline>`.
-        let slot: Arc<Mutex<Option<Arc<u32>>>> = Arc::new(Mutex::new(None));
-
-        let in_gen = Arc::new(Barrier::new(2)); // A now holds its handle and is "mid-generation"
-        let end_gen = Arc::new(Barrier::new(2)); // A may finish only after B acquired concurrently
-        let (slot_a, in_a, end_a) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
-
-        let a = std::thread::spawn(move || {
-            // Build-or-clone via the shared accessor path, then hold ONLY the returned `Arc` across the
-            // "denoise" — never the cache guard (the sc-10608 contract).
-            let handle = candle_gen::cached(&slot_a, || Ok::<_, ()>(Arc::new(7u32))).unwrap();
-            in_a.wait();
-            end_a.wait(); // if B were blocked on the cache lock, this rendezvous would never complete
-            *handle
-        });
-
-        let (tx, rx) = mpsc::channel();
-        let (slot_b, in_b, end_b) = (Arc::clone(&slot), Arc::clone(&in_gen), Arc::clone(&end_gen));
-        std::thread::spawn(move || {
-            in_b.wait(); // A is holding its pipeline handle right now.
-                         // A second request must obtain the pipeline WHILE A is mid-generation. The
-                         // pre-sc-10608 "guard held across the denoise" shape would block this until A
-                         // finished; `cached()` returns immediately (and hits the cache — the panic
-                         // asserts no double-build).
-            let handle = candle_gen::cached(&slot_b, || -> Result<Arc<u32>, ()> {
-                panic!("cache hit expected, not a rebuild")
-            })
-            .unwrap();
-            let _ = tx.send(*handle);
-            end_b.wait();
-        });
-
-        // B must acquire the pipeline promptly while A is still mid-generation — not after A releases.
-        // A held-across-denoise regression would make B block and this `recv_timeout` fire.
-        let got = rx.recv_timeout(Duration::from_secs(2)).expect(
-            "second caller must obtain the pipeline while the first is mid-generation — the cache lock \
-             must NOT be held across the denoise (sc-10608)",
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let warm_loads = Arc::new(AtomicUsize::new(0));
+        let text_loads = Arc::new(AtomicUsize::new(0));
+        let heavy_loads = Arc::new(AtomicUsize::new(0));
+        let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
+            {
+                let events = Arc::clone(&events);
+                let warm_loads = Arc::clone(&warm_loads);
+                move |_| {
+                    warm_loads.fetch_add(1, Ordering::SeqCst);
+                    candle_gen::lock_recover(&events).push("warm-load");
+                    Ok::<_, candle_gen::CandleError>((10u8, 20u16))
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                let text_loads = Arc::clone(&text_loads);
+                move |_, cancel| {
+                    candle_gen::check_cancel(cancel)?;
+                    text_loads.fetch_add(1, Ordering::SeqCst);
+                    candle_gen::lock_recover(&events).push("text-load");
+                    Ok::<_, candle_gen::CandleError>(30u8)
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                let heavy_loads = Arc::clone(&heavy_loads);
+                move |_, _, cancel| {
+                    candle_gen::check_cancel(cancel)?;
+                    heavy_loads.fetch_add(1, Ordering::SeqCst);
+                    candle_gen::lock_recover(&events).push("heavy-load");
+                    Ok::<_, candle_gen::CandleError>(40u16)
+                }
+            },
         );
-        assert_eq!(got, 7, "second caller got the cached pipeline, no rebuild");
-        assert_eq!(a.join().unwrap(), 7);
+        let run = |staged: bool, fail_encode: bool, cancel: &gen_core::CancelFlag| {
+            residency.run_request_scoped(
+                staged,
+                false,
+                cancel,
+                false,
+                &mut |_| {},
+                |text| {
+                    candle_gen::lock_recover(&events).push("encode");
+                    if fail_encode {
+                        Err(candle_gen::CandleError::Msg(
+                            "synthetic encode failure".to_owned(),
+                        ))
+                    } else {
+                        Ok(*text)
+                    }
+                },
+                |_| {
+                    candle_gen::lock_recover(&events).push("synchronize");
+                    Ok(())
+                },
+                |heavy, text, _| {
+                    candle_gen::lock_recover(&events).push("render");
+                    Ok::<_, candle_gen::CandleError>(u32::from(*heavy) + u32::from(text))
+                },
+            )
+        };
+
+        let live = gen_core::CancelFlag::new();
+        assert_eq!(run(false, false, &live).unwrap(), 30);
+        assert_eq!(run(true, false, &live).unwrap(), 70);
+        assert_eq!(run(false, false, &live).unwrap(), 30);
+        assert_eq!(
+            warm_loads.load(Ordering::SeqCst),
+            2,
+            "staged evicts and the next warm request rebuilds"
+        );
+        assert_eq!(text_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            [
+                "warm-load",
+                "encode",
+                "render",
+                "text-load",
+                "encode",
+                "synchronize",
+                "heavy-load",
+                "render",
+                "warm-load",
+                "encode",
+                "render"
+            ],
+            "staged request must encode and synchronize before heavy materialization"
+        );
+
+        let cancelled = gen_core::CancelFlag::new();
+        cancelled.cancel();
+        assert!(run(true, false, &cancelled).is_err());
         assert!(
-            slot.try_lock().is_ok(),
-            "cache lock is free after generation, never wedged across a denoise"
+            run(true, true, &live).is_err(),
+            "error path must release the lifecycle owner"
+        );
+        assert_eq!(
+            run(false, false, &live).unwrap(),
+            30,
+            "warm request recovers after cancellation/error"
+        );
+    }
+
+    #[test]
+    fn memory_scope_binds_request_axes_and_retries_failed_cleanup_only_on_drop() {
+        use gen_core::{GenerationPhase, MemoryRequestScope, MemoryRunOutcome};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/anima".into()));
+        let contract = memory_strategy::weights_free_contract("anima_base", &spec).unwrap();
+        let context = memory_strategy::registered_valid_fixture(
+            &spec,
+            &contract,
+            gen_core::MemoryStrategy::StagedResidency,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context;
+        let cleanup_calls = Rc::new(Cell::new(0));
+        let cleanup_calls_for_scope = Rc::clone(&cleanup_calls);
+        let mut scope = AnimaMemoryScope::with_cleanup(
+            &contract,
+            &context,
+            Box::new(move || {
+                let calls = cleanup_calls_for_scope.get() + 1;
+                cleanup_calls_for_scope.set(calls);
+                (calls > 1)
+                    .then_some(())
+                    .ok_or_else(|| gen_core::Error::Msg("injected synchronize failure".to_owned()))
+            }),
+        );
+        let exact = || gen_core::MemoryBehaviorFixture::new(context.clone()).request;
+        let mut admitted = exact();
+        scope.configure_request(&mut admitted).unwrap();
+
+        let mut pid = exact();
+        pid.use_pid = true;
+        assert!(scope.configure_request(&mut pid).is_err());
+        let mut phases = exact();
+        phases.phases = Some(vec![GenerationPhase {
+            steps: 1,
+            guidance: None,
+            adapters: Vec::new(),
+        }]);
+        assert!(scope.configure_request(&mut phases).is_err());
+        let mut empty_phases = exact();
+        empty_phases.phases = Some(Vec::new());
+        assert!(scope.configure_request(&mut empty_phases).is_err());
+        let mut conditioning = exact();
+        conditioning
+            .conditioning
+            .push(gen_core::Conditioning::Reference {
+                image: gen_core::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+                strength: None,
+            });
+        assert!(scope.configure_request(&mut conditioning).is_err());
+
+        assert!(scope
+            .finish(MemoryRunOutcome::Error {
+                message: "synthetic request failure".to_owned(),
+            })
+            .is_err());
+        assert!(scope.configure_request(&mut exact()).is_err());
+        assert!(scope.finish(MemoryRunOutcome::Complete).is_err());
+        assert_eq!(
+            cleanup_calls.get(),
+            1,
+            "failed finish must not retry cleanup inline"
+        );
+        drop(scope);
+        assert_eq!(
+            cleanup_calls.get(),
+            2,
+            "drop retries the pending synchronize cleanup"
         );
     }
 }

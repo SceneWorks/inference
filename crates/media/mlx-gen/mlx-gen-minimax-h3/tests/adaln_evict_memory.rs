@@ -46,7 +46,7 @@
 //! "geometry-free" means), and the fixed-fraction form the review retired
 //! ([`common::ADALN_RETIRED_GAP_NUM`]) goes red on it — the reason the form changed, executing.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

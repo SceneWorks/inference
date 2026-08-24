@@ -8,7 +8,7 @@
 //! these gates check is purely **routing + the GEGLU row-split + an exhaustive count** — all validated
 //! *build-independently* (byte-exact within this build, so immune to the pmetal-vs-wheel f32 residual).
 //!
-//! Run: cargo test -p mlx-gen-sdxl --release --test lora_complete_real_weights -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration lora_complete_real_weights:: -- --ignored --nocapture
 //!
 //! Gates:
 //! - `complete_strictly_exceeds_vendored_and_count_matches_table` — complete coverage merges strictly
@@ -26,7 +26,7 @@
 //! - `complete_render_differs_from_vendored_and_is_sane` — the extra mid/ff/conv signal actually
 //!   changes the rendered image (and the render is a full, non-empty buffer).
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -446,7 +446,7 @@ fn complete_render_differs_from_vendored_and_is_sane() {
 /// Eyeball helper (not a parity gate): render the SAME prompt/seed at vendored (515) vs complete
 /// (809) coverage and write both PNGs + an amplified abs-diff to `tools/golden/`, for a side-by-side
 /// look at what signal the vendored path drops. Config overridable via `SDXL_{PROMPT,W,H,STEPS,CFG,SEED}`.
-/// Run: cargo test -p mlx-gen-sdxl --release --test lora_complete_real_weights -- --ignored --nocapture dump_vendored_vs_complete_pngs
+/// Run: cargo test -p mlx-gen-sdxl --release --test integration -- --ignored --nocapture lora_complete_real_weights::dump_vendored_vs_complete_pngs
 #[test]
 #[ignore = "needs the real SDXL snapshot + LCM-LoRA — writes comparison PNGs"]
 fn dump_vendored_vs_complete_pngs() {

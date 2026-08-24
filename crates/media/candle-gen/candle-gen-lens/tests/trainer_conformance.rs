@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set LENS_BASE_SNAPSHOT=C:\Users\…\models--microsoft--Lens\snapshots\<hash>
-//! cargo test -p candle-gen-lens --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-lens --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! The profile is forced to **bf16** (the DiT's native dtype) and gradient-checkpointing on (the

@@ -1,7 +1,7 @@
 //! sc-5916: real-weights smoke for the FLUX.2-**dev** MMDiT transformer. `#[ignore]`d — needs the
 //! real `black-forest-labs/FLUX.2-dev` snapshot:
 //!
-//!   cargo test -p mlx-gen-flux2 --test transformer_dev_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration transformer_dev_real_weights:: -- --ignored --nocapture
 //!
 //! The parametric transformer math is already proven bit-tight in f32 by the committed
 //! `transformer_parity.rs` (tiny config) and is dimension-agnostic, so this proves the **dev

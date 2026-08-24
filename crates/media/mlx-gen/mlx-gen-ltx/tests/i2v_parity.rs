@@ -16,7 +16,7 @@
 //! (see `dit_parity.rs` for the mechanism); the free-running 2-stage e2e is envelope-gated; the
 //! conditioned-frame pin stays exact (it is a copy, not compute).
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test i2v_parity -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration i2v_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, gt, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};

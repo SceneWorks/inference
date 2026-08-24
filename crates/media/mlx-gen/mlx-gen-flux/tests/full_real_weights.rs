@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MLX_GEN_FLUX_SNAPSHOT=/path/to/FLUX.1-schnell/snapshot \
-//!   cargo test -p mlx-gen-flux --test full_real_weights -- --ignored
+//!   cargo test -p mlx-gen-flux --test integration full_real_weights:: -- --ignored
 //! ```
 
 use std::path::PathBuf;

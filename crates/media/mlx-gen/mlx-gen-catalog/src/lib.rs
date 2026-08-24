@@ -143,13 +143,21 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
-/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
-/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
-/// from the requested quantization field.
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Bernini
+/// validates its paired planner/renderer packed manifests and headers; Krea and Wan validate their
+/// immutable packed surfaces. Other routes return `None` rather than synthesizing a tier.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
 ) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    if let Some(tier) = mlx_gen_bernini::resolved_video_memory_numeric_tier(provider_id, spec)? {
+        return Ok(Some(tier));
+    }
+    if provider_id == mlx_gen_krea_realtime::MODEL_ID {
+        return mlx_gen_krea_realtime::resolved_numeric_tier(spec)
+            .map(Some)
+            .map_err(|error| media::gen_core::Error::Msg(error.to_string()));
+    }
     mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
 }
 
@@ -483,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+    fn selected_video_memory_apis_stay_provider_owned() {
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
         for provider in [
             "unknown",
@@ -502,6 +510,7 @@ mod tests {
                 None
             );
         }
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
     }
 
     #[test]
@@ -888,22 +897,24 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 50);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 49);
+        assert_eq!(registry.memory_strategy_registrations().len(), 53);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert_eq!(resident_only, ["flux2_dev_control"]);
+        assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b", "svd_xt"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // 47 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync: it ships all three tiers and both materialization
-        // shapes). Two video providers publish narrower, truthful inventories instead: LTX has no
-        // deferred/block-window loader, so it witnesses the eager half; TI2V-5B admits only a BF16
-        // Resident/Eager load, so it witnesses one selector per tier. Spelling the sum out this way
-        // keeps a future provider's narrowing visible in the diff rather than folded into a single
-        // total.
-        assert_eq!(surfaces.len(), 47 * 12 + 6 + 3);
+        // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
+        // joined them in the sc-17137 sync, and FLUX.2 Dev Control has its exact fixture): these
+        // providers publish every tier and materialization selector, even where a provider correctly
+        // classifies a strategy as Missing. Two video providers publish narrower, truthful
+        // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
+        // half; TI2V-5B admits only a BF16 Resident/Eager load, so it witnesses one selector per
+        // tier. SVD is instead covered by the separate resident-only witness assertion above.
+        // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
+        // rather than folded into a single total.
+        assert_eq!(surfaces.len(), 48 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

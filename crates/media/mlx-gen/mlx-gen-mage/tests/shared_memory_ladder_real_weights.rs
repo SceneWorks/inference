@@ -9,7 +9,7 @@
 //! MAGE_LADDER_PROVIDER=mage_flow_edit MAGE_LADDER_MODE=edit MAGE_LADDER_TIER=q4 \
 //! MAGE_LADDER_VARIANT_ROOT=/.../SceneWorks--Mage-Flow-Edit/snapshots/<sha> \
 //! MAGE_LADDER_COMPONENTS_ROOT=/.../Mage-Flow-Components-mlx/snapshots/<sha> \
-//! cargo test -p mlx-gen-mage --release --test shared_memory_ladder_real_weights \
+//! cargo test -p mlx-gen-mage --release --test integration shared_memory_ladder_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 

@@ -10,17 +10,16 @@
 //!     (sc-5446).
 //!
 //! Run the real-weight smoke on macOS against the assembled snapshot:
-//! `cargo test -p mlx-gen-scail2 --test generate_smoke -- --ignored --nocapture`
+//! `cargo test -p mlx-gen-scail2 --test integration generate_smoke:: -- --ignored --nocapture`
 //! (env: `SCAIL2_SNAPSHOT_DIR`, `SCAIL2_SMOKE_SIZE`=256, `SCAIL2_SMOKE_FRAMES`=13,
 //! `SCAIL2_SMOKE_STEPS`=8).
-
-use std::path::PathBuf;
 
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
     WeightsSource,
 };
 use mlx_gen_scail2::pipeline::MODEL_ID;
+use std::path::PathBuf;
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("SCAIL2_SNAPSHOT_DIR")
@@ -78,19 +77,23 @@ fn color_mask(w: usize, h: usize, split: usize) -> Image {
 
 #[test]
 fn missing_reference_errors() {
-    // load() only needs an existing dir (config.json is optional → defaults). The conditioning
-    // extraction runs before any weight load, so an empty request fails fast. Use a per-process
-    // empty dir rather than the shared `$TMPDIR` itself, so nothing another concurrent `cargo test`
-    // process leaves lying around is ever inside this provider's weights root.
+    // load() only needs an existing dir (config.json is optional → defaults) and no sealed memory
+    // receipt (sc-20799). The conditioning extraction runs before any weight load, so an empty
+    // request fails fast. Use a per-process empty dir rather than the shared `$TMPDIR` itself, so
+    // nothing another concurrent `cargo test` process leaves lying around is ever inside this
+    // provider's weights root.
     let dir_tmp = tempfile::tempdir().unwrap();
-    let dir = dir_tmp.path().to_path_buf();
-    let spec = LoadSpec::new(WeightsSource::Dir(dir));
+    let spec = LoadSpec::new(WeightsSource::Dir(dir_tmp.path().to_path_buf()));
     let gen = mlx_gen_scail2::provider_registry()
         .unwrap()
         .load(MODEL_ID, &spec)
         .expect("load scail2 provider");
+    // An explicit in-envelope geometry, so the missing carrier is what refuses rather than the
+    // default 1024×1024 tripping the shared area gate first.
     let req = GenerationRequest {
         prompt: "a person dancing".into(),
+        width: 832,
+        height: 480,
         ..Default::default()
     };
     let err = gen

@@ -85,7 +85,7 @@
 //! ```sh
 //! MLX_GEN_QWEN_SNAPSHOT=/path/to/Qwen-Image/bf16 \
 //!   QWEN_LIGHTNING_SNAPSHOT=/path/to/models--lightx2v--Qwen-Image-Lightning/snapshots/<rev> \
-//!   cargo test -p mlx-gen-qwen-image --release --test fit_preview_rgb -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration fit_preview_rgb:: -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};

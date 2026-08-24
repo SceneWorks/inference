@@ -28,7 +28,7 @@
 //!  5. `lora_per_pass_strength_changes_output` — a `[1.0, 0.0]` per-pass schedule (stage-2 LoRA off)
 //!     diverges from the uniform golden, proving the per-pass wiring drives the pipeline.
 //!
-//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test lora_real_weights -- --ignored --nocapture`
+//! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration lora_real_weights:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, gt, subtract, sum};
 use mlx_rs::{Array, Dtype};

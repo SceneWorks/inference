@@ -475,6 +475,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -491,6 +492,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -651,6 +653,7 @@ dependencies = [
  "candle-gen-sdxl",
  "image",
  "rand",
+ "tempfile",
 ]
 
 [[package]]
@@ -859,6 +862,7 @@ dependencies = [
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -923,6 +927,7 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -939,6 +944,8 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2193,6 +2200,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.21.4",
 ]
@@ -2402,6 +2410,7 @@ dependencies = [
  "mlx-gen-wan",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2544,8 +2553,10 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2612,6 +2623,8 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2647,7 +2660,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=7151a9b27921c6198fd8dfb493dee21db4dcdfcc#7151a9b27921c6198fd8dfb493dee21db4dcdfcc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=bd8f0e3c757195b17b2c34fae3073ab826fb7bc1#bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2682,7 +2695,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=7151a9b27921c6198fd8dfb493dee21db4dcdfcc#7151a9b27921c6198fd8dfb493dee21db4dcdfcc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=bd8f0e3c757195b17b2c34fae3073ab826fb7bc1#bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2978,7 +2991,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=7151a9b27921c6198fd8dfb493dee21db4dcdfcc#7151a9b27921c6198fd8dfb493dee21db4dcdfcc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=bd8f0e3c757195b17b2c34fae3073ab826fb7bc1#bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3001,11 +3014,12 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=7151a9b27921c6198fd8dfb493dee21db4dcdfcc#7151a9b27921c6198fd8dfb493dee21db4dcdfcc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=bd8f0e3c757195b17b2c34fae3073ab826fb7bc1#bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
 dependencies = [
  "bindgen",
  "cc",
  "cmake",
+ "sha2",
 ]
 
 [[package]]

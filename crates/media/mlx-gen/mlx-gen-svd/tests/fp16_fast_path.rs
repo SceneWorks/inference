@@ -5,7 +5,7 @@
 //! confirming the fp16 path stays within the fp16 rounding floor of the parity-validated f32 path
 //! (no dtype-flow bug, no instability). Needs the SVD checkpoint locally → `--ignored`.
 //!
-//! Run: `cargo test -p mlx-gen-svd --test fp16_fast_path -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-svd --test integration fp16_fast_path:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, divide, max as max_op, sqrt, square, subtract, sum};
 use mlx_rs::{random, Array, Dtype};

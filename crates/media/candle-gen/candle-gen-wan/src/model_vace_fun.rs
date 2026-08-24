@@ -10,7 +10,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, PerComponentBytes, Progress, Quant, WeightsSource,
+    OffloadPolicy, PerComponentBytes, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -361,6 +361,7 @@ impl Pipeline {
         prepared: Prepared,
         vae: &WanVae16,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
+        decode_cap: Option<u32>,
     ) -> CResult<(Vec<Image>, u32)> {
         let t = prepared.latents.dim(2)?;
         let latents = if prepared.num_ref > 0 {
@@ -370,7 +371,7 @@ impl Pipeline {
         } else {
             prepared.latents
         };
-        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
+        let decoded = vae.decode_budgeted_with_cancel_and_tile_cap(&latents, cancel, decode_cap)?;
         Ok((frames_to_images(&decoded)?, prepared.fps))
     }
 }
@@ -401,6 +402,7 @@ pub struct WanVaceFunGenerator {
     tier: Option<VaceFunTierPaths>,
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceFunGenerator {
@@ -530,6 +532,15 @@ impl Generator for WanVaceFunGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate_request(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
+        let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(
+            self.offload,
+            self.i2v_memory.is_some(),
+            req,
+        );
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
         let pipeline = Pipeline::new(
             &self.root,
             &self.device,
@@ -538,7 +549,7 @@ impl Generator for WanVaceFunGenerator {
         );
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
-        let (mut prepared, resident_shared) = match self.offload {
+        let (mut prepared, resident_shared) = match effective_offload {
             OffloadPolicy::Resident => {
                 let shared = self.shared(&pipeline)?;
                 let prepared = pipeline.prepare(req, &shared)?;
@@ -557,7 +568,7 @@ impl Generator for WanVaceFunGenerator {
         let timesteps = (0..prepared.steps)
             .map(|step| scheduler.timestep(step))
             .collect::<Vec<_>>();
-        match self.offload {
+        match effective_offload {
             OffloadPolicy::Resident => {
                 let experts = self.experts(&pipeline)?;
                 let steps = prepared.steps;
@@ -644,11 +655,34 @@ impl Generator for WanVaceFunGenerator {
             }
         };
         on_progress(Progress::Decoding);
-        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel)?;
+        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
         Ok(GenerationOutput::Video {
             frames,
             fps,
             audio: None,
+        })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|p| &p.contract)
+    }
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "wan2_2_vace_fun_14b loaded route has no sealed memory contract".to_owned(),
+            },
+            |p| crate::i2v_memory_strategy::safety_check(p, context),
+        )
+    }
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        self.i2v_memory.as_ref().map_or(Ok(None), |p| {
+            crate::i2v_memory_strategy::begin_request(p, self.device.clone(), context)
         })
     }
 }
@@ -675,7 +709,9 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            supported_quants: &[Quant::Q4, Quant::Q8],
+            // The public Candle route is the immutable dense bf16 VACE-Fun snapshot.
+            // Do not advertise dormant packed tiers: they have no provider receipt.
+            supported_quants: &[],
             supports_sequential_offload: true,
             ..Default::default()
         },
@@ -705,10 +741,16 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     };
     let tier = VaceFunTierPaths::detect(&root)?;
     if let Some(tier) = &tier {
+        // Preserve structural validation so malformed packed layouts fail deterministically;
+        // a valid packed layout is still not an admitted public Candle artifact.
         tier.validate_requested_quant(spec.quantize)?;
-    } else if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "wan2_2_vace_fun_14b accepts Q4/Q8 only from a complete hosted split packed tier; on-the-fly quantization is not supported".into(),
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; packed tiers are not a supported provider artifact".into(),
+        ));
+    }
+    if spec.quantize.is_some() {
+        return Err(gen_core::Error::Unsupported(
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; quantized tiers are not supported".into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -717,6 +759,16 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE_FUN)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(
+            spec,
+            MODEL_ID_VACE_FUN,
+        )?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceFunGenerator {
         descriptor: descriptor(),
         root,
@@ -726,6 +778,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         tier,
         shared: Mutex::new(None),
         experts: Mutex::new(None),
+        i2v_memory,
     }))
 }
 
@@ -738,6 +791,7 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use crate::vace::weighted_control_scale;
+    use candle_gen::gen_core::Quant;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
 
@@ -1031,6 +1085,8 @@ mod tests {
 
     #[test]
     fn quantized_load_fails_closed_before_any_weight_or_adapter_load() {
+        assert!(descriptor().capabilities.supported_quants.is_empty());
+        assert!(descriptor().capabilities.supports_sequential_offload);
         let spec = LoadSpec::new(WeightsSource::Dir("/snapshot".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&spec).err().expect("quantized load must fail"),

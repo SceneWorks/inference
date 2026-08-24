@@ -3,7 +3,7 @@
 //! `#[ignore]` by default (needs the weights + a GPU build). Run on the Blackwell box with:
 //! ```text
 //! set SEEDVR2_CKPT=D:\sceneworks-seedvr2-validate\ckpt
-//! cargo test -p candle-gen-seedvr2 --features cuda --release --test cuda_video_smoke -- --ignored --nocapture
+//! cargo test -p candle-gen-seedvr2 --features cuda --release --test integration cuda_video_smoke:: -- --ignored --nocapture
 //! ```
 //! `SEEDVR2_CKPT` is a dir holding `ema_vae_fp16.safetensors` + `seedvr2_ema_3b_fp16.safetensors`.
 //! Optional: `SEEDVR2_DTYPE=bf16` (default f32).

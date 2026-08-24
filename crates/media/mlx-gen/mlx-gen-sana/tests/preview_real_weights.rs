@@ -5,7 +5,7 @@
 //! ```sh
 //! SC16635_ID=sana_1600m SC16635_ROUTE=txt2img SC16635_SNAPSHOT=/path/to/tier \
 //! SC16635_ARTIFACT_DIR=/path/to/artifacts \
-//!   cargo test --release -p mlx-gen-sana --test preview_real_weights -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-sana --test integration preview_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! The acceptance tiers are pinned to `SceneWorks/Sana_1600M_1024px_mlx` revision

@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! MINIMAX_H3_SNAPSHOT=<upstream snapshot root> \
-//!   cargo test -p mlx-gen-minimax-h3 --test staged_residency -- --ignored --nocapture
+//!   cargo test -p mlx-gen-minimax-h3 --test integration staged_residency:: -- --ignored --nocapture
 //! ```
 //!
 //! # Two arms run in CI; the rest are OPERATOR-ONLY, and that is a disk fact
@@ -84,7 +84,7 @@
 //! arms call the same [`handoff_is_clean`] / [`peak_is_one_component`] functions, so the control
 //! cannot drift away from the gate it is supposed to be validating.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

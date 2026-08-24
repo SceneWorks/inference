@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! MLX_GEN_QWEN_SNAPSHOT=<explicit bf16/q8/q4 tier dir> QWEN_RUNG4_TIER=q8 \
-//!   cargo test -p mlx-gen-qwen-image --release --test block_residency_real_weights \
+//!   cargo test -p mlx-gen-qwen-image --release --test integration block_residency_real_weights:: \
 //!   -- --ignored --nocapture
 //! ```
 

@@ -7,7 +7,7 @@
 //! MINIMAX_H3_SNAPSHOT=<root with vae/, audio_vae/, FL2VA/, tokenizer/> \
 //! MINIMAX_H3_DIT=<tier>/transformer \
 //! MINIMAX_H3_TE=<text_encoder dir> \
-//!   cargo test -p mlx-gen-minimax-h3 --test streamed_generate_real -- --ignored --nocapture \
+//!   cargo test -p mlx-gen-minimax-h3 --test integration streamed_generate_real:: -- --ignored --nocapture \
 //!   --test-threads=1
 //! ```
 //!
@@ -32,7 +32,7 @@
 //! This Mac is also the `nax-macos` CI runner. Every asserted number is an MLX peak-memory figure
 //! (a per-process allocator high-water mark); wall clock is printed for context and never asserted.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

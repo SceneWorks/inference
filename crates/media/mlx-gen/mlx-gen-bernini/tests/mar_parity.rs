@@ -9,7 +9,7 @@
 //! handoff. Tolerance reflects the f32 floor compounded over 4 steps × 3 backbone forwards + the final
 //! handoff; the mask mechanics themselves are exact (a wrong reveal/scatter is O(1)).
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test mar_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration mar_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;

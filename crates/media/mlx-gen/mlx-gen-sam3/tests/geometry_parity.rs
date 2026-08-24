@@ -11,7 +11,7 @@
 //!   SAM3_WEIGHTS=.../model.safetensors \
 //!   SAM3_GEOMETRY_FIXTURE=scripts/spikes/sam3_oracle/geometry_fixture.safetensors \
 //!   SAM3_GEOMETRY_E2E_FIXTURE=scripts/spikes/sam3_oracle/geometry_e2e_fixture.safetensors \
-//!     cargo test -p mlx-gen-sam3 --release --test geometry_parity -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam3 --release --test integration geometry_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter};

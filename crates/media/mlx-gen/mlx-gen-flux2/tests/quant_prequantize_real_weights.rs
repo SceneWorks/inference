@@ -1,7 +1,7 @@
 //! sc-5917: FLUX.2-**dev** pre-quantization (producer + packed consumer) on the real checkpoint.
 //! `#[ignore]`d — needs the real `black-forest-labs/FLUX.2-dev` snapshot (~60 GB DiT + ~45 GB TE):
 //!
-//!   cargo test -p mlx-gen-flux2 --release --test quant_prequantize_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --release --test integration quant_prequantize_real_weights:: -- --ignored --nocapture
 //!
 //! Each test is the offline convert vehicle AND the integration proof: it pre-quantizes one
 //! component to a temp dir (the producer, `convert::quantize_flux2_*`), then loads it back through
@@ -25,9 +25,7 @@ use mlx_gen_flux2::{
 };
 use mlx_rs::{random, Dtype};
 
-#[path = "../../tests/support/atomic_cache.rs"]
-#[allow(dead_code)] // the component-specific producer tests do not assemble symlinks
-mod atomic_cache;
+use crate::atomic_cache;
 
 const BITS: i32 = 4;
 const GROUP_SIZE: i32 = 64;

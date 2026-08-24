@@ -42,6 +42,7 @@ use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::Weights;
 
 use crate::config::{BlockType, DcAeConfig};
+use crate::memory_strategy::{DECODE_OVERLAP, DECODE_TILE_EDGE};
 
 // ---------------------------------------------------------------------------------------------------
 // Shared primitives
@@ -614,7 +615,10 @@ impl DcAeDecoder {
     pub fn decode_with(&self, latent: &Tensor, force_tile: bool) -> Result<Tensor> {
         let head = self.decode_head(latent)?;
         if force_tile && self.num_tail_stages() > 0 {
-            self.tile_blend_tail(&head, &TilingConfig::spatial_only(512, 128))
+            self.tile_blend_tail(
+                &head,
+                &TilingConfig::spatial_only(DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32),
+            )
         } else {
             self.decode_tail(&head)
         }
@@ -1188,7 +1192,7 @@ mod tests {
         let (hh, hw) = (head.dim(2).unwrap() as i32, head.dim(3).unwrap() as i32);
 
         // A tile config that actually splits at this CPU resolution (384² output): 256-out-px tiles,
-        // 64-out-px overlap — the production 4:1 tile:overlap ratio (`spatial_only(512, 128)`), scaled to
+        // 64-out-px overlap — the production 4:1 tile:overlap ratio (`spatial_only(192, 48)`), scaled to
         // fire on a small head. Assert it splits, else the test would prove nothing.
         let tile_cfg = TilingConfig::spatial_only(256, 64);
         let vae = VaeTiling {
@@ -1319,25 +1323,38 @@ mod tests {
     ///
     /// The shipped arm runs the production entry point [`DcAeDecoder::decode_with`] rather than a
     /// hand-composed head/tail pair, so the policy that decides *what* gets tiled is under test too.
-    /// An 80²-head is required for the production `spatial_only(512, 128)` gate to actually split.
+    /// An 80²-head is required for the production `spatial_only(192, 48)` gate to actually split.
     ///
-    /// Measured on this fixture (80² latent, 640² output, CPU f32):
-    ///  - shipped (`decode_with(force_tile = true)`): **74.27 dB**
-    ///  - defect (whole-decoder quadrant crops, stitched): **32.31 dB** — a 41.96 dB gap, i.e. ~125×
-    ///    the RMS error, and below the ≥~34.75 dB "no measurable seam" bar this codebase uses.
+    /// Measured on this fixture (80² latent, 640² output, CPU f32, `Device::Cpu`) at the released
+    /// 192/48 physical domain — the same singleton `mlx-gen-sana` ships as its decode default
+    /// (`mlx-gen-sana/src/pipeline.rs` `DECODE_TILE_EDGE`/`DECODE_OVERLAP`):
+    ///  - shipped (`decode_with(force_tile = true)`): **52.45 dB**
+    ///  - defect (whole-decoder quadrant crops, stitched): **31.47 dB**
+    ///  - separation: **20.98 dB**, i.e. ~11× the RMS error, and the defect sits below the ≥34.75 dB
+    ///    "no measurable seam" bar this codebase uses.
     ///
-    /// Mutation-discrimination (measured, not assumed): dropping the seam overlap — `decode_with`'s
-    /// `TilingConfig::spatial_only(512, 128)` → `spatial_only(512, 0)`, so abutting tiles each zero-pad
-    /// at their own edge with nothing to blend — collapses the shipped arm to **35.28 dB** and the gap
-    /// to **2.97 dB**, firing both the `>= 40.0` floor and the `>= 25.0` gap guard.
+    /// (The 41.96 dB separation recorded here before sc-19753's geometry alignment was measured at
+    /// the *pre-alignment* `spatial_only(512, 128)` domain, which advertised a request shape Candle
+    /// does not execute. The narrower separation below is the true 192/48 number, not a relaxation.)
+    ///
+    /// Mutation-discrimination of the `>= 20.0` separation guard specifically (measured, not
+    /// assumed) — note the guard has bite the `>= 40.0` floor does **not**:
+    ///  - overlap → 0 (`spatial_only(DECODE_TILE_EDGE, 0)`, so abutting tiles each zero-pad at their
+    ///    own edge with nothing to blend): shipped collapses to **29.32 dB**, separation **-2.15 dB**
+    ///    — fires both the floor and the separation guard.
+    ///  - overlap → 16 (`spatial_only(DECODE_TILE_EDGE, 16)`, a *partially* degraded blend cell):
+    ///    shipped **44.72 dB**, which still **passes** the ≥40 dB floor, but the separation falls to
+    ///    **13.25 dB** and only the `>= 20.0` guard catches it. This is why the separation bound is
+    ///    load-bearing at 20.0 (0.98 dB of slack) rather than a nominal number.
     ///
     /// Two notes on what this test deliberately does **not** claim. The *sharp* guard on head globality
     /// is `decoder_tail_is_crop_decomposable_but_the_head_is_not` above: with overlap and blending,
     /// tiling this fixture's attention costs only ~1-6 dB, so a blended-PSNR bound is **not** relied on
-    /// to catch it. And deleting the final `broadcast_div` by the accumulated weights was measured to
-    /// be a *no-op* here (74.2724 dB either way) — the trapezoidal masks really do sum to exactly 1.0
-    /// under full coverage, so that division normalizes nothing at these dims and is not a guard this
-    /// test can hold.
+    /// to catch it. And deleting the final `broadcast_div` by the accumulated weights was re-measured
+    /// at 192/48 to be a *no-op* here (`output.broadcast_div(..)` → `Ok(output)`: shipped stays
+    /// **52.45 dB**, bit-identical to the unmutated run) — the trapezoidal masks really do sum to
+    /// exactly 1.0 under full coverage, so that division normalizes nothing at these dims and is not
+    /// a guard this test can hold.
     #[test]
     fn head_tail_split_is_load_bearing_vs_whole_decoder_tiling() {
         let dev = Device::Cpu;
@@ -1357,7 +1374,8 @@ mod tests {
             full_res_channels: 128,
         };
         assert!(
-            TilingConfig::spatial_only(512, 128).needs_tiling(vae, 1, 80, 80),
+            TilingConfig::spatial_only(DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32)
+                .needs_tiling(vae, 1, 80, 80),
             "the production gate must tile an 80²-head, else arm A never exercises tiling"
         );
         let shipped = dec.decode_with(&latent, true).unwrap();
@@ -1394,7 +1412,7 @@ mod tests {
              floor above proves nothing; PSNR={defect_psnr:.2} dB"
         );
         assert!(
-            shipped_psnr - defect_psnr >= 25.0,
+            shipped_psnr - defect_psnr >= 20.0,
             "the head/tail split must buy a large margin over whole-decoder tiling; \
              shipped={shipped_psnr:.2} dB defect={defect_psnr:.2} dB"
         );
@@ -1502,7 +1520,7 @@ mod tests {
         let cfg = DcAeConfig::tiny_test();
         let w = synthetic_weights(&cfg, true, false, &dev);
         let dec = DcAeDecoder::from_weights(&w, cfg.clone()).unwrap();
-        // 80²-head so the production `spatial_only(512, 128)` gate (s_tile = 64 head-px) genuinely
+        // 80²-head so the production `spatial_only(192, 48)` gate (s_tile = 24 head-px) genuinely
         // splits when the budget forces tiling — a smaller head would fall through to a single pass.
         let latent = det(&[1, cfg.latent_channels as usize, 80, 80], 51, &dev);
         let vae = VaeTiling {
@@ -1512,7 +1530,8 @@ mod tests {
             full_res_channels: 128, // mirrors the production tail; the write bound is not under test
         };
         assert!(
-            TilingConfig::spatial_only(512, 128).needs_tiling(vae, 1, 80, 80),
+            TilingConfig::spatial_only(DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32)
+                .needs_tiling(vae, 1, 80, 80),
             "the production gate must tile an 80²-head so the tiled branch is exercised"
         );
         let single = dec.decode(&latent).unwrap();

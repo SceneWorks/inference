@@ -22,6 +22,7 @@ use std::path::Path;
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result};
 
+use crate::quant::QLinear;
 use crate::transformer::Ideogram4Transformer;
 
 /// Recognized `(down, up)` suffix pairs, most-specific first.
@@ -99,6 +100,20 @@ pub fn install_turbo_lora_additive_with_report(
     lora_path: &Path,
     scale: f32,
 ) -> Result<TurboLoraReport> {
+    let device = dit.device();
+    install_turbo_lora_additive_for_visitor(&device, lora_path, scale, |visitor| {
+        dit.visit_adaptable_mut(visitor)
+    })
+}
+
+/// Apply the bundled TurboTime receipt to an exact subset of a streamed DiT. The caller owns the
+/// subset visitor; this is the same resolver and additive math as the resident whole-model path.
+pub(crate) fn install_turbo_lora_additive_for_visitor(
+    device: &Device,
+    lora_path: &Path,
+    scale: f32,
+    visit: impl FnOnce(&mut dyn FnMut(&str, &mut QLinear) -> Result<()>) -> Result<()>,
+) -> Result<TurboLoraReport> {
     if !lora_path.exists() {
         return Err(Error::Msg(format!(
             "ideogram turbo: TurboTime LoRA not found at {} (a turbo snapshot must ship it alongside transformer/)",
@@ -142,11 +157,10 @@ pub fn install_turbo_lora_additive_with_report(
     // are read on the CPU but the base lives on the DiT device (CUDA on a packed tier), so move them at
     // push. A factor whose dims don't match the projection is surfaced as skipped, never a crashing
     // forward (the additive twin of the fold path's shape guard).
-    let device = dit.device();
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
     let mut skipped = 0usize;
-    dit.visit_adaptable_mut(&mut |path, lin| {
+    visit(&mut |path, lin| {
         if let Some(p) = pending.get(path) {
             matched.insert(path.to_string());
             let (out_f, in_f) = lin.base_shape();
@@ -154,7 +168,7 @@ pub fn install_turbo_lora_additive_with_report(
                 skipped += 1;
                 return Ok(());
             }
-            lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+            lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale);
             applied += 1;
         }
         Ok(())
