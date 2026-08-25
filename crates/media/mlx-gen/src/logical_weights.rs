@@ -39,7 +39,7 @@
 //! The receipt's measured bytes equal the plan's `resident_bytes()`; that pair is the
 //! packed-vs-dense pricing seam admission reads.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -567,8 +567,16 @@ fn measure_residency(
 ) -> Result<Vec<CodecResidencyReport>> {
     let mut by_codec: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
     let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+    // Source bytes are attributed per **distinct physical key**, matching
+    // `gen_core::checkpoint_facts::SourceCodecSummary`'s rule. A fused stored tensor feeding
+    // several logical outputs (sc-21547) must contribute its bytes once, or the row exceeds its
+    // own source-inventory entry and `CheckpointWeightFacts` refuses a valid load (sc-21484
+    // review). Tensor counts and resident bytes stay per-logical: each output is separately
+    // decoded and separately occupies memory.
+    let mut counted_physical: BTreeSet<&str> = BTreeSet::new();
     for tensor in &plan.tensors {
         codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+        let first_sighting = counted_physical.insert(tensor.physical_key.as_str());
         let array = logical.require(&tensor.logical_key)?;
         let resident_bytes = u64::try_from(array.nbytes()).map_err(|_| {
             Error::Msg(format!(
@@ -590,30 +598,38 @@ fn measure_residency(
                 resident_bytes: 0,
             });
         report.tensor_count += 1;
-        report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+        if first_sighting {
+            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+        }
         report.resident_bytes = report.resident_bytes.saturating_add(resident_bytes);
     }
     for companion in &plan.companions {
         let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
             continue;
         };
+        // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
+        // this seam — so every companion is consumed by its decode and retains nothing. Adding
+        // the plan's own number in would make the receipt a *copy* of the plan on exactly the
+        // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
+        // packed policy ever reaches this backend, the read refuses rather than silently
+        // agreeing with a residency it never measured.
+        //
+        // Checked BEFORE the distinct-key dedup below, so a companion whose bytes are already
+        // attributed still cannot smuggle a retained residency past this refusal.
+        if companion.resident_bytes != 0 {
+            return Err(Error::Msg(format!(
+                "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
+                 this backend decodes every codec through its dense fallback and measures no \
+                 retained companion; replan with a dense residency policy, or teach \
+                 `measure_residency` to measure the retained form",
+                companion.physical_key, companion.resident_bytes
+            )));
+        }
+        if !counted_physical.insert(companion.physical_key.as_str()) {
+            continue;
+        }
         if let Some(report) = by_codec.get_mut(codec_id) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-            // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
-            // this seam — so every companion is consumed by its decode and retains nothing. Adding
-            // the plan's own number in would make the receipt a *copy* of the plan on exactly the
-            // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
-            // packed policy ever reaches this backend, the read refuses rather than silently
-            // agreeing with a residency it never measured.
-            if companion.resident_bytes != 0 {
-                return Err(Error::Msg(format!(
-                    "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
-                     this backend decodes every codec through its dense fallback and measures no \
-                     retained companion; replan with a dense residency policy, or teach \
-                     `measure_residency` to measure the retained form",
-                    companion.physical_key, companion.resident_bytes
-                )));
-            }
         }
     }
     Ok(by_codec.into_values().collect())

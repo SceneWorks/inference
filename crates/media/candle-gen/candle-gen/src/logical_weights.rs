@@ -41,7 +41,7 @@
 //! dense = logical shape × bf16) and the receipt measures the same quantity from what was actually
 //! materialized; the reader asserts nothing silently.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -525,6 +525,12 @@ impl LogicalWeightReader {
         on_disk.sort_unstable();
         let mut planned: Vec<&str> = plan.all_physical_keys().collect();
         planned.sort_unstable();
+        // A **set** comparison: `all_physical_keys` yields one item per logical tensor, so a fused
+        // physical tensor feeding several logical outputs (sc-21547) appears once per output.
+        // Without the dedup a perfectly valid fused plan would be refused here as "unplanned
+        // tensors present", which is a statement about the file that is simply false — the file
+        // holds exactly the keys the plan names, once each.
+        planned.dedup();
         if on_disk
             .iter()
             .map(String::as_str)
@@ -608,6 +614,21 @@ impl LogicalWeightReader {
     /// the receipt covers the plan's whole surface: its per-codec `resident_bytes` are directly
     /// comparable to the plan's pricing and its `source_bytes` total the plan's
     /// (weights + companions + descriptor payloads all attributed).
+    ///
+    /// # Source bytes count each *physical* tensor once
+    ///
+    /// `source_bytes` — both the receipt's total and each row's — accumulates over **distinct
+    /// physical keys**, matching `gen_core::checkpoint_facts::SourceCodecSummary`'s rule exactly.
+    /// The two are independent producers of the same quantity and
+    /// [`CheckpointWeightFacts::new`] cross-checks them, so they must use the same rule or a
+    /// perfectly valid load fails validation.
+    ///
+    /// This matters as soon as one stored tensor feeds several logical outputs (a fused QKV
+    /// projection split at read time, sc-21547): accumulating per *logical* tensor would report
+    /// the fused tensor's bytes two or three times, pushing the receipt above the file's real size
+    /// and firing `SourceBytesExceedPlan` on a correct read. `tensor_count` and `resident_bytes`
+    /// stay **per logical row** — each logical output is separately counted and separately
+    /// occupies memory; only the source bytes are shared.
     pub fn receipt(&self) -> LogicalWeightReceipt {
         let measured = self
             .measured
@@ -619,6 +640,10 @@ impl LogicalWeightReader {
             BTreeMap::new();
         let mut tensor_count = 0usize;
         let mut source_bytes = 0u64;
+        // Physical keys whose source bytes have already been attributed — the distinct-key rule
+        // this method's doc states, shared by the tensor loop and the companion loop below so a
+        // fused physical tensor is counted once across both.
+        let mut counted_physical: BTreeSet<&str> = BTreeSet::new();
         for tensor in &self.plan.tensors {
             let Some(resident) = measured.get(&tensor.logical_key) else {
                 continue;
@@ -631,7 +656,12 @@ impl LogicalWeightReader {
             let key = (tensor.codec_id, representation);
             codec_by_owner.insert(tensor.physical_key.as_str(), key);
             tensor_count += 1;
-            source_bytes = source_bytes.saturating_add(tensor.source_bytes);
+            // Logical: every materialized output counts. Physical: only the first output of a
+            // fused stored tensor carries its bytes.
+            let first_sighting = counted_physical.insert(tensor.physical_key.as_str());
+            if first_sighting {
+                source_bytes = source_bytes.saturating_add(tensor.source_bytes);
+            }
             let report = residency.entry(key).or_insert(CodecResidencyReport {
                 codec_id: tensor.codec_id,
                 representation,
@@ -640,7 +670,9 @@ impl LogicalWeightReader {
                 resident_bytes: 0,
             });
             report.tensor_count += 1;
-            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+            if first_sighting {
+                report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+            }
             // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] read
             // it off the decoded value itself — including the scale companions a packed load
             // retained, which the packed variant *owns* (it holds them as f32 values, not as file
@@ -650,11 +682,16 @@ impl LogicalWeightReader {
             report.resident_bytes = report.resident_bytes.saturating_add(*resident);
         }
         // A companion's source bytes belong to the codec row of the layer that owns it, and only
-        // once that layer has actually materialized.
+        // once that layer has actually materialized. The same distinct-physical-key set carries
+        // over from the tensor loop, so a companion shared by several fused owners (or one whose
+        // key a weight row already claimed) is likewise counted once.
         for companion in &self.plan.companions {
             let Some(key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
                 continue;
             };
+            if !counted_physical.insert(companion.physical_key.as_str()) {
+                continue;
+            }
             source_bytes = source_bytes.saturating_add(companion.source_bytes);
             if let Some(report) = residency.get_mut(key) {
                 report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
@@ -1013,6 +1050,7 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gen_core::checkpoint_codec::PlannedResidency;
 
     struct StripModel;
 
@@ -2856,6 +2894,109 @@ mod tests {
         assert!(
             error.contains("tensor set changed since planning"),
             "{error}"
+        );
+    }
+
+    /// A **fused physical tensor** — one stored tensor feeding several logical outputs, the shape
+    /// sc-21547's declarative transforms produce — must have its source bytes counted **once** by
+    /// [`LogicalWeightReader::receipt`], because `SourceCodecSummary::of` counts them once and
+    /// [`CheckpointWeightFacts::new`] cross-checks the two.
+    ///
+    /// This is the sc-21484 review's major finding, driven end to end through a real reader rather
+    /// than a hand-built receipt: before the fix `receipt()` accumulated `source_bytes` per
+    /// **logical** tensor, so this two-output fused plan reported 32 source bytes for a 16-byte
+    /// file and every `checkpoint_weight_facts()` call on a fused plan hard-errored with
+    /// `SourceBytesExceedPlan` on a completely valid load.
+    ///
+    /// # Mutation
+    ///
+    /// Drop the `if first_sighting` guard in `receipt()`'s tensor loop (accumulate unconditionally,
+    /// as before): `receipt.source_bytes` becomes 32, the `facts` construction below fails with
+    /// `SourceBytesExceedPlan { measured_bytes: 32, planned_bytes: 16 }`, and this test goes red at
+    /// the `expect("the fused load is valid")`.
+    #[test]
+    fn a_fused_physical_tensors_source_bytes_are_counted_once_in_the_receipt() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused.safetensors");
+        // One 2x2 F32 tensor: 16 bytes on disk, 16 bytes resident per dense decode.
+        const FUSED_BYTES: u64 = 16;
+        write_safetensors(
+            &path,
+            &[(
+                "fused.qkv",
+                "F32",
+                &[2, 2],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            )],
+        );
+
+        // The fused plan: two logical outputs, one physical key. Built by hand because the
+        // declarative transform that emits this shape lands in sc-21547 (PR #808); the *contract*
+        // it will rely on is what this test pins.
+        let fused_entry = |logical_key: &str| LogicalTensorPlan {
+            logical_key: logical_key.to_owned(),
+            physical_key: "fused.qkv".to_owned(),
+            encoding: WeightEncoding::DenseF32,
+            shape: vec![2, 2],
+            source_bytes: FUSED_BYTES,
+            codec_id: DENSE_F32_CODEC.codec_id,
+            resident_encoding: WeightEncoding::DenseF32,
+            codec: TensorCodecSpec::Dense,
+            residency: PlannedResidency {
+                mode: ResidencyMode::Dense,
+                resident_bytes: FUSED_BYTES,
+            },
+        };
+        let plan = LogicalWeightPlan {
+            mapping_id: "fused-test-v1",
+            tensors: vec![fused_entry("attn.to_q"), fused_entry("attn.to_k")],
+            companions: vec![],
+            // The file's real data region: the fused tensor, once.
+            source_bytes: FUSED_BYTES,
+        };
+
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            NativeExecutionCapability::dense_only(),
+        )
+        .expect("a fused plan names exactly the file's tensor set");
+        reader.read("attn.to_q").expect("first logical output");
+        reader.read("attn.to_k").expect("second logical output");
+
+        let receipt = reader.receipt();
+        assert_eq!(receipt.tensor_count, 2, "two LOGICAL outputs materialized");
+        assert_eq!(
+            receipt.source_bytes, FUSED_BYTES,
+            "one PHYSICAL tensor's source bytes, counted once"
+        );
+        assert_eq!(receipt.residency.len(), 1);
+        let row = &receipt.residency[0];
+        assert_eq!(row.tensor_count, 2);
+        assert_eq!(row.source_bytes, FUSED_BYTES, "the row obeys the same rule");
+        assert_eq!(
+            row.resident_bytes,
+            FUSED_BYTES * 2,
+            "resident bytes stay per-logical: both outputs really do occupy memory"
+        );
+
+        // The whole point: this receipt validates against the plan it came from.
+        let facts = reader
+            .checkpoint_weight_facts()
+            .expect("the fused load is valid");
+        assert!(facts.is_complete());
+        assert_eq!(
+            facts
+                .source()
+                .entry(DENSE_F32_CODEC.codec_id)
+                .unwrap()
+                .source_bytes,
+            FUSED_BYTES,
+            "both accountings of the fused tensor's source bytes agree"
         );
     }
 }

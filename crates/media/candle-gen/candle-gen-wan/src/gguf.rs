@@ -42,9 +42,10 @@ use candle_gen::candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_gen::candle_core::{Device, Error as CError, Result as CResult, Shape, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    CheckpointCodecRegistry, CodecResidencyReport, ExecutionRepresentation, LogicalKeyMapping,
-    LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
-    PlannedResidency, ResidencyMode, TensorCodecSpec, WeightEncoding, GGUF_CONTAINER_CODEC,
+    CheckpointCodecRegistry, CheckpointWeightFacts, CodecResidencyReport, ExecutionRepresentation,
+    LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan,
+    LogicalWeightReceipt, NativeExecutionCapability, PlannedResidency, ResidencyMode,
+    TensorCodecSpec, WeightEncoding, GGUF_CONTAINER_CODEC,
 };
 
 use crate::comfyui::remap_wan_key;
@@ -92,6 +93,28 @@ pub fn load_wan_dit_gguf_with_receipt(
     let receipt = dit.receipt().clone();
     let transformer = WanTransformer::from_gguf(cfg, &dit)?;
     Ok((transformer, receipt))
+}
+
+/// `load_wan_dit_gguf` plus the read's [`CheckpointWeightFacts`] (sc-21484) — the **three
+/// correlated facts** rather than the receipt alone: what the source stores
+/// (`gguf-container-v1`), what this host can execute in that stored packing (ggml blocks —
+/// unconditionally, since their residency is host-independent), and what actually materialized,
+/// split per [`ExecutionRepresentation`].
+///
+/// This is the surface a consumer across the worker boundary reads to distinguish "the source is a
+/// GGUF container" from "this run held it packed", without joining a plan and a receipt by hand.
+/// Prefer it to [`load_wan_dit_gguf_with_receipt`] for anything that renders a user-visible model
+/// fact; the receipt alone cannot say whether the packing was executed or merely stored.
+pub fn load_wan_dit_gguf_with_facts(
+    path: &Path,
+    cfg: &TransformerConfig,
+    device: &Device,
+    dtype: candle_gen::candle_core::DType,
+) -> CResult<(WanTransformer, CheckpointWeightFacts)> {
+    let dit = GgufDit::open(path, device, dtype)?;
+    let facts = dit.checkpoint_weight_facts()?;
+    let transformer = WanTransformer::from_gguf(cfg, &dit)?;
+    Ok((transformer, facts))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -485,6 +508,10 @@ pub(crate) struct GgufDit {
     /// The DiT compute dtype (bf16) dense sidecars are cast to on read — matching the dense path's
     /// `VarBuilder::get` cast, so the GGUF and snapshot builds agree tensor-for-tensor on the sidecars.
     dtype: candle_gen::candle_core::DType,
+    /// The plan the read was compiled from, retained so [`GgufDit::checkpoint_weight_facts`] can
+    /// correlate it with the receipt (sc-21484). It holds header-derived metadata only — no
+    /// payload — so keeping it costs nothing next to the resident `QTensor`s.
+    plan: LogicalWeightPlan,
     /// The receipt of the read that produced this DiT: mapping id, tensor count, and the
     /// **measured** container residency (see [`GgufDit::receipt`]).
     receipt: LogicalWeightReceipt,
@@ -568,6 +595,7 @@ impl GgufDit {
             tensors,
             device: device.clone(),
             dtype,
+            plan,
             receipt,
         })
     }
@@ -576,6 +604,43 @@ impl GgufDit {
     /// materialized `QTensor`s, never copied from the plan.
     pub(crate) fn receipt(&self) -> &LogicalWeightReceipt {
         &self.receipt
+    }
+
+    /// The **host capability** this reader renders (sc-21484): `gguf-container-v1` executes in its
+    /// stored packing, **unconditionally**.
+    ///
+    /// Unlike candle-gen's `CandleCodecResidency::native_execution_capability`, this is not probed,
+    /// because there is nothing host-dependent to probe. A ggml block stays resident as stored on
+    /// every device this crate runs on — CPU, CUDA, Metal alike — and the forward dequantizes it
+    /// per matmul ([`candle_gen::quant::MatmulStrategy::DequantDense`]). There is no compute-
+    /// capability floor to clear and no dense-fallback arm to fall to: `compile_gguf_dit_plan`
+    /// prices **every** entry [`ResidencyMode::Packed`], so a host that could not honour that would
+    /// have no second path to take.
+    ///
+    /// This is the declaration [`GgufDit::checkpoint_weight_facts`] validates the receipt's
+    /// `NativePacked` rows against. Without it the facts constructor would refuse every valid GGUF
+    /// load with `NativeWithoutCapability`, since no other backend's capability names this codec.
+    pub(crate) fn native_execution_capability() -> NativeExecutionCapability {
+        NativeExecutionCapability::new([GGUF_CONTAINER_CODEC.codec_id])
+    }
+
+    /// The **three correlated facts** about this GGUF load (sc-21484): the source-codec inventory
+    /// compiled from the retained plan, this reader's host capability, and the measured receipt —
+    /// validated against each other by [`CheckpointWeightFacts::new`].
+    ///
+    /// There is no [`gen_core::checkpoint_facts::SourceBinding`] here: the GGUF route reads its
+    /// path from the [`GGUF_ENV`] seam rather than from a re-verifiable `PinnedWeightsFile`, so
+    /// these facts describe the load without claiming a verified source identity.
+    ///
+    /// Errors only when the plan and the receipt already disagree, which on this reader means a
+    /// contract bug rather than input.
+    pub(crate) fn checkpoint_weight_facts(&self) -> CResult<CheckpointWeightFacts> {
+        CheckpointWeightFacts::new(
+            &self.plan,
+            Self::native_execution_capability(),
+            self.receipt.clone(),
+        )
+        .map_err(|error| CError::msg(error.to_string()))
     }
 
     /// The resident tensor at diffusers `key`, or a **loud** error naming the missing key (a renamed /
@@ -979,6 +1044,61 @@ mod tests {
             .map(|qt| qt.storage_size_in_bytes() as u64)
             .sum();
         assert_eq!(receipt.resident_bytes(), measured);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **sc-21484 review (major): the GGUF receipt must survive `CheckpointWeightFacts::new`.**
+    ///
+    /// The receipt reports its rows `NativePacked` (every GGUF entry is planned `Packed`), and
+    /// `CheckpointWeightFacts` refuses a native row no host capability licenses. No *other*
+    /// backend's capability names `gguf-container-v1` — candle-gen's probes only the fp8 and NVFP4
+    /// compute-capability floors — so without [`GgufDit::native_execution_capability`] every valid
+    /// GGUF load would hard-error with `NativeWithoutCapability`.
+    ///
+    /// This also exercises the completeness equality added in the same review: the read covers the
+    /// whole plan, so the packed row must equal the plan's pricing exactly, not merely fit under
+    /// it.
+    ///
+    /// # Mutation
+    ///
+    /// Return `NativeExecutionCapability::dense_only()` from `native_execution_capability()`:
+    /// `checkpoint_weight_facts()` fails with a `NativeWithoutCapability` message naming
+    /// `gguf-container-v1` and this test goes red at the `expect`.
+    #[test]
+    fn the_gguf_receipt_builds_valid_checkpoint_weight_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = gguf_cfg();
+        let tensors = native_wan_tensors(&cfg);
+        let path = write_gguf(&tmp, &tensors, "facts");
+
+        let dit = GgufDit::open(&path, &Device::Cpu, DType::F32).expect("the container opens");
+        let facts = dit
+            .checkpoint_weight_facts()
+            .expect("the GGUF receipt is valid against its own plan and capability");
+
+        // Fact 2 — the source stores `gguf-container-v1`.
+        assert!(facts.source().declares(GGUF_CONTAINER_CODEC.codec_id));
+        // Fact 3 — and it really executed in that stored packing, on a plain CPU host.
+        assert!(
+            facts.executes_natively(GGUF_CONTAINER_CODEC.codec_id),
+            "ggml blocks stay resident as stored on every device"
+        );
+        assert!(
+            facts
+                .capability()
+                .executes_natively(GGUF_CONTAINER_CODEC.codec_id),
+            "the capability is what licenses the native label"
+        );
+        assert!(!facts.capability().is_dense_only());
+        // The read covered the whole plan, so planned and measured are pinned equal.
+        assert!(facts.is_complete());
+        assert_eq!(facts.resident_bytes(), dit.plan.resident_bytes());
+        assert!(facts
+            .materialized_as(
+                GGUF_CONTAINER_CODEC.codec_id,
+                ExecutionRepresentation::DenseFallback
+            )
+            .is_none());
         std::fs::remove_file(&path).ok();
     }
 

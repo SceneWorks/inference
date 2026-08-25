@@ -1583,6 +1583,7 @@ mod tests {
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
+    use candle_gen::gen_core::checkpoint_facts::ExecutionRepresentation;
     use candle_gen::quant::Nvfp4Tensor;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2655,12 +2656,25 @@ mod tests {
         let nvfp4_row = receipt
             .residency
             .iter()
-            .find(|row| row.codec_id == NVFP4_CODEC.codec_id)
-            .expect("the materialized NVFP4 row is reported");
+            // Keyed on the FULL row identity. Matching on `codec_id` alone would silently accept
+            // a `NativePacked` row here — the exact confusion sc-21484 split the rows to prevent —
+            // so this half must name `DenseFallback` and fail if the reader produced anything else.
+            .find(|row| {
+                row.codec_id == NVFP4_CODEC.codec_id
+                    && row.representation == ExecutionRepresentation::DenseFallback
+            })
+            .expect("the materialized NVFP4 row is reported as a dense fallback");
         assert_eq!(nvfp4_row.tensor_count, 1);
         assert_eq!(
             nvfp4_row.resident_bytes, planned.residency.resident_bytes,
             "the measured dense-fallback residency must equal the plan's declared pricing"
+        );
+        assert!(
+            receipt
+                .residency
+                .iter()
+                .all(|row| row.representation == ExecutionRepresentation::DenseFallback),
+            "a CPU load has no native-packed row at all"
         );
 
         let preserved = linear_detect_planned(&w, "img_in", false, &plan)?;
@@ -2713,6 +2727,23 @@ mod tests {
         assert_eq!(
             binding.canonical_path(),
             std::fs::canonicalize(&path).unwrap()
+        );
+        // The **stable** renderable surface (sc-21484 review): size and a token that mean the same
+        // thing on every OS, unlike the cfg-gated `FileStatFingerprint`.
+        assert_eq!(
+            binding.size_bytes(),
+            std::fs::metadata(&path).unwrap().len(),
+            "size_bytes is the target's real size"
+        );
+        assert_eq!(
+            binding.stable_token(),
+            format!("kreamania_variant7.safetensors@{}", binding.size_bytes()),
+            "the token is `<file-name>@<size>` — no separators, no inode, no machine-local path"
+        );
+        assert_eq!(binding.to_string(), binding.stable_token());
+        assert!(
+            !binding.stable_token().contains(std::path::MAIN_SEPARATOR),
+            "a stable token must not carry a platform-specific path separator"
         );
 
         // ---- the forced-packed (sm_120-equivalent) host: same source, native execution -------
@@ -2805,8 +2836,14 @@ mod tests {
         let nvfp4_row = receipt
             .residency
             .iter()
-            .find(|row| row.codec_id == NVFP4_CODEC.codec_id)
-            .expect("the materialized NVFP4 row is reported");
+            // The packed arm, named explicitly: `codec_id` alone would pass on a dense-fallback
+            // row and this test's whole point is that the forced-packed route produced a
+            // *native* one.
+            .find(|row| {
+                row.codec_id == NVFP4_CODEC.codec_id
+                    && row.representation == ExecutionRepresentation::NativePacked
+            })
+            .expect("the materialized NVFP4 row is reported as native-packed");
         assert_eq!(nvfp4_row.tensor_count, 1);
         let companions: u64 = w
             .logical_plan()

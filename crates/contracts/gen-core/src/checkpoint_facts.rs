@@ -12,10 +12,19 @@
 //!    [`LogicalWeightPlan`]: per codec row, how many logical tensors and how many source bytes.
 //!    A checkpoint whose projections are stored `nvfp4-v1` says so here **on every host**,
 //!    including hosts that cannot execute NVFP4 natively.
-//! 3. **What did this host actually materialize?** — the measured
-//!    [`LogicalWeightReceipt`], now split per **[`ExecutionRepresentation`]** so a
-//!    `nvfp4-v1` row that ran the packed W4A4 operand and a `nvfp4-v1` row that decoded to dense
-//!    BF16 are *different rows*, not one indistinguishable total.
+//! 3. **What did this host actually materialize?** — the [`LogicalWeightReceipt`], now split per
+//!    **[`ExecutionRepresentation`]** so a `nvfp4-v1` row that ran the packed W4A4 operand and a
+//!    `nvfp4-v1` row that decoded to dense BF16 are *different rows*, not one indistinguishable
+//!    total.
+//!
+//!    **How strong is "materialized"?** The resident *bytes* on a row are measured — read off the
+//!    decoded value itself. The row's [`ExecutionRepresentation`] is
+//!    **plan-dispatched-and-refusal-enforced rather than independently measured**: the reader
+//!    dispatches the decode on the planned [`ResidencyMode`] and any arm it cannot honour is a
+//!    typed refusal (a `Packed` fp8 plan on a build without CUDA errors; it never silently
+//!    substitutes a dense decode), so plan mode and outcome cannot diverge without an error. A
+//!    consumer should read the label as "this run dispatched, and was refused any chance to
+//!    deviate from, the packed operand" — not as a post-hoc probe of the kernel that ran.
 //!
 //! [`CheckpointWeightFacts`] carries all three together and **validates** their correlation, so
 //! the three can be read separately without any of them drifting from the others:
@@ -29,8 +38,25 @@
 //!   native, because there is no capability to license the label and no planned packed pricing to
 //!   measure against.
 //! * Nothing may exceed the plan: the receipt is measured over what has materialized *so far*, so
-//!   every count and byte total is `<=` the plan's, and equal once the load is complete
-//!   ([`CheckpointWeightFacts::is_complete`]).
+//!   every count and byte total is `<=` the plan's — including **per codec row**, where a row's
+//!   `source_bytes` may not exceed its own inventory entry's (the bound that catches a receipt
+//!   double-counting a fused physical tensor even when the file-wide total still fits).
+//! * **And equal once the load is complete.** When the receipt is
+//!   [`LogicalReadMaterialization::Materialized`] and covers the plan's whole tensor surface
+//!   ([`CheckpointWeightFacts::is_complete`]), `<=` is upgraded to `==`: every planned
+//!   `(codec, representation)` row with a non-zero count must be present in the receipt with
+//!   *exactly* the planned tensor count and resident bytes
+//!   ([`CheckpointWeightFactsError::CompleteResidencyDisagrees`]). Bounding only from above would
+//!   accept a complete load that silently **under**-reports what it is holding, which is the same
+//!   class of untruth as over-reporting and the one a footprint gate would swallow.
+//!
+//! # Not every source produces facts
+//!
+//! Facts require a compiled [`LogicalWeightPlan`] over a single pinned file. A **directory-sourced
+//! import** — a diffusers tree, or a packed-tier variant resolved to a folder — has no such plan
+//! and no [`SourceBinding`], so the accessors on those loaders return `Ok(None)` rather than
+//! fabricating an inventory. `Ok(None)` means "this source shape does not answer these questions";
+//! it never means "the source stores nothing quantized".
 //!
 //! # Why the source inventory counts a physical tensor once
 //!
@@ -112,6 +138,26 @@ impl NativeExecutionCapability {
     }
 
     /// Declare the codec rows this host executes natively.
+    ///
+    /// # Who may call this
+    ///
+    /// **Only a backend rendering its own probed residency policy.** The AC3 guarantee — that a
+    /// host below a native floor cannot produce facts labelling its run native — rests entirely on
+    /// the capability being a *rendering of a probe*, never an assertion made by a consumer who
+    /// would like the answer to be yes. This constructor is public because the backend crates that
+    /// render it are downstream of this one, not because it is a general-purpose builder.
+    ///
+    /// The sanctioned producers are:
+    ///
+    /// * `candle_gen::logical_weights::CandleCodecResidency::native_execution_capability` — the
+    ///   probed CUDA compute-capability floors, and the only producer of a *non-empty* capability.
+    /// * `candle_gen_wan`'s GGUF reader, whose ggml block residency is host-independent (see
+    ///   `GgufDit::native_execution_capability`).
+    /// * [`NativeExecutionCapability::dense_only`], for every dense-only backend (mlx-gen, CPU,
+    ///   Metal) — prefer it to `new([])`, since it says *why* the set is empty.
+    ///
+    /// Anything else calling this is asserting a hardware fact it did not probe. Tests are the one
+    /// exception, and only to construct the host they are simulating.
     pub fn new(codec_ids: impl IntoIterator<Item = &'static str>) -> Self {
         Self {
             native_codec_ids: codec_ids.into_iter().collect(),
@@ -162,8 +208,51 @@ impl SourceBinding {
     }
 
     /// Mutation-sensitive identity of the resolved target.
+    ///
+    /// **Platform-dependent by construction** — [`FileStatFingerprint`]'s fields are `cfg`-gated
+    /// (device/inode on unix, volume serial + file id on windows), so this is the right thing to
+    /// *compare* on one host and the wrong thing to render into a cross-host artifact. Use
+    /// [`SourceBinding::stable_token`] for anything that leaves the process.
     pub fn target_fingerprint(&self) -> &FileStatFingerprint {
         &self.target_fingerprint
+    }
+
+    /// The resolved target's size in bytes — the one identity field every platform has.
+    pub fn size_bytes(&self) -> u64 {
+        self.target_fingerprint.size
+    }
+
+    /// A **stable, host-independent** rendering of this binding, safe to write into asset metadata
+    /// or a model fact that a different OS may later read.
+    ///
+    /// The form is `"<file-name>@<size-bytes>"` — the target's final path component and its byte
+    /// size, both of which mean the same thing on every platform. Deliberately excluded: the full
+    /// canonical path (leaks a machine-local layout, and separators differ), and every `cfg`-gated
+    /// [`FileStatFingerprint`] field (inode/file-id/change-time exist on one platform and not the
+    /// other, so a token carrying them would compare unequal across hosts for identical bytes).
+    ///
+    /// This is an **identity label, not a content hash**: it re-verifies nothing on its own. The
+    /// verification is [`SourceBinding::verify`], which already ran when this binding was built.
+    /// Two different files of equal size and name render the same token, so treat it as a
+    /// human-readable handle rather than a uniqueness proof.
+    ///
+    /// A target whose name is not valid UTF-8 renders as `"<non-utf8-name>@<size>"`; the token is
+    /// always printable.
+    pub fn stable_token(&self) -> String {
+        let name = self
+            .canonical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-utf8-name>");
+        format!("{name}@{}", self.size_bytes())
+    }
+}
+
+impl fmt::Display for SourceBinding {
+    /// Renders [`SourceBinding::stable_token`] — the host-independent form, so a `{binding}` in a
+    /// log or a serialized fact cannot accidentally become platform-specific.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.stable_token())
     }
 }
 
@@ -225,14 +314,34 @@ pub struct SourceCodecSummary {
 
 impl SourceCodecSummary {
     /// Compile the inventory from a plan. Pure — it reads the plan and nothing else.
-    pub fn of(plan: &LogicalWeightPlan) -> Self {
+    ///
+    /// Fails only on [`CheckpointWeightFactsError::PhysicalKeyCodecCollision`]: a plan in which one
+    /// physical tensor is claimed by two different codecs has no single right answer for whose row
+    /// its source bytes belong to, and picking one by iteration order would attribute them
+    /// silently and unrepeatably.
+    pub fn of(plan: &LogicalWeightPlan) -> Result<Self, CheckpointWeightFactsError> {
         // Codec row → accumulator. Source bytes are accumulated over *distinct physical keys*, so
         // a fused physical tensor feeding several logical outputs is counted once.
+        //
+        // `counted_physical` is global across codec rows rather than per row, which is only sound
+        // because a physical key belongs to exactly one codec — the invariant the collision check
+        // immediately below *enforces* rather than assumes. Without it, a key carrying two codec
+        // ids would have its bytes attributed to whichever row this loop reached first.
         let mut entries: BTreeMap<&'static str, SourceCodecEntry> = BTreeMap::new();
         let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
         let mut counted_physical: BTreeSet<&str> = BTreeSet::new();
         for tensor in &plan.tensors {
-            codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+            if let Some(previous) =
+                codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id)
+            {
+                if previous != tensor.codec_id {
+                    return Err(CheckpointWeightFactsError::PhysicalKeyCodecCollision {
+                        physical_key: tensor.physical_key.clone(),
+                        first_codec_id: previous,
+                        second_codec_id: tensor.codec_id,
+                    });
+                }
+            }
             let entry = entries
                 .entry(tensor.codec_id)
                 .or_insert_with(|| SourceCodecEntry {
@@ -289,12 +398,12 @@ impl SourceCodecSummary {
                     .saturating_add(companion.resident_bytes);
             }
         }
-        Self {
+        Ok(Self {
             mapping_id: plan.mapping_id,
             entries: entries.into_values().collect(),
             source_bytes: plan.source_bytes,
             tensor_count: plan.tensor_count(),
-        }
+        })
     }
 
     /// The inventory row for one codec, or `None` when the source stores nothing in it.
@@ -347,6 +456,37 @@ pub enum CheckpointWeightFactsError {
     SourceBytesExceedPlan {
         measured_bytes: u64,
         planned_bytes: u64,
+    },
+    /// The receipt's rows for one codec account, **together**, for more source bytes than the
+    /// source inventory holds for that codec.
+    ///
+    /// This is the bound that actually cross-checks the two accountings. The file-wide
+    /// [`CheckpointWeightFactsError::SourceBytesExceedPlan`] total can still fit comfortably while
+    /// one codec's rows double-count a fused physical tensor, and summing the codec's rows (rather
+    /// than checking each in isolation) catches the split case too — a fused tensor whose logical
+    /// outputs landed in different representations, where neither row alone exceeds the entry.
+    CodecSourceBytesExceedEntry {
+        codec_id: &'static str,
+        measured_bytes: u64,
+        entry_bytes: u64,
+    },
+    /// A **complete** materialization's residency does not exactly equal the plan's pricing.
+    /// Bounding only from above would let a finished load under-report what it holds; once the
+    /// receipt covers the whole tensor surface the two accountings must agree exactly.
+    ///
+    /// `measured` is `None` when the receipt omits a planned row entirely.
+    CompleteResidencyDisagrees {
+        codec_id: &'static str,
+        representation: ExecutionRepresentation,
+        measured: Option<(usize, u64)>,
+        planned: (usize, u64),
+    },
+    /// One physical tensor is claimed by two different codecs, so its source bytes have no
+    /// single owning row.
+    PhysicalKeyCodecCollision {
+        physical_key: String,
+        first_codec_id: &'static str,
+        second_codec_id: &'static str,
     },
     /// A materialized receipt reports more logical tensors than the plan contains.
     TensorCountExceedsPlan { reported: usize, planned: usize },
@@ -414,6 +554,52 @@ impl fmt::Display for CheckpointWeightFactsError {
                 "checkpoint facts: the receipt accounts for {measured_bytes} source byte(s) but \
                  the plan's file holds {planned_bytes}"
             ),
+            Self::CodecSourceBytesExceedEntry {
+                codec_id,
+                measured_bytes,
+                entry_bytes,
+            } => write!(
+                f,
+                "checkpoint facts: the receipt's codec {codec_id:?} row(s) account for \
+                 {measured_bytes} source byte(s) against {entry_bytes} the source inventory holds \
+                 for that codec; a codec above its entry is counting one physical tensor more than \
+                 once (a fused tensor feeding several logical outputs)"
+            ),
+            Self::CompleteResidencyDisagrees {
+                codec_id,
+                representation,
+                measured,
+                planned,
+            } => {
+                let (planned_tensors, planned_bytes) = planned;
+                match measured {
+                    Some((measured_tensors, measured_bytes)) => write!(
+                        f,
+                        "checkpoint facts: this load is complete, so codec {codec_id:?} \
+                         `{representation}` must measure exactly what the plan priced, but it \
+                         measured {measured_tensors} tensor(s)/{measured_bytes} resident byte(s) \
+                         against {planned_tensors}/{planned_bytes} planned; a complete load that \
+                         under-reports its residency is as untrue as one that over-reports"
+                    ),
+                    None => write!(
+                        f,
+                        "checkpoint facts: this load is complete, but the receipt reports no codec \
+                         {codec_id:?} `{representation}` row at all against {planned_tensors} \
+                         tensor(s)/{planned_bytes} resident byte(s) the plan priced there"
+                    ),
+                }
+            }
+            Self::PhysicalKeyCodecCollision {
+                physical_key,
+                first_codec_id,
+                second_codec_id,
+            } => write!(
+                f,
+                "checkpoint facts: physical tensor {physical_key:?} is claimed by both codec \
+                 {first_codec_id:?} and codec {second_codec_id:?}; its source bytes have no single \
+                 owning row, and attributing them by iteration order would be silent and \
+                 unrepeatable"
+            ),
             Self::TensorCountExceedsPlan { reported, planned } => write!(
                 f,
                 "checkpoint facts: the receipt reports {reported} materialized tensor(s) against a \
@@ -456,7 +642,7 @@ impl CheckpointWeightFacts {
         capability: NativeExecutionCapability,
         receipt: LogicalWeightReceipt,
     ) -> Result<Self, CheckpointWeightFactsError> {
-        let source = SourceCodecSummary::of(plan);
+        let source = SourceCodecSummary::of(plan)?;
         validate(&source, &capability, &receipt)?;
         Ok(Self {
             source_binding: None,
@@ -592,6 +778,66 @@ fn validate(
                 measured_bytes: row.resident_bytes,
                 planned_bytes,
             });
+        }
+    }
+
+    // The second, independent source-byte accounting. `SourceCodecSummary` counts each distinct
+    // physical key once; the receipt is built by a different producer and must land on the same
+    // number or below it. Summing the codec's rows (not checking each alone) is what catches a
+    // fused tensor whose logical outputs were split across representations.
+    let mut measured_source_by_codec: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for row in &receipt.residency {
+        *measured_source_by_codec.entry(row.codec_id).or_default() += row.source_bytes;
+    }
+    for (codec_id, measured_bytes) in measured_source_by_codec {
+        // `entry` is present: the UnplannedCodec guard above already rejected any codec the
+        // inventory does not declare.
+        let Some(entry) = source.entry(codec_id) else {
+            continue;
+        };
+        if measured_bytes > entry.source_bytes {
+            return Err(CheckpointWeightFactsError::CodecSourceBytesExceedEntry {
+                codec_id,
+                measured_bytes,
+                entry_bytes: entry.source_bytes,
+            });
+        }
+    }
+
+    // Once the load is complete, `<=` becomes `==`. Everything above bounds the receipt from
+    // above only, which would silently accept a finished load that under-reports what it holds —
+    // exactly the direction a footprint gate would swallow, and the direction that makes E4
+    // ("planned and measured agree") true only in tests.
+    let complete = receipt.materialization == LogicalReadMaterialization::Materialized
+        && receipt.tensor_count == source.tensor_count;
+    if complete {
+        for entry in &source.entries {
+            for representation in [
+                ExecutionRepresentation::NativePacked,
+                ExecutionRepresentation::DenseFallback,
+            ] {
+                let planned = entry.planned(representation);
+                let measured = receipt
+                    .residency
+                    .iter()
+                    .find(|row| {
+                        row.codec_id == entry.codec_id && row.representation == representation
+                    })
+                    .map(|row| (row.tensor_count, row.resident_bytes));
+                let agrees = match measured {
+                    Some(measured) => measured == planned,
+                    // An absent row is only honest when the plan priced nothing there at all.
+                    None => planned == (0, 0),
+                };
+                if !agrees {
+                    return Err(CheckpointWeightFactsError::CompleteResidencyDisagrees {
+                        codec_id: entry.codec_id,
+                        representation,
+                        measured,
+                        planned,
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -988,12 +1234,220 @@ mod tests {
             source_bytes: 2048,
         };
         let entry = SourceCodecSummary::of(&plan)
+            .expect("one codec per physical key")
             .entry(NVFP4_CODEC.codec_id)
             .expect("nvfp4 row")
             .clone();
         assert_eq!(entry.tensor_count, 2, "two logical outputs");
         assert_eq!(entry.source_bytes, 2048, "one physical tensor's bytes");
         assert_eq!(entry.planned_dense_resident_bytes, 8192 + 8192);
+    }
+
+    /// **A whole fused-physical-tensor load survives `CheckpointWeightFacts::new`.**
+    ///
+    /// The sc-21484 review's major finding, at the gen-core end: the receipt producer and
+    /// `SourceCodecSummary::of` must count source bytes by the same rule (distinct physical keys),
+    /// or a valid fused load hard-errors. Here the receipt is built by hand in the shape
+    /// `LogicalWeightReader::receipt` now produces (candle-gen's
+    /// `a_fused_physical_tensors_source_bytes_are_counted_once_in_the_receipt` drives the real
+    /// reader); sc-21547's transforms are not on this base yet.
+    ///
+    /// # Mutation
+    ///
+    /// Count the fused tensor per **logical** row instead — set the receipt's `source_bytes` and
+    /// its row's `source_bytes` to `2048 + 2048` (as the pre-fix producer did). Then
+    /// `SourceBytesExceedPlan { measured_bytes: 4096, planned_bytes: 2048 }` fires and this test
+    /// goes red, which is exactly the failure every `checkpoint_weight_facts()` call on a fused
+    /// plan hit before the fix.
+    #[test]
+    fn a_fused_plans_receipt_validates_rather_than_exceeding_the_source() {
+        let mut fused_a = nvfp4_tensor("fused.q", ResidencyMode::Dense, 8192);
+        fused_a.physical_key = "fused.qkv".to_owned();
+        let mut fused_b = nvfp4_tensor("fused.k", ResidencyMode::Dense, 8192);
+        fused_b.physical_key = "fused.qkv".to_owned();
+        let plan = LogicalWeightPlan {
+            mapping_id: MAPPING,
+            tensors: vec![fused_a, fused_b],
+            companions: vec![],
+            // The file holds ONE 2048-byte tensor, however many logical outputs read it.
+            source_bytes: 2048,
+        };
+        let receipt = LogicalWeightReceipt {
+            mapping_id: MAPPING,
+            // Two LOGICAL outputs materialized…
+            tensor_count: 2,
+            // …from one PHYSICAL tensor's bytes.
+            source_bytes: 2048,
+            materialization: LogicalReadMaterialization::Materialized,
+            residency: vec![row(
+                NVFP4_CODEC.codec_id,
+                ExecutionRepresentation::DenseFallback,
+                2,
+                2048,
+                // Resident bytes stay per-logical: both decoded outputs occupy memory.
+                8192 + 8192,
+            )],
+        };
+        let facts = CheckpointWeightFacts::new(
+            &plan,
+            NativeExecutionCapability::dense_only(),
+            receipt.clone(),
+        )
+        .expect("a fused load is valid and must not trip SourceBytesExceedPlan");
+        assert!(facts.is_complete());
+        assert_eq!(facts.resident_bytes(), plan.resident_bytes());
+
+        // And the pre-fix producer's output is refused, by name.
+        let mut double_counted = receipt;
+        double_counted.source_bytes = 2048 + 2048;
+        double_counted.residency[0].source_bytes = 2048 + 2048;
+        let error = CheckpointWeightFacts::new(
+            &plan,
+            NativeExecutionCapability::dense_only(),
+            double_counted,
+        )
+        .expect_err("counting the fused tensor per logical row exceeds the file");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::SourceBytesExceedPlan {
+                measured_bytes: 4096,
+                planned_bytes: 2048,
+            }
+        );
+    }
+
+    /// **The per-codec source-byte cross-check.** The file-wide total can fit while one codec's
+    /// rows double-count a fused tensor, so the two accountings are also compared per codec.
+    ///
+    /// # Mutation
+    ///
+    /// Delete the `CodecSourceBytesExceedEntry` loop in `validate()`: the receipt below (whose
+    /// file-wide total is left honest, and whose NVFP4 rows together claim more source bytes than
+    /// the NVFP4 entry holds) is accepted and this test goes red at the `expect_err`.
+    #[test]
+    fn a_codecs_rows_may_not_together_exceed_its_source_entry() {
+        let plan = mixed_plan();
+        let mut receipt = honest_receipt();
+        // Not complete, so the equality check does not pre-empt this one; the file-wide total is
+        // untouched and still fits.
+        receipt.tensor_count = 2;
+        receipt.residency.remove(0);
+        // The NVFP4 entry holds 2048+2048+256+256 = 4608. Push the two nvfp4 rows past it.
+        receipt.residency[0].source_bytes = 4000;
+        receipt.residency[1].source_bytes = 4000;
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), receipt)
+            .expect_err("a codec's rows cannot together exceed its inventory entry");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::CodecSourceBytesExceedEntry {
+                codec_id: NVFP4_CODEC.codec_id,
+                measured_bytes: 8000,
+                entry_bytes: 4608,
+            }
+        );
+    }
+
+    /// **E4 is enforced, not merely tested: a COMPLETE load must measure exactly what it planned.**
+    ///
+    /// Bounding the receipt only from above accepted a finished load that silently *under*-reports
+    /// its residency — the direction a footprint gate swallows without complaint.
+    ///
+    /// # Mutation
+    ///
+    /// Shave **one byte** off the complete receipt's packed row. Before this guard existed the
+    /// facts constructed happily (2303 <= 2304); now it is refused by name. Deleting the
+    /// `if complete` block in `validate()` also turns this test red.
+    #[test]
+    fn a_complete_load_that_under_reports_one_resident_byte_refuses() {
+        let plan = mixed_plan();
+        let mut receipt = honest_receipt();
+        assert_eq!(
+            receipt.tensor_count, 3,
+            "the premise: this receipt covers the whole plan"
+        );
+        // The one-byte shave. `<=` accepts it; `==` does not.
+        receipt.residency[2].resident_bytes -= 1;
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), receipt)
+            .expect_err("a complete load may not under-report its residency");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::CompleteResidencyDisagrees {
+                codec_id: NVFP4_CODEC.codec_id,
+                representation: ExecutionRepresentation::NativePacked,
+                measured: Some((1, 2048 + 256 - 1)),
+                planned: (1, 2048 + 256),
+            }
+        );
+
+        // The same guard catches a complete receipt that OMITS a planned row entirely.
+        let mut missing = honest_receipt();
+        missing.residency.remove(2);
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), missing)
+            .expect_err("a complete load may not drop a planned row");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::CompleteResidencyDisagrees {
+                codec_id: NVFP4_CODEC.codec_id,
+                representation: ExecutionRepresentation::NativePacked,
+                measured: None,
+                planned: (1, 2048 + 256),
+            }
+        );
+
+        // …and an INCOMPLETE receipt with the same shaved row is still fine: mid-load the bound is
+        // genuinely `<=`, so the new guard cannot make honest partial reads refuse.
+        let mut partial = honest_receipt();
+        partial.tensor_count = 2;
+        partial.residency[2].resident_bytes -= 1;
+        CheckpointWeightFacts::new(&plan, nvfp4_capability(), partial)
+            .expect("a partial read is bounded, not pinned");
+    }
+
+    /// **One physical tensor may not be claimed by two codecs.** `codec_by_owner` was
+    /// last-write-wins and `counted_physical` is global across codec rows, so such a plan would
+    /// have attributed the tensor's source bytes to whichever row the loop reached first —
+    /// silently, and unrepeatably if the plan's tensor order ever changed.
+    ///
+    /// # Mutation
+    ///
+    /// Restore the bare `codec_by_owner.insert(...)` (drop the collision branch) in
+    /// `SourceCodecSummary::of`: the plan below compiles to an inventory instead of an error and
+    /// this test goes red at the `expect_err`.
+    #[test]
+    fn one_physical_tensor_claimed_by_two_codecs_refuses() {
+        let mut as_nvfp4 = nvfp4_tensor("shared.a", ResidencyMode::Dense, 8192);
+        as_nvfp4.physical_key = "shared.w".to_owned();
+        let mut as_dense = dense_tensor("shared.b");
+        as_dense.physical_key = "shared.w".to_owned();
+        let plan = LogicalWeightPlan {
+            mapping_id: MAPPING,
+            tensors: vec![as_nvfp4, as_dense],
+            companions: vec![],
+            source_bytes: 2048,
+        };
+        let error = SourceCodecSummary::of(&plan)
+            .expect_err("one physical tensor cannot belong to two codec rows");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::PhysicalKeyCodecCollision {
+                physical_key: "shared.w".to_owned(),
+                first_codec_id: NVFP4_CODEC.codec_id,
+                second_codec_id: DENSE_BF16_CODEC.codec_id,
+            }
+        );
+
+        // The same physical key repeated under the SAME codec is the fused case, and is fine.
+        let mut fused_a = nvfp4_tensor("fused.q", ResidencyMode::Dense, 8192);
+        fused_a.physical_key = "fused.qkv".to_owned();
+        let mut fused_b = nvfp4_tensor("fused.k", ResidencyMode::Dense, 8192);
+        fused_b.physical_key = "fused.qkv".to_owned();
+        SourceCodecSummary::of(&LogicalWeightPlan {
+            mapping_id: MAPPING,
+            tensors: vec![fused_a, fused_b],
+            companions: vec![],
+            source_bytes: 2048,
+        })
+        .expect("a fused tensor under one codec is not a collision");
     }
 
     /// The wire labels SceneWorks renders are fixed by this test, not by whatever the enum's
