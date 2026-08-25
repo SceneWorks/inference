@@ -201,9 +201,27 @@ fn spec(path: PathBuf, scale: f32) -> AdapterSpec {
 
 /// The committed tiny DiT — real crate types, real loader, 2 transformer blocks + 2 refiner blocks.
 fn tiny_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
+    tiny_dit_on(cfg, &dev())
+}
+
+/// The same committed tiny DiT materialized on the caller's device. The CUDA receipt uses this
+/// instead of the CPU-only helper above so a CPU fallback cannot produce a false green.
+fn tiny_dit_on(cfg: &MiniMaxH3DitConfig, device: &Device) -> MiniMaxH3Dit {
     let f = Golden::load(DIT_FIXTURE);
-    let w = weights(f.model_map(&["src.", "in.", "out.", "layout."]));
-    MiniMaxH3Dit::from_weights(&w, cfg, &dev(), DType::F32).expect("the whole tiny DiT")
+    let tensors = f
+        .model_map(&["src.", "in.", "out.", "layout."])
+        .into_iter()
+        .map(|(name, tensor)| {
+            (
+                name,
+                tensor
+                    .to_device(device)
+                    .expect("move tiny DiT fixture to requested device"),
+            )
+        })
+        .collect();
+    let w = weights(tensors);
+    MiniMaxH3Dit::from_weights(&w, cfg, device, DType::F32).expect("the whole tiny DiT")
 }
 
 /// **Relative max-abs-diff**, the only honest gate for this defect class. `max|a-b| / max|b|`.
@@ -689,8 +707,16 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
     let mut base = tiny_dit(&cfg);
     let y0 = base.adaptable_mut(&segments).unwrap().forward(&x).unwrap();
     let mut adapted = tiny_dit(&cfg);
+    let bytes_before = adapted.adaptable_mut(&segments).unwrap().nbytes();
     let report = apply_minimax_h3_adapters(&mut adapted, &[spec(path, strength)]).unwrap();
     assert_eq!(report.applied, 1);
+    assert!(report.unmatched_paths.is_empty());
+    let target = adapted.adaptable_mut(&segments).unwrap();
+    assert!(target.is_adapted());
+    let expected_factor_bytes =
+        w1.elem_count() * w1.dtype().size_in_bytes() + w2.elem_count() * w2.dtype().size_in_bytes();
+    assert_eq!(target.nbytes() - bytes_before, expected_factor_bytes);
+    assert_eq!(adapted.adapted_module_count(), 1);
     let y1 = adapted
         .adaptable_mut(&segments)
         .unwrap()
@@ -893,155 +919,113 @@ fn direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target() {
     assert!(report.unmatched_paths.is_empty());
 }
 
-/// Manual Windows/CUDA acceptance entrypoint for the exact user-supplied LoKr. It validates the
-/// adapter file before mapping the 66 GB text encoder, renders a real T2VA clip, and writes first/
-/// last-frame PPMs, raw f32 audio, and a JSON receipt. It is intentionally not wired to CI.
+/// Manual Windows/CUDA receipt over a fabricated H3 LoKr and the committed tiny DiT. It proves the
+/// actual CUDA install seam without claiming a published H3 adapter or a real-weight render. The
+/// entrypoint is intentionally not wired to CI, but it never skips when invoked explicitly.
 ///
 /// ```text
-/// set MINIMAX_H3_CUDA_LOKR_SNAPSHOT=E:\path\to\MiniMax-H3
-/// set MINIMAX_H3_CUDA_LOKR_ADAPTER=E:\path\to\adapter.safetensors
 /// set MINIMAX_H3_CUDA_LOKR_OUT=E:\receipts\sc-20757
-/// cargo test --release --features cuda -p candle-gen-minimax-h3 --test integration turbo_lora::manual_cuda_real_lokr_render_receipt -- --ignored --exact --nocapture
+/// cargo test --release --locked --features cuda -p candle-gen-minimax-h3 --test integration turbo_lora::manual_cuda_fabricated_lokr_install_receipt -- --ignored --exact --nocapture
 /// ```
 #[test]
-#[ignore = "manual Windows/CUDA real-LoKr render; requires snapshot, exact adapter, and receipt dir"]
-fn manual_cuda_real_lokr_render_receipt() {
+#[ignore = "manual Windows/CUDA fabricated-LoKr install receipt; requires CUDA"]
+fn manual_cuda_fabricated_lokr_install_receipt() {
     let device = candle_gen::default_device().expect("initialize candle device");
     assert!(
         device.is_cuda(),
         "default candle device is not CUDA: {device:?}"
     );
-    let required = |name: &str| {
-        std::env::var(name).unwrap_or_else(|_| panic!("set {name}; this entrypoint never skips"))
-    };
-    let snapshot = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_SNAPSHOT"));
-    let adapter = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_ADAPTER"));
-    let out_dir = PathBuf::from(required("MINIMAX_H3_CUDA_LOKR_OUT"));
-    for component in ["text_encoder", "transformer", "vae", "audio_vae"] {
-        assert!(
-            snapshot.join(component).is_dir(),
-            "{} has no {component}/ component",
-            snapshot.display()
-        );
-    }
-    assert!(adapter.is_file(), "{} is not a file", adapter.display());
-
-    // Fail before real-weight mapping if the exact artifact is not a strict LoKr file.
-    let inspected = candle_gen::train::merge::read_adapter(&adapter).expect("read exact LoKr");
-    assert!(
-        inspected.declares_lokr() || inspected.tensors.keys().any(|key| key.contains(".lokr_w")),
-        "{} has neither networkType=lokr nor lokr_* factors",
-        adapter.display()
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let w1 = tensor(&[8, 8], 0.17);
+    let w2 = tensor(&[12, 8], 1.31);
+    let strength = 0.3;
+    let adapter = write_lokr(
+        dir.path(),
+        "fabricated-h3-lokr.safetensors",
+        vec![
+            (format!("{PROBE}.lokr_w1"), w1.clone()),
+            (format!("{PROBE}.lokr_w2"), w2.clone()),
+        ],
+        "5",
+        "7",
     );
+    let x_cpu = tensor(&[2, 3, cfg.hidden_size], 0.71);
+    let x_cuda = x_cpu
+        .to_device(&device)
+        .expect("move CUDA probe to requested device");
+    let segments = PROBE.split('.').collect::<Vec<_>>();
+    let mut base = tiny_dit_on(&cfg, &device);
+    let y0 = base
+        .adaptable_mut(&segments)
+        .unwrap()
+        .forward(&x_cuda)
+        .expect("CUDA base probe");
+    let mut adapted = tiny_dit_on(&cfg, &device);
     assert!(
-        inspected.tensors.keys().all(|key| key.contains(".lokr_w")),
-        "{} contains non-LoKr tensor keys; the strict installer will reject a partial file",
-        adapter.display()
+        adapted.device().is_cuda(),
+        "fabricated receipt must stay on CUDA"
     );
-    std::fs::create_dir_all(&out_dir).expect("create receipt directory");
+    let report = apply_minimax_h3_adapters(
+        &mut adapted,
+        &[AdapterSpec::new(
+            adapter.clone(),
+            strength,
+            AdapterKind::Lokr,
+        )],
+    )
+    .expect("install fabricated H3 LoKr on CUDA");
+    assert_eq!(report.applied, 1);
+    assert!(report.unmatched_paths.is_empty());
+    let target = adapted.adaptable_mut(&segments).expect("CUDA probe target");
+    assert!(target.is_adapted());
+    let adapted_modules = adapted.adapted_module_count();
+    assert_eq!(adapted_modules, 1);
+    let y1 = adapted
+        .adaptable_mut(&segments)
+        .unwrap()
+        .forward(&x_cuda)
+        .expect("CUDA adapted probe");
+    let actual = (y1 - y0)
+        .expect("CUDA residual")
+        .to_device(&Device::Cpu)
+        .expect("copy CUDA residual to host oracle");
+    let effective = 7.0 / 5.0 * strength;
+    let expected = explicit_dense_residual(&x_cpu, &explicit_kron(&w1, &w2, effective));
+    let drift = rel_max_abs(&actual, &expected);
+    assert!(
+        drift < 2e-5,
+        "structured vs explicit CUDA kron drift {drift:.3e}"
+    );
 
-    let strength = std::env::var("MINIMAX_H3_CUDA_LOKR_SCALE")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<f32>()
-                .expect("MINIMAX_H3_CUDA_LOKR_SCALE f32")
-        })
-        .unwrap_or(1.0);
-    let steps = std::env::var("MINIMAX_H3_CUDA_LOKR_STEPS")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .expect("MINIMAX_H3_CUDA_LOKR_STEPS u32")
-        })
-        .unwrap_or(4);
-    let prompt = std::env::var("MINIMAX_H3_CUDA_LOKR_PROMPT").unwrap_or_else(|_| {
-        "a brass automaton crossing a rain-slick bridge at blue hour, cinematic tracking shot"
-            .into()
-    });
-    let load = candle_gen::gen_core::LoadSpec::new(candle_gen::gen_core::WeightsSource::Dir(
-        snapshot.clone(),
-    ))
-    .with_adapters(vec![AdapterSpec::new(
-        adapter.clone(),
-        strength,
-        AdapterKind::Lokr,
-    )]);
-    let registry = candle_gen_minimax_h3::provider_registry().expect("provider registry");
-    let generator = registry
-        .load(candle_gen_minimax_h3::MODEL_ID, &load)
-        .expect("load MiniMax-H3 with exact LoKr");
-    let request = candle_gen::gen_core::GenerationRequest {
-        prompt: prompt.clone(),
-        width: candle_gen_minimax_h3::CANVAS_SHORT_EDGE * 16
-            / 9
-            / candle_gen_minimax_h3::SPATIAL_STRIDE
-            * candle_gen_minimax_h3::SPATIAL_STRIDE,
-        height: candle_gen_minimax_h3::CANVAS_SHORT_EDGE,
-        frames: Some(candle_gen_minimax_h3::SMALLEST_LEGAL_FRAMES as u32),
-        steps: Some(steps),
-        seed: Some(20757),
-        ..Default::default()
-    };
-    let started = std::time::Instant::now();
-    let output = generator
-        .generate(&request, &mut |progress| {
-            eprintln!("[sc-20757-lokr] {progress:?}")
-        })
-        .expect("real CUDA LoKr render");
-    let candle_gen::gen_core::GenerationOutput::Video { frames, fps, audio } = output else {
-        panic!("MiniMax-H3 must produce joint video/audio")
-    };
-    assert_eq!(frames.len(), candle_gen_minimax_h3::SMALLEST_LEGAL_FRAMES);
-    assert!(!frames.is_empty());
-    let audio = audio.expect("MiniMax-H3 render must carry synchronized audio");
-    assert!(!audio.samples.is_empty());
-    assert!(audio.samples.iter().all(|sample| sample.is_finite()));
-    let write_ppm = |name: &str, image: &candle_gen::gen_core::Image| {
-        let mut bytes = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
-        bytes.extend_from_slice(&image.pixels);
-        std::fs::write(out_dir.join(name), bytes).expect("write PPM receipt artifact");
-    };
-    write_ppm("first.ppm", frames.first().unwrap());
-    write_ppm("last.ppm", frames.last().unwrap());
-    let audio_bytes = audio
-        .samples
-        .iter()
-        .flat_map(|sample| sample.to_le_bytes())
-        .collect::<Vec<_>>();
-    std::fs::write(out_dir.join("audio.f32le"), audio_bytes).expect("write audio receipt");
-    let checksum = |bytes: &[u8]| {
-        bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
-    };
     let receipt = serde_json::json!({
         "story": "sc-20757",
         "backend": "candle-cuda",
-        "snapshot": snapshot,
-        "adapter": adapter,
-        "adapterScale": strength,
-        "prompt": prompt,
-        "seed": 20757,
-        "steps": steps,
-        "width": frames[0].width,
-        "height": frames[0].height,
-        "frames": frames.len(),
-        "fps": fps,
-        "firstFrameFnv64": format!("{:016x}", checksum(&frames[0].pixels)),
-        "lastFrameFnv64": format!("{:016x}", checksum(&frames.last().unwrap().pixels)),
-        "audioSamples": audio.samples.len(),
-        "audioSampleRate": audio.sample_rate,
-        "audioChannels": audio.channels,
-        "elapsedSeconds": started.elapsed().as_secs_f64(),
+        "device": format!("{device:?}"),
+        "fixture": { "kind": "committed_tiny_dit", "path": DIT_FIXTURE },
+        "adapter": { "kind": "fabricated_lokr", "path": adapter, "realAdapter": false },
+        "realRender": false,
+        "target": PROBE,
+        "w1Shape": [8, 8],
+        "w2Shape": [12, 8],
+        "rank": 5,
+        "alpha": 7,
+        "strength": strength,
+        "applied": report.applied,
+        "unmatched": report.unmatched_paths,
+        "adaptedModules": adapted_modules,
+        "residualRelMax": drift,
     });
-    std::fs::write(
-        out_dir.join("receipt.json"),
-        serde_json::to_vec_pretty(&receipt).unwrap(),
-    )
-    .expect("write JSON receipt");
-    eprintln!("[sc-20757-lokr] receipt={}", out_dir.display());
+    let receipt_bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt");
+    if let Ok(out_dir) = std::env::var("MINIMAX_H3_CUDA_LOKR_OUT") {
+        let out_dir = PathBuf::from(out_dir);
+        std::fs::create_dir_all(&out_dir).expect("create receipt directory");
+        std::fs::write(out_dir.join("receipt.json"), &receipt_bytes).expect("write JSON receipt");
+    }
+    eprintln!(
+        "[sc-20757-lokr] {}",
+        String::from_utf8_lossy(&receipt_bytes)
+    );
 }
 
 /// **The PEFT `lora_adapter_metadata` blob is the middle link of the alpha chain — and its `r` is a
