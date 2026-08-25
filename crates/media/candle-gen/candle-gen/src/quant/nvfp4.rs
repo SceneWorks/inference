@@ -605,13 +605,29 @@ mod tests {
     /// its own re-emitted block scales, and the slices' padded scale surfaces partition the
     /// source's rather than duplicating it. A boundary that cut a scale-factor atom would break
     /// that partition, so it refuses.
+    ///
+    /// `cols = 128` on purpose (sc-21547 review): that is `n_blocks = 8` → `sf_cols = 8` → **two**
+    /// k-atom columns, so [`Nvfp4Tensor::scale_offset_for`]'s `atom_index = m_atom + num_m_atoms *
+    /// k_atom` genuinely changes when `num_m_atoms` shrinks from the source's to the slice's, and
+    /// the scale bytes must be re-emitted rather than memcpy'd. At one k-atom column (`cols <= 64`)
+    /// the remap is the identity and a naive `to_vec()` of the byte range would pass this test
+    /// without ever exercising the permutation. The 384-row case adds a **middle** slice, whose
+    /// source `m_atom` is neither 0 nor the last.
     #[test]
     fn a_row_slice_is_lossless_and_refuses_a_boundary_that_cuts_a_scale_atom() -> Result<()> {
-        let (rows, cols) = (256_usize, 64_usize);
-        let data: Vec<f32> = (0..rows * cols)
-            .map(|index| ((index % 97) as f32 - 48.0) / 16.0)
-            .collect();
+        let values = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|index| ((index % 97) as f32 - 48.0) / 16.0)
+                .collect()
+        };
+        let (rows, cols) = (256_usize, 128_usize);
+        let data = values(rows, cols);
         let tensor = Nvfp4Tensor::pack_from_slice(&data, rows, cols)?;
+        assert_eq!(
+            tensor.sf_cols, 8,
+            "the fixture must span more than one k-atom column, or the atom-index remap below is \
+             the identity and a memcpy would pass"
+        );
         let whole = tensor.dequantize_to_vec();
 
         let top = tensor.slice_rows(0, 128)?;
@@ -631,6 +647,45 @@ mod tests {
         );
         assert_eq!(top.dequantize_to_vec(), whole[..128 * cols]);
         assert_eq!(bottom.dequantize_to_vec(), whole[128 * cols..]);
+
+        // The atom-index remap, stated as bytes: the source has two m-atoms, each slice one, so the
+        // second k-atom column moves from source atom 2/3 to slice atom 1. A memcpy of the byte
+        // range `[m_atom * 512 .. )` would put those bytes at the wrong offset.
+        for (slice, source_start) in [(&top, 0_usize), (&bottom, 128_usize)] {
+            for row in [0_usize, 1, 33, 127] {
+                for blk in [0_usize, 3, 4, 7] {
+                    assert_eq!(
+                        slice.scales[Nvfp4Tensor::scale_offset_for(row, blk, 128)],
+                        tensor.scales[tensor.scale_offset(source_start + row, blk)],
+                        "slice from row {source_start}: scale for (row {row}, block {blk}) must be \
+                         re-emitted at the SLICE's atom index, not copied at the source's"
+                    );
+                }
+            }
+        }
+
+        // A middle slice of a 3-m-atom tensor: source m-atom 1, neither first nor last.
+        let (mid_rows, mid_cols) = (384_usize, 128_usize);
+        let mid_data = values(mid_rows, mid_cols);
+        let mid_tensor = Nvfp4Tensor::pack_from_slice(&mid_data, mid_rows, mid_cols)?;
+        let mid_whole = mid_tensor.dequantize_to_vec();
+        let middle = mid_tensor.slice_rows(128, 128)?;
+        assert_eq!((middle.rows, middle.sf_rows), (128, 128));
+        assert_eq!(
+            middle.dequantize_to_vec(),
+            mid_whole[128 * mid_cols..256 * mid_cols],
+            "the middle slice dequantizes to exactly its rows of the source"
+        );
+        for row in [0_usize, 1, 33, 127] {
+            for blk in [0_usize, 3, 4, 7] {
+                assert_eq!(
+                    middle.scales[Nvfp4Tensor::scale_offset_for(row, blk, 128)],
+                    mid_tensor.scales[mid_tensor.scale_offset(128 + row, blk)],
+                    "middle slice: scale for (row {row}, block {blk}) must be re-emitted at the \
+                     slice's atom index"
+                );
+            }
+        }
 
         for (start, len) in [(0, 64), (64, 128), (0, 0)] {
             let error = tensor

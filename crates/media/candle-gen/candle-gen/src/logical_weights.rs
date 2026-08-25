@@ -971,8 +971,13 @@ fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result
             weight_scale_from_companion,
             input_scale,
         } => {
-            // `half_swap` on a packed row is refused at plan time, so a packed transform is a slice.
-            debug_assert!(!transform.half_swap);
+            // `half_swap` on a packed row is refused at plan time, but `transform` is a public
+            // field on a public struct: a plan that did not come from the compiler can carry one
+            // here. A `debug_assert!` would compile out and return UNSWAPPED rows under the
+            // swapped logical key in every shipping build — plausible-but-wrong weights. Refuse.
+            if transform.half_swap {
+                return Err(half_swap_on_packed(tensor));
+            }
             Ok(LogicalTensor::PackedFp8E4M3 {
                 codes: codes.narrow(0, start, len)?.contiguous()?,
                 weight_scale,
@@ -984,7 +989,10 @@ fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result
             tensor: packed,
             input_scale,
         } => {
-            debug_assert!(!transform.half_swap);
+            // Same reasoning as the packed-fp8 arm above: a real refusal, not a `debug_assert!`.
+            if transform.half_swap {
+                return Err(half_swap_on_packed(tensor));
+            }
             let sliced = packed.slice_rows(start, len).map_err(|error| {
                 CandleError::Msg(format!(
                     "codec {}: tensor {:?} logical output {:?}: {error}",
@@ -999,9 +1007,31 @@ fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result
     }
 }
 
+/// The read-time refusal for a `half_swap` declared on a tensor this backend decoded **packed**.
+///
+/// The plan compiler already refuses this combination by name
+/// (`LogicalTransformError::HalfSwapOnPackedResidency`); this is the
+/// local restatement at the site that depends on it, because
+/// [`LogicalTensorPlan::transform`] is a public field on a public struct reached through the public
+/// [`read_logical_weights`] entry. Permuting packed rows would require re-deriving the codec's
+/// scale surface, so the packed arms cannot honour the swap — and quietly returning the unswapped
+/// rows under the swapped logical key is silent corruption, so they refuse instead. The wording
+/// mirrors gen-core's, plus the physical and logical keys the reader knows and the compiler's
+/// error does not carry.
+fn half_swap_on_packed(tensor: &LogicalTensorPlan) -> CandleError {
+    CandleError::Msg(format!(
+        "codec {}: tensor {:?} logical output {:?} declares a half swap but this backend decoded a \
+         packed-native residency for it; permuting packed rows would require re-deriving the \
+         codec's scale surface. Plan this file with a dense residency policy, or declare the swap \
+         on a dense layer",
+        tensor.codec_id, tensor.physical_key, tensor.logical_key
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gen_core::checkpoint_codec::{LogicalTensorTransform, PlannedResidency, RowRange};
 
     struct StripModel;
 
@@ -1749,7 +1779,147 @@ mod tests {
                     wrong.len()
                 );
             }
+
+            // sc-21547 review (major): the arms index `source_shape()`, not `shape`. A plan whose
+            // `shape` is a perfectly good rank-2 grid but whose `transform.source_shape` is rank 1
+            // slips past a `shape`-only guard and then panics on `source_shape[1]`. The transform
+            // is a public field on a public struct, so this plan is constructible by any caller.
+            let mut forced = plan.clone();
+            forced.tensors[0].transform = Some(LogicalTensorTransform {
+                source_shape: vec![2_usize],
+                rows: RowRange { start: 0, len: 1 },
+                half_swap: false,
+            });
+            assert_eq!(
+                forced.tensors[0].shape.len(),
+                2,
+                "{codec}: the shape stays rank 2, so only the source-shape rank can refuse below"
+            );
+            let error = read_logical_weights(path, &forced, &Device::Cpu)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{codec}: a rank-1 transform.source_shape must refuse, not panic")
+                })
+                .to_string();
+            assert!(
+                error.contains(&format!("codec {codec}:"))
+                    && error.contains("expected rank 2")
+                    && error.contains("observed rank 1"),
+                "{codec}: the source-shape rank refusal must name the codec and both ranks, got: \
+                 {error}"
+            );
         }
+    }
+
+    /// sc-21547 review (major): a `half_swap` on a **packed** decode must be a real `Err`, not a
+    /// `debug_assert!`.
+    ///
+    /// The plan compiler refuses that combination, but [`LogicalTensorPlan::transform`] is a public
+    /// field on a public struct reached through the public [`read_logical_weights`] entry, so a
+    /// plan that did not come from the compiler can carry one. A `debug_assert!` compiles out under
+    /// `--release`, and the packed arms would then return the rows **unswapped** under the swapped
+    /// logical key — plausible-but-wrong weights that every downstream shape check agrees with.
+    ///
+    /// This drives [`apply_transform`] directly with hand-made packed decodes (both packed
+    /// variants) because that is the only way to reach the arm without a CUDA device, and it
+    /// asserts on the refusal rather than on a debug-only panic, so it is a real assertion in both
+    /// profiles.
+    #[test]
+    fn a_half_swap_on_a_packed_decode_refuses_in_every_profile() {
+        fn packed_plan(codec_id: &'static str, logical_key: &str) -> LogicalTensorPlan {
+            LogicalTensorPlan {
+                logical_key: logical_key.to_string(),
+                physical_key: "model.qkv.weight".to_string(),
+                encoding: WeightEncoding::Fp8E4M3,
+                shape: vec![128, 64],
+                source_bytes: 128 * 64,
+                codec_id,
+                resident_encoding: WeightEncoding::Fp8E4M3,
+                codec: TensorCodecSpec::Dense,
+                residency: PlannedResidency {
+                    mode: ResidencyMode::Packed,
+                    resident_bytes: 128 * 64,
+                },
+                transform: Some(LogicalTensorTransform {
+                    source_shape: vec![256, 64],
+                    rows: RowRange { start: 0, len: 128 },
+                    half_swap: true,
+                }),
+            }
+        }
+
+        // Packed fp8: the codes tensor's dtype is irrelevant to the transform arm.
+        let fp8_plan = packed_plan(FP8_E4M3_SCALAR_CODEC.codec_id, "q.weight");
+        let codes = Tensor::zeros((256, 64), DType::U8, &Device::Cpu).expect("codes");
+        let error = apply_transform(
+            &fp8_plan,
+            LogicalTensor::PackedFp8E4M3 {
+                codes,
+                weight_scale: 1.0,
+                weight_scale_from_companion: false,
+                input_scale: None,
+            },
+        )
+        .err()
+        .expect("a half swap on a packed fp8 decode must refuse")
+        .to_string();
+        assert!(
+            error.contains(&format!("codec {}:", FP8_E4M3_SCALAR_CODEC.codec_id))
+                && error.contains("\"model.qkv.weight\"")
+                && error.contains("\"q.weight\"")
+                && error.contains("half swap")
+                && error.contains("packed-native residency"),
+            "the packed-fp8 refusal must name the codec, the physical key, the logical key and the \
+             half swap, got: {error}"
+        );
+
+        // Packed NVFP4: the host container, so this leg runs on every lane.
+        let nvfp4_plan = packed_plan(NVFP4_CODEC.codec_id, "k.weight");
+        let packed = Nvfp4Tensor::pack_from_slice(&vec![0.5_f32; 256 * 64], 256, 64)
+            .expect("pack nvfp4 fixture");
+        let error = apply_transform(
+            &nvfp4_plan,
+            LogicalTensor::PackedNvfp4 {
+                tensor: Box::new(packed),
+                input_scale: None,
+            },
+        )
+        .err()
+        .expect("a half swap on a packed NVFP4 decode must refuse")
+        .to_string();
+        assert!(
+            error.contains(&format!("codec {}:", NVFP4_CODEC.codec_id))
+                && error.contains("\"model.qkv.weight\"")
+                && error.contains("\"k.weight\"")
+                && error.contains("half swap")
+                && error.contains("packed-native residency"),
+            "the packed-NVFP4 refusal must name the codec, the physical key, the logical key and \
+             the half swap, got: {error}"
+        );
+
+        // The same transform on a DENSE decode is honoured, not refused — the refusal is about the
+        // packed representation, not about half swaps.
+        let mut dense_plan = packed_plan(DENSE_BF16_CODEC.codec_id, "v.weight");
+        dense_plan.residency.mode = ResidencyMode::Dense;
+        let rows = Tensor::from_vec(
+            (0..256_u32).map(|row| row as f32).collect::<Vec<f32>>(),
+            (256, 1),
+            &Device::Cpu,
+        )
+        .expect("dense rows");
+        let LogicalTensor::Dense(swapped) =
+            apply_transform(&dense_plan, LogicalTensor::Dense(rows)).expect("dense half swap")
+        else {
+            panic!("a dense decode stays dense");
+        };
+        let values = swapped
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("values");
+        assert_eq!(values.len(), 128);
+        assert_eq!(values[0], 64.0, "the swap puts the second half first");
+        assert_eq!(values[64], 0.0);
     }
 
     /// The packed-native policy is a pure layout+hardware predicate: it selects `Packed` only for

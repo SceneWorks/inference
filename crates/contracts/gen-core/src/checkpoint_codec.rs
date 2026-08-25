@@ -1278,9 +1278,15 @@ impl LogicalTensorPlan {
     /// The one refusal message both engines emit when a **matrix codec** row (`mxfp8-v1`,
     /// `nvfp4-v1`, `int8-per-row-v1`) carries a logical [`Self::shape`] that is not rank 2.
     ///
-    /// Those three codecs decode an `[out, in]` grid: every backend arm indexes `shape[0]` /
-    /// `shape[1]` positionally and hands the pair to this crate's `[rows, cols]` reference decoders
+    /// Those three codecs decode an `[out, in]` grid: every backend arm indexes the shape
+    /// positionally and hands the pair to this crate's `[rows, cols]` reference decoders
     /// ([`crate::decode_mxfp8`], [`crate::decode_nvfp4`], [`crate::decode_int8_per_row`]).
+    ///
+    /// **Both ranks are checked.** The arms index [`Self::source_shape`] — the *pre-transform*
+    /// geometry the codec decodes (sc-21547) — while [`Self::shape`] is the post-transform shape the
+    /// model sees and the one downstream shape checks trust. A plan carrying a rank-2 `shape` over a
+    /// rank-&lt;2 `transform.source_shape` would pass a `shape`-only guard and then panic out of
+    /// bounds on `source_shape[1]`, so this refuses whenever *either* is not rank 2.
     ///
     /// [`compile_logical_weight_plan_with_metadata`] already refuses any descriptor-bearing layer
     /// whose stored header is not rank 2, and the MXFP8/NVFP4 geometry validators refuse a declared
@@ -1305,17 +1311,22 @@ impl LogicalTensorPlan {
             | TensorCodecSpec::Int8PerRow { .. } => {}
             TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => return None,
         }
-        if self.shape.len() == MATRIX_RANK {
+        // The decode arms index `source_shape()`; `shape` is what the model is handed. Refuse if
+        // either is not an [out, in] matrix — see the doc above.
+        let offending = if self.source_shape().len() != MATRIX_RANK {
+            self.source_shape()
+        } else if self.shape.len() != MATRIX_RANK {
+            self.shape.as_slice()
+        } else {
             return None;
-        }
+        };
         Some(format!(
             "codec {}: tensor {:?} decodes as an [out, in] matrix — expected rank {MATRIX_RANK}, \
-             observed rank {} (planned logical shape {:?}); this plan did not come from the \
-             checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
+             observed rank {} (planned logical shape {offending:?}); this plan did not come from \
+             the checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
             self.codec_id,
             self.physical_key,
-            self.shape.len(),
-            self.shape,
+            offending.len(),
         ))
     }
 }
