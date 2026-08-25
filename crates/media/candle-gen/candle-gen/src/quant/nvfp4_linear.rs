@@ -281,8 +281,9 @@ pub enum Nvfp4Regime {
     ///
     /// So when the fused kernel is unavailable, W4A4-via-unfused is ~100× *worse than never having
     /// used NVFP4*, while W4A16 costs ~nothing. Routing the gate here is not a compromise; it is
-    /// ~100× the better answer, and the only thing it gives up is the packed footprint (0.28× → 1.00×,
-    /// itself a defect tracked by sc-12121, which makes W4A16 packed-resident). Correctness and
+    /// ~100× the better answer, and the only thing it gives up is the packed footprint (0.28× →
+    /// 1.00× — W4A16 holds a dense bf16 weight, so it is *reported* as dense bf16, never as a native
+    /// NVFP4 footprint). Correctness and
     /// quality are identical in both fallbacks — this is purely about not shipping a 100× cliff behind
     /// a silent `Err(_)`.
     DequantBf16,
@@ -423,6 +424,27 @@ impl Nvfp4Context {
         #[cfg(feature = "cuda")]
         {
             return self.inner.is_some();
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
+    /// True iff the **fused** NVFP4 activation quantizer compiles on this context's device
+    /// (sc-12121, gate policy sc-12078).
+    ///
+    /// Always `false` without a live handle — a context with no FP4 device has no quantizer either.
+    /// The compile is cached on the shared handle, so asking is free after the first call and the
+    /// first call is one the first W4A4 forward would have paid anyway. A provider uses this to
+    /// *report* the representation its layers will resolve to; [`Nvfp4Linear`] still settles the gate
+    /// itself at construction (`try_build_fp4`), so this is a read of the same fact, never a second
+    /// decider.
+    pub fn fused_quantizer_available(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            return self
+                .inner
+                .as_ref()
+                .is_some_and(|c| c.lt.nvfp4_fused_quantizer_available());
         }
         #[allow(unreachable_code)]
         false

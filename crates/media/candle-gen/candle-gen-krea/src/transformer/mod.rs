@@ -236,11 +236,12 @@ impl Krea2Transformer {
     ///
     /// # `final_layer.linear` is stated, not inferred
     ///
-    /// The trunk head is threaded as [`crate::nvfp4_dit::LayerRole::final_proj`] via
-    /// [`DitPlan::act_for_layer`]. The shared policy's name-only fallback anchors on a trailing
-    /// `proj_out` segment and **will not fire** on `final_layer.linear` — relying on it would silently
-    /// leave the head (measured Dense on SANA, crush 438×) on W4A4. That is the sc-12140 defect class,
-    /// pinned by `final_head_is_only_guarded_because_the_loader_states_it`.
+    /// The trunk head is named [`crate::nvfp4_dit::KreaSite::TrunkHead`] by Krea's own role table and
+    /// resolved through [`DitPlan::act_for_layer`] (sc-12121). No name anchor in any crate fires on
+    /// `final_layer.linear` — the shared crate's fallback wants a trailing `proj_out` segment — and
+    /// relying on one would silently leave the head (measured Dense, crush 909× on Krea) on W4A4.
+    /// That is the sc-12140 defect class, pinned by
+    /// `final_head_is_guarded_by_the_role_table_not_by_its_name`.
     pub fn load_planned(w: &Weights, cfg: &Krea2Config, plan: &DitPlan) -> Result<Self> {
         // Bind the plan to THIS trunk's block count so `is_edge_block` names the right last block.
         let plan = &plan.clone().with_num_layers(cfg.num_layers);

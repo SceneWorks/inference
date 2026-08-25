@@ -60,7 +60,7 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::quant::{ActPrecision, CublasLt, OutlierClass};
 use candle_gen_krea::loader::Weights;
-use candle_gen_krea::nvfp4_dit::LayerRole;
+use candle_gen_krea::nvfp4_dit::{LayerRole, Nvfp4Capability};
 use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
 use candle_gen_krea::{
     summarize, turbo_sigmas, ActProbe, DitPlan, Krea2Config, Krea2Transformer, KreaTeConfig,
@@ -1372,8 +1372,8 @@ fn nvfp4_krea_dit_lane_surface_and_final_head_are_correct() {
         );
     }
 
-    // sc-12140: the head is guarded ONLY because the loader states the role. If this ever regresses to
-    // the name-only anchor, the head silently lands on W4A4.
+    // sc-12140: the head is guarded because the ROLE TABLE names it, not because any substring anchor
+    // fires on `final_layer.linear` (none does, in any crate).
     let mixed = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(cfg.num_layers);
     assert_eq!(
         mixed.act_for_layer("final_layer.linear"),
@@ -1383,6 +1383,33 @@ fn nvfp4_krea_dit_lane_surface_and_final_head_are_correct() {
     assert_eq!(
         LayerRole::for_krea_layer("final_layer.linear", cfg.num_layers),
         LayerRole::final_proj()
+    );
+
+    // sc-12121, the `sm_120` receipt fixture: every lane projection is classified by the role table
+    // (nothing falls through to `Unclassified`), and on this Blackwell box — where every capability
+    // fact holds — the model-level receipt's `fp4_lit` count is exactly the set of projections the
+    // decision table says reach packed W4A4. The plan, the constructed linears and the receipt
+    // therefore agree on the representation of all 260 projections, not just the head.
+    let predicted_packed = names
+        .iter()
+        .filter(|name| {
+            assert!(
+                !LayerRole::for_krea_layer(name, cfg.num_layers).is_unclassified,
+                "`{name}` is served by the lane but the role table does not name it"
+            );
+            mixed
+                .representation(name, Nvfp4Capability::ELIGIBLE)
+                .is_packed_w4a4()
+        })
+        .count();
+    assert_eq!(
+        r.fp4_lit, predicted_packed,
+        "the receipt's fp4-lit count must equal the decision table's packed-W4A4 set"
+    );
+    assert_eq!(
+        r.dequant_bf16,
+        names.len() - predicted_packed,
+        "every other projection must be reported as dense bf16"
     );
     eprintln!(
         "[sc-12110] lane surface: {} projections, {}/{} fp4-lit under the mixed policy",
