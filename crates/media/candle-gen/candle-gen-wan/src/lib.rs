@@ -952,8 +952,8 @@ impl Generator for WanGenerator {
 
     /// The three correlated facts about the GGUF DiT this generator loaded (sc-11045 fix round,
     /// BLOCKER 1): what the container stores (`gguf-container-v1`), that ggml blocks execute in
-    /// their stored packing on every host, and the measured receipt — published by
-    /// [`gguf::load_wan_dit_gguf_publishing`] at the DiT load. `None` on the snapshot
+    /// their stored packing on every host, and the measured receipt — published by the GGUF DiT
+    /// load (`gguf::load_wan_dit_gguf_publishing`). `None` on the snapshot
     /// (dense/packed-tier) routes, which compile no plan, and before the lazy DiT has loaded.
     fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
         self.checkpoint_facts.facts()
