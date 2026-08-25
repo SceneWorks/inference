@@ -459,12 +459,14 @@ impl Weights {
             report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
             report.resident_bytes = report.resident_bytes.saturating_add(*bytes);
         }
+        // A companion's source bytes belong to the codec row of the layer that owns it, and only
+        // once that layer has actually been materialized. `measured` is keyed by LOGICAL key, so
+        // the owner's physical key is resolved through the plan rather than compared directly.
         for companion in &plan.companions {
-            if measured.contains_key(companion.owner_physical_key.as_str())
-                || self
-                    .planned_logical_key_for_physical(&companion.owner_physical_key)
-                    .is_some_and(|logical| measured.contains_key(logical))
-            {
+            let owned_by_a_materialized_layer = self
+                .planned_logical_key_for_physical(&companion.owner_physical_key)
+                .is_some_and(|logical| measured.contains_key(logical));
+            if owned_by_a_materialized_layer {
                 report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
             }
         }
