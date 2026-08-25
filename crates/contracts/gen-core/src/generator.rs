@@ -34,6 +34,29 @@ pub trait Generator {
         Vec::new()
     }
 
+    /// The **three correlated facts** about the checkpoint this generator loaded (sc-21484): what
+    /// the source stores per codec, what this host can execute natively, and what actually
+    /// materialized — split per [`crate::ExecutionRepresentation`], so a source stored `nvfp4-v1`
+    /// that ran the packed W4A4 operand is distinguishable from the same source decoded to dense
+    /// BF16.
+    ///
+    /// **This is the surface a consumer across the worker boundary holds.** The producing accessors
+    /// (`candle_gen_krea::loader::Weights::checkpoint_weight_facts`, the shared
+    /// `LogicalWeightReader`) live on loader types a worker never sees; it hands the runtime
+    /// registry a [`crate::LoadSpec`] and receives a `Box<dyn Generator>`. Providers riding the
+    /// shared logical-weight reader propagate their facts here through a
+    /// [`crate::CheckpointFactsSink`].
+    ///
+    /// `None` — the default every provider inherits — means **this load produced no compiled
+    /// plan**: a directory-sourced import, a packed-tier variant resolved to a folder, or a
+    /// provider that has not adopted the seam. It never means "the source stores nothing
+    /// quantized", and it is *not* a claim that the run was dense. A provider whose components load
+    /// lazily also reports `None` until its first materialization, because until then there is no
+    /// measured receipt to report.
+    fn checkpoint_weight_facts(&self) -> Option<crate::CheckpointWeightFacts> {
+        None
+    }
+
     /// The loaded provider's memory-strategy contract, when adopted. Existing providers inherit
     /// `None`, which is the compatibility-safe resident-only/unverified state.
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {

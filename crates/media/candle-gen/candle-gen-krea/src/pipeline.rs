@@ -827,7 +827,15 @@ pub fn load_components_native(
     let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
     let selected = resolve_components_text_encoder(root, None)?;
     load_components_native_with_encoder(
-        root, &selected, &pinned, device, adapters, None, None, false,
+        root,
+        &selected,
+        &pinned,
+        device,
+        adapters,
+        None,
+        None,
+        false,
+        &gen_core::CheckpointFactsSink::new(),
     )
 }
 
@@ -841,6 +849,7 @@ pub(crate) fn load_components_native_with_encoder(
     native_quant: Option<gen_core::Quant>,
     text_load_quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Components> {
     let text = match text_load_quant {
         Some(quant) => {
@@ -856,6 +865,7 @@ pub(crate) fn load_components_native_with_encoder(
         adapters,
         native_quant,
         stream_blocks,
+        facts,
     )?;
     Ok(Components { text, heavy })
 }
@@ -870,6 +880,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
     native_quant: Option<gen_core::Quant>,
     text_load_quant: Option<gen_core::Quant>,
     pid_spec: Option<&PidWeights>,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Components> {
     let mut components = load_components_native_with_encoder(
         root,
@@ -880,6 +891,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
         native_quant,
         text_load_quant,
         false,
+        facts,
     )?;
     components.heavy.pid = pid_spec
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
@@ -892,6 +904,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
 /// single-file entrypoint accepts job-local LoRA/LoKr/diff-patch adapters through the shared Krea
 /// installer ([`load_native_dit`]). PiD remains absent; the registered dense, packed, and ConvRot
 /// routes attach it through their dedicated component loaders.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_heavy_native_with(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -899,8 +912,17 @@ pub(crate) fn load_heavy_native_with(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<KreaHeavy> {
-    let dit = load_native_dit(root, native_dit, device, adapters, quant, stream_blocks)?;
+    let dit = load_native_dit(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        facts,
+    )?;
     let vae = load_vae(root, device)?;
 
     Ok(KreaHeavy {
@@ -910,6 +932,7 @@ pub(crate) fn load_heavy_native_with(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_native_dit(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -917,6 +940,7 @@ fn load_native_dit(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Krea2Transformer> {
     load_native_dit_at_dtype(
         root,
@@ -926,6 +950,7 @@ fn load_native_dit(
         quant,
         stream_blocks,
         DIT_DTYPE,
+        facts,
     )
 }
 
@@ -958,6 +983,20 @@ fn ensure_nvfp4_adapters_supported(native_nvfp4: bool, adapters: &[AdapterSpec])
     Ok(())
 }
 
+/// Read the DiT out of a **single-file native import** and, on the way past, publish that read's
+/// [`gen_core::CheckpointWeightFacts`] into `facts` (sc-21484 follow-up).
+///
+/// This is the provider-build seam: it is the one place in the Krea build that holds the
+/// [`Weights`] the shared logical-weight reader compiled a plan for, and the generator handle a
+/// consumer holds is built long before this runs (Krea residency is lazy). A clone of the sink
+/// therefore travels down here while its sibling stays on `KreaGenerator`, which republishes
+/// nothing and simply reads it back through
+/// [`gen_core::Generator::checkpoint_weight_facts`].
+///
+/// Publication is deliberately the **last** thing before the DiT is returned, so the receipt
+/// measures what actually materialized rather than what was about to. A source with no plan (the
+/// directory route never reaches this function at all) publishes nothing and the sink stays empty.
+#[allow(clippy::too_many_arguments)]
 fn load_native_dit_at_dtype(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -966,6 +1005,7 @@ fn load_native_dit_at_dtype(
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
     dit_dtype: DType,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Krea2Transformer> {
     native_dit.read_unchanged(|_| {
         let cfg = Krea2Config::from_snapshot(root)?;
@@ -1006,8 +1046,12 @@ fn load_native_dit_at_dtype(
                 "Krea native block streaming requires an adapter-free, non-quantizing load".into(),
             ));
         }
+        // Shared before the branch only so the facts below can be read off the SAME reader both
+        // paths consumed — the streamed form hands its `Arc` to the transformer and would otherwise
+        // move it out of reach.
+        let dit_w = Arc::new(dit_w);
         let mut dit = if stream_blocks {
-            Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+            Krea2Transformer::load_block_streamed(Arc::clone(&dit_w), &cfg)?
         } else {
             Krea2Transformer::load(&dit_w, &cfg)?
         };
@@ -1024,6 +1068,10 @@ fn load_native_dit_at_dtype(
         // Individual streamed block windows use the same guarded synchronization when opened.
         device.synchronize()?;
 
+        // The handoff (sc-21484): everything this read materialized, measured, and tied to the
+        // verified pin — published after the synchronize so the receipt is not a prediction.
+        facts.publish_optional(dit_w.checkpoint_weight_facts()?);
+
         Ok(dit)
     })
 }
@@ -1031,6 +1079,7 @@ fn load_native_dit_at_dtype(
 /// Sequential imported-file heavy phase: native DiT + VAE + img2img/edit encoder, loaded only after
 /// the text encoder was released. The transformer stays file-backed and window-materialized when the
 /// source is adapter-free.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_residency_heavy_native(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -1038,13 +1087,23 @@ pub(crate) fn load_residency_heavy_native(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy_native_with(root, native_dit, device, adapters, quant, stream_blocks)?,
+        heavy: load_heavy_native_with(
+            root,
+            native_dit,
+            device,
+            adapters,
+            quant,
+            stream_blocks,
+            facts,
+        )?,
         vae_encoder: load_vae_encoder(root, device)?,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_residency_heavy_native_registry(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -1053,9 +1112,17 @@ pub(crate) fn load_residency_heavy_native_registry(
     quant: Option<gen_core::Quant>,
     pid: PidLoad<'_>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<ResidencyHeavy> {
-    let mut result =
-        load_residency_heavy_native(root, native_dit, device, adapters, quant, stream_blocks)?;
+    let mut result = load_residency_heavy_native(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        facts,
+    )?;
     result.heavy.pid = pid_to_load(pid.spec, pid.enabled)
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
         .transpose()?;
@@ -1150,6 +1217,7 @@ pub(crate) fn render_three_stage_with_native(
     quantization: NativeFileQuantization,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Vec<Image>> {
     let memory = req.memory.unwrap_or_default();
     candle_gen::check_cancel(&req.cancel)?;
@@ -1197,6 +1265,7 @@ pub(crate) fn render_three_stage_with_native(
                 adapters,
                 quantization.transformer,
                 memory.stream_transformer_blocks,
+                facts,
             )?;
             candle_gen::check_cancel(&req.cancel)?;
             dit
@@ -1849,7 +1918,21 @@ fn load_dit_base_at_dtype(
             crate::convert::validate_transformer(&dit_w, &cfg)?;
             Ok(Krea2Transformer::load(&dit_w, &cfg)?)
         },
-        |source| load_native_dit_at_dtype(root, source, device, &[], quant, false, dit_dtype),
+        // A **detached** sink: this is the job-local multi-phase base DiT, not the generator's own
+        // load, so its facts must not overwrite what the generator published about the model the
+        // consumer asked for.
+        |source| {
+            load_native_dit_at_dtype(
+                root,
+                source,
+                device,
+                &[],
+                quant,
+                false,
+                dit_dtype,
+                &gen_core::CheckpointFactsSink::new(),
+            )
+        },
     )
 }
 
@@ -2945,6 +3028,81 @@ mod tests {
         assert_eq!(pid.calls.get(), 1);
     }
 
+    /// **sc-21484 follow-up: the production single-file load is what publishes the facts.**
+    ///
+    /// `lib`'s `a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import` asserts
+    /// the consumer end (sink → `Generator::checkpoint_weight_facts`) on the Kitchen NVFP4 fixture.
+    /// This is the other end: the real provider-build seam, driven end to end on a whole tiny DiT,
+    /// proving the sink a `KreaGenerator` holds is actually written to by a load rather than only
+    /// by a test. The tiny fixture is dense, so its inventory is the dense codec — the codec-neutral
+    /// half of the same contract.
+    ///
+    /// # Mutation
+    ///
+    /// Delete the `facts.publish_optional(...)` line at the end of `load_native_dit_at_dtype`: the
+    /// sink stays empty and the `expect` below goes red.
+    #[test]
+    fn the_native_file_load_publishes_its_checkpoint_facts_into_the_generators_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, source, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&source).unwrap();
+
+        // The generator's end of the seam, cloned BEFORE the load — exactly as `build()` mints it.
+        let generator_side = gen_core::CheckpointFactsSink::new();
+        let load_side = generator_side.clone();
+        assert!(generator_side.is_empty(), "nothing has been read yet");
+
+        load_native_dit_at_dtype(
+            &root,
+            &pinned,
+            &Device::Cpu,
+            &[],
+            None,
+            false,
+            DType::F32,
+            &load_side,
+        )
+        .expect("the tiny native fixture loads");
+
+        let facts = generator_side
+            .facts()
+            .expect("the production load path publishes into the sink the generator holds");
+        assert_eq!(
+            facts
+                .source_binding()
+                .expect("the pin travels with them")
+                .stable_token(),
+            format!(
+                "tiny-native.safetensors@{}",
+                std::fs::metadata(&source).unwrap().len()
+            ),
+        );
+        assert!(
+            facts.capability().is_dense_only(),
+            "a CPU host executes nothing in its stored packing"
+        );
+        // Fact 2 is the whole file, compiled by the shared reader: every dense projection of the
+        // tiny DiT, in the dense codec, with the file's real byte total.
+        let entry = facts
+            .source()
+            .entries
+            .first()
+            .expect("the plan compiled a codec inventory");
+        assert_eq!(facts.source().tensor_count, entry.tensor_count);
+        assert!(entry.tensor_count > 0 && entry.source_bytes > 0);
+        assert_eq!(
+            entry.planned_native_packed_tensors, 0,
+            "nothing is packed here"
+        );
+        // Fact 3 is empty, and honestly so: a dense native trunk reads its tensors straight off the
+        // mmap rather than through the logical reader, so nothing has been *measured* through the
+        // receipt. That asymmetry is the shared reader's (sc-21482), not this seam's — the receipt
+        // half of the contract is asserted on the Kitchen NVFP4 fixture in `lib`'s
+        // `a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import`. What this
+        // test pins is that a *real* load reaches `publish` at all.
+        assert!(facts.materialized().is_empty());
+    }
+
     #[test]
     fn native_file_entrypoint_postchecks_after_provider_payload_consumption() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2998,8 +3156,16 @@ mod tests {
             }));
         });
 
-        let result =
-            load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], None, false, DType::F32);
+        let result = load_native_dit_at_dtype(
+            &root,
+            &pinned,
+            &Device::Cpu,
+            &[],
+            None,
+            false,
+            DType::F32,
+            &gen_core::CheckpointFactsSink::new(),
+        );
         NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
         writer
             .join()

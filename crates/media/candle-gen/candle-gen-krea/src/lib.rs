@@ -383,6 +383,16 @@ pub struct KreaGenerator {
     /// Prepared File identities retained for lazy/sequential adapter, PiD, component, and imported
     /// primary reopens. The cache key and every later provider read consume these same tokens.
     file_pin_spec: LoadSpec,
+    /// The consumer-facing end of the checkpoint-facts handoff (sc-21484 follow-up). The other end
+    /// is a clone held by the residency load closures, which publish into it from
+    /// [`pipeline::load_native_dit_at_dtype`] — the one place that holds the
+    /// [`loader::Weights`] the shared logical-weight reader compiled a plan for.
+    ///
+    /// It is **empty until the first materialization** and stays empty forever on a directory
+    /// source, which is exactly what `Generator::checkpoint_weight_facts` returning `None` means:
+    /// this load produced no compiled plan (or has not read anything yet), never "the source stores
+    /// nothing quantized".
+    checkpoint_facts: gen_core::CheckpointFactsSink,
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -706,6 +716,16 @@ impl Generator for KreaGenerator {
         &self.descriptor
     }
 
+    /// The three correlated facts about the checkpoint this generator loaded (sc-21484 follow-up).
+    ///
+    /// Krea's single-file native import route publishes here from the shared logical-weight reader;
+    /// the directory and packed-tier routes have no compiled plan and leave this `None`. Because
+    /// Krea residency is lazy, this is also `None` between construction and the first
+    /// materialization — there is no measured receipt to report before anything has been read.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.checkpoint_facts.facts()
+    }
+
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         #[cfg(any(feature = "cuda", test))]
         {
@@ -890,6 +910,7 @@ impl Generator for KreaGenerator {
                             },
                             req,
                             on_progress,
+                            &self.checkpoint_facts,
                         )
                     },
                 )
@@ -1568,6 +1589,12 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
     // windows rather than silently falling back to an eager DiT.
     let native_streamable = native_file_streamable(descriptor.id, spec);
+    // The checkpoint-facts handoff (sc-21484 follow-up). One sink, three holders: the resident
+    // closure, the sequential heavy closure, and the generator itself. Residency is lazy, so the
+    // clones must be minted here — the generator is constructed long before either closure runs.
+    let checkpoint_facts = gen_core::CheckpointFactsSink::new();
+    let resident_facts = checkpoint_facts.clone();
+    let heavy_facts = checkpoint_facts.clone();
     let residency = candle_gen::Residency::request_scoped_with_resident_cancelable(
         move |_| {
             let components = resident_file_spec.read_files_unchanged(
@@ -1583,6 +1610,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                             native_quant,
                             text_quant,
                             resident_pid.as_ref(),
+                            &resident_facts,
                         )
                     }
                     (None, Some(convrot_dit)) => pipeline::load_components_convrot_with_encoder(
@@ -1650,6 +1678,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
                                 enabled: use_pid,
                             },
                             native_streamable,
+                            &heavy_facts,
                         )?;
                         candle_gen::check_cancel(cancel)?;
                         Ok(heavy)
@@ -1703,6 +1732,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         })?,
         adapters: spec.adapters.clone(),
         file_pin_spec: spec.clone(),
+        checkpoint_facts,
     }))
 }
 
@@ -3079,6 +3109,116 @@ mod tests {
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(root.to_path_buf()),
         )
+    }
+
+    /// **sc-21484 follow-up: the facts reach the surface a worker actually holds.**
+    ///
+    /// The merged handoff exposed `checkpoint_weight_facts()` only on `loader::Weights` and the
+    /// shared `LogicalWeightReader` — types SceneWorks never touches. It hands the runtime registry
+    /// a [`LoadSpec`] and gets back a `Box<dyn Generator>`, so the contract asserted here is
+    /// [`gen_core::Generator::checkpoint_weight_facts`] on that handle.
+    ///
+    /// Both halves of the AC, on CPU:
+    ///
+    /// * a **native-NVFP4 single-file import** — the Kitchen fixture — reports `Some`, with the
+    ///   source stored `nvfp4-v1` and this dense-only host's execution split as `dense-fallback`;
+    /// * a **directory-sourced** load, built through the real `load()` entrypoint, reports `None`
+    ///   because it compiles no plan at all.
+    ///
+    /// # Mutation
+    ///
+    /// Drop the propagation — return `None` from `KreaGenerator::checkpoint_weight_facts`, or make
+    /// `CheckpointFactsSink::publish` a no-op, or drop `checkpoint_facts` from the `KreaGenerator`
+    /// built by `build()` so the generator holds a sink nothing publishes into: the `expect` below
+    /// goes red. `pipeline`'s
+    /// `the_native_file_load_publishes_its_checkpoint_facts_into_the_generators_sink` is the other
+    /// half — it proves the production load path is what calls `publish`.
+    #[test]
+    fn a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import() {
+        use candle_gen::candle_core::DType;
+        use candle_gen::gen_core::checkpoint_codec::NVFP4_CODEC;
+        use candle_gen::gen_core::checkpoint_facts::ExecutionRepresentation;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ---- the directory route: no compiled plan, so no facts ------------------------------
+        let dir_root = tmp.path().join("snapshot");
+        std::fs::create_dir_all(&dir_root).unwrap();
+        let directory = load(&valid_directory_spec(&dir_root)).expect("a directory spec loads");
+        assert!(
+            directory.checkpoint_weight_facts().is_none(),
+            "a directory-sourced load has no plan and must report None rather than fabricating one"
+        );
+
+        // ---- the native NVFP4 import: the facts the provider build publishes ------------------
+        // The sink is the seam `pipeline::load_native_dit_at_dtype` publishes into; here it is fed
+        // the same accessor result that production line feeds it, from the same Kitchen fixture.
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&path);
+        let cfg = crate::testfix::kitchen_nvfp4_config();
+        let weights = crate::loader::Weights::from_native_file_for(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("the Kitchen fixture imports");
+        // Materialize the fixture's projections. The receipt measures what has actually been read,
+        // so a reader nothing has consumed yet honestly reports no residency rows at all — the
+        // facts only become interesting once the trunk has been built from them.
+        let plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed)
+            .with_num_layers(1);
+        for base in ["transformer_blocks.0.attn.to_q", "img_in"] {
+            crate::loader::linear_detect_planned(&weights, base, false, &plan)
+                .expect("the Kitchen projections materialize on CPU");
+        }
+
+        let sink = gen_core::CheckpointFactsSink::new();
+        let mut generator = sequential_generator(descriptor());
+        generator.checkpoint_facts = sink.clone();
+        assert!(
+            Generator::checkpoint_weight_facts(&generator).is_none(),
+            "before anything materializes there is no measured receipt to report"
+        );
+
+        sink.publish_optional(
+            weights
+                .checkpoint_weight_facts()
+                .expect("the pinned source is unchanged"),
+        );
+
+        let facts = Generator::checkpoint_weight_facts(&generator)
+            .expect("the generator surface exposes what the load published");
+        assert!(
+            facts.source().declares(NVFP4_CODEC.codec_id),
+            "fact 2 — the source stores nvfp4-v1 whatever this host can execute"
+        );
+        assert!(
+            facts.capability().is_dense_only(),
+            "fact 1 — a CPU host executes nothing in its stored packing"
+        );
+        let dense = facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("fact 3 — the nvfp4 rows materialized as the declared dense fallback");
+        assert!(dense.tensor_count > 0);
+        assert!(
+            facts
+                .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+                .is_none(),
+            "a dense-fallback run must never surface a native-packed row"
+        );
+        assert!(!facts.executes_natively(NVFP4_CODEC.codec_id));
+        // The binding travels with the facts, so a consumer can say which artifact they describe.
+        assert_eq!(
+            facts
+                .source_binding()
+                .expect("the verified pin is carried through")
+                .stable_token(),
+            format!(
+                "kreamania_variant7.safetensors@{}",
+                std::fs::metadata(&path).unwrap().len()
+            )
+        );
     }
 
     #[test]
@@ -4740,6 +4880,7 @@ mod tests {
             adapters: Vec::new(),
             has_diff_patch: false,
             file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
+            checkpoint_facts: gen_core::CheckpointFactsSink::new(),
         }
     }
 
@@ -4927,6 +5068,7 @@ mod tests {
                 adapters: Vec::new(),
                 has_diff_patch: false,
                 file_pin_spec: LoadSpec::new(WeightsSource::Dir("/snap".into())),
+                checkpoint_facts: gen_core::CheckpointFactsSink::new(),
             };
             let cancel = gen_core::CancelFlag::new();
             let request = GenerationRequest {

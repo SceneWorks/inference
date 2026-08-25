@@ -59,6 +59,15 @@
 //! fabricating an inventory. `Ok(None)` means "this source shape does not answer these questions";
 //! it never means "the source stores nothing quantized".
 //!
+//! # How a consumer across the worker boundary reaches them
+//!
+//! The loader accessors live on types a worker never holds — it hands the runtime registry a
+//! `LoadSpec` and receives a `Box<dyn Generator>`. [`crate::Generator::checkpoint_weight_facts`] is
+//! that consumer-facing surface, and [`CheckpointFactsSink`] is the provider-neutral seam that
+//! carries the facts from wherever the provider build holds the reader up to the generator handle.
+//! A provider that publishes nothing (directory loaders, packed tiers) inherits the trait default
+//! and reports `None` — the same `None` the loader accessors return.
+//!
 //! # Why the source inventory counts a physical tensor once
 //!
 //! `tensor_count` counts **logical** tensors, while [`SourceCodecEntry::source_bytes`] totals the
@@ -78,6 +87,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::checkpoint_codec::{
     CodecResidencyReport, LogicalReadMaterialization, LogicalWeightPlan, LogicalWeightReceipt,
@@ -718,6 +728,83 @@ impl CheckpointWeightFacts {
     /// measured residency have to be *equal* rather than merely bounded.
     pub fn is_complete(&self) -> bool {
         self.receipt.tensor_count == self.source.tensor_count
+    }
+}
+
+/// The **shareable publication point** that carries one load's [`CheckpointWeightFacts`] from the
+/// place that holds the weights to the loaded-generator handle a consumer holds (sc-21484
+/// follow-up).
+///
+/// # Why a sink rather than an accessor
+///
+/// The facts are produced by whatever holds the logical-weight reader — a provider's DiT load — and
+/// consumed through [`crate::Generator::checkpoint_weight_facts`] on the `Box<dyn Generator>` the
+/// runtime registry returns. Those two are not the same object, and for a provider with lazy or
+/// staged residency they are not even the same *moment*: the generator handle exists before any
+/// tensor has been read. A clonable sink is the seam that spans both — the provider build hands one
+/// clone into its load path and keeps the other on the generator.
+///
+/// It is deliberately **provider-neutral and codec-neutral**: it stores a validated
+/// [`CheckpointWeightFacts`] and nothing else, so any provider riding the shared logical-weight
+/// reader can use it without a bespoke accessor.
+///
+/// # What "empty" means
+///
+/// An unpublished sink reports `None`, which means exactly what `Ok(None)` means on the loader
+/// accessors: **this load produced no compiled plan** (a directory-sourced import, a packed-tier
+/// variant), or nothing has been read yet. It never means "the source stores nothing quantized".
+///
+/// # Publication is last-write-wins, not once
+///
+/// A staged provider can materialize its heavy component more than once (evict, reload). Each read
+/// publishes the facts of the read that just finished, so the sink always describes the most recent
+/// materialization rather than a stale first one. Publishing is cheap and never blocks a reader for
+/// longer than a clone.
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointFactsSink {
+    published: Arc<Mutex<Option<CheckpointWeightFacts>>>,
+}
+
+impl CheckpointFactsSink {
+    /// An empty sink. Until something publishes, [`facts`](Self::facts) is `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the facts of the read that just completed.
+    pub fn publish(&self, facts: CheckpointWeightFacts) {
+        *self.locked() = Some(facts);
+    }
+
+    /// Publish the result of a loader accessor directly. `None` — the source has no plan — leaves
+    /// any previously published facts alone rather than erasing them, because "this component had
+    /// no plan" is not evidence about a component that did.
+    pub fn publish_optional(&self, facts: Option<CheckpointWeightFacts>) {
+        if let Some(facts) = facts {
+            self.publish(facts);
+        }
+    }
+
+    /// The most recently published facts, or `None` when nothing has published.
+    ///
+    /// Returns an owned clone: the sink is shared across threads, so handing out a reference would
+    /// mean handing out the lock guard.
+    pub fn facts(&self) -> Option<CheckpointWeightFacts> {
+        self.locked().clone()
+    }
+
+    /// Whether anything has published yet.
+    pub fn is_empty(&self) -> bool {
+        self.locked().is_none()
+    }
+
+    /// Poison-recovering lock. A panic in a load path must not turn every later facts read into a
+    /// panic of its own; the stored value is a plain validated struct with no invariant a partial
+    /// write could break.
+    fn locked(&self) -> std::sync::MutexGuard<'_, Option<CheckpointWeightFacts>> {
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1470,6 +1557,75 @@ mod tests {
             source_bytes: 2048,
         })
         .expect("a fused tensor under one codec is not a collision");
+    }
+
+    /// **The sink is the seam between the place that holds the reader and the handle a consumer
+    /// holds.** Empty means "no compiled plan / nothing read yet"; a clone taken before publication
+    /// still observes it, which is what makes it usable from inside a lazy load closure.
+    ///
+    /// # Mutation
+    ///
+    /// Make [`CheckpointFactsSink::publish`] a no-op: the `expect` below goes red.
+    #[test]
+    fn a_facts_sink_carries_one_loads_facts_to_every_clone() {
+        let plan = mixed_plan();
+        let sink = CheckpointFactsSink::new();
+        // The clone the generator handle keeps, taken BEFORE the load runs.
+        let consumer = sink.clone();
+        assert!(consumer.is_empty(), "nothing has been read yet");
+        assert!(consumer.facts().is_none());
+
+        // A source with no plan publishes nothing rather than erasing what is there.
+        sink.publish_optional(None);
+        assert!(consumer.is_empty(), "`None` is not a publication");
+
+        let facts =
+            CheckpointWeightFacts::new(&plan, nvfp4_capability(), honest_receipt()).expect("valid");
+        sink.publish(facts.clone());
+        let seen = consumer
+            .facts()
+            .expect("the clone observes the publication");
+        assert_eq!(seen, facts);
+        assert!(seen.source().declares(NVFP4_CODEC.codec_id));
+
+        // Last write wins: a staged provider that re-materializes reports the read that just
+        // finished, not a stale first one.
+        let mut dense_plan = mixed_plan();
+        dense_plan.tensors[0] = nvfp4_tensor("packed", ResidencyMode::Dense, 8192);
+        dense_plan.companions[0] = scale_companion("packed", 0);
+        let dense_receipt = LogicalWeightReceipt {
+            mapping_id: MAPPING,
+            tensor_count: 3,
+            source_bytes: dense_plan.source_bytes,
+            materialization: LogicalReadMaterialization::Materialized,
+            residency: vec![
+                row(
+                    DENSE_BF16_CODEC.codec_id,
+                    ExecutionRepresentation::DenseFallback,
+                    1,
+                    128,
+                    128,
+                ),
+                row(
+                    NVFP4_CODEC.codec_id,
+                    ExecutionRepresentation::DenseFallback,
+                    2,
+                    2048 + 2048 + 256 + 256,
+                    8192 + 8192,
+                ),
+            ],
+        };
+        sink.publish_optional(Some(
+            CheckpointWeightFacts::new(
+                &dense_plan,
+                NativeExecutionCapability::dense_only(),
+                dense_receipt,
+            )
+            .expect("valid"),
+        ));
+        let seen = consumer.facts().expect("republished");
+        assert!(!seen.executes_natively(NVFP4_CODEC.codec_id));
+        assert!(seen.source().declares(NVFP4_CODEC.codec_id));
     }
 
     /// The wire labels SceneWorks renders are fixed by this test, not by whatever the enum's
