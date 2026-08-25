@@ -374,7 +374,9 @@ pub enum QuantizationMetadataError {
         detail: String,
     },
     NotAnObject,
-    /// `format_version` absent or not the `"1.0"` this workspace models.
+    /// `format_version` present but not the `"1.0"` this workspace models. An absent key is
+    /// accepted as v1 (sc-21482): the real pinned `Comfy-Org/Krea-2` NVFP4 export writes no
+    /// version key at all.
     FormatVersion {
         found: Option<String>,
     },
@@ -444,11 +446,22 @@ pub fn parse_quantization_metadata(
     let object = json
         .as_object()
         .ok_or(QuantizationMetadataError::NotAnObject)?;
-    let version = object.get("format_version").and_then(|v| v.as_str());
-    if version != Some("1.0") {
-        return Err(QuantizationMetadataError::FormatVersion {
-            found: version.map(str::to_owned),
-        });
+    // `format_version` is refused when PRESENT and not the "1.0" this workspace models. An absent
+    // key is accepted as v1: the real pinned `Comfy-Org/Krea-2` NVFP4 export (sc-21482) writes
+    // `{"layers": {…}}` with no version key at all, and ComfyUI's own reader
+    // (`comfy.sd.load_diffusion_model_state_dict`) never consults one — so "absent" is the
+    // format's ground truth, not a producer defect.
+    if let Some(version) = object.get("format_version") {
+        if version.as_str() != Some("1.0") {
+            return Err(QuantizationMetadataError::FormatVersion {
+                found: Some(
+                    version
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| version.to_string()),
+                ),
+            });
+        }
     }
     let layers = object
         .get("layers")
@@ -836,6 +849,11 @@ pub enum Nvfp4GeometryError {
     /// block scales to 448, so this is corruption, and multiplying through it would quietly poison
     /// 16 weights instead of failing.
     BlockScaleNaN { row: usize, block: usize },
+    /// A block scale that governs real (non-padding) elements carries the E4M3 sign bit. ComfyUI's
+    /// quantizer clamps block scales to `[0, 448]`, so a negative scale is corruption; multiplying
+    /// through it would silently negate 16 weights instead of failing (sc-21482 — the check the
+    /// provider-owned Krea payload scan used to make, now owned by the codec).
+    BlockScaleNegative { row: usize, block: usize },
     /// A padding element (row ≥ logical rows, or column ≥ logical cols) is not the E2M1 zero code
     /// ComfyUI's `F.pad` writes. A non-zero pad means the shapes are being read wrong — the values
     /// would be dropped silently otherwise.
@@ -882,6 +900,11 @@ impl fmt::Display for Nvfp4GeometryError {
             Self::BlockScaleNaN { row, block } => write!(
                 f,
                 "nvfp4 block scale at (row {row}, block {block}) is the E4M3 NaN code 0x7F"
+            ),
+            Self::BlockScaleNegative { row, block } => write!(
+                f,
+                "nvfp4 block scale at (row {row}, block {block}) carries the E4M3 sign bit; block \
+                 scales are clamped to [0, 448] at quantization, so a negative scale is corruption"
             ),
             Self::PaddingNotZero { row, col, code } => write!(
                 f,
@@ -945,6 +968,48 @@ pub fn validate_nvfp4_geometry(
     }
 }
 
+/// Validate the NVFP4 block-scale **payload** for one layer: every scale byte that governs a real
+/// (non-padding) element of the `logical` matrix must be a valid non-negative, non-NaN UE4M3
+/// magnitude. `scales` is the `to_blocked` swizzled buffer for the `stored` grid, `logical` the
+/// shape the layer decodes/unpads to.
+///
+/// This is a value check the plan compiler's header-level geometry checks cannot make (it never
+/// touches payload bytes), and it is codec-owned rather than provider-owned (sc-21482): both the
+/// dense decode ([`decode_nvfp4`] calls it) and a backend's packed-native repack must refuse the
+/// same corrupted scale surface the same way, before the bad multiplier reaches any weight or any
+/// GEMM.
+pub fn validate_nvfp4_block_scale_payload(
+    scales: &[u8],
+    stored: [usize; 2],
+    logical: [usize; 2],
+) -> Result<(), Nvfp4GeometryError> {
+    let scale_shape = nvfp4_scale_shape(stored);
+    let expected_scales = scale_shape[0] * scale_shape[1];
+    if scales.len() != expected_scales {
+        return Err(Nvfp4GeometryError::PayloadLength {
+            what: "weight_scale",
+            expected: expected_scales,
+            actual: scales.len(),
+        });
+    }
+    let blocks = stored[1] / NVFP4_BLOCK;
+    for row in 0..logical[0].min(stored[0]) {
+        for block in 0..blocks {
+            if block * NVFP4_BLOCK >= logical[1] {
+                break;
+            }
+            let scale_byte = scales[nvfp4_swizzled_scale_index(stored, row, block)];
+            if scale_byte & 0x7F == 0x7F {
+                return Err(Nvfp4GeometryError::BlockScaleNaN { row, block });
+            }
+            if scale_byte & 0x80 != 0 {
+                return Err(Nvfp4GeometryError::BlockScaleNegative { row, block });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reference NVFP4 dequantization — the two-level decode, in plain f32.
 ///
 /// `packed` is the stored `[rows, cols/2]` byte payload (row-major, **even column in the high
@@ -974,15 +1039,6 @@ pub fn decode_nvfp4(
             actual: packed.len(),
         });
     }
-    let scale_shape = nvfp4_scale_shape(stored);
-    let expected_scales = scale_shape[0] * scale_shape[1];
-    if scales.len() != expected_scales {
-        return Err(Nvfp4GeometryError::PayloadLength {
-            what: "weight_scale",
-            expected: expected_scales,
-            actual: scales.len(),
-        });
-    }
     if !global_scale.is_finite() || global_scale < 0.0 {
         return Err(Nvfp4GeometryError::GlobalScale {
             bits: global_scale.to_bits(),
@@ -995,6 +1051,7 @@ pub fn decode_nvfp4(
             expected_stored: nvfp4_padded_shape(logical),
         });
     }
+    validate_nvfp4_block_scale_payload(scales, stored, logical)?;
 
     let code_at = |row: usize, col: usize| -> u8 {
         let byte = packed[row * row_bytes + col / 2];
@@ -1025,10 +1082,8 @@ pub fn decode_nvfp4(
             if block_start >= logical[1] {
                 break;
             }
+            // NaN/negative scale bytes were refused by `validate_nvfp4_block_scale_payload` above.
             let scale_byte = scales[nvfp4_swizzled_scale_index(stored, row, block)];
-            if scale_byte & 0x7F == 0x7F {
-                return Err(Nvfp4GeometryError::BlockScaleNaN { row, block });
-            }
             let element_scale = fp8_e4m3fn_to_f32(scale_byte) * global_scale;
             let block_end = (block_start + NVFP4_BLOCK).min(logical[1]);
             for col in block_start..block_end {
@@ -1583,9 +1638,15 @@ mod tests {
             parse_quantization_metadata("[1]"),
             Err(QuantizationMetadataError::NotAnObject)
         );
+        // An ABSENT `format_version` is accepted as v1 (sc-21482): the real pinned
+        // `Comfy-Org/Krea-2` NVFP4 export writes `{"layers": {…}}` with no version key, and
+        // ComfyUI's own reader never consults one. Only a present-but-different version refuses.
+        assert!(parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#).is_ok());
         assert_eq!(
-            parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#),
-            Err(QuantizationMetadataError::FormatVersion { found: None })
+            parse_quantization_metadata(r#"{"format_version": 1.0, "layers": {}}"#),
+            Err(QuantizationMetadataError::FormatVersion {
+                found: Some("1.0".to_owned())
+            })
         );
         assert_eq!(
             parse_quantization_metadata(
