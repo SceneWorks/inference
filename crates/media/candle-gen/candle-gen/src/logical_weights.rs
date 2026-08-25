@@ -2522,6 +2522,96 @@ mod tests {
         assert!(!packed.executes_natively(DENSE_F32_CODEC.codec_id));
     }
 
+    /// **sc-11045 fix round (epic E5): a `Packed`-priced row the provider demotes to the
+    /// dequant-bf16 regime is reported `DenseFallback` at the measured dense bytes**, with its
+    /// typed `RegimeDemotion` reconciling the receipt against the plan's packed pricing — never a
+    /// native row, never packed byte counts, and the companion scales the dense decode consumed
+    /// leave the packed expectation too.
+    #[test]
+    fn a_demoted_packed_row_reports_the_dense_fallback_truthfully() {
+        use gen_core::checkpoint_codec::LogicalReadMaterialization;
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-demotion.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+        let residency = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            residency.native_execution_capability(),
+        )
+        .expect("open");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("read");
+        }
+
+        // A dense-priced row has no packed pricing to demote from — typed refusal.
+        assert!(reader
+            .demote_to_dense_fallback("norm.weight", 16)
+            .unwrap_err()
+            .to_string()
+            .contains("priced Dense"));
+        // An unknown row refuses by name.
+        assert!(reader
+            .demote_to_dense_fallback("ghost.weight", 16)
+            .unwrap_err()
+            .to_string()
+            .contains("no entry in the compiled plan"));
+
+        // The provider's W4A16 construction: the packed container dequantized to a resident dense
+        // bf16 [rows, cols] weight.
+        let dense_bytes = (rows * cols * 2) as u64;
+        reader
+            .demote_to_dense_fallback("q.weight", dense_bytes)
+            .expect("demote the W4A16 row");
+        // Idempotent at the same measurement; a contradicting re-demotion refuses.
+        reader
+            .demote_to_dense_fallback("q.weight", dense_bytes)
+            .expect("re-demoting at the same bytes is idempotent");
+        assert!(reader
+            .demote_to_dense_fallback("q.weight", dense_bytes + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("contradicts the first measurement"));
+
+        let receipt = reader.receipt();
+        assert_eq!(
+            receipt.materialization,
+            LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(receipt.demotions.len(), 1);
+        assert_eq!(receipt.demotions[0].logical_key, "q.weight");
+        assert_eq!(receipt.demotions[0].resident_bytes, dense_bytes);
+
+        let facts = reader.checkpoint_weight_facts().expect(
+            "a demoted row with its typed accounting must reconcile against the packed plan",
+        );
+        assert!(facts.source().declares(NVFP4_CODEC.codec_id));
+        assert!(
+            !facts.executes_natively(NVFP4_CODEC.codec_id),
+            "the demoted run executed nothing natively"
+        );
+        assert!(facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+            .is_none());
+        let row = facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("the demoted row reports dense-fallback");
+        assert_eq!(row.tensor_count, 1);
+        assert_eq!(
+            row.resident_bytes, dense_bytes,
+            "the receipt carries the measured dense bytes, not the plan's packed pricing"
+        );
+        assert!(facts.is_complete());
+    }
+
     /// **sc-21484 mutation gate.** Two doctored receipts the handoff contract must reject, run
     /// against the engine's own dense-host read:
     ///
