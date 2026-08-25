@@ -160,9 +160,8 @@ mod cuda_impl {
         /// resident-weight forward (and the throughput probe) reflect real FP4 tensor-core speed rather
         /// than repeated heuristic searches. The fp8/int8 paths do not cache (they were spike/bench
         /// scaffolding); the NVFP4 path is a shipping compute lane so it does.
-        nvfp4_algos: std::sync::Mutex<
-            std::collections::HashMap<(usize, usize, usize), sys::cublasLtMatmulAlgo_t>,
-        >,
+        nvfp4_algos:
+            std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), CachedNvfp4Algo>>,
         /// Cached device-resident **gather index** (`U32`) for the on-device NVFP4 activation
         /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. For each byte offset in cuBLASLt's
         /// row-major scale-factor-atom layout it holds the source index into the row-major
@@ -184,6 +183,41 @@ mod cuda_impl {
     /// standard device intrinsics (no fp8/fp4 headers) so nvrtc needs no extra include path.
     const NVFP4_QUANT_CU: &str = include_str!("nvfp4_quant.cu");
 
+    /// The public, driver-reported configuration identity of the cuBLASLt algorithm selected for
+    /// one NVFP4 GEMM shape. This deliberately copies documented scalar configuration attributes
+    /// instead of exposing cuBLASLt's opaque `cublasLtMatmulAlgo_t` outside this module.
+    ///
+    /// The values identify the exact kernel/configuration selected by this installed driver; they
+    /// are evidence for a live device gate, not a cross-driver compatibility contract. In
+    /// particular, callers must not persist or hard-code them as universal expected values.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Nvfp4AlgorithmIdentity {
+        /// cuBLASLt's algorithm index.
+        pub algorithm_id: i32,
+        /// cuBLASLt tile configuration selected for this launch.
+        pub tile_id: u32,
+        /// Number of K splits selected for this launch.
+        pub split_k_num: i32,
+        /// cuBLASLt reduction scheme selected for this launch.
+        pub reduction_scheme: u32,
+        /// cuBLASLt CTA swizzle selected for this launch.
+        pub cta_swizzling: u32,
+        /// cuBLASLt algorithm-specific custom option.
+        pub custom_option: u32,
+        /// cuBLASLt pipeline-stages configuration.
+        pub stages_id: u32,
+        /// cuBLASLt tensor-core MMA inner-shape configuration.
+        pub inner_shape_id: u16,
+        /// cuBLASLt thread-block cluster-shape configuration.
+        pub cluster_shape_id: u16,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CachedNvfp4Algo {
+        algo: sys::cublasLtMatmulAlgo_t,
+        identity: Nvfp4AlgorithmIdentity,
+    }
+
     /// The two nvrtc-compiled kernels of the fused activation quantizer, cached on the handle. The
     /// `CudaFunction`s keep their owning module alive. Force `Send`/`Sync` to match [`CublasLt`]'s own
     /// contract (the handle is used single-threaded per `RUST_TEST_THREADS=1`).
@@ -198,6 +232,78 @@ mod cuda_impl {
     unsafe impl Send for CublasLt {}
     unsafe impl Sync for CublasLt {}
 
+    unsafe fn nvfp4_algo_config_attr<T>(
+        algo: &sys::cublasLtMatmulAlgo_t,
+        attr: sys::cublasLtMatmulAlgoConfigAttributes_t,
+    ) -> Result<T> {
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        let mut size_written = 0usize;
+        sys::cublasLtMatmulAlgoConfigGetAttribute(
+            algo,
+            attr,
+            value.as_mut_ptr().cast::<c_void>(),
+            size_of::<T>(),
+            &mut size_written,
+        )
+        .result()
+        .map_err(cublas_err)?;
+        if size_written != size_of::<T>() {
+            candle_core::bail!(
+                "cuBLASLt returned {size_written} bytes for {attr:?}; expected {}",
+                size_of::<T>()
+            );
+        }
+        Ok(value.assume_init())
+    }
+
+    fn nvfp4_algorithm_identity(
+        algo: &sys::cublasLtMatmulAlgo_t,
+    ) -> Result<Nvfp4AlgorithmIdentity> {
+        // These types are the documented storage types in CUDA 12.9's cublasLt.h. Reading them
+        // through the API is safe and remains valid even though `cublasLtMatmulAlgo_t` itself is
+        // opaque to this wrapper.
+        unsafe {
+            Ok(Nvfp4AlgorithmIdentity {
+                algorithm_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_ID,
+                )?,
+                tile_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID,
+                )?,
+                split_k_num: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                )?,
+                reduction_scheme: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                )?,
+                cta_swizzling: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+                )?,
+                custom_option: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+                )?,
+                stages_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                )?,
+                inner_shape_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+                )?,
+                cluster_shape_id: nvfp4_algo_config_attr(
+                    algo,
+                    sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
+                )?,
+            })
+        }
+    }
+
     impl Drop for CublasLt {
         fn drop(&mut self) {
             unsafe {
@@ -209,6 +315,22 @@ mod cuda_impl {
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
         const WORKSPACE: usize = 32 * 1024 * 1024;
+
+        /// Returns the driver-reported identity for the cached NVFP4 algorithm selected for
+        /// `(m, k, n)`, if that shape has already run. This is an observation seam for device
+        /// gates: a successful FP4-descriptor heuristic search must leave a concrete, cacheable
+        /// tensor-core algorithm configuration, without pretending its driver-specific IDs are
+        /// stable across CUDA releases.
+        pub fn selected_nvfp4_algorithm_identity(
+            &self,
+            m: usize,
+            k: usize,
+            n: usize,
+        ) -> Option<Nvfp4AlgorithmIdentity> {
+            crate::lock_recover(&self.nvfp4_algos)
+                .get(&(m, k, n))
+                .map(|cached| cached.identity)
+        }
 
         pub fn new(dev: &Device) -> Result<Self> {
             let device = match dev {
@@ -1211,7 +1333,7 @@ mod cuda_impl {
                 .get(&(m, k, n))
                 .copied();
             let algo = match cached {
-                Some(a) => a,
+                Some(cached) => cached.algo,
                 None => {
                     let pref = lt::create_matmul_pref().map_err(cublas_err)?;
                     lt::set_matmul_pref_attribute(
@@ -1241,7 +1363,9 @@ mod cuda_impl {
                             return Err(cublas_err(e));
                         }
                     };
-                    crate::lock_recover(&self.nvfp4_algos).insert((m, k, n), algo);
+                    let identity = nvfp4_algorithm_identity(&algo)?;
+                    crate::lock_recover(&self.nvfp4_algos)
+                        .insert((m, k, n), CachedNvfp4Algo { algo, identity });
                     algo
                 }
             };
@@ -1644,7 +1768,7 @@ mod cuda_impl {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, NVFP4_K_ALIGN};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, NVFP4_K_ALIGN};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

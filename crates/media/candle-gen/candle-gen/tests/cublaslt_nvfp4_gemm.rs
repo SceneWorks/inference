@@ -18,9 +18,8 @@
 //!    localised to a single scale atom). The throughput multiple against bf16 dense is
 //!    **reported, not gated** (the spike saw 1.9–3.7×); see the note in
 //!    `nvfp4_gemm_throughput_vs_bf16` for why a wall-clock ratio cannot be an assertion
-//!    (sc-19505). ⚠️ That demotion **gives up** the "is it faster" half of this item — a
-//!    driver/algo regression returning a working-but-slow FP4 algo is now gated nowhere, and
-//!    needs an algo-identity instrument to recover (sc-19556).
+//!    (sc-19505). The selected FP4 tensor-core algorithm/configuration is instead observed
+//!    after the first dispatch and proven to be cached unchanged for the shape (sc-19556).
 //! 4. **K-alignment** (**handoff item (b)**) — the GPU-confirmed requirement is K a multiple of 32
 //!    (K∈{16,48} → `NOT_SUPPORTED`; K∈{32,64,128} accepted); this pins the enforced bound.
 
@@ -206,6 +205,29 @@ fn nvfp4_gemm_throughput_vs_bf16() {
     // Warm up both paths (the FP4 warmup also primes the per-shape algo cache so the loop times the
     // kernel, not the one-off cuBLASLt heuristic search).
     let _ = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
+    let selected = lt
+        .selected_nvfp4_algorithm_identity(m, k, n)
+        .expect("FP4 descriptor heuristic must select and cache a cuBLASLt algorithm");
+    // `tile_id == 0` and `stages_id == 0` are cuBLASLt's UNDEFINED defaults. A selected
+    // configuration with either value would be a default-only false green: the FP4 descriptor
+    // found an opaque algo, but did not identify a concrete tensor-core tile/pipeline for this
+    // launch. `inner_shape_id` is recorded for evidence but may validly be undefined on an
+    // otherwise concrete driver configuration. Do not pin the nonzero values: algorithm/config
+    // IDs legitimately differ by CUDA driver.
+    assert_ne!(
+        selected.tile_id, 0,
+        "FP4 descriptor selected an undefined cuBLASLt tile: {selected:?}"
+    );
+    assert_ne!(
+        selected.stages_id, 0,
+        "FP4 descriptor selected undefined cuBLASLt pipeline stages: {selected:?}"
+    );
+    let _ = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
+    assert_eq!(
+        lt.selected_nvfp4_algorithm_identity(m, k, n),
+        Some(selected),
+        "repeated staged FP4 GEMM must reuse the exact selected cuBLASLt configuration"
+    );
     let _ = x_bf16.matmul(&w_bf16.t().unwrap()).unwrap();
     dev.synchronize().unwrap();
 
@@ -243,15 +265,9 @@ fn nvfp4_gemm_throughput_vs_bf16() {
     // arm) — so a device that cannot deliver an FP4 kernel panics at those `.unwrap()`s and never
     // reaches a timer. `nvfp4_device()` has already screened out the pre-Blackwell case above.
     //
-    // ⚠️ But one real claim DOES lapse here, and it is not noise. `mult > 1.0` also covered a
-    // driver/algo regression in which cuBLASLt returns *an* FP4 algo that is SLOWER than bf16
-    // dense. The `.unwrap()`s above cannot see that — a slow algo is still an algo, and the
-    // heuristic search succeeds. That is this file's own published item 3, "is it faster"
-    // (sc-11039), and after this change it is gated NOWHERE. It is given up deliberately, not
-    // covered by something else: re-gating it needs an instrument that names what the heuristic
-    // actually selected — an algo-identity / kernel-name assertion — rather than a throughput
-    // ratio, which is unfixable on a shared runner at any threshold. Tracked in sc-19556, and not
-    // attempted here because no lane can execute this file to validate a replacement (below).
+    // The selected tile/MMA configuration above carries the non-timing identity claim that the
+    // former `mult > 1.0` clock assertion only approximated. It remains tied to the FP4
+    // descriptor and is not a driver-incidental numeric ID contract.
     //
     // What the clock did carry, and the unwraps do not, is that this staged/algo-cached path is
     // still numerically right at a DiT shape — the round-trip test only reaches 256³ through the
