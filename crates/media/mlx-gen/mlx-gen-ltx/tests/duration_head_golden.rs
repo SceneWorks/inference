@@ -20,6 +20,11 @@ const GOLDEN: &str = concat!(
     "/tests/fixtures/ltx_duration_head_golden.safetensors"
 );
 
+/// The three modality combinations the golden records, in the order its `seconds_*` keys are named.
+pub const SHARED_FIXTURE_DURATION_HEAD_CASES: [&str; 3] = ["video_only", "audio_only", "both"];
+/// Relative-error ceiling the golden's predicted seconds are held to on both lanes.
+pub const SHARED_FIXTURE_DURATION_HEAD_REL_TOLERANCE: f32 = 5e-3;
+
 fn duration_head_file() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("LTX25_DURATION_HEAD_FILE") {
         return p.into();
@@ -51,10 +56,11 @@ fn duration_head_matches_reference_all_modalities() {
     let video = g.require("video_tokens").unwrap();
     let audio = g.require("audio_tokens").unwrap();
 
+    let [video_only, audio_only, both] = SHARED_FIXTURE_DURATION_HEAD_CASES;
     let cases: [(&str, Option<&mlx_rs::Array>, Option<&mlx_rs::Array>); 3] = [
-        ("video_only", Some(video), None),
-        ("audio_only", None, Some(audio)),
-        ("both", Some(video), Some(audio)),
+        (video_only, Some(video), None),
+        (audio_only, None, Some(audio)),
+        (both, Some(video), Some(audio)),
     ];
     for (name, v, a) in cases {
         let want = g.require(&format!("seconds_{name}")).unwrap().item::<f32>();
@@ -62,7 +68,7 @@ fn duration_head_matches_reference_all_modalities() {
         let err = rel_err(got, want);
         eprintln!("{name}: got={got:.6} want={want:.6} rel_err={err:.3e}");
         assert!(
-            err < 5e-3,
+            err < SHARED_FIXTURE_DURATION_HEAD_REL_TOLERANCE,
             "{name}: rel_err {err:.3e} too high (got {got}, want {want})"
         );
     }

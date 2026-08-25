@@ -1854,7 +1854,8 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
                 )
 
     def test_every_byte_identical_fixture_family_declares_its_geometry(self) -> None:
-        """The four families sc-19496 left behind, plus the one it fixed. Structural on both halves:
+        """The families sc-19496 left behind, plus the one it fixed and `ltx`, which joined when the
+        LTX-2.5 branch merged main. Structural on both halves:
         each listed family must really share fixture bytes, and must really declare matching
         `SHARED_FIXTURE_*` constants — no maintained count, because a count is what goes stale."""
         families = {
@@ -1863,7 +1864,7 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
         }
         self.assertEqual(
             set(self.gate.CROSS_BACKEND_FIXTURE_FAMILIES),
-            {"anima", "bernini", "krea", "minimax-h3", "sana"},
+            {"anima", "bernini", "krea", "ltx", "minimax-h3", "sana"},
         )
         # The table must be exactly the families that share fixture bytes — not a subset someone
         # stopped extending. sc-19496 shipped covering one of the five; four dual-backend families

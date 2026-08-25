@@ -38,7 +38,15 @@ use mlx_gen_ltx::config::LtxConfig;
 use mlx_gen_ltx::transformer::{AvDiT, Precision};
 
 const FIXTURE_JSON: &str = include_str!("fixtures/ltx25_distilled_dit_tensors.json");
-const NUM_LAYERS: i32 = 48;
+
+/// DiT depth the fixture header was captured at.
+pub const SHARED_FIXTURE_NUM_LAYERS: i32 = 48;
+/// DiT-only tensor count the fixture carries (4349 real minus the 258 embeddings-connector keys).
+pub const SHARED_FIXTURE_DIT_TENSOR_COUNT: usize = 4091;
+/// Video FFN up-projection bias width, from the real header's `[16384, 4096]` weight out-dim.
+pub const SHARED_FIXTURE_FF_UP_BIAS_DIM: i32 = 16384;
+/// Video FFN down-projection bias width, from the real header's `[4096, 16384]` weight out-dim.
+pub const SHARED_FIXTURE_FF_DOWN_BIAS_DIM: i32 = 4096;
 
 struct RealTensor {
     name: String,
@@ -131,10 +139,16 @@ fn reconstructed_23_weights() -> Weights {
         }
         m.insert(sanitize(&t.name), placeholder(&t.shape));
     }
-    for i in 0..NUM_LAYERS {
+    for i in 0..SHARED_FIXTURE_NUM_LAYERS {
         let p = format!("transformer_blocks.{i}");
-        m.insert(format!("{p}.ff.proj_in.bias"), placeholder(&[16384]));
-        m.insert(format!("{p}.ff.proj_out.bias"), placeholder(&[4096]));
+        m.insert(
+            format!("{p}.ff.proj_in.bias"),
+            placeholder(&[SHARED_FIXTURE_FF_UP_BIAS_DIM]),
+        );
+        m.insert(
+            format!("{p}.ff.proj_out.bias"),
+            placeholder(&[SHARED_FIXTURE_FF_DOWN_BIAS_DIM]),
+        );
     }
     Weights::from_map(m)
 }
@@ -146,7 +160,7 @@ fn ltx23_cfg() -> LtxConfig {
     cfg.apply_gated_attention = true;
     cfg.adaln_embedding_coefficient = 9;
     cfg.cross_attention_adaln = true;
-    cfg.num_layers = NUM_LAYERS;
+    cfg.num_layers = SHARED_FIXTURE_NUM_LAYERS;
     cfg
 }
 
@@ -168,8 +182,8 @@ fn ltx25_config_loads_the_real_header_exactly_no_missing_no_extra() {
     let w = real_25_weights();
     let total = w.len();
     assert_eq!(
-        total, 4091,
-        "fixture must be the real 4091-tensor DiT-only set"
+        total, SHARED_FIXTURE_DIT_TENSOR_COUNT,
+        "fixture must be the real {SHARED_FIXTURE_DIT_TENSOR_COUNT}-tensor DiT-only set"
     );
 
     AvDiT::from_weights(&w, &ltx25_cfg(), prec).expect("ltx_2_5 config must load the real header");
@@ -225,7 +239,7 @@ fn measured_delta_is_exactly_96_removed_and_1_added() {
             .filter(|n| n.as_str() != "keyframes_abs_pos_embedding")
             .cloned()
             .collect();
-        for i in 0..NUM_LAYERS {
+        for i in 0..SHARED_FIXTURE_NUM_LAYERS {
             s.insert(format!("transformer_blocks.{i}.ff.proj_in.bias"));
             s.insert(format!("transformer_blocks.{i}.ff.proj_out.bias"));
         }
@@ -237,7 +251,7 @@ fn measured_delta_is_exactly_96_removed_and_1_added() {
 
     assert_eq!(
         removed_going_25_to_23_direction.len(),
-        (NUM_LAYERS as usize) * 2,
+        (SHARED_FIXTURE_NUM_LAYERS as usize) * 2,
         "reconstructed 2.3 adds back exactly 96 video ff bias tensors vs the real 2.5 set"
     );
     assert!(removed_going_25_to_23_direction
@@ -251,7 +265,7 @@ fn measured_delta_is_exactly_96_removed_and_1_added() {
     );
 
     // Audio FFN bias is present and identical in both directions (untouched by the delta).
-    for i in 0..NUM_LAYERS {
+    for i in 0..SHARED_FIXTURE_NUM_LAYERS {
         let k = format!("transformer_blocks.{i}.audio_ff.proj_in.bias");
         assert!(real.contains(&k) && reconstructed.contains(&k));
         let k = format!("transformer_blocks.{i}.audio_ff.proj_out.bias");

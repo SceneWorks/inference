@@ -643,6 +643,12 @@ CROSS_BACKEND_FIXTURE_FAMILIES: dict[str, str] = {
         "six byte-identical fixtures, including `variant5_native_keys.txt`. Both lanes hand-type the "
         "tiny `Krea2Config` and `KreaTeConfig` the DiT and TE goldens are loaded through."
     ),
+    "ltx": (
+        "two byte-identical fixtures — `ltx25_distilled_dit_tensors.json` (the real LTX-2.5 "
+        "distilled DiT header) and `ltx_duration_head_golden.safetensors`. Both lanes hand-type the "
+        "DiT depth and the two video-FFN bias widths the 2.3↔2.5 delta is reconstructed from, and "
+        "the duration-head golden's three modality case names and relative tolerance."
+    ),
     "minimax-h3": (
         "five byte-identical safetensors goldens loaded through hand-typed video-VAE, audio-VAE and "
         "DiT geometry — the family sc-19496 was written for."
@@ -2621,7 +2627,8 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        values read out of the released checkpoint through diffusers, and both sides are held to them.
 
     4. **The test fixtures' geometry agrees too** (sc-19496). Every family in
-       ``CROSS_BACKEND_FIXTURE_FAMILIES`` — `anima`, `bernini`, `krea`, `minimax-h3`, `sana` — commits
+       ``CROSS_BACKEND_FIXTURE_FAMILIES`` — `anima`, `bernini`, `krea`, `ltx`, `minimax-h3`, `sana` —
+       commits
        fixture files byte-identically on both sides and loads them through geometry each lane
        hand-types, so a drift in either config leaves both lanes internally consistent and both parity
        suites green while the two backends compare a tensor dumped at one shape against a model built
