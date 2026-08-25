@@ -127,6 +127,62 @@ fn run_gemm(dev: &Device, lt: &CublasLt, m: usize, k: usize, n: usize) -> (Vec<f
     (got, dq_ref)
 }
 
+/// Offset of a logical scale byte in the packer's column-major 128×4 atom layout. This is test-side
+/// input construction, deliberately independent of the staging destination calculation below.
+fn packed_scale_offset(row: usize, block: usize, sf_rows: usize) -> usize {
+    let (m_atom, mr) = (row / 128, row % 128);
+    let (k_atom, kc) = (block / 4, block % 4);
+    let num_m_atoms = sf_rows / 128;
+    (m_atom + num_m_atoms * k_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+/// Offset of a logical scale byte in cuBLASLt's row-major 128×4 destination atom layout. Kept in
+/// this device test rather than calling the private staging helper so this remains a real byte oracle.
+fn staged_scale_offset(row: usize, block: usize, sf_cols: usize) -> usize {
+    let (m_atom, mr) = (row / 128, row % 128);
+    let (k_atom, kc) = (block / 4, block % 4);
+    let num_k_atoms = sf_cols / 4;
+    (k_atom + num_k_atoms * m_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+#[test]
+fn staged_nvfp4_scales_match_row_major_byte_oracle() {
+    let Some((_dev, lt)) = nvfp4_device() else {
+        return;
+    };
+
+    // Eight 16-value blocks make two K atoms. Thirty-two logical rows give exactly 256 distinct
+    // UE4M3 bytes while retaining the padded 128×4 atom shape that cuBLASLt consumes.
+    let (rows, cols_padded, sf_rows, sf_cols) = (32usize, 128usize, 128usize, 8usize);
+    let mut scales = vec![0u8; sf_rows * sf_cols];
+    let mut expected = vec![0u8; sf_rows * sf_cols];
+    for row in 0..rows {
+        for block in 0..sf_cols {
+            let byte = (row * sf_cols + block) as u8;
+            scales[packed_scale_offset(row, block, sf_rows)] = byte;
+            expected[staged_scale_offset(row, block, sf_cols)] = byte;
+        }
+    }
+    let packed = Nvfp4Tensor {
+        rows,
+        cols: cols_padded,
+        cols_padded,
+        packed: vec![0u8; rows * cols_padded / 2],
+        scales,
+        sf_rows,
+        sf_cols,
+        global_scale: 1.0,
+    };
+
+    let staged = lt.stage_nvfp4(&packed).unwrap();
+    assert_eq!(
+        staged.scales_to_host(&lt).unwrap(),
+        expected,
+        "staged NVFP4 scales must exactly re-tile logical (row, block) bytes into cuBLASLt's \
+         row-major 128x4 atom layout"
+    );
+}
+
 #[test]
 fn nvfp4_gemm_roundtrip_vs_bf16_dense() {
     let Some((dev, lt)) = nvfp4_device() else {
