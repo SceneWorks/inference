@@ -83,8 +83,9 @@ pub use checkpoint_codec::{
     GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 pub use checkpoint_facts::{
-    CheckpointWeightFacts, CheckpointWeightFactsError, ExecutionRepresentation,
-    NativeExecutionCapability, SourceBinding, SourceCodecEntry, SourceCodecSummary,
+    CheckpointFactsSink, CheckpointWeightFacts, CheckpointWeightFactsError,
+    ExecutionRepresentation, NativeExecutionCapability, SourceBinding, SourceCodecEntry,
+    SourceCodecSummary,
 };
 pub use comfy_quant::{
     blocked_scale_index, blocked_scale_shape, decode_fp8_e4m3fn_scalar, decode_fp8_e5m2_scalar,

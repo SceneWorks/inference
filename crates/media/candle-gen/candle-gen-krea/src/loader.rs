@@ -1754,11 +1754,13 @@ pub(crate) fn rms_scale(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
 mod tests {
     use super::*;
     use crate::nvfp4_dit::DenseReason;
+    // The Kitchen NVFP4 fixture moved to `testfix` (sc-21484 follow-up) so the loaded-generator
+    // propagation contract can be asserted on the same file this module reads facts off.
+    use crate::testfix::{kitchen_nvfp4_config, write_kitchen_nvfp4_native_file};
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
     use candle_gen::gen_core::checkpoint_facts::ExecutionRepresentation;
-    use candle_gen::quant::Nvfp4Tensor;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -2691,110 +2693,6 @@ mod tests {
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         ::safetensors::serialize_to_file(tensors, None, path).unwrap();
-    }
-
-    /// A small but **architecturally coherent** Krea 2 config the NVFP4 fixture below is built to.
-    ///
-    /// Coherence is load-bearing since sc-20651: the import declares its logical shapes from a
-    /// config, so a fixture whose tensors do not belong to one architecture cannot be planned at
-    /// all. `hidden = heads · head_dim = 4 · 16`, `head_dim = sum(axes_dims_rope)`, `heads % kv_heads
-    /// == 0`, `text_hidden = text_heads · head_dim` — every invariant `Krea2Config::validate`
-    /// enforces, at the smallest widths that are still NVFP4-legal (both stored axes 16-aligned).
-    fn kitchen_nvfp4_config() -> crate::Krea2Config {
-        let cfg = crate::Krea2Config {
-            in_channels: 16,
-            patch_size: 2,
-            hidden_size: 64,
-            num_attention_heads: 4,
-            num_kv_heads: 2,
-            attention_head_dim: 16,
-            num_layers: 1,
-            intermediate_size: 128,
-            norm_eps: 1e-5,
-            axes_dims_rope: [4, 6, 6],
-            rope_theta: 1000.0,
-            timestep_embed_dim: 32,
-            num_text_layers: 2,
-            num_layerwise_text_blocks: 1,
-            num_refiner_text_blocks: 1,
-            text_hidden_dim: 32,
-            text_intermediate_size: 64,
-            text_num_attention_heads: 2,
-            text_num_kv_heads: 1,
-        };
-        cfg.validate()
-            .expect("the fixture architecture is coherent");
-        cfg
-    }
-
-    /// A single-projection Kitchen NVFP4 native file plus one dense sibling, carrying the
-    /// **descriptor** a real Kitchen export carries (`__metadata__._quantization_metadata`).
-    ///
-    /// The descriptor is not decoration: it is what makes the layer NVFP4. Before sc-20651 this
-    /// fixture had none and the Candle import still took the NVFP4 path — off `dtype == U8` alone —
-    /// which is exactly the defect the epic's codec seam exists to remove.
-    fn write_kitchen_nvfp4_native_file(path: &Path) {
-        let cfg = kitchen_nvfp4_config();
-        // `attn.to_q` is `[q_dim, hidden]`, and Krea's `q_dim == hidden_size`, so the projection is
-        // square at the fixture's width. Both axes are 16-aligned, so the stored grid IS the layer
-        // (no ComfyUI padding) and the packed container can express it.
-        let (rows, cols) = (cfg.q_dim(), cfg.hidden_size);
-        let mut packed = vec![0u8; rows * cols / 2];
-        packed[0] = 0x12; // Kitchen hi-first: even code 1, odd code 2.
-        let mut block_scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
-        block_scales[Nvfp4Tensor::scale_offset_for(0, 0, rows)] = 0x38; // E4M3 1.0.
-        let global_scale = 2.0f32.to_le_bytes();
-        // The swizzled `to_blocked` scale grid, not `[rows, blocks]`: the plan validates the stored
-        // companion against `gen_core::nvfp4_scale_shape`, which is the 128×4-atom padded shape.
-        let scale_shape = candle_gen::gen_core::nvfp4_scale_shape([rows, cols]).to_vec();
-        let dense = vec![0u8; cfg.hidden_size * cfg.in_channels * 4];
-
-        let mut tensors = std::collections::BTreeMap::new();
-        tensors.insert(
-            "model.diffusion_model.blocks.0.attn.wq.weight",
-            ::safetensors::tensor::TensorView::new(
-                ::safetensors::Dtype::U8,
-                vec![rows, cols / 2],
-                &packed,
-            )
-            .unwrap(),
-        );
-        tensors.insert(
-            "model.diffusion_model.blocks.0.attn.wq.weight_scale",
-            ::safetensors::tensor::TensorView::new(
-                ::safetensors::Dtype::F8_E4M3,
-                scale_shape,
-                &block_scales,
-            )
-            .unwrap(),
-        );
-        tensors.insert(
-            "model.diffusion_model.blocks.0.attn.wq.weight_scale_2",
-            ::safetensors::tensor::TensorView::new(
-                ::safetensors::Dtype::F32,
-                vec![],
-                &global_scale,
-            )
-            .unwrap(),
-        );
-        tensors.insert(
-            "model.diffusion_model.first.weight",
-            ::safetensors::tensor::TensorView::new(
-                ::safetensors::Dtype::F32,
-                vec![cfg.hidden_size, cfg.in_channels],
-                &dense,
-            )
-            .unwrap(),
-        );
-        // Kitchen declares NVFP4 file-wide rather than per-tensor; the layer names are the file's
-        // own (native, prefixed) `{layer}` bases.
-        let metadata = std::collections::HashMap::from([(
-            "_quantization_metadata".to_string(),
-            r#"{"format_version": "1.0", "layers": {"model.diffusion_model.blocks.0.attn.wq": {"format": "nvfp4"}}}"#
-                .to_string(),
-        )]);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
     }
 
     /// [`write_kitchen_nvfp4_native_file`] whose one NVFP4 layer additionally declares
