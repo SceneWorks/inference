@@ -818,13 +818,29 @@ impl AdditiveProj for AdaptLinear {
     fn out_in(&self) -> (usize, usize) {
         self.base_shape()
     }
+    /// Always routed through [`AdaptLinear::push_lora_checked`] (sc-21483), never the unchecked
+    /// `push_lora`. The checked path is a strict superset of the unchecked one — it admits every
+    /// factor the unchecked push would have accepted and additionally refuses a mis-shaped,
+    /// non-float, or off-device factor — so this is the ONE additive wrapper's single admission
+    /// point regardless of which [`AdditiveDit`] handed out the projection. Without it a DiT that
+    /// yields a bare `&mut AdaptLinear` over an NVFP4 base could silently attach nothing and render
+    /// un-adapted, which the NVFP4 base has no fallback to recover from.
     fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
-        self.push_lora(a, b, scale);
-        Ok(())
+        self.push_lora_checked(a, b, scale)
     }
+    /// The LoKr twin of [`Self::add_lora`] — always the checked push.
     fn add_lokr(&mut self, factors: LokrFactors) -> Result<()> {
-        self.push_lokr_structured(factors);
-        Ok(())
+        self.push_lokr_structured_checked(factors)
+    }
+    /// Strict on an **NVFP4** base and only there: that base can be neither folded nor dequantized,
+    /// so a factor it cannot host must be a typed refusal rather than a skipped key. A dense or
+    /// MLX-packed base keeps the skip-and-report contract its callers rely on. This mirrors
+    /// `crate::quant::QLinear::strict_adapter_admission` so the two hosts of the same NVFP4
+    /// projection agree, and it follows the **constructed** representation: a plan-NVFP4 row that
+    /// the reader served dense (CPU, pre-`sm_120`, or an unalignable shape) is a `Base::Dense` here
+    /// and deliberately stays non-strict.
+    fn strict_admission(&self) -> bool {
+        self.is_nvfp4()
     }
 }
 
@@ -2380,6 +2396,106 @@ mod tests {
         let dd = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(dd < 1e-4, "resolved additive LoKr != folded ({dd})");
         assert_eq!(skipped, 0);
+    }
+
+    /// sc-21483 review (major #1). The ONE shared additive wrapper — `AdditiveProj for AdaptLinear`,
+    /// the impl every [`AdditiveDit`] that hands out a **bare** `&mut AdaptLinear` goes through —
+    /// must itself enforce the NVFP4 admission contract, not rely on Krea's `QLinear::Nvfp4`
+    /// wrapper (which not every DiT wraps its leaves in) or on the caller's outer shape guard.
+    ///
+    /// Two claims, both through the TRAIT methods rather than the inherent ones:
+    /// 1. an NVFP4-based host reports `strict_admission() == true`, so an installer skips nothing;
+    /// 2. a mis-shaped factor pushed through `add_lora`/`add_lokr` is an **error**, and nothing is
+    ///    attached — the projection cannot end up silently rendering un-adapted.
+    ///
+    /// Discriminating mutation: revert `add_lora` to the unchecked `push_lora` and this test goes
+    /// green-through-silent-attach (the push returns `Ok(())` and `is_adapted()` becomes true);
+    /// revert `strict_admission` to the `false` default and the first assertion fails.
+    #[test]
+    fn a_bare_adapt_linear_over_nvfp4_is_strict_and_refuses_a_mis_shaped_factor_via_the_trait() {
+        use candle_gen::quant::{ActPrecision, AdaptLinear, Nvfp4Linear};
+
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (32usize, 64usize);
+        let w = Tensor::from_vec(
+            (0..out_dim * in_dim)
+                .map(|i| ((i % 17) as f32 - 8.0) / 11.0)
+                .collect::<Vec<_>>(),
+            (out_dim, in_dim),
+            &dev,
+        )
+        .unwrap();
+        let mut host = AdaptLinear::from_nvfp4(
+            Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A16).unwrap(),
+        );
+        assert!(host.is_nvfp4());
+
+        // (1) The shared wrapper is strict on its own, with no Krea `QLinear` around it.
+        assert!(
+            AdditiveProj::strict_admission(&host),
+            "the ONE additive wrapper must be strict over an NVFP4 base; a `false` here is the \
+             silent-skip path a bare `&mut AdaptLinear` would take"
+        );
+        assert_eq!(AdditiveProj::out_in(&host), (out_dim, in_dim));
+
+        // (2a) A LoRA pair contracting against the wrong input width is refused, not attached.
+        let bad_a = Tensor::zeros((in_dim / 2, 4), DType::F32, &dev).unwrap();
+        let bad_b = Tensor::zeros((4, out_dim), DType::F32, &dev).unwrap();
+        let error = AdditiveProj::add_lora(&mut host, bad_a, bad_b, 1.0)
+            .expect_err("a mis-shaped LoRA must not be silently skipped over an NVFP4 base")
+            .to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(error.contains("do not compose"), "{error}");
+        assert!(!host.is_adapted(), "a refused factor must not be attached");
+
+        // (2b) …and so is a LoKr whose Kronecker factors reconstruct a different projection.
+        let w1 = Tensor::zeros((4, 4), DType::F32, &dev).unwrap();
+        let w2 = Tensor::zeros((4, 4), DType::F32, &dev).unwrap();
+        // Built for a 16×16 projection, pushed onto the 32×64 host.
+        let factors = LokrFactors::build(
+            1.0,
+            (16, 16),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a full-leg LoKr is structurally representable");
+        let error = AdditiveProj::add_lokr(&mut host, factors)
+            .expect_err("a mis-shaped LoKr must not be silently skipped over an NVFP4 base")
+            .to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(!host.is_adapted());
+
+        // A well-formed factor still installs — strictness is a refusal of the inadmissible, not a
+        // blanket refusal (otherwise the assertions above would pass on a wrapper that rejects all).
+        let a = Tensor::zeros((in_dim, 4), DType::F32, &dev).unwrap();
+        let b = Tensor::zeros((4, out_dim), DType::F32, &dev).unwrap();
+        AdditiveProj::add_lora(&mut host, a, b, 1.0).expect("a well-formed factor is admitted");
+        assert!(host.is_adapted());
+    }
+
+    /// The counterpart to the test above: a **dense** base keeps `strict_admission() == false`, so a
+    /// plan-NVFP4 row that the reader served dense (CPU / pre-`sm_120` / unalignable shape) keeps the
+    /// skip-and-report contract. Strictness follows the CONSTRUCTED representation, not the plan.
+    #[test]
+    fn a_dense_based_adapt_linear_stays_non_strict() {
+        use candle_gen::candle_nn::Linear;
+        use candle_gen::quant::AdaptLinear;
+
+        let dev = Device::Cpu;
+        let w = Tensor::zeros((8, 6), DType::F32, &dev).unwrap();
+        let host = AdaptLinear::from_dense(Linear::new(w, None), 6, 8);
+        assert!(!host.is_nvfp4());
+        assert!(
+            !AdditiveProj::strict_admission(&host),
+            "a dense base can fold or absorb a delta, so a mismatched key there still reads as \
+             'this key targeted another module'"
+        );
     }
 
     /// **Generic wide-surface install over both leaf types (sc-11720).** [`install_additive`] drives a DiT

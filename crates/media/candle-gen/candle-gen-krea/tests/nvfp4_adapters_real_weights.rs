@@ -35,6 +35,16 @@ use candle_gen_krea::loader::Weights;
 use candle_gen_krea::native_mapping::DeclaredLogicalShapes;
 use candle_gen_krea::{Krea2Config, Krea2Transformer};
 
+/// Floor on the number of projections the pinned Krea 2 LoRA must resolve onto the NVFP4 trunk.
+///
+/// **Measured**: `applied = 256, skipped_keys = 0, skipped_targets = 0` against
+/// `krea2_turbo_nvfp4.safetensors` + `krea2_identity_edit_v1_1_r64.safetensors` on CUDA
+/// (`nvfp4 quantized=160 fp4_lit=115`). A floor rather than an exact equality so a LoRA trained over
+/// a *superset* of targets still passes — but it sits exactly at the measured count, so any partial
+/// resolution (a renamed key class, a regime that quietly refused a subset) drops below it. The
+/// `applied > 0` assertion this replaces could not tell "one projection matched" from "all did".
+const MIN_APPLIED_TARGETS: usize = 256;
+
 /// The pinned NVFP4 DiT, the base component snapshot, and a real Krea 2 LoRA. `None` (with a
 /// printed reason) when the box is not provisioned, so the lane stays skippable.
 fn fixtures() -> Option<(PathBuf, PathBuf, PathBuf)> {
@@ -109,10 +119,12 @@ fn differing_pixels(a: &Image, b: &Image) -> usize {
 /// **AC#1 on real weights.** A real rank-16 Krea 2 LoRA installs over the pinned NVFP4 checkpoint
 /// and changes the render; the same adapter at strength 0 leaves the base output bit-identical.
 ///
-/// Strength 0 is the render-level removal proof: `AdaptLinear` skips a zero-scale residual before
-/// touching either factor, so the forward is the bare packed base. If installing an adapter had
-/// perturbed the base at load — a dequantize, a re-pack, a fold — the strength-0 render could not
-/// come back byte-equal.
+/// Strength 0 is an **install-neutrality** proof, NOT a removal proof: `Adapter::is_zero`
+/// short-circuits a zero-scale residual before any residual math runs, so the forward is the bare
+/// packed base and the only thing the byte-equal render can witness is that *installing* the adapter
+/// did not perturb the base (no dequantize, no re-pack, no fold at load). The removal claim — that
+/// clearing an installed, non-zero residual restores the base exactly — is carried by
+/// `nvfp4_base_hosts_an_additive_lora_and_restores_exactly_on_removal` in the unit suite.
 #[test]
 #[ignore = "requires explicitly scheduled CUDA and the local pinned Krea 2 NVFP4 checkpoint + a Krea 2 LoRA"]
 fn nvfp4_lora_render_differs_and_zero_scale_restores_the_base_exactly() {
@@ -186,10 +198,27 @@ fn nvfp4_trunk_keeps_every_packed_projection_after_a_real_lora_install() {
         before.fp4_lit,
         before.nvfp4_bytes,
     );
+    // A count, not a `> 0`: the pinned rank-16 Krea 2 LoRA targets every attention/MLP projection of
+    // all 48 blocks, so a partial resolution (a renamed key class, a regime that quietly refused a
+    // subset) has to show up as a number below the floor rather than as a still-passing `> 0`.
     assert!(
-        report.applied > 0,
-        "the LoRA must resolve onto the trunk's NVFP4 projections — a zero here is the \
-         'matched no target' failure this story fixes"
+        report.applied >= MIN_APPLIED_TARGETS,
+        "the LoRA must resolve onto the trunk's NVFP4 projections — applied={} is below the \
+         {MIN_APPLIED_TARGETS}-target floor for this checkpoint/LoRA pair (a zero is the \
+         'matched no target' failure this story fixes; a low non-zero is a partial resolution)",
+        report.applied
+    );
+    // Every key must land. `skipped_keys > 0` on this pair means a factor was dropped, and on an
+    // NVFP4 base there is no fallback that could have rendered it anyway — the story's whole point
+    // is that such a key is a refusal, never a silent skip.
+    assert_eq!(
+        report.skipped_keys, 0,
+        "no key of the pinned LoRA may be skipped against the NVFP4 trunk"
+    );
+    assert!(
+        report.skipped_targets.is_empty(),
+        "every LoRA target must exist on the NVFP4 trunk surface; unmatched: {:?}",
+        report.skipped_targets
     );
 
     let after = trunk.nvfp4_report();

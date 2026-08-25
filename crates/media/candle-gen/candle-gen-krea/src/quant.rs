@@ -481,6 +481,16 @@ impl QLinear {
     /// dequantized, or re-quantized to accommodate a mismatched adapter — so silently skipping would
     /// render an unadapted base with no signal. The dense and MLX-packed arms keep their existing
     /// skip-and-report behavior, where a shape mismatch means the key targeted a different module.
+    ///
+    /// Strictness follows the **constructed representation, not the plan**, and that is deliberate.
+    /// A row the plan marks NVFP4 is served DENSE whenever the FP4 representation is unavailable —
+    /// on CPU, on a pre-`sm_120` device, or when the row's shape cannot be aligned to
+    /// `NVFP4_K_ALIGN`/`NVFP4_N_ALIGN` — and such a row arrives here as `Self::Adapt`, so it keeps
+    /// skip-and-report. That is the correct answer for it: a dense base genuinely *can* fold or
+    /// absorb a delta, so the no-fallback premise that justifies refusing does not hold. The
+    /// consequence is that admission strictness is device-dependent for a plan-NVFP4 checkpoint —
+    /// intended, and the same rule `AdditiveProj for AdaptLinear::strict_admission`
+    /// (`crate::adapters`) applies, so the two hosts of one projection never disagree.
     pub(crate) fn strict_adapter_admission(&self) -> bool {
         matches!(self, Self::Nvfp4(_))
     }
