@@ -69,17 +69,6 @@ pub(crate) fn env_gguf_path() -> Option<PathBuf> {
     }
 }
 
-/// Open a Wan DiT `.gguf` and build the [`WanTransformer`] with its k-quant weights held
-/// **quantized-resident** (sc-12735). The entry point [`crate::Pipeline::build_dit`] calls on the GGUF seam.
-pub(crate) fn load_wan_dit_gguf(
-    path: &Path,
-    cfg: &TransformerConfig,
-    device: &Device,
-    dtype: candle_gen::candle_core::DType,
-) -> CResult<WanTransformer> {
-    load_wan_dit_gguf_with_receipt(path, cfg, device, dtype).map(|(dit, _)| dit)
-}
-
 /// [`load_wan_dit_gguf_with_facts`] wired to the provider-build seam (sc-11045 fix round,
 /// BLOCKER 1): load the DiT, then publish the read's validated [`CheckpointWeightFacts`] into the
 /// clonable sink whose sibling lives on the `WanGenerator`, so a consumer across the worker

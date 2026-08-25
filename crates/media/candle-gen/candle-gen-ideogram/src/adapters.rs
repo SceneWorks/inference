@@ -168,7 +168,8 @@ pub(crate) fn install_turbo_lora_additive_for_visitor(
                 skipped += 1;
                 return Ok(());
             }
-            lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale);
+            lin.push_lora(p.a.to_device(device)?, p.b.to_device(device)?, p.scale)
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
             applied += 1;
         }
         Ok(())
@@ -316,7 +317,7 @@ mod tests {
         let delta = up.matmul(&down)?; // [out, in]
         let mut dense_additive =
             AdaptLinear::from_dense(Linear::new(grid.clone(), None), in_dim, out_dim);
-        dense_additive.push_lora(a.clone(), b_fac.clone(), eff);
+        dense_additive.push_lora(a.clone(), b_fac.clone(), eff).unwrap();
         let folded = Linear::new((grid.clone() + (delta * eff)?)?, None);
         let resid_diff = (dense_additive.forward(&x)? - folded.forward(&x)?)?
             .abs()?
@@ -329,7 +330,7 @@ mod tests {
         // parity test uses) — so `packed additive == dense fold` end to end.
         let packed = SharedQLinear::from_packed_gs(&wq, &s, &b, None, g, &dev)?;
         let mut packed_additive = AdaptLinear::from_packed(packed, in_dim, out_dim);
-        packed_additive.push_lora(a, b_fac, eff);
+        packed_additive.push_lora(a, b_fac, eff).unwrap();
         let (pa, da) = (packed_additive.forward(&x)?, dense_additive.forward(&x)?);
         let pa = pa.flatten_all()?.to_vec1::<f32>()?;
         let da = da.flatten_all()?.to_vec1::<f32>()?;

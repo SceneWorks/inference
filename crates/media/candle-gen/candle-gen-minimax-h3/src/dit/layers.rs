@@ -217,7 +217,9 @@ impl LinearNoBias {
                 b.dims()
             )));
         }
-        self.inner.push_lora(a.clone(), b.clone(), scale);
+        self.inner
+            .push_lora(a.clone(), b.clone(), scale)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
         self.adapters.push(LoraResidual { a, b, scale });
         Ok(())
     }

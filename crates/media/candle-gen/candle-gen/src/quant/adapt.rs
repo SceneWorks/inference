@@ -1,25 +1,25 @@
 //! Shared residual-capable linear for the **forward-time additive (unmerged) LoRA / LoKr** path
-//! (sc-11091, epic 10765) — the one core [`AdaptLinear`] that the per-crate copies in
+//! (sc-11091, epic 10765) â€” the one core [`AdaptLinear`] that the per-crate copies in
 //! `candle-gen-wan/src/quant.rs` (sc-10094) and `candle-gen-anima/src/adapt.rs` (sc-10640) collapse
 //! into, and the first-class seam a new consumer (qwen-image-edit Lightning on a packed q4/q8 tier)
 //! adopts instead of hand-copying a third time. The candle twin of mlx-gen's `AdaptableLinear`.
 //!
-//! A frozen **base** — dense (`candle_nn::Linear`) or an MLX-**packed** [`super::QLinear`] that
-//! dequantizes-on-forward (sc-7702) — plus zero or more **forward-time additive residuals**
-//! `y = base(x) + Σ scale·((x·A)·B)`. Two residual forms, both **memory-free on a packed tier**:
-//!   * `Lora` — `scale·((x·a)·b)`, two small matmuls (`a = downᵀ [in,rank]`, `b = upᵀ·(alpha/rank)
+//! A frozen **base** â€” dense (`candle_nn::Linear`) or an MLX-**packed** [`super::QLinear`] that
+//! dequantizes-on-forward (sc-7702) â€” plus zero or more **forward-time additive residuals**
+//! `y = base(x) + Î£ scaleÂ·((xÂ·A)Â·B)`. Two residual forms, both **memory-free on a packed tier**:
+//!   * `Lora` â€” `scaleÂ·((xÂ·a)Â·b)`, two small matmuls (`a = downáµ€ [in,rank]`, `b = upáµ€Â·(alpha/rank)
 //!     [rank,out]`); never the `[out,in]` product, so a q4 base keeps its q4 footprint.
-//!   * `LokrStructured` — the Kronecker vec-trick `vec(w1·reshape(x)·w2ᵀ)` (the candle port of
+//!   * `LokrStructured` â€” the Kronecker vec-trick `vec(w1Â·reshape(x)Â·w2áµ€)` (the candle port of
 //!     mlx-gen's `Adapter::LokrStructured`), which applies a LoKr WITHOUT ever forming the `[out,in]`
-//!     delta — the one path Wan's old copy lacked (it fell back to a dense `[out,in]` delta, packed-
+//!     delta â€” the one path Wan's old copy lacked (it fell back to a dense `[out,in]` delta, packed-
 //!     rejected).
 //!
 //! **The base weight is NEVER mutated.** On a packed q4/q8 DiT that is the whole point: the packed
 //! codes survive load (`is_packed()` stays true, no dense `[out,in]` weight is materialized), and each
 //! adapter rides *unmerged* as small matmuls per forward. On a **dense** base the fold path
 //! ([`crate::train::merge`]) is still preferred for real runs, because a merge into a real `.weight`
-//! is byte-for-byte what the chaos-sensitive samplers' goldens expect (`(W+δ)·x ≠ W·x + δ·x` to ~1
-//! ULP — see [`crate::train::lora::reconstruct_lora_delta`]); the additive branch equals the fold to
+//! is byte-for-byte what the chaos-sensitive samplers' goldens expect (`(W+Î´)Â·x â‰  WÂ·x + Î´Â·x` to ~1
+//! ULP â€” see [`crate::train::lora::reconstruct_lora_delta`]); the additive branch equals the fold to
 //! f32 tolerance and is the *only* viable path where a merge is impossible (a quant-resident weight).
 //! With **no** adapter attached the forward is byte-identical to the bare base, so swapping this in for
 //! a projection leaves the plain-model / dense-fold paths unchanged.
@@ -31,10 +31,10 @@ use super::{lin_gs, DenseLinear, QLinear, MLX_GROUP_SIZE};
 use crate::{CandleError, Result};
 use gen_core::Quant;
 
-/// The frozen base weight — **dense** (`candle_nn::Linear`), **MLX-packed** ([`super::QLinear`],
+/// The frozen base weight â€” **dense** (`candle_nn::Linear`), **MLX-packed** ([`super::QLinear`],
 /// dequant-on-forward), or **NVFP4** ([`super::Nvfp4Linear`], E2M1 block-16 + UE4M3 scales served
-/// either through the FP4 tensor-core GEMM or its transparent dequant→bf16 fallback — sc-21483).
-/// All three compute `x·Wᵀ (+ b)`; none is ever mutated by an adapter.
+/// either through the FP4 tensor-core GEMM or its transparent dequantâ†’bf16 fallback â€” sc-21483).
+/// All three compute `xÂ·Wáµ€ (+ b)`; none is ever mutated by an adapter.
 ///
 /// The NVFP4 leg is held behind an [`Arc`] because [`super::Nvfp4Linear`] owns a staged device
 /// weight (and, on cuda, a cuBLASLt resident) that must not be deep-copied when a job-local DiT
@@ -51,7 +51,7 @@ enum Base {
 /// The one refusal every fold entry point returns on an **NVFP4** base (sc-21483, epic 11037 E2).
 /// An NVFP4 projection has exactly one correct answer to "re-quantize yourself": no. Folding it to
 /// `Q4`/`Q8` (or dequantizing it to BF16) to make some downstream path fit would silently replace the
-/// numeric regime the caller asked for — the exact silent-conversion class this story forbids.
+/// numeric regime the caller asked for â€” the exact silent-conversion class this story forbids.
 fn nvfp4_refold_refusal(quant: Quant) -> candle_core::Error {
     candle_core::Error::Msg(format!(
         "NVFP4 base: refusing to re-quantize an NVFP4 projection as {quant:?}; an NVFP4 weight is \
@@ -69,8 +69,8 @@ impl Base {
         }
     }
 
-    /// [`Self::forward`] with a **dense** base weight (and bias) upcast to `x`'s dtype per call — the
-    /// storage-dtype ≠ compute-dtype regime (bf16 weights, f32 activations, sc-12828). Only the one
+    /// [`Self::forward`] with a **dense** base weight (and bias) upcast to `x`'s dtype per call â€” the
+    /// storage-dtype â‰  compute-dtype regime (bf16 weights, f32 activations, sc-12828). Only the one
     /// weight in flight is transiently materialized at the compute dtype, so the resident footprint
     /// stays at the storage dtype's. Inert when the base already matches `x`'s dtype (`Tensor::to_dtype`
     /// short-circuits to an `Arc` clone), so byte-identical to [`Self::forward`]. The **packed** base
@@ -98,7 +98,7 @@ impl Base {
         matches!(self, Base::Nvfp4(_))
     }
 
-    /// The device the frozen base weight lives on — the device a residual factor must already be on
+    /// The device the frozen base weight lives on â€” the device a residual factor must already be on
     /// before it can be admitted. `None` on the MLX-packed arm, whose resident weight is a `QTensor`
     /// behind a [`super::MatmulStrategy`] and exposes no device accessor; an admission check then
     /// verifies shape and dtype only, exactly as it did before this seam existed.
@@ -111,14 +111,14 @@ impl Base {
     }
 }
 
-/// A forward-time additive residual attached to an [`AdaptLinear`] — it never touches the frozen base
+/// A forward-time additive residual attached to an [`AdaptLinear`] â€” it never touches the frozen base
 /// weight, so it is memory-free on a packed q4/q8 tier. Factors are held **f32** (the merge/train
 /// dtype) and cast to the activation dtype per forward (they are tiny, so the cast is cheap).
 #[derive(Clone)]
 enum Adapter {
-    /// LoRA residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with
-    /// the `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form — never
-    /// the `[out,in]` product — so it stays memory-free on any quant.
+    /// LoRA residual `scaleÂ·((xÂ·a)Â·b)`: `a` `[in, rank]` (= `downáµ€`), `b` `[rank, out]` (= `upáµ€` with
+    /// the `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form â€” never
+    /// the `[out,in]` product â€” so it stays memory-free on any quant.
     Lora { a: Tensor, b: Tensor, scale: f64 },
     /// Training LoRA keeps the canonical `down [rank,in]` / `up [out,rank]` variable leaves and
     /// transposes them inside every forward. Holding a precomputed transpose here would retain an
@@ -137,7 +137,7 @@ enum Adapter {
         base_shape: (usize, usize),
         scale: f64,
     },
-    /// Structured LoKr residual via the Kronecker vec-trick — the FULL `(alpha/rank)·strength` scale is
+    /// Structured LoKr residual via the Kronecker vec-trick â€” the FULL `(alpha/rank)Â·strength` scale is
     /// baked into [`LokrFactors::w2`], so a LoKr applies WITHOUT ever forming the `[out,in]` delta (the
     /// packed-capable path the whole hoist adds over Wan's old dense-only delta).
     LokrStructured { factors: LokrFactors },
@@ -149,16 +149,16 @@ enum Adapter {
 /// **Never `broadcast_matmul` here.** candle materializes a broadcast rhs through `.contiguous()`
 /// (`candle-core`'s own `broadcast_matmul` carries the `TODO: Avoid concretising the broadcasted
 /// matrixes` note), so a 2-D factor against a `[N, S, in]` activation is physically **copied `N`
-/// times** and then multiplied as `N` batched GEMMs with `M = S`. That is free where `N = 1` — every
-/// DiT trunk site — and pathological where a site folds a token count into the *batch* dim: the Krea
-/// text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so a 2048² image **edit**
+/// times** and then multiplied as `N` batched GEMMs with `M = S`. That is free where `N = 1` â€” every
+/// DiT trunk site â€” and pathological where a site folds a token count into the *batch* dim: the Krea
+/// text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so a 2048Â² image **edit**
 /// (`n_tokens = 4107` vision+text tokens, `d = 2560`, rank 256) turned each rank-256 factor into a
-/// 2.7e9-element / **5.4 GB** copy and then a 4107-batch `M = 12` GEMM against it — 32 such legs per
+/// 2.7e9-element / **5.4 GB** copy and then a 4107-batch `M = 12` GEMM against it â€” 32 such legs per
 /// denoise step across the two layerwise blocks' eight adapted projections. The first denoise step
 /// never finished (hours), while the same render without an adapter took 55 s.
 ///
 /// Flattening is mathematically identical (`matmul` contracts the last dim either way), allocates
-/// nothing beyond the result, and issues ONE large-`M` GEMM — the same lesson sc-11785 applied to the
+/// nothing beyond the result, and issues ONE large-`M` GEMM â€” the same lesson sc-11785 applied to the
 /// LoKr vec-trick's expensive leg, here for the plain-LoRA legs.
 fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
     let dims = x.dims();
@@ -252,34 +252,34 @@ impl Adapter {
 }
 
 /// The two small Kronecker factors of a LoKr delta, kept **unmaterialized** for a deferred structured
-/// forward (the candle port of mlx-gen's `LokrFactors`, sc-10713 / epic 10043). `ΔW = scale·kron(w1,
-/// w2)` reshapes to the base's `[out, in]`, but the Kronecker–vector identity lets us apply it WITHOUT
-/// ever forming that `[out, in]` tensor: with `w1` `[a, c]` and `w2` `[b, d]` (so `out = a·b`,
-/// `in = c·d`), the residual `y = x·ΔWᵀ` is
-///   `Y = w1 · X · w2ᵀ`  (then flatten row-major `[.., a, b] → [.., out]`),
-/// where `X = reshape(x, [.., c, d])`. Two small matmuls (`[a,c]·[..,c,d]` then `·[d,b]`) touch only
-/// the factor shapes — never `[out, in]` — so a LoKr applies on a packed q4/q8 base at the same memory
+/// forward (the candle port of mlx-gen's `LokrFactors`, sc-10713 / epic 10043). `Î”W = scaleÂ·kron(w1,
+/// w2)` reshapes to the base's `[out, in]`, but the Kroneckerâ€“vector identity lets us apply it WITHOUT
+/// ever forming that `[out, in]` tensor: with `w1` `[a, c]` and `w2` `[b, d]` (so `out = aÂ·b`,
+/// `in = cÂ·d`), the residual `y = xÂ·Î”Wáµ€` is
+///   `Y = w1 Â· X Â· w2áµ€`  (then flatten row-major `[.., a, b] â†’ [.., out]`),
+/// where `X = reshape(x, [.., c, d])`. Two small matmuls (`[a,c]Â·[..,c,d]` then `Â·[d,b]`) touch only
+/// the factor shapes â€” never `[out, in]` â€” so a LoKr applies on a packed q4/q8 base at the same memory
 /// profile as a plain LoRA. The row-major kron ordering here matches [`crate::train::lora`]'s `kron2d`
-/// (`out[i·b+k, j·d+l] = w1[i,j]·w2[k,l]`), so the structured residual equals the folded delta. The
-/// full `(alpha/rank)·strength` scale is baked into `w2` at build time.
+/// (`out[iÂ·b+k, jÂ·d+l] = w1[i,j]Â·w2[k,l]`), so the structured residual equals the folded delta. The
+/// full `(alpha/rank)Â·strength` scale is baked into `w2` at build time.
 ///
 /// `Clone`/`Debug` so a caller that stacks these residuals on its own adaptable seam (the SDXL
 /// [`crate::train::lora::LoraLinear`] additive channel, sc-11103) can hold them in a `#[derive(Clone,
-/// Debug)]` module without re-implementing the vec-trick — the factors are `Tensor`s (cheap `Arc`
+/// Debug)]` module without re-implementing the vec-trick â€” the factors are `Tensor`s (cheap `Arc`
 /// clone) plus `usize` shape metadata.
 #[derive(Clone, Debug)]
 pub struct LokrFactors {
-    /// `[a, c]` — the left Kronecker factor (`out = a·b`, `in = c·d`).
+    /// `[a, c]` â€” the left Kronecker factor (`out = aÂ·b`, `in = cÂ·d`).
     w1: Tensor,
-    /// `[b, d]` — the right Kronecker factor, with the full scale baked in.
+    /// `[b, d]` â€” the right Kronecker factor, with the full scale baked in.
     w2: Tensor,
-    /// `a` — row count of `w1`; the flattened output index is `p·b + q`.
+    /// `a` â€” row count of `w1`; the flattened output index is `pÂ·b + q`.
     a: usize,
-    /// `b` — row count of `w2`.
+    /// `b` â€” row count of `w2`.
     b: usize,
-    /// `c` — col count of `w1`; the flattened input index is `r·d + s`.
+    /// `c` â€” col count of `w1`; the flattened input index is `rÂ·d + s`.
     c: usize,
-    /// `d` — col count of `w2`.
+    /// `d` â€” col count of `w2`.
     d: usize,
     /// Optional output-row slice for a fused source projection routed onto one split host projection.
     output_slice: Option<(usize, usize)>,
@@ -300,19 +300,19 @@ impl LokrFactors {
     }
 
     /// Build the small `[a,c]`/`[b,d]` Kronecker factors from a LoKr module's factors (full `w1`/`w2`
-    /// or a low-rank `w_a·w_b` product — that product is bounded by the factor dims, NEVER `out×in`),
+    /// or a low-rank `w_aÂ·w_b` product â€” that product is bounded by the factor dims, NEVER `outÃ—in`),
     /// baking the FULL `scale` into `w2`. The allocation-free counterpart to
     /// [`crate::train::lora::reconstruct_lokr_delta`] (which materializes the full `[out,in]` delta).
     ///
     /// **Scale differs from the fold path by design** (the two-conventions trap, sc-10578): the
     /// materialized `reconstruct_lokr_delta` bakes only `alpha/rank` and rides the user `strength` in
     /// the merge `scale`, whereas the structured residual carries no separate scale field, so the FULL
-    /// `(alpha/rank)·strength` must be baked here (the caller derives it). Mismatching these two is a
+    /// `(alpha/rank)Â·strength` must be baked here (the caller derives it). Mismatching these two is a
     /// silent mis-scale, not a crash.
     ///
-    /// Returns `Ok(None)` when the module has **no 2-D matrix form** deferrable via the vec-trick — a
+    /// Returns `Ok(None)` when the module has **no 2-D matrix form** deferrable via the vec-trick â€” a
     /// tucker/CP `lokr_t2` (conv-only), a factor that is not 2-D, or a base that does not factor as
-    /// `a·b × c·d`. The caller then rejects (a packed base cannot materialize) or folds (a dense base).
+    /// `aÂ·b Ã— cÂ·d`. The caller then rejects (a packed base cannot materialize) or folds (a dense base).
     /// A missing `w1`/`w2` leg is a typed error (a malformed file), never a panic.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
@@ -379,21 +379,21 @@ impl LokrFactors {
                 "lokr: derived scale must be finite, got {scale}"
             )));
         }
-        // A tucker/CP `w2` (a 4-D conv factor, lycoris `lokr_t2`) has no 2-D matrix form — not
+        // A tucker/CP `w2` (a 4-D conv factor, lycoris `lokr_t2`) has no 2-D matrix form â€” not
         // deferrable via the vec-trick. The peft LoKr format never carries it; guard anyway so a conv
         // LoKr falls back to reject/fold rather than silently mis-applying.
         if w2_t2.is_some() {
             return Ok(None);
         }
         let f32d = |t: &Tensor| t.to_dtype(DType::F32);
-        // The small Kronecker factors — full, or the low-rank inner product (bounded by the factor
-        // dims, NEVER `out×in`): `w1_a @ w1_b` yields the small `[a, c]`, not the packed delta.
+        // The small Kronecker factors â€” full, or the low-rank inner product (bounded by the factor
+        // dims, NEVER `outÃ—in`): `w1_a @ w1_b` yields the small `[a, c]`, not the packed delta.
         let factor1 = match (w1, w1_a, w1_b) {
             (Some(w), _, _) => f32d(w)?,
             (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
             _ => {
                 return Err(CandleError::Msg(
-                    "lokr: w1 missing (need full lokr_w1 or lokr_w1_a·lokr_w1_b)".into(),
+                    "lokr: w1 missing (need full lokr_w1 or lokr_w1_aÂ·lokr_w1_b)".into(),
                 ))
             }
         };
@@ -402,18 +402,18 @@ impl LokrFactors {
             (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
             _ => {
                 return Err(CandleError::Msg(
-                    "lokr: w2 missing (need full lokr_w2 or lokr_w2_a·lokr_w2_b)".into(),
+                    "lokr: w2 missing (need full lokr_w2 or lokr_w2_aÂ·lokr_w2_b)".into(),
                 ))
             }
         };
-        // A conv-shaped (>2-D) factor is not a plain matrix — defer to reject/fold.
+        // A conv-shaped (>2-D) factor is not a plain matrix â€” defer to reject/fold.
         if factor1.dims().len() != 2 || factor2.dims().len() != 2 {
             return Ok(None);
         }
         let (a, c) = (factor1.dims()[0], factor1.dims()[1]);
         let (b, d) = (factor2.dims()[0], factor2.dims()[1]);
         let (out_f, in_f) = base_shape;
-        // The base must factor as `out = a·b`, `in = c·d` (a plain 2-D linear); anything else (a conv
+        // The base must factor as `out = aÂ·b`, `in = cÂ·d` (a plain 2-D linear); anything else (a conv
         // weight with kernel dims, or a factor/base mismatch) is not this linear vec-trick.
         let fused_out = a * b;
         let output_matches = match output_slice {
@@ -441,7 +441,7 @@ impl LokrFactors {
         }))
     }
 
-    /// Move the (CPU-read) factors onto `device` — the base lives on the DiT's device, so the residual
+    /// Move the (CPU-read) factors onto `device` â€” the base lives on the DiT's device, so the residual
     /// matmul would be a device mismatch otherwise.
     pub fn to_device(&self, device: &Device) -> Result<Self> {
         Ok(Self {
@@ -456,10 +456,10 @@ impl LokrFactors {
         })
     }
 
-    /// The deferred, allocation-free LoKr residual via the Kronecker–vector identity (`scale` already
-    /// baked into `w2`). For an activation `x` of shape `[.., in]` (`in = c·d`): reshape to
-    /// `[.., c, d]`, compute `Y = w1 · X · w2ᵀ` (`[.., a, b]`), and flatten row-major to `[.., out]`
-    /// (`out = a·b`). The two matmuls touch only the small factor shapes — the full `[out, in]` delta
+    /// The deferred, allocation-free LoKr residual via the Kroneckerâ€“vector identity (`scale` already
+    /// baked into `w2`). For an activation `x` of shape `[.., in]` (`in = cÂ·d`): reshape to
+    /// `[.., c, d]`, compute `Y = w1 Â· X Â· w2áµ€` (`[.., a, b]`), and flatten row-major to `[.., out]`
+    /// (`out = aÂ·b`). The two matmuls touch only the small factor shapes â€” the full `[out, in]` delta
     /// is NEVER materialized, so this holds the same memory profile on a packed q4/q8 base as a plain
     /// LoRA. Factors are cast to the activation dtype so a bf16 stream runs bf16.
     ///
@@ -472,25 +472,25 @@ impl LokrFactors {
         let dims = x.dims();
         let lead = &dims[..dims.len() - 1];
         let n: usize = lead.iter().product::<usize>().max(1);
-        // Vec-trick `Y = w1 · X · w2ᵀ`, ordered so the **expensive** contraction (over `d`, the big
+        // Vec-trick `Y = w1 Â· X Â· w2áµ€`, ordered so the **expensive** contraction (over `d`, the big
         // inner factor) is ONE large-`M` GEMM rather than `N` tiny-`M` batched GEMMs. The prior form
-        // `w1b.broadcast_matmul(xr).broadcast_matmul(w2tb)` ran the `·w2ᵀ` leg as a batch of `N`
-        // `[a,d]·[d,b]` products with `M = a` — for a factor-4 LoKr `a = 4`, and `N` = the token count.
+        // `w1b.broadcast_matmul(xr).broadcast_matmul(w2tb)` ran the `Â·w2áµ€` leg as a batch of `N`
+        // `[a,d]Â·[d,b]` products with `M = a` â€” for a factor-4 LoKr `a = 4`, and `N` = the token count.
         // On CUDA that batch of tiny-`M` GEMMs is pathologically slow at long sequences (a Krea
-        // image-edit's `N ≈ 6.6k` tokens turned an 8-step turbo edit into a multi-minute grind, and it
-        // inflated VRAM), while the flop count barely rises. Fold the `N·c` rows into the GEMM's `M`:
-        //   T = X · w2ᵀ : `[N·c, d] · [d, b] → [N·c, b]`  (single GEMM, `M = N·c`),
-        // then apply the tiny outer `w1` (contraction over `c` — cheap however it batches). Associativity
+        // image-edit's `N â‰ˆ 6.6k` tokens turned an 8-step turbo edit into a multi-minute grind, and it
+        // inflated VRAM), while the flop count barely rises. Fold the `NÂ·c` rows into the GEMM's `M`:
+        //   T = X Â· w2áµ€ : `[NÂ·c, d] Â· [d, b] â†’ [NÂ·c, b]`  (single GEMM, `M = NÂ·c`),
+        // then apply the tiny outer `w1` (contraction over `c` â€” cheap however it batches). Associativity
         // makes this bit-equal (to f32 rounding) to the old order, so the `structured_lokr_*` deltas hold.
         let t = x
             .contiguous()?
             .reshape((n * self.c, self.d))?
-            .matmul(&w2t)? // [N·c, b]
+            .matmul(&w2t)? // [NÂ·c, b]
             .reshape((n, self.c, self.b))?;
         let w1b = w1.reshape((1, self.a, self.c))?;
-        // Y = w1 · T  → [N, a, b] (batch `N`, but `M = a` / `K = c` are the tiny outer factor ⇒ cheap).
+        // Y = w1 Â· T  â†’ [N, a, b] (batch `N`, but `M = a` / `K = c` are the tiny outer factor â‡’ cheap).
         let y = w1b.broadcast_matmul(&t)?;
-        // [N, a, b] → [.., out] (out = a·b), restoring the original leading dims (row-major flatten).
+        // [N, a, b] â†’ [.., out] (out = aÂ·b), restoring the original leading dims (row-major flatten).
         let mut ys = lead.to_vec();
         ys.push(self.a * self.b);
         let y = y.contiguous()?.reshape(ys)?;
@@ -509,13 +509,13 @@ impl LokrFactors {
 #[derive(Clone)]
 pub struct AdaptLinear {
     base: Base,
-    /// The projection's logical `(out_features, in_features)` — captured at construction (recoverable
+    /// The projection's logical `(out_features, in_features)` â€” captured at construction (recoverable
     /// even from a packed base, where the dense weight is never materialized) so the residual installer
     /// can shape-check a factor without reading the quantized weight back.
     out_features: usize,
     in_features: usize,
     /// Forward-time additive residuals, applied in push order (adapters stack). Empty on the plain /
-    /// dense-fold path ⇒ forward is byte-identical to the bare base.
+    /// dense-fold path â‡’ forward is byte-identical to the bare base.
     adapters: Vec<Adapter>,
 }
 
@@ -531,7 +531,7 @@ impl std::fmt::Debug for AdaptLinear {
 }
 
 impl AdaptLinear {
-    /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims — the seam a
+    /// Wrap an already-built dense `candle_nn::Linear` with its logical `[out, in]` dims â€” the seam a
     /// caller uses when it holds a `Linear` directly (e.g. a folded-delta reference, or a test grid).
     pub fn from_dense(l: Linear, in_dim: usize, out_dim: usize) -> Self {
         Self {
@@ -542,7 +542,7 @@ impl AdaptLinear {
         }
     }
 
-    /// Wrap an already-built **packed** base [`super::QLinear`] with its logical `[out, in]` dims — the
+    /// Wrap an already-built **packed** base [`super::QLinear`] with its logical `[out, in]` dims â€” the
     /// raw-tensor twin of [`Self::from_dense`], for a caller that builds the packed base directly from
     /// the MLX triple tensors rather than through a [`VarBuilder`] (the ideogram DiT loader's
     /// `Weights`-based `linear_detect`, sc-11104; the krea loader's `MmapedSafetensors` seam, sc-11105).
@@ -558,11 +558,11 @@ impl AdaptLinear {
     }
 
     /// Wrap an already-built **NVFP4** [`super::Nvfp4Linear`] as an adapter-capable base (sc-21483,
-    /// epic 11037) — the NVFP4 twin of [`Self::from_packed`]. The logical `[out, in]` dims come from
+    /// epic 11037) â€” the NVFP4 twin of [`Self::from_packed`]. The logical `[out, in]` dims come from
     /// the packed tensor itself, so no dense weight is read back.
     ///
     /// The point of routing NVFP4 through the ONE shared additive wrapper (sc-11091) rather than
-    /// giving it a parallel residual stack: a LoRA/LoKr rides as `scale·((x·a)·b)` (or the Kronecker
+    /// giving it a parallel residual stack: a LoRA/LoKr rides as `scaleÂ·((xÂ·a)Â·b)` (or the Kronecker
     /// vec-trick) *alongside* the packed forward, so the E2M1 codes are never dequantized, never
     /// re-packed, and never converted to q4/BF16 to make an adapter fit. Removing the adapter
     /// ([`Self::clear_adapters`]) restores the base output exactly, because the base was never
@@ -578,7 +578,7 @@ impl AdaptLinear {
     }
 
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
-    /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
+    /// checked exactly like `candle_nn::linear` â€” so it loads unchanged on `VarMap`-backed test
     /// fixtures.
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> candle_core::Result<Self> {
         Ok(Self::from_dense(
@@ -603,13 +603,13 @@ impl AdaptLinear {
 
     /// **Packed-detecting** `[out, in]` loader at an explicit MLX `group_size`: if `{base}.scales` is
     /// present under `vb` (a pre-quantized MLX tier), build a `Base::Packed` straight from the packed
-    /// parts on `vb`'s device via the shared [`super::lin_gs`] — **no dense weight is materialized**.
+    /// parts on `vb`'s device via the shared [`super::lin_gs`] â€” **no dense weight is materialized**.
     /// Otherwise the **dense** path is taken unchanged (`{base}.weight` [+ `{base}.bias`], shape-
     /// checked).
     ///
     /// `base` is the full dotted key prefix relative to `vb` (e.g. `to_out.0`), so the
     /// `.scales`/`.biases`/`.bias` siblings survive any `to_out.0`-style nesting: build the base string
-    /// first, then detect — never `.pp()` past the scales sibling (the key-remap trap the shared loader
+    /// first, then detect â€” never `.pp()` past the scales sibling (the key-remap trap the shared loader
     /// guards).
     pub fn linear_detect_gs(
         in_dim: usize,
@@ -635,7 +635,7 @@ impl AdaptLinear {
         }
     }
 
-    /// **Packed-detecting** `[out, in]` loader at the default MLX [`MLX_GROUP_SIZE`] (64) — thin wrapper
+    /// **Packed-detecting** `[out, in]` loader at the default MLX [`MLX_GROUP_SIZE`] (64) â€” thin wrapper
     /// over [`Self::linear_detect_gs`] for the callers whose hosted tiers pack at 64.
     pub fn linear_detect(
         in_dim: usize,
@@ -647,7 +647,7 @@ impl AdaptLinear {
         Self::linear_detect_gs(in_dim, out_dim, vb, base, bias, MLX_GROUP_SIZE)
     }
 
-    /// Bias-less, **packed-detecting** `[out, in]` projection from `{name}` on `vb` — the variant that
+    /// Bias-less, **packed-detecting** `[out, in]` projection from `{name}` on `vb` â€” the variant that
     /// **recovers the logical dims** from the packed `scales` shape (`[out, in/group]`) instead of
     /// taking them as arguments (the Anima DiT loader shape). If `{name}.scales` is present, load the
     /// MLX-packed triple at their native dtypes (u32 codes must NOT be cast through the vb's float
@@ -659,7 +659,7 @@ impl AdaptLinear {
             let wq = vb.get_unchecked_dtype(&format!("{name}.weight"), DType::U32)?;
             let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
             let biases = vb.get_unchecked_dtype(&format!("{name}.biases"), DType::F32)?;
-            // scales is [out, in/group] — recover the logical dims without touching the packed codes.
+            // scales is [out, in/group] â€” recover the logical dims without touching the packed codes.
             let sdims = scales.dims();
             let out_features = sdims[0];
             let in_features = sdims[1] * MLX_GROUP_SIZE;
@@ -683,7 +683,7 @@ impl AdaptLinear {
     }
 
     /// Bias-less **dense** `[out, in]` projection from `{name}.weight` (a component that never packs,
-    /// e.g. Anima's conditioner q/k/v/o — dense bf16 in every tier).
+    /// e.g. Anima's conditioner q/k/v/o â€” dense bf16 in every tier).
     pub fn dense(vb: &VarBuilder, name: &str) -> candle_core::Result<Self> {
         let w = vb.get_unchecked(&format!("{name}.weight"))?;
         let (out_features, in_features) = (w.dims()[0], w.dims()[1]);
@@ -708,7 +708,7 @@ impl AdaptLinear {
         })
     }
 
-    /// `x·Wᵀ (+ b)` plus every attached additive residual, in push order. A disabled residual is
+    /// `xÂ·Wáµ€ (+ b)` plus every attached additive residual, in push order. A disabled residual is
     /// skipped entirely; each live residual keeps `Adapter::residual`'s activation-dtype math and is
     /// cast only at the hand-off to the host output dtype before addition. With no live adapter this
     /// is byte-identical to the bare base forward.
@@ -724,12 +724,12 @@ impl AdaptLinear {
         Ok(y)
     }
 
-    /// [`Self::forward`] for a **storage-dtype ≠ compute-dtype** site (sc-12828): the dense base weight
+    /// [`Self::forward`] for a **storage-dtype â‰  compute-dtype** site (sc-12828): the dense base weight
     /// is upcast to `x`'s dtype per call, so a bf16-resident projection runs against f32 activations
     /// without materializing the whole weight at f32 (only the one weight in flight is transient). The
     /// additive residuals retain their `x`-dtype arithmetic (`Adapter::residual`) and narrow only to
     /// the resulting host output dtype at the add. Inert (byte-identical to [`Self::forward`], an
-    /// `Arc` clone with no copy) when `x` already matches the base dtype — the f32-store
+    /// `Arc` clone with no copy) when `x` already matches the base dtype â€” the f32-store
     /// training/control paths. Used by the Qwen3-VL text encoders (krea/boogu), whose bf16-stored
     /// projections run against an f32 hidden state.
     pub fn forward_upcast(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -744,7 +744,7 @@ impl AdaptLinear {
         Ok(y)
     }
 
-    /// Whether the base loaded from an MLX-packed tier (its codes are quantized) — used to gate the
+    /// Whether the base loaded from an MLX-packed tier (its codes are quantized) â€” used to gate the
     /// residual-vs-fold route and asserted by the tests (packed survives load, no dense weight
     /// materialized).
     pub fn is_packed(&self) -> bool {
@@ -752,13 +752,13 @@ impl AdaptLinear {
     }
 
     /// Whether the base is an **NVFP4** projection (sc-21483). Distinct from [`Self::is_packed`],
-    /// which stays the MLX-packed (`Q4_1`/`Q8_0`) predicate its existing callers key off — an NVFP4
+    /// which stays the MLX-packed (`Q4_1`/`Q8_0`) predicate its existing callers key off â€” an NVFP4
     /// base holds no GGUF block weight and has no [`super::MatmulStrategy`].
     pub fn is_nvfp4(&self) -> bool {
         self.base.is_nvfp4()
     }
 
-    /// Whether the base weight is held in *any* quantized regime — MLX-packed or NVFP4.
+    /// Whether the base weight is held in *any* quantized regime â€” MLX-packed or NVFP4.
     pub fn is_quantized(&self) -> bool {
         self.is_packed() || self.is_nvfp4()
     }
@@ -777,7 +777,7 @@ impl AdaptLinear {
         }
     }
 
-    /// The base projection's `(out_features, in_features)` — the shape a resolved LoRA factor / LoKr
+    /// The base projection's `(out_features, in_features)` â€” the shape a resolved LoRA factor / LoKr
     /// delta is checked against, recoverable even from a packed base.
     pub fn base_shape(&self) -> (usize, usize) {
         (self.out_features, self.in_features)
@@ -801,7 +801,7 @@ impl AdaptLinear {
         }
     }
 
-    /// The projection's contraction (`in_features`) — the last-dim an `[in, rank]` LoRA `a` factor
+    /// The projection's contraction (`in_features`) â€” the last-dim an `[in, rank]` LoRA `a` factor
     /// contracts against.
     pub fn in_features(&self) -> usize {
         self.in_features
@@ -817,18 +817,29 @@ impl AdaptLinear {
         !self.adapters.is_empty()
     }
 
-    /// Attach a forward-time **LoRA** residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b`
-    /// `[rank, out]` (= `upᵀ` with `alpha/rank` folded in), `scale` the caller's per-adapter strength.
-    /// Multiple pushes stack. Valid on **any** base — the base weight is untouched, so a packed q4/q8
+    /// Attach a forward-time **LoRA** residual `scaleÂ·((xÂ·a)Â·b)`: `a` `[in, rank]` (= `downáµ€`), `b`
+    /// `[rank, out]` (= `upáµ€` with `alpha/rank` folded in), `scale` the caller's per-adapter strength.
+    /// Multiple pushes stack. Valid on **any** base â€” the base weight is untouched, so a packed q4/q8
     /// tier keeps its footprint.
-    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+    ///
+    /// **On an NVFP4 base this delegates to [`Self::push_lora_checked`]** (sc-11045 fix round,
+    /// MAJOR 7): an NVFP4 host has no fallback â€” it can neither fold a mismatched delta nor
+    /// dequantize to make one fit â€” so the unchecked bypass is structurally closed and a
+    /// mis-shaped factor is a typed refusal at admission, never a first-forward shape panic.
+    /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
+    /// their own shape screening) and always return `Ok`.
+    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        if matches!(self.base, Base::Nvfp4(_)) {
+            return self.push_lora_checked(a, b, scale);
+        }
         self.adapters.push(Adapter::Lora { a, b, scale });
+        Ok(())
     }
 
     /// [`Self::push_lora`] with **admission validation** (sc-21483): the factor pair must match the
     /// base projection's contraction and output width, carry a float dtype, and already live on the
-    /// base's device. A mismatch is a typed error *here* — at load/admission, before the first
-    /// sampler step — rather than a shape panic inside the first forward, and the base is never
+    /// base's device. A mismatch is a typed error *here* â€” at load/admission, before the first
+    /// sampler step â€” rather than a shape panic inside the first forward, and the base is never
     /// re-quantized or dequantized to make a mismatched factor fit.
     ///
     /// This is the entry point a host with **no fallback** must use. A dense base could in principle
@@ -845,7 +856,7 @@ impl AdaptLinear {
         }
         if a_dims[0] != in_f || b_dims[1] != out_f || a_dims[1] != b_dims[0] {
             return Err(CandleError::Msg(format!(
-                "{}: LoRA factor shapes a{a_dims:?}·b{b_dims:?} do not compose against the base \
+                "{}: LoRA factor shapes a{a_dims:?}Â·b{b_dims:?} do not compose against the base \
                  [out={out_f}, in={in_f}]",
                 self.admission_subject()
             )));
@@ -939,41 +950,48 @@ impl AdaptLinear {
     }
 
     /// Attach a forward-time **structured LoKr** residual via the Kronecker vec-trick: the full
-    /// `(alpha/rank)·strength` scale is already baked into `factors.w2`, so `[out,in]` is never
-    /// materialized. Valid on **any** base — the base weight is untouched, so a packed q4/q8 tier keeps
+    /// `(alpha/rank)Â·strength` scale is already baked into `factors.w2`, so `[out,in]` is never
+    /// materialized. Valid on **any** base â€” the base weight is untouched, so a packed q4/q8 tier keeps
     /// its footprint. Multiple pushes stack, and it mixes freely with LoRA residuals (push order).
-    pub fn push_lokr_structured(&mut self, factors: LokrFactors) {
+    ///
+    /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** â€” same
+    /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
+    pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
+        if matches!(self.base, Base::Nvfp4(_)) {
+            return self.push_lokr_structured_checked(factors);
+        }
         self.adapters.push(Adapter::LokrStructured { factors });
+        Ok(())
     }
 
-    /// Drop **every** attached forward-time residual, reverting the projection to its bare base — so the
+    /// Drop **every** attached forward-time residual, reverting the projection to its bare base â€” so the
     /// next [`Self::forward`] is byte-identical to the un-adapted base (`is_adapted()` returns `false`).
     /// The base weight is never touched (it was never mutated by a residual), so clearing is a cheap,
     /// exact toggle-off. The candle twin of mlx-gen's `AdaptableLinear::clear_adapters`: it is the
-    /// per-phase adapter *toggle* a multi-phase render runs on its **job-local** DiT between phases —
-    /// clear the prior phase's residuals, then push the next phase's subset — without ever mutating the
+    /// per-phase adapter *toggle* a multi-phase render runs on its **job-local** DiT between phases â€”
+    /// clear the prior phase's residuals, then push the next phase's subset â€” without ever mutating the
     /// shared resident base tensors (which stay Arc-shared and read-only across concurrent generates).
     pub fn clear_adapters(&mut self) {
         self.adapters.clear();
     }
 
-    /// Fold a **dense** base to an MLX-packed base in place (Q4/Q8), preserving any attached residuals —
+    /// Fold a **dense** base to an MLX-packed base in place (Q4/Q8), preserving any attached residuals â€”
     /// or an **idempotent no-op** on an already-packed base. The shared-core twin of
     /// [`super::QLinear::quantize`] for a consumer whose DiT quantizes AFTER any dense adapter fold
-    /// (lens / sd3, sc-11105): on a **dense** tier the projection folds dense→Q4/Q8 here; on a **packed**
+    /// (lens / sd3, sc-11105): on a **dense** tier the projection folds denseâ†’Q4/Q8 here; on a **packed**
     /// tier it is the no-op the additive install relies on, so the forward-time residuals survive. Uses
     /// the sc-7702-safe [`super::MatmulStrategy::DequantDense`] forward (via `QLinear::quantize`); the
-    /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
+    /// residual stack is untouched â€” the deltas ride on top of the now-packed base. Only the **base**
     /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
     ///
     /// An **NVFP4** base is a hard error, never a no-op and never a re-fold (sc-21483): re-quantizing
-    /// it to `Q4`/`Q8` — or dequantizing it to BF16 to make some other path fit — would swap the
+    /// it to `Q4`/`Q8` â€” or dequantizing it to BF16 to make some other path fit â€” would swap the
     /// projection's numeric regime out from under a caller that asked for NVFP4. `Quant::Nvfp4` is
     /// refused too: NVFP4 is packed from the bf16 master, so "re-NVFP4ing" an NVFP4 base could only
     /// mean a double quantization.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
         match &mut self.base {
-            // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
+            // Already packed (a packed-tier load, or a prior fold) â†’ idempotent no-op.
             Base::Packed(_) => Ok(()),
             Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::Dense(l) => {
@@ -986,10 +1004,10 @@ impl AdaptLinear {
     }
 
     /// As [`Self::quantize`] but folds a **dense** base to a packed base landing on an explicit `device`
-    /// (the CPU-stage → quantize-onto-GPU path, sc-8504 / sd3) — the base is quantized on its current
+    /// (the CPU-stage â†’ quantize-onto-GPU path, sc-8504 / sd3) â€” the base is quantized on its current
     /// device and placed on `device` via [`super::QLinear::quantize_dequant_onto`]. An already-packed
     /// base is an **idempotent no-op**. Only the base is folded; this is only used on the dense-fold
-    /// route (which carries no forward-time residuals), so the residual stack — empty there — is untouched.
+    /// route (which carries no forward-time residuals), so the residual stack â€” empty there â€” is untouched.
     pub fn quantize_dequant_onto(
         &mut self,
         quant: Quant,
@@ -1022,11 +1040,11 @@ impl AdaptLinear {
         }
     }
 
-    /// Move the projection — base + every attached residual factor — onto `device`, in place. The seam
+    /// Move the projection â€” base + every attached residual factor â€” onto `device`, in place. The seam
     /// a consumer's **dense-kept** leaf migrates through on the CPU-stage quant path (sd3's AdaLN /
     /// embedder linears, sc-11105): they build on the CPU with the rest of the DiT, then migrate to the
     /// GPU alongside the quantized projections. Mirrors [`super::QLinear::to_device`] (a dense base
-    /// moves; a packed base is a no-op — its quantized weight already lives on its device), and also
+    /// moves; a packed base is a no-op â€” its quantized weight already lives on its device), and also
     /// moves any forward-time residual so a migrated adapted leaf stays device-consistent.
     pub fn to_device(&mut self, device: &Device) -> candle_core::Result<()> {
         match &mut self.base {
@@ -1075,7 +1093,7 @@ mod tests {
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
 
-    /// Test-side MLX Q4 packer (group 64): per-element 4-bit codes → u32 words (LSB-first nibbles).
+    /// Test-side MLX Q4 packer (group 64): per-element 4-bit codes â†’ u32 words (LSB-first nibbles).
     /// Returns `(wq [out, in/8] u32, scales [out, in/g], biases [out, in/g], affine grid [out, in])`.
     fn q4_packed(out_dim: usize, in_dim: usize) -> (Tensor, Tensor, Tensor, Vec<f32>) {
         let dev = Device::Cpu;
@@ -1086,7 +1104,7 @@ mod tests {
         let gpr = in_dim / g;
         let groups = out_dim * gpr;
         // Small, BOUNDED scales/biases so the dequantized grid stays ~O(1). A large-magnitude grid
-        // makes `base.forward` huge, and the residual-isolation test (adapted − base) then recovers a
+        // makes `base.forward` huge, and the residual-isolation test (adapted âˆ’ base) then recovers a
         // tiny residual from a catastrophic f32 cancellation. Bounded via `% k` so it holds at any
         // group count.
         let scales: Vec<f32> = (0..groups)
@@ -1115,8 +1133,8 @@ mod tests {
     }
 
     /// A per-call unique suffix so parallel tests never share a temp file (`cargo test` runs threads in
-    /// ONE process, so a pid-only name would collide — one test truncating/deleting the file another is
-    /// mid-mmap on → corrupt reads / flaky failures).
+    /// ONE process, so a pid-only name would collide â€” one test truncating/deleting the file another is
+    /// mid-mmap on â†’ corrupt reads / flaky failures).
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Build a packed [`AdaptLinear`] via [`AdaptLinear::detect`] on a written `.weight`/`.scales`/
@@ -1206,7 +1224,7 @@ mod tests {
     }
 
     /// sc-15444: a strength-zero LoRA is not merely numerically close to disabled: its factors must
-    /// not be evaluated. Poisoned factors make the distinction observable (∞·0 would become NaN).
+    /// not be evaluated. Poisoned factors make the distinction observable (âˆžÂ·0 would become NaN).
     /// The ordinary dense forward and the bf16-store/f32-compute `forward_upcast` must return the
     /// exact no-adapter values and dtype. Candle's CPU backend does not implement bf16 matmul, so the
     /// ordinary-forward leg uses its production f32 regime; the bf16-resident leg is exercised through
@@ -1228,7 +1246,7 @@ mod tests {
             out_dim,
         );
         let (a, b) = poison_lora(in_dim, out_dim);
-        zero_forward_host.push_lora(a, b, 0.0);
+        zero_forward_host.push_lora(a, b, 0.0).unwrap();
         let zero_forward = zero_forward_host.forward(&x_f32).unwrap();
         assert_tensor_exact(&zero_forward, &bare_forward, "dense f32 forward scale=0");
 
@@ -1252,7 +1270,7 @@ mod tests {
             in_dim,
             out_dim,
         );
-        zero_lokr_host.push_lokr_structured(factors);
+        zero_lokr_host.push_lokr_structured(factors).unwrap();
         assert_tensor_exact(
             &zero_lokr_host.forward(&x_f32).unwrap(),
             &bare_forward,
@@ -1263,7 +1281,7 @@ mod tests {
         let bare_upcast = bare_bf16.forward_upcast(&x_f32).unwrap();
         let mut zero_bf16 = dense_bf16_adapt(out_dim, in_dim);
         let (a, b) = poison_lora(in_dim, out_dim);
-        zero_bf16.push_lora(a, b, 0.0);
+        zero_bf16.push_lora(a, b, 0.0).unwrap();
         let zero_upcast = zero_bf16.forward_upcast(&x_f32).unwrap();
         assert_tensor_exact(
             &zero_upcast,
@@ -1306,7 +1324,7 @@ mod tests {
 
             let mut zero = int8_fast_adapt(quant, out_dim, in_dim);
             let (poison_a, poison_b) = poison_lora(in_dim, out_dim);
-            zero.push_lora(poison_a, poison_b, 0.0);
+            zero.push_lora(poison_a, poison_b, 0.0).unwrap();
             assert_tensor_exact(
                 &zero.forward(&x).unwrap(),
                 &bare_forward,
@@ -1319,7 +1337,7 @@ mod tests {
             );
 
             let mut live = int8_fast_adapt(quant, out_dim, in_dim);
-            live.push_lora(a.clone(), b.clone(), 0.5);
+            live.push_lora(a.clone(), b.clone(), 0.5).unwrap();
             let expected = (&bare_forward + &residual).unwrap();
             let got = live.forward(&x).unwrap();
             assert_tensor_exact(&got, &expected, "quantized forward live adapter");
@@ -1457,7 +1475,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (out_dim, in_dim) = (64usize, 128usize); // in divisible by group 64
         let (lin, _grid) = packed_adapt(&tmp, out_dim, in_dim);
-        assert!(lin.is_packed(), "`.scales` ⇒ packed base");
+        assert!(lin.is_packed(), "`.scales` â‡’ packed base");
         assert_eq!(
             lin.base_shape(),
             (out_dim, in_dim),
@@ -1468,7 +1486,7 @@ mod tests {
         assert!(!lin.is_adapted());
     }
 
-    /// The dense arm of `linear_detect` is byte-identical to the legacy `candle_nn::linear` read — a
+    /// The dense arm of `linear_detect` is byte-identical to the legacy `candle_nn::linear` read â€” a
     /// dense checkpoint (no `.scales`) loads dense, unchanged; a `.scales` sibling fires the packed arm.
     #[test]
     fn linear_detect_dense_and_packed_arms() {
@@ -1495,7 +1513,7 @@ mod tests {
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
         let dense = AdaptLinear::linear_detect(in_dim, out_dim, &vb, "d", true).unwrap();
-        assert!(!dense.is_packed(), "no `.scales` ⇒ dense");
+        assert!(!dense.is_packed(), "no `.scales` â‡’ dense");
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
         let want = Linear::new(w, Some(bias));
         let dev_max = (dense.forward(&x).unwrap() - want.forward(&x).unwrap())
@@ -1514,12 +1532,12 @@ mod tests {
         let packed = AdaptLinear::linear_detect(in_dim, out_dim, &vb, "p", false).unwrap();
         assert!(
             packed.is_packed(),
-            "`.scales` ⇒ packed load, not a silent dense fallback"
+            "`.scales` â‡’ packed load, not a silent dense fallback"
         );
     }
 
-    /// The additive LoRA residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with
-    /// `δ = (alpha/rank)·scale·(up·down)` on a dense f32 base — the additive==folded identity (tight in
+    /// The additive LoRA residual `scaleÂ·((xÂ·a)Â·b)` reproduces the **folded** `xÂ·(W + Î´)áµ€` with
+    /// `Î´ = (alpha/rank)Â·scaleÂ·(upÂ·down)` on a dense f32 base â€” the additive==folded identity (tight in
     /// f32), the core weight-level property (no GPU needed).
     #[test]
     fn additive_lora_matches_folded_dense() {
@@ -1531,14 +1549,14 @@ mod tests {
         let (alpha, user_scale) = (8.0f64, 0.7f64);
         let ratio = alpha / rank as f64;
 
-        // a = downᵀ [in, rank]; b = (upᵀ·ratio) [rank, out].
+        // a = downáµ€ [in, rank]; b = (upáµ€Â·ratio) [rank, out].
         let a = down.t().unwrap().contiguous().unwrap();
         let b = (up.t().unwrap().contiguous().unwrap() * ratio).unwrap();
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a, b, user_scale);
+        lin.push_lora(a, b, user_scale).unwrap();
         assert!(lin.is_adapted());
 
-        // Folded reference: δ = ratio·user_scale·(up·down); W_merged = W + δ.
+        // Folded reference: Î´ = ratioÂ·user_scaleÂ·(upÂ·down); W_merged = W + Î´.
         let delta = ((up.matmul(&down).unwrap()) * (ratio * user_scale)).unwrap();
         let folded = Linear::new((w + delta).unwrap(), None);
 
@@ -1555,7 +1573,7 @@ mod tests {
     }
 
     /// A LoRA applied additively onto a **packed** base shifts the output, keeps the base **packed** (no
-    /// dense weight materialized), and stays finite — the core acceptance on a quantized tier. A scale-0
+    /// dense weight materialized), and stays finite â€” the core acceptance on a quantized tier. A scale-0
     /// residual is an exact no-op (the mutation anchor: break the scale and this equality breaks).
     #[test]
     fn additive_lora_on_packed_shifts_stays_packed_and_scale0_is_noop() {
@@ -1568,7 +1586,7 @@ mod tests {
         let (mut adapted, _) = packed_adapt(&tmp, out_dim, in_dim);
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
-        adapted.push_lora(a.clone(), b.clone(), 1.0);
+        adapted.push_lora(a.clone(), b.clone(), 1.0).unwrap();
         assert!(adapted.is_packed(), "adapter must not un-pack the base");
 
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
@@ -1597,9 +1615,9 @@ mod tests {
             "packed additive output non-finite"
         );
 
-        // scale 0 ⇒ exact no-op vs the un-adapted packed base.
+        // scale 0 â‡’ exact no-op vs the un-adapted packed base.
         let (mut zero, _) = packed_adapt(&tmp, out_dim, in_dim);
-        zero.push_lora(a, b, 0.0);
+        zero.push_lora(a, b, 0.0).unwrap();
         let zero_dev = (zero.forward(&x).unwrap().sub(&base_y).unwrap())
             .abs()
             .unwrap()
@@ -1613,9 +1631,9 @@ mod tests {
         );
     }
 
-    /// `clear_adapters` reverts an adapted projection to its **bare base** — the per-phase toggle-off a
+    /// `clear_adapters` reverts an adapted projection to its **bare base** â€” the per-phase toggle-off a
     /// multi-phase render runs on its job-local DiT between phases. After clearing, the forward is
-    /// **byte-identical** to the un-adapted base, and a re-push installs a fresh residual — proving a
+    /// **byte-identical** to the un-adapted base, and a re-push installs a fresh residual â€” proving a
     /// phase's adapter set is authoritative regardless of what the prior phase installed, and that the
     /// base weight is never disturbed by the toggle.
     #[test]
@@ -1632,7 +1650,7 @@ mod tests {
         let base_y = base.forward(&x).unwrap();
 
         let mut lin = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), 0.7);
+        lin.push_lora(a.clone(), b.clone(), 0.7).unwrap();
         assert!(lin.is_adapted());
         let adapted_shift = (lin.forward(&x).unwrap() - &base_y)
             .unwrap()
@@ -1644,7 +1662,7 @@ mod tests {
             .unwrap();
         assert!(adapted_shift > 1e-4, "the residual must shift the forward");
 
-        // Toggle off: clear ⇒ byte-identical to the bare base (an exact 0 deviation, not a tolerance).
+        // Toggle off: clear â‡’ byte-identical to the bare base (an exact 0 deviation, not a tolerance).
         lin.clear_adapters();
         assert!(!lin.is_adapted(), "clear must drop every residual");
         let cleared_dev = (lin.forward(&x).unwrap() - &base_y)
@@ -1660,8 +1678,8 @@ mod tests {
             "after clear the forward must equal the bare base exactly"
         );
 
-        // Re-push a fresh (different-scale) residual — the phase's set is authoritative after a clear.
-        lin.push_lora(a, b, 0.3);
+        // Re-push a fresh (different-scale) residual â€” the phase's set is authoritative after a clear.
+        lin.push_lora(a, b, 0.3).unwrap();
         assert!(lin.is_adapted());
         let repush_shift = (lin.forward(&x).unwrap() - &base_y)
             .unwrap()
@@ -1678,8 +1696,8 @@ mod tests {
     }
 
     /// The **acceptance parity** on a packed base, isolated from the base's own quant error: the
-    /// residual the adapter contributes equals `scale·((x·a)·b)` **exactly** (f32). `adapted.forward −
-    /// base.forward` cancels the (bit-identical) packed base — the dequant-repack quant error included —
+    /// residual the adapter contributes equals `scaleÂ·((xÂ·a)Â·b)` **exactly** (f32). `adapted.forward âˆ’
+    /// base.forward` cancels the (bit-identical) packed base â€” the dequant-repack quant error included â€”
     /// leaving only the residual. This proves the LoRA is added **additively over the packed weight**
     /// (never folded into a re-quantized dense weight).
     #[test]
@@ -1692,13 +1710,13 @@ mod tests {
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
         let scale = 0.7f64;
-        adapted.push_lora(a.clone(), b.clone(), scale);
+        adapted.push_lora(a.clone(), b.clone(), scale).unwrap();
         assert!(adapted.is_packed(), "base stays packed under the residual");
 
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
-        // The residual the adapter contributes = adapted − base (identical packed bases cancel exactly).
+        // The residual the adapter contributes = adapted âˆ’ base (identical packed bases cancel exactly).
         let residual_actual = (adapted.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap();
-        // Expected: scale·((x·a)·b).
+        // Expected: scaleÂ·((xÂ·a)Â·b).
         let residual_expected = ((x.matmul(&a).unwrap().matmul(&b).unwrap()) * scale).unwrap();
         let dev_max = (residual_actual - residual_expected)
             .unwrap()
@@ -1710,12 +1728,12 @@ mod tests {
             .unwrap();
         assert!(
             dev_max < 1e-5,
-            "packed residual != scale·(x·a)·b (max diff {dev_max})"
+            "packed residual != scaleÂ·(xÂ·a)Â·b (max diff {dev_max})"
         );
     }
 
     /// `quantize` folds a **dense** base to packed in place (idempotent no-op if already packed), keeping
-    /// any attached residual — the lens/sd3 "quantize after the dense fold" contract (sc-11105). The
+    /// any attached residual â€” the lens/sd3 "quantize after the dense fold" contract (sc-11105). The
     /// folded-packed forward equals the packed base forward plus the same residual (f32 tol), and a
     /// second quantize on the now-packed base is an exact no-op (the additive residuals survive).
     #[test]
@@ -1727,7 +1745,7 @@ mod tests {
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
 
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), 0.7);
+        lin.push_lora(a.clone(), b.clone(), 0.7).unwrap();
         assert!(!lin.is_packed());
         lin.quantize(Quant::Q8).unwrap();
         assert!(lin.is_packed(), "dense base must fold to packed");
@@ -1735,7 +1753,7 @@ mod tests {
 
         let x = Tensor::randn(0f32, 1f32, (3usize, in_dim), &dev).unwrap();
         let residual = ((x.matmul(&a).unwrap().matmul(&b).unwrap()) * 0.7).unwrap();
-        // The Q8-packed base alone (no residual) — same weight, same fold — plus the residual.
+        // The Q8-packed base alone (no residual) â€” same weight, same fold â€” plus the residual.
         let mut base_only = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
         base_only.quantize(Quant::Q8).unwrap();
         let expected = (base_only.forward(&x).unwrap() + residual).unwrap();
@@ -1770,9 +1788,9 @@ mod tests {
         );
     }
 
-    // ---- Structured (deferred) LoKr — the Kronecker vec-trick ---------------------------------------
+    // ---- Structured (deferred) LoKr â€” the Kronecker vec-trick ---------------------------------------
 
-    /// `x·ΔWᵀ` — the materialized-delta residual, the reference the vec-trick must reproduce.
+    /// `xÂ·Î”Wáµ€` â€” the materialized-delta residual, the reference the vec-trick must reproduce.
     fn delta_residual(x: &Tensor, delta: &Tensor) -> Tensor {
         x.matmul(&delta.t().unwrap().contiguous().unwrap()).unwrap()
     }
@@ -1786,10 +1804,10 @@ mod tests {
             .unwrap()
     }
 
-    /// **Full-factor parity.** The structured vec-trick residual `vec(w1·X·w2ᵀ)` equals the
-    /// materialized-delta residual `x·(kron(w1,w2))ᵀ` for a full `w1⊗w2` LoKr — proving the row-major
+    /// **Full-factor parity.** The structured vec-trick residual `vec(w1Â·XÂ·w2áµ€)` equals the
+    /// materialized-delta residual `xÂ·(kron(w1,w2))áµ€` for a full `w1âŠ—w2` LoKr â€” proving the row-major
     /// Kronecker identity the whole port rests on, against candle's own `reconstruct_lokr_delta` fold.
-    /// The built factors are the SMALL `[a,c]`/`[b,d]` matrices — the `[out,in]` delta is NEVER formed.
+    /// The built factors are the SMALL `[a,c]`/`[b,d]` matrices â€” the `[out,in]` delta is NEVER formed.
     #[test]
     fn structured_lokr_full_matches_reconstruct_delta() {
         let dev = Device::Cpu;
@@ -1842,7 +1860,7 @@ mod tests {
         assert_eq!(factors.w2.dims(), &[b, d], "right factor stays [b,d]");
         assert!(
             factors.w1.elem_count() + factors.w2.elem_count() < out * inp,
-            "structured factors must be « the [out,in] delta"
+            "structured factors must be Â« the [out,in] delta"
         );
 
         let x = Tensor::from_vec(
@@ -1867,7 +1885,7 @@ mod tests {
         );
     }
 
-    /// **Decomposed-factor parity.** Same identity for a low-rank LoKr (`w1_a·w1_b`, `w2_a·w2_b`): the
+    /// **Decomposed-factor parity.** Same identity for a low-rank LoKr (`w1_aÂ·w1_b`, `w2_aÂ·w2_b`): the
     /// inner products are materialized only as the SMALL `[a,c]`/`[b,d]` factors, never `[out,in]`.
     #[test]
     fn structured_lokr_decomposed_matches_reconstruct_delta() {
@@ -1940,7 +1958,7 @@ mod tests {
     fn structured_lokr_on_packed_matches_folded_and_stays_packed() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
-        // in = c·d = 8·16 = 128 (divisible by group 64); out = a·b = 4·16 = 64.
+        // in = cÂ·d = 8Â·16 = 128 (divisible by group 64); out = aÂ·b = 4Â·16 = 64.
         let (a, b, c, d) = (4usize, 16, 8, 16);
         let (out_dim, in_dim) = (a * b, c * d);
         let (base, _grid) = packed_adapt(&tmp, out_dim, in_dim);
@@ -1964,7 +1982,7 @@ mod tests {
         .unwrap()
         .expect("deferrable");
         assert!(factors.w1.elem_count() + factors.w2.elem_count() < out_dim * in_dim);
-        adapted.push_lokr_structured(factors);
+        adapted.push_lokr_structured(factors).unwrap();
         assert!(
             adapted.is_packed(),
             "structured LoKr must not un-pack the base"
@@ -2010,7 +2028,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        zero.push_lokr_structured(f0);
+        zero.push_lokr_structured(f0).unwrap();
         let zero_dev = max_abs(&(zero.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap());
         assert_eq!(
             zero_dev, 0.0,
@@ -2018,8 +2036,8 @@ mod tests {
         );
     }
 
-    /// A tucker/CP `w2` (`lokr_t2`, conv-only) and a base that does not factor as `a·b × c·d` are both
-    /// NOT deferrable via the 2-D vec-trick → `Ok(None)`, so the installer rejects them on a packed tier
+    /// A tucker/CP `w2` (`lokr_t2`, conv-only) and a base that does not factor as `aÂ·b Ã— cÂ·d` are both
+    /// NOT deferrable via the 2-D vec-trick â†’ `Ok(None)`, so the installer rejects them on a packed tier
     /// rather than materializing. A missing `w1`/`w2` leg is a typed error, never a panic.
     #[test]
     fn structured_lokr_non_deferrable_and_missing_legs() {
@@ -2028,7 +2046,7 @@ mod tests {
         let w2a = Tensor::zeros((2usize, 4), DType::F32, &dev).unwrap();
         let w2b = Tensor::zeros((2usize, 5), DType::F32, &dev).unwrap();
         let t2 = Tensor::zeros((2usize, 2, 3, 3), DType::F32, &dev).unwrap();
-        // Tucker `w2_t2` present → None (the guard fires before any shape check).
+        // Tucker `w2_t2` present â†’ None (the guard fires before any shape check).
         let got = LokrFactors::build(
             1.0,
             (24, 180),
@@ -2043,7 +2061,7 @@ mod tests {
         .unwrap();
         assert!(got.is_none(), "tucker/CP LoKr must be non-deferrable");
 
-        // A base that does not factor as a·b × c·d (here a·b = 3·2 = 6 ≠ out = 7) → None.
+        // A base that does not factor as aÂ·b Ã— cÂ·d (here aÂ·b = 3Â·2 = 6 â‰  out = 7) â†’ None.
         let w2 = Tensor::zeros((2usize, 5), DType::F32, &dev).unwrap();
         let mism = LokrFactors::build(
             1.0,
@@ -2059,7 +2077,7 @@ mod tests {
         .unwrap();
         assert!(
             mism.is_none(),
-            "a base that doesn't factor a·b×c·d is non-deferrable"
+            "a base that doesn't factor aÂ·bÃ—cÂ·d is non-deferrable"
         );
 
         // A missing w2 leg (no full, no a/b) is a typed error, not a panic.
@@ -2068,9 +2086,9 @@ mod tests {
     }
 
     /// A LoRA residual on an activation with a **non-1 leading (batch) dim** must fold those leading
-    /// dims into the GEMM's `M` — never `broadcast_matmul`, which physically copies the 2-D factor once
+    /// dims into the GEMM's `M` â€” never `broadcast_matmul`, which physically copies the 2-D factor once
     /// per batch element. The Krea text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so at
-    /// a 2048² image edit (`n_tokens = 4107`, `d = 2560`, rank 256) the old broadcast path materialized a
+    /// a 2048Â² image edit (`n_tokens = 4107`, `d = 2560`, rank 256) the old broadcast path materialized a
     /// 5.4 GB copy per residual leg and the first denoise step never finished. This pins the flattened
     /// path's NUMERICS against a per-batch-slice reference, so the perf fix can't silently change the math.
     #[test]
@@ -2081,7 +2099,7 @@ mod tests {
         let a = Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap(); // [in, rank]
         let b = Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap(); // [rank, out]
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), scale);
+        lin.push_lora(a.clone(), b.clone(), scale).unwrap();
 
         // `[N, S, in]`: N is a BATCH of token stacks (the layerwise-block shape), S the stack length.
         let (n, s) = (5usize, 3usize);
@@ -2111,8 +2129,8 @@ mod tests {
     // NVFP4 as an adapter-capable base (sc-21483, epic 11037).
     //
     // These run on the CPU lane: `Nvfp4Linear` retains the packed host container in every regime and
-    // serves the transparent dequant→bf16 fallback off `sm_120`, so the ADDITIVE arm — the thing this
-    // story adds — is fully exercisable without a Blackwell device. The CUDA lane adds the FP4 GEMM
+    // serves the transparent dequantâ†’bf16 fallback off `sm_120`, so the ADDITIVE arm â€” the thing this
+    // story adds â€” is fully exercisable without a Blackwell device. The CUDA lane adds the FP4 GEMM
     // under the same arm; that is what the krea real-weight render covers.
     // ------------------------------------------------------------------------------------------
 
@@ -2150,8 +2168,8 @@ mod tests {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
-    /// AC#1 — identity / delta / removal at the shared seam. A LoRA installed over an NVFP4 base
-    /// contributes exactly `scale·((x·a)·b)` on top of the packed forward, and `clear_adapters`
+    /// AC#1 â€” identity / delta / removal at the shared seam. A LoRA installed over an NVFP4 base
+    /// contributes exactly `scaleÂ·((xÂ·a)Â·b)` on top of the packed forward, and `clear_adapters`
     /// restores the base output **exactly**: the packed weight was never mutated, so this is bit
     /// equality, not a tolerance.
     #[test]
@@ -2179,7 +2197,7 @@ mod tests {
         assert!(host.is_adapted());
         let adapted = host.forward(&x).unwrap();
 
-        // The delta is the LoRA's own product — the packed base contributed nothing extra.
+        // The delta is the LoRA's own product â€” the packed base contributed nothing extra.
         let want_delta = (x.matmul(&a).unwrap().matmul(&b).unwrap() * 0.75).unwrap();
         let got_delta = (&adapted - &bare).unwrap();
         assert!(
@@ -2202,7 +2220,7 @@ mod tests {
         assert!(host.is_nvfp4(), "the base regime survived the whole cycle");
     }
 
-    /// AC#1 — a structured LoKr rides the same NVFP4 base through the Kronecker vec-trick, matching
+    /// AC#1 â€” a structured LoKr rides the same NVFP4 base through the Kronecker vec-trick, matching
     /// the reconstructed dense delta, and removal is again exact.
     #[test]
     fn nvfp4_base_hosts_a_structured_lokr_residual() {
@@ -2276,21 +2294,66 @@ mod tests {
         assert_eq!(flat(&host.forward(&x).unwrap()), flat(&bare));
     }
 
-    /// AC#2, shape half — a factor that does not compose against the base is refused at ADMISSION,
+    /// **sc-11045 fix round (MAJOR 7, minor): the unchecked pushes delegate to the checked forms
+    /// on an NVFP4 base**, so the bypass is structurally closed — no caller can attach an
+    /// unvalidated factor to a base that has no fallback. Dense/MLX-packed bases keep the
+    /// historical unchecked behaviour.
+    ///
+    /// # Mutation
+    ///
+    /// Remove the `Base::Nvfp4` delegation from `push_lora`/`push_lokr_structured` (restore the
+    /// plain `self.adapters.push(...)`): both `unwrap_err`s below go red.
+    #[test]
+    fn the_unchecked_pushes_delegate_to_the_checked_forms_on_an_nvfp4_base() {
+        let (out_dim, in_dim) = (32, 64);
+        let mut host = nvfp4_host(out_dim, in_dim);
+        // A mis-shaped LoRA through the UNCHECKED entry point refuses on the NVFP4 base.
+        let (bad_a, bad_b) = lora_pair(16, 4, out_dim);
+        let error = host.push_lora(bad_a, bad_b, 1.0).unwrap_err().to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(!host.is_adapted());
+        // A mis-reconstructing LoKr likewise: factors built for a [16, 64] base.
+        let dev = Device::Cpu;
+        let w1 = Tensor::ones((2, 8), DType::F32, &dev).unwrap();
+        let w2 = Tensor::ones((8, 8), DType::F32, &dev).unwrap();
+        let wrong = LokrFactors::build(1.0, (16, 64), Some(&w1), None, None, Some(&w2), None, None, None)
+            .unwrap()
+            .expect("a plain linear LoKr is deferrable");
+        let error = host.push_lokr_structured(wrong).unwrap_err().to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(!host.is_adapted());
+        // Well-shaped factors still install through the same unchecked names.
+        let (a, b) = lora_pair(in_dim, 4, out_dim);
+        host.push_lora(a, b, 1.0).unwrap();
+        assert!(host.is_adapted());
+        // And a dense base keeps the historical unchecked semantics: no validation, always Ok.
+        let mut dense = AdaptLinear::from_dense(
+            Linear::new(
+                Tensor::zeros((out_dim, in_dim), DType::F32, &dev).unwrap(),
+                None,
+            ),
+            in_dim,
+            out_dim,
+        );
+        let (bad_a, bad_b) = lora_pair(16, 4, out_dim);
+        dense.push_lora(bad_a, bad_b, 1.0).unwrap();
+    }
+
+    /// AC#2, shape half â€” a factor that does not compose against the base is refused at ADMISSION,
     /// naming the NVFP4 regime, and nothing is attached. It never reaches a sampler step.
     #[test]
     fn nvfp4_base_refuses_a_mis_shaped_adapter_at_admission() {
         let (out_dim, in_dim) = (32, 64);
         let mut host = nvfp4_host(out_dim, in_dim);
 
-        // `a` contracts against the wrong input width…
+        // `a` contracts against the wrong input widthâ€¦
         let (a, b) = lora_pair(in_dim / 2, 4, out_dim);
         let error = host.push_lora_checked(a, b, 1.0).unwrap_err().to_string();
         assert!(error.contains("NVFP4 base"), "{error}");
         assert!(error.contains("do not compose"), "{error}");
         assert!(!host.is_adapted(), "a refused factor must not be attached");
 
-        // …and the wrong output width.
+        // â€¦and the wrong output width.
         let (a, b) = lora_pair(in_dim, 4, out_dim + 1);
         assert!(host.push_lora_checked(a, b, 1.0).is_err());
         assert!(!host.is_adapted());
@@ -2323,7 +2386,7 @@ mod tests {
         }
     }
 
-    /// AC#2, dtype/device half — an additive residual is cast to the activation dtype per forward,
+    /// AC#2, dtype/device half â€” an additive residual is cast to the activation dtype per forward,
     /// so a non-float factor is refused rather than silently reinterpreted.
     #[test]
     fn nvfp4_base_refuses_a_non_float_adapter_factor() {
@@ -2340,7 +2403,7 @@ mod tests {
         assert!(!host.is_adapted());
     }
 
-    /// AC#2, regime half — an NVFP4 base is NEVER silently converted to q4/q8 (or dequantized to
+    /// AC#2, regime half â€” an NVFP4 base is NEVER silently converted to q4/q8 (or dequantized to
     /// BF16) to make something fit. Every fold entry point refuses, and the base stays NVFP4.
     #[test]
     fn nvfp4_base_refuses_every_requantization() {

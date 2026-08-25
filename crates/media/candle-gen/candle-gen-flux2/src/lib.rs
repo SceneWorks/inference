@@ -1601,6 +1601,18 @@ fn generator_from_pipeline(
 /// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
 /// fixture-only there — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    // sc-11045 fix round (MAJOR 7, the krea `build()` precedent): refuse an adapter-bearing load
+    // against a descriptor that does not advertise adapter support — the shape an imported-model
+    // route takes when its binding declares `inherit_adapters = false` and the registry withdraws
+    // `supports_lora`/`supports_lokr`. A typed refusal here is the difference between a capability
+    // error and a silently un-adapted render, and it runs before the weights are touched because
+    // the answer does not depend on them.
+    let route_descriptor = descriptor(variant);
+    gen_core::reject_unsupported_adapters(
+        route_descriptor.id,
+        &route_descriptor.capabilities,
+        spec.adapters.len(),
+    )?;
     Ok(Box::new(load_variant_concrete(variant, spec)?))
 }
 

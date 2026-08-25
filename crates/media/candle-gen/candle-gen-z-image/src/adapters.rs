@@ -354,7 +354,8 @@ impl AdditivePlan {
                     pending.a.to_device(device)?,
                     pending.b.to_device(device)?,
                     pending.scale,
-                );
+                )
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                 applied += 1;
             }
         }
@@ -373,7 +374,8 @@ impl AdditivePlan {
                     pending.w2_b.as_ref(),
                 )? {
                     Some(factors) => {
-                        lin.push_lokr_structured(factors.to_device(device)?);
+                        lin.push_lokr_structured(factors.to_device(device)?)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                         applied += 1;
                     }
                     None => {
@@ -605,7 +607,8 @@ pub fn install_additive(
                     skipped_keys += 1;
                     continue;
                 }
-                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                 applied += 1;
                 applied_sources.insert(p.source);
             }
@@ -625,7 +628,8 @@ pub fn install_additive(
                     p.w2_b.as_ref(),
                 )? {
                     Some(factors) => {
-                        lin.push_lokr_structured(factors.to_device(&device)?);
+                        lin.push_lokr_structured(factors.to_device(&device)?)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                         applied += 1;
                         applied_sources.insert(p.source);
                     }
@@ -1075,7 +1079,7 @@ mod tests {
         // Additive: base W + the resolved residual.
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        additive.push_lora(p.a.clone(), p.b.clone(), p.scale);
+        additive.push_lora(p.a.clone(), p.b.clone(), p.scale).unwrap();
 
         // Folded: δ = (alpha/rank)·scale·(B·A); W_merged = W + δ.
         let delta = reconstruct_lora_delta(&down, &up, alpha, rank as f32, scale).unwrap();
