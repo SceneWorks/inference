@@ -38,12 +38,14 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Linear,
-    PackedConfig, PackedWeightSidecars,
+    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Fallback,
+    Nvfp4Linear, Nvfp4Regime, PackedConfig, PackedWeightSidecars,
 };
 
 use crate::native_mapping::{DeclaredLogicalShapes, KreaNativeToDiffusersMapping};
-use crate::nvfp4_dit::{DitPlan, Nvfp4Proj, Nvfp4Quant, ProbedProj};
+use crate::nvfp4_dit::{
+    DitPlan, ExecutionRole, Nvfp4Capability, Nvfp4Proj, Nvfp4Quant, ProbedProj,
+};
 use crate::quant::{QEmbedding, QLinear};
 
 /// An mmaped component-directory of `.safetensors`, loading tensors at a fixed compute dtype.
@@ -469,6 +471,86 @@ impl Weights {
                 .unwrap_or_default();
             Error::Msg(format!("{error}{hint}"))
         })
+    }
+
+    /// The NVFP4 capability facts this import carries for one **logical** weight key (sc-12121).
+    ///
+    /// Every field is read off something real — the compiled logical plan's codec spec for the
+    /// checkpoint facts, the residency this import was priced under plus the trunk's shared cuBLASLt
+    /// context for the device facts. Nothing is inferred from a key's spelling or a tensor's dtype,
+    /// which is the whole point: [`DitPlan::representation`] must be able to say *which* fact
+    /// decided a projection's representation, and a re-derivation could only ever restate the
+    /// verdict it is supposed to explain.
+    ///
+    /// The NVFP4 **validation** lane (a dense bf16 tier this import packs itself) has no plan row for
+    /// the key; there the checkpoint facts are vacuously clear and the grid question is answered by
+    /// [`crate::nvfp4_dit::dense_shape_is_fp4_eligible`] on the dense shape the caller passes.
+    ///
+    /// Public so a GPU harness can anchor an assertion on the **live** probe rather than on a
+    /// hardcoded [`Nvfp4Capability::ELIGIBLE`] (sc-12121 review fix).
+    pub fn nvfp4_capability(
+        &self,
+        weight_key: &str,
+        dense_shape: Option<[usize; 2]>,
+        ctx: &candle_gen::quant::Nvfp4Context,
+    ) -> Nvfp4Capability {
+        use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
+        let planned = self.planned(weight_key);
+        let (checkpoint_offers_nvfp4, full_precision_declared, storage_unpadded, layout_native) =
+            match planned.map(|tensor| &tensor.codec) {
+                Some(TensorCodecSpec::Nvfp4 {
+                    stored_shape,
+                    logical_shape,
+                    full_precision_matrix_mult,
+                    ..
+                }) => (
+                    !*full_precision_matrix_mult,
+                    *full_precision_matrix_mult,
+                    logical_shape == stored_shape,
+                    candle_gen::logical_weights::nvfp4_layout_is_native(*stored_shape),
+                ),
+                // A planned row that is NOT an NVFP4 codec row is one Kitchen deliberately exported
+                // dense; the import preserves that rather than requantizing at load.
+                Some(_) => (false, false, true, true),
+                // No plan row at all: the dense validation tier, packed by this import. The grid
+                // question is then answered by the dense shape the caller passes — and there MUST be
+                // one. `dense_shape: None` means the caller had a plan-backed row in mind (the
+                // native arm passes `None` because the codec spec answers the question); combined
+                // with no plan row there is nothing real left to read `layout_native` off, so
+                // claiming `true` would predict PackedW4A4 on grounds never checked (sc-12121 review
+                // fix). Report it as ineligible instead — the dense fallback — and say so.
+                None => {
+                    let layout_native = match dense_shape {
+                        Some([rows, cols]) => {
+                            crate::nvfp4_dit::dense_shape_is_fp4_eligible(rows, cols)
+                        }
+                        None => {
+                            debug_assert!(
+                                false,
+                                "krea nvfp4 (sc-12121): `{weight_key}` has no plan row AND no dense \
+                                 shape — `layout_native` would be asserted on nothing. A native \
+                                 component must have a plan row for every key it serves."
+                            );
+                            eprintln!(
+                                "[sc-12121] krea nvfp4: `{weight_key}` has no plan row and no dense \
+                                 shape; reporting the grid as ineligible rather than assuming it"
+                            );
+                            false
+                        }
+                    };
+                    (true, false, true, layout_native)
+                }
+            };
+        Nvfp4Capability {
+            checkpoint_offers_nvfp4,
+            full_precision_declared,
+            storage_unpadded,
+            layout_native,
+            // The same probe that gates `Nvfp4Linear::try_build_fp4`: a context holds a handle only
+            // above the `sm_120` floor (`Nvfp4Context::new`).
+            nvfp4_device: ctx.is_fp4(),
+            fused_quantizer: ctx.fused_quantizer_available(),
+        }
     }
 
     /// A [`LogicalWeightReceipt`] **measured** from what this import actually materialized through
@@ -1454,12 +1536,21 @@ pub fn linear_detect_planned(
     };
     let weight_key = format!("{base}.weight");
     if w.is_native_nvfp4() {
+        // sc-12121: what the role table + this import's capability facts say this projection will be
+        // served as. It is a REPORT of the decisions the plan and `Nvfp4Linear` already own, not a
+        // second decider — so it is crossed against the constructed layer below and a disagreement
+        // is a defect, never a silent downgrade (epic E4).
+        let expected = plan.representation(
+            base,
+            w.nvfp4_capability(&weight_key, None, plan.nvfp4_context()),
+        );
         // Kitchen's Krea profile intentionally leaves sensitive first/last/time/text-fusion layers
         // dense BF16. Preserve that producer decision instead of quantizing them during import.
         // (`full_precision_matrix_mult` rows take this arm too — the descriptor asks for the dense
         // fallback, and the residency policy priced them dense, so `linear`'s reader-backed `get`
         // materializes exactly the codec's dense decode.)
         if !w.is_native_nvfp4_weight(&weight_key) {
+            check_representation(base, expected, false, None)?;
             return Ok(QLinear::dense(linear(w, base, bias)?));
         }
         // The shared reader materializes what the plan DECLARED for this row (sc-21482):
@@ -1475,9 +1566,16 @@ pub fn linear_detect_planned(
                     act,
                     plan.nvfp4_context(),
                 )?;
+                check_representation(
+                    base,
+                    expected,
+                    lin.regime() == Nvfp4Regime::Fp4W4A4,
+                    lin.fallback_cause(),
+                )?;
                 Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
             }
             LogicalTensor::Dense(weight) => {
+                check_representation(base, expected, false, None)?;
                 let weight = weight.to_dtype(w.dtype())?;
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
@@ -1493,11 +1591,81 @@ pub fn linear_detect_planned(
 
     let weight = w.get(&weight_key)?;
     let device = weight.device().clone();
+    let expected = plan.representation(
+        base,
+        w.nvfp4_capability(
+            &weight_key,
+            Some([weight.dim(0)?, weight.dim(1)?]),
+            plan.nvfp4_context(),
+        ),
+    );
     // sc-12274: build against the plan's ONE shared per-device cuBLASLt handle. `from_dense` would
     // construct a private handle here — and its eager 32 MiB workspace — for every one of the trunk's
     // 260 projections.
     let lin = Nvfp4Linear::from_dense_in(&weight, dense_bias, &device, act, plan.nvfp4_context())?;
+    check_representation(
+        base,
+        expected,
+        lin.regime() == Nvfp4Regime::Fp4W4A4,
+        lin.fallback_cause(),
+    )?;
     Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
+}
+
+/// Cross the representation the role table + capability facts predicted for `base` against the one
+/// the constructed projection actually serves (sc-12121, epic E4).
+///
+/// The prediction never *routes* anything — the logical plan owns residency and `Nvfp4Linear` owns
+/// the construction gate — so this is the seam that keeps the reported role honest. A disagreement
+/// means one of the two drifted, and the only safe response is to say so by name: a run that
+/// silently serves dense BF16 while reporting native NVFP4 is exactly the dishonest reporting E4
+/// forbids.
+///
+/// # Reconciling the two unpredictable causes (sc-12121 review fix)
+///
+/// `fallback` is the constructed layer's **own** report of why it is dense
+/// ([`Nvfp4Linear::fallback_cause`]), `None` for a layer that is not an `Nvfp4Linear` at all (the
+/// preserved-dense / reader-dense arms). Two of its causes —
+/// [`Nvfp4Fallback::DeviceMismatch`] and [`Nvfp4Fallback::StagingFailed`] — are runtime accidents
+/// that **no** [`Nvfp4Capability`] field can see, so a prediction of `PackedW4A4` against them is
+/// not table drift; it is a transparent degradation that has always been legal. Those are
+/// reconciled by rewriting the expectation via [`dense_reason_for_fallback`] before comparing,
+/// which keeps the receipt honest (the projection reports `DenseBf16(DeviceMismatch)`, not a
+/// fictional `PackedW4A4`) without aborting a whole trunk load over a driver accident.
+///
+/// Every other cause is one the capability facts *do* model, so a disagreement there is still a
+/// hard error — in both directions.
+fn check_representation(
+    base: &str,
+    expected: ExecutionRole,
+    packed_w4a4: bool,
+    fallback: Option<Nvfp4Fallback>,
+) -> Result<()> {
+    if expected.is_packed_w4a4() == packed_w4a4 {
+        return Ok(());
+    }
+    // Safe direction only, and only for a cause no capability probe could have predicted.
+    if !packed_w4a4 {
+        if let Some(reason) = fallback.and_then(crate::nvfp4_dit::dense_reason_for_fallback) {
+            eprintln!(
+                "[sc-12121] krea nvfp4: `{base}` was predicted {expected:?} but the layer fell back \
+                 to dense bf16 ({reason:?}); this cause is invisible to the plan-time capability \
+                 facts, so the load continues. `Nvfp4Report` reads the layer's own regime, so the \
+                 run still accounts this projection as dense, never as fp4-lit"
+            );
+            return Ok(());
+        }
+    }
+    let served = if packed_w4a4 {
+        "packed W4A4"
+    } else {
+        "dense bf16"
+    };
+    Err(Error::Msg(format!(
+        "krea nvfp4 (sc-12121): `{base}` was constructed as {served}, but its execution role is \
+         {expected:?}; the role table and the constructed projection disagree about this layer's \
+         representation"
+    )))
 }
 
 /// **Packed-detecting** [`QEmbedding`] loader (sc-9411): transfer its prepared device-format table when
@@ -1551,6 +1719,7 @@ pub(crate) fn rms_scale(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvfp4_dit::DenseReason;
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
@@ -1561,6 +1730,119 @@ mod tests {
 
     /// The Krea MLX tier's group size (64) — the one carried from `config.json`.
     const G: usize = 64;
+
+    /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
+    /// `planned(key)` is `None` for every key.
+    fn unplanned_weights(tmp: &tempfile::TempDir, key: &str) -> Weights {
+        let dev = Device::Cpu;
+        let path = tmp.path().join("unplanned.safetensors");
+        safetensors::save(
+            &HashMap::from([(
+                key.to_owned(),
+                Tensor::zeros((64, 64), DType::F32, &dev).unwrap(),
+            )]),
+            &path,
+        )
+        .unwrap();
+        Weights::from_file(&path, &dev, DType::F32).unwrap()
+    }
+
+    /// **No plan row AND no dense shape asserts `layout_native` on nothing** (sc-12121 review fix).
+    ///
+    /// The `None`-plan-row arm used to answer the grid question with `dense_shape.is_none_or(..)`,
+    /// which short-circuits to `true` when the caller passes no shape — so a native component with
+    /// no plan row would have been predicted `PackedW4A4` on grounds nothing ever checked, breaking
+    /// the "every field is read off something real" claim in `nvfp4_capability`'s own doc. The
+    /// combination is now explicitly refused.
+    #[test]
+    #[should_panic(expected = "no plan row AND no dense shape")]
+    fn capability_refuses_to_assume_a_grid_with_neither_a_plan_row_nor_a_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = unplanned_weights(&tmp, "transformer_blocks.0.attn.to_q.weight");
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        let _ = w.nvfp4_capability(
+            "transformer_blocks.0.attn.to_q.weight",
+            None,
+            plan.nvfp4_context(),
+        );
+    }
+
+    /// The same key **with** a dense shape is answered off something real — the shape — and an
+    /// eligible `[64, 64]` grid reports `layout_native: true`, an ineligible `[64, 16]` one `false`.
+    #[test]
+    fn capability_reads_layout_native_off_the_dense_shape_when_there_is_no_plan_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = unplanned_weights(&tmp, "transformer_blocks.0.attn.to_q.weight");
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        let cap = |shape: [usize; 2]| {
+            w.nvfp4_capability(
+                "transformer_blocks.0.attn.to_q.weight",
+                Some(shape),
+                plan.nvfp4_context(),
+            )
+            .layout_native
+        };
+        assert!(cap([64, 64]), "K_pad 64 % 32 == 0 and N 64 % 16 == 0");
+        assert!(
+            !cap([64, 16]),
+            "K_pad 16 is not a multiple of NVFP4_K_ALIGN"
+        );
+    }
+
+    /// **The hard refusal keeps the unsafe direction, and only the two runtime accidents soften the
+    /// safe one** (sc-12121 review fix).
+    ///
+    /// Before the fix `check_representation` erred on *any* disagreement, which aborted a whole
+    /// trunk load — blaming the role table — for a shared-context device mismatch or a weight-staging
+    /// failure, neither of which any `Nvfp4Capability` field models. After it:
+    ///
+    /// * constructed **packed** while the table predicted dense — the dishonest-reporting direction —
+    ///   is still an `Err`, with **no** softening for any fallback cause (a packed layer reports
+    ///   `fallback_cause() == None` anyway);
+    /// * constructed **dense** while the table predicted packed is an `Err` unless the layer itself
+    ///   names `DeviceMismatch` or `StagingFailed`.
+    #[test]
+    fn check_representation_refuses_drift_but_not_the_two_runtime_accidents() {
+        let packed = ExecutionRole::PackedW4A4;
+        let dense = ExecutionRole::DenseBf16(DenseReason::PostNonlinearity);
+
+        // Agreement, either way round.
+        assert!(check_representation("k", packed, true, None).is_ok());
+        assert!(check_representation("k", dense, false, None).is_ok());
+
+        // UNSAFE direction: constructed packed, table said dense. Never softened.
+        let e = check_representation("k", dense, true, None).unwrap_err();
+        assert!(format!("{e}").contains("constructed as packed W4A4"), "{e}");
+        for cause in [Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed] {
+            assert!(
+                check_representation("k", dense, true, Some(cause)).is_err(),
+                "{cause:?} must not excuse a layer that actually lit the FP4 cores"
+            );
+        }
+
+        // SAFE direction: constructed dense, table said packed.
+        let e = check_representation("k", packed, false, None).unwrap_err();
+        assert!(format!("{e}").contains("constructed as dense bf16"), "{e}");
+        for cause in [
+            Nvfp4Fallback::W4A16Requested,
+            Nvfp4Fallback::NotCudaDevice,
+            Nvfp4Fallback::ShapeIneligible,
+            Nvfp4Fallback::NoDeviceHandle,
+            Nvfp4Fallback::NoFusedQuantizer,
+        ] {
+            assert!(
+                check_representation("k", packed, false, Some(cause)).is_err(),
+                "{cause:?} IS modelled by Nvfp4Capability — a disagreement here is a real defect"
+            );
+        }
+        for cause in [Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed] {
+            assert!(
+                check_representation("k", packed, false, Some(cause)).is_ok(),
+                "{cause:?} is invisible to every capability fact — aborting the load would blame \
+                 the role table for a driver accident"
+            );
+        }
+    }
 
     /// Build an MLX group-64 Q4 packed triple for an `[out, in]` weight — `(wq u32, scales, biases,
     /// affine grid)`. The affine grid is the exact dense weight the pack represents.
@@ -2634,10 +2916,38 @@ mod tests {
             "the measured dense-fallback residency must equal the plan's declared pricing"
         );
 
+        // sc-12121: the plan (`Dense`), the constructed projection (`QLinear::dense`) and the role
+        // table all name the same representation, and the table names WHICH fact decided it.
+        assert_eq!(
+            plan.representation(
+                "transformer_blocks.0.attn.to_q",
+                w.nvfp4_capability(
+                    "transformer_blocks.0.attn.to_q.weight",
+                    None,
+                    plan.nvfp4_context()
+                )
+            ),
+            ExecutionRole::DenseBf16(crate::nvfp4_dit::DenseReason::NoNvfp4Hardware),
+            "a CPU load is below the sm_120 floor — that, not the layer's name, is the reason"
+        );
+
         let preserved = linear_detect_planned(&w, "img_in", false, &plan)?;
         assert!(
             preserved.nvfp4().is_none(),
             "Kitchen profile's dense BF16/F32 projections must not be requantized"
+        );
+        // `img_in` is not an NVFP4 row at all in Kitchen's profile — a distinct dense reason from
+        // the hardware one above, and the one that must survive even on `sm_120`.
+        assert_eq!(
+            plan.representation(
+                "img_in",
+                Nvfp4Capability {
+                    nvfp4_device: true,
+                    fused_quantizer: true,
+                    ..w.nvfp4_capability("img_in.weight", None, plan.nvfp4_context())
+                }
+            ),
+            ExecutionRole::DenseBf16(crate::nvfp4_dit::DenseReason::PreservedDense)
         );
         Ok(())
     }
@@ -2689,6 +2999,32 @@ mod tests {
         let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
         let quantized = linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan)?;
         assert!(quantized.nvfp4().is_some());
+
+        // sc-12121, AC2: the plan priced this row PACKED, but the bound device is a CPU — so the
+        // constructed linear serves dense bf16, and the role table says so for the same reason
+        // (`NoNvfp4Hardware`). All three agree that this run holds dense bf16, and the execution
+        // receipt reports the full 1.0 footprint rather than claiming a native NVFP4 one.
+        let projection = quantized.nvfp4().expect("the NVFP4 arm was taken");
+        assert_eq!(projection.regime(), Nvfp4Regime::DequantBf16);
+        assert_eq!(
+            plan.representation(
+                "transformer_blocks.0.attn.to_q",
+                w.nvfp4_capability(
+                    "transformer_blocks.0.attn.to_q.weight",
+                    None,
+                    plan.nvfp4_context()
+                )
+            ),
+            ExecutionRole::DenseBf16(crate::nvfp4_dit::DenseReason::NoNvfp4Hardware)
+        );
+        let mut report = crate::nvfp4_dit::Nvfp4Report::default();
+        report.add(projection);
+        assert_eq!((report.fp4_lit, report.dequant_bf16), (0, 1));
+        assert!(
+            (report.footprint_ratio() - 1.0).abs() < 1e-6,
+            "a dense-bf16 run must not report an NVFP4 footprint (got {:.4})",
+            report.footprint_ratio()
+        );
 
         // …and the receipt row measured off the container equals the plan's packed pricing
         // (stored nibbles + retained scale companions).
@@ -3153,6 +3489,23 @@ mod tests {
             projection.nvfp4().is_none(),
             "a full_precision_matrix_mult layer must not become an NVFP4 projection"
         );
+        // sc-12121: and the role table names the producer's declaration as the deciding fact — even
+        // on a fully eligible `sm_120` device, which is the case a device-only reason would miss.
+        assert_eq!(
+            plan.representation(
+                "transformer_blocks.0.attn.to_q",
+                Nvfp4Capability {
+                    nvfp4_device: true,
+                    fused_quantizer: true,
+                    ..w.nvfp4_capability(
+                        "transformer_blocks.0.attn.to_q.weight",
+                        None,
+                        plan.nvfp4_context()
+                    )
+                }
+            ),
+            ExecutionRole::DenseBf16(crate::nvfp4_dit::DenseReason::FullPrecisionDeclared)
+        );
 
         // And the RESIDENCY POLICY prices the flagged layer dense even where packed is available,
         // so the shared reader can only ever hand its dense decode to a caller (sc-21482): the
@@ -3182,6 +3535,123 @@ mod tests {
         )
         .expect("the unflagged fixture imports");
         assert!(unflagged.is_native_nvfp4_weight("transformer_blocks.0.attn.to_q.weight"));
+    }
+
+    /// **AC2, plan half (sc-12121): the residency policy and the Krea role table never disagree
+    /// about a row's representation.**
+    ///
+    /// `CandleCodecResidency` is what the *logical plan* consults, and `DitPlan::representation` is
+    /// what the provider reports. They are separate code in separate crates, so the property that
+    /// matters is that they answer the same question the same way for every capability miss AC2
+    /// names — padded storage, an ineligible grid, `full_precision_matrix_mult`, and a device below
+    /// the `sm_120` floor — while a benign structural role on a fully eligible row reaches packed on
+    /// both sides.
+    #[test]
+    fn the_residency_policy_and_the_role_table_agree_on_every_capability_miss() {
+        use crate::nvfp4_dit::DenseReason;
+        use candle_gen::gen_core::checkpoint_codec::{
+            CodecResidencyPolicy, ResidencyMode, TensorCodecSpec,
+        };
+
+        let spec = |stored: [usize; 2], logical: [usize; 2], full_precision: bool| {
+            TensorCodecSpec::Nvfp4 {
+                block_scale: "w.weight_scale".into(),
+                global_scale: "w.weight_scale_2".into(),
+                input_scale: None,
+                stored_shape: stored,
+                logical_shape: logical,
+                logical_shape_declared: true,
+                full_precision_matrix_mult: full_precision,
+            }
+        };
+        // A benign interior compute-bulk projection: nothing structural forces dense, so the row's
+        // own geometry and the device are the only things left to decide it.
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(28);
+        let name = "transformer_blocks.7.attn.to_q";
+        let sm120 = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+
+        let cases: [(
+            TensorCodecSpec,
+            CandleCodecResidency,
+            ResidencyMode,
+            ExecutionRole,
+        ); 5] = [
+            // Eligible everywhere: both sides say packed.
+            (
+                spec([64, 64], [64, 64], false),
+                sm120,
+                ResidencyMode::Packed,
+                ExecutionRole::PackedW4A4,
+            ),
+            // ComfyUI padded the stored grid.
+            (
+                spec([64, 64], [64, 60], false),
+                sm120,
+                ResidencyMode::Dense,
+                ExecutionRole::DenseBf16(DenseReason::PaddedStorage),
+            ),
+            // A legitimate NVFP4 layer the FP4 GEMM's alignment cannot run (K = 48, not 32-aligned).
+            (
+                spec([64, 48], [64, 48], false),
+                sm120,
+                ResidencyMode::Dense,
+                ExecutionRole::DenseBf16(DenseReason::ShapeIneligible),
+            ),
+            // The producer said "no quantized matmul here".
+            (
+                spec([64, 64], [64, 64], true),
+                sm120,
+                ResidencyMode::Dense,
+                ExecutionRole::DenseBf16(DenseReason::FullPrecisionDeclared),
+            ),
+            // Below the NVFP4 floor (a CPU lane, a pre-Blackwell GPU, or a non-cuda build).
+            (
+                spec([64, 64], [64, 64], false),
+                CandleCodecResidency::DENSE,
+                ResidencyMode::Dense,
+                ExecutionRole::DenseBf16(DenseReason::NoNvfp4Hardware),
+            ),
+        ];
+
+        for (codec, residency, expected_mode, expected_role) in cases {
+            let TensorCodecSpec::Nvfp4 {
+                stored_shape,
+                logical_shape,
+                full_precision_matrix_mult,
+                ..
+            } = &codec
+            else {
+                unreachable!("the fixture builds NVFP4 specs only");
+            };
+            // The stored BYTE shape the compiler hands the policy is `[rows, cols / 2]`.
+            let stored_bytes = [stored_shape[0], stored_shape[1] / 2];
+            assert_eq!(
+                residency.residency(&NVFP4_CODEC, &codec, &stored_bytes),
+                expected_mode,
+                "plan side disagreed for {codec:?}"
+            );
+            let cap = Nvfp4Capability {
+                checkpoint_offers_nvfp4: !*full_precision_matrix_mult,
+                full_precision_declared: *full_precision_matrix_mult,
+                storage_unpadded: logical_shape == stored_shape,
+                layout_native: candle_gen::logical_weights::nvfp4_layout_is_native(*stored_shape),
+                nvfp4_device: residency.nvfp4_native,
+                fused_quantizer: residency.nvfp4_native,
+            };
+            assert_eq!(
+                plan.representation(name, cap),
+                expected_role,
+                "role-table side disagreed for {codec:?}"
+            );
+            // The two sides cannot drift: `Packed` on the plan iff packed W4A4 in the report.
+            assert_eq!(
+                expected_mode == ResidencyMode::Packed,
+                plan.representation(name, cap).is_packed_w4a4()
+            );
+        }
     }
 
     /// **Materializing a padded NVFP4 layer without a declared logical shape is refused.** With no

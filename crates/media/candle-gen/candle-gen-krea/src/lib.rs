@@ -99,8 +99,8 @@ pub use control_provider::{
 // methods; ours carry none.)
 // The NVFP4 seam (sc-12110): the plan/probe/report surface a validation harness drives.
 pub use nvfp4_dit::{
-    summarize, ActProbe, ActRecord, DitPlan, LayerRole, LayerSparsitySummary, Nvfp4Quant,
-    Nvfp4Report,
+    summarize, ActProbe, ActRecord, BlockLeaf, DenseReason, DitPlan, ExecutionRole, KreaSite,
+    LayerRole, LayerSparsitySummary, Nvfp4Capability, Nvfp4Quant, Nvfp4Report,
 };
 pub use pipeline::Components;
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
