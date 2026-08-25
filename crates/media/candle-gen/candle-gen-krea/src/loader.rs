@@ -343,7 +343,13 @@ impl Weights {
         // The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the
         // packed rows packed, everything else prices the dense fallback. Passing the real device
         // (rather than a fixed policy) keeps the plan's pricing the pricing of *this* load.
-        let residency = CandleCodecResidency::probe(device);
+        //
+        // The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
+        // `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal —
+        // so pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a
+        // plan this loader itself priced. Masked, an fp8 row takes the exact dense decode
+        // (`weight_scale` applied) through the shared reader on every host.
+        let residency = CandleCodecResidency::probe(device).with_dense_fp8();
         Self::from_pinned_native_file_with_residency(
             pinned_source,
             device,

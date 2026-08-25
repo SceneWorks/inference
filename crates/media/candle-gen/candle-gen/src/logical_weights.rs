@@ -151,6 +151,27 @@ impl CandleCodecResidency {
             nvfp4_native: cuda_meets_sm120_floor(device),
         }
     }
+
+    /// This policy with the fp8 E4M3 native leg **masked off** (sc-11045 fix round, MAJOR 10 —
+    /// the E3 packed-FP8 seam has no provider consumer yet).
+    ///
+    /// The engine can *price and read* a packed E4M3 row (`LogicalTensor::PackedFp8E4M3`, the
+    /// `matmul_fp8` operands), but no provider construction path consumes one: krea's
+    /// `linear_detect_planned` and flux2's `PlannedDitWeights::qlinear` both answer the arm with a
+    /// typed refusal, and `Fp8Linear` has neither a packed-parts constructor nor an `AdaptLinear`
+    /// base arm to ride the shared additive seam. On an `sm_89+` host the unmasked policy
+    /// therefore made a **mixed fp8+NVFP4 native file hard-error at construction on a plan the
+    /// engine itself priced**. Until the consumer is wired, providers importing native single
+    /// files plan — and price admission — under this masked policy: fp8 rows take the exact dense
+    /// decode on every host, NVFP4 keeps its own floor, and the provider refusal arms become
+    /// unreachable-but-typed. The unmasked pricing (and the cuda packed read it selects) stays
+    /// tested engine capability for the future consumer.
+    pub fn with_dense_fp8(self) -> Self {
+        Self {
+            fp8_e4m3_native: false,
+            ..self
+        }
+    }
 }
 
 /// Whether one NVFP4 layer's **stored layout** is one the cuBLASLt FP4 GEMM accepts, independent of
@@ -2221,6 +2242,59 @@ mod tests {
             8 + 4 + 4,
             "a retained input_scale is priced too"
         );
+    }
+
+    /// **sc-11045 fix round (MAJOR 10): the fp8 mask.** `with_dense_fp8` prices every fp8 row
+    /// dense — the pricing the providers with no packed-fp8 consumer plan under — while leaving
+    /// the NVFP4 leg untouched, so a mixed fp8+NVFP4 file plans "fp8 dense decode + NVFP4 packed"
+    /// instead of hard-erroring at the provider's typed packed-fp8 refusal.
+    ///
+    /// # Mutation
+    ///
+    /// Make `with_dense_fp8` return `self` unchanged: the fp8 row prices `Packed` and the first
+    /// two asserts go red.
+    #[test]
+    fn the_fp8_mask_prices_fp8_dense_and_leaves_nvfp4_alone() {
+        let masked = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: true,
+        }
+        .with_dense_fp8();
+        assert!(!masked.fp8_e4m3_native);
+        assert_eq!(
+            masked.residency(
+                &FP8_E4M3_SCALAR_CODEC,
+                &TensorCodecSpec::ScalarFp8 {
+                    scale: ScalarScaleSource::Unit,
+                    input_scale: None,
+                    full_precision_matrix_mult: false,
+                },
+                &[64, 64],
+            ),
+            ResidencyMode::Dense,
+            "a masked policy prices the eligible fp8 row dense"
+        );
+        assert_eq!(
+            masked.residency(
+                &NVFP4_CODEC,
+                &TensorCodecSpec::Nvfp4 {
+                    block_scale: "s".into(),
+                    global_scale: "s2".into(),
+                    input_scale: None,
+                    stored_shape: [64, 64],
+                    logical_shape: [64, 64],
+                    logical_shape_declared: true,
+                    full_precision_matrix_mult: false,
+                },
+                &[64, 32],
+            ),
+            ResidencyMode::Packed,
+            "the mask must not touch the NVFP4 leg"
+        );
+        // And the capability rendered from the masked policy licenses no native fp8 label.
+        let capability = masked.native_execution_capability();
+        assert!(!capability.executes_natively(FP8_E4M3_SCALAR_CODEC.codec_id));
+        assert!(capability.executes_natively(NVFP4_CODEC.codec_id));
     }
 
     /// AC1 (Candle). A header-declared NVFP4 golden fixture — packed E2M1 values, block-16 FP8

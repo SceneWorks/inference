@@ -458,6 +458,17 @@ impl PlannedDitWeights {
     }
 }
 
+/// The residency policy every klein single-file consumer — the loader AND the fit-gate pricing —
+/// plans under (sc-11045 fix round, MAJOR 10): the device's probed floors with the fp8 E4M3
+/// native leg **masked off**, because this provider constructs no packed-fp8 projection
+/// ([`PlannedDitWeights::qlinear`]'s arm is a typed refusal). One definition, two call sites, so
+/// pricing and loading cannot disagree about what an fp8 row holds resident.
+pub(crate) fn klein_import_residency(
+    device: &Device,
+) -> candle_gen::logical_weights::CandleCodecResidency {
+    candle_gen::logical_weights::CandleCodecResidency::probe(device).with_dense_fp8()
+}
+
 /// Cross the representation the role table + context facts predicted for `base` against the one
 /// the constructed projection actually serves (sc-11045 fix round; the krea
 /// `check_representation` pattern, sc-12121 / epic E4).
@@ -627,6 +638,125 @@ mod tests {
         assert!(mapping
             .logical_transform("final_layer.adaLN_modulation.1.weight")
             .is_some());
+    }
+
+    /// **sc-11045 fix round (MAJOR 10): a mixed fp8+NVFP4-class native file loads instead of
+    /// hard-erroring.** On an `sm_89+` host the unmasked engine policy prices a described E4M3
+    /// row `Packed`, and this provider's `qlinear` answers `PackedFp8E4M3` with a typed refusal —
+    /// so the provider plans under [`klein_import_residency`]'s masked policy, where the same row
+    /// prices `Dense` and materializes through the codec's exact dense decode
+    /// (`weight_scale` applied), while the NVFP4 leg keeps its own floor untouched.
+    ///
+    /// # Mutation
+    ///
+    /// Drop `.with_dense_fp8()` from `klein_import_residency` and pass an `sm_89`-shaped policy:
+    /// the plan prices the row `Packed` and the construction below dies at the typed fp8 refusal.
+    #[test]
+    fn a_mixed_fp8_row_takes_the_dense_decode_under_the_masked_policy() {
+        use candle_gen::gen_core::checkpoint_codec::ResidencyMode;
+
+        let cfg = tiny_cfg();
+        let (inner, in_channels) = (cfg.inner_dim(), cfg.in_channels);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("klein-fp8-mixed.safetensors");
+        // `img_in.weight` stored as described E4M3 (0x38 = 1.0) with a 2.0 per-tensor scale.
+        let codes = vec![0x38u8; inner * in_channels];
+        let scale = 2.0f32.to_le_bytes();
+        let descriptor = br#"{"format": "float8_e4m3fn"}"#;
+        let tensors = std::collections::BTreeMap::from([
+            (
+                "img_in.weight",
+                ::safetensors::tensor::TensorView::new(
+                    ::safetensors::Dtype::F8_E4M3,
+                    vec![inner, in_channels],
+                    &codes,
+                )
+                .unwrap(),
+            ),
+            (
+                "img_in.weight_scale",
+                ::safetensors::tensor::TensorView::new(::safetensors::Dtype::F32, vec![], &scale)
+                    .unwrap(),
+            ),
+            (
+                "img_in.comfy_quant",
+                ::safetensors::tensor::TensorView::new(
+                    ::safetensors::Dtype::U8,
+                    vec![descriptor.len()],
+                    descriptor,
+                )
+                .unwrap(),
+            ),
+        ]);
+        ::safetensors::serialize_to_file(tensors, None, &path).unwrap();
+
+        // The sm_89+sm_120 host, as this provider masks it: fp8 dense, NVFP4 preserved.
+        let residency = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: true,
+        }
+        .with_dense_fp8();
+        let cpu = Device::Cpu;
+        let mapping = mapping_for(&cfg);
+        let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
+        let row = plan
+            .tensors
+            .iter()
+            .find(|tensor| tensor.logical_key == "x_embedder.weight")
+            .expect("the fp8 row is planned");
+        assert_eq!(
+            row.residency.mode,
+            ResidencyMode::Dense,
+            "the masked policy prices the fp8 row dense"
+        );
+        // The UNMASKED policy would have priced it Packed — the arm the refusal guards.
+        let unmasked = plan_logical_weights(
+            &path,
+            &mapping,
+            &CandleCodecResidency {
+                fp8_e4m3_native: true,
+                nvfp4_native: true,
+            },
+        )
+        .expect("plan");
+        assert_eq!(
+            unmasked
+                .tensors
+                .iter()
+                .find(|tensor| tensor.logical_key == "x_embedder.weight")
+                .unwrap()
+                .residency
+                .mode,
+            ResidencyMode::Packed
+        );
+
+        // Construction through the provider seam: a dense QLinear whose weight is the EXACT
+        // dense decode, codes × weight_scale = 2.0 everywhere.
+        let reader = LogicalWeightReader::open(&path, plan, &cpu).expect("open");
+        let src = PlannedDitWeights::new(
+            reader,
+            cpu.clone(),
+            DType::F32,
+            Nvfp4Context::none(),
+            KleinRoleTable::new(&cfg),
+        );
+        let lin = src
+            .qlinear("x_embedder", in_channels, inner, false)
+            .expect("the fp8 row constructs through the dense decode, not a refusal");
+        let x = Tensor::from_vec(
+            {
+                let mut one_hot = vec![0f32; in_channels];
+                one_hot[0] = 1.0;
+                one_hot
+            },
+            (1, in_channels),
+            &cpu,
+        )
+        .unwrap();
+        let y = lin.forward(&x).unwrap().flatten_all().unwrap();
+        for value in y.to_vec1::<f32>().unwrap() {
+            assert_eq!(value, 2.0, "the dense decode must apply weight_scale");
+        }
     }
 
     #[test]

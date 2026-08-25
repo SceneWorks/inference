@@ -166,7 +166,9 @@ const COMPUTE_DTYPE_BYTES: u64 = 4;
 /// device cannot take the native leg either.
 fn klein_pricing_residency() -> candle_gen::logical_weights::CandleCodecResidency {
     match candle_gen::default_device() {
-        Ok(device) => candle_gen::logical_weights::CandleCodecResidency::probe(&device),
+        // The SAME policy the loader plans under — including the MAJOR 10 fp8 mask (sc-11045 fix
+        // round): one definition, so pricing and loading cannot drift.
+        Ok(device) => crate::single_file::klein_import_residency(&device),
         Err(_) => candle_gen::logical_weights::CandleCodecResidency::DENSE,
     }
 }

@@ -779,7 +779,9 @@ impl Pipeline {
     fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
         dit_file.read_unchanged(|dit_path| {
             let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
-            let residency = candle_gen::logical_weights::CandleCodecResidency::probe(&self.device);
+            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
+            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
+            let residency = single_file::klein_import_residency(&self.device);
             let plan =
                 candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
             let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
