@@ -9,10 +9,9 @@ use std::path::Path;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_boogu::VisionTower;
-use mlx_rs::ops::multiply;
-use mlx_rs::Dtype;
 
 use crate::config::Krea2Config;
+use crate::native_remap::DeclaredLogicalShapes;
 use crate::text_encoder::{krea_vision_config, KreaTeConfig, KreaTextEncoder};
 use crate::transformer::Krea2Transformer;
 
@@ -129,165 +128,39 @@ pub(crate) fn load_transformer_with_stream(
     })
 }
 
-/// Validate and dequantize the non-rotated ComfyUI int8-tensorwise convention (sc-14023).
+/// Load a community single-file Krea 2 DiT through the mapped logical-weight reader and the
+/// engine's registered codec table (sc-20634 dense; sc-20385 descriptor codecs).
 ///
-/// The app detector only has the safetensors header. Here, before any dequantization, every I8
-/// projection must carry a real U8 JSON descriptor with `format=int8_tensorwise`, `per_row=true`, and
-/// no `convrot` field, plus an F32 `[out]` or `[out,1]` scale (or scalar when `out == 1`). The consumed
-/// companions are removed so the existing strict native-key remap still sees exactly the dense DiT
-/// surface.
-#[cfg(test)]
-fn dequant_plain_int8_tensorwise(native: Weights) -> Result<Weights> {
-    dequant_plain_int8_tensorwise_with_evaluation(native, true)
-}
-
-/// Normalize the native plain-int8 convention, optionally evaluating each reconstructed dense
-/// projection immediately. Eager resident loads evaluate here to release the I8 source graph as each
-/// projection is rebuilt. Deferred block streams must leave the graph lazy: evaluating every block
-/// during each reopen would turn a nominal windowed loader back into full-DiT residency.
-fn dequant_plain_int8_tensorwise_with_evaluation(
-    mut native: Weights,
-    evaluate_dense: bool,
+/// Dense bf16/f32 tensors pass through byte-identical; plain int8-per-row, scalar fp8
+/// (`float8_e4m3fn`/`float8_e5m2` descriptors or the plain fp8 cast) and MXFP8 layers dequantize
+/// per layer through their codec rows. The remapped set then receives the same architecture
+/// coverage/shape validation and transformer assembly as the published snapshot. `cfg` comes from
+/// the resident base snapshot because the single file has no `config.json`.
+///
+/// `shapes` carries that same architecture into the plan compiler (sc-20644): MXFP8 storage is
+/// 32-padded and records no true shape, so the adapter must declare one for the layer to unpad to
+/// the geometry the DiT then validates. Callers holding a `Krea2Config` pass
+/// [`DeclaredLogicalShapes::FromConfig`]; a caller with none passes
+/// [`DeclaredLogicalShapes::NotInScope`] and gets the fail-closed padded-shape behaviour.
+pub(crate) fn normalized_native_weights(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
 ) -> Result<Weights> {
-    let int8_weights: Vec<String> = native
-        .keys()
-        .filter(|key| {
-            native
-                .get(key)
-                .is_some_and(|tensor| tensor.dtype() == Dtype::Int8)
-        })
-        .map(str::to_owned)
-        .collect();
-    let descriptors: Vec<String> = native
-        .keys()
-        .filter(|key| key.ends_with(".comfy_quant"))
-        .map(str::to_owned)
-        .collect();
-
-    if int8_weights.is_empty() {
-        if descriptors.is_empty() {
-            return Ok(native);
-        }
-        return Err(Error::Msg(format!(
-            "krea plain int8: found {} `.comfy_quant` descriptor(s) but no I8 weight tensors",
-            descriptors.len()
-        )));
-    }
-
-    for weight_key in int8_weights {
-        let Some(base) = weight_key.strip_suffix(".weight") else {
-            return Err(Error::Msg(format!(
-                "krea plain int8: I8 tensor `{weight_key}` is not a projection `.weight`"
-            )));
-        };
-        let weight = native.require(&weight_key)?;
-        let [rows, _cols] = weight.shape() else {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{weight_key}` must be rank-2 [out,in], got {:?}",
-                weight.shape()
-            )));
-        };
-        let rows = *rows;
-
-        let descriptor_key = format!("{base}.comfy_quant");
-        let descriptor = native.require(&descriptor_key).map_err(|_| {
-            Error::Msg(format!(
-                "krea plain int8: `{weight_key}` is missing `{descriptor_key}`"
-            ))
-        })?;
-        if descriptor.dtype() != Dtype::Uint8 || descriptor.shape().len() != 1 {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must be a rank-1 U8 JSON blob"
-            )));
-        }
-        let descriptor_bytes = descriptor.try_as_slice::<u8>().map_err(|error| {
-            Error::Msg(format!(
-                "krea plain int8: could not read `{descriptor_key}`: {error}"
-            ))
-        })?;
-        let json: serde_json::Value =
-            serde_json::from_slice(descriptor_bytes).map_err(|error| {
-                Error::Msg(format!(
-                    "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
-                ))
-            })?;
-        if json.get("format").and_then(serde_json::Value::as_str) != Some("int8_tensorwise") {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must declare format `int8_tensorwise`"
-            )));
-        }
-        if json.get("per_row").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` must declare `per_row: true`"
-            )));
-        }
-        if json.get("convrot").is_some() {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{descriptor_key}` contains `convrot`; rotated checkpoints are not \
-                 the plain MLX int8 format"
-            )));
-        }
-
-        let scale_key = format!("{base}.weight_scale");
-        let scale = native.require(&scale_key).map_err(|_| {
-            Error::Msg(format!(
-                "krea plain int8: `{weight_key}` is missing `{scale_key}`"
-            ))
-        })?;
-        if scale.dtype() != Dtype::Float32 {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be F32, got {:?}",
-                scale.dtype()
-            )));
-        }
-        let scalar_single_row = rows == 1 && scale.shape().is_empty();
-        if !scalar_single_row && scale.shape() != [rows] && scale.shape() != [rows, 1] {
-            return Err(Error::Msg(format!(
-                "krea plain int8: `{scale_key}` must be [{rows}] or [{rows},1]{}; got {:?}",
-                if rows == 1 { " or scalar" } else { "" },
-                scale.shape()
-            )));
-        }
-
-        let codes = native
-            .remove(&weight_key)
-            .ok_or_else(|| Error::MissingTensor(weight_key.clone()))?
-            .as_dtype(Dtype::Float32)?;
-        let scale = native
-            .remove(&scale_key)
-            .ok_or_else(|| Error::MissingTensor(scale_key.clone()))?;
-        let scale = match scale.shape() {
-            [] if rows == 1 => scale.reshape(&[1, 1])?,
-            [_] => scale.reshape(&[rows, 1])?,
-            _ => scale,
-        };
-        let dense = multiply(&codes, &scale)?.as_dtype(Dtype::Bfloat16)?;
-        if evaluate_dense {
-            // MLX is lazy: materialize projection-by-projection so the eager dense model does not
-            // retain a graph edge to every removed I8 code/scale buffer (which would keep both the
-            // 13.5 GB source and the BF16 reconstruction alive for the whole resident load).
-            dense.eval()?;
-        }
-        native.insert(weight_key, dense);
-        native.remove(&descriptor_key);
-    }
-
-    if let Some(orphan) = native.keys().find(|key| key.ends_with(".comfy_quant")) {
-        return Err(Error::Msg(format!(
-            "krea plain int8: `{orphan}` does not describe an I8 projection weight"
-        )));
-    }
-    Ok(native)
+    normalized_native_weights_with_receipt(dit_file, shapes).map(|(weights, _)| weights)
 }
 
-/// Load a community single-file Krea 2 DiT through the shared native→diffusers remap.
+/// [`normalized_native_weights`], additionally returning the logical-weight receipt of the read.
+/// Since sc-20385 every native single-file convention reads through the codec seam, so a receipt is
+/// always returned.
 ///
-/// Dense bf16 files pass through unchanged. Plain int8-per-row files are descriptor-validated and
-/// dequantized first as `codes.i8 * weight_scale` with no rotation. The remapped set then receives the
-/// same architecture coverage/shape validation and transformer assembly as the published snapshot.
-/// `cfg` comes from the resident base snapshot because the single file has no `config.json`.
-pub(crate) fn normalized_native_weights(dit_file: &Path) -> Result<Weights> {
-    normalized_native_weights_with_materializer(dit_file, |weights| {
+/// Callers that want the receipt take it from here rather than from the process-global slot: the
+/// global's `reset → load → read` window is not atomic, so two observers in one test binary can
+/// clobber each other's observation.
+pub(crate) fn normalized_native_weights_with_receipt(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
+) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
+    normalized_native_weights_with_materializer(dit_file, shapes, |weights| {
         #[cfg(test)]
         run_native_materialize_test_hook(NativeMaterializeTestStage::Before, weights)?;
         weights.materialize()?;
@@ -330,32 +203,111 @@ fn run_native_materialize_test_hook(
 /// Normalize the native namespace without evaluating the complete checkpoint. The bounded block
 /// loader consumes only its accessed window under a separate pin guard; eagerly evaluating here
 /// would retain the full DiT and invalidate that implementation's residency bound.
-pub(crate) fn normalized_native_weights_lazy(dit_file: &Path) -> Result<Weights> {
-    normalized_native_weights_with_options(dit_file, false, |_| Ok(()))
+pub(crate) fn normalized_native_weights_lazy(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
+) -> Result<Weights> {
+    normalized_native_weights_lazy_with_receipt(dit_file, shapes).map(|(weights, _)| weights)
+}
+
+/// [`normalized_native_weights_lazy`], additionally returning the receipt of the read.
+pub(crate) fn normalized_native_weights_lazy_with_receipt(
+    dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
+) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
+    normalized_native_weights_with_options(dit_file, shapes, false, |_| Ok(()))
 }
 
 fn normalized_native_weights_with_materializer(
     dit_file: &Path,
+    shapes: DeclaredLogicalShapes<'_>,
     materialize: impl FnOnce(&Weights) -> Result<()>,
-) -> Result<Weights> {
-    normalized_native_weights_with_options(dit_file, true, materialize)
+) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
+    normalized_native_weights_with_options(dit_file, shapes, true, materialize)
+}
+
+/// The receipt of the most recent native-file read that went through the mapped logical-weight
+/// reader on this process (sc-20634). Diagnostics only: the loader's correctness does not depend
+/// on it, but SceneWorks' parity checks read it to prove a dense bf16 file was consumed through
+/// the codec seam and what the codec left resident.
+///
+/// `reset → load → read` across a process-global slot is not atomic. Anything that observes this
+/// slot — rather than taking the receipt straight off
+/// [`normalized_native_weights_with_receipt`] / [`normalized_native_weights_lazy_with_receipt`],
+/// which is what every in-crate test does — must hold [`RECEIPT_LOCK`] across the whole window, or
+/// a concurrently running observer's reset can clear the observation. That invariant is pinned by
+/// `every_process_global_receipt_observation_is_serialized`.
+static LAST_NATIVE_FILE_RECEIPT: std::sync::Mutex<Option<mlx_gen::gen_core::LogicalWeightReceipt>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes the `reset → load → read` window of every observer of the process-global receipt
+/// slot. See [`LAST_NATIVE_FILE_RECEIPT`].
+#[cfg(test)]
+pub(crate) static RECEIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn last_native_file_receipt() -> Option<mlx_gen::gen_core::LogicalWeightReceipt> {
+    LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub fn reset_native_file_receipt() {
+    *LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn record_native_file_receipt(receipt: mlx_gen::gen_core::LogicalWeightReceipt) {
+    *LAST_NATIVE_FILE_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt);
 }
 
 fn normalized_native_weights_with_options(
     dit_file: &Path,
-    evaluate_plain_int8: bool,
+    shapes: DeclaredLogicalShapes<'_>,
+    eager: bool,
     materialize: impl FnOnce(&Weights) -> Result<()>,
-) -> Result<Weights> {
-    let native = dequant_plain_int8_tensorwise_with_evaluation(
-        Weights::from_file(dit_file)?,
-        evaluate_plain_int8,
+) -> Result<(Weights, mlx_gen::gen_core::LogicalWeightReceipt)> {
+    // One route for every native single-file convention (sc-20634 dense; sc-20385 descriptor
+    // codecs): the adapter's key mapping + the registered codec table. The plan is compiled from
+    // the header plus the `.comfy_quant` descriptor payloads, so an unmapped key, a collision, a
+    // stored format without a codec (packed u8, nvfp4, …), a malformed descriptor, or a missing /
+    // mis-shaped scale companion refuses here, per layer, before any MLX array is created. Plain
+    // int8-per-row, scalar fp8 (E4M3/E5M2, described or the plain cast), and MXFP8 all decode
+    // through their registered codec rows — the former bespoke int8 arm's math lives in the
+    // engine's `int8-per-row-v1` implementation now.
+    let plan = mlx_gen::logical_weights::plan_logical_weights(
+        dit_file,
+        &crate::native_remap::KreaNativeToDiffusersMapping::new(shapes),
     )?;
-    let mut remapped = crate::native_remap::remap_native_dit_to_diffusers(native)?;
-    crate::native_remap::normalize_modulation_tables(&mut remapped)?;
-    // `Weights::from_file` and every MLX cast/remap above are lazy. Force the final normalized map
-    // while the caller's `PinnedWeightsFile::read_unchanged` guard still spans this function.
-    materialize(&remapped)?;
-    Ok(remapped)
+    let mut materialize = Some(materialize);
+    let mut eager_materializer = |weights: &mut Weights| -> Result<()> {
+        crate::native_remap::normalize_modulation_tables(weights)?;
+        match materialize.take() {
+            Some(materialize) => materialize(weights),
+            None => Err(Error::Msg(
+                "krea native-file materializer invoked twice".to_owned(),
+            )),
+        }
+    };
+    let mode = if eager {
+        mlx_gen::logical_weights::LogicalReadMode::Eager(&mut eager_materializer)
+    } else {
+        mlx_gen::logical_weights::LogicalReadMode::Deferred
+    };
+    let mlx_gen::logical_weights::LogicalWeights {
+        mut weights,
+        receipt,
+    } = mlx_gen::logical_weights::read_logical_weights(dit_file, &plan, mode)?;
+    if receipt.materialization == mlx_gen::gen_core::LogicalReadMaterialization::Deferred {
+        // The deferred reader leaves the closure unused; the shape normalization is still part of
+        // the canonical logical form, so apply it here (lazily, under the caller's pin guard).
+        crate::native_remap::normalize_modulation_tables(&mut weights)?;
+    }
+    record_native_file_receipt(receipt.clone());
+    Ok((weights, receipt))
 }
 
 pub fn load_transformer_from_native_file(
@@ -385,7 +337,8 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
 ) -> Result<Krea2Transformer> {
     pinned.read_unchanged(|path| {
         if streamable {
-            let remapped = normalized_native_weights_lazy(path)?;
+            let remapped =
+                normalized_native_weights_lazy(path, DeclaredLogicalShapes::FromConfig(cfg))?;
             // Validation reads representative shapes only. Keep that access bookkeeping on a clone
             // so the pin-bound evaluation below contains exactly the static model tensors retained by
             // the deferred constructor, not a representative transformer block.
@@ -397,7 +350,7 @@ pub(crate) fn load_transformer_from_pinned_native_file_with_stream(
             remapped.materialize_accessed()?;
             Ok(transformer.with_native_block_stream(pinned.clone()))
         } else {
-            let remapped = normalized_native_weights(path)?;
+            let remapped = normalized_native_weights(path, DeclaredLogicalShapes::FromConfig(cfg))?;
             crate::convert::validate_transformer(&remapped, cfg)?;
             Krea2Transformer::from_weights(&remapped, cfg)
         }
@@ -414,7 +367,8 @@ pub(crate) fn load_transformer_from_pinned_native_file_bounded(
     prepare: impl FnOnce(&mut Krea2Transformer) -> Result<()>,
 ) -> Result<Krea2Transformer> {
     pinned.read_unchanged(|path| {
-        let remapped = normalized_native_weights_lazy(path)?;
+        let remapped =
+            normalized_native_weights_lazy(path, DeclaredLogicalShapes::FromConfig(cfg))?;
         crate::convert::validate_transformer(&remapped.clone(), cfg)?;
         let mut transformer = Krea2Transformer::from_weights(&remapped, cfg)?;
         // `from_weights` clones the lazy Array handles it retains. Drop the normalized source map
@@ -431,32 +385,9 @@ pub(crate) fn load_transformer_from_pinned_native_file_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::Array;
+    use mlx_rs::{Array, Dtype};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
-
-    fn plain_int8_weights(descriptor: &str, scale: Array) -> Weights {
-        plain_int8_weights_with_shape(descriptor, &[1_i8, -2, 3, -4, 5, -6], &[2, 3], scale)
-    }
-
-    fn plain_int8_weights_with_shape(
-        descriptor: &str,
-        codes: &[i8],
-        shape: &[i32],
-        scale: Array,
-    ) -> Weights {
-        let mut weights = Weights::empty();
-        weights.insert(
-            "model.diffusion_model.blocks.0.attn.wq.weight",
-            Array::from_slice(codes, shape),
-        );
-        weights.insert("model.diffusion_model.blocks.0.attn.wq.weight_scale", scale);
-        weights.insert(
-            "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
-            Array::from_slice(descriptor.as_bytes(), &[descriptor.len() as i32]),
-        );
-        weights
-    }
 
     #[test]
     fn deferred_native_normalization_skips_the_full_map_materializer() {
@@ -480,7 +411,8 @@ mod tests {
                 Ok(())
             }));
         });
-        let normalized = normalized_native_weights_lazy(&source).unwrap();
+        let normalized =
+            normalized_native_weights_lazy(&source, DeclaredLogicalShapes::NotInScope).unwrap();
         NATIVE_MATERIALIZE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
 
         assert!(normalized.get("img_in.weight").is_some());
@@ -503,8 +435,13 @@ mod tests {
         let replacement = dir.path().join("krea-native.replacement.safetensors");
         let elements = 64 * 1024;
 
-        let original_weight = Array::from_slice(&vec![0.25_f32; elements], &[elements as i32]);
-        let original_bias = Array::from_slice(&vec![0.75_f32; elements], &[elements as i32]);
+        // Dense bf16, the one encoding the baseline codec table serves (sc-20634).
+        let original_weight = Array::from_slice(&vec![0.25_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let original_bias = Array::from_slice(&vec![0.75_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         Array::save_safetensors(
             vec![
                 ("model.diffusion_model.first.weight", &original_weight),
@@ -514,8 +451,12 @@ mod tests {
             &source,
         )
         .expect("write original native checkpoint");
-        let replacement_weight = Array::from_slice(&vec![-0.25_f32; elements], &[elements as i32]);
-        let replacement_bias = Array::from_slice(&vec![-0.75_f32; elements], &[elements as i32]);
+        let replacement_weight = Array::from_slice(&vec![-0.25_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let replacement_bias = Array::from_slice(&vec![-0.75_f32; elements], &[elements as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         Array::save_safetensors(
             vec![
                 ("model.diffusion_model.first.weight", &replacement_weight),
@@ -550,7 +491,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move |stage, weights| {
                 match stage {
                     NativeMaterializeTestStage::Before => {
-                        let first = weights.require("img_in.weight")?;
+                        let first = mlx_gen::weights::to_f32(weights.require("img_in.weight")?)?;
                         first.eval()?;
                         assert!(first.as_slice::<f32>().iter().all(|value| *value == 0.25));
                         first_evaluated.wait();
@@ -558,7 +499,9 @@ mod tests {
                     }
                     NativeMaterializeTestStage::After => {
                         assert_eq!(
-                            weights.require("img_in.bias")?.as_slice::<f32>().len(),
+                            mlx_gen::weights::to_f32(weights.require("img_in.bias")?)?
+                                .as_slice::<f32>()
+                                .len(),
                             elements
                         );
                         evaluated.store(true, Ordering::SeqCst);
@@ -592,82 +535,1085 @@ mod tests {
         assert!(error.contains("changed after load"), "unexpected: {error}");
     }
 
-    #[test]
-    fn plain_int8_dequants_per_row_without_rotation() {
-        let weights = plain_int8_weights(
-            r#"{"format":"int8_tensorwise","per_row":true}"#,
-            Array::from_slice(&[0.5_f32, 2.0], &[2, 1]),
-        );
-        let dequant = dequant_plain_int8_tensorwise(weights).unwrap();
-        assert!(dequant
-            .get("model.diffusion_model.blocks.0.attn.wq.weight_scale")
-            .is_none());
-        assert!(dequant
-            .get("model.diffusion_model.blocks.0.attn.wq.comfy_quant")
-            .is_none());
-        let got = dequant
-            .require("model.diffusion_model.blocks.0.attn.wq.weight")
-            .unwrap()
-            .as_dtype(Dtype::Float32)
-            .unwrap();
-        assert_eq!(got.as_slice::<f32>(), &[0.5, -1.0, 1.5, -8.0, 10.0, -12.0]);
+    fn write_native_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], Vec<u8>)]) {
+        let mut header_entries = Vec::new();
+        let mut body = Vec::new();
+        for (name, dtype, shape, payload) in tensors {
+            let start = body.len();
+            body.extend_from_slice(payload);
+            let end = body.len();
+            header_entries.push(format!(
+                "{:?}:{{\"dtype\":{:?},\"shape\":{:?},\"data_offsets\":[{start},{end}]}}",
+                name, dtype, shape
+            ));
+        }
+        let mut header = format!("{{{}}}", header_entries.join(",")).into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + header.len() + body.len());
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&body);
+        std::fs::write(path, file).unwrap();
     }
 
-    #[test]
-    fn plain_int8_accepts_scalar_scale_for_single_row() {
-        let weights = plain_int8_weights_with_shape(
-            r#"{"format":"int8_tensorwise","per_row":true}"#,
-            &[1_i8, -2, 3],
-            &[1, 3],
-            Array::from_slice(&[0.5_f32], &[]),
-        );
-        let dequant = dequant_plain_int8_tensorwise(weights).unwrap();
-        let got = dequant
-            .require("model.diffusion_model.blocks.0.attn.wq.weight")
-            .unwrap()
-            .as_dtype(Dtype::Float32)
-            .unwrap();
-        assert_eq!(got.as_slice::<f32>(), &[0.5, -1.0, 1.5]);
+    fn bf16_le(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
     }
 
+    fn native_fixture_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("krea-native-{}-", std::process::id()))
+            .tempdir()
+            .unwrap()
+    }
+
+    /// sc-20634: a dense bf16 native file is consumed through the mapped logical-weight reader and
+    /// the registered dense-bf16 codec — keys arrive canonical, the adapter's modulation reshape is
+    /// part of the logical form, and the receipt reports what the codec left resident, measured
+    /// from the arrays (dense bf16 ⇒ exactly the source bytes).
     #[test]
-    fn plain_int8_rejects_convrot_or_wrong_descriptor() {
-        for (descriptor, expected) in [
+    fn dense_native_file_reads_through_the_logical_codec_seam_and_reports_residency() {
+        let dir = native_fixture_dir();
+        let source = dir.path().join("dense-native.safetensors");
+        write_native_safetensors(
+            &source,
+            &[
+                (
+                    "model.diffusion_model.first.weight",
+                    "BF16",
+                    &[2],
+                    bf16_le(&[0.25, -2.0]),
+                ),
+                (
+                    "model.diffusion_model.first.bias",
+                    "BF16",
+                    &[2],
+                    bf16_le(&[1.0, 0.5]),
+                ),
+                (
+                    "model.diffusion_model.blocks.0.mod.lin",
+                    "BF16",
+                    &[12],
+                    bf16_le(&[1.0; 12]),
+                ),
+            ],
+        );
+        let (normalized, receipt) =
+            normalized_native_weights_with_receipt(&source, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        let mut keys: Vec<&str> = normalized.keys().collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "img_in.bias",
+                "img_in.weight",
+                "transformer_blocks.0.scale_shift_table"
+            ]
+        );
+        assert_eq!(
+            normalized
+                .require("transformer_blocks.0.scale_shift_table")
+                .unwrap()
+                .shape(),
+            [6, 2],
+            "the adapter-owned flat→[6, hidden] reshape is applied inside the logical form"
+        );
+        let weight =
+            mlx_gen::weights::to_f32(normalized.require("img_in.weight").unwrap()).unwrap();
+        assert_eq!(weight.as_slice::<f32>(), [0.25, -2.0]);
+
+        assert_eq!(
+            receipt.mapping_id,
+            crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(receipt.tensor_count, 3);
+        assert_eq!(receipt.source_bytes, 4 + 4 + 24);
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(receipt.residency.len(), 1);
+        assert_eq!(receipt.residency[0].codec_id, "dense-bf16-v1");
+        assert_eq!(receipt.residency[0].tensor_count, 3);
+        let measured: usize = normalized
+            .keys()
+            .map(|key| normalized.get(key).unwrap().nbytes())
+            .sum();
+        assert_eq!(receipt.residency[0].resident_bytes, measured as u64);
+        assert_eq!(receipt.resident_bytes(), 32);
+
+        // The deferred (block-stream / bounded) entry keeps payloads lazy and says so.
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&source, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        assert_eq!(
+            lazy.require("transformer_blocks.0.scale_shift_table")
+                .unwrap()
+                .shape(),
+            [6, 2]
+        );
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        assert!(receipt.residency.is_empty());
+    }
+
+    /// sc-20385: the native single-file route dispatches EVERY ComfyUI convention per layer
+    /// through the registered codec table — plain fp8 casts decode at unit scale, descriptor
+    /// int8-per-row decodes through `int8-per-row-v1` (the former bespoke arm's math), a foreign
+    /// key still refuses, and a stored format without a codec (packed u8) refuses from the header
+    /// naming the tensor.
+    #[test]
+    fn native_file_conventions_dispatch_per_layer_through_the_codec_seam() {
+        let dir = native_fixture_dir();
+
+        // Plain fp8 cast (the KreaMania V1/V2 fp8 shape: every tensor F8_E4M3, no companions).
+        let fp8 = dir.path().join("fp8-native.safetensors");
+        write_native_safetensors(
+            &fp8,
+            &[
+                (
+                    "model.diffusion_model.first.weight",
+                    "F8_E4M3",
+                    &[2, 1],
+                    vec![0x38, 0x40], // 1.0, 2.0
+                ),
+                (
+                    "model.diffusion_model.first.bias",
+                    "F8_E4M3",
+                    &[2],
+                    vec![0xB8, 0x48], // -1.0, 4.0
+                ),
+            ],
+        );
+        let (weights, receipt) =
+            normalized_native_weights_with_receipt(&fp8, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        let weight = mlx_gen::weights::to_f32(weights.require("img_in.weight").unwrap()).unwrap();
+        assert_eq!(weight.as_slice::<f32>(), [1.0, 2.0]);
+        let bias = mlx_gen::weights::to_f32(weights.require("img_in.bias").unwrap()).unwrap();
+        assert_eq!(bias.as_slice::<f32>(), [-1.0, 4.0]);
+        assert_eq!(receipt.residency.len(), 1);
+        assert_eq!(receipt.residency[0].codec_id, "fp8-e4m3-scalar-v1");
+        // fp8 → bf16 residency: twice the stored bytes, measured from the arrays.
+        assert_eq!(receipt.resident_bytes(), 2 * receipt.source_bytes);
+
+        // Foreign key: refuses naming the tensor.
+        let foreign = dir.path().join("foreign-native.safetensors");
+        write_native_safetensors(
+            &foreign,
+            &[(
+                "model.diffusion_model.unknown.weight",
+                "BF16",
+                &[1],
+                bf16_le(&[0.25]),
+            )],
+        );
+        let error = normalized_native_weights(&foreign, DeclaredLogicalShapes::NotInScope)
+            .err()
+            .expect("foreign key must refuse")
+            .to_string();
+        assert!(
+            error.contains("\"model.diffusion_model.unknown.weight\"")
+                && error.contains("no canonical logical key"),
+            "{error}"
+        );
+
+        // A stored format without a codec (packed u8 nibbles) refuses from the header.
+        let packed = dir.path().join("packed-native.safetensors");
+        write_native_safetensors(
+            &packed,
+            &[
+                (
+                    "model.diffusion_model.first.weight",
+                    "BF16",
+                    &[1],
+                    bf16_le(&[0.25]),
+                ),
+                (
+                    "model.diffusion_model.first.bias",
+                    "U8",
+                    &[2],
+                    vec![0x12, 0x34],
+                ),
+            ],
+        );
+        let error = normalized_native_weights(&packed, DeclaredLogicalShapes::NotInScope)
+            .err()
+            .expect("packed u8 must refuse")
+            .to_string();
+        assert!(
+            error.contains("\"model.diffusion_model.first.bias\"")
+                && error.contains("no checkpoint codec is registered"),
+            "{error}"
+        );
+
+        // Plain int8 descriptor convention: now the registry's `int8-per-row-v1` row, with a
+        // receipt — the same dequant values as the former bespoke arm.
+        let int8 = dir.path().join("int8-native.safetensors");
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#;
+        write_native_safetensors(
+            &int8,
+            &[
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight",
+                    "I8",
+                    &[1, 2],
+                    vec![2, 0xFE],
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                    "F32",
+                    &[1],
+                    0.5_f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+        let (dequantized, receipt) =
+            normalized_native_weights_with_receipt(&int8, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        let projection = mlx_gen::weights::to_f32(
+            dequantized
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projection.as_slice::<f32>(), [1.0, -1.0]);
+        assert!(
+            dequantized
+                .get("transformer_blocks.0.attn.to_q.weight_scale")
+                .is_none(),
+            "the scale companion is consumed, not remapped"
+        );
+        assert_eq!(receipt.residency.len(), 1);
+        assert_eq!(receipt.residency[0].codec_id, "int8-per-row-v1");
+    }
+
+    /// sc-20385: int8 per-row descriptor defects refuse per layer with the exact defect — the
+    /// refusal set the former bespoke arm enforced, now from the shared plan compiler.
+    #[test]
+    fn plain_int8_descriptor_defects_refuse_by_layer_via_the_plan() {
+        let dir = native_fixture_dir();
+        let write_int8 = |name: &str,
+                          descriptor: &[u8],
+                          scale_shape: &[usize],
+                          scale_payload: Vec<u8>|
+         -> std::path::PathBuf {
+            let path = dir.path().join(name);
+            write_native_safetensors(
+                &path,
+                &[
+                    (
+                        "model.diffusion_model.blocks.0.attn.wq.weight",
+                        "I8",
+                        &[2, 3],
+                        vec![1, 0xFE, 3, 0xFC, 5, 0xFA],
+                    ),
+                    (
+                        "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                        "F32",
+                        scale_shape,
+                        scale_payload,
+                    ),
+                    (
+                        "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                        "U8",
+                        &[descriptor.len()],
+                        descriptor.to_vec(),
+                    ),
+                ],
+            );
+            path
+        };
+        let two_scales: Vec<u8> = [0.5_f32, 2.0]
+            .iter()
+            .flat_map(|scale| scale.to_le_bytes())
+            .collect();
+
+        // The happy path first, so the refusals below are about the defects, not the fixture.
+        let good = write_int8(
+            "good.safetensors",
+            br#"{"format":"int8_tensorwise","per_row":true}"#,
+            &[2, 1],
+            two_scales.clone(),
+        );
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&good, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        let got = mlx_gen::weights::to_f32(
+            weights
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got.as_slice::<f32>(), [0.5, -1.0, 1.5, -8.0, 10.0, -12.0]);
+
+        for (name, descriptor, scale_shape, scale_payload, expected) in [
             (
-                r#"{"format":"int8_tensorwise","per_row":true,"convrot":true}"#,
+                "convrot.safetensors",
+                br#"{"format":"int8_tensorwise","per_row":true,"convrot":true}"#.as_slice(),
+                [2_usize, 1].as_slice(),
+                two_scales.clone(),
                 "convrot",
             ),
-            (r#"{"format":"mxfp4","per_row":true}"#, "int8_tensorwise"),
-            (r#"{"format":"int8_tensorwise","per_row":false}"#, "per_row"),
+            (
+                "wrongformat.safetensors",
+                br#"{"format":"mxfp4","per_row":true}"#.as_slice(),
+                [2, 1].as_slice(),
+                two_scales.clone(),
+                "mxfp4",
+            ),
+            (
+                "notperrow.safetensors",
+                br#"{"format":"int8_tensorwise","per_row":false}"#.as_slice(),
+                [2, 1].as_slice(),
+                two_scales.clone(),
+                "per_row",
+            ),
+            (
+                "badscale.safetensors",
+                br#"{"format":"int8_tensorwise","per_row":true}"#.as_slice(),
+                [1].as_slice(),
+                0.5_f32.to_le_bytes().to_vec(),
+                "weight_scale",
+            ),
         ] {
-            let error = match dequant_plain_int8_tensorwise(plain_int8_weights(
-                descriptor,
-                Array::from_slice(&[0.5_f32, 2.0], &[2]),
-            )) {
-                Ok(_) => panic!("invalid descriptor must fail"),
-                Err(error) => error.to_string(),
-            };
-            assert!(error.contains(expected), "{error}");
+            let path = write_int8(name, descriptor, scale_shape, scale_payload);
+            let error = normalized_native_weights(&path, DeclaredLogicalShapes::NotInScope)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must refuse"))
+                .to_string();
+            assert!(
+                error.contains(expected) && error.contains("blocks.0.attn.wq"),
+                "{name}: {error}"
+            );
         }
     }
 
+    /// Single-row int8 keeps accepting the scalar scale form the converter writes for `out == 1`.
     #[test]
-    fn plain_int8_rejects_non_per_row_scale_shape() {
-        for scale in [
-            Array::from_slice(&[0.5_f32], &[1]),
-            Array::from_slice(&[0.5_f32], &[]),
+    fn plain_int8_accepts_scalar_scale_for_single_row() {
+        let dir = native_fixture_dir();
+        let path = dir.path().join("single-row.safetensors");
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#;
+        write_native_safetensors(
+            &path,
+            &[
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight",
+                    "I8",
+                    &[1, 3],
+                    vec![1, 0xFE, 3],
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                    "F32",
+                    &[],
+                    0.5_f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&path, DeclaredLogicalShapes::NotInScope)
+                .unwrap();
+        let got = mlx_gen::weights::to_f32(
+            weights
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got.as_slice::<f32>(), [0.5, -1.0, 1.5]);
+    }
+
+    /// A deliberately non-32-aligned architecture: hidden 40 (2 heads × 20), so a single-stream
+    /// `to_q` is logically `[40, 40]` and MXFP8 stores it 32-padded at `[64, 64]`. Padding is
+    /// therefore observable — an undeclared plan lands on 64s, a declared one on 40s.
+    fn unaligned_config() -> Krea2Config {
+        let cfg = Krea2Config {
+            in_channels: 12,
+            patch_size: 2,
+            hidden_size: 40,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            attention_head_dim: 20,
+            num_layers: 1,
+            intermediate_size: 44,
+            norm_eps: 1e-5,
+            axes_dims_rope: [4, 8, 8],
+            rope_theta: 1000.0,
+            timestep_embed_dim: 12,
+            num_text_layers: 3,
+            num_layerwise_text_blocks: 1,
+            num_refiner_text_blocks: 1,
+            text_hidden_dim: 40,
+            text_intermediate_size: 44,
+            text_num_attention_heads: 2,
+            text_num_kv_heads: 1,
+        };
+        cfg.validate().expect("the test architecture is coherent");
+        cfg
+    }
+
+    /// **sc-20644 — a real MXFP8 Krea DiT plans and decodes at the LOGICAL (unpadded) shape when a
+    /// config is in scope, and at the stored padded shape when none is.**
+    ///
+    /// A synthetic MXFP8 layer: a `[64, 64]` E4M3 payload (the 32-padded storage of a logical
+    /// `[40, 40]` `to_q`) plus its swizzled E8M0 `weight_scale` companion and the `mxfp8` descriptor.
+    /// The padded rows/columns carry poison (E4M3 448 under a NaN exponent), so a wrong unpad or a
+    /// missing declaration cannot pass by accident.
+    #[test]
+    fn mxfp8_plans_at_the_declared_logical_shape_and_at_stored_padding_without_a_config() {
+        let cfg = unaligned_config();
+        let logical = [cfg.q_dim(), cfg.hidden_size]; // [40, 40] — the `to_q` the DiT builds.
+        let stored = [64_usize, 64]; // 32-padded on both axes.
+        let scale_shape = mlx_gen::gen_core::mxfp8_scale_shape(stored);
+
+        let mut values = vec![0x7E_u8; stored[0] * stored[1]]; // 448 poison in the padding
+        for row in 0..logical[0] {
+            for col in 0..logical[1] {
+                values[row * stored[1] + col] = 0x38 + ((row + col) % 4) as u8;
+            }
+        }
+        let mut scales = vec![0xFF_u8; scale_shape[0] * scale_shape[1]]; // NaN exponent poison
+        for row in 0..logical[0] {
+            for block in 0..logical[1].div_ceil(32) {
+                scales[mlx_gen::gen_core::mxfp8_swizzled_scale_index(stored, row, block)] =
+                    126 + ((row + block) % 3) as u8;
+            }
+        }
+
+        let dir = native_fixture_dir();
+        let path = dir.path().join("mxfp8-native.safetensors");
+        let descriptor = br#"{"format": "mxfp8"}"#;
+        write_native_safetensors(
+            &path,
+            &[
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight",
+                    "F8_E4M3",
+                    &stored,
+                    values,
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.weight_scale",
+                    "U8",
+                    &scale_shape,
+                    scales,
+                ),
+                (
+                    "model.diffusion_model.blocks.0.attn.wq.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+
+        // With the architecture config in scope the plan unpads to the DiT's real geometry.
+        let declared = mlx_gen::logical_weights::plan_logical_weights(
+            &path,
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&cfg),
+        )
+        .expect("the mxfp8 layer plans through the Krea native mapping");
+        assert_eq!(declared.tensors.len(), 1);
+        assert_eq!(
+            declared.tensors[0].shape,
+            logical.to_vec(),
+            "a declared logical shape must unpad the 32-padded storage"
+        );
+        // Dense residency is priced from the LOGICAL element count, not the padded one.
+        assert_eq!(
+            declared.resident_bytes(),
+            (logical[0] * logical[1] * 2) as u64
+        );
+
+        // ...and the decoded array really is that shape, so the DiT's own architecture validation
+        // (which is what refused a genuine MXFP8 Krea before sc-20644) now accepts the tensor.
+        let (weights, _) =
+            normalized_native_weights_with_receipt(&path, DeclaredLogicalShapes::FromConfig(&cfg))
+                .expect("the mxfp8 layer decodes through the codec seam");
+        assert_eq!(
+            weights
+                .require("transformer_blocks.0.attn.to_q.weight")
+                .unwrap()
+                .shape(),
+            &[logical[0] as i32, logical[1] as i32],
+        );
+
+        // With no config in scope the pre-sc-20644 behaviour is unchanged: the stored padded shape.
+        let undeclared = mlx_gen::logical_weights::plan_logical_weights(
+            &path,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("an undeclared mxfp8 layer still plans");
+        assert_eq!(
+            undeclared.tensors[0].shape,
+            stored.to_vec(),
+            "with no declaration the plan can only use the stored padded shape"
+        );
+        // Which is exactly the geometry the DiT refuses — the fail-closed backstop is intact.
+        assert_ne!(undeclared.tensors[0].shape, logical.to_vec());
+    }
+
+    /// sc-20634 review: `LAST_NATIVE_FILE_RECEIPT` is process-global and its
+    /// `reset → load → read` window is not atomic, so two tests observing it concurrently in this
+    /// binary can clear or overwrite each other's observation. Every in-crate test now takes the
+    /// receipt straight off the read (`*_with_receipt`); anything that still touches the global
+    /// must hold `RECEIPT_LOCK` across the whole window. Pin that so a future test cannot
+    /// reintroduce the race by reaching for `reset_native_file_receipt()` on its own.
+    #[test]
+    fn every_process_global_receipt_observation_is_serialized() {
+        for (file, source) in [
+            ("loader.rs", include_str!("loader.rs")),
+            ("model.rs", include_str!("model.rs")),
         ] {
-            let error = match dequant_plain_int8_tensorwise(plain_int8_weights(
-                r#"{"format":"int8_tensorwise","per_row":true}"#,
-                scale,
-            )) {
-                Ok(_) => panic!("wrong scale shape must fail"),
-                Err(error) => error.to_string(),
-            };
+            let body = source
+                .split_once("mod tests {")
+                .map_or(source, |(_, tests)| tests);
+            let resets = body.matches("reset_native_file_receipt()").count();
+            let reads = body.matches("last_native_file_receipt()").count();
+            let guards = body.matches("RECEIPT_LOCK").count();
             assert!(
-                error.contains("weight_scale") && error.contains("[2]"),
-                "{error}"
+                guards >= resets.max(reads),
+                "{file}: {resets} reset(s) and {reads} read(s) of the process-global receipt but \
+                 only {guards} RECEIPT_LOCK acquisition(s) — every observer must hold the lock \
+                 across its reset → load → read window, or take the receipt from \
+                 `normalized_native_weights_with_receipt` instead"
             );
         }
+    }
+
+    /// Real-weight check of the dense walking-skeleton input (sc-20634): the community
+    /// `kreamania_variant5` DiT plans entirely onto the dense-bf16 codec through the Krea native
+    /// mapping (430 tensors, every byte of the data region accounted for) and its deferred read
+    /// goes through the codec seam with a recorded receipt. Header-only plus a lazy open: no GPU
+    /// render. `KREA_NATIVE_DIT` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT to a dense bf16 ComfyUI Krea 2 DiT"]
+    fn variant5_plans_as_dense_bf16_through_the_codec_seam() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT") else {
+            panic!("set KREA_NATIVE_DIT to a dense bf16 ComfyUI Krea 2 single-file DiT");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("variant5 plans through the Krea native mapping");
+        // variant5 is 415 bf16 + 15 f32 tensors (in/out projections and biases): both dense rows.
+        assert_eq!(plan.codec_ids(), ["dense-bf16-v1", "dense-f32-v1"]);
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        assert_eq!(plan.tensor_count(), headers.len());
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared);
+        let mut file = std::fs::File::open(&dit).unwrap();
+        let mut prefix = [0_u8; 8];
+        std::io::Read::read_exact(&mut file, &mut prefix).unwrap();
+        let header_len = u64::from_le_bytes(prefix);
+        let file_len = std::fs::metadata(&dit).unwrap().len();
+        assert_eq!(
+            plan.source_bytes,
+            file_len - 8 - header_len,
+            "every byte of the data region is planned"
+        );
+        assert!(plan
+            .logical_keys()
+            .any(|key| key == "transformer_blocks.0.attn.to_q.weight"));
+
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("img_in.weight").is_some());
+        assert_eq!(
+            receipt.mapping_id,
+            crate::native_remap::KreaNativeToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(receipt.tensor_count, headers.len());
+        assert_eq!(receipt.source_bytes, declared);
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT variant5 tensors={} source_bytes={} codecs={:?}",
+            receipt.tensor_count,
+            receipt.source_bytes,
+            plan.codec_ids()
+        );
+    }
+
+    /// Real-weight check of the KreaMania fp8 shape (sc-20385): the plain `fp8_e4m3fn` cast of the
+    /// community Krea 2 DiT — every fp8 tensor `F8_E4M3`, no scale companions, no descriptors —
+    /// plans onto the scalar fp8 codec at **unit scale** through the Krea native mapping and its
+    /// deferred read goes through the codec seam with a recorded receipt.
+    /// Header plus a lazy open: no GPU render. `KREA_NATIVE_DIT_FP8` points at the file.
+    ///
+    /// The real artifact for this shape is `kreamania_variant7_fp8` (430 tensors: 265 `F8_E4M3`
+    /// + 158 BF16 + 7 F32, no companions, no `__metadata__`).
+    ///
+    /// **This is NOT what the published V1/V2 fp8 artifacts are.** An earlier revision of this
+    /// comment claimed they were; reading their headers disproved it. `kreamania_variant1_fp8` and
+    /// `kreamania_variant2_fp8` are descriptor-gated **scaled** fp8: 942 tensors carrying 256
+    /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values (not 1.0),
+    /// and 256 `.comfy_quant` descriptors — 160 `{"format": "float8_e4m3fn"}` plus 96
+    /// `{"format": "float8_e4m3fn", "full_precision_matrix_mult": true}` — with the other 174
+    /// tensors left BF16. They exercise the companion-scale and forced-dense paths this test does
+    /// not; `kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm` covers them.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8 to a plain fp8_e4m3fn Krea 2 DiT"]
+    fn kreamania_fp8_cast_plans_as_scalar_fp8_through_the_codec_seam() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_FP8") else {
+            panic!("set KREA_NATIVE_DIT_FP8 to a plain fp8_e4m3fn Krea 2 single-file DiT");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("the fp8 cast plans through the Krea native mapping");
+        // ComfyUI's UNETLoader cast converts the big linear weights and leaves norms/biases alone,
+        // so a real plain-cast checkpoint is fp8 MIXED with dense rows — it is not fp8 throughout.
+        // (An earlier revision asserted a single codec id and `2 * declared` residency here; that
+        // was true of the locally produced surrogate, which cast every tensor, and false of every
+        // real artifact.)
+        assert!(
+            plan.codec_ids().contains(&"fp8-e4m3-scalar-v1"),
+            "{:?}",
+            plan.codec_ids()
+        );
+        assert!(plan.companions.is_empty(), "a plain cast has no companions");
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        assert_eq!(plan.tensor_count(), headers.len());
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared);
+
+        // Every fp8 layer is at UNIT scale — the defining property of the plain cast, and what
+        // separates it from the published V1/V2 scaled artifacts.
+        let fp8: Vec<_> = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "fp8-e4m3-scalar-v1")
+            .collect();
+        assert!(!fp8.is_empty(), "the fixture must carry fp8 layers");
+        assert!(
+            fp8.iter().all(|tensor| matches!(
+                &tensor.codec,
+                mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
+                    scale: mlx_gen::gen_core::ScalarScaleSource::Unit,
+                    ..
+                }
+            )),
+            "a plain cast carries no scale companion, so every layer plans at unit scale"
+        );
+        // Residency: fp8 layers double (→ bf16), dense rows keep their stored bytes. Summing the
+        // two is the real relationship the blanket `2 * declared` was standing in for.
+        let fp8_source: u64 = fp8.iter().map(|tensor| tensor.source_bytes).sum();
+        let dense_source: u64 = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id != "fp8-e4m3-scalar-v1")
+            .map(|tensor| tensor.source_bytes)
+            .sum();
+        assert_eq!(
+            plan.resident_bytes(),
+            2 * fp8_source + dense_source,
+            "fp8 → bf16 doubles; dense rows are byte-preserving"
+        );
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("img_in.weight").is_some());
+        assert_eq!(receipt.tensor_count, headers.len());
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-fp8 tensors={} source_bytes={} resident_bytes={}",
+            plan.tensor_count(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
+    /// Real-weight check of the int8-per-row regression (sc-20385): the community
+    /// `kreamania_variant4` (264 I8 projections + per-row scales + descriptors, mixed with dense
+    /// f32/bf16 tensors) plans through the registry's `int8-per-row-v1` row — the former bespoke
+    /// arm — with every companion consumed and every byte of the data region accounted for.
+    /// `KREA_NATIVE_DIT_INT8` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_INT8 to the int8-per-row kreamania_variant4"]
+    fn kreamania_int8_plans_through_the_registry_codec() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_INT8") else {
+            panic!("set KREA_NATIVE_DIT_INT8 to the int8-per-row kreamania_variant4");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("variant4 plans through the registry int8 codec");
+        assert!(plan.codec_ids().contains(&"int8-per-row-v1"));
+        let int8_layers = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "int8-per-row-v1")
+            .count();
+        assert_eq!(int8_layers, 264, "variant4 carries 264 int8 projections");
+        assert_eq!(
+            plan.companions.len(),
+            264 * 2,
+            "each projection consumes its weight_scale and comfy_quant companions"
+        );
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
+        assert!(
+            lazy.keys()
+                .all(|key| !key.ends_with(".comfy_quant") && !key.ends_with(".weight_scale")),
+            "companions are consumed, never remapped"
+        );
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-int8 tensors={} int8_layers={int8_layers} source_bytes={} \
+             resident_bytes={}",
+            plan.tensor_count(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
+    /// Real-weight regression for the sc-20651 campaign refusal: a published KreaMania int8
+    /// artifact that declares every projection through **both** routes at once, with the file-level
+    /// entry a strict SUBSET of the authoritative per-tensor blob.
+    ///
+    /// `kreamania_variant1.safetensors` (958 tensors: 264 `I8` weights, 264 F32 `.weight_scale`,
+    /// 264 `.comfy_quant`, plus 159 BF16 + 7 F32 dense rows) carries a
+    /// `__metadata__._quantization_metadata` table whose 264 entries are all a bare
+    /// `{"format": "int8_tensorwise"}`, while all 264 blobs say
+    /// `{"format": "int8_tensorwise", "per_row": true}`. Completing the file-level entry first made
+    /// the whole checkpoint refuse with `int8_tensorwise must declare per_row: true` — with the
+    /// authority that says `per_row: true` sitting unread next to the weight.
+    ///
+    /// `KREA_NATIVE_DIT_INT8_BOTH_FORMS` points at the file. Header plus a lazy open: no GPU render.
+    ///
+    /// Mutation: restore blind file-level-first parsing (complete the table's entries before the
+    /// blobs are read) in `compile_logical_weight_plan_with_metadata` and this test refuses again.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_INT8_BOTH_FORMS to a KreaMania int8 checkpoint carrying BOTH declaration routes"]
+    fn kreamania_int8_plans_when_both_declaration_routes_describe_every_layer() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_INT8_BOTH_FORMS") else {
+            panic!(
+                "set KREA_NATIVE_DIT_INT8_BOTH_FORMS to a KreaMania int8 checkpoint carrying \
+                    both `.comfy_quant` tensors and `__metadata__._quantization_metadata`"
+            );
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+
+        // The fixture must actually exercise BOTH routes, or this test proves nothing: a
+        // blob-only file would pass it unchanged even with the defect restored.
+        let metadata = mlx_gen::gen_core::safetensors_path_quantization_metadata(&dit)
+            .expect("header read")
+            .expect("this fixture must carry `__metadata__._quantization_metadata`");
+        let table = mlx_gen::gen_core::parse_quantization_metadata(&metadata)
+            .expect("the file-level table parses");
+        assert_eq!(table.len(), 264, "264 file-level layer declarations");
+        assert!(
+            table.values().all(|entry| entry.per_row.is_none()
+                && entry.full_precision_matrix_mult.is_none()
+                && entry.format
+                    == mlx_gen::gen_core::ComfyQuantFormat::Int8TensorwisePerRow),
+            "every file-level entry is the bare `{{\"format\": \"int8_tensorwise\"}}` real ComfyUI \
+             writes — a strict subset of its blob"
+        );
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|header| header.name.ends_with(".comfy_quant"))
+                .count(),
+            264,
+            "and every one of those layers ALSO carries its authoritative per-tensor blob"
+        );
+
+        // The subset entry corroborates the blob instead of refusing it.
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("the authoritative blob decides the layer; the subset entry must not refuse");
+        assert_eq!(
+            plan.codec_ids(),
+            ["dense-bf16-v1", "dense-f32-v1", "int8-per-row-v1"]
+        );
+        let int8_rows = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "int8-per-row-v1")
+            .count();
+        assert_eq!(int8_rows, 264, "all 264 int8 projections plan per-row");
+        assert_eq!(
+            plan.companions.len(),
+            264 * 2,
+            "each projection still consumes its weight_scale and comfy_quant companions"
+        );
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-int8-both-forms tensors={} int8_rows={int8_rows} \
+             file_level_entries={} source_bytes={} resident_bytes={}",
+            plan.tensor_count(),
+            table.len(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
+    /// Real-weight check of the **published KreaMania V1/V2 fp8** artifacts (sc-20385 AC3): these
+    /// are descriptor-gated **scaled** fp8, not the plain cast — 942 tensors carrying 256
+    /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values, and 256
+    /// `.comfy_quant` descriptors, of which **96 set `full_precision_matrix_mult`**, with the
+    /// remaining 174 tensors left BF16.
+    ///
+    /// So one file exercises three things the plain cast cannot: `ScalarScaleSource::Companion`
+    /// (never `Unit`), the `full_precision_matrix_mult` forced-dense rule, and mixed per-layer
+    /// dispatch against dense bf16 — on the real published artifact.
+    /// `KREA_NATIVE_DIT_FP8_SCALED` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8"]
+    fn kreamania_scaled_fp8_plans_with_companion_scales_and_fpmm() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_FP8_SCALED") else {
+            panic!("set KREA_NATIVE_DIT_FP8_SCALED to a published KreaMania V1/V2 fp8 DiT");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("the published scaled fp8 artifact plans through the Krea native mapping");
+
+        assert_eq!(plan.tensor_count(), 430);
+        assert_eq!(plan.codec_ids(), ["dense-bf16-v1", "fp8-e4m3-scalar-v1"]);
+        let fp8: Vec<_> = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "fp8-e4m3-scalar-v1")
+            .collect();
+        assert_eq!(fp8.len(), 256, "256 scaled fp8 projections");
+
+        // Every fp8 layer takes its scale from a companion — NOT the plain cast's unit scale.
+        // This is the assertion the plain-cast test cannot make.
+        assert!(
+            fp8.iter().all(|tensor| matches!(
+                &tensor.codec,
+                mlx_gen::gen_core::TensorCodecSpec::ScalarFp8 {
+                    scale: mlx_gen::gen_core::ScalarScaleSource::Companion { .. },
+                    ..
+                }
+            )),
+            "a published V1/V2 layer must never plan at unit scale"
+        );
+        let fpmm = fp8
+            .iter()
+            .filter(|tensor| tensor.codec.full_precision_matrix_mult())
+            .count();
+        assert_eq!(fpmm, 96, "96 layers declare full_precision_matrix_mult");
+        // NOTE: asserting these layers plan *dense* would be vacuous here — MLX plans under
+        // `DenseResidencyPolicy`, so every layer is dense whether or not the flag is honored
+        // (verified: deleting the fpmm-forces-dense rule in the compiler leaves this test green).
+        // The flag's residency consequence is tested where a packed policy exists, in gen-core's
+        // `packed_policy_prices_stored_bytes_plus_scales_and_honors_full_precision_layers`. What
+        // this assertion is worth on the real artifact is that the descriptor parse recovered the
+        // flag from 96 of 256 real `.comfy_quant` payloads at all.
+
+        // 256 weight_scale + 256 comfy_quant, every one consumed; every data byte accounted for.
+        assert_eq!(plan.companions.len(), 256 * 2);
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+
+        // ---- the whole dense-fallback residency sum, term by term (sc-20651) -------------------
+        //
+        // The sc-20651 campaign's FP8 admission refusal was diagnosed as this model omitting the 96
+        // `full_precision_matrix_mult: true` layers. It does not omit them, and this arithmetic is
+        // the disproof: every fp8 layer — fpmm or not — is decoded to bf16 by
+        // `mlx_gen::logical_weights::decode`'s `ScalarFp8` arm and priced at 2 bytes/element here,
+        // and the four terms below sum to the plan's own total with nothing left over.
+        //
+        // On `kreamania_variant1_fp8` the terms are:
+        //   96 fpmm fp8 layers      5_055_709_184 stored → ×2 → 10_111_418_368
+        //  160 plain fp8 layers     7_442_792_448 stored → ×2 → 14_885_584_896
+        //  174 dense bf16 rows                                     643_142_808  (byte-preserving)
+        //  256 weight_scale + 256 comfy_quant companions                     0  (consumed)
+        //                                                     = 25_640_146_072
+        //
+        // Mutation: drop the fpmm term (price those 96 layers at their stored fp8 bytes instead of
+        // the bf16 the decode materializes) and the total falls 5_055_709_184 short — this
+        // assertion reds, as does `receipt.resident_bytes() == plan.resident_bytes()`.
+        let group_source = |fpmm_wanted: bool| -> u64 {
+            fp8.iter()
+                .filter(|tensor| tensor.codec.full_precision_matrix_mult() == fpmm_wanted)
+                .map(|tensor| tensor.source_bytes)
+                .sum()
+        };
+        let (fpmm_source, plain_fp8_source) = (group_source(true), group_source(false));
+        let dense_source: u64 = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id != "fp8-e4m3-scalar-v1")
+            .map(|tensor| tensor.source_bytes)
+            .sum();
+        let companion_resident: u64 = plan
+            .companions
+            .iter()
+            .map(|companion| companion.resident_bytes)
+            .sum();
+        assert_eq!(
+            plan.resident_bytes(),
+            2 * fpmm_source + 2 * plain_fp8_source + dense_source + companion_resident,
+            "the fpmm layers are priced at the bf16 the dense fallback materializes, exactly like \
+             the plain fp8 ones — nothing about the flag removes the widening"
+        );
+        assert_eq!(
+            companion_resident, 0,
+            "scale companions are consumed, not retained"
+        );
+        // Per-layer, not just in aggregate: every fpmm layer's own residency is 2× its stored bytes.
+        assert!(
+            fp8.iter()
+                .filter(|tensor| tensor.codec.full_precision_matrix_mult())
+                .all(|tensor| tensor.residency.resident_bytes == 2 * tensor.source_bytes),
+            "each of the 96 fpmm layers doubles individually"
+        );
+        eprintln!(
+            "RESULT kreamania-scaled-fp8-residency fpmm_source={fpmm_source} \
+             plain_fp8_source={plain_fp8_source} dense_source={dense_source} total={}",
+            plan.resident_bytes()
+        );
+
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
+        assert!(
+            lazy.keys()
+                .all(|key| !key.ends_with(".comfy_quant") && !key.ends_with(".weight_scale")),
+            "companions are consumed, never remapped"
+        );
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-scaled-fp8 tensors={} fp8={} fpmm={fpmm} source_bytes={} \
+             resident_bytes={}",
+            plan.tensor_count(),
+            fp8.len(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
+    /// Real-weight check of the **NVFP4 fail-closed** path (sc-20385 review): the community
+    /// `kreamania_variant7` is a genuine ComfyUI NVFP4 checkpoint — 224 `U8` packed weights
+    /// `[6144, 3072]`, 224 `F8_E4M3` block scales `[6144, 384]`, 224 F32 `weight_scale_2`, with the
+    /// quantization declared in the **file header** (`__metadata__._quantization_metadata`, every
+    /// layer `{"format": "nvfp4"}`) rather than as `.comfy_quant` tensors. Both of those are out of
+    /// scope for this story, and the plan must refuse **by name** rather than silently plan the
+    /// `U8` payloads as dense weights or decode the `F8_E4M3` scales at unit scale.
+    ///
+    /// The refusal is the AC3 evidence for this artifact — an unsupported real checkpoint that
+    /// fails closed is as good as a supported one that renders. **sc-20641 owns flipping this from
+    /// a refusal to a supported codec**; when it lands, this test's expectation changes with it.
+    /// `KREA_NATIVE_DIT_NVFP4` points at the file.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_NVFP4 to the nvfp4 kreamania_variant7"]
+    fn kreamania_nvfp4_refuses_by_name_until_sc_20641() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_NVFP4") else {
+            panic!("set KREA_NATIVE_DIT_NVFP4 to the nvfp4 kreamania_variant7");
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+
+        // The fixture really is the NVFP4 shape, not merely some file that happens to refuse.
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        let scale_2 = headers
+            .iter()
+            .filter(|header| header.name.ends_with(".weight_scale_2"))
+            .count();
+        let block_scales = headers
+            .iter()
+            .filter(|header| {
+                header.name.ends_with(".weight_scale")
+                    && header.dtype == mlx_gen::gen_core::weightsmeta::Dtype::F8_E4M3
+            })
+            .count();
+        assert_eq!(scale_2, 224, "nvfp4 second-level scales");
+        assert_eq!(block_scales, 224, "E4M3 block scales");
+        assert!(
+            headers
+                .iter()
+                .all(|header| !header.name.ends_with(".comfy_quant")),
+            "this convention declares quantization in the file header, not in .comfy_quant tensors"
+        );
+
+        let error = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect_err("an nvfp4 checkpoint has no registered codec and must refuse");
+        let error = error.to_string();
+        // Names the exact tensor, the exact format, and the story that will support it.
+        assert!(
+            error.contains("weight_scale_2")
+                && error.contains("nvfp4")
+                && error.contains("sc-20641"),
+            "{error}"
+        );
+        assert!(
+            error.contains(".weight_scale_2\""),
+            "the refusal must name the offending tensor, not just the format: {error}"
+        );
+        eprintln!("RESULT kreamania-nvfp4 refused: {error}");
     }
 }

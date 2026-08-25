@@ -41,6 +41,7 @@
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
 mod control_provider;
+mod memory_strategy;
 mod pipeline;
 // The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
 // loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
@@ -97,9 +98,9 @@ pub mod preview;
 // IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
 pub mod denoise;
 pub use denoise::{
-    decode_image, denoise_curated, denoise_ip_control, denoise_ip_multi_control,
-    preprocess_control_image, seeded_prior, seeded_sigma_prior, text_time_ids, ControlContext,
-    Denoiser,
+    decode_image, decode_image_with_tiling, denoise_curated, denoise_ip_control,
+    denoise_ip_multi_control, preprocess_control_image, seeded_prior, seeded_sigma_prior,
+    text_time_ids, ControlContext, Denoiser,
 };
 
 // Long-prompt chunk-and-concatenate for the CLIP encoders (sc-20528) — the A1111/compel "long prompt
@@ -206,6 +207,11 @@ use pipeline::{Components, Pipeline, SdxlComponents};
 /// `mlx-gen-sdxl` — this crate registers a SINGLE descriptor under `"sdxl"`.
 pub const MODEL_ID: &str = "sdxl";
 
+pub use memory_strategy::{
+    provider_contract_for_spec, resolved_numeric_tier, SdxlArtifactSeal, SdxlSurface,
+    REQUEST_EVIDENCE_REVISION, SDXL_ROUTES,
+};
+
 /// SDXL works in latent space at /8: both dims must be multiples of 8. Exposed as the pinned-engine
 /// stride SceneWorks ties each advertised SDXL image bucket to (sc-12612), mirroring
 /// `wan::config::SIZE_MULTIPLE_14B`. `validate` enforces exactly this value, so the const cannot drift
@@ -297,6 +303,8 @@ pub struct SdxlGenerator {
     /// Real load-time affine fold for an imported fused checkpoint. Snapshot directories select
     /// their packed tier on disk and leave this unset.
     quant: Option<Quant>,
+    memory_contract: Option<gen_core::MemoryProviderContract>,
+    artifact_seal: Option<SdxlArtifactSeal>,
 }
 
 impl SdxlGenerator {
@@ -345,6 +353,47 @@ impl SdxlGenerator {
 impl Generator for SdxlGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_contract.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return gen_core::default_memory_strategy_safety_check(
+                &gen_core::MemoryProviderContract::compatibility_default(
+                    MODEL_ID,
+                    memory_strategy::backend(),
+                ),
+                context,
+            );
+        };
+        memory_strategy::safety_check(contract, context, self.artifact_seal.as_ref())
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(contract) = self.memory_contract.as_ref() else {
+            return Ok(None);
+        };
+        let seal = self.artifact_seal.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "sdxl: authoritative memory contract has no artifact seal".into(),
+            )
+        })?;
+        seal.ensure_unchanged()?;
+        memory_strategy::validate_context(contract, context, seal)?;
+        Ok(Some(Box::new(memory_strategy::request_scope(
+            self.device.clone(),
+            contract,
+            context,
+        )?)))
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -400,6 +449,11 @@ impl Generator for SdxlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
+        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
+        let _staged_guard = staged.then(|| StagedCacheGuard::new(&self.components));
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
         // request's latent dims; the heavy UNet/VAE come from the cache.
@@ -420,19 +474,86 @@ impl Generator for SdxlGenerator {
         // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
         // time, so the footprint stays under the denoise-time peak.
         let negative = req.negative_prompt.as_deref().unwrap_or("");
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let tokenizers = self.tokenizers()?;
         let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
+        if let Some(seal) = &self.artifact_seal {
+            seal.ensure_unchanged()?;
+        }
         let components = self.components(&pipe)?;
-        let images = pipe.render(
-            req,
-            &text_embeddings,
-            &components.unet,
-            &components.vae,
-            components.pid.as_deref(),
-            on_progress,
-        )?;
+        let images = with_request_attention_budget(req, || {
+            pipe.render(
+                req,
+                &text_embeddings,
+                &components.unet,
+                &components.vae,
+                components.pid.as_deref(),
+                on_progress,
+            )
+        })?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+struct StagedCacheGuard<'a> {
+    components: &'a Mutex<Option<(bool, Components)>>,
+}
+
+impl<'a> StagedCacheGuard<'a> {
+    fn new(components: &'a Mutex<Option<(bool, Components)>>) -> Self {
+        candle_gen::lock_recover(components).take();
+        Self { components }
+    }
+}
+
+impl Drop for StagedCacheGuard<'_> {
+    fn drop(&mut self) {
+        candle_gen::lock_recover(self.components).take();
+    }
+}
+
+thread_local! {
+    static REQUEST_ATTENTION_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(candle_gen::ATTN_SCORES_BUDGET) };
+}
+
+pub(crate) fn request_attention_budget() -> usize {
+    REQUEST_ATTENTION_BUDGET.get()
+}
+
+fn with_request_attention_budget<T>(request: &GenerationRequest, f: impl FnOnce() -> T) -> T {
+    with_attention_memory(request.memory, f)
+}
+
+pub(crate) fn with_attention_memory<T>(
+    memory: Option<gen_core::GenerationMemory>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let _guard = enter_attention_memory(memory);
+    f()
+}
+
+pub(crate) struct AttentionMemoryGuard(usize);
+
+impl Drop for AttentionMemoryGuard {
+    fn drop(&mut self) {
+        REQUEST_ATTENTION_BUDGET.set(self.0);
+    }
+}
+
+pub(crate) fn enter_attention_memory(
+    memory: Option<gen_core::GenerationMemory>,
+) -> AttentionMemoryGuard {
+    let previous = REQUEST_ATTENTION_BUDGET.get();
+    let selected = memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map(|budget| budget as usize)
+        .unwrap_or(candle_gen::ATTN_SCORES_BUDGET);
+    REQUEST_ATTENTION_BUDGET.set(selected);
+    AttentionMemoryGuard(previous)
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
@@ -546,6 +667,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // Validate the model-agnostic staged components before opening a potentially multi-gigabyte
     // fused checkpoint.
     let component_paths = SdxlComponents::from_spec(spec, MODEL_ID)?;
+    let authoritative_seal = if spec.resolved_route.is_some() {
+        Some(SdxlArtifactSeal::capture(spec)?)
+    } else {
+        None
+    };
     // A ControlNet changes the graph: route it through the vendored SDXL stack that carries the
     // add-embedding and residual-injection seams.  Do not let the historical txt2img pipeline
     // accept an overlay it would never read.
@@ -554,6 +680,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             spec,
             component_paths,
             candle_gen::default_device()?,
+            authoritative_seal,
         )?));
     }
     if !spec.extra_controls.is_empty() {
@@ -574,6 +701,11 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "{MODEL_ID}: imported fused checkpoints support Q4/Q8 affine tiers, not NVFP4"
         )));
     }
+    let (memory_contract, artifact_seal) = if let Some(seal) = authoritative_seal {
+        (Some(seal.contract().clone()), Some(seal))
+    } else {
+        (None, None)
+    };
     let (root, ldm, ldm_source_pin) = match &spec.weights {
         WeightsSource::Dir(p) => (p.clone(), None, None),
         WeightsSource::File(file) => {
@@ -614,6 +746,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ldm,
         _ldm_source_pin: ldm_source_pin,
         file_pin_spec: spec.clone(),
+        memory_contract,
+        artifact_seal,
     }))
 }
 
@@ -627,17 +761,91 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(REGISTRATION)
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
-            inherit_adapters: true,
+    let registry = registry.register_generator(REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: MODEL_ID,
+                    required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+                    inherit_adapters: true,
+                },
+                // **No `ImportedModelOperation::Edit` binding on Candle** (sc-20651 review, item 8).
+                //
+                // One was carried across from `main` when this epic replaced
+                // `register_imported_model` with the checkpoint adapter, on the reasoning that a
+                // capability `main` had added should not be silently dropped by the port. That
+                // reasoning was wrong about what `main` had added: the binding named
+                // `provider_id: MODEL_ID`, and `MODEL_ID`'s registered generator is
+                // [`SdxlGenerator`], whose descriptor advertises `conditioning: [Control]` on the
+                // registry route and `[]` on a plain load. `Capabilities::validate_request` rejects
+                // every conditioning kind a descriptor does not list, so an Edit import resolving
+                // through that binding got a generator that refuses `Conditioning::Reference` —
+                // i.e. the operation was **declared and unreachable**, which is worse than absent:
+                // SceneWorks stages components and routes a request that can only end in a refusal.
+                //
+                // It is not a wiring oversight; the fused route cannot reach the edit stack as
+                // either side is currently shaped. Naming the exact blockers, since "it's hard" is
+                // not evidence:
+                //
+                //  1. `registry.rs`'s builder requires a binding's `provider_id` to name a
+                //     **registered `Generator`**. `edit_provider::SdxlEdit` does not implement
+                //     `gen_core::Generator` at all — it has a bespoke `generate(&SdxlEditRequest,
+                //     &Image, ..)` / `generate_masked(.., &Image, &Image, ..)` surface that takes
+                //     the source image as a positional argument, not as request conditioning.
+                //  2. `SdxlEdit::load` takes `SdxlEditPaths { sdxl_base: PathBuf, .. }` and hands
+                //     it to `SdxlConditioner::load(root: &Path, ..)`, which reads the diffusers
+                //     `text_encoder/` + `text_encoder_2/` subtrees (`load_clip_tower_with_vb`, for
+                //     the bigG `text_projection` head) and to
+                //     `loaders::load_instantid_unet_with_adapters(root, ..)`, which reads `unet/`.
+                //     Both are directory-shaped. There is no `LdmComponents`-fed constructor for
+                //     either: `ldm::split_ldm_checkpoint` has exactly one caller, `load` below,
+                //     which threads its tensor maps into `pipeline::Pipeline` — a type `SdxlEdit`
+                //     does not use and cannot borrow a VAE **encoder** from (`Pipeline` builds only
+                //     `SdxlVaeDecoder` on the fused path; `VaeMomentsEncoder` has no fused caller).
+                //  3. `SdxlEditPaths.vae_fp16_fix` is required, but this route's
+                //     `LDM_REQUIRED_COMPONENTS` is `[tokenizer_clip_l, tokenizer_clip_bigg]` —
+                //     deliberately no VAE, because a fused checkpoint carries its own. Nothing on
+                //     the fused route can supply that field.
+                //  4. `memory_strategy::validate_bespoke_spec_common` (via
+                //     `SdxlEdit::load_admitted`) hard-requires
+                //     `matches!(spec.weights, WeightsSource::Dir(p) if p == base)` and refuses a
+                //     `WeightsSource::File` outright.
+                //
+                // Dropping the binding is structurally permitted: `SDXL_CHECKPOINT_ADAPTER`'s
+                // `eligible_backends` is `[Mlx, Candle]`, so the builder's per-operation
+                // completeness check (which fires only for a *sole* eligible backend) does not
+                // require Candle to implement every operation — the same way Candle Krea
+                // truthfully omits the MLX-only Pose route. MLX keeps its Edit binding, and its
+                // descriptor really does declare `Reference`/`Mask` and really does consume them.
+                //
+                // `SdxlEdit` itself is untouched and still reachable as the name-driven worker
+                // provider it has always been (a diffusers **snapshot dir** + a staged fp16-fix
+                // VAE). What is gone is only the claim that a *fused single-file import* can edit.
+                // Making that claim true is a feature, not a review fix: it needs
+                // `LdmComponents`-fed CLIP/UNet/VAE-encoder constructors plus an edit-capable
+                // registered generator id, mirroring `candle-gen-krea`'s `krea_2_edit`.
+            ],
+            ..gen_core::SDXL_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
+}
+
+/// Register SDXL's exhaustive weights-free q4/q8/bf16 contract and behavior surface.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::memory_registration())
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: memory_strategy::surface_specs,
+            provider_id: MODEL_ID,
+            contract: memory_strategy::weights_free_contract,
+        })
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle SDXL provider catalog.
@@ -673,6 +881,61 @@ mod explicit_registry_tests {
         assert_eq!(
             imported.required_components,
             pipeline::LDM_REQUIRED_COMPONENTS
+        );
+    }
+
+    /// sc-20651 review (8). **Every checkpoint-import operation this crate binds must resolve to a
+    /// descriptor that can actually accept the conditioning that operation is made of.**
+    ///
+    /// This is deliberately not `assert_eq!(operations, [Generate])` — that would only pin today's
+    /// list and would go green again the moment someone re-adds an `Edit` binding pointing at a
+    /// txt2img generator, which is exactly the defect. Instead it asks the question the registry
+    /// consumer asks: resolve the binding the way SceneWorks does
+    /// (`imported_model_descriptor(family, source, operation)`), then check the resolved descriptor
+    /// against `Capabilities::accepts` for the kind that operation *requires*. An `Edit` route whose
+    /// descriptor cannot take a `Reference` is a route that can only ever refuse.
+    ///
+    /// `Generate` requires no conditioning, so it is checked for resolvability only.
+    #[test]
+    fn every_bound_import_operation_resolves_to_a_descriptor_that_accepts_its_conditioning() {
+        use gen_core::{ConditioningKind, ImportedModelOperation};
+
+        let registry = super::provider_registry().unwrap();
+        // The operation → conditioning kind an import of that operation cannot work without.
+        let required_kind = |operation: ImportedModelOperation| match operation {
+            ImportedModelOperation::Generate => None,
+            _ => Some(ConditioningKind::Reference),
+        };
+
+        let mut checked = 0;
+        for operation in [
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Edit,
+        ] {
+            let Some(descriptor) = registry.imported_model_descriptor(
+                "sdxl",
+                gen_core::ImportedModelSource::FusedCheckpoint,
+                operation,
+            ) else {
+                // Not bound at all is fine and honest — the adapter's `eligible_backends` is
+                // `[Mlx, Candle]`, so Candle is not obliged to implement every operation.
+                continue;
+            };
+            checked += 1;
+            if let Some(kind) = required_kind(operation) {
+                assert!(
+                    descriptor.capabilities.accepts(kind),
+                    "fused-checkpoint {operation:?} binds provider '{}', whose descriptor does not \
+                     accept {kind:?} — the operation is declared but every request through it is \
+                     refused by the capability floor",
+                    descriptor.id
+                );
+            }
+        }
+        // A guard that resolved nothing asks no question.
+        assert!(
+            checked > 0,
+            "no fused-checkpoint route resolved; this crate must bind at least Generate"
         );
     }
 }

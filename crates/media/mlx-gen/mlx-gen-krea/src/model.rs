@@ -1803,7 +1803,43 @@ pub(crate) fn component_footprint_for(
         }
         WeightsSource::File(dit) => Ok(mlx_gen::PerComponentBytes {
             text_encoder,
-            dit: mlx_gen::safetensors_path_bytes(dit),
+            // Priced from the logical-weight plan (sc-20385): a dense bf16 file prices at its
+            // stored bytes as before, while int8/fp8/mxfp8 layers price at their dense bf16
+            // resident form — the file bytes alone would under-report a quantized import by 2×.
+            // `None` quant: like the Dir arm, the footprint reports the pre-load-time-quant dense
+            // form; the memory-strategy contract prices `spec.quantize` for admission.
+            //
+            // Two consequences of pricing from the plan instead of the file length, both
+            // deliberate (sc-20385 review):
+            //
+            // * **Header bytes are excluded.** `safetensors_path_bytes` — the Dir arm, and what
+            //   this arm used to do — counts the whole file, header included. The plan sums tensor
+            //   residency, so a ~100 KB safetensors header no longer lands in the DiT number.
+            //   Against a 12-26 GB DiT that is noise, and counting header bytes as resident weight
+            //   bytes was never right.
+            // * **A file the plan refuses cannot be priced, so this fails closed** — the same
+            //   refusal the load itself would raise, surfaced at admission instead of after the
+            //   caller has committed to loading.
+            //
+            // Cost: this compiles a plan (one header parse plus a bounded `.comfy_quant` payload
+            // scan; no tensor data is read). Measured at ~3 ms in a debug build on the real
+            // 430-tensor 26 GB `kreamania_variant4`. It is a per-load/admission call and never a
+            // per-listing one — every caller of the provider `footprint` seam supplies a resolved
+            // `LoadSpec`, and `ProviderRegistry::footprint` already wraps the call in
+            // `read_prepared_files_unchanged` — so it is left uncached rather than carrying a
+            // second cache alongside that pin.
+            // The base tier's architecture config declares the logical shapes an MXFP8 layer unpads
+            // to (sc-20644), so the footprint prices what the load will actually make resident; see
+            // `block_memory_strategy::base_architecture_config` for the no-config case.
+            dit: crate::block_memory_strategy::native_dit_transformer_bytes(
+                provider_id,
+                dit,
+                None,
+                crate::native_remap::DeclaredLogicalShapes::from_base(
+                    crate::block_memory_strategy::base_architecture_config(provider_id, base)?
+                        .as_ref(),
+                ),
+            )?,
             vae: mlx_gen::safetensors_path_bytes(base.join("vae")),
         }),
     }
@@ -1906,7 +1942,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
-        write_named_safetensors(path, "probe");
+        // A real native DiT key: since sc-20385 imported-file pricing and loading compile the
+        // logical-weight plan, so a foreign probe key would refuse where these fixtures expect a
+        // priceable file. Harmless for component fixtures (their keys are not planned).
+        write_named_safetensors(path, "model.diffusion_model.first.weight");
     }
 
     fn write_named_safetensors(path: &Path, tensor: &str) {
@@ -2901,6 +2940,114 @@ mod tests {
             adapters_have_diff_patch(&adapters),
             "has_diff_patch must be computed from the passed adapters, not hardcoded"
         );
+    }
+
+    /// Real-weight fixed-seed render of a community dense Krea 2 DiT through the native single-file
+    /// entrypoint (sc-20634) — on this revision that means the mapped logical-weight reader + dense
+    /// codec table. Prints the pixel sha256 (and saves a PNG-free raw RGB dump) so it can be
+    /// compared with the SceneWorks parity lane's `legacy_pixel_sha256.txt` rendered on the pinned
+    /// revision: same file, same base, same request ⇒ the two revisions must agree byte for byte.
+    /// `KREA_EXPECTED_PIXEL_SHA256`, when set, is asserted.
+    ///
+    /// ```text
+    /// KREA_NATIVE_DIT=$HOME/models/kreamania_variant5.safetensors \
+    /// KREA_TURBO_DIR=<hub>/models--SceneWorks--krea-2-turbo-mlx/snapshots/<rev>/bf16 \
+    /// KREA_EXPECTED_PIXEL_SHA256=<sha from the SceneWorks lane> \
+    /// cargo test -p mlx-gen-krea --lib variant5_native_file_render_fixed_seed_sha -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real weights + Metal: set KREA_NATIVE_DIT and KREA_TURBO_DIR"]
+    fn variant5_native_file_render_fixed_seed_sha() {
+        use sha2::{Digest, Sha256};
+
+        let env_or =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_owned());
+        let dit = std::path::PathBuf::from(
+            std::env::var("KREA_NATIVE_DIT").expect("set KREA_NATIVE_DIT"),
+        );
+        let base =
+            std::path::PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR"));
+        let steps: u32 = env_or("KREA_STEPS", "2").parse().expect("KREA_STEPS");
+        let width: u32 = env_or("KREA_W", "512").parse().expect("KREA_W");
+        let height: u32 = env_or("KREA_H", "512").parse().expect("KREA_H");
+        let seed: u64 = env_or("KREA_SEED", "42").parse().expect("KREA_SEED");
+        let prompt = env_or(
+            "KREA_PROMPT",
+            "a photorealistic portrait of a red fox sitting in a sunlit autumn forest, sharp focus, \
+             shallow depth of field",
+        );
+
+        // The whole-generator entry has no way to hand the receipt back, so this test observes the
+        // process-global slot. `reset → load → read` is not atomic, so hold the lock across all
+        // three (sc-20634 review); `every_process_global_receipt_observation_is_serialized` pins it.
+        let _receipt_guard = crate::loader::RECEIPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::loader::reset_native_file_receipt();
+        let generator = load_from_native_dit_file(&dit, &base, &[], descriptor())
+            .expect("native single-file load through the logical-weight reader");
+        let receipt = crate::loader::last_native_file_receipt()
+            .expect("the dense native load records its logical-weight receipt");
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Materialized,
+            "a resident load materializes through the reader"
+        );
+        assert!(receipt.tensor_count > 0);
+        // Measured residency equals the plan's prediction for whatever codec mix the file uses:
+        // a dense bf16 file leaves exactly its source bytes resident, an fp8 cast twice them.
+        // Same declared logical shapes the render's own load used, so the two plans are comparable.
+        let base_cfg = crate::config::Krea2Config::from_snapshot(&base)
+            .expect("the base snapshot carries the architecture config");
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&base_cfg),
+        )
+        .expect("the rendered file compiles a codec plan");
+        assert_eq!(
+            receipt.resident_bytes(),
+            plan.resident_bytes(),
+            "measured residency must equal the plan's packed-vs-dense pricing"
+        );
+        let request = GenerationRequest {
+            prompt,
+            width,
+            height,
+            count: 1,
+            seed: Some(seed),
+            steps: Some(steps),
+            guidance: None,
+            ..Default::default()
+        };
+        let output = generator
+            .generate(&request, &mut |_| {})
+            .expect("fixed-seed render");
+        let image = match output {
+            GenerationOutput::Images(mut images) => images.pop().expect("one image"),
+            other => panic!("expected Images, got {other:?}"),
+        };
+        assert_eq!((image.width, image.height), (width, height));
+        let sha = format!("{:x}", Sha256::digest(&image.pixels));
+        eprintln!(
+            "RESULT provider=krea_2_turbo source=native-file geometry={width}x{height} steps={steps} \
+             seed={seed} pixel_sha256={sha} receipt_tensors={} receipt_source_bytes={} \
+             receipt_resident_bytes={} codecs={:?}",
+            receipt.tensor_count,
+            receipt.source_bytes,
+            receipt.resident_bytes(),
+            receipt
+                .residency
+                .iter()
+                .map(|report| (report.codec_id, report.tensor_count))
+                .collect::<Vec<_>>()
+        );
+        if let Ok(expected) = std::env::var("KREA_EXPECTED_PIXEL_SHA256") {
+            assert_eq!(
+                sha,
+                expected.trim(),
+                "render differs from the pixel sha rendered on the pinned revision"
+            );
+        }
     }
 
     #[test]

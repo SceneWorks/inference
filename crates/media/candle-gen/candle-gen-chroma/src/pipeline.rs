@@ -21,6 +21,7 @@
 //! outputs are promoted at the existing F32 activation boundaries. Components are cached by the
 //! generator across `generate` calls.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,103 @@ pub(crate) struct Components {
     pid: Option<Arc<PidEngine>>,
 }
 
+struct TextComponents {
+    tokenizer: Tokenizer,
+    t5: Mutex<T5EncoderModel>,
+    cfg: ChromaTransformerConfig,
+}
+
+struct DenoiseComponents {
+    transformer: ChromaTransformer,
+}
+
+enum DecoderComponents {
+    Native(Box<Vae>),
+    Pid(Box<PidEngine>),
+}
+
+trait PhaseSynchronizer {
+    fn synchronize(&self) -> Result<()>;
+}
+
+impl PhaseSynchronizer for Device {
+    fn synchronize(&self) -> Result<()> {
+        Ok(Device::synchronize(self)?)
+    }
+}
+
+/// Own one staged phase's loaded model until queued backend work has synchronized. The guard is
+/// intentionally responsible for the component's drop: ordinary returns, `?` errors, cancellation,
+/// and panic unwinding all run this ordering. If synchronization itself fails, leaking the component
+/// is safer than releasing storage which may still be referenced by queued device work.
+struct SynchronizedPhase<T, S: PhaseSynchronizer = Device> {
+    component: Option<T>,
+    synchronizer: S,
+    phase: &'static str,
+}
+
+impl<T, S: PhaseSynchronizer> SynchronizedPhase<T, S> {
+    fn new(component: T, synchronizer: S, phase: &'static str) -> Self {
+        Self {
+            component: Some(component),
+            synchronizer,
+            phase,
+        }
+    }
+
+    fn synchronize_before_release(&mut self) -> Result<()> {
+        let Some(component) = self.component.take() else {
+            return Ok(());
+        };
+        match self.synchronizer.synchronize() {
+            Ok(()) => {
+                drop(component);
+                Ok(())
+            }
+            Err(error) => {
+                std::mem::forget(component);
+                Err(CandleError::Msg(format!(
+                    "chroma: synchronize before releasing {}: {error}",
+                    self.phase
+                )))
+            }
+        }
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.synchronize_before_release()
+    }
+}
+
+impl<T, S: PhaseSynchronizer> Deref for SynchronizedPhase<T, S> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.component
+            .as_ref()
+            .expect("a released staged phase is consumed")
+    }
+}
+
+impl<T, S: PhaseSynchronizer> Drop for SynchronizedPhase<T, S> {
+    fn drop(&mut self) {
+        let _ = self.synchronize_before_release();
+    }
+}
+
+/// Last-resort synchronization for every staged exit, including unwinding. Phase boundaries also
+/// synchronize explicitly before their component is dropped; this guard covers early errors and
+/// panics between those boundaries.
+struct StagedCleanup {
+    device: Device,
+}
+
+impl Drop for StagedCleanup {
+    fn drop(&mut self) {
+        let _ = self.device.synchronize();
+    }
+}
+
 impl Pipeline {
     pub(crate) fn load(
         variant: ChromaVariant,
@@ -104,9 +202,30 @@ impl Pipeline {
     /// `group_size` is read from the transformer `config.json` (default 64 when absent — never a silent
     /// dense read of the u32 codes).
     pub(crate) fn load_components(&self) -> Result<Components> {
+        let text = self.load_text_components()?;
+        let denoise = self.load_denoise_components()?;
+        let vae = self.load_native_decoder()?;
+        let pid = self.load_pid_decoder()?.map(Arc::new);
+        Ok(Components {
+            tokenizer: Arc::new(text.tokenizer),
+            t5: Arc::new(text.t5),
+            transformer: Arc::new(denoise.transformer),
+            vae: Arc::new(vae),
+            cfg: text.cfg,
+            pid,
+        })
+    }
+
+    fn load_text_components(&self) -> Result<TextComponents> {
+        Ok(TextComponents {
+            tokenizer: text::load_tokenizer()?,
+            t5: Mutex::new(text::load_t5(&self.root, &self.device)?),
+            cfg: ChromaTransformerConfig::default(),
+        })
+    }
+
+    fn load_denoise_components(&self) -> Result<DenoiseComponents> {
         let cfg = ChromaTransformerConfig::default();
-        let tokenizer = text::load_tokenizer()?;
-        let t5 = text::load_t5(&self.root, &self.device)?;
         let dit_dir = self.root.join("transformer");
         let gs = self.transformer_group_size(&dit_dir);
         let mut transformer = ChromaTransformer::new_gs(cfg, self.vb(&dit_dir, DType::F32)?, gs)?;
@@ -116,26 +235,19 @@ impl Pipeline {
             &self.device,
             |visitor| transformer.visit_adaptable_mut(visitor),
         )?;
+        Ok(DenoiseComponents { transformer })
+    }
+
+    fn load_native_decoder(&self) -> Result<Vae> {
         let vae_dtype = crate::native_component_dtype(crate::NativeComponent::Vae);
-        let vae = Vae::new(self.vb(&self.root.join("vae"), vae_dtype)?)?;
-        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
-        // in via `LoadSpec::pid`; Chroma is a FLUX.1-lineage latent space (`flux` student).
-        let pid = match self.pid_spec.as_ref() {
-            Some(spec) => Some(Arc::new(PidEngine::from_spec(
-                spec,
-                PID_BACKBONE,
-                &self.device,
-            )?)),
-            None => None,
-        };
-        Ok(Components {
-            tokenizer: Arc::new(tokenizer),
-            t5: Arc::new(Mutex::new(t5)),
-            transformer: Arc::new(transformer),
-            vae: Arc::new(vae),
-            cfg,
-            pid,
-        })
+        Ok(Vae::new(self.vb(&self.root.join("vae"), vae_dtype)?)?)
+    }
+
+    fn load_pid_decoder(&self) -> Result<Option<PidEngine>> {
+        self.pid_spec
+            .as_ref()
+            .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, &self.device))
+            .transpose()
     }
 
     /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
@@ -249,10 +361,142 @@ impl Pipeline {
         })
     }
 
+    /// Request-authoritative staged execution: T5 is released before the DiT is opened, the DiT is
+    /// released before the selected decoder is opened, and only the native VAE *or* PiD is loaded.
+    /// The denoise schedule, seeds, CFG branches and decode helpers are the same ones used above.
+    pub(crate) fn render_staged(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        let _cleanup = StagedCleanup {
+            device: self.device.clone(),
+        };
+        candle_gen::check_cancel(&req.cancel)?;
+        let steps = req
+            .steps
+            .map(|steps| steps as usize)
+            .unwrap_or(self.variant.default_steps() as usize);
+        let guidance = req
+            .true_cfg
+            .unwrap_or_else(|| self.variant.default_true_cfg());
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let sigmas = self.sigmas(steps);
+
+        check_calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
+        let text = SynchronizedPhase::new(
+            self.load_text_components()?,
+            self.device.clone(),
+            "conditioning components",
+        );
+        let pos_embeds = self.encode_parts(&text.tokenizer, &text.t5, &req.prompt)?;
+        let neg = if guidance > 1.0 {
+            Some(self.encode_parts(&text.tokenizer, &text.t5, negative)?)
+        } else {
+            None
+        };
+        let h2 = (req.height as usize).div_ceil(16);
+        let w2 = (req.width as usize).div_ceil(16);
+        let rope_pos = rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
+        let rope_neg = neg
+            .as_ref()
+            .map(|value| rope::build_for(&text.cfg, value.dim(1)?, h2, w2, &self.device))
+            .transpose()?;
+        text.release()?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        check_calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
+        let denoise = SynchronizedPhase::new(
+            self.load_denoise_components()?,
+            self.device.clone(),
+            "denoise components",
+        );
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            candle_gen::check_cancel(&req.cancel)?;
+            let seed = base_seed.wrapping_add(u64::from(index));
+            let noise = self.initial_packed_noise(seed, req.height, req.width)?;
+            let preview = crate::preview::hook(&req.preview, req.width, req.height);
+            latents.push(self.denoise(
+                &denoise.transformer,
+                noise,
+                &pos_embeds,
+                &rope_pos,
+                neg.as_ref(),
+                rope_neg.as_ref(),
+                &sigmas,
+                steps,
+                guidance,
+                req.sampler.as_deref(),
+                req.scheduler.as_deref(),
+                seed,
+                &preview,
+                &req.cancel,
+                on_progress,
+            )?);
+        }
+        denoise.release()?;
+
+        candle_gen::check_cancel(&req.cancel)?;
+        check_calibration_fault(req, gen_core::MemoryPhase::Decode)?;
+        let decoder = SynchronizedPhase::new(
+            if req.use_pid {
+                DecoderComponents::Pid(Box::new(self.load_pid_decoder()?.ok_or_else(|| {
+                    CandleError::Msg(format!(
+                        "{}: PiD was requested but no exact PiD load receipt is present",
+                        self.variant.id()
+                    ))
+                })?))
+            } else {
+                DecoderComponents::Native(Box::new(self.load_native_decoder()?))
+            },
+            self.device.clone(),
+            "decode components",
+        );
+        let pid_decoder = match &*decoder {
+            DecoderComponents::Pid(pid) => Some(
+                candle_gen_pid::resolve_pid_decoder(Some(pid), req, base_seed, self.variant.id())?
+                    .ok_or_else(|| {
+                        CandleError::Msg(format!(
+                            "{}: PiD decoder resolution returned none",
+                            self.variant.id()
+                        ))
+                    })?,
+            ),
+            DecoderComponents::Native(_) => None,
+        };
+        let mut images = Vec::with_capacity(latents.len());
+        for latent in &latents {
+            candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Decoding);
+            images.push(match &*decoder {
+                DecoderComponents::Native(vae) => {
+                    self.decode(vae, None, latent, req.height, req.width)?
+                }
+                DecoderComponents::Pid(_) => {
+                    self.decode_tensor(None, pid_decoder.as_ref(), latent, req.height, req.width)?
+                }
+            });
+        }
+        drop(pid_decoder);
+        decoder.release()?;
+        Ok(images)
+    }
+
     /// Encode a prompt to its T5 sequence embedding `[1, L, 4096]` (natural length).
     fn encode(&self, components: &Components, prompt: &str) -> Result<Tensor> {
-        let mut t5 = candle_gen::lock_recover(&components.t5);
-        text::encode_prompt(&components.tokenizer, &mut t5, prompt, &self.device)
+        self.encode_parts(&components.tokenizer, &components.t5, prompt)
+    }
+
+    fn encode_parts(
+        &self,
+        tokenizer: &Tokenizer,
+        t5: &Mutex<T5EncoderModel>,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        let mut t5 = candle_gen::lock_recover(t5);
+        text::encode_prompt(tokenizer, &mut t5, prompt, &self.device)
     }
 
     /// Chroma's flow-match sigma schedule (length `steps + 1`, descending to a trailing `0`). HD/Flash
@@ -367,6 +611,17 @@ impl Pipeline {
         height: u32,
         width: u32,
     ) -> Result<Image> {
+        self.decode_tensor(Some(vae), pid, latents, height, width)
+    }
+
+    fn decode_tensor(
+        &self,
+        vae: Option<&Vae>,
+        pid: Option<&PidDecoder>,
+        latents: &Tensor,
+        height: u32,
+        width: u32,
+    ) -> Result<Image> {
         let latents = unpack(latents, height as usize, width as usize)?;
         let decoded = match pid {
             Some(pid) => {
@@ -376,7 +631,10 @@ impl Pipeline {
                 )?;
                 pid.decode(&latents)?
             }
-            None => vae.decode(&latents)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+            None => vae
+                .ok_or_else(|| CandleError::Msg("chroma: native decode lacks VAE".into()))?
+                .decode(&latents)?
+                .to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
         };
         let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
         let img = candle_gen::round_rgb8(&scaled)?;
@@ -394,6 +652,18 @@ impl Pipeline {
     }
 }
 
+fn check_calibration_fault(req: &GenerationRequest, phase: gen_core::MemoryPhase) -> Result<()> {
+    if req.memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    }) {
+        Err(CandleError::Msg(format!(
+            "chroma: authorized calibration fault at {phase:?}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// 2×2 pack `[1, 16, h, w] → [1, h/2·w/2, 64]` — candle FLUX's `State::new` image packing (so the
 /// row-major `img_ids` in [`crate::rope`] line up with the packed token order).
 fn pack(x: &Tensor) -> Result<Tensor> {
@@ -408,6 +678,141 @@ fn pack(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct RecordingSynchronizer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    impl PhaseSynchronizer for RecordingSynchronizer {
+        fn synchronize(&self) -> Result<()> {
+            candle_gen::lock_recover(&self.events).push("synchronize");
+            if self.fail {
+                Err(CandleError::Msg("expected synchronize failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct RecordingComponent(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for RecordingComponent {
+        fn drop(&mut self) {
+            candle_gen::lock_recover(&self.0).push("release");
+        }
+    }
+
+    fn early_staged_exit(
+        events: Arc<Mutex<Vec<&'static str>>>,
+        message: &'static str,
+    ) -> Result<()> {
+        let _phase = SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events,
+                fail: false,
+            },
+            "fixture",
+        );
+        Err(CandleError::Msg(message.into()))
+    }
+
+    #[test]
+    fn staged_component_release_synchronizes_on_normal_error_cancel_and_panic() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events: events.clone(),
+                fail: false,
+            },
+            "normal",
+        )
+        .release()
+        .unwrap();
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            ["synchronize", "release"]
+        );
+
+        for message in ["expected error", "expected cancellation"] {
+            candle_gen::lock_recover(&events).clear();
+            assert!(early_staged_exit(events.clone(), message).is_err());
+            assert_eq!(
+                *candle_gen::lock_recover(&events),
+                ["synchronize", "release"],
+                "{message}"
+            );
+        }
+
+        candle_gen::lock_recover(&events).clear();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let events = events.clone();
+            move || {
+                let _phase = SynchronizedPhase::new(
+                    RecordingComponent(events.clone()),
+                    RecordingSynchronizer {
+                        events,
+                        fail: false,
+                    },
+                    "panic",
+                );
+                panic!("expected panic");
+            }
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            ["synchronize", "release"]
+        );
+
+        candle_gen::lock_recover(&events).clear();
+        let result = SynchronizedPhase::new(
+            RecordingComponent(events.clone()),
+            RecordingSynchronizer {
+                events: events.clone(),
+                fail: true,
+            },
+            "failed synchronization",
+        )
+        .release();
+        assert!(result.is_err());
+        assert_eq!(
+            *candle_gen::lock_recover(&events),
+            ["synchronize"],
+            "a failed synchronization must leak rather than release active storage"
+        );
+    }
+
+    #[test]
+    fn calibration_faults_are_authorized_and_phase_exact() {
+        let plain = GenerationRequest::default();
+        for phase in [
+            gen_core::MemoryPhase::Conditioning,
+            gen_core::MemoryPhase::Denoise,
+            gen_core::MemoryPhase::Decode,
+        ] {
+            assert!(check_calibration_fault(&plain, phase).is_ok());
+            let mut memory = gen_core::GenerationMemory {
+                calibration_error_phase: Some(phase),
+                ..Default::default()
+            };
+            let unauthorized = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            assert!(check_calibration_fault(&unauthorized, phase).is_ok());
+
+            memory.authorize_calibration_fault(phase);
+            let authorized = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            assert!(check_calibration_fault(&authorized, phase).is_err());
+        }
+    }
 
     /// `transformer_group_size` reads the packed `transformer/config.json`'s `quantization.group_size`
     /// (the sc-9409 packed tier), defaults to the shared 64 for a `bits`-only or a dense config, and

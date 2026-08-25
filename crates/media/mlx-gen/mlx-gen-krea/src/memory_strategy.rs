@@ -417,8 +417,17 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     )?;
     let decoder_bytes =
         stored(&base_snapshot_dir.join("vae"), "base VAE")?.saturating_add(alternate_decoder_bytes);
+    // Same declared logical shapes the load will use (sc-20644) — see
+    // `block_memory_strategy::base_architecture_config`.
+    let base_cfg =
+        crate::block_memory_strategy::base_architecture_config(provider_id, base_snapshot_dir)?;
     let transformer_bytes = spec.read_file_unchanged_if_prepared(dit_file, |p| {
-        crate::block_memory_strategy::native_dit_transformer_bytes(provider_id, p, spec.quantize)
+        crate::block_memory_strategy::native_dit_transformer_bytes(
+            provider_id,
+            p,
+            spec.quantize,
+            crate::native_remap::DeclaredLogicalShapes::from_base(base_cfg.as_ref()),
+        )
     })?;
     let branch_bits =
         crate::memory::control_branch_quant_bits(spec.quantize.map(mlx_gen::Quant::bits));
@@ -770,6 +779,21 @@ mod tests {
         Precision, Quant, WeightsSource,
     };
 
+    /// A native-keyed imported DiT fixture (one dense bf16 tensor, 256 payload bytes) -- the plan
+    /// compiler (sc-20385) refuses foreign keys, so the imported-file fixtures must carry a real
+    /// Krea native key.
+    fn write_native_dit(path: &std::path::Path) {
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
+            .to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 256]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn write_control(path: &std::path::Path) {
         let mut header =
             br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
@@ -807,7 +831,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported-dit.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
 
@@ -914,7 +938,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported-dit.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
         let spec = LoadSpec::new(WeightsSource::File(dit))
@@ -1125,7 +1149,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         let spec = LoadSpec::new(WeightsSource::File(dit))
             .with_component(
@@ -1164,7 +1188,7 @@ mod tests {
         let root = root_tmp.path().to_path_buf();
         write_snapshot(&root);
         let dit = root.join("imported.safetensors");
-        write_control(&dit);
+        write_native_dit(&dit);
         let overlay = root.join("control.safetensors");
         write_control(&overlay);
         let valid = LoadSpec::new(WeightsSource::File(dit))

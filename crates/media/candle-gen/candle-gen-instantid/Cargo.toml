@@ -38,6 +38,8 @@ rand = "0.9"
 [dev-dependencies]
 # Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# RAII fixture roots for the synthetic weights trees the memory-contract tests price.
+tempfile = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate AND the composed provider crates so a downstream

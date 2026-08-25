@@ -578,7 +578,9 @@ fn nvfp4_fused_unavailable_forces_w4a16() {
     // Honest accounting through the fallback (the sc-11045 MAJOR-3 shape): this layer holds a dense
     // bf16 weight now, and must say so rather than reporting its packed host container's size.
     assert_eq!(
-        gated.resident_weight_bytes(),
+        gated
+            .resident_weight_bytes()
+            .expect("a DequantBf16 layer must be able to report its resident bytes"),
         gated.bf16_footprint_bytes(),
         "a W4A16 fallback holds dense bf16 resident — it must not report the packed NVFP4 footprint"
     );

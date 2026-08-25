@@ -19,6 +19,7 @@ mlx-gen-wan = { path = "../mlx-gen-wan" }
 mlx-rs = { workspace = true }
 # config.json / AR-sidecar reading.
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

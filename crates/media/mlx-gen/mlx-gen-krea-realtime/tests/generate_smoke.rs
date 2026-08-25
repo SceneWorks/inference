@@ -441,11 +441,32 @@ fn decode_tiling_never_starves_the_temporal_receptive_field() {
 /// patch×stride alignment — fails here in CI instead of after a 20 GB load.
 #[test]
 fn smoke_request_is_within_the_advertised_surface() {
-    // A per-process empty dir, not the shared `$TMPDIR` itself: the provider only needs the root to
-    // exist, and this keeps whatever another concurrent `cargo test` process left in `$TMPDIR` out
-    // of this weights root.
+    fn tiny_safetensors(path: &Path, fill: u8) {
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "weight": {"dtype": "U8", "shape": [8], "data_offsets": [0, 8]}
+        }))
+        .unwrap();
+        let padding = (8 - header.len() % 8) % 8;
+        header.extend(std::iter::repeat_n(b' ', padding));
+        let mut bytes = Vec::with_capacity(8 + header.len() + 8);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend(std::iter::repeat_n(fill, 8));
+        std::fs::write(path, bytes).unwrap();
+    }
+    // The provider now seals the complete physical receipt before construction, so this
+    // weights-free validation uses a structurally valid tiny q4 inventory rather than an empty dir.
     let dir_tmp = tempfile::tempdir().unwrap();
     let dir = dir_tmp.path().to_path_buf();
+    std::fs::write(
+        dir.join("config.json"),
+        br#"{"quantization":{"bits":4,"group_size":64}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+    tiny_safetensors(&dir.join("dit.safetensors"), 1);
+    tiny_safetensors(&dir.join("t5_encoder.safetensors"), 2);
+    tiny_safetensors(&dir.join("vae.safetensors"), 3);
     let spec = LoadSpec::new(WeightsSource::Dir(dir));
     let gen = mlx_gen_krea_realtime::provider_registry()
         .unwrap()

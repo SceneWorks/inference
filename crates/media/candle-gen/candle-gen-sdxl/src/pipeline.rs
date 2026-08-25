@@ -285,15 +285,6 @@ const SDXL_VAE_TILING: VaeTiling = VaeTiling {
     full_res_channels: 128,
 };
 
-/// The SDXL VAE tiling policy (sc-4987) — diffusers' `enable_vae_tiling` defaults: **512² output
-/// tiles (64² latent) with 128 px overlap (16 latent, the 0.25 overlap-factor)**. `needs_tiling` then
-/// fires only when an output axis exceeds 512 px, so 512² renders stay monolithic (latent 64 is not
-/// `> 64`) and 1024² tiles into a 3×3 grid stepping 48 latent — bounding the decode peak to one 512²
-/// tile while the 16-latent overlap + trapezoidal blend keeps seams invisible.
-pub(crate) fn sdxl_tiling_config() -> TilingConfig {
-    TilingConfig::spatial_only(512, 128)
-}
-
 /// Native SDXL VAE adapter for the backend-generic latent-decoder seam. The seam always receives the
 /// normalized sampler latent; this wrapper owns SDXL's `1 / VAE_SCALE` de-normalization and the
 /// established optional tiled decode, so InstantID and the registered SDXL lanes no longer branch
@@ -1124,6 +1115,7 @@ impl Pipeline {
                     .map(|decoder| decoder as &dyn LatentDecoder),
                 &latents,
                 &req.cancel,
+                crate::denoise::decode_tiling(req.memory),
             )
         })
     }
@@ -1289,13 +1281,14 @@ impl Pipeline {
         pid: Option<&dyn LatentDecoder>,
         latents: &Tensor,
         cancel: &CancelFlag,
+        tiling: Option<TilingConfig>,
     ) -> Result<Image> {
         let native = if self.ldm.is_some() {
             SdxlLatentDecoder::with_decode_dtype(vae, DType::F32)
         } else {
             SdxlLatentDecoder::new(vae)
         };
-        self.decode_with_tiling_gate(&native, pid, latents, cancel, crate::vae_tiling_enabled())
+        self.decode_with_tiling_gate(&native, pid, latents, cancel, tiling)
     }
 
     /// Production SDXL decoder dispatch after the process-global tiling gate is sampled. Kept
@@ -1307,7 +1300,7 @@ impl Pipeline {
         pid: Option<&dyn LatentDecoder>,
         latents: &Tensor,
         cancel: &CancelFlag,
-        tiling_enabled: bool,
+        tiling: Option<TilingConfig>,
     ) -> Result<Image> {
         let decoder = pid.unwrap_or(native);
         if cancel.is_cancelled() {
@@ -1317,10 +1310,9 @@ impl Pipeline {
             Some(&candle_gen::gen_core::SDXL_LATENT_SPACE),
             decoder,
         )?;
-        let img = if tiling_enabled {
-            decoder.decode_tiled(latents, &sdxl_tiling_config(), Some(cancel))?
-        } else {
-            decoder.decode(latents)?
+        let img = match &tiling {
+            Some(tiling) => decoder.decode_tiled(latents, tiling, Some(cancel))?,
+            None => decoder.decode(latents)?,
         };
         self.to_image(&img)
     }
@@ -1586,12 +1578,14 @@ mod tests {
         let expected = legacy_sdxl_image(&vae, &latents);
         let pipeline = decode_test_pipeline(&device);
         let cancel = CancelFlag::default();
-        let got = pipeline.decode(&vae, None, &latents, &cancel).unwrap();
+        let got = pipeline
+            .decode(&vae, None, &latents, &cancel, None)
+            .unwrap();
         assert_eq!(got, expected);
 
         let pid = SdxlDecodeSpy::same(Tensor::ones((1, 3, 4, 7), DType::F32, &device).unwrap());
         let got = pipeline
-            .decode(&vae, Some(&pid), &latents, &cancel)
+            .decode(&vae, Some(&pid), &latents, &cancel, None)
             .unwrap();
         assert_eq!((got.width, got.height), (7, 4));
         assert!(got.pixels.iter().all(|pixel| *pixel == 255));
@@ -1602,14 +1596,20 @@ mod tests {
             Tensor::ones((1, 3, 2, 3), DType::F32, &device).unwrap(),
         );
         let monolithic = pipeline
-            .decode_with_tiling_gate(&native, None, &latents, &cancel, false)
+            .decode_with_tiling_gate(&native, None, &latents, &cancel, None)
             .unwrap();
         assert!(monolithic.pixels.iter().all(|pixel| *pixel == 0));
         assert_eq!(native.decode_calls.get(), 1);
         assert_eq!(native.tiled_calls.get(), 0);
 
         let tiled = pipeline
-            .decode_with_tiling_gate(&native, None, &latents, &cancel, true)
+            .decode_with_tiling_gate(
+                &native,
+                None,
+                &latents,
+                &cancel,
+                Some(crate::memory_strategy::decode_tiling_config(None)),
+            )
             .unwrap();
         assert!(tiled.pixels.iter().all(|pixel| *pixel == 255));
         assert_eq!(native.decode_calls.get(), 1);
@@ -1894,7 +1894,7 @@ mod tests {
     /// decode — the guarantee that 512² output is unchanged by sc-4987.
     #[test]
     fn no_tiling_below_threshold() {
-        let cfg = sdxl_tiling_config();
+        let cfg = crate::memory_strategy::decode_tiling_config(None);
         // 64² latent = 512² output: not > the 64-latent tile, so tiling must NOT fire.
         assert!(!cfg.needs_tiling(SDXL_VAE_TILING, 1, 64, 64));
         // 128² latent = 1024² output: must fire.
@@ -1911,7 +1911,7 @@ mod tests {
     /// latents. A real-VAE decode-parity check runs on the GPU conformance lane (no CPU VAE fixture).
     #[test]
     fn tiled_decode_gate_is_shared_and_size_driven() {
-        let cfg = sdxl_tiling_config();
+        let cfg = crate::memory_strategy::decode_tiling_config(None);
         // The decision both trait-seam callers make is `enabled && needs_tiling`.
         // With the flag off, no latent tiles (registered + bespoke both decode monolithically).
         let gate =
