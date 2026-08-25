@@ -528,6 +528,34 @@ fn guard_stored(
     Ok(())
 }
 
+/// The matrix codecs (`mxfp8-v1`, `nvfp4-v1`, `int8-per-row-v1`) decode a **rank-2** `[out, in]`
+/// logical grid: their arms below index `tensor.shape[0]` / `tensor.shape[1]` directly and hand the
+/// pair to `gen_core`'s `[rows, cols]` reference decoders (`decode_mxfp8`, `decode_nvfp4`,
+/// `decode_int8_per_row`).
+///
+/// `gen_core::compile_logical_weight_plan_with_metadata` already refuses any descriptor-bearing
+/// layer whose stored header is not rank 2, and the MXFP8/NVFP4 geometry validators refuse a
+/// declared logical shape that is not rank 2 either — so a plan that came from the compiler cannot
+/// reach these arms at another rank. This is the **local** restatement of that contract at the site
+/// that depends on it: [`read_logical_weights`] is a public entry taking a caller-supplied
+/// [`LogicalWeightPlan`] whose fields are public, so without this guard a plan that did not come
+/// from the compiler panics on an out-of-bounds index instead of refusing by name.
+fn require_matrix_rank(tensor: &LogicalTensorPlan) -> Result<()> {
+    const MATRIX_RANK: usize = 2;
+    if tensor.shape.len() != MATRIX_RANK {
+        return Err(CandleError::Msg(format!(
+            "codec {}: tensor {:?} decodes as an [out, in] matrix — expected rank {MATRIX_RANK}, \
+             observed rank {} (planned logical shape {:?}); this plan did not come from the \
+             checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
+            tensor.codec_id,
+            tensor.physical_key,
+            tensor.shape.len(),
+            tensor.shape,
+        )));
+    }
+    Ok(())
+}
+
 fn upload_bf16(values: Vec<f32>, shape: &[usize], device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
         .to_dtype(DType::BF16)?
@@ -549,6 +577,19 @@ fn decode(
     // is gen-core's, so both engines refuse the same checkpoint with the same diagnosis.
     if let Some(refusal) = tensor.undeclared_padded_storage_refusal() {
         return Err(CandleError::Msg(refusal));
+    }
+
+    // Rank floor for the arms that index the logical shape positionally — see
+    // [`require_matrix_rank`]. Checked before `guard_stored` so a wrong-rank plan is diagnosed as
+    // the rank defect it is rather than as a stored-shape drift.
+    match &tensor.codec {
+        TensorCodecSpec::Mxfp8 { .. }
+        | TensorCodecSpec::Nvfp4 { .. }
+        | TensorCodecSpec::Int8PerRow { .. } => require_matrix_rank(tensor)?,
+        // The dense rows and the scalar-fp8 cast are rank-agnostic: they carry the logical shape
+        // through whole (ComfyUI casts biases and modulation vectors to fp8 too), so no floor
+        // applies and imposing one here would refuse real checkpoints.
+        TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => {}
     }
 
     let view = st.get(&tensor.physical_key)?;
@@ -1416,6 +1457,147 @@ mod tests {
             .map(|report| report.source_bytes)
             .sum();
         assert_eq!(total, plan.source_bytes);
+    }
+
+    /// sc-20651 feature-end review (minor): the three **matrix** decode arms (MXFP8, NVFP4, int8
+    /// per-row) index `tensor.shape[0]` / `[1]` positionally and hand the pair to `gen_core`'s
+    /// `[rows, cols]` reference decoders. The plan compiler enforces rank 2 for every
+    /// descriptor-bearing layer, so a compiler-built plan cannot reach them at another rank — but
+    /// [`read_logical_weights`] is a public entry over a [`LogicalWeightPlan`] whose fields are
+    /// public, and a plan built or edited outside the compiler used to **panic** on the index
+    /// rather than refuse by name.
+    ///
+    /// Each arm is driven with a rank-1 and a rank-3 logical shape over a real, otherwise-valid
+    /// file — the unmutated plan is read first, so a refusal below is the rank guard and nothing
+    /// else.
+    #[test]
+    fn a_wrong_rank_matrix_plan_refuses_by_name_instead_of_panicking() {
+        let dir = fixture_dir();
+
+        // int8 per-row: a [2, 3] I8 layer with two row scales.
+        let int8_path = dir.path().join("rank-int8.safetensors");
+        let int8_descriptor = br#"{"format": "int8_tensorwise", "per_row": true}"#;
+        write_safetensors(
+            &int8_path,
+            &[
+                (
+                    "model.o.weight",
+                    "I8",
+                    &[2, 3],
+                    vec![1, 0xFE, 3, 0xFC, 5, 0xFA],
+                ),
+                (
+                    "model.o.weight_scale",
+                    "F32",
+                    &[2, 1],
+                    [0.5_f32, 2.0]
+                        .iter()
+                        .flat_map(|scale| scale.to_le_bytes())
+                        .collect(),
+                ),
+                (
+                    "model.o.comfy_quant",
+                    "U8",
+                    &[int8_descriptor.len()],
+                    int8_descriptor.to_vec(),
+                ),
+            ],
+        );
+        let int8_plan = plan_dense(&int8_path);
+        assert_eq!(int8_plan.codec_ids(), ["int8-per-row-v1"]);
+
+        // MXFP8: a 32-aligned [32, 32] grid the adapter declares unpadded (so the undeclared-padding
+        // refusal is not what fires below).
+        let mxfp8_path = dir.path().join("rank-mxfp8.safetensors");
+        let mxfp8_scales = gen_core::mxfp8_scale_shape([32, 32]);
+        let mxfp8_descriptor = br#"{"format": "mxfp8"}"#;
+        write_safetensors(
+            &mxfp8_path,
+            &[
+                (
+                    "model.v.weight",
+                    "F8_E4M3",
+                    &[32, 32],
+                    vec![0x38_u8; 32 * 32],
+                ),
+                (
+                    "model.v.weight_scale",
+                    "F8_E8M0",
+                    &mxfp8_scales,
+                    vec![127_u8; mxfp8_scales[0] * mxfp8_scales[1]],
+                ),
+                (
+                    "model.v.comfy_quant",
+                    "U8",
+                    &[mxfp8_descriptor.len()],
+                    mxfp8_descriptor.to_vec(),
+                ),
+            ],
+        );
+        let mxfp8_plan = plan_logical_weights(
+            &mxfp8_path,
+            &StripModelDeclaring(vec![32, 32]),
+            &CandleCodecResidency::DENSE,
+        )
+        .expect("mxfp8 plan");
+        assert_eq!(mxfp8_plan.codec_ids(), ["mxfp8-v1"]);
+
+        // NVFP4: the unpadded [256, 128] fixture the dense golden uses.
+        let nvfp4_path = dir.path().join("rank-nvfp4.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        let (packed, scales, global, _) =
+            nvfp4_reference_quantize(&nvfp4_fixture_values(rows, cols), rows, cols);
+        write_safetensors_with_metadata(
+            &nvfp4_path,
+            &[
+                ("model.q.weight", "U8", &[rows, cols / 2], packed),
+                ("model.q.weight_scale", "F8_E4M3", &[256, 8], scales),
+                (
+                    "model.q.weight_scale_2",
+                    "F32",
+                    &[],
+                    global.to_le_bytes().to_vec(),
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#,
+            )],
+        );
+        let nvfp4_plan = plan_logical_weights(
+            &nvfp4_path,
+            &StripModelDeclaring(vec![rows, cols]),
+            &CandleCodecResidency::DENSE,
+        )
+        .expect("nvfp4 plan");
+        assert_eq!(nvfp4_plan.codec_ids(), ["nvfp4-v1"]);
+
+        for (codec, path, plan) in [
+            ("int8-per-row-v1", int8_path.as_path(), &int8_plan),
+            ("mxfp8-v1", mxfp8_path.as_path(), &mxfp8_plan),
+            ("nvfp4-v1", nvfp4_path.as_path(), &nvfp4_plan),
+        ] {
+            read_logical_weights(path, plan, &Device::Cpu).unwrap_or_else(|error| {
+                panic!("{codec}: the unmutated fixture must read: {error}")
+            });
+
+            for wrong in [vec![6_usize], vec![1_usize, 2, 3]] {
+                let mut forced = plan.clone();
+                forced.tensors[0].shape = wrong.clone();
+                let error = read_logical_weights(path, &forced, &Device::Cpu)
+                    .err()
+                    .unwrap_or_else(|| panic!("{codec}: a rank-{} plan must refuse", wrong.len()))
+                    .to_string();
+                assert!(
+                    error.contains(&format!("codec {codec}:"))
+                        && error.contains("expected rank 2")
+                        && error.contains(&format!("observed rank {}", wrong.len())),
+                    "{codec}: the rank-{} refusal must name the codec, the expected rank and the \
+                     observed rank, got: {error}",
+                    wrong.len()
+                );
+            }
+        }
     }
 
     /// The packed-native policy is a pure layout+hardware predicate: it selects `Packed` only for

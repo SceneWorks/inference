@@ -566,7 +566,14 @@ pub(crate) fn native_dit_transformer_bytes(
     // The plan's resident headers are logical-keyed (diffusers names) at the dense resident dtype,
     // so the quant-target predicate applies directly and `Stored` means "the planned resident
     // bytes", not the on-disk packing.
-    let resident = plan.resident_tensor_headers();
+    // A plan whose residency has no per-element width (a GGUF container) cannot be priced this way
+    // and refuses by name rather than emitting a header that contradicts its own byte count.
+    let resident = plan.resident_tensor_headers().map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
     mlx_gen::asset_facts::projected_tensor_headers_bytes(&resident, |tensor| {
         if let Some(quant) =
             quant.filter(|_| crate::convert::is_transformer_quant_target(&tensor.name))

@@ -76,10 +76,10 @@ pub use checkpoint_codec::{
     CodecResidencyReport, CompanionRole, CompanionTensorPlan, DenseResidencyPolicy,
     IdentityKeyMapping, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
     LogicalWeightPlan, LogicalWeightPlanError, LogicalWeightReceipt, PlannedResidency,
-    ResidencyMode, ScalarScaleSource, StoredTensorFormat, TensorCodecSpec, WeightEncoding,
-    COMFY_QUANT_CODECS, DENSE_BF16_CODEC, DENSE_CODECS, DENSE_F16_CODEC, DENSE_F32_CODEC,
-    FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC, GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC,
-    MXFP8_CODEC, NVFP4_CODEC,
+    ResidencyMode, ResidentTensorHeadersError, ScalarScaleSource, StoredTensorFormat,
+    TensorCodecSpec, WeightEncoding, COMFY_QUANT_CODECS, DENSE_BF16_CODEC, DENSE_CODECS,
+    DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
+    GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 pub use comfy_quant::{
     blocked_scale_index, blocked_scale_shape, decode_fp8_e4m3fn_scalar, decode_fp8_e5m2_scalar,
