@@ -584,6 +584,7 @@ impl GgufDit {
             tensor_count: plan.tensor_count(),
             source_bytes: plan.source_bytes,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![CodecResidencyReport {
                 codec_id: GGUF_CONTAINER_CODEC.codec_id,
                 // Every GGUF row plans `Packed` (the ggml blocks stay resident as stored and the

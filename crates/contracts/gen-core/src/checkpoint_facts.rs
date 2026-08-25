@@ -508,6 +508,24 @@ pub enum CheckpointWeightFactsError {
     /// nothing measured to report; inventing rows there is the same class of untruth as labelling
     /// a dense row native.
     DeferredReadReportedResidency { rows: usize },
+    /// A read that claims to have evaluated tensors reported **no** residency rows at all — a
+    /// fabricated "measured" state (sc-11045 fix round). An honest producer that measured
+    /// `tensor_count > 0` tensors has at least one row to show for them; an empty row set with a
+    /// non-zero count is a claim of coverage with nothing measured behind it.
+    MaterializedReadReportedNoResidency { tensor_count: usize },
+    /// A demotion names a logical key the plan does not contain.
+    DemotedRowNotInPlan { logical_key: String },
+    /// A demotion names a codec other than the one the plan stores that row in.
+    DemotionCodecMismatch {
+        logical_key: String,
+        demotion_codec_id: &'static str,
+        plan_codec_id: &'static str,
+    },
+    /// A demotion names a row the plan priced `Dense` — there is no packed pricing to demote from,
+    /// so the "demotion" would fabricate a packed row that never existed.
+    DemotedRowNotPlannedPacked { logical_key: String },
+    /// The same logical row was demoted twice; its resident bytes would be double-counted.
+    DuplicateDemotion { logical_key: String },
 }
 
 impl fmt::Display for CheckpointWeightFactsError {
@@ -624,6 +642,36 @@ impl fmt::Display for CheckpointWeightFactsError {
                 "checkpoint facts: a deferred read reported {rows} residency row(s); a deferred \
                  read evaluated nothing and must report no measured residency"
             ),
+            Self::MaterializedReadReportedNoResidency { tensor_count } => write!(
+                f,
+                "checkpoint facts: the receipt claims {tensor_count} tensor(s) were evaluated but \
+                 reports no residency row at all; a measured read has at least one row to show for \
+                 a non-zero count, so this is a fabricated \"measured\" state"
+            ),
+            Self::DemotedRowNotInPlan { logical_key } => write!(
+                f,
+                "checkpoint facts: demotion names logical row {logical_key:?}, which the plan does \
+                 not contain"
+            ),
+            Self::DemotionCodecMismatch {
+                logical_key,
+                demotion_codec_id,
+                plan_codec_id,
+            } => write!(
+                f,
+                "checkpoint facts: demotion of {logical_key:?} names codec {demotion_codec_id:?}, \
+                 but the plan stores that row as {plan_codec_id:?}"
+            ),
+            Self::DemotedRowNotPlannedPacked { logical_key } => write!(
+                f,
+                "checkpoint facts: demotion of {logical_key:?} is invalid — the plan priced that \
+                 row `Dense`, so there is no packed pricing to demote from"
+            ),
+            Self::DuplicateDemotion { logical_key } => write!(
+                f,
+                "checkpoint facts: logical row {logical_key:?} was demoted more than once; its \
+                 resident bytes would be double-counted"
+            ),
         }
     }
 }
@@ -657,7 +705,7 @@ impl CheckpointWeightFacts {
         receipt: LogicalWeightReceipt,
     ) -> Result<Self, CheckpointWeightFactsError> {
         let source = SourceCodecSummary::of(plan)?;
-        validate(&source, &capability, &receipt)?;
+        validate(plan, &source, &capability, &receipt)?;
         Ok(Self {
             source_binding: None,
             capability,
@@ -808,7 +856,101 @@ impl CheckpointFactsSink {
     }
 }
 
+/// The per-codec fold of a receipt's [`crate::checkpoint_codec::RegimeDemotion`]s: how many
+/// tensors (and how many planned packed resident bytes, companions included) leave the
+/// `NativePacked` expectation, and how many measured dense bytes join the `DenseFallback` one.
+#[derive(Default)]
+struct DemotionAdjustment {
+    packed_tensors: usize,
+    packed_bytes: u64,
+    dense_bytes: u64,
+}
+
+/// Validate a receipt's demotions against the plan and fold them per codec. Every refusal is
+/// typed: an unknown row, a codec alias, a dense-priced row, or a duplicate is a fabricated
+/// accounting, never something to round away.
+fn demotion_adjustments(
+    plan: &LogicalWeightPlan,
+    receipt: &LogicalWeightReceipt,
+) -> Result<BTreeMap<&'static str, DemotionAdjustment>, CheckpointWeightFactsError> {
+    let mut adjustments: BTreeMap<&'static str, DemotionAdjustment> = BTreeMap::new();
+    if receipt.demotions.is_empty() {
+        return Ok(adjustments);
+    }
+    let by_logical: BTreeMap<&str, &crate::checkpoint_codec::LogicalTensorPlan> = plan
+        .tensors
+        .iter()
+        .map(|tensor| (tensor.logical_key.as_str(), tensor))
+        .collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    // Per physical owner: how many packed-priced logical outputs it has, and how many of those
+    // were demoted — the companion rule below needs both.
+    let mut packed_outputs: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+    for tensor in &plan.tensors {
+        if tensor.residency.mode == ResidencyMode::Packed {
+            *packed_outputs.entry(tensor.physical_key.as_str()).or_default() += 1;
+            codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+        }
+    }
+    let mut demoted_outputs: BTreeMap<&str, usize> = BTreeMap::new();
+    for demotion in &receipt.demotions {
+        if !seen.insert(demotion.logical_key.as_str()) {
+            return Err(CheckpointWeightFactsError::DuplicateDemotion {
+                logical_key: demotion.logical_key.clone(),
+            });
+        }
+        let Some(tensor) = by_logical.get(demotion.logical_key.as_str()) else {
+            return Err(CheckpointWeightFactsError::DemotedRowNotInPlan {
+                logical_key: demotion.logical_key.clone(),
+            });
+        };
+        if tensor.codec_id != demotion.codec_id {
+            return Err(CheckpointWeightFactsError::DemotionCodecMismatch {
+                logical_key: demotion.logical_key.clone(),
+                demotion_codec_id: demotion.codec_id,
+                plan_codec_id: tensor.codec_id,
+            });
+        }
+        if tensor.residency.mode != ResidencyMode::Packed {
+            return Err(CheckpointWeightFactsError::DemotedRowNotPlannedPacked {
+                logical_key: demotion.logical_key.clone(),
+            });
+        }
+        let adjustment = adjustments.entry(tensor.codec_id).or_default();
+        adjustment.packed_tensors += 1;
+        adjustment.packed_bytes = adjustment
+            .packed_bytes
+            .saturating_add(tensor.residency.resident_bytes);
+        adjustment.dense_bytes = adjustment.dense_bytes.saturating_add(demotion.resident_bytes);
+        *demoted_outputs
+            .entry(tensor.physical_key.as_str())
+            .or_default() += 1;
+    }
+    // A companion priced resident under a packed owner is *consumed* by the dense decode when
+    // every packed-priced logical output of that owner was demoted (a fused tensor whose outputs
+    // split across regimes keeps its scales resident for the outputs that stayed packed).
+    for companion in &plan.companions {
+        let owner = companion.owner_physical_key.as_str();
+        let Some(demoted) = demoted_outputs.get(owner) else {
+            continue;
+        };
+        let total = packed_outputs.get(owner).copied().unwrap_or(0);
+        if total > 0 && *demoted == total {
+            if let Some(codec_id) = codec_by_owner.get(owner) {
+                if let Some(adjustment) = adjustments.get_mut(codec_id) {
+                    adjustment.packed_bytes = adjustment
+                        .packed_bytes
+                        .saturating_add(companion.resident_bytes);
+                }
+            }
+        }
+    }
+    Ok(adjustments)
+}
+
 fn validate(
+    plan: &LogicalWeightPlan,
     source: &SourceCodecSummary,
     capability: &NativeExecutionCapability,
     receipt: &LogicalWeightReceipt,
@@ -820,12 +962,44 @@ fn validate(
         });
     }
     if receipt.materialization == LogicalReadMaterialization::Deferred
-        && !receipt.residency.is_empty()
+        && (!receipt.residency.is_empty() || !receipt.demotions.is_empty())
     {
         return Err(CheckpointWeightFactsError::DeferredReadReportedResidency {
-            rows: receipt.residency.len(),
+            rows: receipt.residency.len() + receipt.demotions.len(),
         });
     }
+    if receipt.materialization != LogicalReadMaterialization::Deferred
+        && receipt.tensor_count > 0
+        && receipt.residency.is_empty()
+    {
+        return Err(
+            CheckpointWeightFactsError::MaterializedReadReportedNoResidency {
+                tensor_count: receipt.tensor_count,
+            },
+        );
+    }
+    let adjustments = demotion_adjustments(plan, receipt)?;
+    // The demotion-adjusted expectation for one (codec, representation) cell: demoted rows leave
+    // the packed expectation (tensor count, planned packed bytes, consumed companions) and join
+    // the dense one carrying the dense bytes the provider measured on the constructed layer.
+    let adjusted = |entry: &SourceCodecEntry,
+                    representation: ExecutionRepresentation|
+     -> (usize, u64) {
+        let (tensors, bytes) = entry.planned(representation);
+        let Some(adjustment) = adjustments.get(entry.codec_id) else {
+            return (tensors, bytes);
+        };
+        match representation {
+            ExecutionRepresentation::NativePacked => (
+                tensors.saturating_sub(adjustment.packed_tensors),
+                bytes.saturating_sub(adjustment.packed_bytes),
+            ),
+            ExecutionRepresentation::DenseFallback => (
+                tensors + adjustment.packed_tensors,
+                bytes.saturating_add(adjustment.dense_bytes),
+            ),
+        }
+    };
     if receipt.tensor_count > source.tensor_count {
         return Err(CheckpointWeightFactsError::TensorCountExceedsPlan {
             reported: receipt.tensor_count,
@@ -853,7 +1027,7 @@ fn validate(
                 tensor_count: row.tensor_count,
             });
         }
-        let (planned_tensors, planned_bytes) = entry.planned(row.representation);
+        let (planned_tensors, planned_bytes) = adjusted(entry, row.representation);
         if row.tensor_count > planned_tensors {
             return Err(CheckpointWeightFactsError::RepresentationExceedsPlan {
                 codec_id: row.codec_id,
@@ -907,7 +1081,7 @@ fn validate(
                 ExecutionRepresentation::NativePacked,
                 ExecutionRepresentation::DenseFallback,
             ] {
-                let planned = entry.planned(representation);
+                let planned = adjusted(entry, representation);
                 let measured = receipt
                     .residency
                     .iter()
@@ -938,8 +1112,8 @@ fn validate(
 mod tests {
     use super::*;
     use crate::checkpoint_codec::{
-        CompanionRole, CompanionTensorPlan, LogicalTensorPlan, PlannedResidency, TensorCodecSpec,
-        WeightEncoding, DENSE_BF16_CODEC, INT8_PER_ROW_CODEC, NVFP4_CODEC,
+        CompanionRole, CompanionTensorPlan, LogicalTensorPlan, PlannedResidency, RegimeDemotion,
+        TensorCodecSpec, WeightEncoding, DENSE_BF16_CODEC, INT8_PER_ROW_CODEC, NVFP4_CODEC,
     };
 
     const MAPPING: &str = "facts-test-v1";
@@ -1042,6 +1216,7 @@ mod tests {
             tensor_count: 3,
             source_bytes: 2048 + 2048 + 128 + 256 + 256,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![
                 row(
                     DENSE_BF16_CODEC.codec_id,
@@ -1124,6 +1299,7 @@ mod tests {
             tensor_count: 3,
             source_bytes: plan.source_bytes,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![
                 row(
                     DENSE_BF16_CODEC.codec_id,
@@ -1168,6 +1344,7 @@ mod tests {
             tensor_count: 1,
             source_bytes: 2048 + 256,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![row(
                 NVFP4_CODEC.codec_id,
                 // The lie: the bytes were decoded dense, the row says native.
@@ -1219,6 +1396,7 @@ mod tests {
             tensor_count: 1,
             source_bytes: 2048 + 256,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![row(
                 INT8_PER_ROW_CODEC.codec_id,
                 ExecutionRepresentation::DenseFallback,
@@ -1267,6 +1445,7 @@ mod tests {
             tensor_count: 1,
             source_bytes: 2048 + 256,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![row(
                 NVFP4_CODEC.codec_id,
                 ExecutionRepresentation::NativePacked,
@@ -1385,6 +1564,7 @@ mod tests {
             // and only the byte-carrying output contributed a non-zero number.
             source_bytes: 2048,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![row(
                 NVFP4_CODEC.codec_id,
                 ExecutionRepresentation::DenseFallback,
@@ -1598,6 +1778,7 @@ mod tests {
             tensor_count: 3,
             source_bytes: dense_plan.source_bytes,
             materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
             residency: vec![
                 row(
                     DENSE_BF16_CODEC.codec_id,
@@ -1626,6 +1807,223 @@ mod tests {
         let seen = consumer.facts().expect("republished");
         assert!(!seen.executes_natively(NVFP4_CODEC.codec_id));
         assert!(seen.source().declares(NVFP4_CODEC.codec_id));
+    }
+
+    /// The receipt a run reports when the provider **demoted** [`mixed_plan`]'s packed row to a
+    /// dense-BF16 (W4A16) execution: the row appears as `DenseFallback` at the dense bytes the
+    /// constructed layer measured (8192 here), a typed [`RegimeDemotion`] names it, and no
+    /// `NativePacked` row exists at all.
+    fn demoted_receipt() -> LogicalWeightReceipt {
+        LogicalWeightReceipt {
+            mapping_id: MAPPING,
+            tensor_count: 3,
+            source_bytes: 2048 + 2048 + 128 + 256 + 256,
+            materialization: LogicalReadMaterialization::Materialized,
+            demotions: vec![RegimeDemotion {
+                logical_key: "packed".to_owned(),
+                codec_id: NVFP4_CODEC.codec_id,
+                resident_bytes: 8192,
+            }],
+            residency: vec![
+                row(
+                    DENSE_BF16_CODEC.codec_id,
+                    ExecutionRepresentation::DenseFallback,
+                    1,
+                    128,
+                    128,
+                ),
+                row(
+                    NVFP4_CODEC.codec_id,
+                    ExecutionRepresentation::DenseFallback,
+                    2,
+                    2048 + 2048 + 256 + 256,
+                    8192 + 8192,
+                ),
+            ],
+        }
+    }
+
+    /// **Honest W4A16 reporting (sc-11045 fix round, epic E5).** A `Packed`-priced row the
+    /// provider's role table served dense-BF16 reconciles against the plan through its typed
+    /// demotion: the facts validate, report `DenseFallback` at the dense bytes actually resident,
+    /// and answer `executes_natively == false` — never a packed row, never packed byte counts.
+    #[test]
+    fn a_demoted_w4a16_row_reports_dense_fallback_and_reconciles_with_the_plan() {
+        let plan = mixed_plan();
+        let facts = CheckpointWeightFacts::new(&plan, nvfp4_capability(), demoted_receipt())
+            .expect("a demoted row with its typed accounting is valid");
+        assert!(facts.source().declares(NVFP4_CODEC.codec_id));
+        assert!(
+            !facts.executes_natively(NVFP4_CODEC.codec_id),
+            "a run whose every packed pricing was demoted executed nothing natively"
+        );
+        assert!(facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+            .is_none());
+        let dense = facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("the demoted row joins the dense-fallback row");
+        assert_eq!(dense.tensor_count, 2);
+        assert_eq!(dense.resident_bytes, 8192 + 8192);
+        // The whole-load sum is the VRAM-side reality of both regimes: the plain dense row plus
+        // the fallback row plus the demoted row's dense bytes — not the plan's packed pricing.
+        assert_eq!(facts.resident_bytes(), 128 + 8192 + 8192);
+        assert!(facts.is_complete());
+    }
+
+    /// **The mutation this seam exists to kill: a demoted row still labelled native.** The
+    /// demotion says the row is dense; a receipt that keeps reporting it `NativePacked` exceeds
+    /// the demotion-adjusted packed expectation (now zero) and refuses.
+    #[test]
+    fn a_demoted_row_still_labelled_native_refuses() {
+        let plan = mixed_plan();
+        let mut mutated = demoted_receipt();
+        // The lie: the demoted row re-appears as a packed row at packed bytes.
+        mutated.residency[1].tensor_count = 1;
+        mutated.residency[1].source_bytes = 2048 + 256;
+        mutated.residency[1].resident_bytes = 8192;
+        mutated.residency.push(row(
+            NVFP4_CODEC.codec_id,
+            ExecutionRepresentation::NativePacked,
+            1,
+            2048 + 256,
+            2048 + 256,
+        ));
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), mutated)
+            .expect_err("a demoted row cannot be labelled native");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::RepresentationExceedsPlan {
+                codec_id: NVFP4_CODEC.codec_id,
+                representation: ExecutionRepresentation::NativePacked,
+                reported_tensors: 1,
+                planned_tensors: 0,
+            }
+        );
+    }
+
+    /// **The byte sum stays exact under demotion.** A demoted dense byte claim that disagrees
+    /// with the measured dense row by one byte is refused, not rounded — the adjusted planned
+    /// dense total must equal the measured one exactly on a complete load.
+    #[test]
+    fn a_demotion_whose_bytes_disagree_with_the_measured_row_refuses() {
+        let plan = mixed_plan();
+        let mut mutated = demoted_receipt();
+        mutated.demotions[0].resident_bytes = 8191;
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), mutated)
+            .expect_err("planned-adjusted and measured dense bytes must agree exactly");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::ResidentBytesExceedPlan {
+                codec_id: NVFP4_CODEC.codec_id,
+                representation: ExecutionRepresentation::DenseFallback,
+                measured_bytes: 8192 + 8192,
+                planned_bytes: 8192 + 8191,
+            }
+        );
+    }
+
+    /// Every malformed demotion is a typed refusal: an unknown row, a codec alias, a row the plan
+    /// priced dense, and a duplicate.
+    #[test]
+    fn malformed_demotions_refuse_by_name() {
+        let plan = mixed_plan();
+        let with_demotion = |demotion: RegimeDemotion| {
+            let mut receipt = demoted_receipt();
+            receipt.demotions = vec![demotion];
+            CheckpointWeightFacts::new(&plan, nvfp4_capability(), receipt)
+        };
+        assert_eq!(
+            with_demotion(RegimeDemotion {
+                logical_key: "ghost".to_owned(),
+                codec_id: NVFP4_CODEC.codec_id,
+                resident_bytes: 8192,
+            })
+            .expect_err("unknown row"),
+            CheckpointWeightFactsError::DemotedRowNotInPlan {
+                logical_key: "ghost".to_owned(),
+            }
+        );
+        assert_eq!(
+            with_demotion(RegimeDemotion {
+                logical_key: "packed".to_owned(),
+                codec_id: INT8_PER_ROW_CODEC.codec_id,
+                resident_bytes: 8192,
+            })
+            .expect_err("codec alias"),
+            CheckpointWeightFactsError::DemotionCodecMismatch {
+                logical_key: "packed".to_owned(),
+                demotion_codec_id: INT8_PER_ROW_CODEC.codec_id,
+                plan_codec_id: NVFP4_CODEC.codec_id,
+            }
+        );
+        assert_eq!(
+            with_demotion(RegimeDemotion {
+                logical_key: "fallback".to_owned(),
+                codec_id: NVFP4_CODEC.codec_id,
+                resident_bytes: 8192,
+            })
+            .expect_err("dense-priced row"),
+            CheckpointWeightFactsError::DemotedRowNotPlannedPacked {
+                logical_key: "fallback".to_owned(),
+            }
+        );
+        let mut duplicated = demoted_receipt();
+        duplicated.demotions.push(duplicated.demotions[0].clone());
+        assert_eq!(
+            CheckpointWeightFacts::new(&plan, nvfp4_capability(), duplicated)
+                .expect_err("duplicate demotion"),
+            CheckpointWeightFactsError::DuplicateDemotion {
+                logical_key: "packed".to_owned(),
+            }
+        );
+    }
+
+    /// **The fabricated "measured" state refuses (sc-11045 fix round, minor).** A receipt that
+    /// claims tensors were evaluated but reports no residency row at all is a claim of coverage
+    /// with nothing measured behind it.
+    #[test]
+    fn a_materialized_receipt_with_tensors_but_no_rows_refuses() {
+        let plan = mixed_plan();
+        let fabricated = LogicalWeightReceipt {
+            mapping_id: MAPPING,
+            tensor_count: 3,
+            source_bytes: plan.source_bytes,
+            materialization: LogicalReadMaterialization::Materialized,
+            demotions: Vec::new(),
+            residency: Vec::new(),
+        };
+        let error = CheckpointWeightFacts::new(&plan, nvfp4_capability(), fabricated)
+            .expect_err("a claimed-evaluated read with no rows is fabricated");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::MaterializedReadReportedNoResidency { tensor_count: 3 }
+        );
+    }
+
+    /// **A `Partial` snapshot is bounded, never forced equal (sc-11045 fix round, minor ii).** A
+    /// front-only block-streamed read reports what it measured, stays `!is_complete()`, and the
+    /// complete-load equality gate does not fire on it.
+    #[test]
+    fn a_partial_snapshot_is_valid_and_incomplete() {
+        let plan = mixed_plan();
+        let partial = LogicalWeightReceipt {
+            mapping_id: MAPPING,
+            tensor_count: 1,
+            source_bytes: 2048 + 256,
+            materialization: LogicalReadMaterialization::Partial,
+            demotions: Vec::new(),
+            residency: vec![row(
+                NVFP4_CODEC.codec_id,
+                ExecutionRepresentation::NativePacked,
+                1,
+                2048 + 256,
+                2048 + 256,
+            )],
+        };
+        let facts = CheckpointWeightFacts::new(&plan, nvfp4_capability(), partial)
+            .expect("a partial snapshot is valid");
+        assert!(!facts.is_complete());
     }
 
     /// The wire labels SceneWorks renders are fixed by this test, not by whatever the enum's

@@ -492,6 +492,13 @@ pub struct LogicalWeightReader {
     /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
     /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
     measured: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Logical key → resident dense bytes for every `Packed`-planned row the provider **demoted**
+    /// to a dense-BF16 execution after construction settled its real regime
+    /// ([`Self::demote_to_dense_fallback`], sc-11045 fix round). The receipt reports such a row as
+    /// [`ExecutionRepresentation::DenseFallback`] carrying these measured bytes, with a matching
+    /// typed [`gen_core::checkpoint_codec::RegimeDemotion`] entry so the facts validator can
+    /// reconcile it against the plan's packed pricing instead of diagnosing drift.
+    demoted: std::sync::Mutex<BTreeMap<String, u64>>,
     /// The host's native-execution declaration, carried from the same
     /// [`CandleCodecResidency`] that priced the plan (sc-21484). A native receipt row is only
     /// representable when this licenses it.
@@ -566,8 +573,57 @@ impl LogicalWeightReader {
             device: device.clone(),
             by_logical_key,
             measured: std::sync::Mutex::new(BTreeMap::new()),
+            demoted: std::sync::Mutex::new(BTreeMap::new()),
             capability,
         })
+    }
+
+    /// Record that the provider served `logical_key` — a row the plan priced
+    /// [`ResidencyMode::Packed`] — as a **dense BF16** weight holding `resident_bytes` on-device
+    /// (sc-11045 fix round, epic E5).
+    ///
+    /// This is the seam that keeps the receipt truthful about W4A16 and the transparent
+    /// construction-time fallbacks: the plan prices from checkpoint geometry and device floors
+    /// alone, but a provider's role table (or a missing fused quantizer, a staging failure) can
+    /// still hold a `Packed`-priced row as the dequantized dense weight. Without this call the
+    /// receipt would report that row `NativePacked` at packed byte counts — dense BF16 execution
+    /// labelled native, which is exactly the dishonest report E5 forbids.
+    ///
+    /// `resident_bytes` is measured off the constructed layer
+    /// (`Nvfp4Linear::resident_weight_bytes`), never derived here. Refuses a key the plan does not
+    /// contain and a row the plan priced `Dense` (nothing packed exists to demote). Re-demoting the
+    /// same key with the same measurement is idempotent (a staged provider can rebuild a layer);
+    /// a *different* measurement for the same key is a contradiction and refuses.
+    pub fn demote_to_dense_fallback(&self, logical_key: &str, resident_bytes: u64) -> Result<()> {
+        let tensor = self.planned(logical_key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "logical weight demotion: `{logical_key}` has no entry in the compiled plan \
+                 (mapping {})",
+                self.plan.mapping_id
+            ))
+        })?;
+        if tensor.residency.mode != ResidencyMode::Packed {
+            return Err(CandleError::Msg(format!(
+                "logical weight demotion: `{logical_key}` was priced Dense by the plan; there is \
+                 no packed pricing to demote from"
+            )));
+        }
+        let mut demoted = self
+            .demoted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = demoted.get(logical_key) {
+            if *previous != resident_bytes {
+                return Err(CandleError::Msg(format!(
+                    "logical weight demotion: `{logical_key}` was already demoted at {previous} \
+                     resident byte(s); re-demoting it at {resident_bytes} contradicts the first \
+                     measurement"
+                )));
+            }
+            return Ok(());
+        }
+        demoted.insert(logical_key.to_owned(), resident_bytes);
+        Ok(())
     }
 
     /// This host's native-execution declaration — the capability the plan was priced under.
@@ -634,12 +690,17 @@ impl LogicalWeightReader {
             .measured
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let demoted = self
+            .demoted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut residency: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
             BTreeMap::new();
         let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
             BTreeMap::new();
         let mut tensor_count = 0usize;
         let mut source_bytes = 0u64;
+        let mut demotions: Vec<gen_core::checkpoint_codec::RegimeDemotion> = Vec::new();
         for tensor in &self.plan.tensors {
             let Some(resident) = measured.get(&tensor.logical_key) else {
                 continue;
@@ -647,8 +708,28 @@ impl LogicalWeightReader {
             // The representation this row was *actually* materialized as. It is read from the
             // planned residency because that is what `decode` dispatched on — the reader never
             // substitutes one for the other (a `Packed` fp8 plan on a non-`cuda` build is a typed
-            // refusal, not a dense decode), so plan mode and outcome cannot disagree here.
-            let representation = ExecutionRepresentation::from_residency(tensor.residency.mode);
+            // refusal, not a dense decode), so plan mode and outcome cannot disagree here —
+            // EXCEPT for a provider-demoted row (sc-11045 fix round): construction resolved a
+            // `Packed`-priced row to the dense-BF16 regime (W4A16 role table, or a transparent
+            // fallback), the provider said so through `demote_to_dense_fallback`, and the receipt
+            // reports the dense truth with a typed `RegimeDemotion` alongside it.
+            let demotion = demoted.get(&tensor.logical_key);
+            let representation = match demotion {
+                Some(_) => ExecutionRepresentation::DenseFallback,
+                None => ExecutionRepresentation::from_residency(tensor.residency.mode),
+            };
+            let resident = match demotion {
+                // The dense bytes measured off the constructed layer, not the packed decode.
+                Some(dense_bytes) => {
+                    demotions.push(gen_core::checkpoint_codec::RegimeDemotion {
+                        logical_key: tensor.logical_key.clone(),
+                        codec_id: tensor.codec_id,
+                        resident_bytes: *dense_bytes,
+                    });
+                    dense_bytes
+                }
+                None => resident,
+            };
             let key = (tensor.codec_id, representation);
             codec_by_owner.insert(tensor.physical_key.as_str(), key);
             tensor_count += 1;
@@ -681,12 +762,24 @@ impl LogicalWeightReader {
                 report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
             }
         }
+        // Honest coverage label (sc-11045 fix round): `Materialized` claims every planned tensor
+        // was evaluated, so it is only stated when that is true. A front-only snapshot of a
+        // block-streamed load is `Partial`; a reader nothing has consumed yet is `Deferred` (its
+        // payloads are, at this instant, exactly as lazy as a deferred read's).
+        let materialization = if tensor_count == self.plan.tensor_count() {
+            LogicalReadMaterialization::Materialized
+        } else if tensor_count == 0 {
+            LogicalReadMaterialization::Deferred
+        } else {
+            LogicalReadMaterialization::Partial
+        };
         LogicalWeightReceipt {
             mapping_id: self.plan.mapping_id,
             tensor_count,
             source_bytes,
-            materialization: LogicalReadMaterialization::Materialized,
+            materialization,
             residency: residency.into_values().collect(),
+            demotions,
         }
     }
 
