@@ -115,6 +115,17 @@ fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
 
+/// The **one** non-finite refusal message this container emits, shared by every f32 input gate so a
+/// NaN/inf is named the same way wherever it enters: [`Nvfp4Tensor::from_kitchen_parts`]'s per-tensor
+/// scale and [`Nvfp4Tensor::pack_from_slice`]'s weight elements.
+///
+/// Both entry points must refuse rather than absorb: `e2m1_from_f32`/`e4m3_from_f32` map NaN to code
+/// `0`, and `f32::max` (the amax fold) *drops* NaN operands entirely, so a NaN weight would pack as a
+/// silent zero and an `inf` weight would drive `global_scale` to `inf` and zero the **whole tensor**.
+fn non_finite_msg(what: &str, value: f32) -> String {
+    format!("nvfp4 {what} must be finite, got {value}")
+}
+
 /// Decode one OCP FP8 **E4M3** byte to f32 (bias 7; subnormals at `E==0`; `S.1111.111` is NaN, max
 /// finite 448 at `S.1111.110`). Block scales are always non-negative, so only codes `0x00..=0x7E`
 /// occur in [`Nvfp4Tensor::scales`], but this decodes the full 8-bit space.
@@ -253,9 +264,15 @@ impl Nvfp4Tensor {
                 blocked_scales.len()
             )));
         }
-        if !global_scale.is_finite() || global_scale < 0.0 {
+        if !global_scale.is_finite() {
+            return Err(candle_core::Error::Msg(non_finite_msg(
+                "Kitchen global scale",
+                global_scale,
+            )));
+        }
+        if global_scale < 0.0 {
             return Err(candle_core::Error::Msg(format!(
-                "nvfp4 Kitchen global scale must be finite and non-negative, got {global_scale}"
+                "nvfp4 Kitchen global scale must be non-negative, got {global_scale}"
             )));
         }
 
@@ -334,7 +351,7 @@ impl Nvfp4Tensor {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        Ok(Self::pack_from_slice(&data, rows, cols))
+        Self::pack_from_slice(&data, rows, cols)
     }
 
     /// Offline pack a row-major `[rows, cols]` f32 slice to NVFP4. Panics if `data.len() != rows *
@@ -343,8 +360,21 @@ impl Nvfp4Tensor {
     /// - per-tensor amax → `global_scale = amax / (6 * 448)` (maps the largest block scale to E4M3 448);
     /// - per-block amax → UE4M3 `block_scale ≈ amax_blk / (6 * global_scale)`;
     /// - per-element E2M1 code = round(value / (e4m3(block_scale) * global_scale)).
-    pub fn pack_from_slice(data: &[f32], rows: usize, cols: usize) -> Self {
+    ///
+    /// **Refuses a non-finite input** naming the offending element, the same gate (and the same
+    /// `non_finite_msg` wording) [`Self::from_kitchen_parts`] applies to its per-tensor scale. Without it the
+    /// packer absorbs the bad value instead of reporting it: the `f32::max` amax fold silently drops a
+    /// NaN (which then packs as E2M1 code `0`), and a single `inf` makes `global_scale` infinite, which
+    /// zeroes **every** element of the tensor. A checkpoint with one poisoned weight would otherwise
+    /// import as a plausible-looking all-zero layer.
+    pub fn pack_from_slice(data: &[f32], rows: usize, cols: usize) -> Result<Self> {
         assert_eq!(data.len(), rows * cols, "data length must be rows * cols");
+        if let Some(i) = data.iter().position(|x| !x.is_finite()) {
+            return Err(candle_core::Error::Msg(non_finite_msg(
+                &format!("weight element {i} (row {}, col {})", i / cols, i % cols),
+                data[i],
+            )));
+        }
         let cols_padded = round_up(cols, NVFP4_BLOCK);
         let n_blocks = cols_padded / NVFP4_BLOCK;
         let sf_rows = round_up(rows, SF_ATOM_ROWS);
@@ -404,7 +434,7 @@ impl Nvfp4Tensor {
             }
         }
 
-        Self {
+        Ok(Self {
             rows,
             cols,
             cols_padded,
@@ -413,7 +443,7 @@ impl Nvfp4Tensor {
             sf_rows,
             sf_cols,
             global_scale,
-        }
+        })
     }
 
     /// CPU dequant reference → a row-major `[rows, cols]` f32 `Vec` (the **logical** shape; the
@@ -606,7 +636,7 @@ mod tests {
         let (rows, cols) = (256, 512); // cols already a multiple of 16
         let mut seed = 0x1234_5678u64;
         let data: Vec<f32> = (0..rows * cols).map(|_| prng(&mut seed)).collect();
-        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
+        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols).unwrap();
 
         assert_eq!(t.cols_padded, cols);
         // Nibble bytes: rows * cols/2.
@@ -642,7 +672,7 @@ mod tests {
             data[3 * cols + c] = 1e-6 * prng(&mut seed);
         }
 
-        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
+        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols).unwrap();
         let back = t.dequantize_to_vec();
         assert!(
             back.iter().all(|v| v.is_finite()),
@@ -690,7 +720,7 @@ mod tests {
         let (rows, cols) = (32, 40); // 40 is not a multiple of 16 → pad to 48
         let mut seed = 0x5EED_5EEDu64;
         let data: Vec<f32> = (0..rows * cols).map(|_| prng(&mut seed)).collect();
-        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
+        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols).unwrap();
 
         assert_eq!(t.cols_padded, 48);
         assert_eq!(t.blocks_per_row(), 3);
@@ -712,7 +742,7 @@ mod tests {
         let (rows, cols) = (64, 32);
         let mut seed = 0x0BAD_F00Du64;
         let data: Vec<f32> = (0..rows * cols).map(|_| prng(&mut seed)).collect();
-        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
+        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols).unwrap();
 
         assert_eq!(t.sf_rows, 128);
         assert_eq!(t.sf_cols, 4);
@@ -751,6 +781,145 @@ mod tests {
         assert!(rr < 0.12, "swizzle round-trip rel-RMS {rr}");
     }
 
+    // ---- scale swizzle: ORDER, pinned to the external producer --------------------------------
+
+    /// sc-20651 review (9). `scale_swizzle_padding_and_bijection` above proves the swizzle is a
+    /// **bijection**; it cannot see the **order**. Neither can any round-trip test in this crate: the
+    /// packer writes through [`Nvfp4Tensor::scale_offset_for`] and the dequant reads back through the
+    /// same function, so *any* bijective permutation of the offset — a transpose of the intra-atom
+    /// slot, a transpose of the atom grid — cancels exactly and is invisible end to end. The order is
+    /// only load-bearing at the two seams where a **foreign** producer/consumer is on the other side:
+    /// ComfyUI Kitchen's `comfy_kitchen.float_utils.to_blocked` buffer on the way in, and cuBLASLt's
+    /// `VEC16` `UE4M3` block-scale descriptor on the way out.
+    ///
+    /// So this pins the offset against the external producer instead of against itself.
+    /// [`gen_core::blocked_scale_index`] *is* `to_blocked`, transliterated from its definition and
+    /// itself pinned in `gen-core` against a matrix computed by running `to_blocked` in a real ComfyUI
+    /// venv (`mxfp8_swizzle_index_matches_comfy_kitchen_to_blocked`). The two layouts are the same
+    /// cuBLAS 128×4 swizzle and differ in exactly one documented way — Kitchen walks the atom grid
+    /// row-major, this container walks it column-major (CuTe `LayoutLeft`) — so:
+    ///
+    /// - the **intra-atom slot** (`offset % 512`) must be *equal* to Kitchen's, and
+    /// - the **atom index** (`offset / 512`) must be Kitchen's atom index *transposed*.
+    ///
+    /// Both halves are stated in terms of `blocked_scale_index`, never by re-spelling
+    /// `scale_offset_for`'s own arithmetic, so a permutation applied to the production function has
+    /// nothing to cancel against.
+    ///
+    /// Live cuBLASLt confirmation of the atom order (the second seam) is still the terminal CUDA-box
+    /// gate for `nvfp4_native=true`; this is the host-side half.
+    #[test]
+    fn scale_offset_order_is_pinned_to_the_external_to_blocked_producer() {
+        const ATOM: usize = SF_ATOM_ROWS * SF_ATOM_COLS; // 512 bytes
+
+        // A real-DiT-shaped multi-atom grid: 256 rows = 2 row atoms, 8 blocks = 2 block atoms. With a
+        // single atom in either dimension the two atom walks coincide and this proves nothing.
+        let (rows, blocks) = (256_usize, 8_usize);
+        let sf_rows = round_up(rows, SF_ATOM_ROWS);
+        let (num_m_atoms, num_k_atoms) = (sf_rows / SF_ATOM_ROWS, blocks / SF_ATOM_COLS);
+        assert!(
+            num_m_atoms > 1 && num_k_atoms > 1,
+            "the fixture must have >1 atom in both dimensions or the atom-order half is vacuous"
+        );
+
+        for r in 0..rows {
+            for blk in 0..blocks {
+                let ours = Nvfp4Tensor::scale_offset_for(r, blk, sf_rows);
+                let kitchen = gen_core::blocked_scale_index(rows, blocks, r, blk);
+
+                // (i) Intra-atom slot: identical to `to_blocked`'s. This is the half the module docs
+                // call "the fixed, load-bearing part" — a transpose of `intra` breaks it here.
+                assert_eq!(
+                    ours % ATOM,
+                    kitchen % ATOM,
+                    "intra-atom slot for (row {r}, block {blk}) must match comfy `to_blocked`"
+                );
+
+                // (ii) Atom index: Kitchen is row-major over the atom grid, this container is
+                // column-major, so ours must be the transpose of Kitchen's — not merely different.
+                let kitchen_atom = kitchen / ATOM;
+                let transposed =
+                    (kitchen_atom % num_k_atoms) * num_m_atoms + (kitchen_atom / num_k_atoms);
+                assert_eq!(
+                    ours / ATOM,
+                    transposed,
+                    "atom index for (row {r}, block {blk}) must be `to_blocked`'s atom transposed"
+                );
+            }
+        }
+
+        // Two concrete bytes of the documented CUTLASS layout, so a reader can check the claim by
+        // hand and so a mutation that happens to preserve the relations above still trips here.
+        // Intra-atom: row 1 → slot 16 (`(1 % 32) * 16`); row 32 → slot 4 (`(32 / 32) * 4`). A
+        // transpose of the intra formula swaps exactly these two.
+        assert_eq!(Nvfp4Tensor::scale_offset_for(1, 0, 128), 16);
+        assert_eq!(Nvfp4Tensor::scale_offset_for(32, 0, 128), 4);
+        // Atom order, on the 2×2 grid: (row 0, block 4) is atom 2 column-major → byte 1024, where
+        // `to_blocked` puts it at 512 (gen-core pins that literal). The disagreement is the whole
+        // reason `from_kitchen_parts` permutes rather than copies.
+        assert_eq!(Nvfp4Tensor::scale_offset_for(0, 4, 256), 1024);
+        assert_eq!(gen_core::blocked_scale_index(256, 8, 0, 4), 512);
+    }
+
+    // ---- non-finite inputs are refused, not absorbed -------------------------------------------
+
+    /// sc-20651 review (minor). A NaN weight would be dropped by the `f32::max` amax fold and then
+    /// pack as E2M1 code `0`; a single `+inf` would make `global_scale` infinite and zero **every**
+    /// element. Both are silent — the container comes back well-formed and wrong, which for an
+    /// imported checkpoint is an all-zero layer that renders black rather than a load error.
+    #[test]
+    fn pack_from_slice_refuses_non_finite_inputs() {
+        let (rows, cols) = (2_usize, 16_usize);
+
+        for (label, bad, at) in [("NaN", f32::NAN, 3_usize), ("inf", f32::INFINITY, 17)] {
+            let mut data = vec![0.25_f32; rows * cols];
+            data[at] = bad;
+            let err = Nvfp4Tensor::pack_from_slice(&data, rows, cols)
+                .expect_err("a non-finite weight element must be refused");
+            let msg = err.to_string();
+            // The refusal names the offending element and its value — not a bare "invalid input".
+            assert!(
+                msg.contains(&format!("weight element {at}")),
+                "{label}: refusal must name the element index, got {msg}"
+            );
+            assert!(
+                msg.contains(&format!("row {}, col {}", at / cols, at % cols)),
+                "{label}: refusal must name the (row, col), got {msg}"
+            );
+            assert!(
+                msg.contains("must be finite"),
+                "{label}: refusal must name the violated property, got {msg}"
+            );
+        }
+
+        // -inf too, and the all-finite fixture still packs (the gate is not a blanket refusal).
+        let mut data = vec![0.25_f32; rows * cols];
+        data[0] = f32::NEG_INFINITY;
+        assert!(Nvfp4Tensor::pack_from_slice(&data, rows, cols).is_err());
+        data[0] = 0.25;
+        assert!(Nvfp4Tensor::pack_from_slice(&data, rows, cols).is_ok());
+    }
+
+    /// The Kitchen constructor's per-tensor-scale gate shares [`non_finite_msg`] with the packer, so
+    /// both name a NaN/inf the same way. Non-negativity stays a separate, separately-worded refusal.
+    #[test]
+    fn kitchen_parts_refuses_a_non_finite_or_negative_global_scale() {
+        let (rows, cols) = (128_usize, 64_usize);
+        let packed = vec![0u8; rows * cols / 2];
+        let scales = vec![0u8; Nvfp4Tensor::scale_tensor_len(rows, cols)];
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let msg = Nvfp4Tensor::from_kitchen_parts(&packed, &scales, bad, rows, cols)
+                .expect_err("non-finite global scale must be refused")
+                .to_string();
+            assert!(msg.contains("must be finite"), "got {msg}");
+        }
+        let msg = Nvfp4Tensor::from_kitchen_parts(&packed, &scales, -1.0, rows, cols)
+            .expect_err("negative global scale must be refused")
+            .to_string();
+        assert!(msg.contains("must be non-negative"), "got {msg}");
+    }
+
     // ---- nibble packing convention ------------------------------------------------------------
 
     #[test]
@@ -761,7 +930,7 @@ mod tests {
         let mut data = vec![0f32; cols];
         data[0] = 6.0; // will map to the block-max magnitude
         data[1] = -6.0;
-        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols);
+        let t = Nvfp4Tensor::pack_from_slice(&data, rows, cols).unwrap();
         let byte0 = t.packed[0];
         let (low, high) = (byte0 & 0x0F, byte0 >> 4);
         assert_eq!(low & 0x08, 0x00, "col 0 (+6) low nibble positive");

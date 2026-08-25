@@ -87,6 +87,11 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
     // register one, and the builder refuses a duplicate row outright.
     let registry = candle_gen::logical_weights::register_checkpoint_codecs(registry);
+    // The GGUF **container** row (sc-20649) is the one codec the engine crate cannot own: decoding
+    // it needs candle's `gguf_file` reader and the ggml block constants, which live with the
+    // implementation in `candle-gen-wan`. It is registered here, once, alongside the engine table
+    // for the same reason the engine table is — so exactly one place composes the codec set.
+    let registry = registry.register_checkpoint_codec(candle_gen::gen_core::GGUF_CONTAINER_CODEC);
     let registry = candle_gen_anima::register_providers(registry);
     let registry = candle_gen_bernini::register_providers(registry);
     let registry = candle_gen_boogu::register_providers(registry);
@@ -4331,20 +4336,50 @@ mod tests {
     fn checkpoint_codecs_register_once_and_every_row_has_an_engine_implementation() {
         use candle_gen::logical_weights::{BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS};
 
+        use candle_gen::gen_core::GGUF_CONTAINER_CODEC;
+
         let registry = super::provider_registry().unwrap();
         let registered: Vec<_> = registry.checkpoint_codecs().codecs().copied().collect();
+        // The engine's safetensors table, then the one GGUF container row the catalog adds because
+        // its implementation lives in `candle-gen-wan` rather than in the engine crate. Still
+        // exactly one composition point: no family `register_providers` may add a row.
+        let expected: Vec<_> = BASELINE_CODECS
+            .iter()
+            .copied()
+            .chain(std::iter::once(GGUF_CONTAINER_CODEC))
+            .collect();
         assert_eq!(
-            registered, BASELINE_CODECS,
-            "the composed Candle catalog must carry the engine codec table exactly once; no \
-             family crate may add or repeat a row"
+            registered, expected,
+            "the composed Candle catalog must carry the engine codec table exactly once plus the \
+             GGUF container row; no family crate may add or repeat a row"
         );
         let mut registered_ids: Vec<&str> = registered.iter().map(|codec| codec.codec_id).collect();
         registered_ids.sort_unstable();
-        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS.to_vec();
+        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS
+            .iter()
+            .copied()
+            .chain(std::iter::once(
+                candle_gen_wan::GGUF_CODEC_IMPLEMENTATION_ID,
+            ))
+            .collect();
         implemented.sort_unstable();
         assert_eq!(
             registered_ids, implemented,
             "every registered codec row needs a decode implementation and vice versa"
+        );
+        // The GGUF row is reachable by its own container encoding, and — critically — is NOT
+        // reachable from any safetensors dtype: `WeightEncoding::from_dtype` can never produce
+        // `GgufContainer`, so a safetensors U8/fp8 tensor cannot be routed into the GGUF decoder.
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::GgufContainer)
+            .is_some_and(|codec| codec.codec_id == GGUF_CONTAINER_CODEC.codec_id));
+        // The plan-side registry `candle-gen-wan` compiles against carries the same row.
+        assert_eq!(
+            candle_gen_wan::gguf_codec_registry()
+                .for_encoding(candle_gen::gen_core::WeightEncoding::GgufContainer)
+                .map(|codec| codec.codec_id),
+            Some(GGUF_CONTAINER_CODEC.codec_id)
         );
         assert!(registry
             .checkpoint_codecs()
@@ -4354,6 +4389,87 @@ mod tests {
             .checkpoint_codecs()
             .for_encoding(candle_gen::gen_core::WeightEncoding::Fp8E4M3)
             .is_some());
+    }
+
+    /// Every `mapping_id` the composed Candle catalog registers resolves to a real
+    /// `LogicalKeyMapping` on this backend, **or** is explicitly declared not plan-driven here.
+    ///
+    /// Both directions matter, and both were broken before sc-20651: five declared mapping ids had
+    /// no implementation anywhere (they read like backed routes and were not), and nothing proved
+    /// that a mapping the Candle lane really does plan through is declared as such. The mirror of
+    /// `mlx-gen-catalog`'s `canonical_mappings_are_backed_by_declared_implementations`.
+    #[test]
+    fn canonical_mappings_are_backed_by_declared_implementations() {
+        use candle_gen::gen_core::{CheckpointBackend, LogicalKeyMapping};
+
+        let registry = super::provider_registry().unwrap();
+        // The complete set of `LogicalKeyMapping` implementations reachable from the Candle
+        // platform. Adding one without declaring it (or declaring one without adding it) fails
+        // below.
+        //
+        // The Krea mapping carries a file-detected namespace prefix and an optional architecture
+        // config; neither affects `mapping_id`, so the id-surface check below uses the
+        // no-config, bare-prefix form.
+        let krea =
+            candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping::without_config("");
+        let implementations: &[&dyn LogicalKeyMapping] =
+            &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea];
+
+        let mut declared_here = 0usize;
+        for adapter in registry.checkpoint_adapters() {
+            for mapping in adapter.canonical_mappings {
+                let implemented = implementations
+                    .iter()
+                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id);
+                let declared = mapping
+                    .plan_driven_backends
+                    .contains(&CheckpointBackend::Candle);
+                assert_eq!(
+                    implemented,
+                    declared,
+                    "adapter {} dialect {:?}: mapping id {:?} is {} on Candle but {} — a declared \
+                     mapping must resolve to a real implementation, and an implementation must be \
+                     declared (loader-native dialects declare no backend at all)",
+                    adapter.adapter_id,
+                    mapping.dialect,
+                    mapping.mapping_id,
+                    if implemented {
+                        "implemented"
+                    } else {
+                        "unimplemented"
+                    },
+                    if declared {
+                        "declared plan-driven"
+                    } else {
+                        "declared loader-native"
+                    },
+                );
+                declared_here += usize::from(declared);
+            }
+        }
+        assert_eq!(
+            declared_here,
+            implementations.len(),
+            "every Candle mapping implementation must be claimed by exactly one registered dialect"
+        );
+
+        // And the Wan mapping really is the refusing remap the GGUF route plans through: a native
+        // key resolves to its diffusers name, and a foreign one refuses rather than passing
+        // through unchanged.
+        let wan = candle_gen_wan::WanNativeToDiffusersMapping;
+        assert_eq!(
+            wan.logical_key("blocks.0.self_attn.q.weight").as_deref(),
+            Some("blocks.0.attn1.to_q.weight")
+        );
+        assert_eq!(wan.logical_key("vace_blocks.0.before_proj.weight"), None);
+
+        // ...and the Krea mapping really is the native-mmdit remap the Kitchen NVFP4 import plans
+        // through: a native key resolves to its diffusers name, a foreign one refuses.
+        assert_eq!(
+            krea.logical_key("blocks.0.attn.wq.weight").as_deref(),
+            Some("transformer_blocks.0.attn.to_q.weight")
+        );
+        assert_eq!(krea.logical_key("blocks.0.attn.bogus"), None);
     }
 
     #[test]
@@ -4418,13 +4534,17 @@ mod tests {
         );
         assert_eq!(
             binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
-            [
-                ImportedModelOperation::Generate,
-                ImportedModelOperation::Edit,
-            ],
-            "Candle implements the fused SDXL edit route: main's 0d7eafb4b sealed the Candle \
-             SDXL edit provider's memory-strategy routes and registered the fused-checkpoint \
-             Edit operation, so the route is no longer MLX-only"
+            [ImportedModelOperation::Generate],
+            "Candle truthfully omits the fused SDXL edit route (sc-20651 review). The previous \
+             expectation here asserted that Candle 'implements' it; it did not. The binding \
+             existed, but it named the txt2img `sdxl` provider, whose descriptor declares no \
+             `Reference` conditioning — so the capability floor refused every request the route \
+             admitted. The Candle SDXL edit stack (`edit_provider::SdxlEdit`) is a name-driven \
+             provider that needs a diffusers snapshot dir and a staged fp16-fix VAE; it has no \
+             `LdmComponents`-fed constructor and so cannot serve a fused single-file import. \
+             `SDXL_CHECKPOINT_ADAPTER.eligible_backends` is `[Mlx, Candle]`, so the per-operation \
+             completeness check does not oblige Candle to bind Edit — exactly as Candle Krea \
+             omits the MLX-only pose route above. MLX keeps its Edit binding and honors it."
         );
         for adapter in &adapters {
             if adapter.eligible_backends == [CheckpointBackend::Candle] {
@@ -4489,14 +4609,8 @@ mod tests {
                 required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
                 inherit_adapters: true,
             },
-            ImportedModelRegistration {
-                family: "sdxl",
-                source: ImportedModelSource::FusedCheckpoint,
-                operation: ImportedModelOperation::Edit,
-                provider_id: candle_gen_sdxl::MODEL_ID,
-                required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
-                inherit_adapters: true,
-            },
+            // No `sdxl` + `FusedCheckpoint` + `Edit` row: Candle does not bind that operation
+            // (sc-20651 review). See the `binding_operations` expectation above for why.
             ImportedModelRegistration {
                 // Wan's imported route takes NO caller-staged components: the UMT5 encoder, VAE
                 // and tokenizer come from a resident snapshot tier the caller resolves, not from

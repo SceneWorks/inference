@@ -65,16 +65,8 @@ const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
 
 /// The codec rows this engine implements and registers — identical to the MLX table (codecs are
 /// backend-portable declarations; each engine owns its implementation).
-pub const BASELINE_CODECS: &[CheckpointCodecRegistration] = &[
-    DENSE_BF16_CODEC,
-    DENSE_F16_CODEC,
-    DENSE_F32_CODEC,
-    FP8_E4M3_SCALAR_CODEC,
-    FP8_E5M2_SCALAR_CODEC,
-    MXFP8_CODEC,
-    INT8_PER_ROW_CODEC,
-    NVFP4_CODEC,
-];
+pub const BASELINE_CODECS: &[CheckpointCodecRegistration] =
+    gen_core::checkpoint_codec::BASELINE_CHECKPOINT_CODECS;
 
 /// The codec ids this engine has a decode implementation for. Must equal the ids of
 /// [`BASELINE_CODECS`] (the catalog test proves it).
@@ -163,7 +155,7 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         &self,
         codec: &CheckpointCodecRegistration,
         spec: &TensorCodecSpec,
-        _stored_shape: &[usize],
+        stored_shape: &[usize],
     ) -> ResidencyMode {
         // The compiler already forces Dense for `full_precision_matrix_mult` layers; checking it
         // here keeps this predicate honest if that ever moved.
@@ -172,7 +164,19 @@ impl CodecResidencyPolicy for CandleCodecResidency {
         }
         // The scalar E4M3 row. The plain undescribed cast (unit scale) qualifies too:
         // `matmul_fp8` takes any f32 weight scale.
-        if self.fp8_e4m3_native && codec.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id {
+        //
+        // **Rank-2 only** — the contract this module's header already states ("a rank-2 E4M3
+        // weight"), enforced rather than merely documented. `CublasLt::matmul_fp8` is a matrix
+        // multiply: its weight-side operand is `[out, in]`. An fp8 checkpoint's rank-1 rows are
+        // real — ComfyUI casts biases and modulation vectors to fp8 alongside the projections —
+        // and planning one `Packed` hands `Nvfp4Linear`'s fp8 sibling a rank-1 container it cannot
+        // read, while MLX (dense-only) decodes the same tensor correctly. That divergence is a
+        // backend disagreement about the same file, so the floor is enforced here, at plan time,
+        // where the fallback is the dense decode both backends share.
+        if self.fp8_e4m3_native
+            && codec.codec_id == FP8_E4M3_SCALAR_CODEC.codec_id
+            && stored_shape.len() == 2
+        {
             return ResidencyMode::Packed;
         }
         // NVFP4 needs the hardware floor, a layout the FP4 leg accepts, *and* a stored grid that is
@@ -300,6 +304,18 @@ pub enum LogicalTensor {
         codes: Tensor,
         /// The `weight_scale` value (1.0 for the plain undescribed cast).
         weight_scale: f32,
+        /// Whether the sibling `weight_scale` was **read from a `{layer}.weight_scale` companion row**
+        /// (`true`) or is the plain undescribed cast's synthetic unit scale (`false`).
+        ///
+        /// This is a residency-accounting fact, not a decode fact — `matmul_fp8` takes the same
+        /// `f32` either way. The plan prices a retained `weight_scale` on its
+        /// [`gen_core::checkpoint_codec::CompanionTensorPlan`] row, and
+        /// [`gen_core::checkpoint_codec::ScalarScaleSource::Unit`] has **no** such row (there is no
+        /// tensor in the file to price). Counting four bytes unconditionally in
+        /// [`Self::resident_bytes`] therefore made the receipt exceed the plan by exactly
+        /// `4 × (undescribed fp8 layers)` — a plan/receipt inequality on the one pairing the two
+        /// exist to cross-check.
+        weight_scale_from_companion: bool,
         /// The retained `input_scale` companion value, when the checkpoint carries one.
         input_scale: Option<f32>,
     },
@@ -332,10 +348,20 @@ impl LogicalTensor {
         match self {
             Self::Dense(tensor) => (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64,
             Self::PackedFp8E4M3 {
-                codes, input_scale, ..
+                codes,
+                weight_scale_from_companion,
+                input_scale,
+                ..
             } => {
+                // Count a retained scale exactly when the plan priced a companion row for it: an
+                // undescribed (`Unit`) fp8 layer has no `weight_scale` tensor in the file, so the
+                // plan prices none and the receipt must not invent four bytes of it.
                 (codes.elem_count() * codes.dtype().size_in_bytes()) as u64
-                    + SCALE_BYTES
+                    + if *weight_scale_from_companion {
+                        SCALE_BYTES
+                    } else {
+                        0
+                    }
                     + if input_scale.is_some() {
                         SCALE_BYTES
                     } else {
@@ -516,6 +542,15 @@ fn decode(
 ) -> Result<LogicalTensor> {
     use ::safetensors::Dtype as StDtype;
 
+    // A block-padded row (MXFP8/NVFP4) whose adapter declared no logical shape would decode its
+    // PADDING as weights — see [`LogicalTensorPlan::undeclared_padded_storage`]. Planning such a
+    // file stays legal (the padded grid is a conservative pricing over-estimate, and the plans
+    // compiled for admission never materialize a tensor); materializing it is not. The refusal text
+    // is gen-core's, so both engines refuse the same checkpoint with the same diagnosis.
+    if let Some(refusal) = tensor.undeclared_padded_storage_refusal() {
+        return Err(CandleError::Msg(refusal));
+    }
+
     let view = st.get(&tensor.physical_key)?;
     match &tensor.codec {
         TensorCodecSpec::Dense => {
@@ -562,11 +597,12 @@ fn decode(
                 expected_dtype,
                 &tensor.shape,
             )?;
-            let weight_scale = match scale {
-                ScalarScaleSource::Unit => 1.0_f32,
-                ScalarScaleSource::Companion { physical_key } => {
-                    scalar_f32(companion_bytes(st, tensor, physical_key)?, physical_key)?
-                }
+            let (weight_scale, weight_scale_from_companion) = match scale {
+                ScalarScaleSource::Unit => (1.0_f32, false),
+                ScalarScaleSource::Companion { physical_key } => (
+                    scalar_f32(companion_bytes(st, tensor, physical_key)?, physical_key)?,
+                    true,
+                ),
             };
             match tensor.residency.mode {
                 ResidencyMode::Dense => {
@@ -592,12 +628,13 @@ fn decode(
                         Ok(LogicalTensor::PackedFp8E4M3 {
                             codes,
                             weight_scale,
+                            weight_scale_from_companion,
                             input_scale,
                         })
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        let _ = input_scale;
+                        let _ = (input_scale, weight_scale_from_companion);
                         Err(CandleError::Msg(format!(
                             "codec {}: tensor {:?} was planned with packed-native fp8 residency, \
                              but this build has no CUDA fp8 leg; replan with a dense residency \
@@ -781,6 +818,27 @@ mod tests {
         }
         fn logical_key(&self, physical_key: &str) -> Option<String> {
             physical_key.strip_prefix("model.").map(str::to_owned)
+        }
+    }
+
+    /// [`StripModel`] that also **declares** one logical shape for every key it maps.
+    ///
+    /// A block-padded codec row (MXFP8/NVFP4) is only materializable when the adapter states the
+    /// layer's true geometry — otherwise the plan can do nothing but carry the padded stored grid
+    /// forward, and decoding it would promote padding to weights (`gen_core` refuses by name). The
+    /// NVFP4 fixtures below are built UNPADDED on purpose, so declaring the grid they were built at
+    /// is the adapter making a true statement about them, not a restatement of the storage.
+    struct StripModelDeclaring(Vec<usize>);
+
+    impl LogicalKeyMapping for StripModelDeclaring {
+        fn mapping_id(&self) -> &'static str {
+            "strip-model-declaring-test"
+        }
+        fn logical_key(&self, physical_key: &str) -> Option<String> {
+            physical_key.strip_prefix("model.").map(str::to_owned)
+        }
+        fn logical_shape(&self, _logical_key: &str) -> Option<Vec<usize>> {
+            Some(self.0.clone())
         }
     }
 
@@ -1083,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_registration_carries_the_seven_row_table() {
+    fn catalog_registration_carries_the_shared_baseline_codec_table() {
         let registry = baseline_codec_registry();
         let mut registered: Vec<&str> = registry.codecs().map(|codec| codec.codec_id).collect();
         registered.sort_unstable();
@@ -1100,6 +1158,13 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             BASELINE_CODECS
+        );
+        // The table itself is gen-core's, not this crate's: a codec is a backend-portable
+        // declaration, and two hand-kept copies could drift into a checkpoint one engine plans and
+        // the other refuses with nothing comparing them.
+        assert_eq!(
+            BASELINE_CODECS,
+            gen_core::checkpoint_codec::BASELINE_CHECKPOINT_CODECS
         );
     }
 
@@ -1453,6 +1518,7 @@ mod tests {
             LogicalTensor::PackedFp8E4M3 {
                 codes: codes.clone(),
                 weight_scale: 1.0,
+                weight_scale_from_companion: true,
                 input_scale: None,
             }
             .resident_bytes(),
@@ -1463,6 +1529,7 @@ mod tests {
             LogicalTensor::PackedFp8E4M3 {
                 codes,
                 weight_scale: 1.0,
+                weight_scale_from_companion: true,
                 input_scale: Some(0.5),
             }
             .resident_bytes(),
@@ -1509,8 +1576,13 @@ mod tests {
             )],
         );
 
+        // The fixture is built at exactly [rows, cols] — no ComfyUI padding — so the adapter
+        // declaring that grid is a true statement about the layer, and it is REQUIRED: without a
+        // declaration the plan could not tell this grid from a padded one and refuses to
+        // materialize it (sc-20651).
+        let mapping = StripModelDeclaring(vec![rows, cols]);
         let plan =
-            plan_logical_weights(&path, &StripModel, &CandleCodecResidency::DENSE).expect("plan");
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
         assert_eq!(plan.codec_ids(), vec!["nvfp4-v1"]);
         let tensor = &plan.tensors[0];
         assert_eq!(tensor.shape, vec![rows, cols], "the logical element grid");
@@ -1605,7 +1677,9 @@ mod tests {
             fp8_e4m3_native: false,
             nvfp4_native: true,
         };
-        let plan = plan_logical_weights(&path, &StripModel, &native).expect("plan");
+        // Unpadded fixture; the adapter declares the grid it was built at (see above).
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+        let plan = plan_logical_weights(&path, &mapping, &native).expect("plan");
         let tensor = &plan.tensors[0];
         assert_eq!(tensor.residency.mode, ResidencyMode::Packed);
         // Packed prices the stored 4-bit bytes; both scale levels are retained and priced on their
@@ -1626,7 +1700,7 @@ mod tests {
             (rows * cols / 2) as u64 + 256 * 8 + 4
         );
         let dense_plan =
-            plan_logical_weights(&path, &StripModel, &CandleCodecResidency::DENSE).expect("plan");
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
         assert!(plan.resident_bytes() < dense_plan.resident_bytes());
 
         // The read repacks into the container `Nvfp4Linear::from_packed_in` consumes...
@@ -1860,6 +1934,154 @@ mod tests {
             CandleCodecResidency::probe(&Device::Cpu),
             CandleCodecResidency::DENSE
         );
+    }
+
+    /// **sc-20651 major 3: an undeclared block-padded layer plans but must not materialize.**
+    ///
+    /// NVFP4 storage is 16-padded on both axes and the file records no true geometry, so with no
+    /// adapter-declared logical shape the plan can only carry the *stored* grid forward. Decoding
+    /// that grid hands the model the pad rows/columns as real weights — silent corruption, not a
+    /// shape error, because every downstream check that trusts the plan agrees with it.
+    ///
+    /// Planning stays legal: a plan is also the pricing artifact admission reads, the padded grid is
+    /// a conservative over-estimate, and the memory-strategy paths that compile a plan never
+    /// materialize a tensor. Materialization is where it stops, and the refusal names the tensor.
+    #[test]
+    fn an_undeclared_block_padded_layer_plans_but_refuses_to_materialize() {
+        let (rows, cols) = (32_usize, 64_usize);
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-undeclared.safetensors");
+        let packed = vec![0x11_u8; rows * cols / 2];
+        let block_scales =
+            vec![0x38_u8; gen_core::nvfp4_scale_shape([rows, cols]).iter().product()];
+        write_safetensors_with_metadata(
+            &path,
+            &[
+                ("model.q.weight", "U8", &[rows, cols / 2], packed),
+                (
+                    "model.q.weight_scale",
+                    "F8_E4M3",
+                    &gen_core::nvfp4_scale_shape([rows, cols]),
+                    block_scales,
+                ),
+                (
+                    "model.q.weight_scale_2",
+                    "F32",
+                    &[],
+                    1.0_f32.to_le_bytes().to_vec(),
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#,
+            )],
+        );
+
+        // Plans — and prices — with nothing declared.
+        let undeclared = plan_logical_weights(&path, &StripModel, &CandleCodecResidency::DENSE)
+            .expect("an undeclared padded checkpoint still PLANS: pricing is not materialization");
+        assert_eq!(undeclared.codec_ids(), vec!["nvfp4-v1"]);
+        assert_eq!(
+            undeclared.tensors[0].undeclared_padded_storage(),
+            Some([rows, cols]),
+            "the plan records that its logical shape is only the stored grid"
+        );
+
+        // ...but the read refuses, naming the tensor.
+        let error = match read_logical_weights(&path, &undeclared, &Device::Cpu) {
+            Ok(_) => panic!("materializing an undeclared padded grid must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("model.q.weight"), "{error}");
+        assert!(error.contains("block-padded"), "{error}");
+        assert!(error.contains("declares no logical shape"), "{error}");
+
+        // The SAME file, with the adapter declaring the layer's true geometry, reads.
+        let declared = plan_logical_weights(
+            &path,
+            &StripModelDeclaring(vec![rows, cols]),
+            &CandleCodecResidency::DENSE,
+        )
+        .expect("plan");
+        assert_eq!(declared.tensors[0].undeclared_padded_storage(), None);
+        read_logical_weights(&path, &declared, &Device::Cpu)
+            .expect("a declared layer materializes exactly as before");
+    }
+
+    /// **sc-20651 blocker 2: the fp8 packed leg is rank-2 only.**
+    ///
+    /// `CublasLt::matmul_fp8`'s weight-side operand is a matrix, and this module's header has
+    /// always said so ("a rank-2 E4M3 weight"). The policy did not enforce it, and the plan
+    /// compiler deliberately applies **no** rank constraint to *undescribed* fp8 (ComfyUI's
+    /// `weight_dtype=fp8_e4m3fn` cast covers biases and modulation vectors too), so a rank-1 bias
+    /// in such a checkpoint planned `Packed` on an sm_89 CUDA device — into a container the fp8 leg
+    /// cannot read — while MLX dense-decoded the same tensor correctly. That is two backends
+    /// disagreeing about one file.
+    #[test]
+    fn fp8_packed_residency_is_rank_two_only() {
+        let native = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: false,
+        };
+        let scalar_fp8 = TensorCodecSpec::ScalarFp8 {
+            scale: ScalarScaleSource::Unit,
+            input_scale: None,
+            full_precision_matrix_mult: false,
+        };
+        assert_eq!(
+            native.residency(&FP8_E4M3_SCALAR_CODEC, &scalar_fp8, &[2048, 512]),
+            ResidencyMode::Packed,
+            "a rank-2 projection is the packed leg's operand"
+        );
+        for stored in [
+            vec![2048_usize],         // a bias / modulation vector — the real rank-1 case
+            vec![],                   // a scalar
+            vec![4_usize, 2048, 512], // a rank-3 payload
+        ] {
+            assert_eq!(
+                native.residency(&FP8_E4M3_SCALAR_CODEC, &scalar_fp8, &stored),
+                ResidencyMode::Dense,
+                "stored rank {} must take the dense fallback both backends share",
+                stored.len()
+            );
+        }
+    }
+
+    /// **sc-20651 minor: a packed fp8 receipt counts a retained scale only when one exists.**
+    ///
+    /// The plan prices a retained `weight_scale` on its companion row, and
+    /// [`ScalarScaleSource::Unit`] — the plain undescribed cast — has no such row, because there is
+    /// no tensor in the file to price. `resident_bytes` added four bytes unconditionally, so the
+    /// receipt exceeded the plan by exactly `4 x (undescribed fp8 layers)` on the one pairing the
+    /// two exist to cross-check.
+    #[test]
+    fn packed_fp8_resident_bytes_counts_only_companions_that_exist() {
+        let codes = Tensor::zeros((8, 8), DType::F8E4M3, &Device::Cpu).expect("codes");
+        let unit = LogicalTensor::PackedFp8E4M3 {
+            codes: codes.clone(),
+            weight_scale: 1.0,
+            weight_scale_from_companion: false,
+            input_scale: None,
+        };
+        let companion = LogicalTensor::PackedFp8E4M3 {
+            codes: codes.clone(),
+            weight_scale: 0.5,
+            weight_scale_from_companion: true,
+            input_scale: None,
+        };
+        let both = LogicalTensor::PackedFp8E4M3 {
+            codes,
+            weight_scale: 0.5,
+            weight_scale_from_companion: true,
+            input_scale: Some(0.25),
+        };
+        assert_eq!(
+            unit.resident_bytes(),
+            64,
+            "the undescribed cast retains no scale ROW, so it prices none"
+        );
+        assert_eq!(companion.resident_bytes(), 64 + 4);
+        assert_eq!(both.resident_bytes(), 64 + 4 + 4);
     }
 
     /// AC1 (Candle). Every NVFP4 layout defect fails closed, naming the layer.

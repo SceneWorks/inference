@@ -55,6 +55,17 @@ pub enum WeightEncoding {
     UInt32,
     UInt64,
     Bool,
+    /// A **GGUF container** payload: one ggml block-quantized (or dense F16/F32/BF16) tensor as it
+    /// sits in a `.gguf` file (epic 20398, sc-20649).
+    ///
+    /// Deliberately unreachable from safetensors: [`WeightEncoding::from_dtype`] never returns it,
+    /// so no safetensors header can route to the GGUF codec row, and
+    /// [`element_bytes`](WeightEncoding::element_bytes) reports `0` because a block quant has no
+    /// integral per-element width — a caller that tried to size a GGUF tensor the safetensors way
+    /// gets `0` and fails closed on the byte-integrity check instead of a plausible-looking number.
+    /// A GGUF plan producer looks the row up directly (`for_encoding(GgufContainer)`) and measures
+    /// every byte from the container's own ggml block/type sizes — see [`GGUF_CONTAINER_CODEC`].
+    GgufContainer,
 }
 
 impl WeightEncoding {
@@ -82,13 +93,52 @@ impl WeightEncoding {
         })
     }
 
-    /// Bytes one element occupies when resident in this encoding.
+    /// Bytes one element occupies when resident in this encoding. `0` for
+    /// [`WeightEncoding::GgufContainer`], which is block-quantized and has no integral per-element
+    /// width — see that variant's documentation.
     pub fn element_bytes(self) -> u64 {
         match self {
+            Self::GgufContainer => 0,
             Self::Bool | Self::Int8 | Self::UInt8 | Self::Fp8E4M3 | Self::Fp8E5M2 => 1,
             Self::DenseBf16 | Self::DenseF16 | Self::Int16 | Self::UInt16 => 2,
             Self::DenseF32 | Self::Int32 | Self::UInt32 => 4,
             Self::DenseF64 | Self::Int64 | Self::UInt64 => 8,
+        }
+    }
+
+    /// The safetensors dtype an element of this encoding is stored as — the exact inverse of
+    /// [`Self::from_dtype`] on its `Some` domain.
+    ///
+    /// Exhaustive on purpose. The two byte-pricing projections in
+    /// [`LogicalWeightPlan::resident_tensor_headers`] each need this map, and the packed one used to
+    /// spell it as three arms plus `_ => Dtype::U8`. That wildcard is only correct because the
+    /// packed rows happen to be fp8/int8/NVFP4-in-`U8` today; a codec that grows a packed row for
+    /// any other encoding would have been silently re-labelled `U8` — right byte count, wrong dtype
+    /// — in the headers admission prices from. Routing both arms through one total function makes
+    /// that a compile error instead.
+    pub fn to_dtype(self) -> Dtype {
+        match self {
+            Self::DenseBf16 => Dtype::BF16,
+            Self::DenseF16 => Dtype::F16,
+            Self::DenseF32 => Dtype::F32,
+            Self::DenseF64 => Dtype::F64,
+            Self::Fp8E4M3 => Dtype::F8_E4M3,
+            Self::Fp8E5M2 => Dtype::F8_E5M2,
+            Self::Int8 => Dtype::I8,
+            Self::UInt8 => Dtype::U8,
+            Self::Int16 => Dtype::I16,
+            Self::Int32 => Dtype::I32,
+            Self::Int64 => Dtype::I64,
+            Self::UInt16 => Dtype::U16,
+            Self::UInt32 => Dtype::U32,
+            Self::UInt64 => Dtype::U64,
+            Self::Bool => Dtype::BOOL,
+            // GGUF is a different *container*: its tensors carry a ggml block type, not a
+            // safetensors dtype, and a block quant has no integral bytes-per-element. `from_dtype`
+            // can never produce this variant, so this arm exists only so the map stays total; the
+            // opaque byte view is the honest projection of ggml blocks, and the `data_bytes` a
+            // pricing consumer reads alongside it carries the measured size regardless.
+            Self::GgufContainer => Dtype::U8,
         }
     }
 
@@ -109,6 +159,7 @@ impl WeightEncoding {
             Self::UInt32 => "uint32",
             Self::UInt64 => "uint64",
             Self::Bool => "bool",
+            Self::GgufContainer => "gguf-container",
         }
     }
 }
@@ -274,6 +325,53 @@ pub const COMFY_QUANT_CODECS: &[CheckpointCodecRegistration] = &[
     INT8_PER_ROW_CODEC,
     NVFP4_CODEC,
 ];
+
+/// The **baseline engine codec table**: [`DENSE_CODECS`] followed by [`COMFY_QUANT_CODECS`], the
+/// rows every checkpoint-importing engine registers.
+///
+/// Declared once here rather than twice in the backends. A *codec* is a backend-portable
+/// declaration of a stored format — the same eight rows mean the same eight things on Metal and on
+/// CUDA — so two hand-maintained copies of the list could drift into a checkpoint one backend
+/// plans and the other refuses as `UnsupportedFormat`, with nothing comparing them (mlx-gen builds
+/// only on macOS, candle-gen's quantized legs only under `cuda`, so no single compilation sees both
+/// lists). What stays per-backend is `CODEC_IMPLEMENTATION_IDS` — the claim "I have a decode arm
+/// for this row" — which each engine's catalog conformance test pins against this table.
+pub const BASELINE_CHECKPOINT_CODECS: &[CheckpointCodecRegistration] = &[
+    DENSE_BF16_CODEC,
+    DENSE_F16_CODEC,
+    DENSE_F32_CODEC,
+    FP8_E4M3_SCALAR_CODEC,
+    FP8_E5M2_SCALAR_CODEC,
+    MXFP8_CODEC,
+    INT8_PER_ROW_CODEC,
+    NVFP4_CODEC,
+];
+
+/// The **GGUF container** codec (epic 20398, sc-20649): one ggml-quantized tensor read out of a
+/// `.gguf` file and held **quantized-resident**, dequantized per matmul rather than at load.
+///
+/// # Why this row is not a safetensors format
+///
+/// Every other row claims a [`StoredTensorFormat`] built from a safetensors dtype plus an optional
+/// `.comfy_quant` descriptor. GGUF is a different *container*: its tensors carry a ggml block type
+/// (`Q4_K`, `Q6_K`, `F16`, …), not a safetensors dtype, and a block quant has no integral
+/// bytes-per-element. So this row claims [`WeightEncoding::GgufContainer`], which
+/// [`WeightEncoding::from_dtype`] can never produce — a safetensors header cannot reach this codec,
+/// and this codec never shadows one of the safetensors rows.
+///
+/// # Residency
+///
+/// The engine that implements this row keeps the ggml blocks resident (the whole point of a GGUF
+/// tier: a Q4_K DiT that fits where a bf16 one does not) and reports **measured** container bytes;
+/// [`resident_encoding`](CheckpointCodecRegistration::resident_encoding) is the bf16 the dense
+/// fallback would leave, i.e. what the per-matmul dequant produces.
+pub const GGUF_CONTAINER_CODEC: CheckpointCodecRegistration = CheckpointCodecRegistration {
+    codec_id: "gguf-container-v1",
+    stored: &[StoredTensorFormat::undescribed(
+        WeightEncoding::GgufContainer,
+    )],
+    resident_encoding: WeightEncoding::DenseBf16,
+};
 
 /// Validated, immutable set of codecs keyed by stored format. Built by
 /// [`CheckpointCodecRegistry::new`] (and by `ProviderRegistryBuilder::build` from the rows a catalog
@@ -565,6 +663,59 @@ pub struct LogicalTensorPlan {
     pub residency: PlannedResidency,
 }
 
+impl LogicalTensorPlan {
+    /// `Some(stored_shape)` when this entry is a **block-padded** codec row (MXFP8 or NVFP4) whose
+    /// [`Self::shape`] is the padded *stored* grid only because the adapter's
+    /// [`LogicalKeyMapping::logical_shape`] declared nothing — i.e. the plan does not know the
+    /// layer's true geometry and merely assumed the padding away.
+    ///
+    /// # Why this is a read-time refusal and not a plan-time one
+    ///
+    /// MXFP8 storage is 32-padded on both axes and NVFP4 storage 16-padded, and neither file format
+    /// records the true `[out_features, in_features]`. With no declaration the compiler can only
+    /// carry the stored grid forward — so a `[3072, 60]` layer stored as `[3072, 64]` plans, prices
+    /// and decodes as `[3072, 64]`, and four columns of **padding become four columns of weights**
+    /// in the tensor handed to the model. That is silent corruption, not a shape error: the values
+    /// are real bytes and every downstream shape check that trusts the plan agrees with it.
+    ///
+    /// Planning is still allowed, because a plan is also a *pricing* artifact: the padded grid is a
+    /// conservative over-estimate of resident bytes, and the memory-strategy paths that compile a
+    /// plan for admission never materialize a tensor. It is **materialization** that must refuse,
+    /// which is what [`Self::undeclared_padded_storage_refusal`] says.
+    ///
+    /// Dense, scalar-fp8 and int8 rows are never padded (their stored grid *is* the logical one), so
+    /// they answer `None` regardless of what the adapter declares.
+    pub fn undeclared_padded_storage(&self) -> Option<[usize; 2]> {
+        match &self.codec {
+            TensorCodecSpec::Mxfp8 {
+                stored_shape,
+                logical_shape_declared,
+                ..
+            }
+            | TensorCodecSpec::Nvfp4 {
+                stored_shape,
+                logical_shape_declared,
+                ..
+            } if !*logical_shape_declared => Some(*stored_shape),
+            _ => None,
+        }
+    }
+
+    /// The one refusal message both engines emit for [`Self::undeclared_padded_storage`], so the
+    /// two backends refuse the same checkpoint with the same diagnosis rather than diverging.
+    pub fn undeclared_padded_storage_refusal(&self) -> Option<String> {
+        let stored = self.undeclared_padded_storage()?;
+        Some(format!(
+            "codec {}: tensor {:?} stores a block-padded grid {stored:?}, but the plan's mapping \
+             declares no logical shape for {:?}; the plan can only assume the padding away, which \
+             would materialize the pad rows/columns as real weights. Declare the architecture's \
+             logical shape on the adapter's LogicalKeyMapping (or plan this file with a mapping \
+             that does) — refusing rather than decoding a padded grid as the layer",
+            self.codec_id, self.physical_key, self.logical_key
+        ))
+    }
+}
+
 /// What a companion tensor is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompanionRole {
@@ -678,33 +829,13 @@ impl LogicalWeightPlan {
             .iter()
             .map(|tensor| {
                 let (dtype, shape) = match tensor.residency.mode {
-                    ResidencyMode::Dense => (
-                        match tensor.resident_encoding {
-                            WeightEncoding::DenseBf16 => Dtype::BF16,
-                            WeightEncoding::DenseF16 => Dtype::F16,
-                            WeightEncoding::DenseF32 => Dtype::F32,
-                            WeightEncoding::DenseF64 => Dtype::F64,
-                            WeightEncoding::Fp8E4M3 => Dtype::F8_E4M3,
-                            WeightEncoding::Fp8E5M2 => Dtype::F8_E5M2,
-                            WeightEncoding::Int8 => Dtype::I8,
-                            WeightEncoding::UInt8 => Dtype::U8,
-                            WeightEncoding::Int16 => Dtype::I16,
-                            WeightEncoding::Int32 => Dtype::I32,
-                            WeightEncoding::Int64 => Dtype::I64,
-                            WeightEncoding::UInt16 => Dtype::U16,
-                            WeightEncoding::UInt32 => Dtype::U32,
-                            WeightEncoding::UInt64 => Dtype::U64,
-                            WeightEncoding::Bool => Dtype::BOOL,
-                        },
-                        tensor.shape.clone(),
-                    ),
+                    ResidencyMode::Dense => {
+                        (tensor.resident_encoding.to_dtype(), tensor.shape.clone())
+                    }
                     ResidencyMode::Packed => (
-                        match tensor.encoding {
-                            WeightEncoding::Fp8E4M3 => Dtype::F8_E4M3,
-                            WeightEncoding::Fp8E5M2 => Dtype::F8_E5M2,
-                            WeightEncoding::Int8 => Dtype::I8,
-                            _ => Dtype::U8,
-                        },
+                        // The stored encoding, exhaustively — NVFP4's nibbles already classify as
+                        // `UInt8`, so no wildcard is needed to reach `U8`.
+                        tensor.encoding.to_dtype(),
                         match &tensor.codec {
                             TensorCodecSpec::Mxfp8 { stored_shape, .. } => stored_shape.to_vec(),
                             // NVFP4's resident packed form is the on-disk `U8` byte matrix

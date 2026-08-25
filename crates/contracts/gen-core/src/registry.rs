@@ -201,10 +201,27 @@ pub struct CheckpointBaseCompatibilityRegistration {
 ///
 /// The mapping id names the provider-owned exhaustive mapper exercised by family migration tests;
 /// callers never infer a mapper from a family allow-list.
+///
+/// # `plan_driven_backends`: which declarations are backed by code
+///
+/// A `mapping_id` is a *declaration*. Whether some crate actually ships a
+/// [`LogicalKeyMapping`](crate::checkpoint_codec::LogicalKeyMapping) with that id is a separate
+/// fact, and for most shipped families the answer is **no**: their loaders read the checkpoint on
+/// their own native path and never compile a
+/// [`LogicalWeightPlan`](crate::checkpoint_codec::LogicalWeightPlan). Declaring that difference
+/// here is what lets each catalog's conformance test prove reachability in both directions —
+/// a backend listed here **must** ship the impl, and a backend not listed **must not**, so neither
+/// an unbacked declaration nor an undeclared plan route can appear silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointCanonicalMappingRegistration {
     pub dialect: &'static str,
     pub mapping_id: &'static str,
+    /// Backends that ship a real `LogicalKeyMapping` implementation whose `mapping_id()` equals
+    /// [`mapping_id`](Self::mapping_id). Empty = **loader-native**: no backend routes this dialect
+    /// through the plan compiler today, and the id names the correspondence only. Must be a
+    /// duplicate-free subset of the adapter's
+    /// [`eligible_backends`](CheckpointAdapterRegistration::eligible_backends).
+    pub plan_driven_backends: &'static [CheckpointBackend],
 }
 
 /// Stable config-recovery authority for one semantic config field.
@@ -340,10 +357,21 @@ pub const KREA_2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
             CheckpointCanonicalMappingRegistration {
                 dialect: "krea-native",
                 mapping_id: "krea-native-to-diffusers-v1",
+                // BOTH engines: `mlx_gen_krea::KreaNativeToDiffusersMapping` and, since sc-20651,
+                // `candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping`. One dialect, one
+                // canonical mapping id, two implementations — which is the shape this field exists
+                // to make checkable rather than assumed.
+                plan_driven_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
             },
+            // NOT `identity-v1`. A Krea 2 checkpoint may carry *undescribed* fp8, and
+            // `IdentityKeyMapping` accepts every on-disk key — including a scale companion under an
+            // unrecognised suffix, which then plans as a unit-scale fp8 weight and decodes silently
+            // wrong (see the `IdentityKeyMapping` doc comment). `krea-2-diffusers-v1` is identity
+            // over the keys the Krea 2 architecture actually contains and REFUSES everything else.
             CheckpointCanonicalMappingRegistration {
                 dialect: "diffusers",
-                mapping_id: "identity-v1",
+                mapping_id: "krea-2-diffusers-v1",
+                plan_driven_backends: &[CheckpointBackend::Mlx],
             },
         ],
         config_recovery: &[
@@ -421,6 +449,9 @@ pub const SDXL_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAda
     canonical_mappings: &[CheckpointCanonicalMappingRegistration {
         dialect: "ldm",
         mapping_id: "sdxl-ldm-to-diffusers-v1",
+        // Loader-native: the SDXL LDM loaders do their own key translation and never compile a
+        // `LogicalWeightPlan`, so no crate ships a `LogicalKeyMapping` with this id.
+        plan_driven_backends: &[],
     }],
     config_recovery: &[
         CheckpointConfigRecoveryRegistration {
@@ -488,6 +519,8 @@ pub const MAGE_FLOW_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
         canonical_mappings: &[CheckpointCanonicalMappingRegistration {
             dialect: "diffusers",
             mapping_id: "identity-v1",
+            // Loader-native: the Mage-Flow diffusers-directory loader reads the snapshot directly.
+            plan_driven_backends: &[],
         }],
         config_recovery: &[CheckpointConfigRecoveryRegistration {
             field: "architecture",
@@ -539,6 +572,8 @@ pub const Z_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
         canonical_mappings: &[CheckpointCanonicalMappingRegistration {
             dialect: "comfyui",
             mapping_id: "z-image-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
         }],
         config_recovery: &[CheckpointConfigRecoveryRegistration {
             field: "architecture",
@@ -590,6 +625,8 @@ pub const QWEN_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
         canonical_mappings: &[CheckpointCanonicalMappingRegistration {
             dialect: "comfyui",
             mapping_id: "qwen-image-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
         }],
         config_recovery: &[CheckpointConfigRecoveryRegistration {
             field: "architecture",
@@ -638,6 +675,8 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
     canonical_mappings: &[CheckpointCanonicalMappingRegistration {
         dialect: "comfyui",
         mapping_id: "flux2-comfyui-to-diffusers-v1",
+        // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+        plan_driven_backends: &[],
     }],
     config_recovery: &[CheckpointConfigRecoveryRegistration {
         field: "architecture",
@@ -729,6 +768,10 @@ pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdap
     canonical_mappings: &[CheckpointCanonicalMappingRegistration {
         dialect: "comfyui",
         mapping_id: "wan-comfyui-to-diffusers-v1",
+        // Plan-driven on Candle: `candle_gen_wan::gguf::WanNativeToDiffusersMapping` is the
+        // refusing implementation of this id, and the GGUF DiT route (sc-20649) compiles its plan
+        // through it against the registered `gguf-container-v1` codec.
+        plan_driven_backends: &[CheckpointBackend::Candle],
     }],
     config_recovery: &[CheckpointConfigRecoveryRegistration {
         field: "architecture",
@@ -1532,6 +1575,22 @@ fn validate_checkpoint_adapters(
                 adapter.adapter_id
             )));
         }
+        // A dialect cannot be plan-driven on a backend the adapter is not eligible for, and cannot
+        // name the same backend twice: the catalog conformance tests read this list as the exact
+        // set of backends that must ship an implementation of `mapping_id`.
+        for mapping in adapter.canonical_mappings {
+            let plan_driven: std::collections::BTreeSet<_> =
+                mapping.plan_driven_backends.iter().copied().collect();
+            if plan_driven.len() != mapping.plan_driven_backends.len()
+                || !plan_driven.is_subset(&eligible_backends)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' canonical mapping for dialect '{}' declares a repeated or ineligible plan-driven backend",
+                    adapter.adapter_id, mapping.dialect
+                )));
+            }
+        }
+
         let operations: std::collections::BTreeSet<_> =
             adapter.operations.iter().copied().collect();
         if operations.len() != adapter.operations.len() {
@@ -4642,6 +4701,7 @@ mod tests {
         &[CheckpointCanonicalMappingRegistration {
             dialect: "fixture-diffusers",
             mapping_id: "fixture-identity-v1",
+            plan_driven_backends: &[],
         }];
     const FIXTURE_RECOVERY: &[CheckpointConfigRecoveryRegistration] =
         &[CheckpointConfigRecoveryRegistration {
@@ -5292,6 +5352,162 @@ mod tests {
             error.contains("no binding for shipped eligible backend 'candle'"),
             "{error}"
         );
+    }
+
+    /// A canonical mapping may only claim a plan-driven backend the adapter is eligible for, and
+    /// may not claim one twice. Each catalog's conformance test reads
+    /// `plan_driven_backends` as the exact set of backends that must ship a `LogicalKeyMapping`
+    /// with that id, so an ineligible or repeated entry would make the reachability proof
+    /// unsatisfiable (or vacuous) rather than merely untidy.
+    #[test]
+    fn canonical_mapping_plan_driven_backends_must_be_eligible_and_unique() {
+        const INELIGIBLE: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                // The fixture adapter is MLX-eligible only.
+                plan_driven_backends: &[CheckpointBackend::Candle],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        const REPEATED: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                plan_driven_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Mlx],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        for mapping in [INELIGIBLE, REPEATED] {
+            let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+            adapter.canonical_mappings = mapping;
+            let error = ProviderRegistryBuilder::new()
+                .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                .register_checkpoint_adapter(adapter)
+                .build()
+                .err()
+                .expect("a repeated or ineligible plan-driven backend must fail the build")
+                .to_string();
+            assert!(
+                error.contains("repeated or ineligible plan-driven backend"),
+                "{error}"
+            );
+        }
+
+        // And the honest declaration still builds.
+        const ELIGIBLE: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                plan_driven_backends: &[CheckpointBackend::Mlx],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        adapter.canonical_mappings = ELIGIBLE;
+        ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(adapter)
+            .build()
+            .expect("an eligible plan-driven backend builds");
+    }
+
+    /// The shipped posture, pinned per (adapter, dialect): which mapping id is the authority and
+    /// which backends actually implement it. Two facts this guards, both of which were live
+    /// defects before sc-20651:
+    ///
+    /// * the Krea 2 `diffusers` dialect must NOT be `identity-v1` — that mapping accepts every
+    ///   on-disk key and decodes undescribed fp8 at unit scale, silently wrong (its own doc comment
+    ///   forbids the use); and
+    /// * a `mapping_id` with no implementation anywhere must say so (`plan_driven_backends: &[]`)
+    ///   rather than reading like a backed route. The catalog tests then prove the non-empty
+    ///   entries resolve and the empty ones have nothing masquerading behind them.
+    #[test]
+    fn shipped_canonical_mapping_posture_is_pinned_per_dialect() {
+        use crate::checkpoint_codec::IdentityKeyMapping;
+
+        /// One pinned mapping row: `(dialect, mapping_id, plan_driven_backends)`.
+        type MappingRow = (&'static str, &'static str, &'static [CheckpointBackend]);
+
+        let expected: &[(&str, &[MappingRow])] = &[
+            (
+                KREA_2_CHECKPOINT_ADAPTER.adapter_id,
+                &[
+                    (
+                        // Implemented on BOTH engines since sc-20651 — one dialect, one canonical
+                        // mapping id, two implementations.
+                        "krea-native",
+                        "krea-native-to-diffusers-v1",
+                        &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+                    ),
+                    (
+                        "diffusers",
+                        "krea-2-diffusers-v1",
+                        &[CheckpointBackend::Mlx],
+                    ),
+                ],
+            ),
+            (
+                SDXL_CHECKPOINT_ADAPTER.adapter_id,
+                &[("ldm", "sdxl-ldm-to-diffusers-v1", &[])],
+            ),
+            (
+                MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id,
+                &[("diffusers", "identity-v1", &[])],
+            ),
+            (
+                Z_IMAGE_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "z-image-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                QWEN_IMAGE_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "qwen-image-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                FLUX2_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "flux2-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                WAN_CHECKPOINT_ADAPTER.adapter_id,
+                &[(
+                    "comfyui",
+                    "wan-comfyui-to-diffusers-v1",
+                    &[CheckpointBackend::Candle],
+                )],
+            ),
+        ];
+        let shipped: &[&CheckpointAdapterRegistration] = &[
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+            &MAGE_FLOW_CHECKPOINT_ADAPTER,
+            &Z_IMAGE_CHECKPOINT_ADAPTER,
+            &QWEN_IMAGE_CHECKPOINT_ADAPTER,
+            &FLUX2_CHECKPOINT_ADAPTER,
+            &WAN_CHECKPOINT_ADAPTER,
+        ];
+        assert_eq!(
+            shipped.len(),
+            expected.len(),
+            "every shipped adapter's mapping posture must be pinned here"
+        );
+        for (adapter, (adapter_id, rows)) in shipped.iter().zip(expected) {
+            assert_eq!(adapter.adapter_id, *adapter_id);
+            let actual: Vec<_> = adapter
+                .canonical_mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        mapping.dialect,
+                        mapping.mapping_id,
+                        mapping.plan_driven_backends,
+                    )
+                })
+                .collect();
+            let expected_rows: Vec<_> = rows.to_vec();
+            assert_eq!(actual, expected_rows, "adapter {adapter_id}");
+            assert!(
+                !adapter
+                    .canonical_mappings
+                    .iter()
+                    .any(
+                        |mapping| mapping.mapping_id == IdentityKeyMapping::MAPPING_ID
+                            && !mapping.plan_driven_backends.is_empty()
+                    ),
+                "adapter {adapter_id} routes a plan through `identity-v1`, which decodes \
+                 undescribed fp8 at unit scale — silently wrong rather than refused"
+            );
+        }
     }
 
     #[test]

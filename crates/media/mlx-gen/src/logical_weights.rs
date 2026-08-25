@@ -46,8 +46,8 @@ use std::sync::OnceLock;
 use gen_core::checkpoint_codec::{
     CheckpointCodecRegistration, CheckpointCodecRegistry, CodecResidencyReport,
     DenseResidencyPolicy, LogicalKeyMapping, LogicalReadMaterialization, LogicalTensorPlan,
-    LogicalWeightPlan, LogicalWeightReceipt, ScalarScaleSource, TensorCodecSpec, WeightEncoding,
-    DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
+    LogicalWeightPlan, LogicalWeightReceipt, ResidencyMode, ScalarScaleSource, TensorCodecSpec,
+    WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::weightsmeta::Dtype as HeaderDtype;
@@ -63,16 +63,8 @@ const MAX_DESCRIPTOR_BYTES: u64 = 65_536;
 
 /// The codec rows this engine implements and registers. Register through
 /// [`register_checkpoint_codecs`]; never per family crate.
-pub const BASELINE_CODECS: &[CheckpointCodecRegistration] = &[
-    DENSE_BF16_CODEC,
-    DENSE_F16_CODEC,
-    DENSE_F32_CODEC,
-    FP8_E4M3_SCALAR_CODEC,
-    FP8_E5M2_SCALAR_CODEC,
-    MXFP8_CODEC,
-    INT8_PER_ROW_CODEC,
-    NVFP4_CODEC,
-];
+pub const BASELINE_CODECS: &[CheckpointCodecRegistration] =
+    gen_core::checkpoint_codec::BASELINE_CHECKPOINT_CODECS;
 
 /// The codec ids this engine has a decode implementation for. Must equal the ids of
 /// [`BASELINE_CODECS`] (the catalog test proves it).
@@ -360,6 +352,33 @@ fn decode(
     array: Array,
     physical: &HashMap<String, Array>,
 ) -> Result<Array> {
+    // A block-padded row (MXFP8/NVFP4) whose adapter declared no logical shape would decode its
+    // PADDING as weights — see [`LogicalTensorPlan::undeclared_padded_storage`]. Planning such a
+    // file stays legal (the padded grid is a conservative pricing over-estimate, and the
+    // memory-strategy paths that compile a plan for admission never materialize a tensor);
+    // materializing it is not.
+    if let Some(refusal) = tensor.undeclared_padded_storage_refusal() {
+        return Err(Error::Msg(refusal));
+    }
+    // Every arm below produces the codec's DENSE resident form. MLX has no packed fp8/int8/fp4
+    // matmul on this seam, so this engine plans [`DenseResidencyPolicy`] for every row — but the
+    // reader must not *assume* that. A `Packed` entry reaching here (a caller planning with a
+    // foreign policy, or a policy that grows a packed row) would dense-decode a layer admission
+    // priced at its packed stored bytes: bf16 is 2 bytes/element against fp8's 1 and NVFP4's 0.5,
+    // so the load silently costs 2–4× the admitted footprint. Refuse instead — the same direction
+    // `candle_gen::logical_weights` takes for a packed plan on a build with no CUDA fp8 leg.
+    if tensor.residency.mode != ResidencyMode::Dense {
+        return Err(Error::Msg(format!(
+            "codec {}: tensor {:?} was planned with {:?} residency ({} stored bytes), but this \
+             engine decodes every codec to its dense resident form; replan with a dense residency \
+             policy instead of silently materializing the dense reconstruction where the plan \
+             priced the stored packing",
+            tensor.codec_id,
+            tensor.physical_key,
+            tensor.residency.mode,
+            tensor.residency.resident_bytes
+        )));
+    }
     match &tensor.codec {
         TensorCodecSpec::Dense => {
             let expected = match tensor.codec_id {
@@ -409,6 +428,23 @@ fn decode(
                             scale.dtype()
                         )));
                     }
+                    // Scalar-fp8 means ONE per-tensor scale. Without this check a companion of any
+                    // broadcastable shape multiplies through silently: a `[cols]` scale broadcasts
+                    // across rows and a `[rows, 1]` one across columns, so a per-row or per-column
+                    // convention mis-read as scalar-fp8 would decode to plausible-looking but wrong
+                    // weights rather than refusing. `size()` (not the shape) is the right test —
+                    // `[]`, `[1]` and `[1, 1]` are all the one scalar this codec means.
+                    if scale.size() != 1 {
+                        return Err(Error::Msg(format!(
+                            "codec {}: companion {:?} must load as ONE F32 scalar (scalar-fp8 is a \
+                             per-tensor scale), got shape {:?} with {} elements; a broadcastable \
+                             multi-element scale is a different convention, not this codec",
+                            tensor.codec_id,
+                            physical_key,
+                            scale.shape(),
+                            scale.size()
+                        )));
+                    }
                     mlx_rs::ops::multiply(&values, scale)?
                 }
             };
@@ -432,7 +468,8 @@ fn decode(
             let rows = stored_shape[0] as i32;
             let cols = stored_shape[1] as i32;
             let blocks = cols / gen_core::MXFP8_BLOCK as i32;
-            let values = e4m3_bytes_to_f32(&array)?.reshape(&[rows, blocks, 32])?;
+            let block = gen_core::MXFP8_BLOCK as i32;
+            let values = e4m3_bytes_to_f32(&array)?.reshape(&[rows, blocks, block])?;
             let block_scales = e8m0_bytes_to_f32(&unswizzle_block_scales(scales, rows, blocks)?)?
                 .reshape(&[rows, blocks, 1])?;
             let dense = mlx_rs::ops::multiply(&values, &block_scales)?.reshape(&[rows, cols])?;
@@ -900,6 +937,27 @@ mod tests {
         }
     }
 
+    /// [`StripModel`] that also **declares** the true logical shape of ONE key.
+    ///
+    /// A block-padded codec row (MXFP8/NVFP4) is only materializable when the adapter states the
+    /// layer's true geometry — otherwise the plan can do nothing but carry the padded stored grid
+    /// forward, and decoding it would promote padding to weights (`gen_core` refuses by name,
+    /// identically on both engines). The fixtures using this build their padded layer at exactly
+    /// the grid declared here, so the declaration is a true statement about the layer.
+    struct StripModelDeclaring(&'static str, Vec<usize>);
+
+    impl LogicalKeyMapping for StripModelDeclaring {
+        fn mapping_id(&self) -> &'static str {
+            "strip-model-declaring-test"
+        }
+        fn logical_key(&self, physical_key: &str) -> Option<String> {
+            physical_key.strip_prefix("model.").map(str::to_owned)
+        }
+        fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
+            (logical_key == self.0).then(|| self.1.clone())
+        }
+    }
+
     fn fixture_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix(&format!("logical-weights-{}-", std::process::id()))
@@ -955,6 +1013,14 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             BASELINE_CODECS
+        );
+        // The table itself is gen-core's, not this crate's: a codec is a backend-portable
+        // declaration, and two hand-kept copies could drift into a checkpoint one engine plans and
+        // the other refuses with nothing comparing them (mlx-gen builds only on macOS and
+        // candle-gen's quantized legs only under `cuda`, so no compilation sees both lists).
+        assert_eq!(
+            BASELINE_CODECS,
+            gen_core::checkpoint_codec::BASELINE_CHECKPOINT_CODECS
         );
     }
 
@@ -1199,7 +1265,11 @@ mod tests {
                 ),
             ],
         );
-        let plan = plan_logical_weights(&path, &StripModel).expect("plan");
+        // The layer IS its stored 32-aligned grid here, and since sc-20651 the adapter has to say
+        // so: an undeclared padded grid plans (for pricing) but refuses to materialize, because
+        // nothing in the file distinguishes it from a grid with pad rows/columns in it.
+        let plan = plan_logical_weights(&path, &StripModelDeclaring("v.weight", stored.to_vec()))
+            .expect("plan");
         assert_eq!(plan.codec_ids(), ["mxfp8-v1"]);
         assert_eq!(plan.tensors[0].shape, vec![64, 96]);
         let LogicalWeights { weights, receipt } = eager_read(&path, &plan);
@@ -1509,7 +1579,11 @@ mod tests {
                 ),
             ],
         );
-        let plan = plan_logical_weights(&path, &StripModel).expect("plan");
+        // The MXFP8 layer is built at its stored 32-aligned grid; the adapter declares it, which
+        // sc-20651 requires before a block-padded row may be materialized at all.
+        let plan =
+            plan_logical_weights(&path, &StripModelDeclaring("v.weight", mx_stored.to_vec()))
+                .expect("plan");
         assert_eq!(
             plan.codec_ids(),
             [
@@ -1732,6 +1806,182 @@ mod tests {
             read_logical_weights(&path, &plan, LogicalReadMode::Deferred)
                 .expect("a reordering remap is not source drift");
         assert_eq!(as_f32(&weights, "alpha"), [2.0]);
+    }
+
+    /// **sc-20651 blocker 4: this engine refuses a `Packed` plan entry instead of dense-decoding it.**
+    ///
+    /// Every arm of `decode` produces the codec's dense resident form, because MLX has no packed
+    /// fp8/int8/fp4 matmul on this seam — so this engine's own policy is
+    /// [`DenseResidencyPolicy`]. The reader was *assuming* that rather than checking it. A `Packed`
+    /// entry arriving from a foreign policy (or from a policy that grows a packed row) would
+    /// materialize the dense reconstruction of a layer admission priced at its stored packing:
+    /// bf16 is 2 bytes/element against fp8's 1, so the load silently costs twice the admitted
+    /// footprint, with the receipt reporting the larger number long after admission committed to
+    /// the smaller one.
+    #[test]
+    fn read_refuses_a_packed_plan_entry_rather_than_dense_decoding_it() {
+        let dir = fixture_dir();
+        let path = dir.path().join("packed-plan.safetensors");
+        let descriptor = br#"{"format": "float8_e4m3fn"}"#;
+        write_safetensors(
+            &path,
+            &[
+                ("model.q.weight", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                (
+                    "model.q.weight_scale",
+                    "F32",
+                    &[],
+                    1.0_f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.q.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+
+        // The engine's own plan is dense, and reads.
+        let dense = plan_logical_weights(&path, &StripModel).expect("plan");
+        assert_eq!(dense.tensors[0].residency.mode, ResidencyMode::Dense);
+        eager_read(&path, &dense);
+
+        // The same file under a plan that priced the layer PACKED — the stored 8 bytes rather than
+        // the 16 bytes of bf16 this engine would materialize.
+        let mut packed = dense.clone();
+        packed.tensors[0].residency = PlannedResidency {
+            mode: ResidencyMode::Packed,
+            resident_bytes: 8,
+        };
+        let mut materialize = |weights: &mut Weights| weights.materialize();
+        let error = read_logical_weights(&path, &packed, LogicalReadMode::Eager(&mut materialize))
+            .err()
+            .expect("a packed plan entry must refuse on an engine with no packed leg");
+        let error = error.to_string();
+        assert!(error.contains("model.q.weight"), "{error}");
+        assert!(error.contains("Packed"), "{error}");
+        assert!(
+            error.contains("dense residency policy"),
+            "the refusal must name the fix: {error}"
+        );
+    }
+
+    /// **sc-20651 blocker 5: a scalar-fp8 scale companion must hold exactly one value.**
+    ///
+    /// `scalar_fp8` means ONE per-tensor scale. The decode multiplied by whatever the companion
+    /// held, and MLX broadcasts: a `[cols]` companion would broadcast across rows and a `[rows, 1]`
+    /// one across columns, so a per-row or per-column scale convention mis-read as scalar-fp8
+    /// decoded to plausible-but-wrong weights instead of refusing. The dtype check that was there
+    /// cannot catch it — both conventions are `F32`.
+    #[test]
+    fn scalar_fp8_refuses_a_multi_element_scale_companion() {
+        let dir = fixture_dir();
+        let path = dir.path().join("broadcast-scale.safetensors");
+        write_safetensors(
+            &path,
+            &[
+                // Undescribed fp8 (the plain cast), so the plan gives it `ScalarScaleSource::Unit`
+                // and no companion of its own.
+                ("model.q", "F8_E4M3", &[2, 4], vec![0x38; 8]),
+                // A per-COLUMN F32 vector that is a legitimate weight of this fixture; the plan
+                // names it as an ordinary dense row.
+                (
+                    "model.zscale",
+                    "F32",
+                    &[4],
+                    [2.0_f32, 2.0, 2.0, 2.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                ),
+            ],
+        );
+        let plan = plan_logical_weights(&path, &StripModel).expect("plan");
+
+        // Re-point the fp8 layer's scale at that four-element vector — the shape a per-column
+        // convention would have. `zscale` sorts after `q`, so it is still resident when `q`
+        // decodes.
+        let mut broadcast = plan.clone();
+        let fp8 = broadcast
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.physical_key == "model.q")
+            .expect("the fp8 layer is planned");
+        fp8.codec = TensorCodecSpec::ScalarFp8 {
+            scale: ScalarScaleSource::Companion {
+                physical_key: "model.zscale".to_string(),
+            },
+            input_scale: None,
+            full_precision_matrix_mult: false,
+        };
+
+        let mut materialize = |weights: &mut Weights| weights.materialize();
+        let error =
+            read_logical_weights(&path, &broadcast, LogicalReadMode::Eager(&mut materialize))
+                .err()
+                .expect("a broadcastable multi-element scale must refuse")
+                .to_string();
+        assert!(error.contains("model.zscale"), "{error}");
+        assert!(error.contains("ONE F32 scalar"), "{error}");
+        assert!(error.contains("4 elements"), "{error}");
+    }
+
+    /// **sc-20651 major 3: an undeclared block-padded layer plans but must not materialize.**
+    ///
+    /// The MLX half of the same rule the Candle engine applies, from the same gen-core refusal, so
+    /// both engines say the same thing about the same checkpoint. MXFP8 storage is 32-padded on
+    /// both axes and the file records no true geometry, so an adapter that declares nothing leaves
+    /// the plan carrying the *padded* grid — and decoding it hands the model padding as weights.
+    /// Planning still succeeds because a plan is also a pricing artifact.
+    #[test]
+    fn an_undeclared_block_padded_layer_plans_but_refuses_to_materialize() {
+        let dir = fixture_dir();
+        let path = dir.path().join("mxfp8-undeclared.safetensors");
+        let (rows, cols) = (32_usize, 64_usize);
+        let descriptor = br#"{"format": "mxfp8"}"#;
+        let scale_shape = gen_core::mxfp8_scale_shape([rows, cols]);
+        write_safetensors(
+            &path,
+            &[
+                (
+                    "model.q.weight",
+                    "F8_E4M3",
+                    &[rows, cols],
+                    vec![0x38; rows * cols],
+                ),
+                (
+                    "model.q.weight_scale",
+                    "U8",
+                    &scale_shape,
+                    vec![127_u8; scale_shape.iter().product()],
+                ),
+                (
+                    "model.q.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+
+        let undeclared = plan_logical_weights(&path, &StripModel)
+            .expect("an undeclared padded checkpoint still PLANS: pricing is not materialization");
+        assert_eq!(
+            undeclared.tensors[0].undeclared_padded_storage(),
+            Some([rows, cols]),
+            "the plan records that its logical shape is only the stored grid"
+        );
+
+        let mut materialize = |weights: &mut Weights| weights.materialize();
+        let error =
+            read_logical_weights(&path, &undeclared, LogicalReadMode::Eager(&mut materialize))
+                .err()
+                .expect("materializing an undeclared padded grid must be refused")
+                .to_string();
+        assert!(error.contains("model.q.weight"), "{error}");
+        assert!(error.contains("block-padded"), "{error}");
+        assert!(error.contains("declares no logical shape"), "{error}");
     }
 
     #[test]

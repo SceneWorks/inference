@@ -843,18 +843,57 @@ impl Nvfp4Linear {
             .map(|w| w.elem_count() * w.dtype().size_in_bytes())
     }
 
-    /// Total bytes this layer actually holds **resident on-device for its weight**, whatever regime it
-    /// resolved to: the staged E2M1 + UE4M3 buffers under [`Nvfp4Regime::Fp4W4A4`], or the dense bf16
-    /// tensor under [`Nvfp4Regime::DequantBf16`].
+    /// Total bytes this layer actually holds **resident on-device for its weight**, read from the leg
+    /// its **declared regime** owns: the staged E2M1 + UE4M3 buffers under [`Nvfp4Regime::Fp4W4A4`],
+    /// the dense bf16 tensor under [`Nvfp4Regime::DequantBf16`].
     ///
     /// Unlike [`Self::nvfp4_footprint_bytes`] (a property of the *format*), this is a property of the
-    /// **run** — it is what SC#6 is actually about.
-    pub fn resident_weight_bytes(&self) -> usize {
-        #[cfg(feature = "cuda")]
-        if let Some(b) = self.resident_device_bytes() {
-            return b;
+    /// **run** — it is what SC#6 is actually about, which is why a layer that cannot answer says so
+    /// instead of returning a number.
+    ///
+    /// # Why it dispatches on `self.regime`, and why the missing leg is an error (sc-20651 review)
+    ///
+    /// The previous body asked `resident_device_bytes()` first and, on `None`, fell through to the
+    /// bf16 leg and finally to `unwrap_or(0)`. Both fallbacks were regime-blind, and each is a
+    /// distinct defect:
+    ///
+    /// - **Regime mismatch.** A layer *declaring* `Fp4W4A4` whose staged FP4 leg was absent silently
+    ///   reported the **`DequantBf16`** quantity. The two regimes differ by ~3.6× (0.28× vs 1.00× of
+    ///   the bf16 baseline) and the answer carried no hint of which one it came from — the accessor
+    ///   read residency (`which Option is populated`) where the caller asked about regime.
+    /// - **Flattering default.** With neither leg present the answer was `0`. Zero is the *best
+    ///   possible* result a resident-VRAM gate can see: an SC#6 sum over N such layers reads as
+    ///   "nothing resident at all", i.e. a perfect footprint win, exactly when the accounting has
+    ///   broken. A gate cannot distinguish that from success.
+    ///
+    /// Each arm now reads only its own regime's leg, and a missing leg is a typed error naming the
+    /// regime rather than a number.
+    pub fn resident_weight_bytes(&self) -> Result<usize> {
+        match self.regime {
+            #[cfg(feature = "cuda")]
+            Nvfp4Regime::Fp4W4A4 => self.resident_device_bytes().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "Nvfp4Linear::resident_weight_bytes: regime is Fp4W4A4 but no FP4 weight is \
+                     staged on-device; the layer's resident footprint is unknown"
+                        .into(),
+                )
+            }),
+            // `Fp4W4A4` is only ever constructed by `try_build_fp4`, which is `cuda`-gated — so on a
+            // non-cuda build this is not a fallback, it is a broken invariant, and it says so.
+            #[cfg(not(feature = "cuda"))]
+            Nvfp4Regime::Fp4W4A4 => Err(candle_core::Error::Msg(
+                "Nvfp4Linear::resident_weight_bytes: regime is Fp4W4A4 on a non-cuda build, where \
+                 that regime is not constructible"
+                    .into(),
+            )),
+            Nvfp4Regime::DequantBf16 => self.resident_dequant_bf16_bytes().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "Nvfp4Linear::resident_weight_bytes: regime is DequantBf16 but no dequantized \
+                     bf16 weight is resident; the layer's resident footprint is unknown"
+                        .into(),
+                )
+            }),
         }
-        self.resident_dequant_bf16_bytes().unwrap_or(0)
     }
 }
 
@@ -950,6 +989,47 @@ mod tests {
         assert!(
             rr < 0.02,
             "dequant fallback forward rel-RMS {rr} vs its own dequant ref"
+        );
+        Ok(())
+    }
+
+    /// sc-20651 review (minor). `resident_weight_bytes` must read the leg its **declared regime** owns
+    /// and must never answer `0`.
+    ///
+    /// A `DequantBf16` layer holds a dense bf16 `[out, in]` weight — 1.00× the bf16 baseline, 3.6× its
+    /// own packed container. That the two are far apart is what makes the old regime-blind fallback
+    /// chain (`device leg → bf16 leg → unwrap_or(0)`) a real defect rather than a tidiness point: a
+    /// wrong arm reports a *plausible* number, and the `0` floor reports the most flattering number an
+    /// SC#6 resident-VRAM sum can receive.
+    #[test]
+    fn resident_weight_bytes_reads_the_declared_regimes_leg() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let mut seed = 0x5C20_651Du64;
+        let w = Tensor::from_vec(
+            (0..out_dim * in_dim)
+                .map(|_| prng(&mut seed) * 0.4)
+                .collect::<Vec<_>>(),
+            (out_dim, in_dim),
+            &dev,
+        )?;
+        let lin = Nvfp4Linear::from_dense(&w, None, &dev, ActPrecision::W4A4)?;
+        assert_eq!(lin.regime(), Nvfp4Regime::DequantBf16);
+
+        let resident = lin
+            .resident_weight_bytes()
+            .expect("a DequantBf16 layer holds its bf16 leg and must report it");
+
+        // It is the DequantBf16 leg, byte for byte — not the FP4 one, and not zero.
+        assert_eq!(resident, lin.resident_dequant_bf16_bytes().unwrap());
+        assert_eq!(resident, lin.bf16_footprint_bytes());
+        assert_eq!(resident, out_dim * in_dim * 2);
+        assert_ne!(resident, 0, "the flattering default must be unreachable");
+        // ...and emphatically not the packed *format* size, the number the wrong arm would give.
+        assert!(
+            resident > lin.nvfp4_footprint_bytes() * 3,
+            "dense bf16 ({resident}) must dwarf the packed container ({})",
+            lin.nvfp4_footprint_bytes()
         );
         Ok(())
     }
