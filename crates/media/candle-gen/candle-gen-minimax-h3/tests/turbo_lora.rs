@@ -707,8 +707,16 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
     let mut base = tiny_dit(&cfg);
     let y0 = base.adaptable_mut(&segments).unwrap().forward(&x).unwrap();
     let mut adapted = tiny_dit(&cfg);
+    let bytes_before = adapted.adaptable_mut(&segments).unwrap().nbytes();
     let report = apply_minimax_h3_adapters(&mut adapted, &[spec(path, strength)]).unwrap();
     assert_eq!(report.applied, 1);
+    assert!(report.unmatched_paths.is_empty());
+    let target = adapted.adaptable_mut(&segments).unwrap();
+    assert!(target.is_adapted());
+    let expected_factor_bytes =
+        w1.elem_count() * w1.dtype().size_in_bytes() + w2.elem_count() * w2.dtype().size_in_bytes();
+    assert_eq!(target.nbytes() - bytes_before, expected_factor_bytes);
+    assert_eq!(adapted.adapted_module_count(), 1);
     let y1 = adapted
         .adaptable_mut(&segments)
         .unwrap()
@@ -969,14 +977,10 @@ fn manual_cuda_fabricated_lokr_install_receipt() {
     .expect("install fabricated H3 LoKr on CUDA");
     assert_eq!(report.applied, 1);
     assert!(report.unmatched_paths.is_empty());
-    assert_eq!(
-        adapted
-            .adaptable_mut(&segments)
-            .expect("CUDA probe target")
-            .adapters()
-            .len(),
-        1
-    );
+    let target = adapted.adaptable_mut(&segments).expect("CUDA probe target");
+    assert!(target.is_adapted());
+    let adapted_modules = adapted.adapted_module_count();
+    assert_eq!(adapted_modules, 1);
     let y1 = adapted
         .adaptable_mut(&segments)
         .unwrap()
@@ -1009,7 +1013,7 @@ fn manual_cuda_fabricated_lokr_install_receipt() {
         "strength": strength,
         "applied": report.applied,
         "unmatched": report.unmatched_paths,
-        "adaptedModules": 1,
+        "adaptedModules": adapted_modules,
         "residualRelMax": drift,
     });
     let receipt_bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt");

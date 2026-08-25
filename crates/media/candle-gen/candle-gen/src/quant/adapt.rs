@@ -248,6 +248,13 @@ pub struct LokrFactors {
 }
 
 impl LokrFactors {
+    /// Device bytes retained by the structured residual. The shape metadata and scalar scale are
+    /// not allocations; the owned factor tensors are the complete LoKr storage payload.
+    pub fn nbytes(&self) -> usize {
+        self.w1.elem_count() * self.w1.dtype().size_in_bytes()
+            + self.w2.elem_count() * self.w2.dtype().size_in_bytes()
+    }
+
     /// Build the small `[a,c]`/`[b,d]` Kronecker factors from a LoKr module's factors (full `w1`/`w2`
     /// or a low-rank `w_a·w_b` product — that product is bounded by the factor dims, NEVER `out×in`),
     /// baking the FULL `scale` into `w2`. The allocation-free counterpart to

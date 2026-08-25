@@ -316,6 +316,11 @@ impl LinearNoBias {
                         + ad.b.elem_count() * ad.b.dtype().size_in_bytes()
                 })
                 .sum::<usize>()
+            + self
+                .lokr_adapters
+                .iter()
+                .map(|ad| ad.factors.nbytes())
+                .sum::<usize>()
     }
 
     /// The one tensor name this projection consumes.
