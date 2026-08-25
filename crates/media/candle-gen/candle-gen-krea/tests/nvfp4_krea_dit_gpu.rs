@@ -1390,6 +1390,33 @@ fn nvfp4_krea_dit_lane_surface_and_final_head_are_correct() {
     // fact holds — the model-level receipt's `fp4_lit` count is exactly the set of projections the
     // decision table says reach packed W4A4. The plan, the constructed linears and the receipt
     // therefore agree on the representation of all 260 projections, not just the head.
+    //
+    // sc-12121 review fix: the capability facts below are the LIVE probe's, not a hardcoded
+    // constant. On this box (`nvfp4_device()` returned a device, so it is at the `sm_120` floor) a
+    // benign interior block projection must probe exactly `ELIGIBLE` — if the probe ever stops
+    // saying so, the `predicted_packed` count below is being computed against a fiction and this
+    // assertion fails first, naming the reason.
+    let probe_w = trunk_weights(&root, &dev, DType::BF16);
+    let probe_plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(cfg.num_layers);
+    const PROBE_KEY: &str = "transformer_blocks.7.attn.to_q.weight";
+    // The dense shape the loader itself passes on this (bf16, un-planned) snapshot — the `None`
+    // form is for a plan-backed native row, where the codec spec answers the grid question, and
+    // `nvfp4_capability` now refuses to assume a grid when it has neither (sc-12121 review fix).
+    let pw = probe_w.get(PROBE_KEY).expect("probe weight");
+    let probed = probe_w.nvfp4_capability(
+        PROBE_KEY,
+        Some([pw.dim(0).unwrap(), pw.dim(1).unwrap()]),
+        probe_plan.nvfp4_context(),
+    );
+    assert_eq!(
+        probed,
+        Nvfp4Capability::ELIGIBLE,
+        "on an sm_120 box a benign interior projection must probe ELIGIBLE; the constant below \
+         stands in for this live probe and must not diverge from it"
+    );
+    drop(pw);
+    drop(probe_w);
+
     let predicted_packed = names
         .iter()
         .filter(|name| {

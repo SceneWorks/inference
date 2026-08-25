@@ -38,8 +38,8 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
 use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Linear,
-    Nvfp4Regime, PackedConfig, PackedWeightSidecars,
+    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, Int8Context, Nvfp4Fallback,
+    Nvfp4Linear, Nvfp4Regime, PackedConfig, PackedWeightSidecars,
 };
 
 use crate::native_mapping::{DeclaredLogicalShapes, KreaNativeToDiffusersMapping};
@@ -485,7 +485,10 @@ impl Weights {
     /// The NVFP4 **validation** lane (a dense bf16 tier this import packs itself) has no plan row for
     /// the key; there the checkpoint facts are vacuously clear and the grid question is answered by
     /// [`crate::nvfp4_dit::dense_shape_is_fp4_eligible`] on the dense shape the caller passes.
-    fn nvfp4_capability(
+    ///
+    /// Public so a GPU harness can anchor an assertion on the **live** probe rather than on a
+    /// hardcoded [`Nvfp4Capability::ELIGIBLE`] (sc-12121 review fix).
+    pub fn nvfp4_capability(
         &self,
         weight_key: &str,
         dense_shape: Option<[usize; 2]>,
@@ -509,15 +512,34 @@ impl Weights {
                 // A planned row that is NOT an NVFP4 codec row is one Kitchen deliberately exported
                 // dense; the import preserves that rather than requantizing at load.
                 Some(_) => (false, false, true, true),
-                // No plan row at all: the dense validation tier, packed by this import.
-                None => (
-                    true,
-                    false,
-                    true,
-                    dense_shape.is_none_or(|[rows, cols]| {
-                        crate::nvfp4_dit::dense_shape_is_fp4_eligible(rows, cols)
-                    }),
-                ),
+                // No plan row at all: the dense validation tier, packed by this import. The grid
+                // question is then answered by the dense shape the caller passes — and there MUST be
+                // one. `dense_shape: None` means the caller had a plan-backed row in mind (the
+                // native arm passes `None` because the codec spec answers the question); combined
+                // with no plan row there is nothing real left to read `layout_native` off, so
+                // claiming `true` would predict PackedW4A4 on grounds never checked (sc-12121 review
+                // fix). Report it as ineligible instead — the dense fallback — and say so.
+                None => {
+                    let layout_native = match dense_shape {
+                        Some([rows, cols]) => {
+                            crate::nvfp4_dit::dense_shape_is_fp4_eligible(rows, cols)
+                        }
+                        None => {
+                            debug_assert!(
+                                false,
+                                "krea nvfp4 (sc-12121): `{weight_key}` has no plan row AND no dense \
+                                 shape — `layout_native` would be asserted on nothing. A native \
+                                 component must have a plan row for every key it serves."
+                            );
+                            eprintln!(
+                                "[sc-12121] krea nvfp4: `{weight_key}` has no plan row and no dense \
+                                 shape; reporting the grid as ineligible rather than assuming it"
+                            );
+                            false
+                        }
+                    };
+                    (true, false, true, layout_native)
+                }
             };
         Nvfp4Capability {
             checkpoint_offers_nvfp4,
@@ -1523,7 +1545,7 @@ pub fn linear_detect_planned(
         // fallback, and the residency policy priced them dense, so `linear`'s reader-backed `get`
         // materializes exactly the codec's dense decode.)
         if !w.is_native_nvfp4_weight(&weight_key) {
-            check_representation(base, expected, false)?;
+            check_representation(base, expected, false, None)?;
             return Ok(QLinear::dense(linear(w, base, bias)?));
         }
         // The shared reader materializes what the plan DECLARED for this row (sc-21482):
@@ -1539,11 +1561,16 @@ pub fn linear_detect_planned(
                     act,
                     plan.nvfp4_context(),
                 )?;
-                check_representation(base, expected, lin.regime() == Nvfp4Regime::Fp4W4A4)?;
+                check_representation(
+                    base,
+                    expected,
+                    lin.regime() == Nvfp4Regime::Fp4W4A4,
+                    lin.fallback_cause(),
+                )?;
                 Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
             }
             LogicalTensor::Dense(weight) => {
-                check_representation(base, expected, false)?;
+                check_representation(base, expected, false, None)?;
                 let weight = weight.to_dtype(w.dtype())?;
                 Ok(QLinear::dense(Linear::new(weight, dense_bias)))
             }
@@ -1571,7 +1598,12 @@ pub fn linear_detect_planned(
     // construct a private handle here — and its eager 32 MiB workspace — for every one of the trunk's
     // 260 projections.
     let lin = Nvfp4Linear::from_dense_in(&weight, dense_bias, &device, act, plan.nvfp4_context())?;
-    check_representation(base, expected, lin.regime() == Nvfp4Regime::Fp4W4A4)?;
+    check_representation(
+        base,
+        expected,
+        lin.regime() == Nvfp4Regime::Fp4W4A4,
+        lin.fallback_cause(),
+    )?;
     Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
 }
 
@@ -1583,9 +1615,41 @@ pub fn linear_detect_planned(
 /// means one of the two drifted, and the only safe response is to say so by name: a run that
 /// silently serves dense BF16 while reporting native NVFP4 is exactly the dishonest reporting E4
 /// forbids.
-fn check_representation(base: &str, expected: ExecutionRole, packed_w4a4: bool) -> Result<()> {
+///
+/// # Reconciling the two unpredictable causes (sc-12121 review fix)
+///
+/// `fallback` is the constructed layer's **own** report of why it is dense
+/// ([`Nvfp4Linear::fallback_cause`]), `None` for a layer that is not an `Nvfp4Linear` at all (the
+/// preserved-dense / reader-dense arms). Two of its causes —
+/// [`Nvfp4Fallback::DeviceMismatch`] and [`Nvfp4Fallback::StagingFailed`] — are runtime accidents
+/// that **no** [`Nvfp4Capability`] field can see, so a prediction of `PackedW4A4` against them is
+/// not table drift; it is a transparent degradation that has always been legal. Those are
+/// reconciled by rewriting the expectation via [`dense_reason_for_fallback`] before comparing,
+/// which keeps the receipt honest (the projection reports `DenseBf16(DeviceMismatch)`, not a
+/// fictional `PackedW4A4`) without aborting a whole trunk load over a driver accident.
+///
+/// Every other cause is one the capability facts *do* model, so a disagreement there is still a
+/// hard error — in both directions.
+fn check_representation(
+    base: &str,
+    expected: ExecutionRole,
+    packed_w4a4: bool,
+    fallback: Option<Nvfp4Fallback>,
+) -> Result<()> {
     if expected.is_packed_w4a4() == packed_w4a4 {
         return Ok(());
+    }
+    // Safe direction only, and only for a cause no capability probe could have predicted.
+    if !packed_w4a4 {
+        if let Some(reason) = fallback.and_then(crate::nvfp4_dit::dense_reason_for_fallback) {
+            eprintln!(
+                "[sc-12121] krea nvfp4: `{base}` was predicted {expected:?} but the layer fell back \
+                 to dense bf16 ({reason:?}); this cause is invisible to the plan-time capability \
+                 facts, so the load continues. `Nvfp4Report` reads the layer's own regime, so the \
+                 run still accounts this projection as dense, never as fp4-lit"
+            );
+            return Ok(());
+        }
     }
     let served = if packed_w4a4 {
         "packed W4A4"
@@ -1650,6 +1714,7 @@ pub(crate) fn rms_scale(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvfp4_dit::DenseReason;
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::Module;
     use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
@@ -1660,6 +1725,119 @@ mod tests {
 
     /// The Krea MLX tier's group size (64) — the one carried from `config.json`.
     const G: usize = 64;
+
+    /// A `Weights` over one dense `[64, 64]` f32 tensor with **no logical plan** — so
+    /// `planned(key)` is `None` for every key.
+    fn unplanned_weights(tmp: &tempfile::TempDir, key: &str) -> Weights {
+        let dev = Device::Cpu;
+        let path = tmp.path().join("unplanned.safetensors");
+        safetensors::save(
+            &HashMap::from([(
+                key.to_owned(),
+                Tensor::zeros((64, 64), DType::F32, &dev).unwrap(),
+            )]),
+            &path,
+        )
+        .unwrap();
+        Weights::from_file(&path, &dev, DType::F32).unwrap()
+    }
+
+    /// **No plan row AND no dense shape asserts `layout_native` on nothing** (sc-12121 review fix).
+    ///
+    /// The `None`-plan-row arm used to answer the grid question with `dense_shape.is_none_or(..)`,
+    /// which short-circuits to `true` when the caller passes no shape — so a native component with
+    /// no plan row would have been predicted `PackedW4A4` on grounds nothing ever checked, breaking
+    /// the "every field is read off something real" claim in `nvfp4_capability`'s own doc. The
+    /// combination is now explicitly refused.
+    #[test]
+    #[should_panic(expected = "no plan row AND no dense shape")]
+    fn capability_refuses_to_assume_a_grid_with_neither_a_plan_row_nor_a_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = unplanned_weights(&tmp, "transformer_blocks.0.attn.to_q.weight");
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        let _ = w.nvfp4_capability(
+            "transformer_blocks.0.attn.to_q.weight",
+            None,
+            plan.nvfp4_context(),
+        );
+    }
+
+    /// The same key **with** a dense shape is answered off something real — the shape — and an
+    /// eligible `[64, 64]` grid reports `layout_native: true`, an ineligible `[64, 16]` one `false`.
+    #[test]
+    fn capability_reads_layout_native_off_the_dense_shape_when_there_is_no_plan_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = unplanned_weights(&tmp, "transformer_blocks.0.attn.to_q.weight");
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        let cap = |shape: [usize; 2]| {
+            w.nvfp4_capability(
+                "transformer_blocks.0.attn.to_q.weight",
+                Some(shape),
+                plan.nvfp4_context(),
+            )
+            .layout_native
+        };
+        assert!(cap([64, 64]), "K_pad 64 % 32 == 0 and N 64 % 16 == 0");
+        assert!(
+            !cap([64, 16]),
+            "K_pad 16 is not a multiple of NVFP4_K_ALIGN"
+        );
+    }
+
+    /// **The hard refusal keeps the unsafe direction, and only the two runtime accidents soften the
+    /// safe one** (sc-12121 review fix).
+    ///
+    /// Before the fix `check_representation` erred on *any* disagreement, which aborted a whole
+    /// trunk load — blaming the role table — for a shared-context device mismatch or a weight-staging
+    /// failure, neither of which any `Nvfp4Capability` field models. After it:
+    ///
+    /// * constructed **packed** while the table predicted dense — the dishonest-reporting direction —
+    ///   is still an `Err`, with **no** softening for any fallback cause (a packed layer reports
+    ///   `fallback_cause() == None` anyway);
+    /// * constructed **dense** while the table predicted packed is an `Err` unless the layer itself
+    ///   names `DeviceMismatch` or `StagingFailed`.
+    #[test]
+    fn check_representation_refuses_drift_but_not_the_two_runtime_accidents() {
+        let packed = ExecutionRole::PackedW4A4;
+        let dense = ExecutionRole::DenseBf16(DenseReason::PostNonlinearity);
+
+        // Agreement, either way round.
+        assert!(check_representation("k", packed, true, None).is_ok());
+        assert!(check_representation("k", dense, false, None).is_ok());
+
+        // UNSAFE direction: constructed packed, table said dense. Never softened.
+        let e = check_representation("k", dense, true, None).unwrap_err();
+        assert!(format!("{e}").contains("constructed as packed W4A4"), "{e}");
+        for cause in [Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed] {
+            assert!(
+                check_representation("k", dense, true, Some(cause)).is_err(),
+                "{cause:?} must not excuse a layer that actually lit the FP4 cores"
+            );
+        }
+
+        // SAFE direction: constructed dense, table said packed.
+        let e = check_representation("k", packed, false, None).unwrap_err();
+        assert!(format!("{e}").contains("constructed as dense bf16"), "{e}");
+        for cause in [
+            Nvfp4Fallback::W4A16Requested,
+            Nvfp4Fallback::NotCudaDevice,
+            Nvfp4Fallback::ShapeIneligible,
+            Nvfp4Fallback::NoDeviceHandle,
+            Nvfp4Fallback::NoFusedQuantizer,
+        ] {
+            assert!(
+                check_representation("k", packed, false, Some(cause)).is_err(),
+                "{cause:?} IS modelled by Nvfp4Capability — a disagreement here is a real defect"
+            );
+        }
+        for cause in [Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed] {
+            assert!(
+                check_representation("k", packed, false, Some(cause)).is_ok(),
+                "{cause:?} is invisible to every capability fact — aborting the load would blame \
+                 the role table for a driver accident"
+            );
+        }
+    }
 
     /// Build an MLX group-64 Q4 packed triple for an `[out, in]` weight — `(wq u32, scales, biases,
     /// affine grid)`. The affine grid is the exact dense weight the pack represents.

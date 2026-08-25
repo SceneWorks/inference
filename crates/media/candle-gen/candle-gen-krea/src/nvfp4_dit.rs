@@ -95,8 +95,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::lock_recover;
 use candle_gen::quant::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
-    NVFP4_BLOCK, NVFP4_K_ALIGN, NVFP4_N_ALIGN,
+    ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Regime, OutlierClass,
+    OutlierSparsity, NVFP4_BLOCK, NVFP4_K_ALIGN, NVFP4_N_ALIGN,
 };
 
 /// How the trunk should serve one projection's activations when running NVFP4.
@@ -138,8 +138,70 @@ pub enum BlockLeaf {
     FfDown,
 }
 
+/// Define [`BlockLeaf`]'s key accessors from **one** list of `(variant, module, module-relative
+/// suffix, ordinal)` rows (sc-12121).
+///
+/// The point is that there is exactly one place the eight loader strings are spelled: `attn`/`ff`
+/// `load_planned` call [`BlockLeaf::module_leaf`] rather than passing literals of their own, so the
+/// role table and the loader cannot drift apart. Every generated body is an **exhaustive** `match`
+/// with no wildcard arm, so a leaf added to the enum without a row here does not compile.
+macro_rules! block_leaf_table {
+    ($( $variant:ident => $module:literal, $leaf:literal, $ordinal:literal );* $(;)?) => {
+        impl BlockLeaf {
+            /// The module this leaf is loaded by — `attn` (`GatedAttention`) or `ff` (`SwiGlu`),
+            /// spelled as the block's `join(prefix, ..)` segment.
+            pub fn module(self) -> &'static str {
+                match self { $( Self::$variant => $module, )* }
+            }
+
+            /// The dotted suffix this leaf is loaded under **relative to its module's prefix** — the
+            /// exact literal `GatedAttention::load_planned` / `SwiGlu::load_planned` hand to
+            /// `linear_detect_planned`, because those loaders read it from here.
+            pub fn module_leaf(self) -> &'static str {
+                match self { $( Self::$variant => $leaf, )* }
+            }
+
+            /// The dotted suffix this leaf is loaded under relative to its **block** prefix —
+            /// [`Self::module`] and [`Self::module_leaf`] composed at compile time.
+            pub fn leaf_key(self) -> &'static str {
+                match self { $( Self::$variant => concat!($module, ".", $leaf), )* }
+            }
+
+            /// A dense index for this leaf, by exhaustive match — the count source
+            /// `block_leaf_all_is_every_variant` crosses against [`Self::ALL`]'s length.
+            #[cfg(test)]
+            fn ordinal(self) -> usize {
+                match self { $( Self::$variant => $ordinal, )* }
+            }
+
+            /// The leaf with the given [`Self::ordinal`], if any — the inverse the anchor test walks
+            /// to reconstruct [`Self::ALL`] without reading the array literal.
+            #[cfg(test)]
+            fn from_ordinal(i: usize) -> Option<Self> {
+                $( if i == $ordinal { return Some(Self::$variant); } )*
+                None
+            }
+        }
+    };
+}
+
+block_leaf_table! {
+    AttnQ    => "attn", "to_q",     0;
+    AttnK    => "attn", "to_k",     1;
+    AttnV    => "attn", "to_v",     2;
+    AttnGate => "attn", "to_gate",  3;
+    AttnOut  => "attn", "to_out.0", 4;
+    FfGate   => "ff",   "gate",     5;
+    FfUp     => "ff",   "up",       6;
+    FfDown   => "ff",   "down",     7;
+}
+
 impl BlockLeaf {
     /// Every leaf, in the order a block loads them — the coverage test's enumeration source.
+    ///
+    /// Anchored by `block_leaf_all_is_every_variant`: an array literal is not an exhaustive
+    /// construct, so the test reconstructs this list from the exhaustive `ordinal` / `from_ordinal`
+    /// pair (test-only, hence not linkable here) and asserts the two agree.
     pub const ALL: [Self; 8] = [
         Self::AttnQ,
         Self::AttnK,
@@ -151,20 +213,18 @@ impl BlockLeaf {
         Self::FfDown,
     ];
 
-    /// The dotted suffix this leaf is loaded under, relative to its block prefix — the exact strings
-    /// `GatedAttention::load_planned` / `SwiGlu::load_planned` pass to `linear_detect_planned`.
-    pub fn leaf_key(self) -> &'static str {
-        match self {
-            Self::AttnQ => "attn.to_q",
-            Self::AttnK => "attn.to_k",
-            Self::AttnV => "attn.to_v",
-            Self::AttnGate => "attn.to_gate",
-            Self::AttnOut => "attn.to_out.0",
-            Self::FfGate => "ff.gate",
-            Self::FfUp => "ff.up",
-            Self::FfDown => "ff.down",
-        }
-    }
+    /// The leaves `GatedAttention::load_planned` loads, in load order — the loader's own enumeration,
+    /// so its five projection keys come from this table too.
+    pub const ATTN: [Self; 5] = [
+        Self::AttnQ,
+        Self::AttnK,
+        Self::AttnV,
+        Self::AttnGate,
+        Self::AttnOut,
+    ];
+
+    /// The leaves `SwiGlu::load_planned` loads, in load order.
+    pub const FF: [Self; 3] = [Self::FfGate, Self::FfUp, Self::FfDown];
 
     /// The leaf named by a block-relative dotted suffix, or `None` for a suffix that is not one of the
     /// lane's eight GEMM leaves.
@@ -174,8 +234,21 @@ impl BlockLeaf {
 
     /// True iff this leaf's **input** is a post-nonlinearity intermediate rather than a normalized
     /// block input — see [`LayerRole::is_post_nonlinearity`], sc-12110's central partition finding.
+    ///
+    /// Deliberately an **exhaustive** `match` rather than a `matches!`: a `matches!` would silently
+    /// default a newly-added leaf to `false`, i.e. route an unexamined post-nonlinearity projection
+    /// straight into the packed W4A4 lane — the unsafe direction. Written this way, adding a leaf
+    /// without answering this question does not compile.
     pub fn reads_post_nonlinearity(self) -> bool {
-        matches!(self, Self::AttnOut | Self::FfDown)
+        match self {
+            Self::AttnOut | Self::FfDown => true,
+            Self::AttnQ
+            | Self::AttnK
+            | Self::AttnV
+            | Self::AttnGate
+            | Self::FfGate
+            | Self::FfUp => false,
+        }
     }
 }
 
@@ -327,6 +400,37 @@ pub enum DenseReason {
     /// unfused reference chain measured **0.01×** vs dense bf16, so the honest answer is W4A16
     /// (sc-12078) — settled at construction, never per forward.
     NoFusedQuantizer,
+    /// The trunk's shared cuBLASLt context is bound to a **different** device than this projection
+    /// (`Nvfp4Fallback::DeviceMismatch`). A runtime accident of context sharing, **not** predictable
+    /// from any per-key capability fact — [`Nvfp4Capability`] cannot model it, so the prediction is
+    /// reconciled against the constructed layer's own reported cause instead (sc-12121 review fix).
+    DeviceMismatch,
+    /// Staging the FP4 weight onto the device failed (allocation/driver accident,
+    /// `Nvfp4Fallback::StagingFailed`). Like [`Self::DeviceMismatch`], invisible to a plan-time
+    /// probe and reconciled from the constructed layer.
+    StagingFailed,
+}
+
+/// The [`DenseReason`] a construction-time [`Nvfp4Fallback`] corresponds to, or `None` when the cause
+/// is one [`DitPlan::representation`] already predicts from [`Nvfp4Capability`] (sc-12121 review fix).
+///
+/// This exists for exactly the two causes no capability fact can see — a shared-context/device
+/// mismatch and a weight-staging failure. Both are legitimate transparent degradations that predate
+/// this story; without this mapping `check_representation` would abort a whole trunk load and blame
+/// the role table for a driver accident. Every other cause stays `None`, so a genuine
+/// prediction/construction disagreement is still a hard error.
+pub fn dense_reason_for_fallback(cause: Nvfp4Fallback) -> Option<DenseReason> {
+    match cause {
+        Nvfp4Fallback::DeviceMismatch => Some(DenseReason::DeviceMismatch),
+        Nvfp4Fallback::StagingFailed => Some(DenseReason::StagingFailed),
+        // Predicted by `Nvfp4Capability`: `nvfp4_device`, `layout_native`, `fused_quantizer`, and the
+        // plan's own regime. A disagreement on any of these is a real defect, not an accident.
+        Nvfp4Fallback::W4A16Requested
+        | Nvfp4Fallback::NotCudaDevice
+        | Nvfp4Fallback::ShapeIneligible
+        | Nvfp4Fallback::NoDeviceHandle
+        | Nvfp4Fallback::NoFusedQuantizer => None,
+    }
 }
 
 /// The device- and checkpoint-level facts that can force dense BF16 **regardless of the structural
@@ -1139,6 +1243,147 @@ pub fn summarize(records: &[ActRecord]) -> Vec<LayerSparsitySummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// **`ALL` is every variant** (sc-12121 review fix). `pub const ALL: [Self; 8]` is an array
+    /// literal, not an exhaustive construct: a leaf added to the enum but left out of it would be
+    /// invisible to the coverage walk while still classifying — the "no leaf without a role-table
+    /// row" claim would quietly stop holding.
+    ///
+    /// So `ALL` is crossed against the exhaustive [`BlockLeaf::ordinal`] match (which a new variant
+    /// cannot compile without extending) in both directions: every ordinal `0..ALL.len()` names a
+    /// leaf, and every leaf's ordinal is its position in `ALL`. Add a ninth variant and the macro
+    /// forces it an ordinal; whatever ordinal it gets, either it collides (RED here) or it is
+    /// `ALL.len()`, and `from_ordinal(ALL.len())` then returns `Some` — also RED.
+    #[test]
+    fn block_leaf_all_is_every_variant() {
+        for (i, leaf) in BlockLeaf::ALL.iter().enumerate() {
+            assert_eq!(leaf.ordinal(), i, "{leaf:?} is not at its ordinal in ALL");
+            assert_eq!(BlockLeaf::from_ordinal(i), Some(*leaf));
+        }
+        assert_eq!(
+            BlockLeaf::from_ordinal(BlockLeaf::ALL.len()),
+            None,
+            "the exhaustive ordinal match names more leaves than `BlockLeaf::ALL` lists — a variant \
+             was added to the enum without being added to ALL"
+        );
+        // Every key round-trips, and the eight keys are distinct.
+        for leaf in BlockLeaf::ALL {
+            assert_eq!(BlockLeaf::from_leaf_key(leaf.leaf_key()), Some(leaf));
+            assert_eq!(
+                leaf.leaf_key(),
+                format!("{}.{}", leaf.module(), leaf.module_leaf()),
+                "leaf_key must be module + module_leaf composed"
+            );
+        }
+        let keys: BTreeSet<&str> = BlockLeaf::ALL.iter().map(|l| l.leaf_key()).collect();
+        assert_eq!(keys.len(), BlockLeaf::ALL.len(), "duplicate leaf keys");
+        // ATTN + FF partition ALL, and each sub-list is one module.
+        let split: Vec<BlockLeaf> = BlockLeaf::ATTN
+            .into_iter()
+            .chain(BlockLeaf::FF)
+            .collect::<Vec<_>>();
+        assert_eq!(split, BlockLeaf::ALL.to_vec());
+        assert!(BlockLeaf::ATTN.iter().all(|l| l.module() == "attn"));
+        assert!(BlockLeaf::FF.iter().all(|l| l.module() == "ff"));
+        // The post-nonlinearity partition is the sc-12110 finding, pinned.
+        let post: BTreeSet<&str> = BlockLeaf::ALL
+            .iter()
+            .filter(|l| l.reads_post_nonlinearity())
+            .map(|l| l.leaf_key())
+            .collect();
+        assert_eq!(
+            post,
+            BTreeSet::from(["attn.to_out.0", "ff.down"]),
+            "the post-nonlinearity class moved"
+        );
+    }
+
+    /// **The loader's leaf strings ARE the role table's** (sc-12121 review fix).
+    ///
+    /// The original review found the coverage walk building block keys from `BlockLeaf::leaf_key`
+    /// while claiming to spell them the way the loader does — the table checked against itself. The
+    /// fix made `GatedAttention::load_planned` / `SwiGlu::load_planned` read their suffixes from
+    /// [`BlockLeaf::module_leaf`], so there is one source. This test proves the loop closes against
+    /// something the table does **not** own:
+    ///
+    /// 1. `testfix::tiny_transformer` writes a real safetensors file whose keys are spelled by hand
+    ///    (`{prefix}.attn.to_q`, `{prefix}.ff.down`, …) and loads a real trunk through the real
+    ///    loader — so a table typo makes the load fail outright.
+    /// 2. `native_mapping::BLOCK_DIFFUSERS_LEAVES` is the checkpoint namespace's own independent
+    ///    enumeration of per-block leaves; the eight GEMM leaves must each appear there.
+    ///
+    /// Mutate any one of the eight `module_leaf` literals and both halves go RED.
+    #[test]
+    fn loader_leaf_literals_match_the_role_table() {
+        // (2) — the checkpoint namespace's list, which nothing in `nvfp4_dit` produces.
+        let checkpoint: BTreeSet<&str> = crate::native_mapping::BLOCK_DIFFUSERS_LEAVES
+            .iter()
+            .copied()
+            .collect();
+        for leaf in BlockLeaf::ALL {
+            let weight_key = format!("{}.weight", leaf.leaf_key());
+            assert!(
+                checkpoint.contains(weight_key.as_str()),
+                "{weight_key} is not a per-block leaf the Krea checkpoint namespace names — the \
+                 role table and the checkpoint's key spelling have drifted"
+            );
+        }
+
+        // (1) — a real load through the real loader, keys spelled independently by the fixture.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, _cfg) = crate::testfix::tiny_transformer(&tmp);
+        let loaded: BTreeSet<String> = dit
+            .nvfp4_layer_names()
+            .into_iter()
+            .filter_map(|n| n.strip_prefix("transformer_blocks.0.").map(str::to_string))
+            .collect();
+        let table: BTreeSet<String> = BlockLeaf::ALL
+            .iter()
+            .map(|l| l.leaf_key().to_string())
+            .collect();
+        assert_eq!(
+            loaded, table,
+            "the block's loaded projection keys and `BlockLeaf::ALL` disagree — a key that stops \
+             classifying silently downgrades to DenseReason::Unclassified"
+        );
+    }
+
+    /// **Only the two unpredictable causes are excused** (sc-12121 review fix).
+    ///
+    /// `dense_reason_for_fallback` is the whole width of the hole `check_representation` allows in
+    /// its refusal, so the set of causes it maps must be exactly the two `Nvfp4Capability` cannot
+    /// model. Widen it to a cause the capability facts DO model — say `NoFusedQuantizer`, which
+    /// `Nvfp4Capability::fused_quantizer` predicts — and a real prediction defect stops being an
+    /// error, which is the coverage lie this story exists to delete.
+    #[test]
+    fn only_the_unpredictable_fallback_causes_are_excused() {
+        let excused: Vec<Nvfp4Fallback> = [
+            Nvfp4Fallback::W4A16Requested,
+            Nvfp4Fallback::NotCudaDevice,
+            Nvfp4Fallback::ShapeIneligible,
+            Nvfp4Fallback::NoDeviceHandle,
+            Nvfp4Fallback::DeviceMismatch,
+            Nvfp4Fallback::NoFusedQuantizer,
+            Nvfp4Fallback::StagingFailed,
+        ]
+        .into_iter()
+        .filter(|c| dense_reason_for_fallback(*c).is_some())
+        .collect();
+        assert_eq!(
+            excused,
+            vec![Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed],
+            "exactly the two runtime accidents no per-key capability probe can see may be excused"
+        );
+        assert_eq!(
+            dense_reason_for_fallback(Nvfp4Fallback::DeviceMismatch),
+            Some(DenseReason::DeviceMismatch)
+        );
+        assert_eq!(
+            dense_reason_for_fallback(Nvfp4Fallback::StagingFailed),
+            Some(DenseReason::StagingFailed)
+        );
+    }
 
     #[test]
     fn baseline_plan_is_not_nvfp4_and_blanket_plans_force_their_regime() {
@@ -1232,9 +1477,15 @@ mod tests {
     /// Every dotted key the NVFP4 lane serves on a Krea trunk of `n` single-stream blocks — built
     /// from the role table's own leaf enumeration, in the order the loader visits them.
     ///
-    /// Deliberately **not** the role table's inverse: it spells the keys the way
-    /// `Krea2Transformer::load_front` / `Krea2Block::load_planned` spell them, so the coverage test
-    /// crosses the loader's surface against the table rather than the table against itself.
+    /// **This is the table's inverse, and says so.** The per-block suffixes come from
+    /// [`BlockLeaf::leaf_key`], not from a second copy of the loader's literals — because since
+    /// sc-12121's review fix the loader has no literals of its own: `GatedAttention::load_planned`
+    /// and `SwiGlu::load_planned` call [`BlockLeaf::module_leaf`] and [`BlockLeaf::module`]. There is
+    /// one source of the eight strings, so "the loader's surface" and "the table's inverse" are the
+    /// same set by construction. What crosses the two is
+    /// `loader_leaf_literals_match_the_role_table`, which walks a real loaded block's projection keys
+    /// and asserts they are exactly `BlockLeaf::ALL.map(leaf_key)`; this helper then supplies the
+    /// non-block keys (`img_in`, `txt_in.*`, `final_layer.linear`) the same way.
     fn krea_lane_surface(n: usize) -> Vec<String> {
         let leaves = || BlockLeaf::ALL.into_iter().map(BlockLeaf::leaf_key);
         let mut names: Vec<String> = vec![
