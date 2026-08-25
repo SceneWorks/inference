@@ -33,9 +33,10 @@ use candle_gen::gen_core::checkpoint_codec::{
 };
 use candle_gen::gen_core::checkpoint_facts::CheckpointWeightFacts;
 use candle_gen::logical_weights::{LogicalTensor, LogicalWeightReader};
-use candle_gen::quant::{ActPrecision, Nvfp4Context, Nvfp4Linear};
+use candle_gen::quant::{Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Regime};
 
 use crate::config::Flux2Config;
+use crate::nvfp4_roles::{KleinExecutionRole, KleinRoleTable};
 use crate::quant::QLinear;
 
 /// Top-level (non-block) 1:1 renames: BFL physical → diffusers logical. The klein community
@@ -308,6 +309,11 @@ pub(crate) struct PlannedDitWeights {
     device: Device,
     dtype: DType,
     ctx: Nvfp4Context,
+    /// The provider-owned structural role table (sc-11045 fix round, epic E5) — which packed rows
+    /// run genuine W4A4 and which are the outlier-class W4A16 (dense-BF16) override. Replaces the
+    /// deleted `ActPrecision::for_outlier_layer` substring heuristic, whose anchors mis-fired on
+    /// klein's key surface (unguarded last block / post-nonlinearity / context reads).
+    roles: KleinRoleTable,
 }
 
 impl PlannedDitWeights {
@@ -316,12 +322,14 @@ impl PlannedDitWeights {
         device: Device,
         dtype: DType,
         ctx: Nvfp4Context,
+        roles: KleinRoleTable,
     ) -> Self {
         Self {
             reader,
             device,
             dtype,
             ctx,
+            roles,
         }
     }
 
@@ -395,13 +403,34 @@ impl PlannedDitWeights {
                          [{out_dim}, {in_dim}]"
                     )));
                 }
+                // sc-11045 fix round (epic E5): the activation regime comes from the provider's
+                // structural role table, never a substring anchor. The role is a REPORT of the
+                // policy — `Nvfp4Linear`'s construction gates still own the final regime, and the
+                // cross-check below refuses a disagreement instead of silently downgrading.
+                let role = self.roles.execution_role(base);
+                let expected_packed = role.is_packed_w4a4()
+                    && self.ctx.is_fp4()
+                    && self.ctx.fused_quantizer_available();
                 let lin = Nvfp4Linear::from_packed_in(
                     *tensor,
                     dense_bias,
                     &self.device,
-                    ActPrecision::for_outlier_layer(base),
+                    role.act_precision(),
                     &self.ctx,
                 )?;
+                check_klein_representation(base, role, expected_packed, &lin)?;
+                // A packed-priced row the role table (or a transparent fallback) resolved to the
+                // dequant-bf16 regime holds a dense bf16 weight; tell the reader so the
+                // receipt/facts report DenseFallback at the measured dense bytes instead of
+                // labelling the row native (BLOCKER 2).
+                if lin.regime() == Nvfp4Regime::DequantBf16 {
+                    let resident = lin.resident_weight_bytes()? as u64;
+                    self.reader
+                        .demote_to_dense_fallback(&weight_key, resident)
+                        .map_err(|error| {
+                            candle_gen::candle_core::Error::Msg(error.to_string())
+                        })?;
+                }
                 Ok(QLinear::from_nvfp4(lin))
             }
             LogicalTensor::PackedFp8E4M3 { .. } => {
@@ -427,6 +456,49 @@ impl PlannedDitWeights {
     pub(crate) fn checkpoint_weight_facts(&self) -> candle_gen::Result<CheckpointWeightFacts> {
         self.reader.checkpoint_weight_facts()
     }
+}
+
+/// Cross the representation the role table + context facts predicted for `base` against the one
+/// the constructed projection actually serves (sc-11045 fix round; the krea
+/// `check_representation` pattern, sc-12121 / epic E4).
+///
+/// The prediction never routes anything — the logical plan owns residency and `Nvfp4Linear` owns
+/// the construction gate — so this is the seam that keeps the reported role honest. Two
+/// construction-time causes ([`Nvfp4Fallback::DeviceMismatch`], [`Nvfp4Fallback::StagingFailed`])
+/// are runtime accidents no plan-time fact can see; a dense outcome for one of those is a
+/// transparent degradation (logged, and demoted by the caller), never table drift. Every other
+/// disagreement — in either direction — is a hard error.
+fn check_klein_representation(
+    base: &str,
+    role: KleinExecutionRole,
+    expected_packed: bool,
+    lin: &Nvfp4Linear,
+) -> Result<()> {
+    let packed = lin.regime() == Nvfp4Regime::Fp4W4A4;
+    if expected_packed == packed {
+        return Ok(());
+    }
+    if !packed {
+        if let Some(cause) = lin.fallback_cause().filter(|cause| {
+            matches!(
+                cause,
+                Nvfp4Fallback::DeviceMismatch | Nvfp4Fallback::StagingFailed
+            )
+        }) {
+            eprintln!(
+                "[sc-11045] flux2 klein nvfp4: `{base}` was predicted packed W4A4 but the layer \
+                 fell back to dense bf16 ({cause:?}); this cause is invisible to plan-time facts, \
+                 so the load continues and the row is demoted in the receipt"
+            );
+            return Ok(());
+        }
+    }
+    let served = if packed { "packed W4A4" } else { "dense bf16" };
+    Err(candle_gen::candle_core::Error::Msg(format!(
+        "flux2 klein nvfp4 (sc-11045): `{base}` was constructed as {served}, but the role table \
+         predicted {role:?} (context: fp4={expected_packed}); the role table and the constructed \
+         projection disagree about this layer's representation"
+    )))
 }
 
 /// The semantic identity of a compiled plan, for the linked-versus-managed equality the story
@@ -828,7 +900,13 @@ mod tests {
         let mapping = mapping_for(&cfg);
         let plan = plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).unwrap();
         let reader = LogicalWeightReader::open(&path, plan, &cpu).unwrap();
-        let src = PlannedDitWeights::new(reader, cpu.clone(), DType::F32, Nvfp4Context::none());
+        let src = PlannedDitWeights::new(
+            reader,
+            cpu.clone(),
+            DType::F32,
+            Nvfp4Context::none(),
+            KleinRoleTable::new(&cfg),
+        );
         let planned = Flux2Transformer::new_planned(&cfg, &src).expect("planned transformer");
 
         // Path B: the trusted converter (klein community tables + chunk3 + swap_halves).

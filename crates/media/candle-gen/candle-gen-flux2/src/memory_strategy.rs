@@ -206,10 +206,41 @@ fn klein_planned_dit_bytes(
     let plan = candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, residency)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
     let overflow = || gen_core::Error::Msg("FLUX.2 imported DiT resident byte sum overflow".into());
+    // Pricing and loading must not disagree about what a row holds resident, and the loader's
+    // decision is not the plan's residency alone: the provider role table sends the outlier class
+    // of `Packed`-priced rows to **W4A16**, which dequantizes once at construction and holds the
+    // full dense **bf16** weight (2 B per logical element — `Nvfp4Linear::new_dequant` stores
+    // BF16, unlike the plan-dense rows this pipeline casts to F32). Pricing those rows at packed
+    // bytes under-priced the pinned klein artifact by ~0.94 GB and falsely admitted it
+    // (sc-11045 feature-end review, BLOCKER 4). The same role table the loader consults prices
+    // here, so the two cannot drift without failing the loader's representation cross-check.
+    let roles = crate::nvfp4_roles::KleinRoleTable::new(cfg);
+    const W4A16_RESIDENT_BYTES_PER_ELEMENT: u64 = 2;
+    let stays_packed = |logical_key: &str| -> bool {
+        let base = logical_key
+            .strip_suffix(".weight")
+            .unwrap_or(logical_key);
+        roles.execution_role(base).is_packed_w4a4()
+    };
     let mut total = 0_u64;
+    // Physical keys with at least one logical output that genuinely stays packed W4A4: only those
+    // owners retain their scale companions (a role-dense W4A16 construction consumes them in the
+    // one-time dequant).
+    let mut packed_owner: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for tensor in &plan.tensors {
         let bytes = match tensor.residency.mode {
-            ResidencyMode::Packed => tensor.residency.resident_bytes,
+            ResidencyMode::Packed if stays_packed(&tensor.logical_key) => {
+                packed_owner.insert(tensor.physical_key.as_str());
+                tensor.residency.resident_bytes
+            }
+            // A Packed-priced row the role table serves W4A16: resident dense bf16.
+            ResidencyMode::Packed => tensor
+                .shape
+                .iter()
+                .try_fold(W4A16_RESIDENT_BYTES_PER_ELEMENT, |acc: u64, dim| {
+                    acc.checked_mul(*dim as u64)
+                })
+                .ok_or_else(overflow)?,
             ResidencyMode::Dense => tensor
                 .shape
                 .iter()
@@ -221,6 +252,13 @@ fn klein_planned_dit_bytes(
         total = total.checked_add(bytes).ok_or_else(overflow)?;
     }
     for companion in &plan.companions {
+        if companion.resident_bytes > 0
+            && !packed_owner.contains(companion.owner_physical_key.as_str())
+        {
+            // Retained-scale pricing for an owner whose every output is role-dense: the W4A16
+            // dequant consumes the scales, so nothing stays resident.
+            continue;
+        }
         total = total
             .checked_add(companion.resident_bytes)
             .ok_or_else(overflow)?;
@@ -2028,7 +2066,7 @@ mod klein_nvfp4_pricing_tests {
     /// atom tile), `in_channels = 8`.
     fn fixture_cfg() -> crate::config::Flux2Config {
         let mut cfg = Flux2Variant::Klein9b.config();
-        cfg.num_double_layers = 1;
+        cfg.num_double_layers = 2;
         cfg.num_single_layers = 1;
         cfg.num_heads = 16;
         cfg.head_dim = 8;
@@ -2036,7 +2074,11 @@ mod klein_nvfp4_pricing_tests {
         cfg
     }
 
-    fn write_nvfp4_mixed_klein_file(path: &Path) -> (usize, usize) {
+    /// `block` selects which double block carries the packed qkv: block **1** is interior (its
+    /// `to_q/to_k/to_v` stay genuinely packed under the role table), block **0** is the leading
+    /// edge (its whole surface is the W4A16 outlier class) — the two sides of the mixed policy the
+    /// pricing must distinguish (sc-11045 fix round, BLOCKER 4).
+    fn write_nvfp4_mixed_klein_file(path: &Path, block: usize) -> (usize, usize) {
         let (inner, in_channels) = (128usize, 8usize);
         let (rows, cols) = (3 * inner, inner);
         let embedder = vec![0u8; inner * in_channels * 2];
@@ -2044,6 +2086,12 @@ mod klein_nvfp4_pricing_tests {
         let scale_shape = candle_gen::gen_core::nvfp4_scale_shape([rows, cols]).to_vec();
         let scales = vec![0x38u8; scale_shape.iter().product::<usize>()];
         let global = 1.0f32.to_le_bytes();
+        let qkv = format!("double_blocks.{block}.img_attn.qkv");
+        let (weight_key, scale_key, global_key) = (
+            format!("{qkv}.weight"),
+            format!("{qkv}.weight_scale"),
+            format!("{qkv}.weight_scale_2"),
+        );
         let mut tensors = BTreeMap::new();
         tensors.insert(
             "img_in.weight",
@@ -2055,7 +2103,7 @@ mod klein_nvfp4_pricing_tests {
             .unwrap(),
         );
         tensors.insert(
-            "double_blocks.0.img_attn.qkv.weight",
+            weight_key.as_str(),
             ::safetensors::tensor::TensorView::new(
                 ::safetensors::Dtype::U8,
                 vec![rows, cols / 2],
@@ -2064,7 +2112,7 @@ mod klein_nvfp4_pricing_tests {
             .unwrap(),
         );
         tensors.insert(
-            "double_blocks.0.img_attn.qkv.weight_scale",
+            scale_key.as_str(),
             ::safetensors::tensor::TensorView::new(
                 ::safetensors::Dtype::F8_E4M3,
                 scale_shape,
@@ -2073,14 +2121,15 @@ mod klein_nvfp4_pricing_tests {
             .unwrap(),
         );
         tensors.insert(
-            "double_blocks.0.img_attn.qkv.weight_scale_2",
+            global_key.as_str(),
             ::safetensors::tensor::TensorView::new(::safetensors::Dtype::F32, vec![], &global)
                 .unwrap(),
         );
         let metadata = std::collections::HashMap::from([(
             "_quantization_metadata".to_string(),
-            r#"{"format_version": "1.0", "layers": {"double_blocks.0.img_attn.qkv": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [384, 128]}}}"#
-                .to_string(),
+            format!(
+                r#"{{"format_version": "1.0", "layers": {{"{qkv}": {{"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [384, 128]}}}}}}"#
+            ),
         )]);
         ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
         (inner, in_channels)
@@ -2109,7 +2158,9 @@ mod klein_nvfp4_pricing_tests {
     fn the_klein_file_dit_is_priced_from_the_plan_in_both_residency_modes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("klein-nvfp4-mixed.safetensors");
-        let (inner, in_channels) = write_nvfp4_mixed_klein_file(&path);
+        // Block 1 — interior, so the role table keeps its qkv slices genuinely packed and this
+        // test measures the packed arm of the pricing.
+        let (inner, in_channels) = write_nvfp4_mixed_klein_file(&path, 1);
         let cfg = fixture_cfg();
         assert_eq!((cfg.inner_dim(), cfg.in_channels), (inner, in_channels));
 
@@ -2146,5 +2197,51 @@ mod klein_nvfp4_pricing_tests {
             f32_or_packed_component_bytes(&path, None, "imported DiT", false, true).unwrap();
         assert_ne!(header_sum, dense);
         assert_ne!(header_sum, packed);
+    }
+
+    /// **BLOCKER 4 (sc-11045 feature-end review): role-dense (W4A16) rows are priced at the dense
+    /// bf16 they actually hold, never at packed bytes.**
+    ///
+    /// The same fixture geometry with the packed qkv in double block **0** — the leading edge,
+    /// whose whole surface the role table sends to W4A16. The loader will dequantize each slice to
+    /// a resident dense **bf16** weight and consume the scales, so the pricing must charge
+    /// 2 B per logical element and nothing for the companions. Pricing these rows at packed bytes
+    /// (the pre-fix arm) under-prices by `dense_bf16 - packed` per row — ~0.94 GB across the
+    /// pinned klein artifact — and falsely admits.
+    ///
+    /// # Mutation witness (RUN)
+    ///
+    /// Restore the packed-only pricing — make the `ResidencyMode::Packed` match arm
+    /// unconditionally return `tensor.residency.resident_bytes` (and drop the companion
+    /// `packed_owner` filter): the total collapses onto `packed_only` below and both
+    /// `assert_eq!(mixed, ...)` and `assert!(mixed > packed_only)` go red.
+    #[test]
+    fn role_dense_packed_rows_are_priced_at_their_dense_bf16_residency() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("klein-nvfp4-edge.safetensors");
+        let (inner, in_channels) = write_nvfp4_mixed_klein_file(&path, 0);
+        let cfg = fixture_cfg();
+
+        let embedder_bytes = (inner * in_channels * 4) as u64;
+        // Three role-dense W4A16 slices: dense bf16 (2 B/elt), scales consumed.
+        let qkv_w4a16_bytes = (3 * inner * inner * 2) as u64;
+        let mixed =
+            klein_planned_dit_bytes(&path, &cfg, &ForcePackedNvfp4).expect("mixed-policy pricing");
+        assert_eq!(mixed, embedder_bytes + qkv_w4a16_bytes);
+        assert_eq!(mixed, 102_400);
+
+        // The falsely-admitting number the review measured: nibbles + retained scales.
+        let packed_only = {
+            let qkv_nibble_bytes = (3 * inner * inner / 2) as u64;
+            let block_scale_bytes = candle_gen::gen_core::nvfp4_scale_shape([3 * inner, inner])
+                .iter()
+                .product::<usize>() as u64;
+            embedder_bytes + qkv_nibble_bytes + block_scale_bytes + (3 * 4)
+        };
+        assert!(
+            mixed > packed_only,
+            "a W4A16 row holds dense bf16, which must price above the packed bytes the old arm \
+             charged ({mixed} vs {packed_only})"
+        );
     }
 }
