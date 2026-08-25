@@ -11,7 +11,7 @@
 //! and the 12 GB snapshot are gitignored, so this is `#[ignore]`d. The Python golden process and this
 //! test each peak ~40–50 GB and run sequentially — don't run them concurrently.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test encoder_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration encoder_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};

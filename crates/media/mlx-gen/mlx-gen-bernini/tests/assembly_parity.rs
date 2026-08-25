@@ -8,12 +8,21 @@
 //!
 //! These are exact host/array ops (gather, scatter, concat, pad, slice) → bit-for-bit equality.
 //!
-//! Run: `cargo test -p mlx-gen-bernini --test assembly_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-bernini --test integration assembly_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_bernini::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use mlx_gen_bernini::qwen2_5_vl::{Qwen25VlText, QwenVlTextConfig};
 use mlx_rs::Array;
+
+use crate::common;
+
+use common::{
+    SHARED_FIXTURE_ASSEMBLY_HEAD_DIM, SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE,
+    SHARED_FIXTURE_ASSEMBLY_MROPE_SECTION, SHARED_FIXTURE_ASSEMBLY_NUM_HEADS,
+    SHARED_FIXTURE_ASSEMBLY_NUM_KV_HEADS, SHARED_FIXTURE_ASSEMBLY_NUM_LAYERS,
+    SHARED_FIXTURE_ASSEMBLY_RMS_NORM_EPS, SHARED_FIXTURE_ASSEMBLY_ROPE_THETA,
+};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -46,18 +55,27 @@ fn assert_exact(name: &str, got: &Array, want: &Array) {
 #[test]
 fn assembly_matches_reference() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
+    // Read from the golden's own `__metadata__`, as the candle lane does, rather than re-typing what
+    // the fixture already records: `hidden` and `max_seq` are the dumper's, so a regenerated golden
+    // moves both lanes together instead of only one (sc-19496).
+    let meta = |k: &str| {
+        w.metadata(k)
+            .unwrap_or_else(|| panic!("missing metadata {k}"))
+    };
+    let hidden: i32 = meta("hidden").parse().unwrap();
+    let max_seq: i32 = meta("max_seq").parse().unwrap();
 
     // Minimal backbone (0 layers) — only the token embedding is exercised.
     let cfg = QwenVlTextConfig {
-        hidden_size: 16,
-        num_layers: 0,
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 8,
-        intermediate_size: 32,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1_000_000.0,
-        mrope_section: [1, 2, 1],
+        hidden_size: hidden,
+        num_layers: SHARED_FIXTURE_ASSEMBLY_NUM_LAYERS,
+        num_heads: SHARED_FIXTURE_ASSEMBLY_NUM_HEADS,
+        num_kv_heads: SHARED_FIXTURE_ASSEMBLY_NUM_KV_HEADS,
+        head_dim: SHARED_FIXTURE_ASSEMBLY_HEAD_DIM,
+        intermediate_size: SHARED_FIXTURE_ASSEMBLY_INTERMEDIATE_SIZE,
+        rms_norm_eps: SHARED_FIXTURE_ASSEMBLY_RMS_NORM_EPS,
+        rope_theta: SHARED_FIXTURE_ASSEMBLY_ROPE_THETA,
+        mrope_section: SHARED_FIXTURE_ASSEMBLY_MROPE_SECTION,
         quantization: None,
     };
     let backbone = Qwen25VlText::from_weights(&w, cfg, "model").expect("backbone");
@@ -78,13 +96,15 @@ fn assembly_matches_reference() {
     // no-visual path == plain token embedding (sanity: scatter of nothing is a no-op).
     let none =
         format_mllm_inputs_embeds(&backbone, &input_ids, None, &vin, &vout).expect("no visual");
-    assert_eq!(none.shape(), &[1, input_ids.len() as i32, 16]);
+    assert_eq!(none.shape(), &[1, input_ids.len() as i32, hidden]);
 
     // --- concat_with_zero_init (pad + truncate) ---
     let t5 = w.require("io.t5").unwrap();
-    let pad = concat_with_zero_init(t5, w.require("io.stream_short").unwrap(), 10).expect("pad");
+    let pad =
+        concat_with_zero_init(t5, w.require("io.stream_short").unwrap(), max_seq).expect("pad");
     assert_exact("concat_pad", &pad, w.require("out.concat_pad").unwrap());
-    let trunc = concat_with_zero_init(t5, w.require("io.stream_long").unwrap(), 10).expect("trunc");
+    let trunc =
+        concat_with_zero_init(t5, w.require("io.stream_long").unwrap(), max_seq).expect("trunc");
     assert_exact(
         "concat_trunc",
         &trunc,

@@ -42,7 +42,7 @@
 //! FLUX1_CHROMA_VAES="<hd vae>;<base vae>;<flash vae>" \
 //! FLUX1_BOOGU_VAE=...\models--Boogu--Boogu-Image-0.1-Turbo\snapshots\<rev>\vae\diffusion_pytorch_model.safetensors \
 //! FLUX1_PREVIEW_ARTIFACT_DIR=E:\out\sc-16956 \
-//!   cargo test -p candle-gen-flux --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-flux --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

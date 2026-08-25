@@ -24,6 +24,7 @@ pub mod config;
 pub mod conv3d;
 pub mod embeddings;
 pub mod image_encoder;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preprocess;
 pub mod scheduler;
@@ -40,7 +41,7 @@ use candle_gen::gen_core::runtime::LoadPhase;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, PerComponentBytes,
-    Progress, SizeFloor, WeightsSource,
+    Progress, StepSupport, WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -244,7 +245,7 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<PerCompon
 
 /// Upper bound on a `Reference` image's dimensions (caps host allocations on the input buffer + the
 /// resize's f32 intermediates). 8192 is far above any real photo (F-164).
-const MAX_REFERENCE_DIM: u32 = 8192;
+pub(crate) const MAX_REFERENCE_DIM: u32 = 8192;
 /// Upper bound on requested output `frames` — SVD-XT is the 25-frame variant; per-frame latents +
 /// `added_time_ids` scale linearly, so cap the allocation.
 const MAX_FRAMES: u32 = 64;
@@ -264,44 +265,23 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Unified curated SAMPLER menu (epic 7114 P4, sc-7125, decision 3b: sampler-only, NO
             // scheduler axis — SVD keeps its native Karras EDM σ schedule). SVD is EDM v-prediction;
             // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
             samplers: candle_gen::curated_sampler_names(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,
-            mac_only: false,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // SVD-XT's engine bound, advertised rather than hidden (sc-19559) — the candle twin
+            // of `mlx-gen-svd`'s declaration, from this lane's own `MAX_STEPS` (both 200).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -316,6 +296,7 @@ pub struct SvdGenerator {
     /// conditioner → UNet → VAE in disjoint phases through the shared Candle lifecycle.
     offload: OffloadPolicy,
     components: Mutex<Option<Components>>,
+    memory: Option<memory_strategy::PreparedSvdMemory>,
 }
 
 /// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
@@ -380,19 +361,22 @@ fn validate_reference_image(img: &Image) -> gen_core::Result<()> {
 impl SvdGenerator {
     /// Resolve the single conditioning reference image (image→video input).
     fn reference<'a>(&self, req: &'a GenerationRequest) -> gen_core::Result<&'a Image> {
-        req.conditioning
-            .iter()
-            .find_map(|c| match c {
-                Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                gen_core::Error::Msg("svd_xt: image→video requires a Reference image".into())
-            })
+        match req.conditioning.as_slice() {
+            [Conditioning::Reference {
+                image,
+                strength: None,
+            }] => Ok(image),
+            _ => Err(gen_core::Error::Msg(
+                "svd_xt: image→video requires exactly one strength-free Reference image".into(),
+            )),
+        }
     }
 
     /// Lazily load + cache the SVD components. `cached` recovers a poisoned lock (sc-9015) internally.
     fn components(&self) -> CResult<Components> {
+        if let Some(memory) = &self.memory {
+            memory.ensure_unchanged()?;
+        }
         candle_gen::cached(&self.components, || {
             Components::load(&self.root, &self.device)
         })
@@ -505,6 +489,15 @@ impl Generator for SvdGenerator {
         validate_output_params(req)?;
         let img = self.reference(req)?;
         validate_reference_image(img)?;
+        if req.memory.is_some() {
+            let memory = self.memory.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "svd_xt: memory request requires a sealed physical receipt".into(),
+                )
+            })?;
+            memory_strategy::validate_memory_request(req)?;
+            memory_strategy::validate_active_request(memory, req)?;
+        }
         Ok(())
     }
 
@@ -733,9 +726,42 @@ impl Generator for SvdGenerator {
             audio: None,
         })
     }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "svd_xt: loaded generator has no sealed memory receipt".into(),
+            )
+        })?;
+        memory_strategy::begin_request(memory, self.device.clone(), context)
+    }
 }
 
 fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -756,18 +782,38 @@ fn load_generator(spec: &LoadSpec) -> gen_core::Result<SvdGenerator> {
             "candle svd does not support quantization".into(),
         ));
     }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
         return Err(gen_core::Error::Unsupported(
             "candle svd does not support control / IP-adapter overlays".into(),
         ));
     }
     let device = candle_gen::default_device()?;
+    // The public prepared route advertises request-scoped Resident authority. Materialize its
+    // sealed components inside the admitted cache load transaction so the cache's before/after
+    // device snapshots attribute the actual F32 residency. Direct callers without a prepared
+    // receipt retain the historical lazy Resident/Sequential behavior.
+    let components = if memory.is_some() {
+        Some(Components::load(&root, &device)?)
+    } else {
+        None
+    };
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
     Ok(SvdGenerator {
         descriptor: descriptor(),
         root,
         device,
         offload: spec.offload_policy,
-        components: Mutex::new(None),
+        components: Mutex::new(components),
+        memory,
     })
 }
 
@@ -787,7 +833,16 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(REGISTRATION)
+    register_memory_contract_surfaces(registry.register_generator(REGISTRATION))
+}
+
+/// Register SVD-XT's dense Resident memory route and its explicit weights-free witness.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_resident_only_memory_contract(memory_strategy::RESIDENT_ONLY_WITNESS)
 }
 
 /// Build the complete explicit Candle SVD provider catalog.
@@ -871,6 +926,47 @@ mod tests {
         assert!(
             d.capabilities.supports_sequential_offload,
             "svd_xt must advertise the staged conditioner → UNet → VAE lifecycle"
+        );
+    }
+
+    /// sc-19559 — the candle twin of `mlx-gen-svd`'s ceiling test. The bound both lanes have
+    /// always enforced privately is now readable off the descriptor and rejected by the SHARED
+    /// floor, so the two lanes refuse the same counts from the same declaration.
+    ///
+    /// Reading `ceiling()` alone would pass against a descriptor nothing enforces; asserting only
+    /// the refusal would pass against a bound that stays undiscoverable. Both are asserted.
+    #[test]
+    fn the_step_ceiling_is_advertised_and_enforced_by_the_shared_floor() {
+        let caps = descriptor().capabilities;
+        assert_eq!(
+            caps.supported_steps.ceiling(),
+            Some(MAX_STEPS),
+            "the descriptor must advertise the engine's own ceiling, weights-free"
+        );
+        assert_eq!(caps.supported_steps.floor(), Some(1));
+
+        let at = |steps: u32| {
+            caps.validate_request(
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    steps: Some(steps),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            at(MAX_STEPS).is_ok(),
+            "the advertised ceiling itself must be renderable"
+        );
+        let err = at(MAX_STEPS + 1)
+            .expect_err("the shared floor must refuse an over-ceiling count")
+            .to_string();
+        assert!(
+            err.contains(MODEL_ID) && err.contains(&format!("1..={MAX_STEPS}")),
+            "the refusal must name the model and the advertised range: {err}"
         );
     }
 

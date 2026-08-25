@@ -15,7 +15,7 @@
 //!   LENS_SNAPSHOT_DIR     — the `microsoft/Lens-Turbo` snapshot root (tokenizer/ + text_encoder/)
 //!   LENS_REASONER_GOLDENS — lens_reasoner_golden.safetensors (default: .scratch/lens-reasoner-goldens/…)
 //! Run with the `cuda` feature:
-//!   cargo test -p candle-gen-lens --features cuda --test reasoner_parity -- --nocapture
+//!   cargo test -p candle-gen-lens --features cuda --test integration reasoner_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -34,6 +34,7 @@ fn ids(t: &Tensor) -> Result<Vec<u32>, AnyErr> {
 }
 
 #[test]
+#[ignore = "needs the Lens-Turbo snapshot root (LENS_SNAPSHOT_DIR) + goldens (LENS_REASONER_GOLDENS)"]
 fn lens_reasoner_matches_reference() -> Result<(), AnyErr> {
     let root = match std::env::var("LENS_SNAPSHOT_DIR") {
         Ok(d) => d,

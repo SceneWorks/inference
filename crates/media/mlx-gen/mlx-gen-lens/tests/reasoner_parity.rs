@@ -12,7 +12,7 @@
 //!
 //! `#[ignore]`d — needs the golden + the Lens-Turbo `text_encoder` snapshot (~40 GB bf16 load).
 //!
-//! Run: `cargo test -p mlx-gen-lens --test reasoner_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration reasoner_parity:: -- --ignored --nocapture`
 
 use mlx_rs::Dtype;
 

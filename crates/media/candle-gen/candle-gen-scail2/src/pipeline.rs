@@ -7,13 +7,14 @@
 //! video + per-frame color masks** are a `ControlClip`; `video_mode == "replacement"` toggles the
 //! cross-identity `replace_flag` (else animation). Inference adapters (`spec.adapters`) — LoRA / LoKr /
 //! LoHa, the lightx2v lightning diff-patch, and the Bias-Aware DPO refinement LoRA — are folded into the
-//! dense DiT before build ([`crate::adapters`], sc-6838). Multi-reference awaits the worker request
-//! contract (sc-5583: gen-core has no way to pair an extra reference image with its color-coded mask —
-//! `Conditioning::MultiReference` carries images only); `crate::generate` already supports extra
-//! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
-//! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
+//! dense DiT before build ([`crate::adapters`], sc-6838). Multiple characters use the existing ordered
+//! conditioning carrier: each [`Conditioning::Reference`] must be followed by its color-coded
+//! [`Conditioning::Mask`]. The first pair is the primary character and later pairs reach
+//! [`crate::generate::Scail2Job::additional`] in caller order. The generic
+//! [`Conditioning::MultiReference`] image vector is advertised for routing but is deliberately refused:
+//! it cannot carry the mandatory per-character masks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,7 @@ use candle_gen::candle_nn::{Init, VarBuilder};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    SizeFloor, WeightsSource,
+    ReplacementMode, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
@@ -47,6 +48,29 @@ const DEFAULT_STEPS: u32 = 40;
 const DEFAULT_SHIFT: f32 = 5.0;
 const DEFAULT_GUIDANCE: f32 = 5.0;
 const DEFAULT_FPS: u32 = 16;
+
+/// The upstream source-position table is trained through source id 5, inclusive. The primary character
+/// occupies id 0, so a request may carry at most five additional image/mask pairs. Refusing the seventh
+/// pair is intentional: silently clipping it would make a caller believe a character was conditioned.
+const MAX_REFERENCE_CHARACTERS: usize = 6;
+
+/// The only DiT projections the SCAIL2 MLX converter packs. These raw `SCAIL2Model` names are
+/// deliberately not diffusers-prefixed: the hosted `dit.safetensors` is a flat file, while the
+/// legacy candle tree is a separate dense format.
+const PACKED_DIT_SUFFIXES: &[&str] = &[
+    "self_attn.q",
+    "self_attn.k",
+    "self_attn.v",
+    "self_attn.o",
+    "cross_attn.q",
+    "cross_attn.k",
+    "cross_attn.v",
+    "cross_attn.o",
+    "cross_attn.k_img",
+    "cross_attn.v_img",
+    "ffn.0",
+    "ffn.2",
+];
 
 /// SceneWorks/engine model id (matches `mlx-gen-scail2` so a consumer resolves the same engine across
 /// backends). A still image is `num_frames == 1`.
@@ -128,14 +152,10 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
-            // Reference character image (Reference) + its color-coded segmentation mask (Mask); the
-            // driving video + its per-frame color masks map to ControlClip. `MultiReference` (extra
-            // characters) is deliberately NOT advertised: gen-core's `Conditioning::MultiReference`
-            // carries images only, with no way to pair each extra reference with its required
-            // color-coded mask, so the request contract can't reach `Scail2Job.additional` yet —
-            // sc-5583 tracks the paired ref+mask contract + worker plumbing (sc-8985: advertising it
-            // let multi-ref requests validate, render for minutes, and silently drop the extras).
+            // A character is a strict ordered Reference + Mask pair. The first pair is primary and up
+            // to five later pairs are extra characters. MultiReference is advertised for the shared
+            // multi-reference routing surface, but its image-only payload is rejected below because it
+            // cannot express the matching masks this model requires.
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
@@ -149,38 +169,18 @@ pub fn descriptor() -> ModelDescriptor {
             // candle's FlowScheduler is UniPC/Euler; "dpm++" resolves to UniPC (bh2). Advertised to
             // match the mlx-gen-scail2 descriptor for cross-backend routing parity.
             samplers: vec!["unipc", "dpm++"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
-            supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
+            // The hosted packed Q4/Q8 tiers stay selectable (the Resident *memory* receipt is
+            // dense-bf16 only, which is a separate surface); MLX advertises the same pair.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Match the MLX sibling: `0×0` resolves from the driving clip, while every explicit
             // request remains exact-or-rejected on SCAIL-2's 32-pixel render lattice (sc-16199).
             size_floor: SizeFloor::ResolvedDownstreamExplicitGrid {
                 multiple: DIM_ALIGN,
             },
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -329,6 +329,163 @@ fn shared_vae_vb(root: &Path, device: &Device) -> CResult<VarBuilder<'static>> {
     Ok(VarBuilder::from_tensors(map, DType::F32, device))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedProjectionSchema {
+    output: usize,
+    input: usize,
+}
+
+/// Every MLX-packed SCAIL2 projection, including its logical dense matrix shape. The packed
+/// triple alone is not enough to prove this: `QLinear` infers its bit width from the triple and
+/// intentionally does not compare the inferred matrix dimensions with its caller's schema.
+fn expected_packed_dit_projections(cfg: &Scail2Config) -> BTreeMap<String, PackedProjectionSchema> {
+    (0..cfg.num_layers)
+        .flat_map(|block| {
+            PACKED_DIT_SUFFIXES.iter().map(move |suffix| {
+                let (output, input) = match *suffix {
+                    "ffn.0" => (cfg.ffn_dim, cfg.dim),
+                    "ffn.2" => (cfg.dim, cfg.ffn_dim),
+                    _ => (cfg.dim, cfg.dim),
+                };
+                (
+                    format!("blocks.{block}.{suffix}"),
+                    PackedProjectionSchema { output, input },
+                )
+            })
+        })
+        .collect()
+}
+
+/// Validate the published SCAIL2 packed-DiT *format* from safetensors headers only. This runs
+/// before constructing a VarBuilder, so an incomplete or mixed payload cannot fall through to a
+/// dense U32 read and it never stages full weights. The manifest and every triple must agree on
+/// the exact raw SCAIL2 block namespace and the hosted group-64 Q4/Q8 representation.
+fn validate_shared_packed_dit(root: &Path, cfg: &Scail2Config) -> CResult<()> {
+    use candle_gen::gen_core::weightsmeta::Dtype;
+    use candle_gen::quant::{
+        mlx_packed_bits_gs, mlx_packed_qtensor_resident_bytes, MLX_GROUP_SIZE,
+    };
+
+    let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+        root.join("dit.safetensors"),
+    )?;
+    let tensors: BTreeMap<_, _> = headers
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect();
+    let has_packed_leaf = tensors.iter().any(|(name, header)| {
+        name.ends_with(".scales")
+            || name.ends_with(".biases")
+            || (name.ends_with(".weight") && header.dtype == Dtype::U32)
+    });
+    let Some(quant) = cfg.packed_quant else {
+        if has_packed_leaf {
+            return Err(CandleError::Msg(
+                "scail2: dense config.json cannot admit MLX packed DiT leaves".into(),
+            ));
+        }
+        return Ok(());
+    };
+
+    let expected = expected_packed_dit_projections(cfg);
+    for name in tensors
+        .keys()
+        .filter(|name| name.ends_with(".scales") || name.ends_with(".biases"))
+    {
+        let suffix = if name.ends_with(".scales") {
+            ".scales"
+        } else {
+            ".biases"
+        };
+        let base = name.strip_suffix(suffix).expect("suffix checked");
+        if !expected.contains_key(base) {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT has orphan or non-SCAIL2 sidecar {name}"
+            )));
+        }
+    }
+    for (name, header) in &tensors {
+        if name.ends_with(".weight") && header.dtype == Dtype::U32 {
+            let base = name.strip_suffix(".weight").expect("suffix checked");
+            if !expected.contains_key(base) {
+                return Err(CandleError::Msg(format!(
+                    "scail2: packed DiT has unrecognized U32 weight {name}"
+                )));
+            }
+        }
+    }
+    for (base, schema) in expected {
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        let bias_key = format!("{base}.bias");
+        let weight = tensors.get(&weight_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {weight_key}"))
+        })?;
+        let scales = tensors.get(&scales_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {scales_key}"))
+        })?;
+        let biases = tensors.get(&biases_key).ok_or_else(|| {
+            CandleError::Msg(format!("scail2: packed DiT is missing {biases_key}"))
+        })?;
+        let bias = tensors
+            .get(&bias_key)
+            .ok_or_else(|| CandleError::Msg(format!("scail2: packed DiT is missing {bias_key}")))?;
+        if !matches!(scales.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+            || !matches!(biases.dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32)
+        {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} sidecars must be F16, BF16, or F32 (scales {:?}, biases {:?})",
+                scales.dtype, biases.dtype
+            )));
+        }
+        let input = schema.input;
+        let scale_columns = input.checked_div(MLX_GROUP_SIZE).filter(|_| input.is_multiple_of(MLX_GROUP_SIZE)).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "scail2: packed DiT {base} input width {input} is not divisible by group size {MLX_GROUP_SIZE}"
+            ))
+        })?;
+        let bits = quant.bits() as usize;
+        let packed_columns = input
+            .checked_mul(bits)
+            .filter(|encoded| encoded.is_multiple_of(32))
+            .map(|encoded| encoded / 32)
+            .ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "scail2: packed DiT {base} schema {input}×Q{bits} cannot form U32 code words"
+                ))
+            })?;
+        if weight.shape.as_slice() != [schema.output, packed_columns]
+            || scales.shape.as_slice() != [schema.output, scale_columns]
+            || biases.shape.as_slice() != [schema.output, scale_columns]
+            || bias.shape.as_slice() != [schema.output]
+        {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} violates its schema: expected weight [{}, {packed_columns}], \
+                 scales/biases [{}, {scale_columns}], and bias [{}]; got weight {:?}, scales {:?}, biases {:?}, bias {:?}",
+                schema.output,
+                schema.output,
+                schema.output,
+                weight.shape,
+                scales.shape,
+                biases.shape,
+                bias.shape,
+            )));
+        }
+        // The shared helper then validates U32 codes, triple compatibility, and GGML block
+        // alignment without reading a tensor payload.
+        mlx_packed_qtensor_resident_bytes(weight, scales, biases, MLX_GROUP_SIZE)?;
+        let packed_bits = mlx_packed_bits_gs(weight.shape[1], scales.shape[1], MLX_GROUP_SIZE);
+        if packed_bits != bits {
+            return Err(CandleError::Msg(format!(
+                "scail2: packed DiT {base} is Q{packed_bits}, but config.json declares Q{}",
+                quant.bits()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The loaded SCAIL-2 model: resolved config + snapshot dir, with the heavy components (DiT / VAE /
 /// UMT5 / CLIP) loaded lazily on first generate and cached.
 pub struct Scail2 {
@@ -340,6 +497,7 @@ pub struct Scail2 {
     /// Inference adapters (LoRA / LoKr / LoHa / lightx2v lightning diff-patch) folded into the DiT
     /// before build; empty for the stock path (sc-6838).
     adapters: Vec<AdapterSpec>,
+    memory_strategy: Option<crate::memory_strategy::PreparedMemory>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
@@ -433,7 +591,8 @@ impl Scail2 {
 /// candle component tree (`text_encoder/`, `transformer/`, `vae/`, `clip/`, and
 /// `tokenizer/tokenizer.json`). Inference
 /// adapters (`spec.adapters` — LoRA / LoKr / LoHa / lightx2v lightning diff-patch / Bias-Aware DPO) are
-/// merged into the dense DiT before build (sc-6838); on-the-fly quantization is still rejected.
+/// merged into the dense DiT before build (sc-6838). Q4/Q8 select the matching hosted packed tier;
+/// they are not on-the-fly quantization.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -446,11 +605,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle scail2 does not support on-the-fly Q4/Q8 quantization yet".into(),
-        ));
-    }
     if !root.exists() {
         return Err(gen_core::Error::Msg(format!(
             "scail2: snapshot dir does not exist: {}",
@@ -459,6 +613,33 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }
     let layout = snapshot_layout(&root)?;
     let config = Scail2Config::from_model_dir(&root)?;
+    if layout == SnapshotLayout::SharedMlxTier {
+        validate_shared_packed_dit(&root, &config)?;
+    }
+    if spec.quantize != config.packed_quant {
+        return Err(gen_core::Error::Unsupported(format!(
+            "scail2: requested precision tier {:?} does not match the snapshot's {:?} DiT layout",
+            spec.quantize, config.packed_quant
+        )));
+    }
+    if config.packed_quant.is_some() && !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "scail2: adapters require the dense DiT; packed Q4/Q8 tiers refuse adapter merging rather than staging a dense base".into(),
+        ));
+    }
+    // A shared tier that is not the canonical dense-bf16 public-animation artifact — a
+    // non-canonical snapshot, or a packed VACE-Fun Q4/Q8 tier — carries no public memory evidence,
+    // but it must still load and render exactly as it did before this epic. The memory seams fail
+    // closed on `None` (`memory_strategy_safety_check` Rejects and `validate` refuses a request
+    // that asks for memory), so dropping the receipt cannot silently admit anything.
+    let memory_strategy = if layout == SnapshotLayout::SharedMlxTier {
+        crate::memory_strategy::PreparedMemory::prepare(spec).ok()
+    } else {
+        None
+    };
+    if let Some(memory) = &memory_strategy {
+        memory.ensure_unchanged(&spec.adapters)?;
+    }
     let device = candle_gen::default_device()?;
     Ok(Box::new(Scail2 {
         descriptor: descriptor(),
@@ -467,6 +648,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         layout,
         device,
         adapters: spec.adapters.clone(),
+        memory_strategy,
         components: Mutex::new(None),
     }))
 }
@@ -479,11 +661,29 @@ impl Generator for Scail2 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // Actionable multi-reference rejection first, so the caller learns WHY (pending contract,
-        // sc-5583) rather than the generic capability-floor "not supported" from `validate_request`
-        // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
-        reject_multi_reference(self.descriptor.id, req)?;
+        // Gate on `req.memory`, as SVD does. Running the exact Resident envelope for *every*
+        // request hard-rejected the documented `0x0` resolve-from-clip sentinel and the multi-
+        // character Reference/Mask pairs this pipeline still accepts.
+        if req.memory.is_some() {
+            let memory = self.memory_strategy.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{MODEL_ID}: memory request requires the sealed canonical dense-bf16 receipt"
+                ))
+            })?;
+            crate::memory_strategy::validate_generation_request(req)?;
+            // The executing request must be the one the admitted scope opened.
+            crate::memory_strategy::validate_active_request(memory, req)?;
+        }
+        // Validate pair/order/cardinality before the generic capability floor. This keeps an image-only
+        // MultiReference or an orphan Mask an actionable request error instead of a render that omits a
+        // character, and does not load any components.
+        let _ = resolve_character_references(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
+        // sc-20262 — refuse the ControlClip knobs this pipeline does not implement, rather than
+        // silently dropping them. One site is enough on this lane: `generate` above calls
+        // `validate` (the MLX sibling needs it on both seams because `impl_generator!`'s `generate`
+        // does not).
+        reject_unimplemented_control_clip_knobs(req)?;
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
@@ -500,26 +700,194 @@ impl Generator for Scail2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        Ok(self.run(req, on_progress)?)
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        let output = self.run(req, on_progress)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.ensure_unchanged(&self.adapters)?;
+        }
+        Ok(output)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref().map(|memory| &memory.contract)
+    }
+
+    fn structural_resident_evidence(&self) -> Option<&gen_core::MemoryStructuralResidentEvidence> {
+        self.memory_strategy
+            .as_ref()
+            .map(|memory| &memory.structural_evidence)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.memory_strategy.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{MODEL_ID}: legacy snapshot has no public memory evidence"),
+            },
+            |memory| crate::memory_strategy::safety_check(memory, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let Some(memory) = &self.memory_strategy else {
+            return Ok(None);
+        };
+        crate::memory_strategy::begin_request(memory, self.device.clone(), context)
     }
 }
 
-/// Reject `MultiReference` conditioning loudly instead of letting a multi-character request render
-/// for minutes and silently drop the extra characters (sc-8985). The engine core already supports
-/// extra characters ([`crate::generate::CharacterRef`] / `Scail2Job.additional`), but gen-core's
-/// `Conditioning::MultiReference` carries images only — there is no way to pair each extra reference
-/// with its required color-coded segmentation mask until the paired ref+mask request contract lands
-/// (sc-5583).
-fn reject_multi_reference(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
-    if req
-        .conditioning
-        .iter()
-        .any(|c| matches!(c, Conditioning::MultiReference { .. }))
-    {
+/// One strictly ordered character-pair request, split into the primary subject and any later subjects.
+/// The references borrow from [`GenerationRequest`] so no pixel buffers are copied before the model
+/// pipeline resizes and encodes them.
+#[derive(Debug)]
+struct CharacterReferences<'a> {
+    primary: CharacterRef<'a>,
+    additional: Vec<CharacterRef<'a>>,
+}
+
+/// Parse the public conditioning list into ordered `(Reference, Mask)` character pairs.
+///
+/// `Conditioning::MultiReference` intentionally remains unsupported *as a payload*: it is just an
+/// image vector and therefore cannot name the corresponding color masks. The routing capability is
+/// advertised, while the usable no-schema-change representation is repeated `Reference, Mask` pairs.
+/// We inspect only those two kinds here, so the required `ControlClip` may retain its established
+/// position before, after, or between the pairs without changing its own semantics.
+fn resolve_character_references<'a>(
+    id: &str,
+    req: &'a GenerationRequest,
+) -> gen_core::Result<CharacterReferences<'a>> {
+    let mut pairs = Vec::new();
+    let mut pending: Option<(&Image, usize)> = None;
+
+    for (index, conditioning) in req.conditioning.iter().enumerate() {
+        match conditioning {
+            Conditioning::Reference { image, .. } => {
+                if let Some((_, reference_index)) = pending {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: conditioning[{reference_index}] is a Reference without its following \
+                         Mask before conditioning[{index}] starts another Reference; pass ordered \
+                         Reference, Mask pairs"
+                    )));
+                }
+                pending = Some((image, index));
+            }
+            Conditioning::Mask { image } => {
+                let Some((reference, reference_index)) = pending.take() else {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: conditioning[{index}] is a Mask without a preceding Reference; pass \
+                         ordered Reference, Mask pairs"
+                    )));
+                };
+                pairs.push(CharacterRef {
+                    image: reference,
+                    mask: image,
+                });
+                if pairs.len() > MAX_REFERENCE_CHARACTERS {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{id}: received {} reference/mask character pairs, but SCAIL-2 supports at \
+                         most {MAX_REFERENCE_CHARACTERS}; no pairs were truncated",
+                        pairs.len()
+                    )));
+                }
+                debug_assert!(reference_index < index);
+            }
+            Conditioning::MultiReference { .. } => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{id}: MultiReference carries only images and has no paired color-coded \
+                     segmentation masks; pass ordered Reference, Mask pairs instead"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((_, index)) = pending {
         return Err(gen_core::Error::Unsupported(format!(
-            "{id}: MultiReference (extra reference characters) is not supported yet — each extra \
-             character needs its own color-coded segmentation mask and the paired reference+mask \
-             request contract is pending (sc-5583); pass exactly one Reference + Mask"
+            "{id}: conditioning[{index}] is a Reference without its following Mask; pass ordered \
+             Reference, Mask pairs"
+        )));
+    }
+
+    let Some(primary) = pairs.first() else {
+        return Err(gen_core::Error::Msg(
+            "scail2: a Reference character image paired with a color-coded Mask is required".into(),
+        ));
+    };
+    let primary = CharacterRef {
+        image: primary.image,
+        mask: primary.mask,
+    };
+    let additional = pairs
+        .iter()
+        .skip(1)
+        .map(|pair| CharacterRef {
+            image: pair.image,
+            mask: pair.mask,
+        })
+        .collect();
+    Ok(CharacterReferences {
+        primary,
+        additional,
+    })
+}
+
+/// Refuse the [`Conditioning::ControlClip`] knobs SCAIL-2 does not implement (sc-20262).
+///
+/// SCAIL-2 consumes the ControlClip as a **driving video + per-frame color masks** — `run` reads
+/// `frames` and `mask` and nothing else. The other three fields belong to the LTX / Wan-VACE
+/// replace_person mask-injection mechanism, which this pipeline does not have:
+///
+/// * `masking_strength` weights a mask-injection step count (`ceil(steps · masking_strength)`) —
+///   SCAIL-2 has no mask-injection stage to weight; the driving masks are consumed as color-coded
+///   region labels, not as a blend.
+/// * `start_frame` aligns the clip to an output latent frame — SCAIL-2's segmented driving loop
+///   starts at frame 0 by construction (`SEGMENT_LEN` / `SEGMENT_OVERLAP`).
+/// * `mode` is the replacement granularity — SCAIL-2 re-renders the whole tracked person, so there
+///   is no face-only vs full-person branch here to select.
+///
+/// Until sc-20262 these were silently dropped: a caller who set one got a render that ignored it
+/// with no diagnostic. The sc-19571 rule is that a control either works or is refused with a clear
+/// error, so this is the refusal. It fires **only on a non-default value** — a request carrying the
+/// contract defaults (`1.0` / `0` / `ReplacementMode::default()`) passes through unchanged, which is
+/// every request SceneWorks builds today.
+///
+/// Typed [`gen_core::Error::Unsupported`], not `Msg`: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure. Byte-for-byte
+/// the MLX sibling's `reject_unimplemented_control_clip_knobs` — a knob one backend refuses and the
+/// other silently drops is the divergence this class of work keeps paying for.
+fn reject_unimplemented_control_clip_knobs(req: &GenerationRequest) -> gen_core::Result<()> {
+    let Some(clip) = req.control_clip() else {
+        return Ok(());
+    };
+    if clip.masking_strength != 1.0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID} does not implement masking_strength (got {}); remove it or leave it at the \
+             default 1.0 — SCAIL-2 consumes the ControlClip masks as color-coded region labels and \
+             has no mask-injection stage to weight",
+            clip.masking_strength
+        )));
+    }
+    if clip.start_frame != 0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID} does not implement start_frame (got {}); remove it or leave it at the \
+             default 0 — SCAIL-2's segmented driving loop starts at frame 0 by construction",
+            clip.start_frame
+        )));
+    }
+    if clip.mode != ReplacementMode::default() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID} does not implement mode (got {:?}); remove it or leave it at the default \
+             {:?} — SCAIL-2 re-renders the whole tracked person, so there is no replacement \
+             granularity to select",
+            clip.mode,
+            ReplacementMode::default()
         )));
     }
     Ok(())
@@ -698,14 +1066,6 @@ fn reject_over_area(id: &str, width: u32, height: u32) -> gen_core::Result<()> {
     Ok(())
 }
 
-/// The first conditioning input matching `f`.
-fn find_conditioning<'a, T>(
-    req: &'a GenerationRequest,
-    f: impl Fn(&'a Conditioning) -> Option<T>,
-) -> Option<T> {
-    req.conditioning.iter().find_map(f)
-}
-
 impl Scail2 {
     /// Map the request conditioning onto a [`Scail2Job`] and run the denoise pipeline.
     fn run(
@@ -713,23 +1073,8 @@ impl Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
-        let reference = find_conditioning(req, |c| match c {
-            Conditioning::Reference { image, .. } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            CandleError::Msg("scail2: a Reference character image is required".into())
-        })?;
-        let ref_mask = find_conditioning(req, |c| match c {
-            Conditioning::Mask { image } => Some(image),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            CandleError::Msg(
-                "scail2: a Mask (the reference character's color-coded segmentation mask) is required"
-                    .into(),
-            )
-        })?;
+        let characters = resolve_character_references(self.descriptor.id, req)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         let driving = req.control_clip().ok_or_else(|| {
             CandleError::Msg(
                 "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
@@ -751,16 +1096,11 @@ impl Scail2 {
             negative_prompt: &neg,
             width,
             height,
-            reference: CharacterRef {
-                image: reference,
-                mask: ref_mask,
-            },
-            // Extra characters await the paired ref+mask request contract (sc-5583); `validate`
-            // rejects `MultiReference` until then (sc-8985).
-            additional: Vec::new(),
+            reference: characters.primary,
+            additional: characters.additional,
             driving_frames: driving.frames,
             driving_masks: driving.mask,
-            replace_flag: req.video_mode.as_deref() == Some("replacement"),
+            replace_flag: replace_flag_for_request(req),
             seed: req.seed.unwrap_or_else(gen_core::default_seed),
             steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
             shift: req.scheduler_shift.unwrap_or(DEFAULT_SHIFT) as f64,
@@ -776,10 +1116,88 @@ impl Scail2 {
     }
 }
 
+/// SCAIL-2's provider mode is the engine's cross-identity switch. Legacy requests that predate the
+/// explicit mode remain animation; the memory-backed public surface validates the only two accepted
+/// values before this mapping is reached.
+fn replace_flag_for_request(req: &GenerationRequest) -> bool {
+    req.video_mode.as_deref() == Some("replacement")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn provider_mode_selects_the_exact_engine_replace_flag() {
+        for (mode, expected) in [
+            (Some("animation"), false),
+            (Some("replacement"), true),
+            (None, false),
+        ] {
+            let request = GenerationRequest {
+                video_mode: mode.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(replace_flag_for_request(&request), expected, "{mode:?}");
+        }
+    }
+
+    type MapMutation = Box<dyn Fn(&mut HashMap<String, Tensor>)>;
+
+    fn mini_packed_config(quant: Option<Quant>) -> Scail2Config {
+        let mut cfg = Scail2Config::scail2_14b();
+        // Keep the real projection *schema* (attention/cross-attention dim×dim and asymmetric
+        // FFN matrices) while making the safetensors fixture small enough for ordinary CPU CI.
+        cfg.dim = 64;
+        cfg.ffn_dim = 192;
+        cfg.num_heads = 1;
+        cfg.num_layers = 1;
+        cfg.packed_quant = quant;
+        cfg
+    }
+
+    fn packed_projection(bits: usize, output: usize, input: usize) -> (Tensor, Tensor, Tensor) {
+        let dense = Tensor::from_vec(
+            vec![0.25_f32; output * input],
+            (output, input),
+            &Device::Cpu,
+        )
+        .unwrap();
+        candle_gen::quant::pack_mlx_affine(&dense, bits, 64).unwrap()
+    }
+
+    fn packed_dit_map(bits: usize) -> HashMap<String, Tensor> {
+        let mut out = HashMap::new();
+        for (base, schema) in expected_packed_dit_projections(&mini_packed_config(Some(Quant::Q4)))
+        {
+            let (weight, scales, biases) = packed_projection(bits, schema.output, schema.input);
+            out.insert(format!("{base}.weight"), weight);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+            out.insert(
+                format!("{base}.bias"),
+                Tensor::zeros(schema.output, DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        out
+    }
+
+    fn dense_dit_map() -> HashMap<String, Tensor> {
+        expected_packed_dit_projections(&mini_packed_config(None))
+            .into_iter()
+            .map(|(base, schema)| {
+                (
+                    format!("{base}.weight"),
+                    Tensor::zeros((schema.output, schema.input), DType::F32, &Device::Cpu).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn write_dit(root: &Path, tensors: &HashMap<String, Tensor>) {
+        cst::save(tensors, root.join("dit.safetensors")).unwrap();
+    }
 
     fn touch(path: &Path) {
         if let Some(parent) = path.parent() {
@@ -803,6 +1221,233 @@ mod tests {
         let error = snapshot_layout(tmp.path()).unwrap_err().to_string();
         assert!(error.contains("t5_encoder.safetensors"), "got: {error}");
         assert!(error.contains("text_encoder/"), "got: {error}");
+    }
+
+    #[test]
+    fn hosted_q4_q8_scail2_block_keys_load_as_quantized_without_dense_staging() {
+        for (bits, quant) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_dit(tmp.path(), &packed_dit_map(bits));
+            let cfg = mini_packed_config(Some(quant));
+            validate_shared_packed_dit(tmp.path(), &cfg).unwrap();
+
+            for file in SHARED_TIER_FILES {
+                if *file != "config.json" && *file != "dit.safetensors" {
+                    touch(&tmp.path().join(file));
+                }
+            }
+            std::fs::write(
+                tmp.path().join("config.json"),
+                serde_json::json!({
+                    "dim": cfg.dim,
+                    "ffn_dim": cfg.ffn_dim,
+                    "num_heads": cfg.num_heads,
+                    "num_layers": 1,
+                    "quantization": { "bits": bits, "group_size": 64 }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let selected =
+                LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf())).with_quant(quant);
+            // sc-20799: the Resident animation receipt is dense-bf16 only, but that is a *memory*
+            // surface — a packed VACE-Fun tier must still load and render, as it did before the
+            // memory-ladder epic. It simply carries no memory contract.
+            let generator =
+                load(&selected).unwrap_or_else(|e| panic!("Q{bits} tier must be selectable: {e}"));
+            assert!(
+                generator.memory_strategy_contract().is_none(),
+                "Q{bits}: a packed tier has no public memory evidence"
+            );
+
+            // This is the exact bounded mmap + raw SCAIL2 key form used by transformer_vb.  The
+            // assertion proves the q/k block projection chose QLinear's packed arm rather than a
+            // dense `Linear` over the U32 codes.
+            let vb = cpu_cast_mmap_var_builder(
+                &[tmp.path().join("dit.safetensors")],
+                DType::F32,
+                &Device::Cpu,
+            )
+            .unwrap();
+            let q = crate::common::packed_linear(cfg.dim, cfg.dim, &vb, "blocks.0.self_attn.q")
+                .unwrap();
+            assert!(q.is_quantized(), "Q{bits} must stay packed-resident");
+            assert_eq!(
+                q.forward(&Tensor::ones((1, cfg.dim), DType::F32, &Device::Cpu).unwrap())
+                    .unwrap()
+                    .dims(),
+                &[1, cfg.dim]
+            );
+        }
+    }
+
+    #[test]
+    fn packed_projection_schema_matches_scail2_14b() {
+        let cfg = Scail2Config::scail2_14b();
+        let expected = expected_packed_dit_projections(&cfg);
+        for base in [
+            "blocks.0.self_attn.q",
+            "blocks.0.cross_attn.k_img",
+            "blocks.39.cross_attn.v_img",
+        ] {
+            assert_eq!(
+                expected[base],
+                PackedProjectionSchema {
+                    output: 5120,
+                    input: 5120
+                },
+                "{base} must remain a dim×dim projection"
+            );
+        }
+        assert_eq!(
+            expected["blocks.0.ffn.0"],
+            PackedProjectionSchema {
+                output: 13824,
+                input: 5120
+            }
+        );
+        assert_eq!(
+            expected["blocks.39.ffn.2"],
+            PackedProjectionSchema {
+                output: 5120,
+                input: 13824
+            }
+        );
+    }
+
+    #[test]
+    fn packed_dit_sidecars_must_be_floating() {
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            for key in ["blocks.0.self_attn.q.scales", "blocks.0.self_attn.q.biases"] {
+                map.insert(
+                    key.into(),
+                    Tensor::zeros((64, 1), dtype, &Device::Cpu).unwrap(),
+                );
+            }
+            write_dit(tmp.path(), &map);
+            assert!(
+                validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q4)))
+                    .is_ok(),
+                "{dtype:?} sidecars must be accepted"
+            );
+        }
+
+        for (key, dtype) in [
+            ("blocks.0.self_attn.q.scales", DType::U32),
+            ("blocks.0.self_attn.q.biases", DType::U32),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            map.insert(
+                key.into(),
+                Tensor::zeros((64, 1), dtype, &Device::Cpu).unwrap(),
+            );
+            write_dit(tmp.path(), &map);
+            let error =
+                validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q4)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("sidecars must be F16, BF16, or F32"),
+                "got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_base_uses_raw_scail2_keys_and_refuses_packed_leaves_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dit(tmp.path(), &dense_dit_map());
+        validate_shared_packed_dit(tmp.path(), &mini_packed_config(None)).unwrap();
+
+        write_dit(tmp.path(), &packed_dit_map(4));
+        let error = validate_shared_packed_dit(tmp.path(), &mini_packed_config(None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dense config.json"), "got: {error}");
+    }
+
+    #[test]
+    fn packed_dit_fails_closed_on_partial_mixed_or_orphan_sidecars() {
+        let cfg = mini_packed_config(Some(Quant::Q4));
+        let cases: Vec<(&str, MapMutation)> = vec![
+            (
+                "missing biases",
+                Box::new(|map| {
+                    map.remove("blocks.0.self_attn.q.biases");
+                }),
+            ),
+            (
+                "mixed dense q",
+                Box::new(|map| {
+                    map.remove("blocks.0.self_attn.q.scales");
+                    map.remove("blocks.0.self_attn.q.biases");
+                    map.insert(
+                        "blocks.0.self_attn.q.weight".into(),
+                        Tensor::zeros((64, 64), DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "wrong but internally consistent ffn schema",
+                Box::new(|map| {
+                    let (weight, scales, biases) = packed_projection(4, 64, 64);
+                    map.insert("blocks.0.ffn.0.weight".into(), weight);
+                    map.insert("blocks.0.ffn.0.scales".into(), scales);
+                    map.insert("blocks.0.ffn.0.biases".into(), biases);
+                    map.insert(
+                        "blocks.0.ffn.0.bias".into(),
+                        Tensor::zeros(64, DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "missing dense bias",
+                Box::new(|map| {
+                    map.remove("blocks.0.cross_attn.k_img.bias");
+                }),
+            ),
+            (
+                "wrong dense bias length",
+                Box::new(|map| {
+                    map.insert(
+                        "blocks.0.self_attn.o.bias".into(),
+                        Tensor::zeros(63, DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "orphan sidecar",
+                Box::new(|map| {
+                    map.insert(
+                        "transformer.blocks.0.self_attn.q.scales".into(),
+                        Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+                    );
+                }),
+            ),
+        ];
+        for (label, mutate) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut map = packed_dit_map(4);
+            mutate(&mut map);
+            write_dit(tmp.path(), &map);
+            assert!(
+                validate_shared_packed_dit(tmp.path(), &cfg).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_dit_rejects_manifest_payload_bit_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dit(tmp.path(), &packed_dit_map(4));
+        let error = validate_shared_packed_dit(tmp.path(), &mini_packed_config(Some(Quant::Q8)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("violates its schema"), "got: {error}");
     }
 
     #[test]
@@ -936,8 +1581,8 @@ mod tests {
     #[test]
     fn every_shared_component_avoids_the_stock_device_then_cast_backend() {
         let source = include_str!("pipeline.rs")
-            .split("#[cfg(test)]")
-            .next()
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _tests)| production)
             .expect("production source before tests");
         let forbidden = [
             "SnapshotLayout::SharedMlxTier => candle_gen::",
@@ -1252,8 +1897,6 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::Mask));
         assert!(d.capabilities.accepts(ConditioningKind::ControlClip));
-        // MultiReference is deliberately NOT advertised until the paired ref+mask request contract
-        // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
         assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
         assert_eq!(
@@ -1291,42 +1934,101 @@ mod tests {
     }
 
     #[test]
-    fn multi_reference_is_rejected_loudly() {
-        let img = Image {
+    fn public_character_contract_uses_one_ordered_pair_and_never_truncates() {
+        let image = |tag| Image {
             width: 64,
             height: 64,
-            pixels: vec![0u8; 64 * 64 * 3],
+            pixels: vec![tag; 64 * 64 * 3],
         };
-        let req = GenerationRequest {
-            prompt: "a character".into(),
+        let primary_image = image(11);
+        let primary_mask = image(12);
+        let paired = GenerationRequest {
+            prompt: "one character".into(),
             width: 64,
             height: 64,
             count: 1,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: primary_image,
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: primary_mask,
+                },
+                // ControlClip may retain its existing position; pair ordering is evaluated only
+                // across Reference and Mask inputs.
+                Conditioning::ControlClip {
+                    frames: vec![image(31)],
+                    mask: vec![image(32)],
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &paired)
+            .expect("the advertised pair kinds validate");
+        let resolved = resolve_character_references(MODEL_ID, &paired).expect("ordered pairs");
+        assert_eq!(resolved.primary.image.pixels[0], 11);
+        assert_eq!(resolved.primary.mask.pixels[0], 12);
+        assert!(resolved.additional.is_empty());
+
+        let image_only = GenerationRequest {
             conditioning: vec![Conditioning::MultiReference {
-                images: vec![img.clone(), img],
+                images: vec![image(41), image(42)],
             }],
             ..Default::default()
         };
-        // The dedicated guard fires with the actionable pending-contract message.
-        let err = reject_multi_reference(MODEL_ID, &req).expect_err("err");
-        assert!(matches!(err, gen_core::Error::Unsupported(_)), "got: {err}");
-        let msg = err.to_string();
-        assert!(msg.contains("MultiReference"), "got: {msg}");
-        assert!(msg.contains("sc-5583"), "got: {msg}");
-        // Backstop: with `MultiReference` unadvertised, the shared capability floor rejects it too.
+        descriptor()
+            .capabilities
+            .validate_request(MODEL_ID, &image_only)
+            .expect_err("MultiReference is outside the public SCAIL-2 carrier");
+        let error =
+            resolve_character_references(MODEL_ID, &image_only).expect_err("maskless input");
         assert!(
-            descriptor()
-                .capabilities
-                .validate_request(MODEL_ID, &req)
-                .is_err(),
-            "the capability floor must reject unadvertised MultiReference conditioning"
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "got: {error}"
         );
-        // A request without MultiReference passes the guard (the floor still enforces the rest).
-        let single = GenerationRequest {
-            conditioning: Vec::new(),
-            ..req
+        assert!(
+            error.to_string().contains("paired color-coded"),
+            "got: {error}"
+        );
+
+        let misordered = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Mask { image: image(51) },
+                Conditioning::Reference {
+                    image: image(52),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
         };
-        assert!(reject_multi_reference(MODEL_ID, &single).is_ok());
+        let error = resolve_character_references(MODEL_ID, &misordered).expect_err("misordered");
+        assert!(error.to_string().contains("without a preceding Reference"));
+
+        let mut too_many = Vec::new();
+        for tag in 0..=MAX_REFERENCE_CHARACTERS {
+            too_many.push(Conditioning::Reference {
+                image: image(tag as u8),
+                strength: None,
+            });
+            too_many.push(Conditioning::Mask {
+                image: image(tag as u8 + 64),
+            });
+        }
+        let error = resolve_character_references(
+            MODEL_ID,
+            &GenerationRequest {
+                conditioning: too_many,
+                ..Default::default()
+            },
+        )
+        .expect_err("the seventh pair must not be silently dropped");
+        assert!(error.to_string().contains("no pairs were truncated"));
     }
 
     #[test]
@@ -1480,6 +2182,109 @@ mod tests {
         assert!(reject_over_area(MODEL_ID, 1, 30000).is_err());
     }
 
+    /// A canonical shared-tier `Scail2` that *does* hold a sealed Resident receipt.
+    fn with_sealed_memory() -> (tempfile::TempDir, Scail2) {
+        let (temp, spec) = crate::memory_strategy::tests::candle_fixture(None);
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root.clone(),
+            _ => unreachable!(),
+        };
+        let generator = Scail2 {
+            descriptor: descriptor(),
+            config: Scail2Config::default(),
+            root,
+            layout: SnapshotLayout::SharedMlxTier,
+            device: Device::Cpu,
+            adapters: Vec::new(),
+            memory_strategy: Some(crate::memory_strategy::PreparedMemory::prepare(&spec).unwrap()),
+            components: Mutex::new(None),
+        };
+        (temp, generator)
+    }
+
+    fn animation_clip(width: u32, height: u32, frames: u32) -> Vec<Image> {
+        (0..frames)
+            .map(|_| Image {
+                width,
+                height,
+                pixels: vec![3; width as usize * height as usize * 3],
+            })
+            .collect()
+    }
+
+    /// sc-20799: the exact Resident envelope is a *memory* surface. Running it for every request
+    /// hard-rejected the documented `0x0` resolve-from-clip sentinel and the multi-character
+    /// Reference/Mask pairs this pipeline still accepts, on every canonical shared-tier load.
+    #[test]
+    fn a_sealed_tier_still_accepts_the_sentinel_and_multi_character_pairs_without_memory() {
+        let (_temp, generator) = with_sealed_memory();
+        assert!(generator.memory_strategy_contract().is_some());
+        let character = |tag| Image {
+            width: 64,
+            height: 64,
+            pixels: vec![tag; 64 * 64 * 3],
+        };
+
+        // `0x0` resolves from the driving clip.
+        let mut sentinel = GenerationRequest {
+            prompt: "sentinel".into(),
+            width: 0,
+            height: 0,
+            count: 1,
+            frames: Some(45),
+            fps: Some(16),
+            video_mode: Some("animation".into()),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: character(11),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: character(12),
+                },
+                Conditioning::ControlClip {
+                    frames: animation_clip(832, 480, 45),
+                    mask: animation_clip(832, 480, 45),
+                    masking_strength: 1.0,
+                    start_frame: 0,
+                    mode: ReplacementMode::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        generator.validate(&sentinel).expect("0x0 sentinel");
+
+        // Two ordered character pairs.
+        let mut pairs = sentinel.clone();
+        pairs.width = 832;
+        pairs.height = 480;
+        pairs.conditioning.insert(
+            2,
+            Conditioning::Mask {
+                image: character(22),
+            },
+        );
+        pairs.conditioning.insert(
+            2,
+            Conditioning::Reference {
+                image: character(21),
+                strength: None,
+            },
+        );
+        assert_eq!(
+            resolve_character_references(MODEL_ID, &pairs)
+                .unwrap()
+                .additional
+                .len(),
+            1
+        );
+        generator.validate(&pairs).expect("two character pairs");
+
+        // ...but a request that *asks* for memory is still held to the exact envelope.
+        sentinel.memory = Some(gen_core::GenerationMemory::default());
+        assert!(generator.validate(&sentinel).is_err());
+    }
+
     fn unloaded() -> Scail2 {
         Scail2 {
             descriptor: descriptor(),
@@ -1488,6 +2293,7 @@ mod tests {
             layout: SnapshotLayout::LegacyComponents,
             device: Device::Cpu,
             adapters: Vec::new(),
+            memory_strategy: None,
             components: Mutex::new(None),
         }
     }
@@ -1638,11 +2444,95 @@ mod tests {
             "got: {err}"
         );
         assert!(err.to_string().contains("does not exist"), "got: {err}");
-        // on-the-fly quant is still rejected
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        // Q4/Q8 select an already-packed hosted tier. Use an owned empty directory rather than
+        // `/snap`: the latter is a real system directory on Ubuntu CI, so the correct rejection is
+        // the complete-layout diagnostic, not a missing-directory error.
+        let empty_snapshot = tempfile::tempdir().expect("empty snapshot fixture");
+        let quant = LoadSpec::new(WeightsSource::Dir(empty_snapshot.path().to_path_buf()))
+            .with_quant(Quant::Q8);
+        let err = load(&quant).err().expect("err");
+        assert!(
+            err.to_string().contains("incomplete snapshot"),
+            "got: {err}"
+        );
+    }
+
+    /// A 640×480 request whose driving ControlClip carries the given sc-20262 knob values.
+    fn with_clip_knobs(
+        masking_strength: f32,
+        start_frame: i32,
+        mode: ReplacementMode,
+    ) -> GenerationRequest {
+        let img = Image {
+            width: 640,
+            height: 480,
+            pixels: vec![0u8; 640 * 480 * 3],
+        };
+        GenerationRequest {
+            prompt: "a character follows the driving motion".into(),
+            width: 640,
+            height: 480,
+            count: 1,
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img.clone(),
+                    strength: None,
+                },
+                Conditioning::Mask { image: img.clone() },
+                Conditioning::ControlClip {
+                    frames: vec![img.clone()],
+                    mask: vec![img],
+                    masking_strength,
+                    start_frame,
+                    mode,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// sc-20262 — `masking_strength` / `start_frame` / `mode` were silently dropped. Each is now a
+    /// typed [`gen_core::Error::Unsupported`] naming the field and the model, raised from
+    /// `Generator::validate` (which `generate` calls first), so the refusal is reachable through
+    /// the seam SceneWorks actually drives.
+    ///
+    /// Every case uses a genuinely NON-default value; the companion test pins that the defaults
+    /// still pass.
+    #[test]
+    fn non_default_control_clip_knobs_are_refused_by_name() {
+        let m = unloaded();
+        for (req, field) in [
+            (
+                with_clip_knobs(0.5, 0, ReplacementMode::default()),
+                "masking_strength",
+            ),
+            (
+                with_clip_knobs(1.0, 3, ReplacementMode::default()),
+                "start_frame",
+            ),
+            (
+                with_clip_knobs(1.0, 0, ReplacementMode::FullPersonReplaceOutfit),
+                "mode",
+            ),
+        ] {
+            let err =
+                Generator::validate(&m, &req).expect_err("a non-default knob must be refused");
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "{field}: typed Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field}: names the field: {msg}");
+            assert!(msg.contains(MODEL_ID), "{field}: names the model: {msg}");
+        }
+    }
+
+    /// sc-20262 — the refusal fires **only** on a value a caller actually set. A request carrying
+    /// the contract defaults — every request SceneWorks builds today — validates unchanged.
+    #[test]
+    fn default_control_clip_knobs_still_pass_unchanged() {
+        let m = unloaded();
+        Generator::validate(&m, &with_clip_knobs(1.0, 0, ReplacementMode::default()))
+            .expect("a default-valued ControlClip must still validate");
     }
 }

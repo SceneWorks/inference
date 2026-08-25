@@ -33,19 +33,19 @@
 //! # q4, 256x256x9, 24 fps, with audio decode skipped.
 //! LTX_MODEL_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/q4 \
 //! LTX_GEMMA_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/gemma \
-//!   cargo test -p mlx-gen-ltx --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! # Reproduce the historical maximum-envelope bf16/no-audio row.
 //! LTX_MODEL_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/bf16 \
 //! LTX_GEMMA_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/gemma \
 //! LTX_TIER=bf16 LTX_W=1280 LTX_H=704 LTX_FRAMES=449 LTX_FPS=30 \
-//!   cargo test -p mlx-gen-ltx --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! # Measure the production full-A/V route instead (`default` means no `video_mode` override).
 //! LTX_MODEL_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/q8 \
 //! LTX_GEMMA_DIR=/path/to/models--SceneWorks--ltx-2.3-mlx/snapshots/01df27d308466533aa09d251e3aebdcc627d07eb/gemma \
 //! LTX_TIER=q8 LTX_W=768 LTX_H=512 LTX_FRAMES=145 LTX_FPS=24 LTX_VIDEO_MODE=default \
-//!   cargo test -p mlx-gen-ltx --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! For an exploratory local run only, `MLX_GEN_MODELS_ROOT` may point at a `models--*/snapshots`

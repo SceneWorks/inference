@@ -5,7 +5,7 @@
 //! holds the reference f32 input/mask/output; this test loads the SAME connector weights and
 //! checks the Rust `Connector` reproduces the video embeddings.
 //!
-//! Run: `LTX_EROS_DIR=… cargo test -p mlx-gen-ltx --test connector_parity -- --ignored --nocapture`
+//! Run: `LTX_EROS_DIR=… cargo test -p mlx-gen-ltx --test integration connector_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;

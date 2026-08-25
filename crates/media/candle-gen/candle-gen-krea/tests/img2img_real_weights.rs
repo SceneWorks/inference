@@ -11,7 +11,7 @@
 //! ```sh
 //! KREA_TURBO_DIR=D:\models\Krea-2-Turbo \
 //! KREA_IMG2IMG_SOURCE=D:\fixtures\photo.png \
-//!   cargo test -p candle-gen-krea --release --features cuda --test img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration img2img_real_weights:: -- --ignored --nocapture
 //! ```
 //! `KREA_IMG2IMG_SIZE=WxH` (multiples of 16) overrides the target resolution; else the reference's size
 //! rounded down to a multiple of 16. `KREA_IMG2IMG_STEPS` overrides the ~8-step Turbo budget.
@@ -261,7 +261,7 @@ fn img2img_is_coherent_and_monotone_in_reference_fidelity() {
 /// ```sh
 /// KREA_RAW_DIR=D:\models\Krea-2-Raw \
 /// KREA_IMG2IMG_SOURCE=D:\fixtures\photo.png \
-///   cargo test -p candle-gen-krea --release --features cuda --test img2img_real_weights -- --ignored --nocapture
+///   cargo test -p candle-gen-krea --release --features cuda --test integration img2img_real_weights:: -- --ignored --nocapture
 /// ```
 /// `KREA_IMG2IMG_SIZE=WxH` (multiples of 16) overrides the resolution; `KREA_IMG2IMG_STEPS` the ~52-step
 /// Raw budget; `KREA_IMG2IMG_GUIDANCE` the CFG scale; `KREA_IMG2IMG_PROMPT` / `KREA_IMG2IMG_NEGATIVE` the

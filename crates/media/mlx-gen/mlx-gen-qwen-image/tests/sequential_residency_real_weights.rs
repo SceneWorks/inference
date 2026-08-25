@@ -3,7 +3,7 @@
 //! (`qwen_image_edit`) and **Control** (`qwen_image_control`), the two sc-11006 fan-out engines.
 //!
 //! `#[ignore]`d — needs the real snapshots (env overrides, else the HF cache). Run:
-//!   cargo test -p mlx-gen-qwen-image --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Two claims per engine (same as the SDXL/Z-Image A/B): (1) `Sequential` peaks LOWER than `Resident`
 //! because the Qwen2.5-VL text (T2I/Control) or vision-language (Edit) encoder is dropped (+

@@ -6,7 +6,7 @@
 //! reference `input_ids` **byte-for-byte** for every prompt (using the golden's recorded date for the
 //! harmony preamble), and that the preamble is exactly `TXT_OFFSET` tokens.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test tokenizer_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration tokenizer_parity:: -- --ignored --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::text::{LensTokenizer, TXT_OFFSET};

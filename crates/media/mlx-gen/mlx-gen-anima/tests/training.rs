@@ -2,7 +2,7 @@
 //! real-weights-gated — they need the licensed `circlestone-labs/Anima` base snapshot in the HF cache
 //! and Metal. Run single-threaded (heavy Metal train + gen in one process):
 //!
-//!   cargo test -p mlx-gen-anima --release --test training -- --ignored --nocapture --test-threads=1
+//!   cargo test -p mlx-gen-anima --release --test integration training:: -- --ignored --nocapture --test-threads=1
 //!
 //! Each test overfits a tiny synthetic dataset (a handful of vivid-magenta images + a trigger
 //! caption), trains an adapter, then proves it worked two ways: (1) a **fixed-batch velocity-MSE**

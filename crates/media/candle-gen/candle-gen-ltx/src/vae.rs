@@ -398,6 +398,17 @@ impl LtxVideoVae {
     /// Geometry owned by the concrete decoder and consumed by its planner and tiled driver.
     pub const VAE_TILING: VaeTiling = VaeTiling::LTX;
 
+    /// Convert DiT-normalized latents to the learned-upscaler's VAE latent
+    /// domain. The stats are loaded from the same checkpoint as decode.
+    pub(crate) fn denormalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_mul(&self.std)?.broadcast_add(&self.mean)
+    }
+
+    /// Convert learned-upscaler output back into the DiT-normalized domain.
+    pub(crate) fn normalize_latents(&self, latents: &Tensor) -> Result<Tensor> {
+        latents.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+    }
+
     /// Build a decoder-only VAE from a VarBuilder rooted at the `vae.` prefix.
     pub fn new(vb: VarBuilder, latent_channels: usize, patch_size: usize) -> Result<Self> {
         Self::build(vb, None, latent_channels, patch_size)
@@ -567,6 +578,29 @@ impl LtxVideoVae {
             Some(cfg) => self.decode_tiled(latent, &cfg),
             None => self.decode(latent),
         }
+    }
+
+    /// Execute the request-scoped bounded-decode rung.  The selected spatial cap is never merely
+    /// telemetry: it forces the same shared tiling driver used by automatic safety budgeting.
+    pub fn decode_budgeted_with_spatial_cap(
+        &self,
+        latent: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let (_b, _c, f, h, w) = latent.dims5()?;
+        let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale;
+        let out_h = h as i32 * Self::VAE_TILING.spatial_scale;
+        let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
+        let mut cfg =
+            plan_ltx_tiling(out_h, out_w, out_f, ltx_vae_safe_budget_gib())?.unwrap_or_default();
+        // A one-tile result is still materialized through `decode_tiled`, preserving the selected
+        // control rather than silently falling back to ordinary decode.
+        cfg.spatial = Some(candle_gen::gen_core::tiling::SpatialTiling {
+            tile_px: tile_edge as i32,
+            overlap_px: overlap as i32,
+        });
+        self.decode_tiled(latent, &cfg)
     }
 }
 

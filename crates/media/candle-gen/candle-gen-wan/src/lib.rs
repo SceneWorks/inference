@@ -39,6 +39,15 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+// The GGUF container route's public surface (epic 20398, sc-20649/sc-20651): the registered codec
+// id this crate implements, the codec registry the route plans against, the refusing canonical
+// mapping the checkpoint registry names, the plan producer, and its typed refusals. The module
+// itself stays private — everything else in it is loader internals.
+pub use gguf::{
+    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_receipt, GgufDitPlan,
+    GgufPlanError, WanNativeToDiffusersMapping, GGUF_CODEC_IMPLEMENTATION_ID,
+};
+pub mod i2v_memory_strategy;
 pub mod memory_strategy;
 pub mod model_vace;
 pub mod model_vace_fun;
@@ -51,6 +60,7 @@ pub mod text_encoder;
 pub mod training;
 pub mod transformer;
 pub mod vace;
+mod vace_fun_tier;
 pub mod vae;
 pub mod vae16;
 pub mod wan14b;
@@ -145,7 +155,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
+    OffloadPolicy, Progress, Quant, WeightsSource,
 };
 use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
 
@@ -826,6 +836,7 @@ pub struct WanGenerator {
     descriptor: ModelDescriptor,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_tier: Option<gen_core::MemoryNumericTier>,
+    i2v_memory: Option<i2v_memory_strategy::PreparedWanI2vMemory>,
     root: PathBuf,
     device: Device,
     dit_source: DitSource,
@@ -908,14 +919,7 @@ impl WanGenerator {
     }
 
     fn request_offload(&self, req: &GenerationRequest) -> OffloadPolicy {
-        if req.memory.is_some_and(|memory| memory.stage_residency) {
-            OffloadPolicy::Sequential
-        } else {
-            // An explicit Resident selection is represented by no request memory block. Preserve
-            // the policy with which this generator was loaded instead of silently overriding a
-            // caller-owned Sequential load.
-            self.offload
-        }
+        i2v_memory_strategy::selected_offload_policy(self.offload, self.i2v_memory.is_some(), req)
     }
 }
 
@@ -1057,13 +1061,17 @@ impl Generator for WanGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         run_serialized_request(&self.lifecycle, || {
             let pipe = self.pipeline();
             // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
             // denoise peak is the DiT alone. A request-selected staged transition must first evict a
             // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
             // the still-resident aggregate and invalidate the published phase envelope.
-            let (frames, fps) = match self.request_offload(req) {
+            let effective_offload = self.request_offload(req);
+            let (frames, fps) = match effective_offload {
                 OffloadPolicy::Sequential => {
                     release_warm_cache_for_staged(&self.components, || {
                         Ok(self.device.synchronize()?)
@@ -1084,13 +1092,19 @@ impl Generator for WanGenerator {
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref()
+        self.i2v_memory
+            .as_ref()
+            .map(|prepared| &prepared.contract)
+            .or(self.memory_strategy.as_ref())
     }
 
     fn memory_strategy_safety_check(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
+        if let Some(prepared) = &self.i2v_memory {
+            return i2v_memory_strategy::safety_check(prepared, context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
                 gen_core::MemorySafetyDecision::Accept
@@ -1109,6 +1123,9 @@ impl Generator for WanGenerator {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        if let Some(prepared) = &self.i2v_memory {
+            return i2v_memory_strategy::begin_request(prepared, self.device.clone(), context);
+        }
         let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
             return Ok(None);
         };
@@ -1133,7 +1150,6 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Keyframe],
             // LoRA/LoKr apply at load (sc-10095): folded on a dense tier, or as additive residuals on a
             // packed q4/q8 tier. Structured LoKr is packed-safe; LoHa fails closed. The env-only native
@@ -1155,41 +1171,19 @@ pub fn descriptor() -> ModelDescriptor {
                 "ddim",
                 "unipc",
             ],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
             // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
             // (dense + packed alike, sc-10306). Enforced by `Capabilities::validate_request`.
             min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // The TI2V-5B honors `OffloadPolicy::Sequential` (epic 12732, sc-12757): the staged
             // `render_sequential` keeps the ~11 GB bf16 UMT5 encoder off-GPU for the whole denoise and
             // frees the dense DiT before the VAE loads, bounding the pre-decode peak. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -1244,6 +1238,13 @@ fn build_generator_with_source(
     // generator merely because the provider crate is part of that platform's catalog.
     #[cfg(not(any(feature = "cuda", test)))]
     let (memory_strategy, memory_tier) = (None, None);
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(i2v_memory_strategy::prepare(spec, MODEL_ID)?)
+    } else {
+        None
+    };
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12757).
     let offload = spec.offload_policy;
@@ -1251,6 +1252,7 @@ fn build_generator_with_source(
         descriptor: descriptor(),
         memory_strategy,
         memory_tier,
+        i2v_memory,
         root,
         device,
         dit_source,
@@ -1281,6 +1283,33 @@ pub fn register_providers(
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
     registry
+        // The Wan 2.2 ComfyUI expert pair (epic 20398, sc-20644). Registering it is what makes
+        // `ProviderRegistry::checkpoint_adapters` — and therefore SceneWorks'
+        // `inference_runtime::checkpoint_adapter("wan-video")` — actually resolve; the portable
+        // const alone is inert metadata that nothing can reach (review major 6).
+        //
+        // ONE binding, onto the T2V provider. `ImportedModelOperation` has no video vocabulary —
+        // T2V and I2V are the same `Generate` operation distinguished by an `i2v` flag on the
+        // loader, not by the operation enum — so a second binding for this (backend, source) is not
+        // expressible, and registering I2V as `Edit` would be a lie about what the enum means. The
+        // SceneWorks lane refuses an I2V expert pair by name for exactly this reason.
+        //
+        // `required_components` is `None`: `load_from_comfyui_experts` takes the UMT5 encoder, the
+        // VAE and the tokenizer from a resident snapshot tier that the CALLER resolves, not from
+        // caller-staged `LoadSpec` components.
+        .register_checkpoint_adapter(candle_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[candle_gen::gen_core::CheckpointBackendBindingRegistration {
+                backend: candle_gen::gen_core::CheckpointBackend::Candle,
+                source: candle_gen::gen_core::ImportedModelSource::ComfyUiTree,
+                operation: candle_gen::gen_core::ImportedModelOperation::Generate,
+                provider_id: config::MODEL_ID_T2V_14B,
+                required_components: None,
+                // `load_from_comfyui_experts` has no adapter seam, so the imported route must not
+                // advertise the provider's LoRA/LoKr flags.
+                inherit_adapters: false,
+            }],
+            ..candle_gen::gen_core::WAN_CHECKPOINT_ADAPTER
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
         .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
@@ -1335,6 +1364,79 @@ pub fn conservative_video_decode_memory_profile(
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    /// sc-20644 review major 6 — the Wan checkpoint adapter is REACHABLE from a built registry.
+    ///
+    /// The portable `WAN_CHECKPOINT_ADAPTER` const was declared but registered by no provider
+    /// crate, so `ProviderRegistry::checkpoint_adapters` never yielded it and SceneWorks'
+    /// `inference_runtime::checkpoint_adapter("wan-video")` answered `None`. A declaration nothing
+    /// can reach is inert metadata: AC1's "family truth comes from the adapter" was unmet in fact
+    /// however carefully the const was written.
+    ///
+    /// Reachability is asserted through the registry — the seam SceneWorks actually queries — not
+    /// against the const, which would pass whether or not anything registered it.
+    ///
+    /// Failing mutations: delete the `register_checkpoint_adapter` call from `register_providers`;
+    /// change the binding's `provider_id` to an id no generator registers.
+    #[test]
+    fn the_wan_checkpoint_adapter_is_reachable_from_the_built_registry() {
+        let registry = super::provider_registry().unwrap();
+
+        let adapter = registry
+            .checkpoint_adapters()
+            .find(|adapter| adapter.compatibility_projection.family == "wan-video")
+            .expect("the Wan adapter must be reachable by the projection SceneWorks keys on");
+        assert_eq!(adapter.adapter_id, "wan-comfyui-v1");
+
+        // The binding is real: exactly one, Candle, ComfyUI tree, onto a provider this registry
+        // actually registers.
+        let bindings = adapter.backend_bindings;
+        assert_eq!(
+            bindings.len(),
+            1,
+            "one binding is expressible for this (backend, source)"
+        );
+        let binding = &bindings[0];
+        assert_eq!(
+            binding.backend,
+            candle_gen::gen_core::CheckpointBackend::Candle
+        );
+        assert_eq!(
+            binding.source,
+            candle_gen::gen_core::ImportedModelSource::ComfyUiTree
+        );
+        assert_eq!(
+            binding.operation,
+            candle_gen::gen_core::ImportedModelOperation::Generate
+        );
+        assert!(
+            !binding.inherit_adapters,
+            "`load_from_comfyui_experts` has no adapter seam"
+        );
+        let registered: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert!(
+            registered.iter().any(|id| id == binding.provider_id),
+            "the binding must point at a generator this registry registers; it names {:?} and the \
+             registry has {registered:?}",
+            binding.provider_id
+        );
+
+        // And the route the binding creates resolves, which is what SceneWorks' descriptor lookup
+        // does. This is the assertion that fails if the binding is registered but mis-keyed.
+        assert!(
+            registry
+                .imported_model_descriptor(
+                    "wan-video",
+                    candle_gen::gen_core::ImportedModelSource::ComfyUiTree,
+                    candle_gen::gen_core::ImportedModelOperation::Generate,
+                )
+                .is_some(),
+            "the registered binding must produce a resolvable imported-model route"
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();

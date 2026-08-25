@@ -2,7 +2,7 @@
 //! `microsoft/Lens` DiT), driven through the explicit provider registry.
 //!
 //! `#[ignore]`d — needs the real `SceneWorks/Lens` weights in the HF cache (or `LENS_SNAPSHOT`). Run:
-//!   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-lens --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/caption-encoded and cached, AdamW training drives the flow-match loss down, and a PEFT adapter
@@ -433,7 +433,7 @@ fn lens_trainer_trains_and_reloads_lokr() {
 
 /// sc-5637 — preview samples. Proves the Lens render path (install in-progress adapter → norm-rescaled
 /// CFG flow-match denoise → Flux.2 VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture lens_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-lens --release --test integration -- --ignored --nocapture trainer_e2e::lens_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real microsoft/Lens weights (~20B gpt-oss encoder; loads Q8)"]
 fn lens_trainer_emits_preview_samples() {

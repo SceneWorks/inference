@@ -11,7 +11,7 @@
 //! across a test binary, so running it alongside the other real-weights tests can cross-contaminate.
 //! Its own binary sidesteps that entirely. Real-weights-gated + `#[ignore]`d exactly like
 //! `tests/real_weights.rs`, so it never runs in CI. Run it alone with:
-//!   cargo test -p mlx-gen-anima --test velocity_convention -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --test integration velocity_convention:: -- --ignored --nocapture
 //!
 //! Measurement (reproduces the port-time check): VAE-encode the checkpoint's shipped real anime image
 //! `example.png` to a KNOWN on-manifold latent `x0`, re-noise it to `x_σ` at a mid σ, run the DiT, and

@@ -3,7 +3,7 @@
 //! bicubic, in `[-1,1]`) against a golden dumped straight from the diffusers pipeline function
 //! (`tools/dump_svd_clip_preprocess_golden.py`) — no checkpoint needed, so this runs by default.
 //!
-//! Run: `cargo test -p mlx-gen-svd --test clip_preprocess_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-svd --test integration clip_preprocess_parity:: -- --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, mean, subtract};
 

@@ -29,7 +29,7 @@
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Result};
+use mlx_gen::{CancelFlag, Error, GenerationRequest, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sin, split, subtract};
 use mlx_rs::{Array, Dtype};
@@ -826,6 +826,36 @@ pub fn prepare_video_latents(
 /// (diffusers `__call__`'s `conditioning_latents = cat([conditioning_latents, mask], dim=1)`).
 pub fn build_vace_control(video_latents: &Array, mask_latents: &Array) -> Result<Array> {
     Ok(concatenate_axis(&[video_latents, mask_latents], 0)?)
+}
+
+/// The per-vace-layer `control_hidden_states_scale` a request resolves to, with
+/// `ControlClip.masking_strength` folded in (sc-20261).
+///
+/// VACE exposes exactly ONE conditioning scale for the whole hint stack (diffusers
+/// `conditioning_scale`), so the requested masking strength weights the mask/video control by
+/// multiplying that scale rather than thresholding a soft mask away inside
+/// [`prepare_video_latents`]. `masking_strength = 1.0` (the contract default) leaves the scale
+/// byte-identical to `req.control_scale`, so a default request renders exactly as before.
+///
+/// **Byte-for-byte the candle lane's `weighted_control_scale`** (`candle-gen-wan/src/vace.rs`),
+/// where the mechanism originated on the dual-expert VACE-Fun route. MLX has no separate
+/// `model_vace_fun.rs` — `WanVace` and `WanVaceFun` share `crate::model_vace::vace_prep` (private,
+/// so a plain code span rather than an intra-doc link) — so wiring it there honors the field on
+/// BOTH MLX VACE routes at once.
+pub fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
+    control_scale.unwrap_or(1.0) * masking_strength
+}
+
+/// The full per-vace-layer scale vector a request resolves to — the value `vace_prep` hands the
+/// VACE transformer as `scales` (sc-20261).
+///
+/// This is the whole resolution, request in / vector out, so the honor wiring is testable without
+/// weights: [`weighted_control_scale`] alone is arithmetic that a call site can bypass, while this
+/// is the exact expression the render binds `scales` to. A missing `ControlClip` resolves to the
+/// contract default strength `1.0` (the identity), so a non-clip route is unchanged.
+pub fn vace_control_scales(req: &GenerationRequest, vace_layers: usize) -> Vec<f32> {
+    let masking_strength = req.control_clip().map_or(1.0, |c| c.masking_strength);
+    vec![weighted_control_scale(req.control_scale, masking_strength); vace_layers]
 }
 
 /// VACE CFG denoise loop (sc-3436) — mirrors the validated base Wan [`crate::pipeline::denoise`]

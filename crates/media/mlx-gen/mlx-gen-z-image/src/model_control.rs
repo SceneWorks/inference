@@ -20,8 +20,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
     require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
     FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor, StagedHeavy,
-    WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
 use mlx_rs::Dtype;
 use std::path::Path;
@@ -57,10 +56,6 @@ pub fn descriptor() -> ModelDescriptor {
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Control (required) + an optional img2img Reference init.
             conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
             supports_lora: true,
@@ -69,32 +64,14 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base turbo variant — static-shift default.
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

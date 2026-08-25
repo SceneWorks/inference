@@ -13,6 +13,84 @@ use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE};
 
 const REPLACE_NEUTRAL: u32 = 118;
 
+/// Materialize LTX replace-person's ordered 1–4 character-reference carrier as one
+/// target-sized contact sheet. LTX's IC-LoRA accepts one image latent at frame zero;
+/// treating a `MultiReference` as its first image would silently discard identities.
+///
+/// The grid is deliberately part of the provider contract: one reference occupies the
+/// whole canvas, two occupy left-to-right halves, and three/four occupy row-major
+/// quadrants. Every source is resized with the shared PIL-compatible bicubic helper,
+/// so Candle and MLX hand the same RGB8 composite to their VAE encoders.
+pub fn compose_ordered_character_references(
+    images: &[Image],
+    target_width: u32,
+    target_height: u32,
+) -> Result<Image> {
+    if !(1..=4).contains(&images.len()) {
+        return Err(Error::Msg(format!(
+            "ltx: replace-person requires 1–4 ordered character references (got {})",
+            images.len()
+        )));
+    }
+    let (width, height) = (target_width as usize, target_height as usize);
+    let expected = imageops::checked_image_buffer_len(width, height, 3)
+        .ok_or_else(|| Error::Msg("ltx: replace-person composite dimensions overflow".into()))?;
+    if width == 0 || height == 0 {
+        return Err(Error::Msg(
+            "ltx: replace-person composite dimensions must be non-zero".into(),
+        ));
+    }
+    let (columns, rows) = match images.len() {
+        1 => (1, 1),
+        2 => (2, 1),
+        3 | 4 => (2, 2),
+        _ => unreachable!("the cardinality check above admits only 1–4"),
+    };
+    let mut pixels = vec![0_u8; expected];
+    for (ordinal, image) in images.iter().enumerate() {
+        let (input_width, input_height) = (image.width as usize, image.height as usize);
+        let input_len = imageops::checked_image_buffer_len(input_width, input_height, 3)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "ltx: replace-person reference {ordinal} dimensions overflow"
+                ))
+            })?;
+        if input_width == 0 || input_height == 0 || image.pixels.len() != input_len {
+            return Err(Error::Msg(format!(
+                "ltx: replace-person reference {ordinal} must be a non-empty RGB8 image"
+            )));
+        }
+        let column = ordinal % columns;
+        let row = ordinal / columns;
+        let x0 = column * width / columns;
+        let x1 = (column + 1) * width / columns;
+        let y0 = row * height / rows;
+        let y1 = (row + 1) * height / rows;
+        let tile_width = x1 - x0;
+        let tile_height = y1 - y0;
+        let tile = imageops::resize_bicubic_u8(
+            &image.pixels,
+            input_height,
+            input_width,
+            tile_height,
+            tile_width,
+        )
+        .map_err(|error| Error::Msg(error.to_string()))?;
+        for y in 0..tile_height {
+            let dst = ((y0 + y) * width + x0) * 3;
+            let src = y * tile_width * 3;
+            for x in 0..tile_width * 3 {
+                pixels[dst + x] = tile[src + x].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(Image {
+        width: target_width,
+        height: target_height,
+        pixels,
+    })
+}
+
 /// Convert the request contract's latent-frame index into the output-frame coordinate consumed by
 /// `VideoConditionByKeyframeIndex` RoPE positions.
 pub fn latent_frame_to_output_offset(frame_idx: usize) -> Result<i32> {
@@ -426,5 +504,81 @@ mod tests {
         let got = apply_replacement_mask(&frame, &mask, 1.0)?;
         assert_eq!(got.pixels, [118, 118, 118, 40, 50, 60]);
         Ok(())
+    }
+
+    #[test]
+    fn ordered_character_reference_grid_preserves_all_four_identities() {
+        let image = |pixels| Image {
+            width: 1,
+            height: 1,
+            pixels,
+        };
+        let references = vec![
+            image(vec![255, 0, 0]),
+            image(vec![0, 255, 0]),
+            image(vec![0, 0, 255]),
+            image(vec![255, 255, 0]),
+        ];
+        let composite = compose_ordered_character_references(&references, 4, 4).unwrap();
+        let pixel = |x: usize, y: usize| &composite.pixels[(y * 4 + x) * 3..][..3];
+        assert_eq!(pixel(0, 0), [255, 0, 0]);
+        assert_eq!(pixel(3, 0), [0, 255, 0]);
+        assert_eq!(pixel(0, 3), [0, 0, 255]);
+        assert_eq!(pixel(3, 3), [255, 255, 0]);
+    }
+
+    #[test]
+    fn ordered_character_reference_grid_refuses_cardinality_and_bad_rgb() {
+        assert!(compose_ordered_character_references(&[], 64, 64).is_err());
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        };
+        assert!(compose_ordered_character_references(&vec![image.clone(); 5], 64, 64).is_err());
+        assert!(compose_ordered_character_references(
+            &[Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0],
+            }],
+            64,
+            64,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ordered_character_reference_grid_uses_each_advertised_geometry() {
+        let image = |pixels| Image {
+            width: 1,
+            height: 1,
+            pixels,
+        };
+        let red = image(vec![255, 0, 0]);
+        let green = image(vec![0, 255, 0]);
+        let blue = image(vec![0, 0, 255]);
+        let pixel = |image: &Image, x: usize, y: usize| {
+            let start = (y * 4 + x) * 3;
+            [
+                image.pixels[start],
+                image.pixels[start + 1],
+                image.pixels[start + 2],
+            ]
+        };
+
+        let one = compose_ordered_character_references(std::slice::from_ref(&red), 4, 4).unwrap();
+        assert_eq!(pixel(&one, 3, 3), [255, 0, 0], "1 = full canvas");
+        let two =
+            compose_ordered_character_references(&[red.clone(), green.clone()], 4, 4).unwrap();
+        assert_eq!(pixel(&two, 0, 3), [255, 0, 0], "2 = left tile");
+        assert_eq!(pixel(&two, 3, 3), [0, 255, 0], "2 = right tile");
+        let three = compose_ordered_character_references(&[red, green, blue], 4, 4).unwrap();
+        assert_eq!(pixel(&three, 0, 3), [0, 0, 255], "3 = lower-left tile");
+        assert_eq!(
+            pixel(&three, 3, 3),
+            [0, 0, 0],
+            "3 leaves only lower-right empty"
+        );
     }
 }

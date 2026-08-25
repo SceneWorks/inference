@@ -18,7 +18,7 @@
 //! `#[ignore]`d — needs the real `SceneWorks/Lens-Turbo` snapshot (~21 GiB on disk) and Metal:
 //! ```sh
 //! LENS_SNAPSHOT=/path/to/models--SceneWorks--Lens-Turbo/snapshots/<rev> \
-//!   cargo test -p mlx-gen-lens --release --test conformance -- --ignored --nocapture
+//!   cargo test -p mlx-gen-lens --release --test integration conformance:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

@@ -4,7 +4,7 @@
 //! `MLX_GEN_QWEN_SNAPSHOT`) and the adapter goldens from `tools/dump_qwen_adapter_golden.py`
 //! (gitignored, local). Run:
 //!   python3 crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py
-//!   cargo test -p mlx-gen-qwen-image --release --test adapter_real_weights -- --ignored --nocapture --test-threads=1
+//!   cargo test -p mlx-gen-qwen-image --release --test integration adapter_real_weights:: -- --ignored --nocapture --test-threads=1
 //!
 //! Gates: (1) the key→module map resolves the FULL fork `QwenLoRAMapping` surface (60 blocks x
 //! modulation + attention + img/txt MLP) against the real module tree; (2) the public

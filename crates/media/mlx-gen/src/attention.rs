@@ -6,14 +6,20 @@
 //! That is the shared-ladder split rungs 2 (`gen_core::tiling`) and 4 (`gen_core::block_window`)
 //! already use.
 //!
-//! What stays here is genuinely MLX's: [`sdpa_budgeted_bhsd`], the `slice_axis` helper, and the
-//! per-chunk `eval`. The kernels must NOT merge — measured like-for-like on the denoise phase, this
+//! What stays here is genuinely MLX's: [`sdpa_budgeted_bhsd`], [`sdpa_head_budgeted_bhsd`], the
+//! `slice_axis` helper, and the per-chunk `eval`. The kernels must NOT merge — measured like-for-like on the denoise phase, this
 //! rung is worth **−32% on candle and −1.7% here**, roughly an order of magnitude apart, precisely
 //! because the kernels differ; see the attribution table below and the [`gen_core::attention_budget`]
 //! module doc. (MLX's often-quoted −5.0% is the whole-request figure, not the denoise phase — the two
 //! are not interchangeable when comparing backends.)
 //!
-//! The lever is query-row chunking: every query row's softmax is over **all** keys and is independent
+//! There are **two** levers, and [`AttentionChunkAxis`] is where a caller picks between them. The
+//! head axis ([`sdpa_head_budgeted_bhsd`], sc-18661) splits complete heads and is the stronger one —
+//! it leaves the query GEMM's `M` untouched and reconstructs the unbounded output exactly, provided
+//! the budget admits one whole head. Read [`AttentionChunkAxis`] before relying on that: below that
+//! budget it falls back to query rows and inherits their weaker contract under the same name.
+//!
+//! The original lever is query-row chunking: every query row's softmax is over **all** keys and is independent
 //! of the other rows, so running the attention over blocks of query rows leaves each query's complete
 //! key/value domain intact while bounding the per-call attention scratch to `chunk_rows × Sk` scores
 //! instead of `Sq × Sk`. Precision, schedule, seed, conditioning, and the output contract are
@@ -188,6 +194,235 @@ pub fn sdpa_budgeted_bhsd(
     Ok(concatenate_axis(&refs, 2)?)
 }
 
+/// Which axis a bounded call splits, when the budget forces a split at all.
+///
+/// The two axes **share a score budget but not a numerical contract**, which is
+/// [`gen_core::attention_budget`]'s own wording and the reason this is an explicit choice rather
+/// than an internal heuristic:
+///
+/// | axis | what a chunk is | the query GEMM's `M` | agreement with the unbounded call |
+/// |---|---|---|---|
+/// | [`QueryRows`](Self::QueryRows) | `block` query rows, all `H` heads, complete k/v | **changes** | numerical |
+/// | [`Heads`](Self::Heads) | `heads_per_chunk` complete heads, all `Sq` rows | unchanged | **exact**, while the budget admits one whole head — see below |
+///
+/// # The head axis is bit-exact — but only while it does not fall back (sc-18661)
+///
+/// `mlx_gen_sdxl::memory_strategy::ATTENTION_SUPPORT` predicted that "a head-axis implementation
+/// would be bit-exact by construction". Measured, that holds: heads are fully independent, there is
+/// no accumulator and no running max to split, `M` is untouched, and MLX dispatches the same Metal
+/// specialization. Exactly `0` relative max-abs at every shape sc-18661 measured — the production
+/// MiniMax-H3 DiT (bf16, `H = 56`, `D = 128`, `Sq` 7 586 and 20 022), a synthetic `f32` `H = 5`
+/// sweep across four heads-per-chunk boundaries, and the committed H3 DiT fixture (`f32`, `H = 4`,
+/// `D = 24`).
+///
+/// **The trap is the budget.** [`Heads`](Self::Heads) falls back to query rows *inside* a head chunk
+/// when one head still exceeds the budget — the order the shared planner prescribes — and such a
+/// call silently inherits the query axis's weaker numerical contract while still reporting itself as
+/// the head axis. The condition is exact and worth stating: the head axis keeps bit identity iff the
+/// budget admits one whole head, `max_score_elements >= B · Sq · Sk`. Below that it is the query axis
+/// wearing a different name. Measured on the H3 fixture at `Sq = 29`: `0` at a one-head budget,
+/// `5.9e-4` at half of one — the *same* number the query-row arm reports there.
+///
+/// Callers that need the distinction should read it off the plan rather than assume it:
+/// `AttentionBudget::head_chunks(..).chunks_heads()` with a query block equal to `Sq` is the
+/// bit-exact configuration, and `mlx_gen_minimax_h3::dit::layers::planned_attention_chunks` is a
+/// worked example of surfacing both counts.
+///
+/// Until sc-18661 only the query-row axis existed on MLX. MiniMax-H3 is the family that forced the
+/// point — 56 heads against Z-Image's 30, so the head axis alone buys a 56x reduction in the score
+/// domain.
+///
+/// Neither axis is a default: [`BoundedAttention::UNBOUNDED`] is, and a family selects an axis only
+/// on its own measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionChunkAxis {
+    /// Split query rows. Every chunk sees all `H` heads and the complete k/v.
+    QueryRows,
+    /// Split complete heads first, and fall back to query rows **inside** a head chunk only when one
+    /// head still exceeds the budget — the order [`AttentionBudget::head_chunks`] prescribes.
+    Heads,
+}
+
+/// A [`AttentionPlan`] plus the axis its chunks are cut on — everything a bounded MLX attention call
+/// needs that is not a tensor.
+///
+/// `Copy`, so it threads through a whole DiT forward chain as cheaply as the budget alone. Existing
+/// callers that predate the head axis keep [`sdpa_budgeted_bhsd`], which is exactly this value at
+/// [`AttentionChunkAxis::QueryRows`].
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedAttention<'a> {
+    /// The budget and the request's cancel flag.
+    pub plan: AttentionPlan<'a>,
+    /// The axis chunks are cut on when the budget forces a split.
+    pub axis: AttentionChunkAxis,
+}
+
+impl<'a> BoundedAttention<'a> {
+    /// The unbounded, uncancellable plan — byte-identical to the pre-rung forward on either axis.
+    pub const UNBOUNDED: Self = Self {
+        plan: AttentionPlan::UNBOUNDED,
+        axis: AttentionChunkAxis::QueryRows,
+    };
+
+    /// A bounded plan on `axis`.
+    pub const fn new(plan: AttentionPlan<'a>, axis: AttentionChunkAxis) -> Self {
+        Self { plan, axis }
+    }
+
+    /// A bounded plan at `budget`, cutting complete heads.
+    pub const fn heads(budget: AttentionBudget) -> Self {
+        Self::new(AttentionPlan::budgeted(budget), AttentionChunkAxis::Heads)
+    }
+
+    /// A bounded plan at `budget`, cutting query rows.
+    pub const fn query_rows(budget: AttentionBudget) -> Self {
+        Self::new(
+            AttentionPlan::budgeted(budget),
+            AttentionChunkAxis::QueryRows,
+        )
+    }
+
+    /// The same plan with `cancel` attached, checked between chunks.
+    pub fn with_cancel(mut self, cancel: &'a crate::CancelFlag) -> Self {
+        self.plan = self.plan.with_cancel(cancel);
+        self
+    }
+}
+
+/// Bounded SDPA over `q, k, v: [B, H, Sq, D]` on the caller's chosen [`AttentionChunkAxis`].
+///
+/// [`AttentionChunkAxis::QueryRows`] is exactly [`sdpa_budgeted_bhsd`]. [`AttentionChunkAxis::Heads`]
+/// consumes [`AttentionBudget::head_chunks`] first and delegates each head chunk to
+/// [`sdpa_budgeted_bhsd`], which re-plans the query axis **inside** the chunk — with `H` already
+/// narrowed the query planner usually reports the whole `Sq`, i.e. one un-chunked fused call per head
+/// group, which is what makes this axis bit-exact.
+pub fn sdpa_bounded_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    bounded: BoundedAttention<'_>,
+) -> Result<Array> {
+    match bounded.axis {
+        AttentionChunkAxis::QueryRows => sdpa_budgeted_bhsd(q, k, v, scale, mask, bounded.plan),
+        AttentionChunkAxis::Heads => sdpa_head_budgeted_bhsd(q, k, v, scale, mask, bounded.plan),
+    }
+}
+
+/// Bounded SDPA that splits **complete heads** — the bit-exact axis (sc-18661).
+///
+/// Each chunk is a complete fused SDPA over `heads_per_chunk` whole heads, every one of them seeing
+/// its full `Sq` query rows and the complete k/v for those heads. The query GEMM's `M` dimension is
+/// therefore identical to the unbounded call's, so MLX dispatches the same Metal specialization and
+/// the reconstruction is bit-exact rather than tolerance-equivalent — the property the query-row axis
+/// cannot offer (`mlx_gen_sdxl::memory_strategy::ATTENTION_SUPPORT` predicted this; sc-18661 measured
+/// it).
+///
+/// **That holds only while the budget admits one whole head** (`max_score_elements >= B · Sq · Sk`).
+/// Below it a single head still exceeds the budget, this kernel falls back to query rows *inside* the
+/// head chunk — the order the shared planner prescribes — and the call inherits the query axis's
+/// weaker numerical contract under this function's name. See [`AttentionChunkAxis`].
+///
+/// `mask` is narrowed on the head axis when it carries one head entry per head; a broadcast `[.., 1,
+/// .., ..]` mask (or `None`) is shared by every chunk unchanged. A per-query mask is narrowed by the
+/// inner [`sdpa_budgeted_bhsd`] call if the query axis also has to split.
+///
+/// Cancellation follows the rung's shared contract: checked **between** chunks, before the next
+/// launch, and never on the unbounded fast path.
+pub fn sdpa_head_budgeted_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    plan: AttentionPlan<'_>,
+) -> Result<Array> {
+    let qs = q.shape();
+    if qs.len() != 4 {
+        return Err(Error::Msg(format!(
+            "sdpa_head_budgeted_bhsd expects q as [B, H, Sq, D], got {qs:?}"
+        )));
+    }
+    for (name, a) in [("k", k), ("v", v)] {
+        if a.shape().len() != 4 {
+            return Err(Error::Msg(format!(
+                "sdpa_head_budgeted_bhsd expects {name} as [B, H, Sk, D], got {:?}",
+                a.shape()
+            )));
+        }
+    }
+    let (b, h, sq) = (qs[0], qs[1], qs[2]);
+    let sk = k.shape()[2];
+    // `k`/`v` carry the same head axis as `q`; a k/v with a different `H` would make the head slices
+    // below pair a query head with the wrong key head — wrong output, not a failure.
+    for (name, a) in [("k", k), ("v", v)] {
+        if a.shape()[1] != h {
+            return Err(Error::Msg(format!(
+                "sdpa_head_budgeted_bhsd expects {name} to carry q's {h} heads, got {:?}",
+                a.shape()
+            )));
+        }
+    }
+
+    let heads = plan.budget.head_chunks(
+        b.max(0) as u64,
+        h.max(0) as u64,
+        sq.max(0) as u64,
+        sk.max(0) as u64,
+    );
+    if !heads.chunks_heads() {
+        // In budget, unbounded, or a single head: there is nothing for this axis to split, and the
+        // query-row kernel owns the remaining decision (which for an in-budget call is the
+        // byte-identical single fused call).
+        record_head_chunk_count(1);
+        return sdpa_budgeted_bhsd(q, k, v, scale, mask, plan);
+    }
+    let per_chunk = (heads.heads_per_chunk().max(1) as i32).min(h);
+
+    // A mask with a real head axis must be narrowed with the heads; a broadcast one is shared.
+    let mask_head_axis = mask.and_then(|m| {
+        let ms = m.shape();
+        // The head axis is the second-from-last-two, i.e. `len() - 3`; ranks below 3 have none.
+        (ms.len() >= 3 && ms[ms.len() - 3] == h).then_some((ms.len() - 3) as i32)
+    });
+
+    let mut outs: Vec<Array> = Vec::with_capacity(h.div_euclid(per_chunk) as usize + 1);
+    let mut start = 0;
+    while start < h {
+        if plan.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let len = per_chunk.min(h - start);
+        let q_chunk = slice_axis(q, 1, start, len)?;
+        let k_chunk = slice_axis(k, 1, start, len)?;
+        let v_chunk = slice_axis(v, 1, start, len)?;
+        let chunk_mask = match (mask, mask_head_axis) {
+            (Some(m), Some(axis)) => Some(slice_axis(m, axis, start, len)?),
+            (other, _) => other.cloned(),
+        };
+        // The inner call re-plans the query axis against the NARROWED head count, so it only chunks
+        // query rows when a single head still exceeds the budget — the order the shared planner
+        // prescribes, and the reason this axis stays bit-exact whenever it can.
+        let out = sdpa_budgeted_bhsd(
+            &q_chunk,
+            &k_chunk,
+            &v_chunk,
+            scale,
+            chunk_mask.as_ref(),
+            plan,
+        )?;
+        if plan.budget.eval_per_chunk() {
+            mlx_rs::transforms::eval([&out])?;
+        }
+        outs.push(out);
+        start += len;
+    }
+    record_head_chunk_count(outs.len());
+    let refs: Vec<&Array> = outs.iter().collect();
+    Ok(concatenate_axis(&refs, 1)?)
+}
+
 /// Test-only observation of how many chunks the last [`sdpa_budgeted_bhsd`] call actually ran.
 ///
 /// Without this, every equivalence test in this module — and every one in `mlx-gen-z-image` — passes
@@ -200,20 +435,31 @@ mod chunk_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) static LAST_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static LAST_HEAD_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     /// Chunks run by the most recent [`super::sdpa_budgeted_bhsd`] call (`1` = the unchunked path).
+    ///
+    /// Under [`super::sdpa_head_budgeted_bhsd`] this reports the **last head chunk's** query-axis
+    /// decision, which is the one that says whether the head axis alone was enough to fit the budget.
     pub fn last_chunk_count() -> usize {
         LAST_CHUNK_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Head chunks run by the most recent [`super::sdpa_head_budgeted_bhsd`] call (`1` = the head
+    /// axis did not split).
+    pub fn last_head_chunk_count() -> usize {
+        LAST_HEAD_CHUNK_COUNT.load(Ordering::Relaxed)
     }
 
     /// Reset before a call so a stale value cannot satisfy an assertion.
     pub fn reset() {
         LAST_CHUNK_COUNT.store(0, Ordering::Relaxed);
+        LAST_HEAD_CHUNK_COUNT.store(0, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
-pub use chunk_probe::{last_chunk_count, reset as reset_chunk_count};
+pub use chunk_probe::{last_chunk_count, last_head_chunk_count, reset as reset_chunk_count};
 
 #[cfg(test)]
 fn record_chunk_count(n: usize) {
@@ -223,6 +469,15 @@ fn record_chunk_count(n: usize) {
 #[cfg(not(test))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
+
+#[cfg(test)]
+fn record_head_chunk_count(n: usize) {
+    chunk_probe::LAST_HEAD_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_head_chunk_count(_n: usize) {}
 
 /// Contiguous `[.., start..start+len, ..]` slice along `axis`, via boundary splits (no host index
 /// vector and no gather, unlike `take_axis`).
@@ -630,6 +885,291 @@ mod tests {
             sdpa_budgeted_bhsd(&q, &k, &v, scale, None, plan).is_ok(),
             "a cancelled flag must not affect the unbounded fast path"
         );
+    }
+
+    // ── The head axis (sc-18661) ────────────────────────────────────────────────────────────────
+
+    /// **Exact reconstruction on the head axis**, pinned at `0.0` rather than at a tolerance.
+    ///
+    /// Splitting complete heads leaves every call's `Sq` — and therefore the query GEMM's `M` — at
+    /// its unbounded value, so the arithmetic is untouched, there is no accumulator to split, and MLX
+    /// dispatches the same Metal specialization. Every heads-per-chunk from 1 to 4 over a **prime**
+    /// head count is swept, so every arm leaves a ragged tail and a single lucky boundary cannot
+    /// carry the claim.
+    ///
+    /// Each arm additionally asserts that the query axis stayed **whole** inside the head chunk. That
+    /// is the condition the exactness depends on ([`AttentionChunkAxis`]): a budget below one head's
+    /// score domain makes this kernel fall back to query rows and inherit their weaker contract while
+    /// still reporting itself as the head axis, and the zeros below would then be measuring the wrong
+    /// thing. The final arm shows the same budget genuinely binding on the query axis, so the zeros
+    /// are the axis's doing rather than a budget that never engaged.
+    #[test]
+    fn the_head_axis_reconstructs_the_unbounded_forward_exactly() {
+        // 5 heads is prime, so every heads-per-chunk below it leaves a ragged tail.
+        let (b, h, s, d) = (1, 5, 24, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let k = arange(&[b, h, s, d], 0.023, -0.4);
+        let v = arange(&[b, h, s, d], 0.007, 0.9);
+        let scale = (d as f32).powf(-0.5);
+        let full = sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::UNBOUNDED).unwrap();
+
+        let mut split_arms = 0;
+        for heads_per_chunk in [1u64, 2, 3, 4] {
+            // `head_chunks` splits when `B·H·Sq·Sk` exceeds the budget and yields
+            // `budget / (B·Sq·Sk)` heads per chunk.
+            let per_head = (b * s * s) as u64;
+            let budget = AttentionBudget::from_score_elements(per_head * heads_per_chunk, true);
+            reset_chunk_count();
+            let chunked =
+                sdpa_head_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::budgeted(budget))
+                    .unwrap();
+            let expected = (h as usize).div_ceil(heads_per_chunk as usize);
+            assert_eq!(
+                last_head_chunk_count(),
+                expected,
+                "at {heads_per_chunk} heads per chunk the kernel ran {} head chunks, the shared \
+                 planner implies {expected}",
+                last_head_chunk_count()
+            );
+            assert_eq!(
+                last_chunk_count(),
+                1,
+                "with H narrowed to {heads_per_chunk} the query axis must stay whole, or the \
+                 exactness below is not the head axis's property"
+            );
+            assert_eq!(chunked.shape(), full.shape());
+            let (a, c) = (flat(&full), flat(&chunked));
+            let max_abs = a
+                .iter()
+                .zip(&c)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert_eq!(
+                max_abs, 0.0,
+                "heads_per_chunk {heads_per_chunk}: head-axis chunking must be bit-exact, got a \
+                 max absolute difference of {max_abs:e}"
+            );
+            split_arms += 1;
+        }
+        assert_eq!(
+            split_arms, 4,
+            "every arm must have split, or this test passes with the head axis gone"
+        );
+
+        // **The contrast, and the anti-vacuity guard in one.** The same budget on the query axis
+        // must actually chunk — proving the budget was binding and that the zero above is the
+        // *axis's* doing rather than a budget that never engaged.
+        let budget = AttentionBudget::from_score_elements((b * s * s) as u64, true);
+        reset_chunk_count();
+        sdpa_budgeted_bhsd(&q, &k, &v, scale, None, AttentionPlan::budgeted(budget)).unwrap();
+        assert!(
+            last_chunk_count() > 1,
+            "the query axis did not chunk at the budget the head axis split five ways — the \
+             comparison above is not between two axes at one budget"
+        );
+    }
+
+    /// An in-budget, unbounded or single-head call must take the query-row kernel's own fast path
+    /// rather than entering a head loop that would concatenate one chunk back together.
+    #[test]
+    fn the_head_axis_delegates_when_there_is_nothing_to_split() {
+        let (b, s, d) = (1, 12, 8);
+        let scale = (d as f32).powf(-0.5);
+        for (label, h, budget) in [
+            ("unbounded", 4, AttentionBudget::UNBOUNDED),
+            (
+                "single head",
+                1,
+                AttentionBudget::from_score_elements(1, true),
+            ),
+            (
+                "in budget",
+                4,
+                AttentionBudget::from_score_elements(u64::MAX - 1, true),
+            ),
+        ] {
+            let q = arange(&[b, h, s, d], 0.019, 0.2);
+            reset_chunk_count();
+            let out =
+                sdpa_head_budgeted_bhsd(&q, &q, &q, scale, None, AttentionPlan::budgeted(budget))
+                    .unwrap();
+            assert_eq!(out.shape(), &[b, h, s, d], "{label}");
+            assert_eq!(last_head_chunk_count(), 1, "{label}: must not split heads");
+        }
+    }
+
+    /// A mask with a real head axis must be narrowed with the heads. Un-narrowed, every chunk would
+    /// see head 0's mask — the head-axis twin of the classic per-query chunking bug — so the mask is
+    /// made strongly head-dependent and the result compared against the unbounded call.
+    #[test]
+    fn a_per_head_mask_is_narrowed_to_each_chunks_own_heads() {
+        let (b, h, s, d) = (1, 4, 10, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let k = arange(&[b, h, s, d], 0.023, -0.4);
+        let v = arange(&[b, h, s, d], 0.007, 0.9);
+        let scale = (d as f32).powf(-0.5);
+
+        // Head `i` may attend only to key `i`; an un-narrowed mask makes every chunk head 0's.
+        let mut data = vec![-1.0e4f32; (b * h * s) as usize];
+        for head in 0..h {
+            for row in 0..s {
+                data[(head * s + row) as usize] = if row == head { 0.0 } else { -1.0e4 };
+            }
+        }
+        let mask = Array::from_slice(&data, &[b, h, 1, s]);
+        let full =
+            sdpa_budgeted_bhsd(&q, &k, &v, scale, Some(&mask), AttentionPlan::UNBOUNDED).unwrap();
+
+        let budget = AttentionBudget::from_score_elements((b * s * s) as u64, false);
+        reset_chunk_count();
+        let chunked = sdpa_head_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&mask),
+            AttentionPlan::budgeted(budget),
+        )
+        .unwrap();
+        assert_eq!(last_head_chunk_count(), 4, "the head axis must have split");
+        let (a, c) = (flat(&full), flat(&chunked));
+        let max_abs = a
+            .iter()
+            .zip(&c)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert_eq!(max_abs, 0.0, "a per-head mask was not narrowed per chunk");
+
+        // A broadcast mask has no head axis to narrow and must be shared unchanged.
+        let broadcast = arange(&[b, 1, 1, s], 0.31, 0.0);
+        let full = sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&broadcast),
+            AttentionPlan::UNBOUNDED,
+        )
+        .unwrap();
+        let chunked = sdpa_head_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&broadcast),
+            AttentionPlan::budgeted(budget),
+        )
+        .unwrap();
+        let (a, c) = (flat(&full), flat(&chunked));
+        let max_abs = a
+            .iter()
+            .zip(&c)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert_eq!(max_abs, 0.0, "a broadcast mask must survive head chunking");
+    }
+
+    /// A single head that still exceeds the budget must fall back to query rows **inside** the head
+    /// chunk — the order the shared planner prescribes — rather than silently exceeding it.
+    #[test]
+    fn one_head_over_budget_falls_back_to_query_rows_inside_the_chunk() {
+        let (b, h, s, d) = (1, 3, 20, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let scale = (d as f32).powf(-0.5);
+        // Half of one head's score domain: the head axis can only reach one head per chunk, and one
+        // head is still twice the budget.
+        let budget = AttentionBudget::from_score_elements(((b * s * s) / 2) as u64, false);
+        reset_chunk_count();
+        let out = sdpa_head_budgeted_bhsd(&q, &q, &q, scale, None, AttentionPlan::budgeted(budget))
+            .unwrap();
+        assert_eq!(out.shape(), &[b, h, s, d]);
+        assert_eq!(last_head_chunk_count(), h as usize, "one head per chunk");
+        assert!(
+            last_chunk_count() > 1,
+            "one head still over budget must chunk query rows inside the head chunk, ran {}",
+            last_chunk_count()
+        );
+    }
+
+    /// Between-chunk cancellation on the head axis, and inertness of a cancelled flag on the
+    /// unbounded fast path — the rung's shared contract, asserted on the new axis too.
+    #[test]
+    fn a_cancel_stops_a_head_bounded_call_between_chunks() {
+        let (b, h, s, d) = (1, 4, 12, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let scale = (d as f32).powf(-0.5);
+        let budget = AttentionBudget::from_score_elements((b * s * s) as u64, false);
+
+        let cancel = CancelFlag::default();
+        cancel.cancel();
+        let plan = AttentionPlan::budgeted(budget).with_cancel(&cancel);
+        assert!(
+            matches!(
+                sdpa_head_budgeted_bhsd(&q, &q, &q, scale, None, plan).unwrap_err(),
+                Error::Canceled
+            ),
+            "a head-bounded call must return Error::Canceled"
+        );
+        let plan = AttentionPlan::UNBOUNDED.with_cancel(&cancel);
+        assert!(
+            sdpa_head_budgeted_bhsd(&q, &q, &q, scale, None, plan).is_ok(),
+            "a cancelled flag must not affect the unbounded fast path"
+        );
+    }
+
+    /// A k/v whose head axis disagrees with q would pair each query head with the wrong key head —
+    /// wrong output, not a failure — so it is refused rather than sliced.
+    #[test]
+    fn the_head_axis_rejects_a_key_value_with_a_different_head_count() {
+        let q = arange(&[1, 4, 8, 4], 0.1, 0.0);
+        let wrong = arange(&[1, 2, 8, 4], 0.1, 0.0);
+        for (label, k, v) in [("k", &wrong, &q), ("v", &q, &wrong)] {
+            let err = sdpa_head_budgeted_bhsd(&q, k, v, 1.0, None, AttentionPlan::UNBOUNDED)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("q's 4 heads"), "{label}: {err}");
+        }
+        let flat3 = arange(&[1, 4, 8], 0.1, 0.0);
+        let err = sdpa_head_budgeted_bhsd(&q, &flat3, &q, 1.0, None, AttentionPlan::UNBOUNDED)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[B, H, Sk, D]"), "{err}");
+    }
+
+    /// [`sdpa_bounded_bhsd`] must route to the axis it is handed and to no other. Asserted through
+    /// the two probes, which are the only observable that distinguishes the axes at equal output.
+    #[test]
+    fn the_axis_selector_routes_to_the_axis_it_is_given() {
+        let (b, h, s, d) = (1, 4, 16, 8);
+        let q = arange(&[b, h, s, d], 0.019, 0.2);
+        let scale = (d as f32).powf(-0.5);
+        let budget = AttentionBudget::from_score_elements((b * s * s) as u64, false);
+
+        reset_chunk_count();
+        sdpa_bounded_bhsd(&q, &q, &q, scale, None, BoundedAttention::heads(budget)).unwrap();
+        assert_eq!(last_head_chunk_count(), 4);
+        assert_eq!(last_chunk_count(), 1);
+
+        reset_chunk_count();
+        sdpa_bounded_bhsd(
+            &q,
+            &q,
+            &q,
+            scale,
+            None,
+            BoundedAttention::query_rows(budget),
+        )
+        .unwrap();
+        assert_eq!(
+            last_head_chunk_count(),
+            0,
+            "the query-row route must not touch the head probe"
+        );
+        assert!(last_chunk_count() > 1);
+
+        reset_chunk_count();
+        sdpa_bounded_bhsd(&q, &q, &q, scale, None, BoundedAttention::UNBOUNDED).unwrap();
+        assert_eq!(last_chunk_count(), 1);
     }
 
     #[test]

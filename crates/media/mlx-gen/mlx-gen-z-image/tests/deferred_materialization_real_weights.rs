@@ -8,11 +8,11 @@
 //!
 //! ```text
 //! MLX_GEN_ZIMAGE_SNAPSHOT=<q4/q8/bf16 tier dir> ZIMAGE_SIZE=512 ZIMAGE_STEPS=1 \
-//!   cargo test -p mlx-gen-z-image --release --test deferred_materialization_real_weights \
+//!   cargo test -p mlx-gen-z-image --release --test integration deferred_materialization_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
-mod common;
+use crate::common;
 
 use common::tier_snapshot as snapshot;
 use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};

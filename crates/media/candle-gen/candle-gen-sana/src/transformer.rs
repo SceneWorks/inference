@@ -41,32 +41,146 @@
 //! `SanaTransformer2DModel` names exactly, so a converted checkpoint (or the committed tiny golden)
 //! loads unchanged.
 
-use candle_gen::candle_core::{DType, Result, Tensor, D};
+use std::path::PathBuf;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::{silu, softmax_last_dim};
-use candle_gen::candle_nn::{Conv2d, Linear, Module};
-use candle_gen::quant::{ActPrecision, Nvfp4Context, Nvfp4Linear};
+use candle_gen::candle_nn::{Conv2d, Module};
+use candle_gen::quant::{linear_from_weights, ActPrecision, Nvfp4Context, Nvfp4Linear, QLinear};
 use candle_gen::Weights;
 
 use crate::config::SanaTransformerConfig;
 use crate::dc_ae::{conv, glu_mbconv_core, relu_linear_attention};
 use crate::nvfp4_dit::{report_over, DitPlan, LayerRole, Nvfp4Report, Proj, SanaProj};
 
+/// The published SANA q4/q8 snapshots use the standard MLX affine group-64 layout. There is no
+/// component config sidecar for this family, so validation is deliberately keyed to the exact
+/// converted projection surface instead of guessing from an arbitrary `.scales` tensor.
+const MLX_PACKED_GROUP: usize = 64;
+
+fn packed_linear_bases(cfg: &SanaTransformerConfig) -> Vec<(String, bool)> {
+    let mut bases = Vec::with_capacity(cfg.num_layers as usize * 8 + 9);
+    let (ts1, ts2) = if cfg.guidance_embeds {
+        (
+            "time_embed.timestep_embedder.linear_1",
+            "time_embed.timestep_embedder.linear_2",
+        )
+    } else {
+        (
+            "time_embed.emb.timestep_embedder.linear_1",
+            "time_embed.emb.timestep_embedder.linear_2",
+        )
+    };
+    bases.extend([
+        (ts1.into(), true),
+        (ts2.into(), true),
+        ("time_embed.linear".into(), true),
+        ("caption_projection.linear_1".into(), true),
+        ("caption_projection.linear_2".into(), true),
+        ("proj_out".into(), true),
+    ]);
+    if cfg.guidance_embeds {
+        bases.extend([
+            ("time_embed.guidance_embedder.linear_1".into(), true),
+            ("time_embed.guidance_embedder.linear_2".into(), true),
+        ]);
+    }
+    for i in 0..cfg.num_layers {
+        let p = format!("transformer_blocks.{i}");
+        bases.extend([
+            (format!("{p}.attn1.to_q"), false),
+            (format!("{p}.attn1.to_k"), false),
+            (format!("{p}.attn1.to_v"), false),
+            (format!("{p}.attn1.to_out.0"), true),
+            (format!("{p}.attn2.to_q"), true),
+            (format!("{p}.attn2.to_k"), true),
+            (format!("{p}.attn2.to_v"), true),
+            (format!("{p}.attn2.to_out.0"), true),
+        ]);
+    }
+    bases
+}
+
+/// Return the packed tier bit-width if this is a hosted SANA affine snapshot, otherwise `None`
+/// for a fully dense checkpoint. A partial/mixed checkpoint is never allowed to quietly treat U32
+/// codes as dense weights: it fails with the missing key and expected group-64 layout.
+fn validate_packed_tier(
+    w: &Weights,
+    cfg: &SanaTransformerConfig,
+) -> candle_gen::Result<Option<usize>> {
+    let bases = packed_linear_bases(cfg);
+    let is_packed = bases.iter().any(|(base, _)| {
+        w.contains(&format!("{base}.scales"))
+            || w.require(&format!("{base}.weight"))
+                .map(|weight| weight.dtype() == DType::U32)
+                .unwrap_or(false)
+    });
+    if !is_packed {
+        return Ok(None);
+    }
+
+    let mut bits = None;
+    for (base, has_bias) in bases {
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        for key in [&weight_key, &scales_key, &biases_key] {
+            if !w.contains(key) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "SANA packed tier is incomplete: missing {key}; every converted DiT projection \
+                     must carry MLX group-{MLX_PACKED_GROUP} weight/scales/biases parts"
+                )));
+            }
+        }
+        if has_bias && !w.contains(&format!("{base}.bias")) {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "SANA packed tier is incomplete: missing {base}.bias for its biased projection"
+            )));
+        }
+        let weight = w.require(&weight_key)?;
+        let scales = w.require(&scales_key)?;
+        let biases = w.require(&biases_key)?;
+        if weight.dtype() != DType::U32 || scales.dims2()? != biases.dims2()? {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "SANA packed tier has invalid affine parts for {base}: expected U32 weight and equal \
+                 rank-2 scales/biases"
+            )));
+        }
+        let (out, packed_cols) = weight.dims2()?;
+        let (scale_out, scale_cols) = scales.dims2()?;
+        if out != scale_out || scale_cols == 0 {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "SANA packed tier has invalid group-{MLX_PACKED_GROUP} geometry for {base}"
+            )));
+        }
+        let this_bits =
+            candle_gen::quant::mlx_packed_bits_gs(packed_cols, scale_cols, MLX_PACKED_GROUP);
+        if !matches!(this_bits, 4 | 8) {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "SANA packed tier has unsupported Q{this_bits} affine layout for {base}; expected Q4 or Q8 group-{MLX_PACKED_GROUP}"
+            )));
+        }
+        if let Some(expected) = bits {
+            if expected != this_bits {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "SANA packed tier mixes Q{expected} and Q{this_bits} projections; select one coherent Q4 or Q8 tier"
+                )));
+            }
+        } else {
+            bits = Some(this_bits);
+        }
+    }
+    Ok(bits)
+}
+
 // ----------------------------------------------------------------------------------------------
 // Shared scalar / norm primitives (f32).
 // ----------------------------------------------------------------------------------------------
 
-/// `nn.Linear` (weight `[out, in]`, optional bias) applied over the last axis — via candle's
-/// batched [`Linear`], which handles the `[B, N, in]` token layout. Weights stored f32.
-fn linear(w: &Weights, prefix: &str, bias: bool) -> candle_gen::Result<Linear> {
-    let weight = w
-        .require(&format!("{prefix}.weight"))?
-        .to_dtype(DType::F32)?;
-    let b = if bias {
-        Some(w.require(&format!("{prefix}.bias"))?.to_dtype(DType::F32)?)
-    } else {
-        None
-    };
-    Ok(Linear::new(weight, b))
+/// Packed-detecting SANA `nn.Linear`: dense checkpoints retain the original f32 `Linear`, while
+/// the hosted MLX q4/q8 triples land in Candle's affine repacker directly.
+fn linear(w: &Weights, prefix: &str, bias: bool) -> candle_gen::Result<QLinear> {
+    linear_from_weights(w, prefix, bias)
 }
 
 /// Load one trunk **projection** under a [`DitPlan`] (sc-11045): dense f32 [`Linear`] by default, or an
@@ -92,7 +206,7 @@ fn proj(
         // alongside the packed one across `Nvfp4Linear::from_dense` — a redundant device alloc + copy
         // per projection, ×163 at peak load (sc-11045 review, MINOR 5).
         return Ok(Proj::new(
-            SanaProj::Dense(linear(w, prefix, bias)?),
+            SanaProj::Packed(Box::new(linear(w, prefix, bias)?)),
             prefix,
             plan,
             ActPrecision::W4A16,
@@ -320,7 +434,7 @@ impl CrossAttn {
     }
 
     /// `x` (query) `[B, N, dim]`, `kv` (caption) `[B, M, dim]`.
-    fn forward(&self, x: &Tensor, kv: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, kv: &Tensor, score_budget: Option<usize>) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let m = kv.dim(1)?;
 
@@ -349,12 +463,23 @@ impl CrossAttn {
         let k = split(&k, m)?; // [B,H,M,hd]
         let v = split(&v, m)?; // [B,H,M,hd]
 
-        // Softmax SDPA in f32 (caption seq is short; full attention).
-        let scores = q
-            .matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
-            .affine(scale, 0.0)?; // [B,H,N,M]
-        let probs = softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // [B,H,N,hd]
+        let kt = k.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+        let rows = score_budget
+            .map(|budget| (budget / b.max(1) / self.heads.max(1) / m.max(1)).max(1))
+            .unwrap_or(n)
+            .min(n);
+        let ctx = if rows == n {
+            let scores = q.matmul(&kt)?.affine(scale, 0.0)?;
+            softmax_last_dim(&scores)?.matmul(&v)?
+        } else {
+            let mut chunks = Vec::with_capacity(n.div_ceil(rows));
+            for first in (0..n).step_by(rows) {
+                let count = rows.min(n - first);
+                let scores = q.narrow(2, first, count)?.matmul(&kt)?.affine(scale, 0.0)?;
+                chunks.push(softmax_last_dim(&scores)?.matmul(&v)?);
+            }
+            Tensor::cat(&chunks, 2)?
+        };
 
         let ctx = ctx.permute((0, 2, 1, 3))?.reshape((b, n, inner))?;
         self.to_out.forward(&ctx)
@@ -437,6 +562,7 @@ impl SanaBlock {
         temb: &Tensor,
         h: usize,
         w: usize,
+        attention_budget: Option<usize>,
     ) -> Result<Tensor> {
         let (b, n, dim) = hidden.dims3()?;
 
@@ -454,7 +580,7 @@ impl SanaBlock {
         let hidden = (hidden + gate_msa.broadcast_mul(&attn_out)?)?;
 
         // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption)?;
+        let cross = self.attn2.forward(&hidden, caption, attention_budget)?;
         let hidden = (cross + hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to NCHW [B,dim,H,W] → GLUMBConv → flatten → gate.
@@ -482,18 +608,34 @@ pub struct SanaTransformer {
     patch_embed: Conv2d, // proj: in → inner (kernel/stride = patch_size)
     // timestep path (AdaLayerNormSingle.emb + .linear, or — Sprint — the combined
     // timestep+guidance embedder).
-    ts_embedder_1: Linear,
-    ts_embedder_2: Linear,
-    time_linear: Linear, // → 6·inner
+    ts_embedder_1: QLinear,
+    ts_embedder_2: QLinear,
+    time_linear: QLinear, // → 6·inner
     /// Sprint: the extra guidance embedder (`SanaCombinedTimestepGuidanceEmbeddings`). `None` for base.
-    guidance_embedder: Option<(Linear, Linear)>,
+    guidance_embedder: Option<(QLinear, QLinear)>,
     // caption path
     caption_proj_1: Proj,
     caption_proj_2: Proj,
     caption_norm: Tensor, // RMSNorm weight [inner]
     blocks: Vec<SanaBlock>,
+    window_source: Option<WindowSource>,
     scale_shift_table: Tensor, // [2, inner] (output modulated norm)
     proj_out: Proj,
+}
+
+struct WindowSource {
+    files: Vec<PathBuf>,
+    pins: Vec<candle_gen::gen_core::PinnedWeightsFile>,
+    digests: Vec<[u8; 32]>,
+    device: Device,
+    window: usize,
+}
+
+fn block_windows(total: usize, window: usize) -> Vec<(usize, usize)> {
+    (0..total)
+        .step_by(window)
+        .map(|first| (first, window.min(total - first)))
+        .collect()
 }
 
 impl SanaTransformer {
@@ -514,6 +656,23 @@ impl SanaTransformer {
         cfg: SanaTransformerConfig,
         plan: &DitPlan,
     ) -> candle_gen::Result<Self> {
+        Self::from_weights_planned_inner(w, cfg, plan, None)
+    }
+
+    fn from_weights_planned_inner(
+        w: &Weights,
+        cfg: SanaTransformerConfig,
+        plan: &DitPlan,
+        window_source: Option<WindowSource>,
+    ) -> candle_gen::Result<Self> {
+        if let Some(bits) = validate_packed_tier(w, &cfg)? {
+            if plan.is_nvfp4() {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "SANA Q{bits} MLX-affine tier cannot use the NVFP4 plan: select the packed Q{bits} \
+                     route, because NVFP4 is a distinct weight format"
+                )));
+            }
+        }
         // sc-12274: build ONE cuBLASLt handle for this trunk and thread it to every NVFP4 projection
         // via the plan. A handle eagerly allocates a 32 MiB workspace held for life and nothing on it
         // is per-layer, so one per layer meant 163 × 32 MiB ≈ 5.1 GiB of duplicated scratch — invisible
@@ -524,21 +683,27 @@ impl SanaTransformer {
         };
         let p = cfg.patch_size as usize;
         let patch_embed = conv(w, "patch_embed.proj", p, 0, 1, true)?;
-        let mut blocks = Vec::with_capacity(cfg.num_layers as usize);
+        let mut blocks = Vec::with_capacity(if window_source.is_some() {
+            0
+        } else {
+            cfg.num_layers as usize
+        });
         let last = cfg.num_layers - 1;
-        for i in 0..cfg.num_layers {
-            // The spike sc-11038 outlier class includes the FIRST and LAST DiT blocks. sc-11045's real
-            // activation capture showed block **1**'s self-attention also measures Dense-outlier on a
-            // live Sana-1.6B denoise (min benign fraction 0.969, crush 176×) — the residual stream is
-            // still outlier-carrying two blocks in — so the leading edge covers blocks 0 AND 1.
-            let edge = i <= 1 || i == last;
-            blocks.push(SanaBlock::load(
-                w,
-                &format!("transformer_blocks.{i}"),
-                &cfg,
-                plan,
-                edge,
-            )?);
+        if window_source.is_none() {
+            for i in 0..cfg.num_layers {
+                // The spike sc-11038 outlier class includes the FIRST and LAST DiT blocks. sc-11045's real
+                // activation capture showed block **1**'s self-attention also measures Dense-outlier on a
+                // live Sana-1.6B denoise (min benign fraction 0.969, crush 176×) — the residual stream is
+                // still outlier-carrying two blocks in — so the leading edge covers blocks 0 AND 1.
+                let edge = i <= 1 || i == last;
+                blocks.push(SanaBlock::load(
+                    w,
+                    &format!("transformer_blocks.{i}"),
+                    &cfg,
+                    plan,
+                    edge,
+                )?);
+            }
         }
         // The Sprint guidance variant (`SanaCombinedTimestepGuidanceEmbeddings`) drops the `.emb.`
         // nesting AdaLayerNormSingle introduces and adds a parallel `guidance_embedder`.
@@ -571,10 +736,65 @@ impl SanaTransformer {
             caption_proj_2: proj(w, "caption_projection.linear_2", true, plan, interior)?,
             caption_norm: w.require("caption_norm.weight")?.to_dtype(DType::F32)?,
             blocks,
+            window_source,
             scale_shift_table: w.require("scale_shift_table")?.to_dtype(DType::F32)?,
             proj_out: proj(w, "proj_out", true, plan, LayerRole::final_proj())?,
             cfg,
         })
+    }
+
+    /// Build a host-backed 20-block trunk. Common projections are resident; each denoise forward
+    /// reopens and materializes only the selected consecutive block window.
+    pub fn from_files_windowed(
+        files: &[PathBuf],
+        cfg: SanaTransformerConfig,
+        window: usize,
+        device: &Device,
+    ) -> candle_gen::Result<Self> {
+        if window == 0
+            || !crate::memory_strategy::TRANSFORMER_WINDOW_SIZES.contains(&(window as u32))
+        {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "unsupported SANA transformer window {window}"
+            )));
+        }
+        let pins = files
+            .iter()
+            .map(candle_gen::gen_core::PinnedWeightsFile::pin)
+            .collect::<candle_gen::gen_core::Result<Vec<_>>>()
+            .map_err(candle_gen::CandleError::from)?;
+        let digests = pins
+            .iter()
+            .map(|pin| {
+                pin.read_unchanged(crate::memory_strategy::sha256_file)
+                    .map_err(candle_gen::CandleError::from)
+            })
+            .collect::<candle_gen::Result<Vec<_>>>()?;
+        let common = Weights::from_files_filtered(
+            files,
+            device,
+            DType::F32,
+            &[
+                "patch_embed.",
+                "time_embed.",
+                "caption_projection.",
+                "caption_norm.",
+                "scale_shift_table",
+                "proj_out.",
+            ],
+        )?;
+        Self::from_weights_planned_inner(
+            &common,
+            cfg,
+            &DitPlan::dense(),
+            Some(WindowSource {
+                files: files.to_vec(),
+                pins,
+                digests,
+                device: device.clone(),
+                window,
+            }),
+        )
     }
 
     /// Every quantizable projection in the trunk, in a stable order.
@@ -603,6 +823,40 @@ impl SanaTransformer {
         report_over(self.projections())
     }
 
+    #[cfg(test)]
+    fn mlx_packed_projection_count(&self) -> usize {
+        let timestep = self.ts_embedder_1.is_quantized() as usize
+            + self.ts_embedder_2.is_quantized() as usize
+            + self.time_linear.is_quantized() as usize;
+        let guidance = self
+            .guidance_embedder
+            .as_ref()
+            .map(|(a, b)| a.is_quantized() as usize + b.is_quantized() as usize)
+            .unwrap_or_default();
+        timestep
+            + guidance
+            + self.caption_proj_1.is_mlx_packed() as usize
+            + self.caption_proj_2.is_mlx_packed() as usize
+            + self.proj_out.is_mlx_packed() as usize
+            + self
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    [
+                        &block.attn1.to_q,
+                        &block.attn1.to_k,
+                        &block.attn1.to_v,
+                        &block.attn1.to_out,
+                        &block.attn2.to_q,
+                        &block.attn2.to_k,
+                        &block.attn2.to_v,
+                        &block.attn2.to_out,
+                    ]
+                })
+                .filter(|projection| projection.is_mlx_packed())
+                .count()
+    }
+
     /// Forward one denoise step.
     ///
     /// * `latent_nchw` — `[B, in_channels, H, W]` (channels-first, diffusers-native).
@@ -618,7 +872,7 @@ impl SanaTransformer {
         caption: &Tensor,
         timestep: &Tensor,
     ) -> Result<Tensor> {
-        self.forward_with_guidance(latent_nchw, caption, timestep, None)
+        self.forward_with_guidance_memory(latent_nchw, caption, timestep, None, None)
     }
 
     /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint).
@@ -633,6 +887,17 @@ impl SanaTransformer {
         caption: &Tensor,
         timestep: &Tensor,
         guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_with_guidance_memory(latent_nchw, caption, timestep, guidance, None)
+    }
+
+    pub fn forward_with_guidance_memory(
+        &self,
+        latent_nchw: &Tensor,
+        caption: &Tensor,
+        timestep: &Tensor,
+        guidance: Option<&Tensor>,
+        attention_budget: Option<usize>,
     ) -> Result<Tensor> {
         let cfg = &self.cfg;
         let dim = cfg.inner_dim() as usize;
@@ -671,8 +936,47 @@ impl SanaTransformer {
         let caption = rms_norm_last(&cap, &self.caption_norm, cfg.caption_norm_eps as f64)?;
 
         // 4. Transformer blocks.
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, &caption, &temb, ph, pw)?;
+        if let Some(source) = &self.window_source {
+            let total = cfg.num_layers as usize;
+            for (first, count) in block_windows(total, source.window) {
+                for (pin, digest) in source.pins.iter().zip(&source.digests) {
+                    pin.ensure_unchanged()
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    let current = pin
+                        .read_unchanged(crate::memory_strategy::sha256_file)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    if current != *digest {
+                        return Err(candle_gen::candle_core::Error::Msg(format!(
+                            "SANA transformer source changed before lazy window load: {}",
+                            pin.loader_path().display()
+                        )));
+                    }
+                }
+                let prefixes = (first..first + count)
+                    .map(|index| format!("transformer_blocks.{index}."))
+                    .collect::<Vec<_>>();
+                let refs = prefixes.iter().map(String::as_str).collect::<Vec<_>>();
+                let weights =
+                    Weights::from_files_filtered(&source.files, &source.device, DType::F32, &refs)
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                for index in first..first + count {
+                    let edge = index <= 1 || index + 1 == total;
+                    let block = SanaBlock::load(
+                        &weights,
+                        &format!("transformer_blocks.{index}"),
+                        cfg,
+                        &DitPlan::dense(),
+                        edge,
+                    )
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                    hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+                }
+                source.device.synchronize()?;
+            }
+        } else {
+            for block in &self.blocks {
+                hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+            }
         }
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
@@ -786,7 +1090,7 @@ mod tests {
 
     /// Build a synthetic (deterministic) weight map covering every key the BASE trunk requires for
     /// `cfg`, then load it through the real [`Weights`] path.
-    fn synthetic_trunk_weights(cfg: &SanaTransformerConfig, dev: &Device) -> Weights {
+    fn synthetic_trunk_map(cfg: &SanaTransformerConfig, dev: &Device) -> HashMap<String, Tensor> {
         let inner = cfg.inner_dim() as usize;
         let cross_inner = (cfg.num_cross_attention_heads * cfg.cross_attention_head_dim) as usize;
         let p = cfg.patch_size as usize;
@@ -795,18 +1099,23 @@ mod tests {
         let mut e = Emit::new(dev);
 
         e.conv("patch_embed.proj", inner, cfg.in_channels as usize, p, true);
-        e.linear(
-            "time_embed.emb.timestep_embedder.linear_1",
-            inner,
-            256,
-            true,
-        );
-        e.linear(
-            "time_embed.emb.timestep_embedder.linear_2",
-            inner,
-            inner,
-            true,
-        );
+        let (ts1, ts2) = if cfg.guidance_embeds {
+            (
+                "time_embed.timestep_embedder.linear_1",
+                "time_embed.timestep_embedder.linear_2",
+            )
+        } else {
+            (
+                "time_embed.emb.timestep_embedder.linear_1",
+                "time_embed.emb.timestep_embedder.linear_2",
+            )
+        };
+        e.linear(ts1, inner, 256, true);
+        e.linear(ts2, inner, inner, true);
+        if cfg.guidance_embeds {
+            e.linear("time_embed.guidance_embedder.linear_1", inner, 256, true);
+            e.linear("time_embed.guidance_embedder.linear_2", inner, inner, true);
+        }
         e.linear("time_embed.linear", 6 * inner, inner, true);
         e.linear(
             "caption_projection.linear_1",
@@ -832,6 +1141,12 @@ mod tests {
             e.linear(&format!("{bp}.attn2.to_k"), cross_inner, inner, true);
             e.linear(&format!("{bp}.attn2.to_v"), cross_inner, inner, true);
             e.linear(&format!("{bp}.attn2.to_out.0"), inner, cross_inner, true);
+            if cfg.qk_norm {
+                e.t(&[inner], format!("{bp}.attn1.norm_q.weight"));
+                e.t(&[inner], format!("{bp}.attn1.norm_k.weight"));
+                e.t(&[cross_inner], format!("{bp}.attn2.norm_q.weight"));
+                e.t(&[cross_inner], format!("{bp}.attn2.norm_k.weight"));
+            }
             // ff (GLUMBConv Mix-FFN): conv_inverted 1×1 → 2·hidden, conv_depth 3×3 depthwise,
             // conv_point 1×1 hidden → inner (no bias).
             e.conv(
@@ -844,7 +1159,27 @@ mod tests {
             e.conv(&format!("{bp}.ff.conv_depth"), 2 * hidden, 1, 3, true);
             e.conv(&format!("{bp}.ff.conv_point"), inner, hidden, 1, false);
         }
-        Weights::from_map(e.map)
+        e.map
+    }
+
+    fn synthetic_trunk_weights(cfg: &SanaTransformerConfig, dev: &Device) -> Weights {
+        Weights::from_map(synthetic_trunk_map(cfg, dev))
+    }
+
+    fn packed_trunk_weights(cfg: &SanaTransformerConfig, bits: usize, dev: &Device) -> Weights {
+        let mut map = synthetic_trunk_map(cfg, dev);
+        for (base, _) in packed_linear_bases(cfg) {
+            let weight = map
+                .remove(&format!("{base}.weight"))
+                .expect("synthetic packed projection weight");
+            let (wq, scales, biases) =
+                candle_gen::quant::pack_mlx_affine(&weight, bits, MLX_PACKED_GROUP)
+                    .expect("pack synthetic affine triple");
+            map.insert(format!("{base}.weight"), wq);
+            map.insert(format!("{base}.scales"), scales);
+            map.insert(format!("{base}.biases"), biases);
+        }
+        Weights::from_map(map)
     }
 
     fn small_cfg() -> SanaTransformerConfig {
@@ -901,6 +1236,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_caption_cross_attention_preserves_the_full_row_domain() {
+        let dev = Device::Cpu;
+        let cfg = small_cfg();
+        let model =
+            SanaTransformer::from_weights(&synthetic_trunk_weights(&cfg, &dev), cfg.clone())
+                .unwrap();
+        let latent = det(&[1, cfg.in_channels as usize, 4, 4], 101, &dev);
+        let caption = det(&[1, 3, cfg.caption_channels as usize], 202, &dev);
+        let timestep = Tensor::from_vec(vec![0.7f32], (1,), &dev).unwrap();
+        let full = model
+            .forward(&latent, &caption, &timestep)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let chunked = model
+            .forward_with_guidance_memory(&latent, &caption, &timestep, None, Some(12))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(full.len(), chunked.len());
+        let max_error = full
+            .iter()
+            .zip(&chunked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_error < 1e-5,
+            "query-row chunking changed caption attention by {max_error}"
+        );
+    }
+
+    #[test]
+    fn every_published_window_visits_the_real_twenty_block_stack_once_in_order() {
+        for window in crate::memory_strategy::TRANSFORMER_WINDOW_SIZES {
+            let ranges = block_windows(
+                crate::memory_strategy::TRANSFORMER_BLOCKS as usize,
+                *window as usize,
+            );
+            assert_eq!(ranges.first(), Some(&(0, (*window as usize).min(20))));
+            let visited = ranges
+                .iter()
+                .flat_map(|(first, count)| *first..*first + *count)
+                .collect::<Vec<_>>();
+            assert_eq!(visited, (0..20).collect::<Vec<_>>());
+            let (last, count) = ranges.last().copied().unwrap();
+            assert_eq!(last + count, 20);
+        }
+    }
+
     /// NVFP4-eligible small config: `inner = 64` (K % 32 == 0, N % 16 == 0 — the cuBLASLt FP4 shape
     /// gate), 3 blocks so block 1 is a non-edge block the mixed policy sends to W4A4.
     fn nvfp4_eligible_cfg() -> SanaTransformerConfig {
@@ -913,6 +1302,69 @@ mod tests {
             caption_channels: 64,
             ..small_cfg()
         }
+    }
+
+    #[test]
+    fn hosted_mlx_q4_and_q8_base_and_sprint_trunks_load_packed_without_dense_fallback() {
+        // All linear in-dimensions are group-64 aligned, matching the published SANA/Sprint tier
+        // schema. Both fixtures replace every exact converter target with MLX U32 affine parts.
+        let dev = Device::Cpu;
+        let base = nvfp4_eligible_cfg();
+        let sprint = SanaTransformerConfig {
+            guidance_embeds: true,
+            qk_norm: true,
+            ..base.clone()
+        };
+        for (variant, cfg) in [("base", base), ("sprint", sprint)] {
+            let expected = packed_linear_bases(&cfg).len();
+            for bits in [4, 8] {
+                let weights = packed_trunk_weights(&cfg, bits, &dev);
+                assert_eq!(validate_packed_tier(&weights, &cfg).unwrap(), Some(bits));
+                let trunk =
+                    SanaTransformer::from_weights(&weights, cfg.clone()).unwrap_or_else(|error| {
+                        panic!("{variant} Q{bits} packed trunk must load: {error}")
+                    });
+                assert_eq!(
+                    trunk.mlx_packed_projection_count(),
+                    expected,
+                    "{variant} Q{bits} tier must not silently retain a dense DiT projection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_packed_trunk_fails_loudly_instead_of_falling_back_to_dense() {
+        let dev = Device::Cpu;
+        let cfg = nvfp4_eligible_cfg();
+        let mut map = synthetic_trunk_map(&cfg, &dev);
+        let base = "caption_projection.linear_1";
+        let weight = map.remove(&format!("{base}.weight")).unwrap();
+        let (wq, scales, _) =
+            candle_gen::quant::pack_mlx_affine(&weight, 4, MLX_PACKED_GROUP).unwrap();
+        map.insert(format!("{base}.weight"), wq);
+        map.insert(format!("{base}.scales"), scales);
+        let error = SanaTransformer::from_weights(&Weights::from_map(map), cfg)
+            .err()
+            .expect("partial packed tier must fail")
+            .to_string();
+        assert!(error.contains("packed tier is incomplete"), "got: {error}");
+    }
+
+    #[test]
+    fn u32_trunk_codes_without_any_sidecars_fail_loudly() {
+        let dev = Device::Cpu;
+        let cfg = nvfp4_eligible_cfg();
+        let mut map = synthetic_trunk_map(&cfg, &dev);
+        let base = "caption_projection.linear_1";
+        let weight = map.remove(&format!("{base}.weight")).unwrap();
+        let (wq, _, _) = candle_gen::quant::pack_mlx_affine(&weight, 4, MLX_PACKED_GROUP).unwrap();
+        map.insert(format!("{base}.weight"), wq);
+        let error = SanaTransformer::from_weights(&Weights::from_map(map), cfg)
+            .err()
+            .expect("orphaned U32 codes must not reach a dense linear")
+            .to_string();
+        assert!(error.contains("packed tier is incomplete"), "got: {error}");
     }
 
     /// **SC#4 Blackwell-only gate, observed at model level (sc-11045).** An `nvfp4` trunk loaded on a

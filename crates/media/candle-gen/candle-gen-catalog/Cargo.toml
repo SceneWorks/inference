@@ -24,6 +24,7 @@ candle-gen-krea = { path = "../candle-gen-krea" }
 candle-gen-lens = { path = "../candle-gen-lens" }
 candle-gen-ltx = { path = "../candle-gen-ltx" }
 candle-gen-mage = { path = "../candle-gen-mage" }
+candle-gen-minimax-h3 = { path = "../candle-gen-minimax-h3" }
 candle-gen-mochi = { path = "../candle-gen-mochi" }
 candle-gen-pid = { path = "../candle-gen-pid" }
 candle-gen-pulid = { path = "../candle-gen-pulid" }
@@ -63,6 +64,7 @@ metal = [
     "candle-gen-krea/metal",
     "candle-gen-lens/metal",
     "candle-gen-ltx/metal",
+    "candle-gen-minimax-h3/metal",
     "candle-gen-mochi/metal",
     "candle-gen-pid/metal",
     "candle-gen-pulid/metal",
@@ -97,6 +99,7 @@ cuda = [
     "candle-gen-lens/cuda",
     "candle-gen-ltx/cuda",
     "candle-gen-mage/cuda",
+    "candle-gen-minimax-h3/cuda",
     "candle-gen-mochi/cuda",
     "candle-gen-pid/cuda",
     "candle-gen-pulid/cuda",

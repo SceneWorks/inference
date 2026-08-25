@@ -23,7 +23,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Result, SizeFloor, WeightsSource,
+    Precision, Progress, Result, StepSupport, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -50,7 +50,7 @@ pub const VAE_SCALE: u32 = 8;
 /// the source buffer (and the resize's intermediate f32 work) scale with the *input* dims, so an
 /// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
 /// while capping the source at a few hundred MB.
-const MAX_REFERENCE_DIM: u32 = 8192;
+pub(crate) const MAX_REFERENCE_DIM: u32 = 8192;
 /// Output `width`/`height` must be divisible by this: VAE 8× spatial compression then the UNet's 3
 /// stride-2 downsamples / nearest-2× upsamples (another 8×). An unaligned size fails deep in
 /// `UpBlock::forward` on a skip-concat shape mismatch instead of at validation (F-165). Exposed as
@@ -77,48 +77,30 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Video,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // SVD uses a frame-wise guidance ramp (min→max); `req.guidance` overrides the ceiling.
             supports_guidance: true,
-            supports_true_cfg: false,
             // image→video is a single `Reference` image.
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Curated unified solvers (epic 7114, sc-7122): SVD exposes the SAMPLER axis but NO scheduler
             // (matching ComfyUI) — it keeps its native Karras EDM σ schedule and only swaps the
             // integrator (over `EdmModelSampling`, v-prediction). An unset sampler → the native EDM Euler
             // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,
+            // SVD-XT's engine bound, advertised rather than hidden (sc-19559). It lived only in
+            // `validate_output_params` below, so a consumer could not learn the ceiling without
+            // dispatching a job; the shared floor now enforces the same number from the same
+            // constant. `candle-gen-svd` declares the identical range from its own `MAX_STEPS`.
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -127,6 +109,7 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct Svd {
     pipeline: SvdPipeline,
     descriptor: ModelDescriptor,
+    memory: Option<crate::memory_strategy::PreparedSvdMemory>,
 }
 
 /// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
@@ -138,6 +121,29 @@ pub struct Svd {
 /// upcast internally by MLX). `Precision::Fp32` selects the full-precision quality path (the
 /// S1/S3/S4 parity-validated precision). The **VAE always stays f32** (`force_upcast=True`).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.quantize.is_some()
+        || !spec.adapters.is_empty()
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
+        return Err(Error::Unsupported(
+            "svd_xt: quantization, adapters, controls, identity, and extra components are unsupported"
+                .into(),
+        ));
+    }
+    let memory = if spec.prepared_file_pins().is_prepared() {
+        Some(crate::memory_strategy::PreparedSvdMemory::prepare(spec)?)
+    } else {
+        None
+    };
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
@@ -183,10 +189,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &load("image_encoder", "model", dense)?,
         &ImageEncoderConfig::default(),
     )?;
+    if let Some(memory) = &memory {
+        memory.ensure_unchanged()?;
+    }
 
     Ok(Box::new(Svd {
         pipeline: SvdPipeline::new(image_encoder, vae, unet, SchedulerConfig::default()),
         descriptor: descriptor(),
+        memory,
     }))
 }
 
@@ -312,13 +322,15 @@ fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> 
 impl Svd {
     /// Resolve the single conditioning reference image (image→video input).
     fn reference<'a>(&self, req: &'a GenerationRequest) -> Result<&'a Image> {
-        req.conditioning
-            .iter()
-            .find_map(|c| match c {
-                Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .ok_or_else(|| Error::Msg("svd_xt: image→video requires a Reference image".into()))
+        match req.conditioning.as_slice() {
+            [Conditioning::Reference {
+                image,
+                strength: None,
+            }] => Ok(image),
+            _ => Err(Error::Msg(
+                "svd_xt: image→video requires exactly one strength-free Reference image".into(),
+            )),
+        }
     }
 
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing`
@@ -379,10 +391,50 @@ impl Svd {
     }
 }
 
-mlx_gen::impl_generator!(Svd {
-    validate: |s, req| s.validate_impl(req),
-    generate: generate_impl,
-});
+impl Generator for Svd {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        self.validate_impl(req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        self.memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        self.memory.as_ref().map_or_else(
+            || mlx_gen::gen_core::MemorySafetyDecision::Reject {
+                reason: "svd_xt: loaded generator has no sealed memory receipt".into(),
+            },
+            |prepared| crate::memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        let prepared = self.memory.as_ref().ok_or_else(|| {
+            Error::Msg("svd_xt: loaded generator has no sealed memory receipt".into())
+        })?;
+        crate::memory_strategy::begin_request(prepared, context)
+    }
+}
 
 impl Svd {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -398,6 +450,13 @@ impl Svd {
         // size-range validation, so bound it here (F-164).
         let img = self.reference(req)?;
         validate_reference_image(img)?;
+        if req.memory.is_some() {
+            let prepared = self.memory.as_ref().ok_or_else(|| {
+                Error::Msg("svd_xt: memory request requires a sealed physical receipt".into())
+            })?;
+            crate::memory_strategy::validate_memory_request(req)?;
+            crate::memory_strategy::validate_active_request(prepared, req)?;
+        }
         Ok(())
     }
 
@@ -637,6 +696,53 @@ mod tests {
         assert!(validate_output_params(&req(512, 512, Some(0), None)).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(MAX_STEPS + 1))).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(0))).is_err());
+    }
+
+    /// sc-19559 — the step ceiling this model has always had is now on the advertised surface, so
+    /// a consumer can read it without loading a single weight, and the SHARED floor refuses an
+    /// over-ceiling count rather than only `validate_output_params` doing so privately.
+    ///
+    /// Both halves matter. Reading `ceiling()` alone would pass against a descriptor nothing
+    /// enforces (the declared-but-unread defect this epic keeps hitting); asserting only the
+    /// refusal would pass against a bound that stays undiscoverable, which is the state this
+    /// story found.
+    #[test]
+    fn the_step_ceiling_is_advertised_and_enforced_by_the_shared_floor() {
+        let caps = descriptor().capabilities;
+        assert_eq!(
+            caps.supported_steps.ceiling(),
+            Some(MAX_STEPS),
+            "the descriptor must advertise the engine's own ceiling, weights-free"
+        );
+        assert_eq!(caps.supported_steps.floor(), Some(1));
+
+        let at = |steps: u32| {
+            caps.validate_request(
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 512,
+                    height: 512,
+                    count: 1,
+                    steps: Some(steps),
+                    conditioning: vec![Conditioning::Reference {
+                        image: img(512, 512, 512 * 512 * 3),
+                        strength: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(
+            at(MAX_STEPS).is_ok(),
+            "the advertised ceiling itself must be renderable"
+        );
+        let err = at(MAX_STEPS + 1)
+            .expect_err("the shared floor must refuse an over-ceiling count")
+            .to_string();
+        assert!(
+            err.contains(MODEL_ID) && err.contains(&format!("1..={MAX_STEPS}")),
+            "the refusal must name the model and the advertised range: {err}"
+        );
     }
 
     #[test]

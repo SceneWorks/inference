@@ -7,7 +7,7 @@
 //!
 //! Run:
 //!   ~/.dwpose-spike/venv/bin/python tools/convert_scrfd.py
-//!   cargo test -p mlx-gen-face --release --test scrfd_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-face --release --test integration scrfd_parity:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{Detection, Scrfd};

@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the real `Tongyi-MAI/Z-Image-Turbo` weights in the HF cache and the
 //! adapter goldens produced by `tools/dump_z_image_adapter_golden.py` (gitignored, local). Run:
 //!   python3 crates/media/mlx-gen/tools/verify_adapter_parity_artifacts.py
-//!   cargo test -p mlx-gen-z-image --release --test adapter_real_weights -- --ignored --nocapture --test-threads=1
+//!   cargo test -p mlx-gen-z-image --release --test integration adapter_real_weights:: -- --ignored --nocapture --test-threads=1
 //!
 //! Three gates: (1) the key→module map resolves the FULL fork `ZImageLoRAMapping` target surface
 //! against the real module tree; (2) the public `load(spec.with_adapters(…)).generate()` render
@@ -20,7 +20,7 @@ use mlx_gen_z_image::{apply_z_image_adapters, decoded_to_image, load_transformer
 use mlx_rs::ops::array_eq;
 use mlx_rs::Array;
 
-mod common;
+use crate::common;
 use common::snapshot;
 
 fn golden_dir() -> PathBuf {

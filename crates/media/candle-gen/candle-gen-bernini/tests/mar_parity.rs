@@ -7,7 +7,7 @@
 //! reveal, the reference's `nonzero().sum()==0` skip (a lone token-0 reveal), and two multi-token
 //! reveals. Asserts the filled `pred_vit_embed` and the 4 handoff streams. CPU, f32 — no cuda/weights.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

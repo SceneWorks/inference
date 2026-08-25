@@ -6,7 +6,7 @@
 //! pickle VM + storage decode), applies the Wan2.2 VAE sanitizer, and asserts the result reproduces
 //! the golden byte-for-byte.
 //!
-//! Run with: `cargo test -p mlx-gen-wan --test convert_vae_parity -- --ignored --nocapture`
+//! Run with: `cargo test -p mlx-gen-wan --test integration convert_vae_parity:: -- --ignored --nocapture`
 //! Override paths with `WAN_TI2V_5B_DIR` (golden) / `WAN_VAE_PTH` (source .pth).
 
 use std::collections::BTreeSet;

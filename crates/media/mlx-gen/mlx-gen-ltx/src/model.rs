@@ -56,7 +56,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision as LoadPrecision, Progress, Result, SizeFloor, WeightsSource,
+    Precision as LoadPrecision, Progress, Result, StepSupport, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
@@ -244,13 +244,14 @@ pub fn descriptor() -> ModelDescriptor {
             // I2V single-image conditioning (sc-2685) is wired via `Reference`; audio is always
             // produced (sc-2684). Q4/Q8-of-everything is a sibling slice.
             supports_negative_prompt: false,
-            supports_guidance: false,
-            supports_true_cfg: false,
             // Reference = single-image I2V (sc-2685); Keyframe = first_last_frame / multi-keyframe
-            // (replace-latent, epic 3040); VideoClip = extend_clip / video_bridge (IC-LoRA
-            // keyframe-append — requires an IC-LoRA adapter via `spec.adapters`).
+            // (replace-latent, epic 3040); `MultiReference` is the ordered 1–4 identity carrier
+            // for replace_person (composited to the provider-native one-latent IC-LoRA input);
+            // VideoClip = extend_clip / video_bridge (IC-LoRA keyframe-append — requires an
+            // IC-LoRA adapter via `spec.adapters`).
             conditioning: vec![
                 ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
                 ConditioningKind::Keyframe,
                 ConditioningKind::VideoClip,
                 ConditioningKind::ControlClip,
@@ -262,7 +263,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Quantization is checkpoint-driven (split_model.json); load() rejects on-the-fly
             // spec.quantize that disagrees with the manifest. No on-the-fly re-quant available.
             supported_quants: &[],
-            component_precision_floors: &[],
             // Curated unified solvers (epic 7114, sc-7122): LTX exposes the SAMPLER axis but NO scheduler
             // (matching ComfyUI) — it keeps its baked distilled σ schedule (8+3 steps) and only swaps the
             // integrator (over the two-stream `MlxAvLatentOps`, joint video+audio). LTX is distilled, so
@@ -270,37 +270,30 @@ pub fn descriptor() -> ModelDescriptor {
             // others are exposed for parity with ComfyUI's menu. T2V only — the I2V/keyframe/clip paths
             // (per-token σ + post-step blend) stay native.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
             // height/width must be divisible by SIZE_MULTIPLE (= 2×SPATIAL_SCALE; stage-1 runs at //2//32).
             supported_guidance_methods: vec![],
             min_size: MIN_SIZE,
             max_size: MAX_SIZE,
             max_count: 1,
+            // sc-19502 — THE FIX for this lane. `req.steps` was never read here at all: a
+            // `steps: 30` request was accepted, the knob did nothing, and the baked 8-step stage-1
+            // schedule rendered anyway, while the candle lane refused the same request outright.
+            // A control that is binding on one backend and silently inert on the other is the
+            // sc-11993 silent-coercion class, and the silent side is the worse one.
+            //
+            // The distilled schedule genuinely cannot be resampled to an arbitrary count without
+            // going out-of-distribution, so the honest resolution is an explicit refusal on BOTH
+            // lanes — not a knob that pretends to work here. Same derived constant, same shared
+            // floor, same message as candle.
+            supported_steps: StepSupport::Exact(vec![crate::pipeline::NATIVE_STEPS]),
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
             supports_sequential_offload: false,
             // sc-18816: every generate builds/evaluates/drops Gemma before materializing the AvDiT,
             // then drops the AvDiT before VAE/audio decode. This is physical default behavior, not a
             // selectable Sequential control and not an evidence-composition edge.
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -712,9 +705,20 @@ impl Ltx {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // Materialize every conditioned latent inside one encoder-residency scope. The VAE encoder
+        // is request-only: once these arrays are forced, no denoise or decode operation needs its
+        // weights. Release it on success, cancellation, and error before the 48-block AvDiT loads.
+        let conditioned = (|| {
+            let keyframes = self.build_keyframes(req)?;
+            let clips = self.build_clips(req)?;
+            Ok::<_, Error>((keyframes, clips))
+        })();
+        if self.vae.release_encoder() {
+            mlx_rs::memory::clear_cache();
+        }
+        let (kf_owned, clip_owned) = conditioned?;
         // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
         // I2V = a single `Reference` at frame 0; first_last_frame / multi-keyframe = `Keyframe`s.
-        let kf_owned = self.build_keyframes(req)?;
         let keyframes: Vec<StageKeyframe> = kf_owned
             .iter()
             .map(|(s1, s2, idx, strength)| StageKeyframe {
@@ -726,7 +730,6 @@ impl Ltx {
             .collect();
         // In-context clips (extend_clip / video_bridge) — VAE-encoded at stage-1 resolution, appended
         // as IC-LoRA conditioning tokens in stage 1 only.
-        let clip_owned = self.build_clips(req)?;
         let clips: Vec<StageClip> = clip_owned
             .iter()
             .map(|(s1, idx, strength)| StageClip {
@@ -940,6 +943,24 @@ impl Ltx {
             let s2 = self.encode_conditioning(image, req.height, req.width)?;
             mlx_rs::transforms::eval([&s1, &s2])?;
             out.push((s1, s2, IMAGE_FRAME_IDX, strength));
+        }
+        if let Some(images) = req.conditioning.iter().find_map(|entry| match entry {
+            Conditioning::MultiReference { images } => Some(images.as_slice()),
+            _ => None,
+        }) {
+            // SC-20776: LTX's native IC-LoRA has exactly one frame-zero image-latent carrier.
+            // Keep every ordered identity reference physically present by composing the closed
+            // 1–4 surface before either VAE encode; do not accept it merely in the descriptor.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let composite = crate::conditioning::compose_ordered_character_references(
+                images, req.width, req.height,
+            )?;
+            let s1 = self.encode_conditioning(&composite, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(&composite, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, IMAGE_FRAME_IDX, 1.0));
         }
         for kf in req.keyframes() {
             if req.cancel.is_cancelled() {
@@ -1214,9 +1235,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         Ok(())
     };
 
-    // Apply-or-reject at the weight-free boundary. The render path consumes one Reference and one
-    // ControlClip; accepting more here would silently discard later entries after the ~24 GB staged
-    // text phase. Clip emptiness, mask parity, and target-grid bounds are equally request-only facts.
+    // Apply-or-reject at the weight-free boundary. Plain I2V consumes one `Reference`; the closed
+    // replace_person composite is exactly one ControlClip + one 1–4 image MultiReference carrier.
+    // Anything crossed is refused before the ~24 GB staged text phase, not silently discarded.
     let reference_count = req
         .conditioning
         .iter()
@@ -1225,6 +1246,19 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if reference_count > 1 {
         return Err(Error::Msg(
             "ltx_2_3: multiple reference images are not supported (single-image I2V only)".into(),
+        ));
+    }
+    let multi_references: Vec<&[Image]> = req
+        .conditioning
+        .iter()
+        .filter_map(|c| match c {
+            Conditioning::MultiReference { images } => Some(images.as_slice()),
+            _ => None,
+        })
+        .collect();
+    if multi_references.len() > 1 {
+        return Err(Error::Msg(
+            "ltx_2_3: replace_person accepts exactly one ordered MultiReference carrier".into(),
         ));
     }
     let control_clip_count = req
@@ -1236,6 +1270,36 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         return Err(Error::Msg(
             "ltx_2_3: at most one ControlClip can be applied per request".into(),
         ));
+    }
+    let replace_person = control_clip_count == 1 || !multi_references.is_empty();
+    if replace_person {
+        if control_clip_count != 1 {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person requires exactly one ControlClip".into(),
+            ));
+        }
+        let Some(images) = multi_references.first().copied() else {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person requires exactly one ordered MultiReference carrier"
+                    .into(),
+            ));
+        };
+        if reference_count != 0
+            || req.conditioning.iter().any(|c| {
+                matches!(
+                    c,
+                    Conditioning::Keyframe { .. } | Conditioning::VideoClip { .. }
+                )
+            })
+        {
+            return Err(Error::Msg(
+                "ltx_2_3: replace_person cannot be mixed with Reference, Keyframe, or VideoClip conditioning"
+                    .into(),
+            ));
+        }
+        // This also verifies every RGB buffer and dimensions before model construction. The render
+        // recomputes the same deterministic contact sheet for the VAE input.
+        crate::conditioning::compose_ordered_character_references(images, req.width, req.height)?;
     }
     // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
     // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
@@ -1300,6 +1364,11 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                     )));
                 }
                 resolve_latent_index("replace_person", *start_frame)?;
+                if *start_frame != 0 {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_3: replace_person ControlClip must start at latent frame 0 (got {start_frame})"
+                    )));
+                }
                 check_strength("control clip masking", *masking_strength)?;
             }
             _ => {}
@@ -1492,6 +1561,8 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // sc-19502: the derived stage-1 step count the descriptor advertises.
+    use crate::pipeline::NATIVE_STEPS;
 
     #[test]
     fn calibration_fault_is_request_local_and_phase_exact() {
@@ -1917,6 +1988,76 @@ mod tests {
         .is_err());
     }
 
+    /// sc-19502 — this lane used to accept ANY `req.steps` and render the baked 8-step schedule
+    /// regardless, while candle refused the same request. Both now refuse it.
+    ///
+    /// Goes through `validate_request`, the function the generator actually calls
+    /// (`impl_generator!`'s `validate` arm), rather than asserting on `descriptor().capabilities`
+    /// directly — a declaration that no request path consults is exactly the inert-key failure this
+    /// story exists to fix, and reading the field back would prove only that a struct literal
+    /// contains what it contains.
+    #[test]
+    fn validate_request_refuses_an_off_schedule_step_count() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            ..Default::default()
+        };
+        let at = |steps: Option<u32>| {
+            validate_request(
+                &caps,
+                &GenerationRequest {
+                    steps,
+                    ..base.clone()
+                },
+            )
+        };
+
+        // The advertised count and "the model picks" are both admitted — the common path (the
+        // catalog's `defaults.steps` is 8) must not regress into a rejection.
+        assert!(at(Some(NATIVE_STEPS)).is_ok());
+        assert!(at(None).is_ok());
+
+        // 30 is the case the story names: previously accepted here and silently ignored, refused on
+        // candle. 1 and 4 cover the under side, which a FLOOR-shaped key would have admitted.
+        for steps in [1u32, 4, 7, 9, 30, 50] {
+            let err = at(Some(steps))
+                .expect_err("an off-schedule step count must be refused, not silently ignored")
+                .to_string();
+            assert!(
+                err.contains(MODEL_ID) && err.contains(&format!("steps={steps}")),
+                "the refusal must name the model and the request: {err}"
+            );
+            assert!(
+                err.contains(&NATIVE_STEPS.to_string()),
+                "the refusal must name the legal value: {err}"
+            );
+        }
+    }
+
+    /// sc-19502 — the advertised step surface is DERIVED from the σ table this engine actually runs,
+    /// so re-baking the schedule cannot leave a stale advertised count behind.
+    ///
+    /// The cross-lane half (that candle advertises the same 8) cannot be asserted here: no crate
+    /// depends on both `mlx-gen-ltx` and `candle-gen-ltx`, and mlx is macOS-only. SceneWorks owns
+    /// that guard, where one catalog entry demonstrably drives both backends.
+    #[test]
+    fn advertised_steps_are_derived_from_the_baked_schedule() {
+        assert_eq!(
+            NATIVE_STEPS as usize,
+            crate::pipeline::STAGE1_SIGMAS.len() - 1
+        );
+        assert_eq!(NATIVE_STEPS, 8, "the distilled stage-1 schedule is 8 steps");
+        assert_eq!(
+            descriptor().capabilities.supported_steps,
+            StepSupport::Exact(vec![NATIVE_STEPS]),
+            "the descriptor must advertise exactly the baked schedule"
+        );
+    }
+
     #[test]
     fn validate_request_conditioning() {
         let caps = descriptor().capabilities;
@@ -1970,15 +2111,63 @@ mod tests {
         let err = validate_request(&caps, &two).unwrap_err().to_string();
         assert!(err.contains("multiple reference images"), "{err}");
 
-        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
-        // than silently discard the second after text encoding.
         let control = Conditioning::ControlClip {
             frames: vec![img.clone()],
-            mask: vec![img],
+            mask: vec![img.clone()],
             masking_strength: 0.8,
             start_frame: 0,
             mode: mlx_gen::ReplacementMode::FaceOnly,
         };
+        // The full 1–4 ordered replace-person surface is admitted before weights load.
+        for reference_count in 1..=4 {
+            assert!(validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning: vec![
+                        control.clone(),
+                        Conditioning::MultiReference {
+                            images: vec![img.clone(); reference_count],
+                        },
+                    ],
+                    ..base.clone()
+                }
+            )
+            .is_ok());
+        }
+        for conditioning in [
+            vec![control.clone()],
+            vec![Conditioning::MultiReference {
+                images: vec![img.clone()],
+            }],
+            vec![
+                control.clone(),
+                Conditioning::Reference {
+                    image: img.clone(),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![img.clone()],
+                },
+            ],
+            vec![
+                control.clone(),
+                Conditioning::MultiReference {
+                    images: vec![img.clone(); 5],
+                },
+            ],
+        ] {
+            assert!(validate_request(
+                &caps,
+                &GenerationRequest {
+                    conditioning,
+                    ..base.clone()
+                }
+            )
+            .is_err());
+        }
+
+        // The render consumes `control_clip()` (the first match), so duplicates must fail rather
+        // than silently discard the second after text encoding.
         let err = validate_request(
             &caps,
             &GenerationRequest {
@@ -2038,29 +2227,42 @@ mod tests {
         }]);
         assert!(err.contains("clip latent frame index -8"), "{err}");
 
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![],
-            mask: vec![],
-            masking_strength: 1.0,
-            start_frame: 0,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![],
+                mask: vec![],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference {
+                images: vec![img.clone()],
+            },
+        ]);
         assert!(err.contains("control clip is empty"), "{err}");
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![img.clone()],
-            mask: vec![],
-            masking_strength: 1.0,
-            start_frame: 0,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![img.clone()],
+                mask: vec![],
+                masking_strength: 1.0,
+                start_frame: 0,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference {
+                images: vec![img.clone()],
+            },
+        ]);
         assert!(err.contains("frame count 1 != mask count 0"), "{err}");
-        let err = rejects(vec![Conditioning::ControlClip {
-            frames: vec![img.clone()],
-            mask: vec![img],
-            masking_strength: 1.0,
-            start_frame: 7,
-            mode: mlx_gen::ReplacementMode::FaceOnly,
-        }]);
+        let err = rejects(vec![
+            Conditioning::ControlClip {
+                frames: vec![img.clone()],
+                mask: vec![img.clone()],
+                masking_strength: 1.0,
+                start_frame: 7,
+                mode: mlx_gen::ReplacementMode::FaceOnly,
+            },
+            Conditioning::MultiReference { images: vec![img] },
+        ]);
         assert!(err.contains("replace_person latent frame index 7"), "{err}");
     }
 

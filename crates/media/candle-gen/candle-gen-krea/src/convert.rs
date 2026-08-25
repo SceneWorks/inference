@@ -161,11 +161,12 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     validate_shapes(w, cfg)
 }
 
-/// Validate a **dense-bf16 or plain-int8 native-keyed single file** (sc-14022/sc-14023) — the candle
+/// Validate a **dense-bf16, plain-int8, or Kitchen-NVFP4 native-keyed single file** — the candle
 /// sibling of the MLX `remap_native_dit_to_diffusers` + `validate_transformer` fail-closed pair.
 /// Stricter than the ConvRot branch of [`validate_transformer`]: every model tensor must form a
 /// bijection onto the module tree. A descriptor-validated plain-int8 projection additionally carries
-/// exactly its `.weight_scale` and `.comfy_quant` companions; those are the only allowed surplus.
+/// its `.weight_scale` and `.comfy_quant` companions; a validated NVFP4 projection carries
+/// `.weight_scale` and `.weight_scale_2`. Those are the only allowed surplus tensors.
 ///
 /// Fails closed (typed error) — never a silent gap:
 /// 1. **coverage** — any expected diffusers key that does not resolve to a present native tensor (a
@@ -204,9 +205,8 @@ fn validate_native_key_surface(w: &Weights, cfg: &Krea2Config) -> Result<()> {
         )));
     }
     // (2) No foreign/extra: dense has exactly one on-disk tensor per expected model tensor. Plain int8
-    // has exactly two already-validated companions for each I8 projection. `from_native_file` proves
-    // descriptor contents, I8 rank, scale dtype/shape, and the 1:1 descriptor-to-I8 relationship before
-    // constructing `Weights`, so descriptor count is the authoritative quantized projection count here.
+    // has exactly two already-validated companions for each quantized projection. `from_native_file`
+    // proves each descriptor/triplet and its 1:1 relationship before constructing `Weights`.
     let keys = w.keys();
     let plain_int8_projections = if w.is_plain_int8() {
         keys.iter()
@@ -215,15 +215,26 @@ fn validate_native_key_surface(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     } else {
         0
     };
-    let expected_on_disk = expected.len() + plain_int8_projections * 2;
+    let native_nvfp4_projections = w.native_nvfp4_projection_count();
+    let expected_on_disk =
+        expected.len() + plain_int8_projections * 2 + native_nvfp4_projections * 2;
     let on_disk = keys.len();
     if on_disk != expected_on_disk {
-        let quant_note = if w.is_plain_int8() {
-            format!(
-                " plus two companions for each of {plain_int8_projections} validated plain-int8 projection(s)"
-            )
-        } else {
+        let mut quant_notes = Vec::new();
+        if w.is_plain_int8() {
+            quant_notes.push(format!(
+                "two companions for each of {plain_int8_projections} validated plain-int8 projection(s)"
+            ));
+        }
+        if w.is_native_nvfp4() {
+            quant_notes.push(format!(
+                "two companions for each of {native_nvfp4_projections} validated NVFP4 projection(s)"
+            ));
+        }
+        let quant_note = if quant_notes.is_empty() {
             String::new()
+        } else {
+            format!(" plus {}", quant_notes.join(" and "))
         };
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "krea native single-file: {on_disk} on-disk DiT tensor(s), expected exactly {} model \
@@ -494,10 +505,12 @@ mod tests {
         Ok(())
     }
 
-    /// **Fail-closed on an unmapped/foreign key (sc-14022).** A native single file carrying the full 430
-    /// plus one foreign tensor is rejected: coverage passes, but the on-disk count exceeds the expected
-    /// count, so the bijection check rejects the surplus (the candle analogue of the MLX remap's
-    /// `unmapped_key_fails_closed`). No stray weight loads silently.
+    /// **Fail-closed on an unmapped/foreign key (sc-14022, tightened by sc-20651).** A native single
+    /// file carrying the full 430 plus one foreign tensor is rejected — and since the import now
+    /// compiles a `gen_core` logical-weight plan at construction, it is rejected **at open**, naming
+    /// the exact tensor, before any weight is read. The surviving property is the one the test was
+    /// always about: no stray weight loads silently. What changed is how early, and how
+    /// specifically, the refusal lands.
     #[test]
     fn validate_native_foreign_key_fails_closed() -> Result<()> {
         let dev = Device::Cpu;
@@ -507,14 +520,27 @@ mod tests {
         let path = path_tmp.path().join("variant5.safetensors");
         write_native_stub_file(&path, &keys);
 
-        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
-        let err = crate::convert::validate_native_transformer(&w, &Krea2Config::turbo())
-            .expect_err("an unmapped/foreign tensor must fail closed")
+        let err = Weights::from_native_file(&path, &dev, DType::F32)
+            .err()
+            .expect("an unmapped/foreign tensor must fail closed at open")
             .to_string();
         assert!(
-            err.contains("unmapped/foreign") || err.contains("bijection"),
-            "error must flag the foreign tensor: {err}"
+            err.contains("model.diffusion_model.blocks.0.attn.bogus"),
+            "error must name the foreign tensor: {err}"
         );
+        assert!(
+            err.contains("no canonical logical key"),
+            "the refusal must be the plan's unmapped-key one: {err}"
+        );
+
+        // The same fixture WITHOUT the foreign tensor opens, so the refusal above is about that one
+        // tensor and not about the fixture as a whole. (These stubs are 1-element tensors, so the
+        // architecture *shape* check is not what is under test here — the key surface is.)
+        let clean_path = path_tmp.path().join("variant5_clean.safetensors");
+        write_native_stub_file(&clean_path, &variant5_native_keys());
+        let clean = Weights::from_native_file(&clean_path, &dev, DType::F32)?;
+        validate_native_key_surface(&clean, &Krea2Config::turbo())?;
+
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         Ok(())
     }
@@ -536,13 +562,16 @@ mod tests {
 
         let foreign_path = root.join("variant4_foreign.safetensors");
         write_plain_int8_native_stub_file(&foreign_path, &keys, true);
-        let foreign = Weights::from_native_file(&foreign_path, &dev, DType::F32)?;
-        let err = validate_native_key_surface(&foreign, &Krea2Config::turbo())
-            .expect_err("a non-companion surplus tensor must still fail closed")
+        // sc-20651: the surplus tensor is now caught by the compiled plan at open, before any
+        // weight is read, rather than by the later key-surface diff. Same property, earlier seam.
+        let err = Weights::from_native_file(&foreign_path, &dev, DType::F32)
+            .err()
+            .expect("a non-companion surplus tensor must still fail closed")
             .to_string();
         assert!(
-            err.contains("unmapped/foreign"),
-            "error must flag the foreign tensor: {err}"
+            err.contains("model.diffusion_model.blocks.0.attn.bogus")
+                && err.contains("no canonical logical key"),
+            "error must name the foreign tensor: {err}"
         );
 
         Ok(())
@@ -555,6 +584,17 @@ mod tests {
             .expect("set KREAMANIA_VARIANT4 to kreamania_variant4.safetensors");
         let weights = Weights::from_native_file(Path::new(&path), &Device::Cpu, DType::F32)?;
         assert!(weights.is_plain_int8());
+        validate_native_transformer(&weights, &Krea2Config::turbo())
+    }
+
+    #[test]
+    #[ignore = "requires a local KREAMANIA_VARIANT7 Kitchen NVFP4 checkpoint"]
+    fn validate_real_variant7_nvfp4_checkpoint() -> Result<()> {
+        let path = std::env::var("KREAMANIA_VARIANT7")
+            .expect("set KREAMANIA_VARIANT7 to kreamania_variant7.safetensors");
+        let weights = Weights::from_native_file(Path::new(&path), &Device::Cpu, DType::BF16)?;
+        assert!(weights.is_native_nvfp4());
+        assert!(!weights.is_plain_int8());
         validate_native_transformer(&weights, &Krea2Config::turbo())
     }
 }

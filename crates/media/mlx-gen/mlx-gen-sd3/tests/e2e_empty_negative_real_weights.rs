@@ -27,7 +27,7 @@
 //! cd ~/repos/mflux && .venv-0312/bin/python ~/repos/mlx-gen/tools/dump_sd3_empty_negative_e2e_golden.py
 //! # 2. run the gate:
 //! SD3_LARGE_SNAPSHOT=/path/to/stable-diffusion-3.5-large \
-//!   cargo test -p mlx-gen-sd3 --release --test e2e_empty_negative_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sd3 --release --test integration e2e_empty_negative_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! When the golden is ABSENT the test prints a clear "run the dump script" message and returns Ok

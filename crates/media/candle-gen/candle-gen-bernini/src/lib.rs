@@ -53,6 +53,7 @@ pub mod convert;
 pub mod forward;
 pub mod guidance;
 pub mod mar;
+pub mod memory_strategy;
 mod nn;
 pub mod pipeline;
 pub mod preprocess;
@@ -142,9 +143,25 @@ pub use vit_preprocess::{
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(pipeline::RENDERER_REGISTRATION)
-        .register_generator(bernini::FULL_REGISTRATION)
+        .register_generator(bernini::FULL_REGISTRATION);
+    // Exactly one of this and `register_memory_contract_surfaces` runs in the catalog build (LTX
+    // has the same shape): the catalog calls this one always and the surfaces one only on
+    // `cfg(not(cuda))`. Registering the memory surface from both would be a duplicate-id error.
+    #[cfg(any(feature = "cuda", test))]
+    let registry = memory_strategy::register_memory_strategy(registry);
+    registry
+}
+
+/// Register Bernini's weights-free memory-contract declarations in the catalog-only registry.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    // The non-CUDA catalog still needs the provider-owned registration callbacks, the weights-free
+    // fixtures, and the lifecycle behaviors; the callbacks fail closed until terminal CUDA evidence
+    // exists.
+    memory_strategy::register_memory_strategy(registry)
 }
 
 /// Build the complete explicit Candle Bernini provider catalog.
@@ -163,6 +180,28 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit, ["bernini_renderer", "bernini"]);
+    }
+
+    /// The lifecycle behaviors must reach the *catalog-only* (non-CUDA) registry, as SenseNova and
+    /// LTX already do. Gated behind `cfg(cuda)` they left non-CUDA catalog conformance walking the
+    /// Bernini surface with no lifecycle fixtures at all.
+    #[test]
+    fn catalog_only_surface_registers_both_lifecycle_behaviors() {
+        let catalog_only = super::register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(super::pipeline::RENDERER_REGISTRATION)
+                .register_generator(super::bernini::FULL_REGISTRATION),
+        )
+        .build()
+        .unwrap();
+        for registry in [catalog_only, super::provider_registry().unwrap()] {
+            let mut behaviors: Vec<&str> = registry
+                .memory_behavior_registrations()
+                .map(|registration| registration.provider_id)
+                .collect();
+            behaviors.sort_unstable();
+            assert_eq!(behaviors, ["bernini", "bernini_renderer"]);
+        }
     }
 
     #[test]

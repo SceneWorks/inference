@@ -14,8 +14,8 @@
 //!
 //! Run:
 //!   SC16462_BASELINE=<shipped q4/q8 tier dir> SC16462_OUT=<scratch dir> \
-//!     cargo test -p mlx-gen-chroma --release --test auxiliary_pack_identity \
-//!       -- --ignored --nocapture packed_auxiliaries_match_load_time_quantization
+//!     cargo test -p mlx-gen-chroma --release --test integration \
+//!       -- --ignored --nocapture auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization
 
 use mlx_rs::Array;
 use std::path::PathBuf;

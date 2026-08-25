@@ -23,7 +23,8 @@
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0; Krea 2 Community License (non-commercial use
 //! satisfies it). The packed q4/q8/bf16 turnkey loads per-tier via `loader::linear_detect` (sc-9411);
-//! the descriptor advertises `supported_quants: [Q4, Q8]` so the worker's A-B quant toggle engages
+//! the descriptor advertises `supported_quants: [Q4, Q8, Nvfp4]` so the worker can select both
+//! packed turnkey tiers and native NVIDIA Kitchen NVFP4 checkpoints
 //! (sc-9607). Packed loads retain file-backed converted sidecars: writable snapshots cache beside the
 //! component, while read-only snapshots use the configurable per-user external cache (sc-16587). A
 //! complete valid warm cache is read without taking its preparation lock; operators should budget
@@ -36,6 +37,7 @@ pub mod loader;
 /// Multi-phase Krea denoise primitive (epic 13879, sc-13887 — the candle mirror of mlx-gen-krea's
 /// sc-13884). Pure host-side decomposition of an ordered phase list over ONE shared sigma schedule.
 pub mod multiphase;
+pub mod native_mapping;
 /// The NVFP4 precision seam for the Krea 2 DiT trunk (sc-12110, epic 11037) — the epic's SC#1/SC#2
 /// validation vehicle. See [`nvfp4_dit`].
 pub mod nvfp4_dit;
@@ -119,7 +121,7 @@ use candle_gen::gen_core::OffloadPolicy;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    SizeFloor, WeightsSource, BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    WeightsSource, BASE_SNAPSHOT_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -1100,10 +1102,8 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "candle",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
-            supports_true_cfg: false,
             // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
@@ -1119,18 +1119,13 @@ pub fn descriptor() -> ModelDescriptor {
             // native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            mac_only: false,
-            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
-            // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
-            // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
-            supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // Advertise packed turnkey tiers plus the native Kitchen NVFP4 file encoding. The
+            // resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
+            // sc-9411); imported native NVFP4 is selected explicitly by its stamped source format.
+            supported_quants: &[Quant::Q4, Quant::Q8, Quant::Nvfp4],
             // sc-12089 (epic 10765 Phase 1c): the Turbo txt2img lane wires the load→encode→drop
             // residency lifecycle (`pipeline::render_sequential`), so it advertises the discovery bit
             // the worker's fit-gate reads. `raw_descriptor` inherits this for its CFG twin, and
@@ -1142,7 +1137,6 @@ pub fn descriptor() -> ModelDescriptor {
             // actually run resident makes the gate under-predict its real peak — an admitted job that
             // then OOMs. Never flip this on ahead of the wiring.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // sc-16951 (epic 16948): sc-16950 wired EVERY shipped Krea render route — the seven
             // `pipeline` sites (Turbo three-stage / t2i / img2img, Raw t2i / multi-phase / img2img,
             // and the shared Turbo+Raw edit) plus the pose-control provider — to hand
@@ -1156,21 +1150,7 @@ pub fn descriptor() -> ModelDescriptor {
             // direction. The trainer's periodic sample render is deliberately outside that set: it
             // renders from a synthetic request that carries no sink.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -2117,15 +2097,7 @@ fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant
         return Ok(companion_quant);
     }
 
-    let requested = match spec.quantize {
-        Some(quant @ (Quant::Q4 | Quant::Q8)) => Some(quant),
-        Some(Quant::Nvfp4) => {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{id}: imported native checkpoints support Q4/Q8 affine tiers, not NVFP4"
-            )))
-        }
-        None => None,
-    };
+    let requested = spec.quantize;
     match (companion_quant, requested) {
         (Some(companion), Some(requested)) if companion == requested => Ok(Some(requested)),
         (Some(companion), Some(requested)) => Err(gen_core::Error::Unsupported(format!(
@@ -2783,29 +2755,34 @@ pub fn register_providers(
         .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: KREA_2_TURBO_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::Edit,
-            provider_id: KREA_2_TURBO_EDIT_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::MultiPhase,
-            provider_id: KREA_2_RAW_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: KREA_2_TURBO_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Edit,
+                    provider_id: KREA_2_TURBO_EDIT_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::MultiPhase,
+                    provider_id: KREA_2_RAW_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..gen_core::KREA_2_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)
@@ -4075,7 +4052,10 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         // Shared surface stays in lockstep with Turbo (derived from `descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.samplers, descriptor().capabilities.samplers);
         assert!(!d.capabilities.mac_only);
         assert_eq!(pipeline::RAW_STEPS, 52);
@@ -4167,10 +4147,13 @@ mod tests {
             d.capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
-        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers advertised (sc-9607).
+        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers and native NVFP4 advertised.
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(TURBO_STEPS, 8);
     }
@@ -4436,7 +4419,10 @@ mod tests {
         );
         // Shared surface stays in lockstep with Raw/Turbo (derived from `raw_descriptor()`).
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            d.capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
+        );
     }
 
     #[test]

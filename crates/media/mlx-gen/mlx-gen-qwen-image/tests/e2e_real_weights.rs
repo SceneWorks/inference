@@ -15,7 +15,7 @@
 //!    2 through the slice-4 loader).
 //!
 //! Run (loads the ~40 GB transformer; the text-encoder check adds ~14 GB):
-//!   cargo test -p mlx-gen-qwen-image --release --test e2e_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration e2e_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -425,6 +425,143 @@ fn resolve_lora_file(
     Ok(())
 }
 
+/// Project the adapter factors that this Wan expert will actually retain on its additive path.
+/// Unknown keys, incomplete pairs, off-surface targets, and shape-mismatched factors contribute
+/// zero; at least one compatible target must apply, matching [`install_additive`]'s fail-closed
+/// contract. Source F16/BF16/F32 widths are irrelevant because installed LoRA and structured LoKr
+/// factors are retained as f32.
+pub fn applied_factor_f32_bytes(
+    spec: &AdapterSpec,
+    projections: &BTreeMap<String, (usize, usize)>,
+) -> Result<u64> {
+    let af = read_adapter(&spec.path)?;
+    if has_loha_factors(&af) {
+        return Err(CandleError::Msg(format!(
+            "wan: LoHa has no truthful packed additive representation: {}",
+            spec.path.display()
+        )));
+    }
+    let table = projections
+        .keys()
+        .map(|path| (path.replace('.', "_"), path.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let keys_lokr = af
+        .tensors
+        .keys()
+        .any(|key| key.contains(".lokr_") || key.starts_with("lokr_"));
+    let is_lokr = spec.kind == AdapterKind::Lokr || af.declares_lokr() || keys_lokr;
+    if is_lokr {
+        if spec.kind == AdapterKind::Lora && af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "wan: adapter {} was declared LoRA but its metadata says networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        if spec.kind == AdapterKind::Lokr && !af.declares_lokr() {
+            return Err(CandleError::Msg(format!(
+                "wan: adapter {} was declared LoKr but does not declare networkType=lokr",
+                spec.path.display()
+            )));
+        }
+        let (rank, alpha) = parse_lokr_metadata(
+            af.meta.get("rank").map(String::as_str),
+            af.meta.get("alpha").map(String::as_str),
+        )?;
+        let scale = alpha as f64 / rank as f64 * spec.scale as f64;
+        let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
+        for (key, tensor) in &af.tensors {
+            if let Some((path, factor)) = classify_lokr_key(key, &table) {
+                grouped
+                    .entry(path)
+                    .or_default()
+                    .insert(factor, tensor.clone());
+            }
+        }
+        let mut total = 0_u64;
+        let mut applied = 0_usize;
+        for (path, factors) in grouped {
+            let Some(&(out_features, in_features)) = projections.get(&path) else {
+                continue;
+            };
+            let Some(retained) = candle_gen::quant::LokrFactors::build(
+                scale,
+                (out_features, in_features),
+                factors.get("lokr_w1"),
+                factors.get("lokr_w1_a"),
+                factors.get("lokr_w1_b"),
+                factors.get("lokr_w2"),
+                None,
+                factors.get("lokr_w2_a"),
+                factors.get("lokr_w2_b"),
+            )?
+            else {
+                continue;
+            };
+            total = total
+                .checked_add(u64::try_from(retained.resident_f32_bytes()).map_err(|_| {
+                    CandleError::Msg("wan: LoKr resident byte count overflow".into())
+                })?)
+                .ok_or_else(|| CandleError::Msg("wan: adapter resident bytes overflow".into()))?;
+            applied += 1;
+        }
+        if applied == 0 {
+            return Err(CandleError::Msg(format!(
+                "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
+                spec.path.display()
+            )));
+        }
+        return Ok(total);
+    }
+
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, tensor) in &af.tensors {
+        match classify_lora_key(key, &table) {
+            Some((path, Role::Down)) => {
+                triples.entry(path).or_default().down = Some(tensor.clone())
+            }
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(tensor.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", tensor)?)
+            }
+            None => {}
+        }
+    }
+    let mut total = 0_u64;
+    let mut applied = 0_usize;
+    for (path, triple) in triples {
+        let (Some(down), Some(up)) = (triple.down, triple.up) else {
+            continue;
+        };
+        let Some(&(out_features, in_features)) = projections.get(&path) else {
+            continue;
+        };
+        if down.dims().len() != 2 || up.dims().len() != 2 {
+            continue;
+        }
+        let rank = down.dims()[0];
+        if rank == 0 || down.dims() != [rank, in_features] || up.dims() != [out_features, rank] {
+            continue;
+        }
+        let elements = down
+            .elem_count()
+            .checked_add(up.elem_count())
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| CandleError::Msg("wan: LoRA resident byte count overflow".into()))?;
+        total = total
+            .checked_add(elements)
+            .ok_or_else(|| CandleError::Msg("wan: adapter resident bytes overflow".into()))?;
+        applied += 1;
+    }
+    if applied == 0 {
+        return Err(CandleError::Msg(format!(
+            "wan: adapter {} matched no compatible model projection; every selected adapter must apply",
+            spec.path.display()
+        )));
+    }
+    Ok(total)
+}
+
 /// Install `specs` as forward-time additive residuals on an already-built [`WanTransformer`] (sc-10094)
 /// — the packed-tier path where [`merge_adapters`] can't fold. Shared (`moe_expert == None`) specs apply
 /// to any `expert`; expert-tagged specs apply only to their expert (the A14B MoE routing), shared ones

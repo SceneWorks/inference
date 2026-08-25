@@ -8,7 +8,7 @@
 //!   * the base `Lightricks/LTX-2.3` distilled checkpoint at Q4 **and** Q8 (`ltx_2_3_base_q4`/`q8`),
 //!   * a community fine-tune at Q4 (`TenStrip/LTX2.3-10Eros` → `ltx_2_3_eros`).
 //!
-//! Run with: `cargo test -p mlx-gen-ltx --test convert_parity -- --ignored --nocapture`
+//! Run with: `cargo test -p mlx-gen-ltx --test integration convert_parity:: -- --ignored --nocapture`
 //! Path overrides: `LTX_BASE_SRC`, `LTX_EROS_DIR` / `LTX_EROS_SRC`.
 
 use std::collections::BTreeSet;

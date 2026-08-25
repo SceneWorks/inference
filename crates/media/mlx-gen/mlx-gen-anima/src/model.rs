@@ -7,7 +7,7 @@
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, SizeFloor,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
@@ -36,8 +36,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: cfg_capable,
             supports_guidance: cfg_capable,
-            supports_true_cfg: false,
-            conditioning: vec![],
             // LoRA/LoKr injection is sc-10521; every projection is an adapter-ready `AdaptableLinear`.
             supports_lora: true,
             supports_lokr: true,
@@ -45,7 +43,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // (req.sampler == None) is the recommended er_sde solver; the full menu is advertised.
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -57,8 +54,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // like SANA). The worker reads `supported_quants` for its capability advertisement
             // (gen-core sc-3723); every advertised tier actually loads, so this is honest.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
             // (F-176). Under `Sequential` the Qwen3-0.6B text encoder is encoded, materialized, then
@@ -66,23 +61,8 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // `max(Qwen3-TE, DiT+conditioner+VAE)`. Q4/Q8 are packed convert-at-install tiers (no
             // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

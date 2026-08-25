@@ -3,7 +3,7 @@
 //! against a golden dumped from the real model (`tools/dump_svd_image_encoder_golden.py`), in f32 so
 //! the gate isolates the math from fp16 rounding. Needs the SVD checkpoint locally → `--ignored`.
 //!
-//! Run: `cargo test -p mlx-gen-svd --test image_encoder_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-svd --test integration image_encoder_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max as max_op, subtract};
 use mlx_rs::Dtype;

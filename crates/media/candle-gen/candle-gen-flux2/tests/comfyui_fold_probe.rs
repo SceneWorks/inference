@@ -21,7 +21,7 @@
 //!
 //! Weightful + CUDA-only → `#[ignore]`; skips gracefully when the local files are absent. Run:
 //! ```text
-//! cargo test -p candle-gen-flux2 --test comfyui_fold_probe --features cuda --release -- --ignored --nocapture
+//! cargo test -p candle-gen-flux2 --test integration comfyui_fold_probe:: --features cuda --release -- --ignored --nocapture
 //! ```
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;

@@ -209,7 +209,11 @@ impl<K: PartialEq, V: Clone> RopeCache<K, V> {
 impl Krea2Transformer {
     /// Build from a loaded `transformer/` weight set.
     pub fn load(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
-        Self::load_planned(w, cfg, &DitPlan::baseline())
+        if w.is_native_nvfp4() {
+            Self::load_planned(w, cfg, &DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed))
+        } else {
+            Self::load_planned(w, cfg, &DitPlan::baseline())
+        }
     }
 
     /// [`Self::load`] under an NVFP4 [`DitPlan`] (sc-12110, epic 11037) — the seam that serves the

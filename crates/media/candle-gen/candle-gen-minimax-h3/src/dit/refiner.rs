@@ -1,0 +1,213 @@
+//! The 2-layer text **token refiner** (`MiniMaxH3TokenRefiner`).
+//!
+//! `context_embedder` maps the text encoder's 5120-wide context to `hidden_size`, and this stack
+//! then refines it before its rows are scattered into the packed sequence. It is small — 21 of the
+//! 638 published tensors — and easy to mistake for an optional pre-pass, so:
+//!
+//! * it is **not** stubbed, and `tests/dit_parity.rs` covers both blocks and the final norm
+//!   against the reference;
+//! * the lightx2v turbo step-distill LoRAs (sc-18728, the candle twin) target
+//!   `token_refiner.refiner_blocks.{0,1}` on the same six leaves as `transformer_blocks`, so 24 of
+//!   their 624 tensors land here. A refiner with different naming or dims puts those in
+//!   `unmatched_paths` and the distill silently applies at partial coverage.
+//!
+//! # How it differs from a `transformer_blocks` entry
+//!
+//! Same leaf names, same widths (`attn` 5376 → 7168, `ff` 5376 → 2·14336 → 5376), and **two
+//! removals**:
+//!
+//! | | `transformer_blocks.N` | `token_refiner.refiner_blocks.N` |
+//! |---|---|---|
+//! | AdaLN | `adaln_proj.linear` modulates both residuals | **none** — plain pre-norm residuals |
+//! | rotary | MM-RoPE on q and k | **none** — `self.attn(self.norm1(x))` passes no `rotary_emb` |
+//!
+//! Applying the rotary here anyway is the plausible error, and it is invisible structurally: the
+//! shapes are unchanged and the refiner would still produce finite, well-scaled output.
+
+use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::{CandleError, Result, Weights};
+
+use crate::dit::config::MiniMaxH3DitConfig;
+use crate::dit::layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
+
+/// One refiner block: `x + attn(norm1(x))`, then `x + ff(norm2(x))`.
+#[derive(Debug, Clone)]
+pub struct TokenRefinerBlock {
+    norm1: RmsNorm,
+    attn: DitAttention,
+    norm2: RmsNorm,
+    ff: DitFeedForward,
+}
+
+impl TokenRefinerBlock {
+    /// Load block `prefix` (e.g. `token_refiner.refiner_blocks.0`).
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
+            attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
+            norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
+            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+        })
+    }
+
+    /// Resolve one adapter path segment run **relative to this refiner block** (sc-18728). The same
+    /// six leaves a transformer block exposes; a refiner block has no `adaln_proj` to exclude.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Drop every residual attached anywhere in this refiner block.
+    pub fn clear_adapters(&mut self) {
+        self.attn.clear_adapters();
+        self.ff.clear_adapters();
+    }
+
+    /// The 10 tensors a refiner block consumes — a `transformer_blocks` entry's 12 minus
+    /// `adaln_proj`'s weight/bias pair.
+    pub fn names(prefix: &str) -> Vec<String> {
+        let mut v = RmsNorm::names(&format!("{prefix}.norm1")).to_vec();
+        v.extend(RmsNorm::names(&format!("{prefix}.norm2")));
+        v.extend(DitAttention::names(&format!("{prefix}.attn")));
+        v.extend(DitFeedForward::names(&format!("{prefix}.ff")));
+        v
+    }
+
+    /// Unmodulated, unrotated pre-norm residuals.
+    ///
+    /// The `None` handed to [`DitAttention::forward`] is the whole "the refiner applies no rotary"
+    /// claim, and `tests/dit_parity.rs` measures that the rotary genuinely moves attention so the
+    /// distinction is not vacuous.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let attn = self.attn.forward(&self.norm1.forward(x)?, None)?;
+        let x = x.add(&attn)?;
+        let ff = self.ff.forward(&self.norm2.forward(&x)?)?;
+        Ok(x.add(&ff)?)
+    }
+}
+
+/// The refiner stack plus its `final_norm`.
+#[derive(Debug, Clone)]
+pub struct TokenRefiner {
+    blocks: Vec<TokenRefinerBlock>,
+    final_norm: RmsNorm,
+}
+
+impl TokenRefiner {
+    /// Load `token_refiner`. `cfg.num_refiner_layers` blocks — 2 in the published checkpoint.
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        if cfg.num_refiner_layers == 0 {
+            return Err(CandleError::Msg(
+                "minimax-h3 dit refiner: num_refiner_layers must be positive, got 0".into(),
+            ));
+        }
+        let blocks = (0..cfg.num_refiner_layers)
+            .map(|i| {
+                TokenRefinerBlock::from_weights(
+                    w,
+                    &format!("{prefix}.refiner_blocks.{i}"),
+                    cfg,
+                    dtype,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            blocks,
+            // `final_norm` uses `final_norm_eps`, not `norm_eps` — the same value in the shipped
+            // config, but they are separate knobs.
+            final_norm: RmsNorm::from_weights(
+                w,
+                &format!("{prefix}.final_norm"),
+                cfg.final_norm_eps,
+                dtype,
+            )?,
+        })
+    }
+
+    /// Every tensor the refiner consumes — 21 in the published checkpoint.
+    pub fn names(prefix: &str, cfg: &MiniMaxH3DitConfig) -> Vec<String> {
+        let mut v: Vec<String> = (0..cfg.num_refiner_layers)
+            .flat_map(|i| TokenRefinerBlock::names(&format!("{prefix}.refiner_blocks.{i}")))
+            .collect();
+        v.extend(RmsNorm::names(&format!("{prefix}.final_norm")));
+        v
+    }
+
+    /// Blocks in order, then `final_norm`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = x.clone();
+        for block in &self.blocks {
+            h = block.forward(&h)?;
+        }
+        self.final_norm.forward(&h)
+    }
+
+    /// Blocks loaded — `num_refiner_layers`.
+    pub fn num_layers(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Resolve one adapter path segment run **relative to `token_refiner`** (sc-18728).
+    ///
+    /// `final_norm` is not addressable — it is a `[hidden]` vector, not a projection.
+    ///
+    /// **24 of the 624 tensors in every published turbo file land here**, so a stubbed refiner is
+    /// not merely a parity risk: it puts those 12 modules in `unmatched_paths` and fails the strict
+    /// install outright.
+    pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        match path {
+            ["refiner_blocks", idx, rest @ ..] => {
+                let i: usize = idx.parse().ok()?;
+                self.blocks.get_mut(i)?.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop every residual attached anywhere in the refiner.
+    pub fn clear_adapters(&mut self) {
+        for b in &mut self.blocks {
+            b.clear_adapters();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2 blocks × 10 tensors + `final_norm` = the published 21, and no `adaln_proj` among them.
+    #[test]
+    fn refiner_names_cover_the_published_twenty_one_tensors() {
+        let cfg = MiniMaxH3DitConfig::default();
+        let names = TokenRefiner::names("token_refiner", &cfg);
+        assert_eq!(cfg.num_refiner_layers, 2);
+        assert_eq!(TokenRefinerBlock::names("x").len(), 10);
+        assert_eq!(
+            crate::dit::block::DitBlock::names("y").len(),
+            TokenRefinerBlock::names("x").len() + 2,
+            "a refiner block is a transformer block minus adaln_proj's weight/bias pair"
+        );
+        assert_eq!(names.len(), 21, "got {names:?}");
+        assert!(names.contains(&"token_refiner.final_norm.weight".to_string()));
+        assert!(names.contains(&"token_refiner.refiner_blocks.1.attn.norm_k.weight".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("adaln")),
+            "the refiner has no AdaLN"
+        );
+    }
+}

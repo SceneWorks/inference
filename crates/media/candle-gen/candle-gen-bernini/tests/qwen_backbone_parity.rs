@@ -5,7 +5,7 @@
 //! the external additive 4D mask, the residual stack, and the HF `hidden_states[-2]` tap — without the
 //! 14 GB checkpoint. CPU, f32 throughout.
 
-mod common;
+use crate::common;
 
 use common::{errors, flat_f32, Golden};
 

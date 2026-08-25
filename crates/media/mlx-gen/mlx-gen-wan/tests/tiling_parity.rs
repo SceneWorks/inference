@@ -387,7 +387,7 @@ fn wan_combined_plan_decode_is_sane() {
 ///
 /// ```text
 /// WAN_A14B_MODEL_DIR=~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16 \
-///   cargo test -p mlx-gen-wan --test tiling_parity wan_combined_auto_decode_not_flat_real \
+///   cargo test -p mlx-gen-wan --test integration tiling_parity::wan_combined_auto_decode_not_flat_real \
 ///   -- --ignored --nocapture
 /// ```
 #[test]
@@ -448,7 +448,7 @@ fn wan_combined_auto_decode_not_flat_real() {
 ///
 /// ```text
 /// WAN_A14B_MODEL_DIR=~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16 \
-///   cargo test -p mlx-gen-wan --test tiling_parity -- --ignored --nocapture
+///   cargo test -p mlx-gen-wan --test integration tiling_parity:: -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "needs the converted Wan2.2-T2V-A14B vae.safetensors (WAN_A14B_MODEL_DIR)"]

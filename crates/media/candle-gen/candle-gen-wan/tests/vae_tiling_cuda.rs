@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! set WAN_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-TI2V-5B-Diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-wan --features cuda --release --test vae_tiling_cuda -- --ignored --nocapture
+//! cargo test -p candle-gen-wan --features cuda --release --test integration vae_tiling_cuda:: -- --ignored --nocapture
 //! ```
 //!
 //! NOTE: the z48 decoder has **global per-frame spatial attention** (`MidAttn` softmaxes over all

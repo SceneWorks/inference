@@ -29,10 +29,10 @@
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
-    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryMode, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    Result as CoreResult,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryMode, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
 };
 #[cfg(test)]
 use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome, MemorySelection};
@@ -372,6 +372,7 @@ fn memory_strategy_contract_with_adapters(
                 kind: MemoryComponentKind::AdapterStack,
                 resident_bytes: adapter_bytes,
                 bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
             }],
         }
     } else {

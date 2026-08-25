@@ -16,14 +16,150 @@
 //! third-party LoKr/LoHa (`lokr_*`/`hada_*` factors, optional per-module `.alpha`), and kohya
 //! (`lora_unet_<flattened path>.lora_down/up.weight` + `.alpha`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub use safetensors::Dtype;
 use safetensors::SafeTensors;
 
 use crate::{Error, Result};
+
+// =================================================================================================
+// Dtype — the stored element type of one safetensors tensor (gen-core owned; sc-20385).
+// =================================================================================================
+
+/// The stored element type of one safetensors tensor, as named by the file header's `dtype`
+/// string.
+///
+/// gen-core owns this enum (it was the pinned `safetensors 0.4` crate's `Dtype` until sc-20385) so
+/// the header reader can name dtypes that crate predates. The one that matters today is
+/// [`Dtype::F8_E8M0`]: ComfyUI serialises MXFP8 block scales as `torch.float8_e8m0fnu`, which
+/// safetensors writes as the `"F8_E8M0"` dtype string, and a parser that cannot name it rejects the
+/// whole checkpoint header. Variant names are the exact safetensors dtype strings, so every
+/// `Dtype::F8_E4M3`-style comparison in the tree is unchanged, and a dtype string outside this list
+/// is a typed header error naming the tensor — never a silent "unknown" classification.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Dtype {
+    BOOL,
+    U8,
+    I8,
+    F8_E5M2,
+    F8_E4M3,
+    /// OCP MX shared-exponent scale (`torch.float8_e8m0fnu`): one byte = a biased power-of-two
+    /// exponent. Only ever a *companion* (MXFP8 block scales), never a weight element type.
+    F8_E8M0,
+    I16,
+    U16,
+    F16,
+    BF16,
+    I32,
+    U32,
+    F32,
+    F64,
+    I64,
+    U64,
+}
+
+impl Dtype {
+    /// Every dtype this reader can name, in safetensors declaration order.
+    pub const ALL: &'static [Dtype] = &[
+        Dtype::BOOL,
+        Dtype::U8,
+        Dtype::I8,
+        Dtype::F8_E5M2,
+        Dtype::F8_E4M3,
+        Dtype::F8_E8M0,
+        Dtype::I16,
+        Dtype::U16,
+        Dtype::F16,
+        Dtype::BF16,
+        Dtype::I32,
+        Dtype::U32,
+        Dtype::F32,
+        Dtype::F64,
+        Dtype::I64,
+        Dtype::U64,
+    ];
+
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            Dtype::BOOL
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::F8_E5M2
+            | Dtype::F8_E4M3
+            | Dtype::F8_E8M0 => 1,
+            Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
+            Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
+            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+        }
+    }
+
+    /// The safetensors header dtype string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dtype::BOOL => "BOOL",
+            Dtype::U8 => "U8",
+            Dtype::I8 => "I8",
+            Dtype::F8_E5M2 => "F8_E5M2",
+            Dtype::F8_E4M3 => "F8_E4M3",
+            Dtype::F8_E8M0 => "F8_E8M0",
+            Dtype::I16 => "I16",
+            Dtype::U16 => "U16",
+            Dtype::F16 => "F16",
+            Dtype::BF16 => "BF16",
+            Dtype::I32 => "I32",
+            Dtype::U32 => "U32",
+            Dtype::F32 => "F32",
+            Dtype::F64 => "F64",
+            Dtype::I64 => "I64",
+            Dtype::U64 => "U64",
+        }
+    }
+
+    /// Parse a safetensors header dtype string; `None` for a string this reader cannot name.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|dtype| dtype.as_str() == name)
+    }
+}
+
+impl TryFrom<safetensors::Dtype> for Dtype {
+    type Error = Error;
+
+    fn try_from(dtype: safetensors::Dtype) -> Result<Self> {
+        Ok(match dtype {
+            safetensors::Dtype::BOOL => Dtype::BOOL,
+            safetensors::Dtype::U8 => Dtype::U8,
+            safetensors::Dtype::I8 => Dtype::I8,
+            safetensors::Dtype::F8_E5M2 => Dtype::F8_E5M2,
+            safetensors::Dtype::F8_E4M3 => Dtype::F8_E4M3,
+            safetensors::Dtype::I16 => Dtype::I16,
+            safetensors::Dtype::U16 => Dtype::U16,
+            safetensors::Dtype::F16 => Dtype::F16,
+            safetensors::Dtype::BF16 => Dtype::BF16,
+            safetensors::Dtype::I32 => Dtype::I32,
+            safetensors::Dtype::U32 => Dtype::U32,
+            safetensors::Dtype::F32 => Dtype::F32,
+            safetensors::Dtype::F64 => Dtype::F64,
+            safetensors::Dtype::I64 => Dtype::I64,
+            safetensors::Dtype::U64 => Dtype::U64,
+            // The pinned crate's enum is `#[non_exhaustive]`; a dtype a future release adds that
+            // this enum has not named must not be mis-priced as some other width. The only caller
+            // is `CheckpointMeta` (adapter-sized files); the header-only reader parses dtype strings
+            // itself and names its refusal per tensor.
+            other => {
+                return Err(Error::Msg(format!(
+                    "safetensors dtype {other:?} is not named by gen_core::weightsmeta::Dtype"
+                )))
+            }
+        })
+    }
+}
 
 /// True when `path`'s file name begins with `.` — a hidden entry that is never a weight shard.
 ///
@@ -208,11 +344,17 @@ impl CheckpointMeta {
         let data_base = 8 + n;
         let shard = self.buffers.len();
         for (key, info) in meta.tensors() {
+            let dtype = Dtype::try_from(info.dtype).map_err(|error| {
+                Error::Msg(format!(
+                    "safetensors tensor {key:?} in {}: {error}",
+                    path.display()
+                ))
+            })?;
             self.index.insert(
                 key,
                 TensorLoc {
                     shard,
-                    dtype: info.dtype,
+                    dtype,
                     shape: info.shape.clone(),
                     start: data_base + info.data_offsets.0,
                     end: data_base + info.data_offsets.1,
@@ -314,136 +456,12 @@ impl SafetensorsTensorHeader {
 pub fn safetensors_path_tensor_headers(
     path: impl AsRef<Path>,
 ) -> Result<Vec<SafetensorsTensorHeader>> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
     fn read_file(path: &Path) -> Result<Vec<SafetensorsTensorHeader>> {
-        let mut file = std::fs::File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut prefix = [0_u8; 8];
-        file.read_exact(&mut prefix)?;
-        let header_len = u64::from_le_bytes(prefix);
-        if header_len > MAX_HEADER_SIZE {
-            return Err(Error::Msg(format!(
-                "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
-                path.display()
-            )));
-        }
-        let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
-            Error::Msg(format!(
-                "safetensors header too large in {}",
-                path.display()
-            ))
-        })?;
-        if data_start > file_len {
-            return Err(Error::Msg(format!(
-                "safetensors header in {} extends past the file",
-                path.display()
-            )));
-        }
-        let header_len = usize::try_from(header_len).map_err(|_| {
-            Error::Msg(format!(
-                "safetensors header too large in {}",
-                path.display()
-            ))
-        })?;
-        let mut header = vec![0_u8; header_len];
-        file.read_exact(&mut header)?;
-        let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
-            .map_err(|error| {
-                Error::Msg(format!("safetensors header in {}: {error}", path.display()))
-            })?;
-        let available = file_len - data_start;
-        let mut tensors = json
+        Ok(safetensors_file_tensor_locations(path)?
+            .tensors
             .into_iter()
-            .filter(|(name, _)| name != "__metadata__")
-            .map(|(name, value)| {
-                let info: safetensors::tensor::TensorInfo =
-                    serde_json::from_value(value).map_err(|error| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                let (start, end) = info.data_offsets;
-                let end_u64 = u64::try_from(end).map_err(|_| {
-                    Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has an unrepresentable end offset",
-                        path.display()
-                    ))
-                })?;
-                if start > end || end_u64 > available {
-                    return Err(Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has invalid offsets [{start}, {end})",
-                        path.display()
-                    )));
-                }
-                let data_bytes = u64::try_from(end - start).map_err(|_| {
-                    Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} has an unrepresentable byte length",
-                        path.display()
-                    ))
-                })?;
-                let element_count = info.shape.iter().try_fold(1_u64, |count, dimension| {
-                    let dimension = u64::try_from(*dimension).map_err(|_| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has an unrepresentable dimension",
-                            path.display()
-                        ))
-                    })?;
-                    count.checked_mul(dimension).ok_or_else(|| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has a shape product overflow",
-                            path.display()
-                        ))
-                    })
-                })?;
-                let expected_bytes = element_count
-                    .checked_mul(info.dtype.size() as u64)
-                    .ok_or_else(|| {
-                        Error::Msg(format!(
-                            "safetensors tensor {name:?} in {} has a byte-size overflow",
-                            path.display()
-                        ))
-                    })?;
-                if data_bytes != expected_bytes {
-                    return Err(Error::Msg(format!(
-                        "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
-                        path.display(), info.dtype, info.shape
-                    )));
-                }
-                Ok((
-                    start,
-                    end,
-                    SafetensorsTensorHeader {
-                        name,
-                        dtype: info.dtype,
-                        shape: info.shape,
-                        data_bytes,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        tensors.sort_by(|left, right| {
-            (left.0, left.1, left.2.name.as_str()).cmp(&(right.0, right.1, right.2.name.as_str()))
-        });
-        let mut expected_start = 0_usize;
-        for (start, end, header) in &tensors {
-            if *start != expected_start {
-                return Err(Error::Msg(format!(
-                    "safetensors tensor {:?} in {} starts at {start}, expected contiguous offset {expected_start}",
-                    header.name,
-                    path.display()
-                )));
-            }
-            expected_start = *end;
-        }
-        if u64::try_from(expected_start).ok() != Some(available) {
-            return Err(Error::Msg(format!(
-                "safetensors tensor payload in {} covers {expected_start} bytes but file contains {available}",
-                path.display()
-            )));
-        }
-        Ok(tensors.into_iter().map(|(_, _, header)| header).collect())
+            .map(|location| location.header)
+            .collect())
     }
 
     fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -488,6 +506,267 @@ pub fn safetensors_path_tensor_headers(
         }
     }
     Ok(tensors.into_values().collect())
+}
+
+/// One tensor's header plus where its payload starts in the file (absolute byte offset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetensorsTensorLocation {
+    pub header: SafetensorsTensorHeader,
+    /// Absolute file offset of the first payload byte (`8 + header_len + data_offsets.0`).
+    pub file_offset: u64,
+}
+
+/// The validated header of one safetensors **file**: every tensor's header and payload location,
+/// sorted by payload offset, plus the raw header JSON bytes and where the data region begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetensorsFileLayout {
+    /// The header JSON exactly as stored (space padding included), for readers that need to
+    /// re-present it (the MLX lazy loader rewrites fp8 dtypes to `U8` at identical byte length).
+    pub header_json: Vec<u8>,
+    /// Absolute offset of the data region (`8 + header_len`).
+    pub data_start: u64,
+    /// Total file length in bytes.
+    pub file_len: u64,
+    /// Tensors sorted by `(file_offset, name)`; the payload region is proven contiguous.
+    pub tensors: Vec<SafetensorsTensorLocation>,
+}
+
+/// The header-only validation every safetensors consumer in this workspace shares, on one file:
+/// parses the header JSON itself (so a dtype string the pinned `safetensors` crate predates — e.g.
+/// `F8_E8M0` — is named, not fatal), checks each tensor's shape × dtype width against its declared
+/// byte range, and proves the payload region is contiguous and exactly covers the file. Reads the
+/// header only; never a tensor payload.
+pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<SafetensorsFileLayout> {
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+            path.display()
+        )));
+    }
+    let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    if data_start > file_len {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} extends past the file",
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+        .map_err(|error| {
+            Error::Msg(format!("safetensors header in {}: {error}", path.display()))
+        })?;
+    let available = file_len - data_start;
+    let mut tensors = json
+        .into_iter()
+        .filter(|(name, _)| name != "__metadata__")
+        .map(|(name, value)| {
+            let object = value.as_object().ok_or_else(|| {
+                Error::Msg(format!(
+                    "safetensors tensor {name:?} in {}: header entry is not an object",
+                    path.display()
+                ))
+            })?;
+            let dtype_name = object
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing string `dtype`",
+                        path.display()
+                    ))
+                })?;
+            let dtype = Dtype::parse(dtype_name).ok_or_else(|| {
+                Error::Msg(format!(
+                    "safetensors tensor {name:?} in {}: unknown dtype {dtype_name:?}",
+                    path.display()
+                ))
+            })?;
+            let shape = object
+                .get("shape")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing array `shape`",
+                        path.display()
+                    ))
+                })?
+                .iter()
+                .map(|dimension| {
+                    dimension
+                        .as_u64()
+                        .and_then(|dimension| usize::try_from(dimension).ok())
+                        .ok_or_else(|| {
+                            Error::Msg(format!(
+                                "safetensors tensor {name:?} in {} has an unrepresentable dimension",
+                                path.display()
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<usize>>>()?;
+            let offsets = object
+                .get("data_offsets")
+                .and_then(serde_json::Value::as_array)
+                .filter(|offsets| offsets.len() == 2)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {}: missing two-element `data_offsets`",
+                        path.display()
+                    ))
+                })?;
+            let (start, end) = match (offsets[0].as_u64(), offsets[1].as_u64()) {
+                (Some(start), Some(end)) => (start, end),
+                _ => {
+                    return Err(Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has non-integer data offsets",
+                        path.display()
+                    )))
+                }
+            };
+            if start > end || end > available {
+                return Err(Error::Msg(format!(
+                    "safetensors tensor {name:?} in {} has invalid offsets [{start}, {end})",
+                    path.display()
+                )));
+            }
+            let data_bytes = end - start;
+            let element_count = shape.iter().try_fold(1_u64, |count, dimension| {
+                count.checked_mul(*dimension as u64).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has a shape product overflow",
+                        path.display()
+                    ))
+                })
+            })?;
+            let expected_bytes = element_count
+                .checked_mul(dtype.size() as u64)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "safetensors tensor {name:?} in {} has a byte-size overflow",
+                        path.display()
+                    ))
+                })?;
+            if data_bytes != expected_bytes {
+                return Err(Error::Msg(format!(
+                    "safetensors tensor {name:?} in {} declares {data_bytes} payload bytes but {:?} {:?} requires {expected_bytes}",
+                    path.display(), dtype, shape
+                )));
+            }
+            Ok(SafetensorsTensorLocation {
+                header: SafetensorsTensorHeader {
+                    name,
+                    dtype,
+                    shape,
+                    data_bytes,
+                },
+                file_offset: data_start + start,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tensors.sort_by(|left, right| {
+        (left.file_offset, left.header.name.as_str())
+            .cmp(&(right.file_offset, right.header.name.as_str()))
+    });
+    let mut expected_start = data_start;
+    for location in &tensors {
+        if location.file_offset != expected_start {
+            return Err(Error::Msg(format!(
+                "safetensors tensor {:?} in {} starts at {}, expected contiguous offset {}",
+                location.header.name,
+                path.display(),
+                location.file_offset - data_start,
+                expected_start - data_start
+            )));
+        }
+        expected_start = location.file_offset + location.header.data_bytes;
+    }
+    if expected_start != file_len {
+        return Err(Error::Msg(format!(
+            "safetensors tensor payload in {} covers {} bytes but file contains {available}",
+            path.display(),
+            expected_start - data_start
+        )));
+    }
+    Ok(SafetensorsFileLayout {
+        header_json: header,
+        data_start,
+        file_len,
+        tensors,
+    })
+}
+
+/// The file-level `__metadata__._quantization_metadata` string of one safetensors file, if it
+/// carries one (sc-20641).
+///
+/// Header-only — the data region is never touched — so it is safe on a multi-gigabyte checkpoint,
+/// which matters because this is exactly how a whole-file NVFP4 import declares its quantization
+/// (the ComfyUI Kitchen converters write no per-layer `.comfy_quant` tensors at all). Returns
+/// `Ok(None)` when the key is absent: the ordinary case for a checkpoint that is unquantized or
+/// uses the per-layer descriptor convention.
+pub fn safetensors_path_quantization_metadata(path: impl AsRef<Path>) -> Result<Option<String>> {
+    let layout = safetensors_file_tensor_locations(path)?;
+    let header: serde_json::Value = serde_json::from_slice(&layout.header_json)
+        .map_err(|error| Error::Msg(format!("safetensors header is not valid JSON: {error}")))?;
+    Ok(header
+        .get("__metadata__")
+        .and_then(|metadata| metadata.get("_quantization_metadata"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
+/// Read the raw payload bytes of the selected tensors from one safetensors file — nothing else is
+/// touched. Built for the *small* per-layer companions a codec plan needs before any backend array
+/// exists (ComfyUI `.comfy_quant` descriptor blobs); `max_bytes_each` bounds every selected payload
+/// so a mis-selected multi-gigabyte weight is a typed refusal, not a host-RAM surprise.
+pub fn read_safetensors_tensor_payloads(
+    path: impl AsRef<Path>,
+    mut select: impl FnMut(&SafetensorsTensorHeader) -> bool,
+    max_bytes_each: u64,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    use std::io::{Seek, SeekFrom};
+
+    let path = path.as_ref();
+    let layout = safetensors_file_tensor_locations(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let mut payloads = BTreeMap::new();
+    for location in layout.tensors {
+        if !select(&location.header) {
+            continue;
+        }
+        if location.header.data_bytes > max_bytes_each {
+            return Err(Error::Msg(format!(
+                "safetensors tensor {:?} in {} is {} bytes, above the {max_bytes_each}-byte \
+                 payload read limit",
+                location.header.name,
+                path.display(),
+                location.header.data_bytes
+            )));
+        }
+        let mut payload = vec![0_u8; location.header.data_bytes as usize];
+        file.seek(SeekFrom::Start(location.file_offset))?;
+        file.read_exact(&mut payload)?;
+        payloads.insert(location.header.name, payload);
+    }
+    Ok(payloads)
 }
 
 /// Sum the on-disk bytes of every `.safetensors` weight file under `dir` (recursively), **without
@@ -607,6 +886,265 @@ pub const LOHA_TP_SUFFIXES: [&str; 6] = [
 
 /// The kohya flattened-path namespace prefix (`lora_unet_<dotted-path-with-dots→underscores>`).
 pub const KOHYA_PREFIX: &str = "lora_unet_";
+
+/// The exact kohya network module used by the MiniMax-H3 trainer. This format is intentionally
+/// narrower than generic [`KOHYA_PREFIX`] handling: its four fused/raw leaves require numerical
+/// conversion before they can bind to the diffusers-shaped runtime DiT.
+pub const MINIMAX_H3_TRAINER_NETWORK_MODULE: &str = "networks.lora_minimax_h3";
+
+/// The metadata flag which makes a 50-block, trunk-only H3 adapter intentional rather than partial.
+pub const MINIMAX_H3_TOKEN_REFINER_METADATA_KEY: &str = "ss_h3_lora_token_refiner";
+
+/// One of the four raw MiniMax-H3 trainer targets in every transformer block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MiniMaxH3TrainerLeaf {
+    AttnQkvProj,
+    AttnOutProj,
+    MlpFc1,
+    MlpFc2,
+}
+
+impl MiniMaxH3TrainerLeaf {
+    /// The dotted raw-module spelling consumed by the H3 ComfyUI conversion.
+    pub const fn dotted(self) -> &'static str {
+        match self {
+            Self::AttnQkvProj => "attn.qkv_proj",
+            Self::AttnOutProj => "attn.out_proj",
+            Self::MlpFc1 => "mlp.fc1",
+            Self::MlpFc2 => "mlp.fc2",
+        }
+    }
+
+    const fn flattened(self) -> &'static str {
+        match self {
+            Self::AttnQkvProj => "attn_qkv_proj",
+            Self::AttnOutProj => "attn_out_proj",
+            Self::MlpFc1 => "mlp_fc1",
+            Self::MlpFc2 => "mlp_fc2",
+        }
+    }
+
+    const fn geometry(self) -> (usize, usize) {
+        match self {
+            Self::AttnQkvProj => (5_376, 21_504),
+            Self::AttnOutProj => (7_168, 5_376),
+            Self::MlpFc1 => (5_376, 28_672),
+            Self::MlpFc2 => (14_336, 5_376),
+        }
+    }
+}
+
+/// Which tensor in a raw MiniMax-H3 trainer target a key names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MiniMaxH3TrainerRole {
+    Down,
+    Up,
+    Alpha,
+}
+
+impl MiniMaxH3TrainerRole {
+    /// The equivalent suffix in the dotted ComfyUI-compatible intermediate key space.
+    pub const fn dotted_suffix(self) -> &'static str {
+        match self {
+            Self::Down => ".lora_down.weight",
+            Self::Up => ".lora_up.weight",
+            Self::Alpha => ".alpha",
+        }
+    }
+}
+
+/// Parsed identity of one tensor in the exact MiniMax-H3 trainer namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiniMaxH3TrainerKey {
+    pub block: usize,
+    pub leaf: MiniMaxH3TrainerLeaf,
+    pub role: MiniMaxH3TrainerRole,
+}
+
+/// Structural receipt for one validated MiniMax-H3 trainer adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MiniMaxH3TrainerLayout {
+    /// Source modules, before the fused QKV target expands to three runtime linears.
+    pub source_targets: usize,
+    /// Distinct factor ranks present in the file, sorted for stable receipts.
+    pub ranks: Vec<usize>,
+    /// This namespace is trunk-only by construction; the explicit metadata flag makes that intent
+    /// machine-readable and prevents an accidentally partial export from looking valid.
+    pub trunk_only: bool,
+}
+
+/// Parse one exact H3 trainer tensor name:
+/// `lora_unet_blocks_{0..49}_{attn_qkv_proj,attn_out_proj,mlp_fc1,mlp_fc2}` followed by
+/// `.lora_down.weight`, `.lora_up.weight`, or `.alpha`.
+pub fn parse_minimax_h3_trainer_key(key: &str) -> Option<MiniMaxH3TrainerKey> {
+    let rest = key.strip_prefix("lora_unet_blocks_")?;
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 || rest.as_bytes().get(digits_len) != Some(&b'_') {
+        return None;
+    }
+    let block = rest[..digits_len].parse::<usize>().ok()?;
+    let target_and_role = &rest[digits_len + 1..];
+    let (role, target) = [
+        (MiniMaxH3TrainerRole::Down, ".lora_down.weight"),
+        (MiniMaxH3TrainerRole::Up, ".lora_up.weight"),
+        (MiniMaxH3TrainerRole::Alpha, ".alpha"),
+    ]
+    .into_iter()
+    .find_map(|(role, suffix)| {
+        target_and_role
+            .strip_suffix(suffix)
+            .map(|target| (role, target))
+    })?;
+    let leaf = [
+        MiniMaxH3TrainerLeaf::AttnQkvProj,
+        MiniMaxH3TrainerLeaf::AttnOutProj,
+        MiniMaxH3TrainerLeaf::MlpFc1,
+        MiniMaxH3TrainerLeaf::MlpFc2,
+    ]
+    .into_iter()
+    .find(|leaf| target == leaf.flattened())?;
+    (block < 50).then_some(MiniMaxH3TrainerKey { block, leaf, role })
+}
+
+/// Whether the keys or metadata claim the exact MiniMax-H3 trainer namespace. Callers use this
+/// before generic kohya handling so the fused QKV and FC1 half-order transforms cannot be skipped.
+pub fn is_minimax_h3_trainer_key_space<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_module: Option<&str>,
+) -> bool {
+    network_module.is_some_and(|module| module.trim() == MINIMAX_H3_TRAINER_NETWORK_MODULE)
+        || keys
+            .into_iter()
+            .any(|key| key.starts_with("lora_unet_blocks_"))
+}
+
+/// Classify an exact MiniMax-H3 trainer claim while keeping it disjoint from LoKr.
+///
+/// Call this before generic LoKr routing. Otherwise a file stamped as the H3 trainer namespace can
+/// add one valid `lokr_*` factor, take the LoKr branch, and have all of its unvalidated trainer keys
+/// ignored while the adapter reports success.
+pub fn classify_minimax_h3_trainer_namespace<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_module: Option<&str>,
+    network_type: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let trainer = is_minimax_h3_trainer_key_space(keys.iter().copied(), network_module);
+    let lokr = is_lokr_network_type(network_type) || keys_contain_lokr(keys.iter().copied());
+    if trainer && lokr {
+        return Err(format!(
+            "the {MINIMAX_H3_TRAINER_NETWORK_MODULE} trainer namespace cannot be mixed with LoKr metadata or factors"
+        ));
+    }
+    Ok(trainer)
+}
+
+/// Validate the complete 50-block × four-leaf H3 trainer surface without materializing tensors.
+///
+/// `entries` supplies `(key, shape)` pairs from either backend or a safetensors header. Every key is
+/// required to be in the exact namespace, every source target must carry down/up/alpha, factor
+/// geometry and rank must compose, and the intentionally absent token refiner must be declared with
+/// `ss_h3_lora_token_refiner=False`. This is deliberately strict only for this trainer namespace;
+/// existing diffusers/PEFT, ComfyUI, and LoKr paths never call it.
+pub fn validate_minimax_h3_trainer_layout(
+    entries: impl IntoIterator<Item = (String, Vec<usize>)>,
+    network_module: Option<&str>,
+    token_refiner: Option<&str>,
+) -> std::result::Result<MiniMaxH3TrainerLayout, String> {
+    match network_module.map(str::trim) {
+        Some(MINIMAX_H3_TRAINER_NETWORK_MODULE) => {}
+        Some(other) => {
+            return Err(format!(
+                "unsupported MiniMax-H3 trainer namespace {other:?}; expected __metadata__[\"ss_network_module\"] = {MINIMAX_H3_TRAINER_NETWORK_MODULE:?}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "MiniMax-H3 trainer keys require __metadata__[\"ss_network_module\"] = {MINIMAX_H3_TRAINER_NETWORK_MODULE:?}"
+            ));
+        }
+    }
+    if !token_refiner.is_some_and(|value| value.trim().eq_ignore_ascii_case("false")) {
+        return Err(format!(
+            "the 50-block MiniMax-H3 trainer adapter omits token-refiner targets, so __metadata__[\"{MINIMAX_H3_TOKEN_REFINER_METADATA_KEY}\"] must be False"
+        ));
+    }
+
+    let mut groups: BTreeMap<
+        (usize, MiniMaxH3TrainerLeaf),
+        BTreeMap<MiniMaxH3TrainerRole, Vec<usize>>,
+    > = BTreeMap::new();
+    for (key, shape) in entries {
+        let parsed = parse_minimax_h3_trainer_key(&key).ok_or_else(|| {
+            format!(
+                "unsupported or malformed MiniMax-H3 trainer tensor {key:?}; expected lora_unet_blocks_{{0..49}}_{{attn_qkv_proj,attn_out_proj,mlp_fc1,mlp_fc2}}.{{lora_down.weight,lora_up.weight,alpha}}"
+            )
+        })?;
+        if groups
+            .entry((parsed.block, parsed.leaf))
+            .or_default()
+            .insert(parsed.role, shape)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate MiniMax-H3 trainer tensor role in {key:?}"
+            ));
+        }
+    }
+
+    let mut ranks = BTreeSet::new();
+    for block in 0..50 {
+        for leaf in [
+            MiniMaxH3TrainerLeaf::AttnQkvProj,
+            MiniMaxH3TrainerLeaf::AttnOutProj,
+            MiniMaxH3TrainerLeaf::MlpFc1,
+            MiniMaxH3TrainerLeaf::MlpFc2,
+        ] {
+            let target = format!("lora_unet_blocks_{block}_{}", leaf.flattened());
+            let roles = groups.get(&(block, leaf)).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: missing target {target}")
+            })?;
+            let down = roles.get(&MiniMaxH3TrainerRole::Down).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing lora_down.weight")
+            })?;
+            let up = roles.get(&MiniMaxH3TrainerRole::Up).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing lora_up.weight")
+            })?;
+            let alpha = roles.get(&MiniMaxH3TrainerRole::Alpha).ok_or_else(|| {
+                format!("partial MiniMax-H3 trainer adapter: {target} is missing alpha")
+            })?;
+            let (in_dim, out_dim) = leaf.geometry();
+            if down.len() != 2 || down[0] == 0 || down[1] != in_dim {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.lora_down.weight: expected [rank, {in_dim}], got {down:?}"
+                ));
+            }
+            let rank = down[0];
+            if up.as_slice() != [out_dim, rank] {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.lora_up.weight: expected [{out_dim}, {rank}], got {up:?}"
+                ));
+            }
+            if !(alpha.is_empty() || alpha.as_slice() == [1]) {
+                return Err(format!(
+                    "malformed MiniMax-H3 trainer tensor {target}.alpha: expected scalar [] or [1], got {alpha:?}"
+                ));
+            }
+            ranks.insert(rank);
+        }
+    }
+    if groups.len() != 200 {
+        return Err(format!(
+            "MiniMax-H3 trainer adapter must contain exactly 200 source targets (50 blocks × four leaves), found {}",
+            groups.len()
+        ));
+    }
+    Ok(MiniMaxH3TrainerLayout {
+        source_targets: groups.len(),
+        ranks: ranks.into_iter().collect(),
+        trunk_only: true,
+    })
+}
 
 /// Common LoRA namespace prefixes a PEFT/diffusers file may carry on its keys (LoKr keys are bare).
 pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
@@ -1093,25 +1631,7 @@ mod tests {
     /// new safetensors dtype is classified deliberately instead of quietly inheriting `false`.
     #[test]
     fn is_float_admits_only_candle_cast_float_dtypes() {
-        const ALL_DTYPES: &[Dtype] = &[
-            Dtype::BOOL,
-            Dtype::U8,
-            Dtype::I8,
-            Dtype::F8_E5M2,
-            Dtype::F8_E4M3,
-            Dtype::I16,
-            Dtype::U16,
-            Dtype::F16,
-            Dtype::BF16,
-            Dtype::I32,
-            Dtype::U32,
-            Dtype::F32,
-            Dtype::F64,
-            Dtype::I64,
-            Dtype::U64,
-        ];
-
-        let admitted = ALL_DTYPES
+        let admitted = Dtype::ALL
             .iter()
             .copied()
             .filter(|dtype| {
@@ -1229,6 +1749,137 @@ mod tests {
             Some("transformer.")
         );
         assert_eq!(detect_lora_prefix(["bare.key"].into_iter()), None);
+    }
+
+    fn minimax_h3_trainer_entries() -> Vec<(String, Vec<usize>)> {
+        let mut entries = Vec::new();
+        for block in 0..50 {
+            for (leaf, input, output) in [
+                ("attn_qkv_proj", 5_376, 21_504),
+                ("attn_out_proj", 7_168, 5_376),
+                ("mlp_fc1", 5_376, 28_672),
+                ("mlp_fc2", 14_336, 5_376),
+            ] {
+                let stem = format!("lora_unet_blocks_{block}_{leaf}");
+                entries.push((format!("{stem}.lora_down.weight"), vec![16, input]));
+                entries.push((format!("{stem}.lora_up.weight"), vec![output, 16]));
+                entries.push((format!("{stem}.alpha"), Vec::new()));
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn minimax_h3_trainer_parser_is_exact_and_layout_is_complete() {
+        assert_eq!(
+            parse_minimax_h3_trainer_key("lora_unet_blocks_49_attn_qkv_proj.lora_down.weight"),
+            Some(MiniMaxH3TrainerKey {
+                block: 49,
+                leaf: MiniMaxH3TrainerLeaf::AttnQkvProj,
+                role: MiniMaxH3TrainerRole::Down,
+            })
+        );
+        for malformed in [
+            "lora_unet_blocks_50_attn_qkv_proj.lora_down.weight",
+            "lora_unet_blocks_0_attn_q_proj.lora_down.weight",
+            "lora_unet_blocks_0_mlp_fc1.lora_mid.weight",
+            "lora_unet_blocks_x_mlp_fc2.alpha",
+        ] {
+            assert_eq!(
+                parse_minimax_h3_trainer_key(malformed),
+                None,
+                "{malformed} must not be widened into the exact trainer namespace"
+            );
+        }
+
+        let layout = validate_minimax_h3_trainer_layout(
+            minimax_h3_trainer_entries(),
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .expect("the exact 50-block trunk-only layout");
+        assert_eq!(layout.source_targets, 200);
+        assert_eq!(layout.ranks, vec![16]);
+        assert!(layout.trunk_only);
+    }
+
+    #[test]
+    fn minimax_h3_trainer_claim_rejects_lokr_before_generic_routing() {
+        for network_type in [None, Some("lokr")] {
+            let keys = if network_type.is_some() {
+                vec!["lora_unet_blocks_0_attn_qkv_proj.lora_down.weight"]
+            } else {
+                vec!["transformer_blocks.0.attn.to_q.lokr_w1"]
+            };
+            let error = classify_minimax_h3_trainer_namespace(
+                keys,
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                network_type,
+            )
+            .unwrap_err();
+            assert!(error.contains(MINIMAX_H3_TRAINER_NETWORK_MODULE), "{error}");
+            assert!(error.contains("LoKr") && error.contains("mixed"), "{error}");
+        }
+
+        assert!(!classify_minimax_h3_trainer_namespace(
+            ["transformer_blocks.0.attn.to_q.lokr_w1"],
+            None,
+            None,
+        )
+        .expect("a plain LoKr remains available to its existing route"));
+    }
+
+    #[test]
+    fn minimax_h3_trainer_layout_rejects_independent_partial_shape_and_namespace_mutations() {
+        let base = minimax_h3_trainer_entries();
+
+        let mut partial = base.clone();
+        partial.retain(|(key, _)| key != "lora_unet_blocks_7_mlp_fc2.alpha");
+        let error = validate_minimax_h3_trainer_layout(
+            partial,
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("blocks_7_mlp_fc2") && error.contains("missing alpha"),
+            "{error}"
+        );
+
+        let mut wrong_shape = base.clone();
+        wrong_shape
+            .iter_mut()
+            .find(|(key, _)| key == "lora_unet_blocks_3_attn_qkv_proj.lora_up.weight")
+            .unwrap()
+            .1 = vec![21_503, 16];
+        let error = validate_minimax_h3_trainer_layout(
+            wrong_shape,
+            Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+            Some("False"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("[21504, 16]") && error.contains("[21503, 16]"),
+            "{error}"
+        );
+
+        for (network, token_refiner, expected) in [
+            (Some("networks.lora"), Some("False"), "unsupported"),
+            (
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                None,
+                "must be False",
+            ),
+            (
+                Some(MINIMAX_H3_TRAINER_NETWORK_MODULE),
+                Some("True"),
+                "must be False",
+            ),
+        ] {
+            let error = validate_minimax_h3_trainer_layout(base.clone(), network, token_refiner)
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -1374,7 +2025,7 @@ mod tests {
         // Serialize a tiny safetensors file, reopen it through CheckpointMeta, and assert the header
         // view + byte slice round-trip without a tensor library.
         let data: Vec<u8> = (0u8..16).collect(); // 4×i32 = 16 bytes
-        let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let tv = StTensorView::new(safetensors::Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
         let tmp = fixture_dir("gencore_meta_");
@@ -1490,7 +2141,7 @@ mod tests {
     #[test]
     fn from_dir_skips_appledouble_sidecar() {
         let data: Vec<u8> = (0u8..16).collect();
-        let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let tv = StTensorView::new(safetensors::Dtype::I32, vec![2, 2], &data).unwrap();
         let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
 
         let tmp = fixture_dir("gencore_appledouble_");

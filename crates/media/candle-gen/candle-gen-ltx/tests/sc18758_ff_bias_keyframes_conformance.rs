@@ -29,7 +29,15 @@ use candle_gen_ltx::config::AvConfig;
 use candle_gen_ltx::transformer::AvDiT;
 
 const FIXTURE_JSON: &str = include_str!("fixtures/ltx25_distilled_dit_tensors.json");
-const NUM_LAYERS: usize = 48;
+
+/// DiT depth the fixture header was captured at.
+pub const SHARED_FIXTURE_NUM_LAYERS: usize = 48;
+/// DiT-only tensor count the fixture carries (4349 real minus the 258 embeddings-connector keys).
+pub const SHARED_FIXTURE_DIT_TENSOR_COUNT: usize = 4091;
+/// Video FFN up-projection bias width, from the real header's `[16384, 4096]` weight out-dim.
+pub const SHARED_FIXTURE_FF_UP_BIAS_DIM: usize = 16384;
+/// Video FFN down-projection bias width, from the real header's `[4096, 16384]` weight out-dim.
+pub const SHARED_FIXTURE_FF_DOWN_BIAS_DIM: usize = 4096;
 
 struct RealTensor {
     name: String,
@@ -99,13 +107,16 @@ fn reconstructed_23_weights(dev: &Device) -> HashMap<String, Tensor> {
         .filter(|t| t.name != "keyframes_abs_pos_embedding")
         .map(|t| (t.name.clone(), placeholder(&t.shape, dev)))
         .collect();
-    for i in 0..NUM_LAYERS {
+    for i in 0..SHARED_FIXTURE_NUM_LAYERS {
         let p = format!("transformer_blocks.{i}");
         m.insert(
             format!("{p}.ff.net.0.proj.bias"),
-            placeholder(&[16384], dev),
+            placeholder(&[SHARED_FIXTURE_FF_UP_BIAS_DIM], dev),
         );
-        m.insert(format!("{p}.ff.net.2.bias"), placeholder(&[4096], dev));
+        m.insert(
+            format!("{p}.ff.net.2.bias"),
+            placeholder(&[SHARED_FIXTURE_FF_DOWN_BIAS_DIM], dev),
+        );
     }
     m
 }
@@ -118,8 +129,8 @@ fn ltx25_config_loads_the_real_header() {
     let m = real_25_weights(&dev);
     assert_eq!(
         m.len(),
-        4091,
-        "fixture must be the real 4091-tensor DiT-only set"
+        SHARED_FIXTURE_DIT_TENSOR_COUNT,
+        "fixture must be the real {SHARED_FIXTURE_DIT_TENSOR_COUNT}-tensor DiT-only set"
     );
     let vb = VarBuilder::from_tensors(m, DType::F32, &dev);
     AvDiT::new(vb, &AvConfig::ltx_2_5()).expect("ltx_2_5 config must load the real header");
@@ -164,13 +175,16 @@ fn ltx25_config_tolerates_but_does_not_require_video_ff_bias_present() {
     // The real 2.5 set (has `keyframes_abs_pos_embedding`) PLUS the video ff bias tensors it does not
     // ship — a strict superset of what `ltx_2_5` needs.
     let mut m = real_25_weights(&dev);
-    for i in 0..NUM_LAYERS {
+    for i in 0..SHARED_FIXTURE_NUM_LAYERS {
         let p = format!("transformer_blocks.{i}");
         m.insert(
             format!("{p}.ff.net.0.proj.bias"),
-            placeholder(&[16384], &dev),
+            placeholder(&[SHARED_FIXTURE_FF_UP_BIAS_DIM], &dev),
         );
-        m.insert(format!("{p}.ff.net.2.bias"), placeholder(&[4096], &dev));
+        m.insert(
+            format!("{p}.ff.net.2.bias"),
+            placeholder(&[SHARED_FIXTURE_FF_DOWN_BIAS_DIM], &dev),
+        );
     }
     let vb = VarBuilder::from_tensors(m, DType::F32, &dev);
     AvDiT::new(vb, &AvConfig::ltx_2_5())

@@ -9,7 +9,7 @@
 //! Run (writes to a scratch dir OUTSIDE the repo):
 //!   MOCHI_SNAPSHOT=/path/to/models--genmo--mochi-1-preview/snapshots/<rev> \
 //!   MOCHI_TIERS_OUT=~/mochi-tiers \
-//!   cargo test -p mlx-gen-mochi --test build_tiers -- --ignored --nocapture
+//!   cargo test -p mlx-gen-mochi --test integration build_tiers:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

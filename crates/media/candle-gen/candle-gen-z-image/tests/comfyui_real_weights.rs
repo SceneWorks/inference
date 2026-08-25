@@ -9,7 +9,7 @@
 //!
 //! Ignored (needs the real files + a resident tokenizer snapshot + a CUDA GPU). Run:
 //! ```text
-//! cargo test -p candle-gen-z-image --release --features cuda --test comfyui_real_weights -- --ignored --nocapture
+//! cargo test -p candle-gen-z-image --release --features cuda --test integration comfyui_real_weights:: -- --ignored --nocapture
 //! ```
 //! Override paths via `COMFYUI_ROOT` (the ComfyUI `models/` dir) and `ZIMAGE_TOKENIZER_DIR` (a diffusers
 //! Z-Image snapshot with `tokenizer/tokenizer.json`).

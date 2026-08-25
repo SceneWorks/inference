@@ -6,7 +6,7 @@
 //! exercises the whole shim — the reshape-to-packed-grid, the bn de-normalize, the 2×2 unpatchify, and
 //! the Flux.2 conv decoder — end to end.
 //!
-//! Run: `cargo test -p mlx-gen-lens --test vae_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-lens --test integration vae_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Dtype;
