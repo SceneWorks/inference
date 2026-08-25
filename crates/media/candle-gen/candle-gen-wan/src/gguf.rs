@@ -452,6 +452,9 @@ pub fn compile_gguf_dit_plan(
                 mode: ResidencyMode::Packed,
                 resident_bytes: container_bytes,
             },
+            // GGUF containers are read one-to-one; the adapter-declared logical transforms
+            // (sc-21547) are a safetensors-plan feature and this compiler declares none.
+            transform: None,
         });
     }
 
