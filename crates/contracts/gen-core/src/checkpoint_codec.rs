@@ -714,6 +714,50 @@ impl LogicalTensorPlan {
             self.codec_id, self.physical_key, self.logical_key
         ))
     }
+
+    /// The one refusal message both engines emit when a **matrix codec** row (`mxfp8-v1`,
+    /// `nvfp4-v1`, `int8-per-row-v1`) carries a logical [`Self::shape`] that is not rank 2.
+    ///
+    /// Those three codecs decode an `[out, in]` grid: every backend arm indexes `shape[0]` /
+    /// `shape[1]` positionally and hands the pair to this crate's `[rows, cols]` reference decoders
+    /// ([`crate::decode_mxfp8`], [`crate::decode_nvfp4`], [`crate::decode_int8_per_row`]).
+    ///
+    /// [`compile_logical_weight_plan_with_metadata`] already refuses any descriptor-bearing layer
+    /// whose stored header is not rank 2, and the MXFP8/NVFP4 geometry validators refuse a declared
+    /// logical shape that is not rank 2 either — so a plan that came from the compiler cannot reach
+    /// those arms at another rank. This is the **local** restatement of that contract at the sites
+    /// that depend on it: each engine's logical-weight read is a public entry taking a
+    /// caller-supplied [`LogicalWeightPlan`] whose fields are public, so without this guard a plan
+    /// that did not come from the compiler panics on an out-of-bounds index instead of refusing by
+    /// name. It lives here, beside [`Self::undeclared_padded_storage_refusal`], so both engines
+    /// refuse the same plan with the same diagnosis rather than keeping two copies that can drift
+    /// (nothing compiles both backends at once: mlx-gen is macOS-only and candle-gen's quantized
+    /// legs are `cuda`-gated).
+    ///
+    /// Dense and scalar-fp8 rows are rank-agnostic — they carry the logical shape through whole
+    /// (ComfyUI casts biases and modulation vectors to fp8 too) — so they answer `None`: imposing a
+    /// floor on them would refuse real checkpoints.
+    pub fn matrix_rank_refusal(&self) -> Option<String> {
+        const MATRIX_RANK: usize = 2;
+        match &self.codec {
+            TensorCodecSpec::Mxfp8 { .. }
+            | TensorCodecSpec::Nvfp4 { .. }
+            | TensorCodecSpec::Int8PerRow { .. } => {}
+            TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => return None,
+        }
+        if self.shape.len() == MATRIX_RANK {
+            return None;
+        }
+        Some(format!(
+            "codec {}: tensor {:?} decodes as an [out, in] matrix — expected rank {MATRIX_RANK}, \
+             observed rank {} (planned logical shape {:?}); this plan did not come from the \
+             checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
+            self.codec_id,
+            self.physical_key,
+            self.shape.len(),
+            self.shape,
+        ))
+    }
 }
 
 /// What a companion tensor is for.
@@ -824,10 +868,43 @@ impl LogicalWeightPlan {
     /// resident dtype, logical shape — for byte-pricing projections (quantization projections
     /// included) that operate on tensor headers. Dense-fallback view: packed entries keep their
     /// stored encoding and shape.
-    pub fn resident_tensor_headers(&self) -> Vec<SafetensorsTensorHeader> {
+    ///
+    /// # Why this refuses a GGUF-backed plan (sc-20651)
+    ///
+    /// The whole point of a synthesized header is that `dtype × shape` **is** the tensor's byte
+    /// count — that is the invariant every consumer of these headers reads them under.
+    /// `mlx_gen::asset_facts::projected_tensor_headers_bytes` re-prices from `shape` for both the
+    /// dense-width and the `GroupQuantized` projection, and only falls back to `data_bytes` for a
+    /// tensor it cannot shape.
+    ///
+    /// A [`WeightEncoding::GgufContainer`] entry breaks that invariant: it is ggml block-quantized,
+    /// so it has no integral per-element width ([`WeightEncoding::element_bytes`] reports `0`) and
+    /// its `to_dtype` is the opaque `U8` byte view, while `shape` stays the *logical element* grid.
+    /// A `[256, 256]` Q4_K weight would present as `U8 [256, 256]` — 65 536 bytes — against a real
+    /// container size of 36 864. Rather than emit that header and rely on every present and future
+    /// consumer preferring `data_bytes`, the whole view refuses and names the tensor. A GGUF plan's
+    /// byte accounting is already available, correct, from [`Self::resident_bytes`] and each
+    /// tensor's `residency.resident_bytes`, both measured from ggml's own block/type sizes.
+    pub fn resident_tensor_headers(
+        &self,
+    ) -> Result<Vec<SafetensorsTensorHeader>, ResidentTensorHeadersError> {
         self.tensors
             .iter()
             .map(|tensor| {
+                // The encoding whose `to_dtype` this header would present. A zero per-element width
+                // means the `dtype × shape` re-pricing the header promises cannot be honoured.
+                let presented = match tensor.residency.mode {
+                    ResidencyMode::Dense => tensor.resident_encoding,
+                    ResidencyMode::Packed => tensor.encoding,
+                };
+                if presented.element_bytes() == 0 {
+                    return Err(ResidentTensorHeadersError::NoPerElementWidth {
+                        logical_key: tensor.logical_key.clone(),
+                        codec_id: tensor.codec_id,
+                        encoding: presented,
+                        resident_bytes: tensor.residency.resident_bytes,
+                    });
+                }
                 let (dtype, shape) = match tensor.residency.mode {
                     ResidencyMode::Dense => {
                         (tensor.resident_encoding.to_dtype(), tensor.shape.clone())
@@ -847,16 +924,73 @@ impl LogicalWeightPlan {
                         },
                     ),
                 };
-                SafetensorsTensorHeader {
+                Ok(SafetensorsTensorHeader {
                     name: tensor.logical_key.clone(),
                     dtype,
                     shape,
                     data_bytes: tensor.residency.resident_bytes,
-                }
+                })
             })
             .collect()
     }
 }
+
+/// Why a plan cannot present a synthesized resident tensor-header view.
+///
+/// See [`LogicalWeightPlan::resident_tensor_headers`]; the one case today is the GGUF container
+/// row, whose ggml blocks have no per-element width to re-price from.
+///
+/// # Deliberately NOT `#[non_exhaustive]` (sc-20651 feature-end review, minor 13)
+///
+/// Marking it `#[non_exhaustive]` would let a future variant be added without touching any
+/// consumer. That is the wrong trade here, twice over:
+///
+/// * gen-core is a **workspace-internal contract crate** with no downstream users outside this
+///   repo, so there is no compatibility to buy — the only thing `#[non_exhaustive]` would purchase
+///   is that a new refusal reason slips past the code that has to react to it.
+/// * Every other error enum on this seam ([`LogicalWeightPlanError`] here,
+///   `candle_gen_wan::gguf::GgufPlanError`) is exhaustive for the same reason, and
+///   `mlx-gen-minimax-h3`'s residency test states the rule outright: list every variant so a new
+///   one **reds the code that must handle it**.
+///
+/// The consequence is intended and is a *compile* error, never a silent one: a second variant here
+/// stops `candle_gen_wan::gguf`'s `resident_tensor_headers_refuse_a_gguf_backed_plan` from
+/// compiling (it destructures `NoPerElementWidth` irrefutably), which is exactly the prompt to
+/// decide what that test should now assert. Whoever adds the variant owns that edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidentTensorHeadersError {
+    /// The tensor's resident encoding has no integral bytes-per-element, so a synthesized
+    /// `dtype × shape` header would contradict its own byte count.
+    NoPerElementWidth {
+        logical_key: String,
+        codec_id: &'static str,
+        encoding: WeightEncoding,
+        /// The correct resident size, so the diagnostic carries the number the caller wanted.
+        resident_bytes: u64,
+    },
+}
+
+impl fmt::Display for ResidentTensorHeadersError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPerElementWidth {
+                logical_key,
+                codec_id,
+                encoding,
+                resident_bytes,
+            } => write!(
+                f,
+                "codec {codec_id}: tensor {logical_key:?} is resident as `{}`, which has no \
+                 bytes-per-element, so a synthesized `dtype x shape` tensor header would misstate \
+                 its size; this plan cannot be priced through tensor headers — read its measured \
+                 residency ({resident_bytes} bytes for this tensor) instead",
+                encoding.label()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResidentTensorHeadersError {}
 
 /// Why a header could not compile to a plan. Every variant names the exact tensor it fails on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2143,8 +2277,14 @@ mod tests {
         assert!(plan.resident_bytes() < dense.resident_bytes());
 
         // The packed projection presents the stored byte matrix, the dense one the logical grid.
-        assert_eq!(plan.resident_tensor_headers()[0].shape, vec![32, 32]);
-        assert_eq!(dense.resident_tensor_headers()[0].shape, vec![32, 64]);
+        assert_eq!(
+            plan.resident_tensor_headers().expect("priceable")[0].shape,
+            vec![32, 32]
+        );
+        assert_eq!(
+            dense.resident_tensor_headers().expect("priceable")[0].shape,
+            vec![32, 64]
+        );
     }
 
     #[test]
@@ -3089,7 +3229,7 @@ mod tests {
     fn resident_tensor_headers_present_the_dense_fallback_form_for_pricing() {
         let (headers, descriptors) = mixed_fixture();
         let plan = compile(&headers, &descriptors, &StripPrefix, &full()).unwrap();
-        let resident = plan.resident_tensor_headers();
+        let resident = plan.resident_tensor_headers().expect("priceable");
         let by_name: BTreeMap<&str, &SafetensorsTensorHeader> = resident
             .iter()
             .map(|header| (header.name.as_str(), header))
@@ -3130,7 +3270,7 @@ mod tests {
         assert_eq!(tensor.resident_encoding, WeightEncoding::DenseF32);
         assert_eq!(tensor.residency.resident_bytes, 4 * 8 * 4);
 
-        let resident = plan.resident_tensor_headers();
+        let resident = plan.resident_tensor_headers().expect("priceable");
         assert_eq!(resident.len(), 1);
         assert_eq!(resident[0].dtype, Dtype::F32);
         // The synthesized header must be internally consistent: dtype width × logical elements is

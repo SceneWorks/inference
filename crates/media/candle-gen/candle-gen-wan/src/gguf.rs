@@ -719,8 +719,9 @@ impl<'a> WeightSrc<'a> {
 mod tests {
     use super::*;
     use crate::rope::WanRope;
-    use candle_gen::candle_core::quantized::{gguf_file, GgmlDType};
+    use candle_gen::candle_core::quantized::{gguf_file, GgmlDType, QStorage};
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::gen_core::ResidentTensorHeadersError;
     use candle_gen::quant::MatmulStrategy;
 
     /// A small config whose every Linear contraction (`in`) is a multiple of the Q4_K block (256), so a
@@ -1089,6 +1090,275 @@ mod tests {
             GgufPlanError::UnregisteredCodec {
                 codec_id: GGUF_CONTAINER_CODEC.codec_id,
             }
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **sc-20651 feature-end review (minor): a Q4_K value golden.**
+    ///
+    /// Everything else in this module checks *sizes* — container bytes, receipts, key remaps —
+    /// and a Q4_K weight that dequantized to garbage would pass all of it. This pins the values.
+    ///
+    /// One `block_q4_K` is built here byte by byte in the ggml wire layout, written into a real
+    /// `.gguf`, and asserted against the reference **twice**:
+    ///
+    /// 1. at the raw seam — `gguf_file::Content::tensor` + `QTensor::dequantize`, the two calls
+    ///    the loader makes;
+    /// 2. through the loader itself — [`GgufDit::open_with`] (the drivable form of
+    ///    [`GgufDit::open`], driven here with the production mapping and the production
+    ///    `gguf_codec_registry`) followed by [`GgufDit::dense`]. This is what makes the
+    ///    "production path" claim above load-bearing rather than a comment: it pins the plan
+    ///    compile, the native→diffusers remap and the resident-`QTensor` dequantization as one
+    ///    chain onto these values, so a regression anywhere along it reds here.
+    ///
+    /// The k-quant *Linear* path (`GgufDit::qlinear` →
+    /// `candle_gen::quant::MatmulStrategy::DequantDense`) dequantizes per matmul rather than at
+    /// load, so it is not driven here — but it dequantizes the **same** resident `Arc<QTensor>`
+    /// [`GgufDit::dense`] reads below, and the test asserts that identity rather than assuming it.
+    ///
+    /// The expected values are computed **here**, from the ggml Q4_K spec (llama.cpp
+    /// `k_quants.c`: `dequantize_row_q4_K` + `get_scale_min_k4`) — nothing in the expectation
+    /// calls candle, and nothing is snapshotted from what the code currently emits:
+    ///
+    /// ```text
+    /// block_q4_K = { d: f16, dmin: f16, scales: [u8; 12], qs: [u8; 128] }   // 144 bytes, QK_K = 256
+    ///
+    /// sub-block j in 0..8 draws a 6-bit scale sc[j] and min m[j] out of `scales`:
+    ///   j < 4 : sc = scales[j] & 63
+    ///           m  = scales[j + 4] & 63
+    ///   j >= 4: sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4)
+    ///           m  = (scales[j + 4] >> 4)  | ((scales[j]     >> 6) << 4)
+    ///
+    /// the 128 `qs` bytes are read in four 32-byte groups p = 0..4; group p carries sub-blocks
+    /// 2p (LOW nibbles) then 2p + 1 (HIGH nibbles):
+    ///   out[64p + l]      = d * sc[2p]     * (qs[32p + l] & 0xF) - dmin * m[2p]
+    ///   out[64p + 32 + l] = d * sc[2p + 1] * (qs[32p + l] >> 4)  - dmin * m[2p + 1]
+    /// ```
+    #[test]
+    fn q4k_block_dequantizes_to_the_ggml_spec_values() {
+        // ── the fixture, chosen not sampled ───────────────────────────────────────────────────
+        // Six-bit scales and mins. Indices 4..8 are >15 on purpose: their low nibble lives in
+        // `scales[j + 4]` and their high 2 bits in the top of `scales[j - 4]` / `scales[j]`, so a
+        // decoder that skipped the split-field branch reads them wrong.
+        let ls: [u8; 8] = [1, 17, 33, 63, 5, 21, 42, 58];
+        let lm: [u8; 8] = [63, 2, 18, 34, 9, 25, 41, 57];
+        let mut scales = [0_u8; 12];
+        for j in 0..8 {
+            if j < 4 {
+                scales[j] = ls[j];
+                scales[j + 4] = lm[j];
+            } else {
+                scales[j + 4] = (ls[j] & 0xF) | ((lm[j] & 0xF) << 4);
+                scales[j - 4] |= (ls[j] >> 4) << 6;
+                scales[j] |= (lm[j] >> 4) << 6;
+            }
+        }
+        // `d` = 2^-5 and `dmin` = 2^-6, both exactly representable as f16 (sign 0, mantissa 0),
+        // written as their little-endian half bits so the fixture owes candle nothing:
+        // 2^-5 -> exponent field 10 -> 0x2800; 2^-6 -> exponent field 9 -> 0x2400.
+        let (d, dmin) = (0.03125_f32, 0.015625_f32);
+        let (d_bits, dmin_bits) = (0x2800_u16, 0x2400_u16);
+        // 128 quant bytes; 7 is odd, so both nibble lanes sweep all 16 codes.
+        let qs: Vec<u8> = (0..128_usize).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+
+        let mut block = Vec::with_capacity(144);
+        block.extend_from_slice(&d_bits.to_le_bytes());
+        block.extend_from_slice(&dmin_bits.to_le_bytes());
+        block.extend_from_slice(&scales);
+        block.extend_from_slice(&qs);
+        assert_eq!(block.len(), GgmlDType::Q4K.type_size(), "one block_q4_K");
+
+        // ── the independent reference, straight from the spec above ───────────────────────────
+        let get_scale_min_k4 = |j: usize| -> (u8, u8) {
+            if j < 4 {
+                (scales[j] & 63, scales[j + 4] & 63)
+            } else {
+                (
+                    (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4),
+                    (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+                )
+            }
+        };
+        // The fixture is what it claims to be: the packing above round-trips through the
+        // unpacking, including the split 6-bit fields.
+        for j in 0..8 {
+            assert_eq!(get_scale_min_k4(j), (ls[j], lm[j]), "sub-block {j}");
+        }
+        let mut expected = vec![0.0_f32; 256];
+        for p in 0..4 {
+            let (sc_low, m_low) = get_scale_min_k4(2 * p);
+            let (sc_high, m_high) = get_scale_min_k4(2 * p + 1);
+            for l in 0..32 {
+                let byte = qs[32 * p + l];
+                expected[64 * p + l] =
+                    d * sc_low as f32 * (byte & 0xF) as f32 - dmin * m_low as f32;
+                expected[64 * p + 32 + l] =
+                    d * sc_high as f32 * (byte >> 4) as f32 - dmin * m_high as f32;
+            }
+        }
+
+        // ── through the production read + dequantize ──────────────────────────────────────────
+        let storage = QStorage::from_data(
+            std::borrow::Cow::Borrowed(block.as_slice()),
+            &Device::Cpu,
+            GgmlDType::Q4K,
+        )
+        .unwrap();
+        let qt = QTensor::new(storage, (1, 256)).unwrap();
+        assert_eq!(
+            qt.data().unwrap().as_ref(),
+            block.as_slice(),
+            "fixture bytes"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tensors: HashMap<String, QTensor> = HashMap::new();
+        tensors.insert("blocks.0.self_attn.q.weight".into(), qt);
+        let path = write_gguf(&tmp, &tensors, "q4k-golden");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut file).unwrap();
+        assert_eq!(
+            content.tensor_infos["blocks.0.self_attn.q.weight"].ggml_dtype,
+            GgmlDType::Q4K
+        );
+        let read_back = content
+            .tensor(&mut file, "blocks.0.self_attn.q.weight", &Device::Cpu)
+            .unwrap();
+        assert_eq!(read_back.storage_size_in_bytes(), 144);
+        let got: Vec<f32> = read_back
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert_eq!(got.len(), 256);
+        for (index, (got, expected)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got,
+                expected,
+                "element {index} (sub-block {}, {} nibble)",
+                index / 32,
+                if (index / 32) % 2 == 0 { "low" } else { "high" }
+            );
+        }
+        // The sweep only means something if the block actually spans its scale/min grid: a decode
+        // that collapsed to one sub-block's scale would still match a constant reference.
+        let distinct: std::collections::BTreeSet<u32> = got.iter().map(|v| v.to_bits()).collect();
+        assert!(
+            distinct.len() > 100,
+            "the fixture must produce a wide value spread, got {} distinct values",
+            distinct.len()
+        );
+
+        // ── and through the loader, so the claim above is asserted rather than asserted-about ──
+        // `open_with` is `GgufDit::open` with the two collaborators injected; both are the
+        // production ones here, so this drives the whole chain: header parse → plan compile →
+        // native→diffusers remap → materialize → `GgufDit::dense`'s `QTensor::dequantize`.
+        let dit = GgufDit::open_with(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            &WanNativeToDiffusersMapping,
+            gguf_codec_registry(),
+        )
+        .expect("the golden container opens through the loader");
+        // The remap really fired: the loader keys the block at its diffusers name.
+        let logical = "blocks.0.attn1.to_q.weight";
+        let resident = dit
+            .require(logical)
+            .unwrap_or_else(|error| panic!("fixture check: {error}"));
+        assert_eq!(
+            resident.dtype(),
+            GgmlDType::Q4K,
+            "the loader must hold the block STILL QUANTIZED — dequantizing at load is the \
+             behaviour this whole route exists to avoid"
+        );
+        // `qlinear` hands exactly this `Arc<QTensor>` to `MatmulStrategy::DequantDense`, so the
+        // values pinned below are the values that path dequantizes.
+        assert_eq!(
+            resident.data().unwrap().as_ref(),
+            block.as_slice(),
+            "the resident QTensor must be the fixture's bytes"
+        );
+        let through_loader: Vec<f32> = dit
+            .dense(logical, Shape::from((1, 256)))
+            .expect("the resident block dequantizes through the loader")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(through_loader, expected, "loader dequantize vs ggml spec");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **sc-20651 feature-end review (minor): a GGUF plan cannot be priced through tensor
+    /// headers.** [`LogicalWeightPlan::resident_tensor_headers`] synthesizes a `dtype × shape`
+    /// header, and its consumer (`mlx_gen::asset_facts::projected_tensor_headers_bytes`) re-prices
+    /// from that shape. A GGUF entry is ggml block-quantized: it has no bytes-per-element, its
+    /// `to_dtype` is the opaque `U8` byte view, and `shape` stays the *logical element* grid — so
+    /// the header for the `[256, 256]` Q4_K projection below would claim 65 536 bytes against a
+    /// real container size of 36 864. The view therefore refuses by name instead of emitting a
+    /// number that contradicts the plan's own residency.
+    ///
+    /// Documenting the skew at the emit site was the alternative; it was rejected because there is
+    /// no caller that needs this view on a GGUF plan (the one production caller,
+    /// `mlx-gen-krea::block_memory_strategy::native_dit_transformer_bytes`, prices safetensors),
+    /// and a GGUF plan's byte accounting is already available and correct from
+    /// `LogicalWeightPlan::resident_bytes`.
+    #[test]
+    fn resident_tensor_headers_refuse_a_gguf_backed_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = gguf_cfg();
+        let tensors = native_wan_tensors(&cfg);
+        let path = write_gguf(&tmp, &tensors, "resident-headers");
+        let content = read_content(&path);
+        let GgufDitPlan { plan, .. } = compile_gguf_dit_plan(
+            &path,
+            &content,
+            &WanNativeToDiffusersMapping,
+            gguf_codec_registry(),
+        )
+        .expect("the native fixture compiles");
+
+        let error = plan
+            .resident_tensor_headers()
+            .expect_err("a GGUF-backed plan has no header-priceable resident form");
+        let ResidentTensorHeadersError::NoPerElementWidth {
+            logical_key,
+            codec_id,
+            encoding,
+            resident_bytes,
+        } = &error;
+        assert_eq!(*codec_id, GGUF_CONTAINER_CODEC.codec_id);
+        assert_eq!(*encoding, WeightEncoding::GgufContainer);
+        let refused = plan
+            .tensors
+            .iter()
+            .find(|tensor| tensor.logical_key == *logical_key)
+            .expect("the refusal names a planned tensor");
+        assert_eq!(*resident_bytes, refused.residency.resident_bytes);
+        assert!(
+            error.to_string().contains(logical_key.as_str())
+                && error.to_string().contains(&resident_bytes.to_string()),
+            "the refusal must name the tensor and its measured size: {error}"
+        );
+
+        // The number the refusal prevents: `U8 × logical shape` for the Q4_K projection is the
+        // element count, ~1.78× its real 144-bytes-per-256-element container size.
+        let q = plan
+            .tensors
+            .iter()
+            .find(|tensor| tensor.logical_key == "blocks.0.attn1.to_q.weight")
+            .expect("the remapped q projection is planned");
+        let header_bytes: u64 = q.shape.iter().product::<usize>() as u64
+            * WeightEncoding::GgufContainer.to_dtype().size() as u64;
+        assert_eq!(header_bytes, (cfg.dim * cfg.dim) as u64);
+        assert_ne!(
+            header_bytes, q.residency.resident_bytes,
+            "if a U8-times-shape header ever equalled the container size the refusal would be moot"
         );
         std::fs::remove_file(&path).ok();
     }
