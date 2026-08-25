@@ -602,9 +602,10 @@ fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
 
     let Some(dev) = nvfp4_device() else { return };
     let root = bf16_root();
-    let nvfp4_file = PathBuf::from(std::env::var("KREAMANIA_VARIANT7").expect(
-        "set KREAMANIA_VARIANT7 to the pinned krea2_turbo_nvfp4.safetensors single file",
-    ));
+    let nvfp4_file =
+        PathBuf::from(std::env::var("KREAMANIA_VARIANT7").expect(
+            "set KREAMANIA_VARIANT7 to the pinned krea2_turbo_nvfp4.safetensors single file",
+        ));
     assert_exclusive_gpu("E9 median step-speed floor");
 
     let ctx = encode_context(&root, &dev);
@@ -626,7 +627,10 @@ fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
         DeclaredLogicalShapes::FromConfig(&cfg),
     )
     .expect("the pinned NVFP4 single file plans");
-    assert!(w.is_native_nvfp4(), "the fixture must be the NVFP4 checkpoint");
+    assert!(
+        w.is_native_nvfp4(),
+        "the fixture must be the NVFP4 checkpoint"
+    );
     let mixed = Krea2Transformer::load(&w, &cfg).expect("the shipping mixed trunk constructs");
 
     // Planned-vs-resident agreement: the facts validator enforces the demotion-adjusted equality

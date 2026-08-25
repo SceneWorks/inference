@@ -112,7 +112,11 @@ impl DoubleLeaf {
     /// default into the packed lane.
     pub fn reads_text_stream(self) -> bool {
         match self {
-            Self::AddQ | Self::AddK | Self::AddV | Self::ToAddOut | Self::FfCtxIn
+            Self::AddQ
+            | Self::AddK
+            | Self::AddV
+            | Self::ToAddOut
+            | Self::FfCtxIn
             | Self::FfCtxOut => true,
             Self::ToQ | Self::ToK | Self::ToV | Self::ToOut | Self::FfIn | Self::FfOut => false,
         }
@@ -125,8 +129,14 @@ impl DoubleLeaf {
     pub fn reads_post_nonlinearity(self) -> bool {
         match self {
             Self::ToOut | Self::ToAddOut | Self::FfOut | Self::FfCtxOut => true,
-            Self::ToQ | Self::ToK | Self::ToV | Self::AddQ | Self::AddK | Self::AddV
-            | Self::FfIn | Self::FfCtxIn => false,
+            Self::ToQ
+            | Self::ToK
+            | Self::ToV
+            | Self::AddQ
+            | Self::AddK
+            | Self::AddV
+            | Self::FfIn
+            | Self::FfCtxIn => false,
         }
     }
 }
@@ -519,7 +529,10 @@ mod tests {
         }
         // Edges: the first double block and the first/last single block guard their
         // block-input reads too.
-        expect_dense("transformer_blocks.0.attn.to_q", KleinDenseReason::EdgeBlock);
+        expect_dense(
+            "transformer_blocks.0.attn.to_q",
+            KleinDenseReason::EdgeBlock,
+        );
         expect_dense(
             "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
             KleinDenseReason::EdgeBlock,
@@ -531,6 +544,9 @@ mod tests {
         );
         // Unclassified keys are dense by refusal, never packed by default.
         expect_dense("some.novel.key", KleinDenseReason::Unclassified);
-        expect_dense("transformer_blocks.4.attn.mystery", KleinDenseReason::Unclassified);
+        expect_dense(
+            "transformer_blocks.4.attn.mystery",
+            KleinDenseReason::Unclassified,
+        );
     }
 }

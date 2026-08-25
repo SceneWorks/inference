@@ -1050,7 +1050,9 @@ mod tests {
 
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        additive.push_lora(p.a.clone(), p.b.clone(), p.scale).unwrap();
+        additive
+            .push_lora(p.a.clone(), p.b.clone(), p.scale)
+            .unwrap();
         let delta = reconstruct_lora_delta(&down, &up, alpha, rank as f32, scale).unwrap();
         let folded =
             AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);

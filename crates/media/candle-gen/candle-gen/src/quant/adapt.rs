@@ -2316,9 +2316,19 @@ mod tests {
         let dev = Device::Cpu;
         let w1 = Tensor::ones((2, 8), DType::F32, &dev).unwrap();
         let w2 = Tensor::ones((8, 8), DType::F32, &dev).unwrap();
-        let wrong = LokrFactors::build(1.0, (16, 64), Some(&w1), None, None, Some(&w2), None, None, None)
-            .unwrap()
-            .expect("a plain linear LoKr is deferrable");
+        let wrong = LokrFactors::build(
+            1.0,
+            (16, 64),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a plain linear LoKr is deferrable");
         let error = host.push_lokr_structured(wrong).unwrap_err().to_string();
         assert!(error.contains("NVFP4 base"), "{error}");
         assert!(!host.is_adapted());

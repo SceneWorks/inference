@@ -535,7 +535,9 @@ pub fn install_anima_residuals(
                     )? {
                         Some(f) => {
                             lin.push_lokr_structured(f.to_device(device)?)
-                                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+                                .map_err(|error| {
+                                    candle_gen::candle_core::Error::Msg(error.to_string())
+                                })?;
                             report.merged += 1;
                         }
                         None => {

@@ -427,9 +427,7 @@ impl PlannedDitWeights {
                     let resident = lin.resident_weight_bytes()? as u64;
                     self.reader
                         .demote_to_dense_fallback(&weight_key, resident)
-                        .map_err(|error| {
-                            candle_gen::candle_core::Error::Msg(error.to_string())
-                        })?;
+                        .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                 }
                 Ok(QLinear::from_nvfp4(lin))
             }

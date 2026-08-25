@@ -219,9 +219,7 @@ fn klein_planned_dit_bytes(
     let roles = crate::nvfp4_roles::KleinRoleTable::new(cfg);
     const W4A16_RESIDENT_BYTES_PER_ELEMENT: u64 = 2;
     let stays_packed = |logical_key: &str| -> bool {
-        let base = logical_key
-            .strip_suffix(".weight")
-            .unwrap_or(logical_key);
+        let base = logical_key.strip_suffix(".weight").unwrap_or(logical_key);
         roles.execution_role(base).is_packed_w4a4()
     };
     let mut total = 0_u64;

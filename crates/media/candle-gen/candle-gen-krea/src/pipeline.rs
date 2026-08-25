@@ -3102,11 +3102,8 @@ mod tests {
             !facts.materialized().is_empty(),
             "a planned dense native load measures its reads through the shared reader"
         );
-        assert!(facts
-            .materialized()
-            .iter()
-            .all(|row| row.representation
-                == gen_core::checkpoint_facts::ExecutionRepresentation::DenseFallback));
+        assert!(facts.materialized().iter().all(|row| row.representation
+            == gen_core::checkpoint_facts::ExecutionRepresentation::DenseFallback));
         assert!(facts.receipt().demotions.is_empty());
     }
 

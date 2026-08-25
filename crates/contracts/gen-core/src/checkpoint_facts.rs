@@ -889,7 +889,9 @@ fn demotion_adjustments(
     let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
     for tensor in &plan.tensors {
         if tensor.residency.mode == ResidencyMode::Packed {
-            *packed_outputs.entry(tensor.physical_key.as_str()).or_default() += 1;
+            *packed_outputs
+                .entry(tensor.physical_key.as_str())
+                .or_default() += 1;
             codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
         }
     }
@@ -922,7 +924,9 @@ fn demotion_adjustments(
         adjustment.packed_bytes = adjustment
             .packed_bytes
             .saturating_add(tensor.residency.resident_bytes);
-        adjustment.dense_bytes = adjustment.dense_bytes.saturating_add(demotion.resident_bytes);
+        adjustment.dense_bytes = adjustment
+            .dense_bytes
+            .saturating_add(demotion.resident_bytes);
         *demoted_outputs
             .entry(tensor.physical_key.as_str())
             .or_default() += 1;
@@ -982,24 +986,23 @@ fn validate(
     // The demotion-adjusted expectation for one (codec, representation) cell: demoted rows leave
     // the packed expectation (tensor count, planned packed bytes, consumed companions) and join
     // the dense one carrying the dense bytes the provider measured on the constructed layer.
-    let adjusted = |entry: &SourceCodecEntry,
-                    representation: ExecutionRepresentation|
-     -> (usize, u64) {
-        let (tensors, bytes) = entry.planned(representation);
-        let Some(adjustment) = adjustments.get(entry.codec_id) else {
-            return (tensors, bytes);
+    let adjusted =
+        |entry: &SourceCodecEntry, representation: ExecutionRepresentation| -> (usize, u64) {
+            let (tensors, bytes) = entry.planned(representation);
+            let Some(adjustment) = adjustments.get(entry.codec_id) else {
+                return (tensors, bytes);
+            };
+            match representation {
+                ExecutionRepresentation::NativePacked => (
+                    tensors.saturating_sub(adjustment.packed_tensors),
+                    bytes.saturating_sub(adjustment.packed_bytes),
+                ),
+                ExecutionRepresentation::DenseFallback => (
+                    tensors + adjustment.packed_tensors,
+                    bytes.saturating_add(adjustment.dense_bytes),
+                ),
+            }
         };
-        match representation {
-            ExecutionRepresentation::NativePacked => (
-                tensors.saturating_sub(adjustment.packed_tensors),
-                bytes.saturating_sub(adjustment.packed_bytes),
-            ),
-            ExecutionRepresentation::DenseFallback => (
-                tensors + adjustment.packed_tensors,
-                bytes.saturating_add(adjustment.dense_bytes),
-            ),
-        }
-    };
     if receipt.tensor_count > source.tensor_count {
         return Err(CheckpointWeightFactsError::TensorCountExceedsPlan {
             reported: receipt.tensor_count,

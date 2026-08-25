@@ -317,7 +317,9 @@ mod tests {
         let delta = up.matmul(&down)?; // [out, in]
         let mut dense_additive =
             AdaptLinear::from_dense(Linear::new(grid.clone(), None), in_dim, out_dim);
-        dense_additive.push_lora(a.clone(), b_fac.clone(), eff).unwrap();
+        dense_additive
+            .push_lora(a.clone(), b_fac.clone(), eff)
+            .unwrap();
         let folded = Linear::new((grid.clone() + (delta * eff)?)?, None);
         let resid_diff = (dense_additive.forward(&x)? - folded.forward(&x)?)?
             .abs()?
