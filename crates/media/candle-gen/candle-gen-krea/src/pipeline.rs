@@ -929,6 +929,35 @@ fn load_native_dit(
     )
 }
 
+/// Adapter admission for a **Kitchen NVFP4** import (sc-21483, epic 11037).
+///
+/// Low-rank **LoRA/LoKr** adapters are supported: they ride as forward-time additive residuals over
+/// the packed base through the shared [`candle_gen::quant::AdaptLinear`], so no NVFP4 row is
+/// dequantized, re-packed, or converted to host them. (Before sc-21483 the NVFP4 arm was outside
+/// adapter routing entirely and this whole class was refused.)
+///
+/// A **diff-patch** is refused, and that is not a "not yet": a `.diff`/`.diff_b` delta folds
+/// `W += δ` into the DENSE base weight before the trunk is assembled
+/// ([`crate::adapters::fold_diff_patch`]), and an NVFP4-planned row has no dense form to fold into —
+/// the shared reader deliberately refuses a dense read of a packed-planned row rather than
+/// reinterpret the packed nibbles at the component dtype (sc-21482). Folding it would require
+/// dequantizing the base, which is exactly the silent regime change E2 forbids.
+///
+/// Factored as a free fn over `(is_nvfp4, adapters)` so the reject is unit-testable without a
+/// loaded model, mirroring `ensure_multiphase_allowed_for`. A no-op on a non-NVFP4 import.
+fn ensure_nvfp4_adapters_supported(native_nvfp4: bool, adapters: &[AdapterSpec]) -> Result<()> {
+    if native_nvfp4 && crate::adapters::any_diff_patch(adapters) {
+        return Err(CandleError::Msg(
+            "Krea Kitchen NVFP4 imports cannot apply a diff-patch (.diff/.diff_b) adapter: a \
+             diff-patch folds into the dense base weight at load, and an NVFP4-planned row has no \
+             dense form to fold into. Low-rank LoRA/LoKr adapters are supported — they ride as \
+             additive residuals over the packed base."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn load_native_dit_at_dtype(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -957,12 +986,7 @@ fn load_native_dit_at_dtype(
             crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
         )?;
         let native_nvfp4 = dit_w.is_native_nvfp4();
-        if native_nvfp4 && !adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "Krea Kitchen NVFP4 imports do not yet support LoRA/LoKr or diff-patch adapters"
-                    .into(),
-            ));
-        }
+        ensure_nvfp4_adapters_supported(native_nvfp4, adapters)?;
         if native_nvfp4 && stream_blocks {
             return Err(CandleError::Msg(
                 "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
@@ -2711,6 +2735,70 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    /// sc-21483: a Kitchen NVFP4 import admits low-rank **LoRA/LoKr** adapters (they ride as
+    /// additive residuals over the packed base) and still refuses a **diff-patch**, which would
+    /// have to fold into a dense base weight an NVFP4-planned row does not have.
+    ///
+    /// Before sc-21483 this guard refused *every* adapter form on an NVFP4 import, so the real
+    /// Krea NVFP4 + LoRA render failed at load with "do not yet support LoRA/LoKr or diff-patch
+    /// adapters" — which is how the real-weight test caught it.
+    #[test]
+    fn nvfp4_import_admits_low_rank_adapters_and_still_refuses_a_diff_patch() {
+        use candle_gen::candle_core::safetensors::save as save_tensors;
+        use candle_gen::candle_core::{Device, Tensor};
+        use candle_gen::gen_core::AdapterKind;
+        use std::collections::HashMap;
+
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().unwrap();
+
+        let lora_path = dir.path().join("lowrank.safetensors");
+        let mut lora: HashMap<String, Tensor> = HashMap::new();
+        lora.insert(
+            "transformer_blocks.0.attn.to_q.lora_A.weight".to_owned(),
+            Tensor::zeros((2, 8), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        lora.insert(
+            "transformer_blocks.0.attn.to_q.lora_B.weight".to_owned(),
+            Tensor::zeros((8, 2), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        save_tensors(&lora, &lora_path).unwrap();
+
+        let diff_path = dir.path().join("patch.safetensors");
+        let mut diff: HashMap<String, Tensor> = HashMap::new();
+        diff.insert(
+            "transformer_blocks.0.attn.to_q.diff".to_owned(),
+            Tensor::zeros((8, 8), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        save_tensors(&diff, &diff_path).unwrap();
+
+        let lora_spec = vec![AdapterSpec::new(lora_path, 1.0, AdapterKind::Lora)];
+        let diff_spec = vec![AdapterSpec::new(diff_path, 1.0, AdapterKind::Lora)];
+
+        // The low-rank adapter is admitted on an NVFP4 import…
+        ensure_nvfp4_adapters_supported(true, &lora_spec)
+            .expect("a low-rank LoRA rides additively over the packed NVFP4 base");
+        // …the diff-patch is not.
+        let error = ensure_nvfp4_adapters_supported(true, &diff_spec)
+            .expect_err("a diff-patch has no dense base weight to fold into on an NVFP4 import")
+            .to_string();
+        assert!(error.contains("diff-patch"), "{error}");
+        assert!(
+            error.contains("no dense form to fold into"),
+            "the refusal must say WHY, not just that it is unsupported: {error}"
+        );
+        assert!(
+            error.contains("LoRA/LoKr adapters are supported"),
+            "the refusal must not read as a blanket adapter ban: {error}"
+        );
+
+        // A non-NVFP4 import is unaffected by this gate in either direction (a dense/int8 import
+        // folds diff-patches normally).
+        ensure_nvfp4_adapters_supported(false, &diff_spec)
+            .expect("a dense import still folds diff-patches");
+        ensure_nvfp4_adapters_supported(true, &[]).expect("an adapter-free NVFP4 import loads");
+    }
 
     #[test]
     fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {

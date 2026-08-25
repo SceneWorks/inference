@@ -1509,6 +1509,17 @@ fn validate_native_file_transformer_request(
 }
 
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
+    // sc-21483: refuse an adapter-bearing load against a descriptor that does not advertise adapter
+    // support — the shape an imported-model route takes when its binding declares
+    // `inherit_adapters = false` (the registry withdraws `supports_lora`/`supports_lokr` from the
+    // route's descriptor). Refusing here is the difference between a typed capability error and a
+    // silently un-adapted render. It runs BEFORE the load-source validation because the answer does
+    // not depend on the weights: the caller asked for something this route cannot do at all.
+    gen_core::reject_unsupported_adapters(
+        descriptor.id,
+        &descriptor.capabilities,
+        spec.adapters.len(),
+    )?;
     let (root, native_dit, convrot_dit, loaded_quant, text_encoder_source) =
         validate_load_spec(spec, descriptor.id)?;
     #[cfg(any(feature = "cuda", test))]
@@ -3208,6 +3219,64 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// **AC#3 (sc-21483) — a descriptor that does not inherit adapters REFUSES an adapter-bearing
+    /// request** with a typed capability error, rather than loading and ignoring the adapter.
+    ///
+    /// This is the shape an imported-model route takes when its binding declares
+    /// `inherit_adapters = false`: the registry withdraws `supports_lora`/`supports_lokr` from the
+    /// route's descriptor before handing it to `build`. Krea's own registered descriptors all
+    /// inherit adapters (asserted below), so the negative case is exercised by withdrawing the
+    /// capability the way the registry does.
+    #[test]
+    fn a_descriptor_that_does_not_inherit_adapters_refuses_an_adapter_bearing_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("base");
+        std::fs::create_dir_all(&root).unwrap();
+        let adapter = tmp.path().join("style.safetensors");
+        std::fs::write(&adapter, b"fixture").unwrap();
+
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.adapters = vec![gen_core::AdapterSpec::new(
+            adapter,
+            1.0,
+            gen_core::AdapterKind::Lora,
+        )];
+
+        // The registered descriptor DOES inherit adapters, so the same spec is admitted here…
+        let inheriting = descriptor();
+        assert!(inheriting.capabilities.supports_lora || inheriting.capabilities.supports_lokr);
+        gen_core::reject_unsupported_adapters(
+            inheriting.id,
+            &inheriting.capabilities,
+            spec.adapters.len(),
+        )
+        .expect("an adapter-inheriting route admits an adapter-bearing spec");
+
+        // …and refused once the route withdraws adapter inheritance.
+        let mut withdrawn = descriptor();
+        withdrawn.capabilities.supports_lora = false;
+        withdrawn.capabilities.supports_lokr = false;
+        let error = match build(&spec, withdrawn) {
+            Ok(_) => panic!("an adapter-bearing load must not silently drop the adapter"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "the refusal must be a typed capability error, got {error:?}"
+        );
+        let error = error.to_string();
+        assert!(error.contains("does not inherit adapters"), "{error}");
+        assert!(error.contains(KREA_2_TURBO_ID), "{error}");
+
+        // An adapter-free spec against the SAME withdrawn descriptor is not refused for this
+        // reason — the gate keys off the adapter selection, not the capability alone.
+        let mut withdrawn = descriptor();
+        withdrawn.capabilities.supports_lora = false;
+        withdrawn.capabilities.supports_lokr = false;
+        gen_core::reject_unsupported_adapters(withdrawn.id, &withdrawn.capabilities, 0)
+            .expect("an adapter-free spec is unaffected");
     }
 
     #[test]

@@ -423,7 +423,12 @@ impl QLinear {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         match self {
             Self::Adapt(linear) => linear.to_device(device),
-            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => Ok(()),
+            // sc-21483: route the NVFP4 arm through the shared host so any installed residual
+            // migrates with the projection, and a cross-device move is refused rather than silently
+            // dropped (the packed weight is staged at construction and cannot be re-staged). A move
+            // onto the device it already occupies stays the no-op it has always been.
+            Self::Nvfp4(p) => p.adapt_mut().to_device(device),
+            Self::ConvRotInt8(_) | Self::Probed(_) => Ok(()),
         }
     }
 
@@ -452,62 +457,104 @@ impl QLinear {
     }
 
     /// The inner shared [`AdaptLinear`] used by dense/MLX-packed projections. INT8-ConvRot carries its
-    /// own additive stack through `as_additive_mut`; NVFP4/probed validation legs are bench-only.
+    /// own additive stack through `as_additive_mut`; the probe leg is instrumentation-only.
     pub fn as_adapt_mut(&mut self) -> Option<&mut AdaptLinear> {
         match self {
             Self::Adapt(a) => Some(a),
-            Self::ConvRotInt8(_) | Self::Nvfp4(_) | Self::Probed(_) => None,
+            Self::Nvfp4(p) => Some(p.adapt_mut()),
+            Self::ConvRotInt8(_) | Self::Probed(_) => None,
         }
     }
 
     /// Whether this projection can host job-local additive LoRA/LoKr residuals. Shipping dense,
-    /// MLX-packed, and INT8-ConvRot projections are supported; bench-only NVFP4/probed projections are
-    /// deliberately outside generator routing.
+    /// MLX-packed, **NVFP4** (sc-21483), and INT8-ConvRot projections are all supported; only the
+    /// probe leg is excluded, because it is measurement instrumentation and never on a shipping path.
     pub(crate) fn as_additive_mut(&mut self) -> Option<&mut Self> {
         match self {
-            Self::Adapt(_) | Self::ConvRotInt8(_) => Some(self),
-            Self::Nvfp4(_) | Self::Probed(_) => None,
+            Self::Adapt(_) | Self::ConvRotInt8(_) | Self::Nvfp4(_) => Some(self),
+            Self::Probed(_) => None,
         }
+    }
+
+    /// Whether a factor this projection cannot host must be a hard **admission error** rather than a
+    /// skipped key (sc-21483). True for NVFP4: it has no fallback — the base cannot be folded,
+    /// dequantized, or re-quantized to accommodate a mismatched adapter — so silently skipping would
+    /// render an unadapted base with no signal. The dense and MLX-packed arms keep their existing
+    /// skip-and-report behavior, where a shape mismatch means the key targeted a different module.
+    ///
+    /// Strictness follows the **constructed representation, not the plan**, and that is deliberate.
+    /// A row the plan marks NVFP4 is served DENSE whenever the FP4 representation is unavailable —
+    /// on CPU, on a pre-`sm_120` device, or when the row's shape cannot be aligned to
+    /// `NVFP4_K_ALIGN`/`NVFP4_N_ALIGN` — and such a row arrives here as `Self::Adapt`, so it keeps
+    /// skip-and-report. That is the correct answer for it: a dense base genuinely *can* fold or
+    /// absorb a delta, so the no-fallback premise that justifies refusing does not hold. The
+    /// consequence is that admission strictness is device-dependent for a plan-NVFP4 checkpoint —
+    /// intended, and the same rule `AdditiveProj for AdaptLinear::strict_admission`
+    /// (`crate::adapters`) applies, so the two hosts of one projection never disagree.
+    pub(crate) fn strict_adapter_admission(&self) -> bool {
+        matches!(self, Self::Nvfp4(_))
     }
 
     pub(crate) fn additive_shape(&self) -> (usize, usize) {
         match self {
             Self::Adapt(a) => a.base_shape(),
+            Self::Nvfp4(p) => p.adapt().base_shape(),
             Self::ConvRotInt8(c) => {
                 let (out, input) = c.w_i8.dims2().expect("validated ConvRot rank-2 weight");
                 (out, input)
             }
-            Self::Nvfp4(_) | Self::Probed(_) => {
-                unreachable!("bench-only projections are not exposed to adapter installation")
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
             }
         }
     }
 
-    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+    pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         match self {
             Self::Adapt(host) => host.push_lora(a, b, scale),
+            // NVFP4 admits through the shared CHECKED push: a shape/dtype/device mismatch is a typed
+            // error here — at install, before the first sampler step — and the packed base is never
+            // converted to another regime to make the factor fit.
+            Self::Nvfp4(host) => {
+                return host
+                    .adapt_mut()
+                    .push_lora_checked(a, b, scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
             Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lora { a, b, scale }),
-            Self::Nvfp4(_) | Self::Probed(_) => {
-                unreachable!("bench-only projections are not exposed to adapter installation")
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn push_additive_lokr(&mut self, factors: candle_gen::quant::LokrFactors) {
+    pub(crate) fn push_additive_lokr(
+        &mut self,
+        factors: candle_gen::quant::LokrFactors,
+    ) -> Result<()> {
         match self {
             Self::Adapt(host) => host.push_lokr_structured(factors),
+            Self::Nvfp4(host) => {
+                return host
+                    .adapt_mut()
+                    .push_lokr_structured_checked(factors)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
             Self::ConvRotInt8(host) => host.adapters.push(ConvRotAdapter::Lokr { factors }),
-            Self::Nvfp4(_) | Self::Probed(_) => {
-                unreachable!("bench-only projections are not exposed to adapter installation")
+            Self::Probed(_) => {
+                unreachable!("probe projections are not exposed to adapter installation")
             }
         }
+        Ok(())
     }
 
     pub(crate) fn clear_adapters(&mut self) {
         match self {
             Self::Adapt(host) => host.clear_adapters(),
+            Self::Nvfp4(host) => host.adapt_mut().clear_adapters(),
             Self::ConvRotInt8(host) => host.adapters.clear(),
-            Self::Nvfp4(_) | Self::Probed(_) => {}
+            Self::Probed(_) => {}
         }
     }
 }
@@ -754,7 +801,7 @@ mod tests {
         let mut lora = build()?;
         let a = Tensor::from_vec(vec![0.4f32, -0.2, 0.7, 0.3], (in_dim, 1), &dev)?;
         let b = Tensor::from_vec(vec![0.5f32, -0.6, 0.2, 0.9], (1, out_dim), &dev)?;
-        lora.push_additive_lora(a.clone(), b.clone(), 0.75);
+        lora.push_additive_lora(a.clone(), b.clone(), 0.75)?;
         let lora_actual = (lora.forward(&x)? - bare.forward(&x)?)?;
         let lora_expected = (x.matmul(&a)?.matmul(&b)? * 0.75)?;
         let lora_max = (lora_actual - lora_expected)?
@@ -783,7 +830,7 @@ mod tests {
         .expect("2x2 kron factors fit a 4x4 projection");
         let expected = factors.residual(&x)?;
         let mut lokr = build()?;
-        lokr.push_additive_lokr(factors);
+        lokr.push_additive_lokr(factors)?;
         let lokr_actual = (lokr.forward(&x)? - bare.forward(&x)?)?;
         let lokr_max = (lokr_actual - expected)?
             .abs()?

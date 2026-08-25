@@ -31,12 +31,33 @@ use super::{lin_gs, DenseLinear, QLinear, MLX_GROUP_SIZE};
 use crate::{CandleError, Result};
 use gen_core::Quant;
 
-/// The frozen base weight — **dense** (`candle_nn::Linear`) or **MLX-packed** ([`super::QLinear`],
-/// dequant-on-forward). Both compute `x·Wᵀ (+ b)`; neither is ever mutated by an adapter.
+/// The frozen base weight — **dense** (`candle_nn::Linear`), **MLX-packed** ([`super::QLinear`],
+/// dequant-on-forward), or **NVFP4** ([`super::Nvfp4Linear`], E2M1 block-16 + UE4M3 scales served
+/// either through the FP4 tensor-core GEMM or its transparent dequant→bf16 fallback — sc-21483).
+/// All three compute `x·Wᵀ (+ b)`; none is ever mutated by an adapter.
+///
+/// The NVFP4 leg is held behind an [`Arc`] because [`super::Nvfp4Linear`] owns a staged device
+/// weight (and, on cuda, a cuBLASLt resident) that must not be deep-copied when a job-local DiT
+/// clones the resident trunk to install its own residual stack. The base is read-only by contract,
+/// so sharing it is exactly right: cloning an [`AdaptLinear`] to adapt it per job costs a refcount,
+/// never a re-pack.
 #[derive(Clone)]
 enum Base {
     Dense(Linear),
     Packed(QLinear),
+    Nvfp4(std::sync::Arc<super::Nvfp4Linear>),
+}
+
+/// The one refusal every fold entry point returns on an **NVFP4** base (sc-21483, epic 11037 E2).
+/// An NVFP4 projection has exactly one correct answer to "re-quantize yourself": no. Folding it to
+/// `Q4`/`Q8` (or dequantizing it to BF16) to make some downstream path fit would silently replace the
+/// numeric regime the caller asked for — the exact silent-conversion class this story forbids.
+fn nvfp4_refold_refusal(quant: Quant) -> candle_core::Error {
+    candle_core::Error::Msg(format!(
+        "NVFP4 base: refusing to re-quantize an NVFP4 projection as {quant:?}; an NVFP4 weight is \
+         packed from the bf16 master and is never silently converted to another numeric regime. \
+         Adapters ride as forward-time additive residuals over the packed base instead."
+    ))
 }
 
 impl Base {
@@ -44,6 +65,7 @@ impl Base {
         match self {
             Base::Dense(l) => l.forward(x),
             Base::Packed(q) => q.forward(x),
+            Base::Nvfp4(q) => q.forward(x),
         }
     }
 
@@ -62,11 +84,30 @@ impl Base {
                 Linear::new(w, b).forward(x)
             }
             Base::Packed(q) => q.forward(x),
+            // NVFP4 already produces its output in the activation dtype (the packed weight is never
+            // stored at the activation dtype in the first place), so there is nothing to upcast.
+            Base::Nvfp4(q) => q.forward(x),
         }
     }
 
     fn is_packed(&self) -> bool {
         matches!(self, Base::Packed(_))
+    }
+
+    fn is_nvfp4(&self) -> bool {
+        matches!(self, Base::Nvfp4(_))
+    }
+
+    /// The device the frozen base weight lives on — the device a residual factor must already be on
+    /// before it can be admitted. `None` on the MLX-packed arm, whose resident weight is a `QTensor`
+    /// behind a [`super::MatmulStrategy`] and exposes no device accessor; an admission check then
+    /// verifies shape and dtype only, exactly as it did before this seam existed.
+    fn device(&self) -> Option<Device> {
+        match self {
+            Base::Dense(l) => Some(l.weight().device().clone()),
+            Base::Packed(_) => None,
+            Base::Nvfp4(q) => Some(q.device().clone()),
+        }
     }
 }
 
@@ -516,6 +557,26 @@ impl AdaptLinear {
         }
     }
 
+    /// Wrap an already-built **NVFP4** [`super::Nvfp4Linear`] as an adapter-capable base (sc-21483,
+    /// epic 11037) — the NVFP4 twin of [`Self::from_packed`]. The logical `[out, in]` dims come from
+    /// the packed tensor itself, so no dense weight is read back.
+    ///
+    /// The point of routing NVFP4 through the ONE shared additive wrapper (sc-11091) rather than
+    /// giving it a parallel residual stack: a LoRA/LoKr rides as `scale·((x·a)·b)` (or the Kronecker
+    /// vec-trick) *alongside* the packed forward, so the E2M1 codes are never dequantized, never
+    /// re-packed, and never converted to q4/BF16 to make an adapter fit. Removing the adapter
+    /// ([`Self::clear_adapters`]) restores the base output exactly, because the base was never
+    /// touched.
+    pub fn from_nvfp4(base: super::Nvfp4Linear) -> Self {
+        let (out_dim, in_dim) = base.shape();
+        Self {
+            base: Base::Nvfp4(std::sync::Arc::new(base)),
+            out_features: out_dim,
+            in_features: in_dim,
+            adapters: Vec::new(),
+        }
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
     /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
     /// fixtures.
@@ -690,20 +751,28 @@ impl AdaptLinear {
         self.base.is_packed()
     }
 
+    /// Whether the base is an **NVFP4** projection (sc-21483). Distinct from [`Self::is_packed`],
+    /// which stays the MLX-packed (`Q4_1`/`Q8_0`) predicate its existing callers key off — an NVFP4
+    /// base holds no GGUF block weight and has no [`super::MatmulStrategy`].
+    pub fn is_nvfp4(&self) -> bool {
+        self.base.is_nvfp4()
+    }
+
+    /// Whether the base weight is held in *any* quantized regime — MLX-packed or NVFP4.
     pub fn is_quantized(&self) -> bool {
-        self.is_packed()
+        self.is_packed() || self.is_nvfp4()
     }
 
     pub fn matmul_strategy(&self) -> Option<super::MatmulStrategy> {
         match &self.base {
-            Base::Dense(_) => None,
+            Base::Dense(_) | Base::Nvfp4(_) => None,
             Base::Packed(linear) => linear.matmul_strategy(),
         }
     }
 
     pub fn quant_dtype(&self) -> Option<candle_core::quantized::GgmlDType> {
         match &self.base {
-            Base::Dense(_) => None,
+            Base::Dense(_) | Base::Nvfp4(_) => None,
             Base::Packed(linear) => linear.quant_dtype(),
         }
     }
@@ -719,7 +788,16 @@ impl AdaptLinear {
     pub fn base_qlinear(&self) -> Option<&QLinear> {
         match &self.base {
             Base::Packed(q) => Some(q),
-            Base::Dense(_) => None,
+            Base::Dense(_) | Base::Nvfp4(_) => None,
+        }
+    }
+
+    /// The NVFP4 base projection (for a consumer's footprint/regime accounting), or `None` on a
+    /// dense / MLX-packed base. sc-21483.
+    pub fn base_nvfp4(&self) -> Option<&super::Nvfp4Linear> {
+        match &self.base {
+            Base::Nvfp4(q) => Some(q),
+            Base::Dense(_) | Base::Packed(_) => None,
         }
     }
 
@@ -745,6 +823,100 @@ impl AdaptLinear {
     /// tier keeps its footprint.
     pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
         self.adapters.push(Adapter::Lora { a, b, scale });
+    }
+
+    /// [`Self::push_lora`] with **admission validation** (sc-21483): the factor pair must match the
+    /// base projection's contraction and output width, carry a float dtype, and already live on the
+    /// base's device. A mismatch is a typed error *here* — at load/admission, before the first
+    /// sampler step — rather than a shape panic inside the first forward, and the base is never
+    /// re-quantized or dequantized to make a mismatched factor fit.
+    ///
+    /// This is the entry point a host with **no fallback** must use. A dense base could in principle
+    /// fold a delta and a packed base could be dequantized, but an NVFP4 base can do neither: its
+    /// only correct answer to a factor it cannot host is to refuse.
+    pub fn push_lora_checked(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        let (out_f, in_f) = self.base_shape();
+        let (a_dims, b_dims) = (a.dims().to_vec(), b.dims().to_vec());
+        if a_dims.len() != 2 || b_dims.len() != 2 {
+            return Err(CandleError::Msg(format!(
+                "{}: LoRA factors must be rank-2, got a{a_dims:?} b{b_dims:?}",
+                self.admission_subject()
+            )));
+        }
+        if a_dims[0] != in_f || b_dims[1] != out_f || a_dims[1] != b_dims[0] {
+            return Err(CandleError::Msg(format!(
+                "{}: LoRA factor shapes a{a_dims:?}·b{b_dims:?} do not compose against the base \
+                 [out={out_f}, in={in_f}]",
+                self.admission_subject()
+            )));
+        }
+        self.check_factor_admissible("LoRA `a`", &a)?;
+        self.check_factor_admissible("LoRA `b`", &b)?;
+        self.adapters.push(Adapter::Lora { a, b, scale });
+        Ok(())
+    }
+
+    /// [`Self::push_lokr_structured`] with the same admission validation as
+    /// [`Self::push_lora_checked`] (sc-21483). The Kronecker factors are checked against the base
+    /// shape they were built for, plus dtype/device, before anything is attached.
+    pub fn push_lokr_structured_checked(&mut self, factors: LokrFactors) -> Result<()> {
+        let (out_f, in_f) = self.base_shape();
+        // A fused source projection routed onto one split host narrows its residual to `len` output
+        // rows, so the admitted width is the slice's when one is present.
+        let residual_out = match factors.output_slice {
+            Some((_, len)) => len,
+            None => factors.a * factors.b,
+        };
+        let residual_in = factors.c * factors.d;
+        if residual_out != out_f || residual_in != in_f {
+            return Err(CandleError::Msg(format!(
+                "{}: LoKr factors reconstruct [out={residual_out}, in={residual_in}], not the base \
+                 [out={out_f}, in={in_f}]",
+                self.admission_subject(),
+            )));
+        }
+        self.check_factor_admissible("LoKr `w1`", &factors.w1)?;
+        self.check_factor_admissible("LoKr `w2`", &factors.w2)?;
+        self.adapters.push(Adapter::LokrStructured { factors });
+        Ok(())
+    }
+
+    /// The base regime named in an admission error, so the message says *which* numeric contract
+    /// refused the factor.
+    fn admission_subject(&self) -> &'static str {
+        match &self.base {
+            Base::Dense(_) => "dense base",
+            Base::Packed(_) => "MLX-packed base",
+            Base::Nvfp4(_) => "NVFP4 base",
+        }
+    }
+
+    /// Reject a residual factor whose dtype is not a float, or which lives on a different device
+    /// than the frozen base. Both would otherwise surface as a mid-render failure (or, worse, a
+    /// silent host-side copy) on the first denoise step.
+    fn check_factor_admissible(&self, what: &str, factor: &Tensor) -> Result<()> {
+        match factor.dtype() {
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64 => {}
+            other => {
+                return Err(CandleError::Msg(format!(
+                    "{}: {what} has non-float dtype {other:?}; an additive residual is cast to the \
+                     activation dtype per forward and cannot be quantized storage",
+                    self.admission_subject()
+                )))
+            }
+        }
+        if let Some(base_device) = self.base.device() {
+            if !factor.device().same_device(&base_device) {
+                return Err(CandleError::Msg(format!(
+                    "{}: {what} lives on {:?} but the base weight is on {:?}; move the factor onto \
+                     the base device before installing",
+                    self.admission_subject(),
+                    factor.device().location(),
+                    base_device.location(),
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Attach a trainable LoRA residual whose canonical factors are `Var`-backed. Unlike
@@ -793,10 +965,17 @@ impl AdaptLinear {
     /// the sc-7702-safe [`super::MatmulStrategy::DequantDense`] forward (via `QLinear::quantize`); the
     /// residual stack is untouched — the deltas ride on top of the now-packed base. Only the **base**
     /// weight is quantized (never a residual factor), so a dense base carrying residuals stays correct.
+    ///
+    /// An **NVFP4** base is a hard error, never a no-op and never a re-fold (sc-21483): re-quantizing
+    /// it to `Q4`/`Q8` — or dequantizing it to BF16 to make some other path fit — would swap the
+    /// projection's numeric regime out from under a caller that asked for NVFP4. `Quant::Nvfp4` is
+    /// refused too: NVFP4 is packed from the bf16 master, so "re-NVFP4ing" an NVFP4 base could only
+    /// mean a double quantization.
     pub fn quantize(&mut self, quant: Quant) -> candle_core::Result<()> {
         match &mut self.base {
             // Already packed (a packed-tier load, or a prior fold) → idempotent no-op.
             Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize(quant)?;
@@ -818,6 +997,7 @@ impl AdaptLinear {
     ) -> candle_core::Result<()> {
         match &mut self.base {
             Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize_dequant_onto(quant, device)?;
@@ -832,6 +1012,7 @@ impl AdaptLinear {
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> candle_core::Result<()> {
         match &mut self.base {
             Base::Packed(_) => Ok(()),
+            Base::Nvfp4(_) => Err(nvfp4_refold_refusal(quant)),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
                 q.quantize_onto(quant, device)?;
@@ -858,6 +1039,20 @@ impl AdaptLinear {
                 *l = Linear::new(w, b);
             }
             Base::Packed(q) => q.to_device(device)?,
+            // The NVFP4 weight is staged on its device at construction and cannot be re-staged
+            // without re-packing, so a cross-device move is refused rather than silently dropped
+            // (which would leave the residuals on one device and the base on another). A move onto
+            // the device it already occupies is the ordinary no-op.
+            Base::Nvfp4(q) => {
+                if !q.device().same_device(device) {
+                    return Err(candle_core::Error::Msg(format!(
+                        "NVFP4 base: refusing to migrate a staged NVFP4 projection from {:?} to \
+                         {:?}; the packed weight would have to be re-staged",
+                        q.device().location(),
+                        device.location(),
+                    )));
+                }
+            }
         }
         for ad in &mut self.adapters {
             ad.migrate_to(device)?;
@@ -1910,5 +2105,302 @@ mod tests {
                 .unwrap();
             assert!(d < 1e-5, "batch slice {i} diverged from the reference: {d}");
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // NVFP4 as an adapter-capable base (sc-21483, epic 11037).
+    //
+    // These run on the CPU lane: `Nvfp4Linear` retains the packed host container in every regime and
+    // serves the transparent dequant→bf16 fallback off `sm_120`, so the ADDITIVE arm — the thing this
+    // story adds — is fully exercisable without a Blackwell device. The CUDA lane adds the FP4 GEMM
+    // under the same arm; that is what the krea real-weight render covers.
+    // ------------------------------------------------------------------------------------------
+
+    /// An NVFP4-based [`AdaptLinear`] plus the dense master it was packed from.
+    fn nvfp4_host(out_dim: usize, in_dim: usize) -> AdaptLinear {
+        let dev = Device::Cpu;
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 11.0)
+            .collect();
+        let w = Tensor::from_vec(w, (out_dim, in_dim), &dev).unwrap();
+        let lin = super::super::Nvfp4Linear::from_dense(
+            &w,
+            None,
+            &dev,
+            super::super::ActPrecision::W4A16,
+        )
+        .unwrap();
+        AdaptLinear::from_nvfp4(lin)
+    }
+
+    /// A deterministic `a [in, rank]` / `b [rank, out]` LoRA factor pair on the CPU.
+    fn lora_pair(in_dim: usize, rank: usize, out_dim: usize) -> (Tensor, Tensor) {
+        let dev = Device::Cpu;
+        let a: Vec<f32> = (0..in_dim * rank).map(|i| (i % 5) as f32 * 0.03).collect();
+        let b: Vec<f32> = (0..rank * out_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.02)
+            .collect();
+        (
+            Tensor::from_vec(a, (in_dim, rank), &dev).unwrap(),
+            Tensor::from_vec(b, (rank, out_dim), &dev).unwrap(),
+        )
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// AC#1 — identity / delta / removal at the shared seam. A LoRA installed over an NVFP4 base
+    /// contributes exactly `scale·((x·a)·b)` on top of the packed forward, and `clear_adapters`
+    /// restores the base output **exactly**: the packed weight was never mutated, so this is bit
+    /// equality, not a tolerance.
+    #[test]
+    fn nvfp4_base_hosts_an_additive_lora_and_restores_exactly_on_removal() {
+        let (out_dim, in_dim, rank) = (32, 64, 4);
+        let mut host = nvfp4_host(out_dim, in_dim);
+        assert!(host.is_nvfp4(), "the base must be an NVFP4 projection");
+        assert!(host.is_quantized(), "NVFP4 is a quantized regime");
+        assert!(!host.is_packed(), "NVFP4 is not the MLX-packed regime");
+        assert_eq!(host.base_shape(), (out_dim, in_dim));
+        assert!(host.base_nvfp4().is_some());
+
+        let x = Tensor::from_vec(
+            (0..8 * in_dim)
+                .map(|i| (i % 13) as f32 * 0.05)
+                .collect::<Vec<_>>(),
+            (8, in_dim),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let bare = host.forward(&x).unwrap();
+
+        let (a, b) = lora_pair(in_dim, rank, out_dim);
+        host.push_lora_checked(a.clone(), b.clone(), 0.75).unwrap();
+        assert!(host.is_adapted());
+        let adapted = host.forward(&x).unwrap();
+
+        // The delta is the LoRA's own product — the packed base contributed nothing extra.
+        let want_delta = (x.matmul(&a).unwrap().matmul(&b).unwrap() * 0.75).unwrap();
+        let got_delta = (&adapted - &bare).unwrap();
+        assert!(
+            max_abs(&(got_delta - &want_delta).unwrap()) < 1e-5,
+            "the additive arm did not contribute the LoRA delta"
+        );
+        assert!(
+            max_abs(&(adapted - &bare).unwrap()) > 1e-4,
+            "the adapter must actually move the output"
+        );
+
+        // Removal restores the base output EXACTLY.
+        host.clear_adapters();
+        assert!(!host.is_adapted());
+        assert_eq!(
+            flat(&host.forward(&x).unwrap()),
+            flat(&bare),
+            "clearing the adapter must restore the exact base output"
+        );
+        assert!(host.is_nvfp4(), "the base regime survived the whole cycle");
+    }
+
+    /// AC#1 — a structured LoKr rides the same NVFP4 base through the Kronecker vec-trick, matching
+    /// the reconstructed dense delta, and removal is again exact.
+    #[test]
+    fn nvfp4_base_hosts_a_structured_lokr_residual() {
+        let (a, b, c, d) = (4usize, 8usize, 8usize, 8usize);
+        let (out_dim, in_dim) = (a * b, c * d);
+        let dev = Device::Cpu;
+        let mut host = nvfp4_host(out_dim, in_dim);
+        let w1 = Tensor::from_vec(
+            (0..(a * c))
+                .map(|i| (i as f32 * 0.11).sin())
+                .collect::<Vec<_>>(),
+            (a, c),
+            &dev,
+        )
+        .unwrap();
+        let w2 = Tensor::from_vec(
+            (0..(b * d))
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect::<Vec<_>>(),
+            (b, d),
+            &dev,
+        )
+        .unwrap();
+        let scale = 0.5f64;
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            1.0,
+            1.0,
+            scale as f32,
+            (out_dim, in_dim),
+        )
+        .unwrap();
+        let factors = LokrFactors::build(
+            scale,
+            (out_dim, in_dim),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a plain linear LoKr is deferrable");
+
+        let x = Tensor::from_vec(
+            (0..(4 * in_dim))
+                .map(|i| (i as f32 * 0.013 - 0.5).sin())
+                .collect::<Vec<_>>(),
+            (4, in_dim),
+            &dev,
+        )
+        .unwrap();
+        let bare = host.forward(&x).unwrap();
+        host.push_lokr_structured_checked(factors).unwrap();
+        let adapted = host.forward(&x).unwrap();
+
+        let want = (&bare + delta_residual(&x, &delta)).unwrap();
+        assert!(
+            max_abs(&(adapted - &want).unwrap()) < 1e-4,
+            "structured LoKr over NVFP4 diverged from the reconstructed delta"
+        );
+
+        host.clear_adapters();
+        assert_eq!(flat(&host.forward(&x).unwrap()), flat(&bare));
+    }
+
+    /// AC#2, shape half — a factor that does not compose against the base is refused at ADMISSION,
+    /// naming the NVFP4 regime, and nothing is attached. It never reaches a sampler step.
+    #[test]
+    fn nvfp4_base_refuses_a_mis_shaped_adapter_at_admission() {
+        let (out_dim, in_dim) = (32, 64);
+        let mut host = nvfp4_host(out_dim, in_dim);
+
+        // `a` contracts against the wrong input width…
+        let (a, b) = lora_pair(in_dim / 2, 4, out_dim);
+        let error = host.push_lora_checked(a, b, 1.0).unwrap_err().to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(error.contains("do not compose"), "{error}");
+        assert!(!host.is_adapted(), "a refused factor must not be attached");
+
+        // …and the wrong output width.
+        let (a, b) = lora_pair(in_dim, 4, out_dim + 1);
+        assert!(host.push_lora_checked(a, b, 1.0).is_err());
+        assert!(!host.is_adapted());
+
+        // A LoKr whose Kronecker factors reconstruct a different projection is refused too.
+        let w1 = Tensor::from_vec(vec![0.1f32; 4 * 8], (4, 8), &Device::Cpu).unwrap();
+        let w2 = Tensor::from_vec(vec![0.1f32; 4 * 8], (4, 8), &Device::Cpu).unwrap();
+        let factors = LokrFactors::build(
+            0.5,
+            (32, 64),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        if let Some(factors) = factors {
+            // Re-host the same factors on a DIFFERENT projection shape: admission must reject.
+            let mut other = nvfp4_host(64, 32);
+            let error = other
+                .push_lokr_structured_checked(factors)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("NVFP4 base"), "{error}");
+            assert!(error.contains("not the base"), "{error}");
+            assert!(!other.is_adapted());
+        }
+    }
+
+    /// AC#2, dtype/device half — an additive residual is cast to the activation dtype per forward,
+    /// so a non-float factor is refused rather than silently reinterpreted.
+    #[test]
+    fn nvfp4_base_refuses_a_non_float_adapter_factor() {
+        let (out_dim, in_dim, rank) = (32, 64, 4);
+        let mut host = nvfp4_host(out_dim, in_dim);
+        let (a, b) = lora_pair(in_dim, rank, out_dim);
+        let a_u32 = a.to_dtype(DType::U32).unwrap();
+        let error = host
+            .push_lora_checked(a_u32, b, 1.0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(error.contains("non-float dtype"), "{error}");
+        assert!(!host.is_adapted());
+    }
+
+    /// AC#2, regime half — an NVFP4 base is NEVER silently converted to q4/q8 (or dequantized to
+    /// BF16) to make something fit. Every fold entry point refuses, and the base stays NVFP4.
+    #[test]
+    fn nvfp4_base_refuses_every_requantization() {
+        let mut host = nvfp4_host(32, 64);
+        for quant in [Quant::Q4, Quant::Q8, Quant::Nvfp4] {
+            let error = host.quantize(quant).unwrap_err().to_string();
+            assert!(error.contains("refusing to re-quantize"), "{error}");
+            let error = host
+                .quantize_onto(quant, &Device::Cpu)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refusing to re-quantize"), "{error}");
+            let error = host
+                .quantize_dequant_onto(quant, &Device::Cpu)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refusing to re-quantize"), "{error}");
+        }
+        assert!(
+            host.is_nvfp4(),
+            "the base must still be NVFP4 after the refusals"
+        );
+        assert!(host.base_nvfp4().is_some());
+        assert!(host.matmul_strategy().is_none());
+        assert!(host.quant_dtype().is_none());
+    }
+
+    /// A same-device migration is the ordinary no-op (and still migrates residual factors); the
+    /// NVFP4 base is never re-staged behind the caller's back.
+    #[test]
+    fn nvfp4_base_same_device_migration_is_a_noop() {
+        let (out_dim, in_dim, rank) = (32, 64, 4);
+        let mut host = nvfp4_host(out_dim, in_dim);
+        let (a, b) = lora_pair(in_dim, rank, out_dim);
+        host.push_lora_checked(a, b, 0.5).unwrap();
+        host.to_device(&Device::Cpu).unwrap();
+        assert!(host.is_nvfp4());
+        assert!(host.is_adapted());
+    }
+
+    /// The checked pushes are not NVFP4-only: they are the shared admission gate, so a dense host
+    /// validates identically (and a valid factor still installs).
+    #[test]
+    fn checked_push_validates_a_dense_host_too() {
+        let (out_dim, in_dim, rank) = (16, 8, 2);
+        let w = Tensor::from_vec(
+            (0..out_dim * in_dim)
+                .map(|i| i as f32 * 0.01)
+                .collect::<Vec<_>>(),
+            (out_dim, in_dim),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut host = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
+        let (a, b) = lora_pair(in_dim, rank, out_dim);
+        host.push_lora_checked(a, b, 1.0).unwrap();
+        assert!(host.is_adapted());
+
+        let (a, b) = lora_pair(in_dim + 1, rank, out_dim);
+        let error = host.push_lora_checked(a, b, 1.0).unwrap_err().to_string();
+        assert!(error.contains("dense base"), "{error}");
     }
 }
