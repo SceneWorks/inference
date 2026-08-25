@@ -19,8 +19,8 @@
 //!
 //! Run it (Q8 from the prod model dir, Q4 auto-detected alongside):
 //! ```text
-//! cargo test --release -p mlx-gen-ltx --test perf -- --ignored --nocapture
-//! LTX_BASE_DIR=… LTX_BASE_Q4_DIR=… cargo test --release -p mlx-gen-ltx --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-ltx --test integration perf:: -- --ignored --nocapture
+//! LTX_BASE_DIR=… LTX_BASE_Q4_DIR=… cargo test --release -p mlx-gen-ltx --test integration perf:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

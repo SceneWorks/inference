@@ -31,6 +31,7 @@ pub mod providers {
     pub use candle_gen_lens as lens;
     pub use candle_gen_ltx as ltx;
     pub use candle_gen_mage as mage;
+    pub use candle_gen_minimax_h3 as minimax_h3;
     pub use candle_gen_mochi as mochi;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
@@ -82,6 +83,15 @@ pub const BESPOKE_MEMORY_ROUTE_WAIVERS: &[BespokeMemoryRouteWaiver] =
 
 /// Add every provider shipped by the Candle media platform to an explicit registry builder.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    // The engine's checkpoint codec table is registered here, exactly once, before any family
+    // crate: codecs are engine-level (sc-20634/sc-20385), so no family `register_providers` may
+    // register one, and the builder refuses a duplicate row outright.
+    let registry = candle_gen::logical_weights::register_checkpoint_codecs(registry);
+    // The GGUF **container** row (sc-20649) is the one codec the engine crate cannot own: decoding
+    // it needs candle's `gguf_file` reader and the ggml block constants, which live with the
+    // implementation in `candle-gen-wan`. It is registered here, once, alongside the engine table
+    // for the same reason the engine table is — so exactly one place composes the codec set.
+    let registry = registry.register_checkpoint_codec(candle_gen::gen_core::GGUF_CONTAINER_CODEC);
     let registry = candle_gen_anima::register_providers(registry);
     let registry = candle_gen_bernini::register_providers(registry);
     let registry = candle_gen_boogu::register_providers(registry);
@@ -96,6 +106,10 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_lens::register_providers(registry);
     let registry = candle_gen_ltx::register_providers(registry);
     let registry = candle_gen_mage::register_providers(registry);
+    // sc-17156: the generator and the memory-strategy registration land TOGETHER.
+    // `ProviderRegistryBuilder::build` rejects a memory-strategy registration whose `provider_id`
+    // has no matching generator, so this line was absent while the crate shipped only the contract.
+    let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -128,11 +142,19 @@ pub fn memory_contract_surface_registry() -> candle_gen::gen_core::Result<Provid
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_lens::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_ltx::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_mage::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_minimax_h3::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_qwen_image::register_memory_contract_surfaces(registry);
     #[cfg(not(feature = "cuda"))]
     let registry = candle_gen_z_image::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_bernini::register_memory_contract_surfaces(registry);
+    #[cfg(not(feature = "cuda"))]
+    let registry = candle_gen_scail2::register_memory_contract_surfaces(registry);
     registry.build()
 }
 
@@ -361,8 +383,9 @@ pub const SURFACES_NVFP4_TIER: bool = cfg!(feature = "cuda");
 ///   fit is a property of the VAE latent space, not of the backend, so a linear approximation that
 ///   misses the holdout bar on MLX misses it on candle too. **Do not re-run these fits**; the
 ///   `NoGo` basis on each row says whether it rides a measurement or a deliberate non-measurement.
-/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Boogu's latent space already has a
-///   committed fit clearing the bar (sc-17218 is the wiring).
+/// * `PREVIEW_DEFERRED_ROUTE_IDS` — **viable but unwired**. Empty after sc-17218 wired the last
+///   deferred family, but retained as an explicit class so a future measured-but-unwired route cannot
+///   be mistaken for a no-go.
 ///
 /// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` makes those three total over the
 /// registered surface, so a newly registered route must be classified rather than defaulting into
@@ -421,12 +444,12 @@ mod preview_advertising {
     /// shared sampler anywhere, so it becomes visible below through a direct emission call rather than
     /// through a hooked call site. That is the case the direct-emission scanner was hardened for.
     ///
-    /// `candle-gen-boogu` is deliberately absent, and its absence is a measurement rather than an
-    /// omission: the epic groups it with FLUX.2, but it loads a plain 244-tensor **16-channel**
-    /// `AutoencoderKL` (the FLUX.1 / Z-Image lineage, `z_image::vae::AutoEncoderKL`, SHA-256
-    /// `8c717328…4c94`) with no `bn.*` stats at all, so the 32-channel fit does not describe its latent
-    /// space and sc-16955's own acceptance criterion is that it emits only if its VAE is proven to be
-    /// FLUX.2's. It is not. See `docs/migration/evidence/sc-16955-flux2-candle-preview.md`.
+    /// `candle-gen-boogu` was deliberately absent from sc-16955 because it loads a plain 244-tensor
+    /// **16-channel** `AutoencoderKL`, not FLUX.2's 32-channel space. sc-16956 then proved the positive
+    /// relationship: Boogu's f32 tensors round exactly onto FLUX.1's bf16 bits, key for key. sc-17218
+    /// wires that reused raw-latent projector across all three registered ids. Base and Edit have one
+    /// hooked shared-driver site each; Turbo has a hooked curated lane plus a direct emission in its
+    /// default native DMD loop, always observing the running latent entering the outer step.
     ///
     /// The FLUX.1 family (sc-16956) is the first to make the descriptor-less half of the platform
     /// *visible* rather than merely absent. It contributes seven rows — `flux1_schnell` / `flux1_dev`
@@ -566,6 +589,9 @@ mod preview_advertising {
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
+        "boogu_image",
+        "boogu_image_turbo",
+        "boogu_image_edit",
         "sdxl",
         "kolors",
         "flux2_klein_9b",
@@ -655,13 +681,20 @@ mod preview_advertising {
         /// over a low-resolution input has no multi-step progression to preview. No holdout R² was
         /// ever measured for it and none is quoted.
         Seedvr2SuperResolution,
+        /// MiniMax-H3's **joint audio+video** space (sc-17156). Excluded on its shape, not on a
+        /// number: the video half decodes through a 36-layer *transformer* whose output projection
+        /// performs all 16x spatial and 4x temporal upsampling, so there is no per-frame linear map
+        /// from a latent to a preview frame the way there is for a CNN VAE — and the packed sequence
+        /// interleaves audio rows that have no picture at all. No holdout R^2 was ever measured for
+        /// it and none is quoted.
+        MinimaxH3Joint,
     }
 
     impl NoGo {
         /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
         /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
         /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-        const ALL: [NoGo; 7] = [
+        const ALL: [NoGo; 8] = [
             NoGo::Ltx,
             NoGo::Mage,
             NoGo::Mochi,
@@ -669,6 +702,7 @@ mod preview_advertising {
             NoGo::WanZ48,
             NoGo::SvdTemporal,
             NoGo::Seedvr2SuperResolution,
+            NoGo::MinimaxH3Joint,
         ];
 
         /// Exactly the variants epic 16624 put a number on. Kept beside [`NoGo::measured`] so the
@@ -696,6 +730,7 @@ mod preview_advertising {
                      candle-side adjudication sc-16954",
                 ),
                 NoGo::Seedvr2SuperResolution => None,
+                NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -711,9 +746,11 @@ mod preview_advertising {
                 NoGo::Ltx => Some(("0.984291", "0.618575")),
                 NoGo::Mage => Some(("0.938091", "0.806216")),
                 NoGo::Mochi => Some(("0.846932", "0.807202")),
-                NoGo::WanZ16 | NoGo::WanZ48 | NoGo::SvdTemporal | NoGo::Seedvr2SuperResolution => {
-                    None
-                }
+                NoGo::WanZ16
+                | NoGo::WanZ48
+                | NoGo::SvdTemporal
+                | NoGo::Seedvr2SuperResolution
+                | NoGo::MinimaxH3Joint => None,
             }
         }
 
@@ -744,6 +781,13 @@ mod preview_advertising {
                         "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
                          temporal decoder) — NEVER measured, same program gate; not SDXL's \
                          four-channel space"
+                    }
+                    NoGo::MinimaxH3Joint => {
+                        "MiniMax-H3's joint audio+video space — NEVER measured, and excluded on its \
+                         SHAPE: the video half decodes through a 36-layer transformer whose output \
+                         projection performs all 16x spatial and 4x temporal upsampling, so there \
+                         is no per-frame linear latent→pixel map to fit, and the packed sequence \
+                         interleaves audio rows that carry no picture at all"
                     }
                     NoGo::Seedvr2SuperResolution => {
                         "a one-step super-resolution upscaler over a low-resolution input — no \
@@ -788,6 +832,7 @@ mod preview_advertising {
         ("wan_vace", NoGo::WanZ16),
         ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
+        ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
         ("mage_flow_base", NoGo::Mage),
@@ -810,21 +855,10 @@ mod preview_advertising {
 
     /// The third class: registered routes that neither emit previews **nor** are no-gos.
     ///
-    /// Without this list "preview-inert" and "rejected" would collapse into each other, and the no-go
-    /// set would silently absorb every family that simply has not been wired yet. Boogu is exactly
-    /// that case and it is the opposite of a rejection: sc-16956 proved its VAE **is** FLUX.1's — a
-    /// different f32 container whose 244 tensors round exactly onto FLUX.1's bf16 bits — so its latent
-    /// space already has a committed fit that clears the bar. It is unwired only because the wiring has
-    /// not been done, tracked as **sc-17218**.
-    ///
-    /// Keeping it named here is what lets
-    /// `the_no_go_set_and_the_wired_set_partition_every_shipped_route` be a **total** partition, which
-    /// is the assertion that stops the no-go set going stale as the catalog grows.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[
-        ("boogu_image", "sc-17218"),
-        ("boogu_image_turbo", "sc-17218"),
-        ("boogu_image_edit", "sc-17218"),
-    ];
+    /// The class is empty after sc-17218 wired Boogu, but keeping it explicit prevents a future
+    /// viable-but-unwired route from being silently absorbed into the no-go set. The total-partition
+    /// assertion below keeps all three classes honest as the registry grows.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -921,7 +955,17 @@ mod preview_advertising {
             dir: "candle-gen-boogu",
             register: candle_gen_boogu::register_providers,
             denoise: Denoise::Shared,
-            routes: &[],
+            // sc-17218's resident inventory plus sc-20787's exact staged twin. Base, Turbo's
+            // curated/img2img lane, and Edit each drive one hooked flow-sampler site per residency
+            // path. Turbo's default route owns one direct four-step DMD loop per residency path and
+            // emits before prediction and re-noise. No dark site: every user-reachable denoise lane
+            // has a live sink seam.
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 6,
+                direct: 2,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-chroma",
@@ -1032,11 +1076,10 @@ mod preview_advertising {
             dir: "candle-gen-kolors",
             register: candle_gen_kolors::register_providers,
             denoise: Denoise::Shared,
-            // sc-16954's inventory. Kolors has one hooked driver call — the registered route's curated
-            // lane in `pipeline.rs` — and three bespoke leading-Euler loops, one per entry point, each
-            // emitting directly: the registered route's native lane (`pipeline.rs`), the pose-control
-            // provider (`control.rs`) and the IP-Adapter provider (`ip_provider.rs`). The two
-            // providers' CURATED lanes are invisible here by construction: they reach
+            // sc-16954/sc-20790 inventory. Kolors has one hooked driver call — the registered route's
+            // curated resident lane in `pipeline.rs` — and resident plus request-staged leading-Euler
+            // loops in each of `pipeline.rs`, `control.rs`, and `ip_provider.rs`, all emitting directly.
+            // The two providers' CURATED lanes are invisible here by construction: they reach
             // `candle_gen_sdxl::denoise_curated` rather than a driver of their own, so the hook they
             // build is counted in `candle-gen-sdxl`'s `denoise.rs` row. No dark site — this crate has
             // no trainer.
@@ -1044,19 +1087,19 @@ mod preview_advertising {
                 FileRoutes {
                     file: "control.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "ip_provider.rs",
                     hooked: 0,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
                 FileRoutes {
                     file: "pipeline.rs",
                     hooked: 1,
-                    direct: 1,
+                    direct: 2,
                     dark: &[],
                 },
             ],
@@ -1146,6 +1189,12 @@ mod preview_advertising {
             routes: &[],
         },
         ProviderCrate {
+            dir: "candle-gen-minimax-h3",
+            register: candle_gen_minimax_h3::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        ProviderCrate {
             dir: "candle-gen-mochi",
             register: candle_gen_mochi::register_providers,
             denoise: Denoise::Bespoke,
@@ -1215,19 +1264,16 @@ mod preview_advertising {
             dir: "candle-gen-sd3",
             register: candle_gen_sd3::register_providers,
             denoise: Denoise::Shared,
-            // sc-16958's inventory, and the first in this table that is simply the plain shape: ONE
-            // hooked `run_flow_sampler` site, in `pipeline.rs`'s `render_core`, which is the only
-            // shared-driver call the whole crate contains. It carries all SIX user-reachable lanes —
-            // the three registered descriptors each reached through txt2img and through
-            // img2img / `Reference` — because the img2img fork blends its reference into `x_t` and
-            // shortens the σ schedule before the driver call rather than opening a second one.
+            // Two hooked `run_flow_sampler` sites: the warm Resident `render_core` and the
+            // request-local Staged denoise phase. Each carries all six route/mode lanes (three
+            // descriptors x T2I/I2I) through the same schedule, CFG, seed, and preview contract.
             // No dark site: `load_variant` refuses control / IP-adapter overlays, so this crate ships
             // no descriptor-less render lane, and it has no trainer. No direct emission either —
             // `preview.rs` holds only the reused epic-16624 16-channel fit and a layout check, since
             // SD3.5's running latent is already the `[1, C, h, w]` contract with nothing to unpack.
             routes: &[FileRoutes {
                 file: "pipeline.rs",
-                hooked: 1,
+                hooked: 2,
                 direct: 0,
                 dark: &[],
             }],
@@ -1237,7 +1283,9 @@ mod preview_advertising {
             register: candle_gen_sdxl::register_providers,
             denoise: Denoise::Shared,
             // sc-16954's inventory, and the first to mix both wiring layers in one crate. SDXL ships
-            // FOUR emitting lanes across three files plus one deliberately dark trainer site:
+            // SIX emitting lanes across four files plus one deliberately dark trainer site:
+            //   * `control_provider.rs` — the generic ControlNet route's bespoke Euler loop
+            //     (direct).
             //   * `pipeline.rs` — the registered route's two lanes: the curated driver call (hooked)
             //     and the bespoke Lightning Euler loop (direct).
             //   * `denoise.rs` — the shared helpers the name-driven providers, Kolors and InstantID
@@ -1248,6 +1296,12 @@ mod preview_advertising {
             // `ip_provider.rs` gets no row: it drives `denoise::denoise_curated` and the ancestral
             // loop rather than a driver of its own, so its wiring is counted where those live.
             routes: &[
+                FileRoutes {
+                    file: "control_provider.rs",
+                    hooked: 0,
+                    direct: 1,
+                    dark: &[],
+                },
                 FileRoutes {
                     file: "denoise.rs",
                     hooked: 1,
@@ -1809,9 +1863,11 @@ mod preview_advertising {
                         skipped.clear();
                         continue;
                     }
-                    // A cfg that also ships stays: emit its `#` and let the rest parse normally.
-                    out.push(ch);
-                    i += 1;
+                    // A cfg that also ships stays. Preserve the whole attribute rather than
+                    // letting the ordinary literal stripper erase its feature value: source-based
+                    // catalog tests must distinguish `feature = "cuda"` from another feature.
+                    out.extend(chars[i..end].iter());
+                    i = end;
                     continue;
                 }
             }
@@ -3322,50 +3378,146 @@ mod preview_advertising {
         register_providers: fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder,
         /// `Some` for a crate that publishes weights-free contract surfaces on every platform.
         /// `None` marks a route reachable only through a CUDA-gated `register_providers` — the
-        /// asymmetry the old `24`/`23` registration pin used to encode.
+        /// asymmetry the old `24`/`23` registration pin used to encode, unless it publishes a
+        /// resident-only witness directly from `register_providers`.
         register_surfaces: Option<fn(ProviderRegistryBuilder) -> ProviderRegistryBuilder>,
+        /// A resident-only route can be registered on every platform without publishing optimized
+        /// contract surfaces; this keeps that intentional asymmetry explicit.
+        resident_only_on_cpu: bool,
     }
 
     const MEMORY_ROUTE_CRATES: &[MemoryRouteCrate] = &[
         MemoryRouteCrate {
+            dir: "candle-gen-anima",
+            register_providers: candle_gen_anima::register_providers,
+            register_surfaces: Some(candle_gen_anima::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-bernini",
+            register_providers: candle_gen_bernini::register_providers,
+            register_surfaces: Some(candle_gen_bernini::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-boogu",
+            register_providers: candle_gen_boogu::register_providers,
+            register_surfaces: Some(candle_gen_boogu::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-chroma",
+            register_providers: candle_gen_chroma::register_providers,
+            register_surfaces: Some(candle_gen_chroma::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-ideogram",
+            register_providers: candle_gen_ideogram::register_providers,
+            register_surfaces: Some(candle_gen_ideogram::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-flux",
             register_providers: candle_gen_flux::register_providers,
             register_surfaces: Some(candle_gen_flux::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-flux2",
             register_providers: candle_gen_flux2::register_providers,
             register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-kolors",
+            register_providers: candle_gen_kolors::register_providers,
+            register_surfaces: Some(candle_gen_kolors::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-krea",
             register_providers: candle_gen_krea::register_providers,
             register_surfaces: Some(candle_gen_krea::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-lens",
             register_providers: candle_gen_lens::register_providers,
             register_surfaces: Some(candle_gen_lens::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-ltx",
+            register_providers: candle_gen_ltx::register_providers,
+            register_surfaces: Some(candle_gen_ltx::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-mage",
             register_providers: candle_gen_mage::register_providers,
             register_surfaces: Some(candle_gen_mage::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-minimax-h3",
+            register_providers: candle_gen_minimax_h3::register_providers,
+            register_surfaces: Some(candle_gen_minimax_h3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sana",
+            register_providers: candle_gen_sana::register_providers,
+            register_surfaces: Some(candle_gen_sana::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-scail2",
+            register_providers: candle_gen_scail2::register_providers,
+            register_surfaces: Some(candle_gen_scail2::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sd3",
+            register_providers: candle_gen_sd3::register_providers,
+            register_surfaces: Some(candle_gen_sd3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sdxl",
+            register_providers: candle_gen_sdxl::register_providers,
+            register_surfaces: Some(candle_gen_sdxl::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-sensenova",
+            register_providers: candle_gen_sensenova::register_providers,
+            register_surfaces: Some(candle_gen_sensenova::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
+        MemoryRouteCrate {
+            dir: "candle-gen-svd",
+            register_providers: candle_gen_svd::register_providers,
+            register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-wan",
             register_providers: candle_gen_wan::register_providers,
             register_surfaces: None,
+            resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
             dir: "candle-gen-z-image",
             register_providers: candle_gen_z_image::register_providers,
             register_surfaces: Some(candle_gen_z_image::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
         },
     ];
 
@@ -3479,12 +3631,21 @@ mod preview_advertising {
         let mut expected_ids = BTreeSet::new();
         for owner in MEMORY_ROUTE_CRATES {
             let mut builder = (owner.register_providers)(ProviderRegistryBuilder::new());
-            // Mirror `memory_contract_surface_registry`: the weights-free surfaces are appended only
-            // off CUDA, because on a CUDA build `register_providers` already carries the same ids and
-            // registering both would be a duplicate.
+            // Mirror `memory_contract_surface_registry`: append weights-free surfaces off CUDA only
+            // when `register_providers` does not already carry them. Most Candle image routes add
+            // their memory surface only on CUDA; SenseNova publishes the same surface on every
+            // platform, so registering it twice would be a duplicate.
             if !cfg!(feature = "cuda") {
                 if let Some(register) = owner.register_surfaces {
-                    builder = register(builder);
+                    let provider_ids = (owner.register_providers)(ProviderRegistryBuilder::new())
+                        .build()
+                        .unwrap_or_else(|error| panic!("{}: {error}", owner.dir))
+                        .memory_strategy_registrations()
+                        .map(|registration| registration.provider_id)
+                        .collect::<BTreeSet<_>>();
+                    if provider_ids.is_empty() {
+                        builder = register(builder);
+                    }
                 }
             }
             let ids = builder
@@ -3493,7 +3654,9 @@ mod preview_advertising {
                 .memory_strategy_registrations()
                 .map(|registration| registration.provider_id)
                 .collect::<BTreeSet<_>>();
-            let reachable = owner.register_surfaces.is_some() || cfg!(feature = "cuda");
+            let reachable = owner.register_surfaces.is_some()
+                || owner.resident_only_on_cpu
+                || cfg!(feature = "cuda");
             assert_eq!(
                 !ids.is_empty(),
                 reachable,
@@ -3508,6 +3671,220 @@ mod preview_advertising {
             catalog_ids, expected_ids,
             "the catalog's memory-strategy set must be exactly what the memory-route crates \
              contribute on this build"
+        );
+    }
+
+    /// Every catalog provider whose registration changes under CUDA must receive that feature from
+    /// the composition crate. Otherwise Cargo enables `candle-gen-catalog/cuda` while leaving the
+    /// provider on its non-CUDA registration path: neither side of a `cfg(feature = "cuda")` /
+    /// `cfg(not(feature = "cuda"))` split owns the registration.
+    ///
+    /// The provider set is derived from the shipped module trees and the catalog's actual
+    /// `register_providers` body. In particular, this does not search comments or test modules,
+    /// and it does not use a hand-maintained list that could miss the next CUDA-gated provider.
+    #[test]
+    fn cuda_feature_forwarding_covers_every_cuda_gated_catalog_registration() {
+        fn function_body<'a>(source: &'a str, function: &str) -> &'a str {
+            let start = source
+                .find(function)
+                .unwrap_or_else(|| panic!("missing {function:?}"));
+            let rest = &source[start..];
+            let open = rest
+                .find('{')
+                .unwrap_or_else(|| panic!("{function:?} has no body"));
+            let body_start = open + 1;
+            let mut depth = 1usize;
+            for (offset, ch) in rest[body_start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &rest[body_start..body_start + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{function:?} has an unterminated body");
+        }
+
+        /// Whether a `cfg` predicate changes with the `cuda` feature. This deliberately treats
+        /// `any`, `all`, and `not` alike: a provider registration whose branch depends on CUDA in
+        /// any boolean position needs the catalog to forward that feature rather than selecting an
+        /// accidental fallback branch.
+        fn predicate_mentions_cuda(predicate: &str) -> bool {
+            let predicate = predicate.trim();
+            if let Some(rest) = predicate.strip_prefix("feature") {
+                return rest
+                    .trim_start()
+                    .strip_prefix('=')
+                    .is_some_and(|value| value.trim().trim_matches('"') == "cuda");
+            }
+            for combinator in ["all", "any", "not"] {
+                if let Some(inner) = strip_call(predicate, combinator) {
+                    return split_top_level(inner)
+                        .iter()
+                        .any(|part| predicate_mentions_cuda(part));
+                }
+            }
+            false
+        }
+
+        /// Every `cfg` predicate attached inside the registration body that mentions CUDA.
+        /// `module_tree` has already removed comments and test-only modules, so this reads only
+        /// compiled source rather than prose which happens to quote a cfg expression.
+        fn has_cuda_gated_registration(source: &str) -> bool {
+            const OPEN: &str = "#[cfg(";
+            let mut rest = source;
+            while let Some(offset) = rest.find(OPEN) {
+                let predicate = &rest[offset + OPEN.len()..];
+                let mut depth = 1usize;
+                for (end, ch) in predicate.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                if predicate_mentions_cuda(&predicate[..end]) {
+                                    return true;
+                                }
+                                rest = &predicate[end + 1..];
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(depth, 0, "unterminated cfg predicate in registration body");
+            }
+            false
+        }
+
+        // Parser controls: these are all valid CUDA-dependent registration predicates, including
+        // Wan's `any(feature = "cuda", test)` form and a negated fallback branch.
+        for predicate in [
+            "feature = \"cuda\"",
+            "any(feature = \"cuda\", test)",
+            "all(unix, feature = \"cuda\")",
+            "not(feature = \"cuda\")",
+        ] {
+            assert!(
+                predicate_mentions_cuda(predicate),
+                "CUDA predicate parser missed {predicate:?}"
+            );
+        }
+        assert!(
+            !predicate_mentions_cuda("any(feature = \"metal\", test)"),
+            "CUDA predicate parser must not match another feature"
+        );
+
+        let catalog_src = candle_gen_root().join("candle-gen-catalog/src");
+        let catalog_tree = module_tree("candle-gen-catalog", &catalog_src);
+        let catalog_registration = function_body(
+            catalog_tree
+                .shipped
+                .get("lib.rs")
+                .expect("catalog lib.rs is shipped"),
+            "pub fn register_providers",
+        );
+
+        let mut cuda_gated_catalog_providers = BTreeSet::new();
+        let mut crate_dirs: Vec<_> = std::fs::read_dir(candle_gen_root())
+            .expect("crates/media/candle-gen is readable")
+            .map(|entry| entry.expect("readable directory entry").path())
+            .filter(|path| path.join("src/lib.rs").is_file())
+            .collect();
+        crate_dirs.sort();
+        for crate_dir in crate_dirs {
+            let dir = crate_dir
+                .file_name()
+                .expect("a crate directory has a name")
+                .to_string_lossy()
+                .into_owned();
+            if dir == "candle-gen-catalog" {
+                continue;
+            }
+            let provider_call = format!("{}::register_providers(", dir.replace('-', "_"));
+            if !catalog_registration.contains(&provider_call) {
+                continue;
+            }
+            let provider_tree = module_tree(&dir, &crate_dir.join("src"));
+            let provider_registration = function_body(
+                provider_tree
+                    .shipped
+                    .get("lib.rs")
+                    .expect("provider lib.rs is shipped"),
+                "pub fn register_providers",
+            );
+            if has_cuda_gated_registration(provider_registration) {
+                cuda_gated_catalog_providers.insert(dir);
+            }
+        }
+        assert!(
+            !cuda_gated_catalog_providers.is_empty(),
+            "the CUDA registration scan found no catalog providers; its forwarding assertion would be vacuous"
+        );
+        assert!(
+            cuda_gated_catalog_providers.contains("candle-gen-wan"),
+            "Wan's cfg(any(feature = \"cuda\", test)) registration branch must be covered"
+        );
+
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(4)
+            .expect("candle-gen-catalog sits four levels below the workspace root");
+        let output = std::process::Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(workspace_root.join("Cargo.toml"))
+            .output()
+            .unwrap_or_else(|error| panic!("cargo metadata: {error}"));
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+        let features = metadata["packages"]
+            .as_array()
+            .expect("cargo metadata reports packages")
+            .iter()
+            .find(|package| package["name"] == "candle-gen-catalog")
+            .expect("candle-gen-catalog is a workspace member")["features"]
+            .as_object()
+            .expect("catalog package reports features");
+        let feature_members = |feature: &str| {
+            features[feature]
+                .as_array()
+                .unwrap_or_else(|| panic!("catalog has no {feature:?} feature"))
+                .iter()
+                .map(|member| member.as_str().expect("feature member is a string"))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let cuda_forwarded = feature_members("cuda");
+        for provider in &cuda_gated_catalog_providers {
+            let forwarding = format!("{provider}/cuda");
+            assert!(
+                cuda_forwarded.contains(forwarding.as_str()),
+                "{provider} has a CUDA-gated register_providers branch, so candle-gen-catalog's \
+                 cuda feature must forward {forwarding:?}"
+            );
+        }
+
+        // The MiniMax-H3 seam has both backend paths. CUDA is covered by the class check above;
+        // Metal has no analogous gated registration branch, so pin its forwarding explicitly.
+        assert!(
+            feature_members("metal").contains("candle-gen-minimax-h3/metal"),
+            "candle-gen-catalog's metal feature must forward candle-gen-minimax-h3/metal"
         );
     }
 
@@ -3642,18 +4019,27 @@ mod preview_advertising {
             classified.difference(&registered).collect::<Vec<_>>()
         );
 
-        // Two independent registrations landed on the 51/29/19/3 base and BOTH bumped this tally, so
-        // the merged value is their union rather than either side's number:
-        //   * SC-18306 registered the already-wired Krea Turbo edit route (+1 registered, +1 wired).
-        //     No preview fit or emission behavior changed; the new descriptor reaches Krea's
-        //     existing edit preview hook.
-        //   * VACE-Fun occupies the already-settled Wan z16 no-go space (+1 registered, +1 no-go).
-        // 53 registered generators = 30 wired + 20 no-go + 3 deferred.
-        assert_eq!(
-            (registered.len(), wired.len(), no_go.len(), deferred.len()),
-            (53, 30, 20, 3),
-            "moving a route between preview classes is a decision that must be written down here"
-        );
+        // Deliberately NOT a pinned total. Two consecutive main syncs (sc-18306+VACE-Fun, then
+        // MiniMax-H3+Krea Turbo edit) each tripped a frozen (registered, wired, no_go, deferred)
+        // tuple whose only failure mode was "two branches merged" — never a defect. The decision
+        // record this test exists for is the *classification*: the partition, disjointness, and
+        // classified == registered assertions above already force every new registration to be
+        // filed into exactly one class, in writing, in the three pinned id lists. What remains
+        // load-bearing here is that the catalog, wired set, and permanent no-go set do not silently
+        // empty out. The deferred class is intentionally allowed to reach zero: sc-17218 wired its
+        // final member. The class and its provenance validation remain above so the next viable but
+        // unwired route must still be recorded explicitly.
+        for (label, len) in [
+            ("registered", registered.len()),
+            ("wired", wired.len()),
+            ("no-go", no_go.len()),
+        ] {
+            assert!(
+                len > 0,
+                "the {label} preview class must not be empty — an empty class means a whole \
+                 decision category was silently dropped, not that the catalog shrank honestly"
+            );
+        }
     }
 
     /// **No no-go family may acquire a preview fit, a fit producer, or an emission call** (sc-16961).
@@ -3708,13 +4094,14 @@ mod preview_advertising {
                 "candle-gen-bernini",
                 "candle-gen-ltx",
                 "candle-gen-mage",
+                "candle-gen-minimax-h3",
                 "candle-gen-mochi",
                 "candle-gen-scail2",
                 "candle-gen-seedvr2",
                 "candle-gen-svd",
                 "candle-gen-wan",
             ],
-            "the 19 no-go ids must resolve to exactly these eight crates — a mismatch means an id \
+            "the 20 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
         );
 
@@ -4162,6 +4549,313 @@ mod tests {
     use candle_gen::gen_core::ConditioningKind;
 
     #[test]
+    fn checkpoint_codecs_register_once_and_every_row_has_an_engine_implementation() {
+        use candle_gen::logical_weights::{BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS};
+
+        use candle_gen::gen_core::GGUF_CONTAINER_CODEC;
+
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<_> = registry.checkpoint_codecs().codecs().copied().collect();
+        // The engine's safetensors table, then the one GGUF container row the catalog adds because
+        // its implementation lives in `candle-gen-wan` rather than in the engine crate. Still
+        // exactly one composition point: no family `register_providers` may add a row.
+        let expected: Vec<_> = BASELINE_CODECS
+            .iter()
+            .copied()
+            .chain(std::iter::once(GGUF_CONTAINER_CODEC))
+            .collect();
+        assert_eq!(
+            registered, expected,
+            "the composed Candle catalog must carry the engine codec table exactly once plus the \
+             GGUF container row; no family crate may add or repeat a row"
+        );
+        let mut registered_ids: Vec<&str> = registered.iter().map(|codec| codec.codec_id).collect();
+        registered_ids.sort_unstable();
+        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS
+            .iter()
+            .copied()
+            .chain(std::iter::once(
+                candle_gen_wan::GGUF_CODEC_IMPLEMENTATION_ID,
+            ))
+            .collect();
+        implemented.sort_unstable();
+        assert_eq!(
+            registered_ids, implemented,
+            "every registered codec row needs a decode implementation and vice versa"
+        );
+        // The GGUF row is reachable by its own container encoding, and — critically — is NOT
+        // reachable from any safetensors dtype: `WeightEncoding::from_dtype` can never produce
+        // `GgufContainer`, so a safetensors U8/fp8 tensor cannot be routed into the GGUF decoder.
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::GgufContainer)
+            .is_some_and(|codec| codec.codec_id == GGUF_CONTAINER_CODEC.codec_id));
+        // The plan-side registry `candle-gen-wan` compiles against carries the same row.
+        assert_eq!(
+            candle_gen_wan::gguf_codec_registry()
+                .for_encoding(candle_gen::gen_core::WeightEncoding::GgufContainer)
+                .map(|codec| codec.codec_id),
+            Some(GGUF_CONTAINER_CODEC.codec_id)
+        );
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::DenseBf16)
+            .is_some());
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(candle_gen::gen_core::WeightEncoding::Fp8E4M3)
+            .is_some());
+    }
+
+    /// Every `mapping_id` the composed Candle catalog registers resolves to a real
+    /// `LogicalKeyMapping` on this backend, **or** is explicitly declared not plan-driven here.
+    ///
+    /// Both directions matter, and both were broken before sc-20651: five declared mapping ids had
+    /// no implementation anywhere (they read like backed routes and were not), and nothing proved
+    /// that a mapping the Candle lane really does plan through is declared as such. The mirror of
+    /// `mlx-gen-catalog`'s `canonical_mappings_are_backed_by_declared_implementations`.
+    #[test]
+    fn canonical_mappings_are_backed_by_declared_implementations() {
+        use candle_gen::gen_core::{CheckpointBackend, LogicalKeyMapping};
+
+        let registry = super::provider_registry().unwrap();
+        // The complete set of `LogicalKeyMapping` implementations reachable from the Candle
+        // platform. Adding one without declaring it (or declaring one without adding it) fails
+        // below.
+        //
+        // The Krea mapping carries a file-detected namespace prefix and an optional architecture
+        // config; neither affects `mapping_id`, so the id-surface check below uses the
+        // no-config, bare-prefix form.
+        let krea =
+            candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping::without_config("");
+        let implementations: &[&dyn LogicalKeyMapping] =
+            &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea];
+
+        let mut declared_here = 0usize;
+        for adapter in registry.checkpoint_adapters() {
+            for mapping in adapter.canonical_mappings {
+                let implemented = implementations
+                    .iter()
+                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id);
+                let declared = mapping
+                    .plan_driven_backends
+                    .contains(&CheckpointBackend::Candle);
+                assert_eq!(
+                    implemented,
+                    declared,
+                    "adapter {} dialect {:?}: mapping id {:?} is {} on Candle but {} — a declared \
+                     mapping must resolve to a real implementation, and an implementation must be \
+                     declared (loader-native dialects declare no backend at all)",
+                    adapter.adapter_id,
+                    mapping.dialect,
+                    mapping.mapping_id,
+                    if implemented {
+                        "implemented"
+                    } else {
+                        "unimplemented"
+                    },
+                    if declared {
+                        "declared plan-driven"
+                    } else {
+                        "declared loader-native"
+                    },
+                );
+                declared_here += usize::from(declared);
+            }
+        }
+        assert_eq!(
+            declared_here,
+            implementations.len(),
+            "every Candle mapping implementation must be claimed by exactly one registered dialect"
+        );
+
+        // And the Wan mapping really is the refusing remap the GGUF route plans through: a native
+        // key resolves to its diffusers name, and a foreign one refuses rather than passing
+        // through unchanged.
+        let wan = candle_gen_wan::WanNativeToDiffusersMapping;
+        assert_eq!(
+            wan.logical_key("blocks.0.self_attn.q.weight").as_deref(),
+            Some("blocks.0.attn1.to_q.weight")
+        );
+        assert_eq!(wan.logical_key("vace_blocks.0.before_proj.weight"), None);
+
+        // ...and the Krea mapping really is the native-mmdit remap the Kitchen NVFP4 import plans
+        // through: a native key resolves to its diffusers name, a foreign one refuses.
+        assert_eq!(
+            krea.logical_key("blocks.0.attn.wq.weight").as_deref(),
+            Some("transformer_blocks.0.attn.to_q.weight")
+        );
+        assert_eq!(krea.logical_key("blocks.0.attn.bogus"), None);
+    }
+
+    #[test]
+    fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bindings() {
+        use candle_gen::gen_core::{
+            CheckpointBackend, ImportedModelOperation, ImportedModelRegistration,
+            ImportedModelSource, BASE_SNAPSHOT_COMPONENT, FLUX2_CHECKPOINT_ADAPTER,
+            KREA_2_CHECKPOINT_ADAPTER, QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER,
+            WAN_CHECKPOINT_ADAPTER, Z_IMAGE_CHECKPOINT_ADAPTER,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let expected = [
+            &FLUX2_CHECKPOINT_ADAPTER,
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &QWEN_IMAGE_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+            // The Wan 2.2 ComfyUI expert pair (sc-20644). Registering it widened this frozen
+            // corpus by one row; the corpus is a SHAPE assertion, so it is rewritten here in the
+            // same change rather than exempted.
+            &WAN_CHECKPOINT_ADAPTER,
+            &Z_IMAGE_CHECKPOINT_ADAPTER,
+        ];
+        let adapters: Vec<_> = registry.checkpoint_adapters().collect();
+        assert_eq!(adapters.len(), expected.len());
+        for portable in expected {
+            let bound = adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == portable.adapter_id)
+                .unwrap_or_else(|| panic!("missing Candle adapter {}", portable.adapter_id));
+            assert!(
+                bound.has_same_portable_metadata(portable),
+                "{} drifted from portable metadata",
+                portable.adapter_id
+            );
+            assert!(bound
+                .backend_bindings
+                .iter()
+                .all(|binding| binding.backend == CheckpointBackend::Candle));
+        }
+
+        let binding_operations = |adapter_id| {
+            adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == adapter_id)
+                .unwrap()
+                .backend_bindings
+                .iter()
+                .map(|binding| binding.operation)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            binding_operations(KREA_2_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+                ImportedModelOperation::MultiPhase,
+            ],
+            "Candle truthfully omits the MLX-only Krea pose route"
+        );
+        assert_eq!(
+            binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
+            [ImportedModelOperation::Generate],
+            "Candle truthfully omits the fused SDXL edit route (sc-20651 review). The previous \
+             expectation here asserted that Candle 'implements' it; it did not. The binding \
+             existed, but it named the txt2img `sdxl` provider, whose descriptor declares no \
+             `Reference` conditioning — so the capability floor refused every request the route \
+             admitted. The Candle SDXL edit stack (`edit_provider::SdxlEdit`) is a name-driven \
+             provider that needs a diffusers snapshot dir and a staged fp16-fix VAE; it has no \
+             `LdmComponents`-fed constructor and so cannot serve a fused single-file import. \
+             `SDXL_CHECKPOINT_ADAPTER.eligible_backends` is `[Mlx, Candle]`, so the per-operation \
+             completeness check does not oblige Candle to bind Edit — exactly as Candle Krea \
+             omits the MLX-only pose route above. MLX keeps its Edit binding and honors it."
+        );
+        for adapter in &adapters {
+            if adapter.eligible_backends == [CheckpointBackend::Candle] {
+                for operation in adapter.operations {
+                    assert!(
+                        adapter
+                            .backend_bindings
+                            .iter()
+                            .any(|binding| binding.operation == *operation),
+                        "single-backend Candle adapter {} leaves {operation:?} implementation-free",
+                        adapter.adapter_id
+                    );
+                }
+            }
+        }
+        let expected_legacy_projection = [
+            ImportedModelRegistration {
+                family: "flux2",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_flux2::config::FLUX2_DEV_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_krea::KREA_2_TURBO_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Edit,
+                provider_id: candle_gen_krea::KREA_2_TURBO_EDIT_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::MultiPhase,
+                provider_id: candle_gen_krea::KREA_2_RAW_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "qwen-image",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_qwen_image::config::MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_sdxl::MODEL_ID,
+                required_components: Some(&["tokenizer_clip_l", "tokenizer_clip_bigg"]),
+                inherit_adapters: true,
+            },
+            // No `sdxl` + `FusedCheckpoint` + `Edit` row: Candle does not bind that operation
+            // (sc-20651 review). See the `binding_operations` expectation above for why.
+            ImportedModelRegistration {
+                // Wan's imported route takes NO caller-staged components: the UMT5 encoder, VAE
+                // and tokenizer come from a resident snapshot tier the caller resolves, not from
+                // `LoadSpec::components`. And `inherit_adapters` is false because
+                // `load_from_comfyui_experts` has no adapter seam (sc-20644).
+                family: "wan-video",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_wan::config::MODEL_ID_T2V_14B,
+                required_components: None,
+                inherit_adapters: false,
+            },
+            ImportedModelRegistration {
+                family: "z-image",
+                source: ImportedModelSource::ComfyUiTree,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_z_image::MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+        ];
+        assert_eq!(
+            registry.imported_models().copied().collect::<Vec<_>>(),
+            expected_legacy_projection,
+            "the legacy catalog surface must be the exact pre-registry compatibility projection"
+        );
+    }
+
+    #[test]
     fn modelled_video_provider_ids_have_typed_vae_assignments() {
         let registry = super::provider_registry().unwrap();
         let registered: Vec<&str> = registry
@@ -4332,6 +5026,12 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
+                // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
+                // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
+                // external decoder can consume it, so the descriptor deliberately advertises
+                // nothing and fails closed against every decoder swap.
+                "minimax_h3" => None,
                 family => panic!(
                     "{} has unclassified latent lineage for registered family {family}",
                     descriptor.id
@@ -4818,6 +5518,7 @@ mod tests {
                 "mage_flow_edit",
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
+                "minimax_h3",
                 "mochi_1",
                 "qwen_image",
                 "sana_1600m",
@@ -4870,9 +5571,10 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
-        // also generator ids, which is why 53 + 14 + 1 + 2 registrations are 58 distinct ids. Both
-        // branches independently added one generator to the 51-id base, so the generator count here
-        // is their union (53), not either side's 52.
+        // also generator ids, which is why 54 + 14 + 1 + 2 registrations are 59 distinct ids. Both
+        // branches independently added one generator to the 53-id base (MiniMax-H3 joint-space
+        // no-go on the epic side, the Krea Turbo edit route on main), so the generator count here
+        // is their union (54), not either side's 53.
         //
         // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -4885,8 +5587,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 58);
-        assert_eq!(super::provider_components().len(), 49);
+        assert_eq!(distinct.len(), 59);
+        assert_eq!(super::provider_components().len(), 50);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

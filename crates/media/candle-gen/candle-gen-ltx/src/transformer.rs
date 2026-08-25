@@ -141,6 +141,12 @@ impl Attention {
         Ok(())
     }
 
+    fn set_adapter_pass(&self, pass: usize) {
+        for linear in [&self.to_q, &self.to_k, &self.to_v, &self.to_out, &self.gate] {
+            linear.set_additive_pass(pass);
+        }
+    }
+
     fn to_heads(&self, x: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         x.reshape((b, s, self.heads, self.dim_head))?
@@ -247,6 +253,11 @@ impl FeedForward {
         }
         Ok(())
     }
+
+    fn set_adapter_pass(&self, pass: usize) {
+        self.proj_in.set_additive_pass(pass);
+        self.proj_out.set_additive_pass(pass);
+    }
 }
 
 struct AdaLayerNormSingle {
@@ -285,6 +296,12 @@ impl AdaLayerNormSingle {
             f(&path, linear)?;
         }
         Ok(())
+    }
+
+    fn set_adapter_pass(&self, pass: usize) {
+        self.ts_lin1.set_additive_pass(pass);
+        self.ts_lin2.set_additive_pass(pass);
+        self.linear.set_additive_pass(pass);
     }
 }
 
@@ -381,6 +398,15 @@ impl AvStream {
         self.prompt_adaln.visit_adaptable_mut(f)?;
         self.cross_ss_adaln.visit_adaptable_mut(f)?;
         self.cross_gate_adaln.visit_adaptable_mut(f)
+    }
+
+    fn set_adapter_pass(&self, pass: usize) {
+        self.patchify.set_additive_pass(pass);
+        self.proj_out.set_additive_pass(pass);
+        self.adaln.set_adapter_pass(pass);
+        self.prompt_adaln.set_adapter_pass(pass);
+        self.cross_ss_adaln.set_adapter_pass(pass);
+        self.cross_gate_adaln.set_adapter_pass(pass);
     }
 
     /// adaLN-single + prompt/cross controllers for a uniform T2V timestep `sigma`.
@@ -623,6 +649,17 @@ impl AvBlock {
         self.v2a.visit_adaptable_mut(f)
     }
 
+    fn set_adapter_pass(&self, pass: usize) {
+        self.attn1.set_adapter_pass(pass);
+        self.attn2.set_adapter_pass(pass);
+        self.ff.set_adapter_pass(pass);
+        self.a_attn1.set_adapter_pass(pass);
+        self.a_attn2.set_adapter_pass(pass);
+        self.a_ff.set_adapter_pass(pass);
+        self.a2v.set_adapter_pass(pass);
+        self.v2a.set_adapter_pass(pass);
+    }
+
     /// Self-attn (RoPE) → prompt-modulated text cross-attention (no RoPE), for one modality.
     fn self_and_text(
         &self,
@@ -815,6 +852,17 @@ impl AvDiT {
 
     pub(crate) fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Select the active distilled denoise pass for every installed adapter residual. This takes
+    /// `&self`: projections carry an atomic pass selector so a shared render-time `Arc<AvDiT>` can
+    /// switch stages without rebuilding or mutating the frozen model.
+    pub(crate) fn set_adapter_pass(&self, pass: usize) {
+        self.video.set_adapter_pass(pass);
+        self.audio.set_adapter_pass(pass);
+        for block in &self.blocks {
+            block.set_adapter_pass(pass);
+        }
     }
 
     /// Build (or reuse) the four split-RoPE tables for this render's fixed position grids (sc-8992).

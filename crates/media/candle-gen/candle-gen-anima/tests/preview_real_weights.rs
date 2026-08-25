@@ -26,7 +26,7 @@
 //! ANIMA_PREVIEW_DIR=E:\huggingface\hub\models--circlestone-labs--Anima\snapshots\<rev>\split_files \
 //! ANIMA_QWEN_FIT_VAE=E:\huggingface\hub\models--SceneWorks--qwen-image-mlx\snapshots\<rev>\q8\vae\diffusion_pytorch_model.safetensors \
 //! ANIMA_PREVIEW_ARTIFACT_DIR=E:\out\sc-16953 \
-//!   cargo test -p candle-gen-anima --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-anima --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

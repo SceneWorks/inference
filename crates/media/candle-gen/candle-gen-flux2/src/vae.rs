@@ -511,6 +511,45 @@ impl Flux2Vae {
             .forward(&latent.to_dtype(DType::F32)?)?;
         self.decode(&z)
     }
+
+    /// Decode an already-unpatchified raw latent with the same bounded upsampling-tail plan as
+    /// [`Self::decode_packed_tiled`]. This seam is for providers such as Ideogram whose transformer
+    /// owns a different 128-channel packing order: they must unpatchify themselves, but can still use
+    /// the FLUX.2 VAE's native, overlap-blended bounded decode without repacking through FLUX.2 order.
+    pub fn decode_latent_tiled(
+        &self,
+        latent: &Tensor,
+        tile_edge: u32,
+        overlap: u32,
+    ) -> Result<Tensor> {
+        let z = self
+            .post_quant_conv
+            .forward(&latent.to_dtype(DType::F32)?)?;
+        let mut mid = self.conv_in.forward(&z)?;
+        mid = self.mid_resnet0.forward(&mid)?;
+        mid = self.mid_attn.forward(&mid)?;
+        mid = self.mid_resnet1.forward(&mid)?;
+        let cfg = candle_gen::gen_core::tiling::TilingConfig::spatial_only(
+            tile_edge as i32,
+            overlap as i32,
+        );
+        let mid = mid.unsqueeze(2)?;
+        candle_gen::vae_tiling::decode_tiled(
+            candle_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE,
+            "flux2 vae raw latent",
+            &mid,
+            &cfg,
+            |tile| -> candle_gen::candle_core::Result<Tensor> {
+                let mut h = tile.squeeze(2)?;
+                for block in &self.up_blocks {
+                    h = block.forward(&h)?;
+                }
+                let h = self.conv_norm_out.forward(&h)?.silu()?;
+                self.conv_out.forward(&h)?.unsqueeze(2)
+            },
+        )?
+        .squeeze(2)
+    }
 }
 
 /// Recover the **raw 32-channel VAE latent** `[B, 32, 2h, 2w]` from packed transformer latents

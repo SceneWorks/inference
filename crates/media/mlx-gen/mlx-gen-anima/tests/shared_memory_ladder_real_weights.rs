@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the licensed `circlestone-labs/Anima` snapshot and an Apple GPU. Run:
 //!   ANIMA_SNAPSHOT=<…>/models--circlestone-labs--Anima/snapshots/<rev> \
-//!   cargo test -p mlx-gen-anima --release --test shared_memory_ladder_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration shared_memory_ladder_real_weights:: -- --ignored --nocapture
 //!
 //! Every number this suite prints is measured **on this backend, against this family's own exact
 //! reference**. Nothing here is inherited from Z-Image or Qwen-Image because they share the VAE and

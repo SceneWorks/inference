@@ -23,6 +23,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder};
@@ -110,35 +114,72 @@ enum AdditiveResidual {
     /// `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with `alpha/rank`
     /// folded in). The deferred two-matmul form — never the `[out,in]` product — so it stays memory-free
     /// on a packed base. Mirrors [`crate::quant::AdaptLinear`]'s `Lora` arm exactly.
-    Lora { a: Tensor, b: Tensor, scale: f64 },
-    /// The structured LoKr residual via the shared Kronecker vec-trick; the full `(alpha/rank)·strength`
-    /// scale is baked into the [`LokrFactors`], so `[out,in]` is never formed.
-    LokrStructured { factors: LokrFactors },
+    Lora {
+        a: Tensor,
+        b: Tensor,
+        /// One strength per distilled pass. A length-one vector is uniform over all passes.
+        scales: Vec<f64>,
+    },
+    /// The structured LoKr residual via the shared Kronecker vec-trick. `LokrFactors` carries the
+    /// alpha/rank scale while this overlay carries the selected user strength, so `[out,in]` is never
+    /// formed and the same factors serve each distilled pass.
+    LokrStructured {
+        factors: LokrFactors,
+        /// Multiplies the structured factors for the selected pass. This remains separate from
+        /// `LokrFactors`' baked alpha/rank scale so one adapter can truthfully serve two passes.
+        scales: Vec<f64>,
+    },
 }
 
 impl AdditiveResidual {
     /// A zero user strength is an exact disabled adapter. Check it before evaluating the factors so
     /// unused non-finite data cannot contaminate the host output.
-    fn is_zero(&self) -> bool {
-        match self {
-            AdditiveResidual::Lora { scale, .. } => *scale == 0.0,
-            AdditiveResidual::LokrStructured { factors } => factors.scale == 0.0,
+    fn scale_at(&self, pass: usize) -> candle_core::Result<f64> {
+        let scales = match self {
+            AdditiveResidual::Lora { scales, .. }
+            | AdditiveResidual::LokrStructured { scales, .. } => scales,
+        };
+        scales
+            .get(pass.min(scales.len().saturating_sub(1)))
+            .copied()
+            .ok_or_else(|| {
+                candle_core::Error::Msg("additive adapter pass scales must not be empty".into())
+            })
+    }
+
+    fn is_zero(&self, pass: usize) -> candle_core::Result<bool> {
+        let selected_scale = self.scale_at(pass)?;
+        // Structured LoKr keeps its alpha/rank component baked into the shared factors. The
+        // single-scale API can therefore be disabled either by that legacy effective scale or by
+        // the newly-added selected per-pass strength. Both checks must happen before evaluating
+        // the factors: `0 * NaN` is NaN, not an inert adapter.
+        Ok(selected_scale == 0.0
+            || matches!(self, AdditiveResidual::LokrStructured { factors, .. } if factors.scale == 0.0))
+    }
+
+    fn validate_scales(scales: &[f64]) -> Result<()> {
+        if scales.is_empty() || scales.iter().any(|scale| !scale.is_finite()) {
+            return Err(CandleError::Msg(
+                "additive adapter pass scales must be non-empty and finite".into(),
+            ));
         }
+        Ok(())
     }
 
     /// The residual this adapter contributes, in the activation dtype of `x` (factors are held f32 and
     /// cast per forward — they are tiny). Identical to [`crate::quant::AdaptLinear`]'s residual so the
     /// packed-additive SDXL path and the dense-fold path agree to f32 tolerance.
-    fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    fn residual(&self, x: &Tensor, pass: usize) -> candle_core::Result<Tensor> {
+        let scale = self.scale_at(pass)?;
         match self {
-            AdditiveResidual::Lora { a, b, scale } => {
+            AdditiveResidual::Lora { a, b, .. } => {
                 let xd = x.dtype();
                 let r = x
                     .broadcast_matmul(&a.to_dtype(xd)?)?
                     .broadcast_matmul(&b.to_dtype(xd)?)?;
-                r * *scale
+                r * scale
             }
-            AdditiveResidual::LokrStructured { factors } => factors.residual(x),
+            AdditiveResidual::LokrStructured { factors, .. } => factors.residual(x)? * scale,
         }
     }
 }
@@ -209,6 +250,9 @@ pub struct LoraLinear {
     /// identical to before. Valid on a **packed** base — the SDXL packed-tier distill-LoRA path pushes
     /// these instead of dequant-folding, so the q4/q8 footprint survives.
     additive: Vec<AdditiveResidual>,
+    /// Active distilled denoise pass for additive inference residuals. `Arc<AtomicUsize>` keeps
+    /// `LoraLinear` cloneable and `Sync`, which Candle's shared `Arc<AvDiT>` requires.
+    additive_pass: Arc<AtomicUsize>,
 }
 
 impl LoraLinear {
@@ -228,6 +272,7 @@ impl LoraLinear {
             adapter: None,
             frozen: None,
             additive: Vec::new(),
+            additive_pass: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -249,6 +294,7 @@ impl LoraLinear {
             adapter: None,
             frozen: None,
             additive: Vec::new(),
+            additive_pass: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -298,7 +344,7 @@ impl LoraLinear {
                     *a = a.to_device(device)?;
                     *b = b.to_device(device)?;
                 }
-                AdditiveResidual::LokrStructured { factors } => {
+                AdditiveResidual::LokrStructured { factors, .. } => {
                     *factors = factors.to_device(device)?;
                 }
             }
@@ -353,7 +399,24 @@ impl LoraLinear {
     /// this is valid on **any** base including a **packed** [`QLinear`] — the base weight is never
     /// dequantized, so a q4/q8 tier keeps its footprint. Multiple pushes stack (applied in push order).
     pub fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
-        self.additive.push(AdditiveResidual::Lora { a, b, scale });
+        self.additive.push(AdditiveResidual::Lora {
+            a,
+            b,
+            scales: vec![scale],
+        });
+    }
+
+    /// Attach a LoRA residual with one scale per distilled denoise pass. A one-entry vector is
+    /// intentionally uniform; longer vectors select by [`set_additive_pass`](Self::set_additive_pass).
+    pub fn push_additive_lora_per_pass(
+        &mut self,
+        a: Tensor,
+        b: Tensor,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        AdditiveResidual::validate_scales(&scales)?;
+        self.additive.push(AdditiveResidual::Lora { a, b, scales });
+        Ok(())
     }
 
     /// Attach a forward-time **additive structured LoKr** inference residual via the shared Kronecker
@@ -361,8 +424,29 @@ impl LoraLinear {
     /// `[out,in]` delta is never formed and the residual is memory-free on a packed base. Valid on any
     /// base; multiple pushes stack and mix freely with additive LoRA residuals (push order).
     pub fn push_additive_lokr(&mut self, factors: LokrFactors) {
+        self.additive.push(AdditiveResidual::LokrStructured {
+            factors,
+            scales: vec![1.0],
+        });
+    }
+
+    /// Attach a structured LoKr residual with per-pass user strengths. Build `factors` with its
+    /// alpha/rank scale only; this method applies the selected user strength at forward time.
+    pub fn push_additive_lokr_per_pass(
+        &mut self,
+        factors: LokrFactors,
+        scales: Vec<f64>,
+    ) -> Result<()> {
+        AdditiveResidual::validate_scales(&scales)?;
         self.additive
-            .push(AdditiveResidual::LokrStructured { factors });
+            .push(AdditiveResidual::LokrStructured { factors, scales });
+        Ok(())
+    }
+
+    /// Select the active distilled denoise pass for additive residuals. Indexes past a residual's
+    /// final scale intentionally clamp, so a conventional scalar adapter remains uniform.
+    pub fn set_additive_pass(&self, pass: usize) {
+        self.additive_pass.store(pass, Ordering::Relaxed);
     }
 
     /// Whether any forward-time additive inference residual is attached (sc-11103) — distinct from
@@ -484,11 +568,12 @@ impl Module for LoraLinear {
         // trainable adapter. Disabled residuals are skipped; live residuals retain their x-dtype math
         // and cast only to the current host output dtype at the add. Empty on the plain / trainable
         // path, so this loop is a no-op there.
+        let pass = self.additive_pass.load(Ordering::Relaxed);
         for ar in &self.additive {
-            if ar.is_zero() {
+            if ar.is_zero(pass)? {
                 continue;
             }
-            let residual = ar.residual(x)?.to_dtype(y.dtype())?;
+            let residual = ar.residual(x, pass)?.to_dtype(y.dtype())?;
             y = (y + residual)?;
         }
         Ok(y)
@@ -1785,6 +1870,39 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(dmax < 1e-4, "additive vs folded deviates by {dmax}");
+    }
+
+    /// An explicit two-stage adapter must change the actual forward residual when the LTX pipeline
+    /// moves from stage one to stage two; merely accepting `[1.0, 0.4]` at load time is insufficient.
+    #[test]
+    fn additive_lora_selects_the_requested_distilled_pass_scale() {
+        let dev = Device::Cpu;
+        let base = Linear::new(Tensor::zeros((1, 1), DType::F32, &dev).unwrap(), None);
+        let mut lin = LoraLinear::from_linear(base, 1, 1, "ltx.pass_test".into());
+        lin.push_additive_lora_per_pass(
+            Tensor::ones((1, 1), DType::F32, &dev).unwrap(),
+            Tensor::ones((1, 1), DType::F32, &dev).unwrap(),
+            vec![1.0, 0.4],
+        )
+        .unwrap();
+        let x = Tensor::from_vec(vec![5.0f32], (1, 1), &dev).unwrap();
+
+        lin.set_additive_pass(0);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![5.0]]
+        );
+        lin.set_additive_pass(1);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![2.0]]
+        );
+        // A later pass clamps to the final explicit scale instead of silently reverting to stage one.
+        lin.set_additive_pass(9);
+        assert_eq!(
+            lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![2.0]]
+        );
     }
 
     /// A trainable residual is legal over an immutable packed base: the packed weights remain frozen

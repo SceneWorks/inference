@@ -113,6 +113,7 @@ pub(crate) struct Pipeline {
     /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
     pid_spec: Option<PidWeights>,
     adapters: Vec<AdapterSpec>,
+    load_seal: Option<crate::memory_strategy::KolorsLoadSeal>,
 }
 
 /// Kolors' two UNet deltas vs stock SDXL, both auto-present in the checkpoint: the `add_embedding` MLP
@@ -221,7 +222,24 @@ impl Pipeline {
             device: device.clone(),
             pid_spec,
             adapters,
+            load_seal: None,
         }
+    }
+
+    pub(crate) fn with_load_seal(
+        mut self,
+        seal: Option<crate::memory_strategy::KolorsLoadSeal>,
+    ) -> Self {
+        self.load_seal = seal;
+        self
+    }
+
+    fn ensure_load_seal(&self) -> Result<()> {
+        if let Some(seal) = &self.load_seal {
+            seal.ensure_unchanged()
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Load the four heavy components from the Kolors-diffusers snapshot (`tokenizer/`, `text_encoder/`
@@ -237,6 +255,25 @@ impl Pipeline {
     ///   dense `unet/` builds the stock [`KolorsUNet`] (the byte-exact default path);
     /// - the VAE stays dense f32 in every tier (the MLX packer mirrors it, not packs it).
     pub(crate) fn load_components(&self) -> Result<Components> {
+        let (tokenizer, chatglm) = self.load_conditioner()?;
+        let unet = self.load_unet()?;
+        let vae = self.load_vae()?;
+        let pid = self.load_pid()?;
+        Ok(Components {
+            tokenizer: Arc::new(tokenizer),
+            chatglm: Arc::new(chatglm),
+            unet,
+            vae: Arc::new(vae),
+            vae_encoder: Arc::new(Mutex::new(None)),
+            pid,
+        })
+    }
+
+    /// Materialize only the tokenizer and ChatGLM conditioning phase.  Staged
+    /// requests use this independently so the 6B text tower is released before
+    /// the UNet phase is opened.
+    fn load_conditioner(&self) -> Result<(KolorsTokenizer, ChatGlmModel)> {
+        self.ensure_load_seal()?;
         let tokenizer = KolorsTokenizer::from_dir(self.root.join("tokenizer"))?;
 
         // ChatGLM3-6B text encoder. The four GLM projections packed-detect on their `.scales` sibling
@@ -249,11 +286,16 @@ impl Pipeline {
             self.f32_vb(&te_dir)?,
             te_group,
         )?;
+        Ok((tokenizer, chatglm))
+    }
 
+    /// Materialize only the denoise phase, preserving the packed/dense fork.
+    fn load_unet(&self) -> Result<KolorsUnet> {
+        self.ensure_load_seal()?;
         // UNet: a packed MLX tier (a `quantization` block in `unet/config.json`) builds the vendored,
         // packed-detecting SDXL UNet + the two Kolors deltas straight from the packed parts; a dense
         // snapshot builds the stock `KolorsUNet` (byte-exact default path, zero regression).
-        let unet = match detect_packed_unet(&self.root)? {
+        match detect_packed_unet(&self.root)? {
             Some((unet_file, group_size)) => {
                 let vs = candle_gen::mmap_var_builder(&[unet_file], DType::F32, &self.device)?;
                 // The vendored UNet + the 5632 `add_embedding` (both packed-detecting via the shared
@@ -277,15 +319,15 @@ impl Pipeline {
                     true,
                     group_size,
                 )?;
-                KolorsUnet::Packed {
+                Ok(KolorsUnet::Packed {
                     unet: Arc::new(vendored),
                     encoder_hid_proj: Arc::new(encoder_hid_proj),
-                }
+                })
             }
-            None if self.adapters.is_empty() => KolorsUnet::Dense(Arc::new(KolorsUNet::new(
+            None if self.adapters.is_empty() => Ok(KolorsUnet::Dense(Arc::new(KolorsUNet::new(
                 self.f32_vb(&self.root.join("unet"))?,
                 false,
-            )?)),
+            )?))),
             None => {
                 let vs = self.f32_vb(&self.root.join("unet"))?;
                 let vendored = load_vendored_unet_with_adapters(
@@ -304,36 +346,37 @@ impl Pipeline {
                     true,
                     MLX_GROUP_SIZE,
                 )?;
-                KolorsUnet::Packed {
+                Ok(KolorsUnet::Packed {
                     unet: Arc::new(vendored),
                     encoder_hid_proj: Arc::new(encoder_hid_proj),
-                }
+                })
             }
-        };
+        }
+    }
 
-        let vae = AutoEncoderKL::new(
+    /// Materialize only the native F32 SDXL VAE decode phase.  bf16 snapshots
+    /// intentionally still execute this exact F32 recipe.
+    fn load_vae(&self) -> Result<AutoEncoderKL> {
+        self.ensure_load_seal()?;
+        Ok(AutoEncoderKL::new(
             self.f32_vb(&self.root.join("vae"))?,
             3,
             3,
             sdxl_vae_config(),
-        )?;
+        )?)
+    }
+
+    fn load_pid(&self) -> Result<Option<Arc<PidEngine>>> {
+        self.ensure_load_seal()?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
-        let pid = match self.pid_spec.as_ref() {
+        Ok(match self.pid_spec.as_ref() {
             Some(spec) => Some(Arc::new(PidEngine::from_spec(
                 spec,
                 PID_BACKBONE,
                 &self.device,
             )?)),
             None => None,
-        };
-        Ok(Components {
-            tokenizer: Arc::new(tokenizer),
-            chatglm: Arc::new(chatglm),
-            unet,
-            vae: Arc::new(vae),
-            vae_encoder: Arc::new(Mutex::new(None)),
-            pid,
         })
     }
 
@@ -341,6 +384,14 @@ impl Pipeline {
     /// sharded or single-file).
     fn f32_vb(&self, dir: &Path) -> Result<VarBuilder<'static>> {
         candle_gen::load_sorted_mmap(dir, DType::F32, &self.device, "kolors")
+    }
+
+    fn load_vae_encoder(&self) -> Result<VaeMomentsEncoder> {
+        self.ensure_load_seal()?;
+        Ok(VaeMomentsEncoder::new(
+            self.f32_vb(&self.root.join("vae"))?,
+            VAE_SCALE,
+        )?)
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -493,6 +544,154 @@ impl Pipeline {
         })
     }
 
+    /// Request-authoritative staged execution.  The conditioning tower, denoiser, and decoder are
+    /// materialized in three non-overlapping phases; img2img opens its VAE encoder before
+    /// conditioning.  Every phase synchronizes before it is dropped, including on cancellation or
+    /// an error through [`SynchronizedPhase`]'s drop guard.  This must remain separate from the warm
+    /// [`Components`] cache: a staged request must never inherit resident heavyweight components.
+    pub(crate) fn render_staged(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<Image>> {
+        ensure_not_cancelled(req)?;
+        let steps = req
+            .steps
+            .map(|s| s as usize)
+            .unwrap_or(DEFAULT_STEPS as usize);
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let use_guide = guidance > 1.0;
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+        let (h, w) = (req.height, req.width);
+        let img2img = resolve_reference(req)?;
+
+        // Edit's latent-init phase precedes ChatGLM and does not retain the VAE encoder once the
+        // deterministic posterior mean has been produced.
+        let init_latents = match img2img {
+            Some((image, _)) => {
+                let encoder = SynchronizedPhase::new(self.load_vae_encoder()?, self.device.clone());
+                let latents = self.encode_reference_with(&encoder, image, w, h)?;
+                encoder.release()?;
+                Some(latents)
+            }
+            None => None,
+        };
+
+        ensure_not_cancelled(req)?;
+        let conditioner = SynchronizedPhase::new(self.load_conditioner()?, self.device.clone());
+        let (context, pooled, batch) = common::cfg_batch_context(
+            &req.prompt,
+            negative,
+            use_guide,
+            common::resolve_cfg_batching(req),
+            |prompt| self.encode_with(&conditioner.0, &conditioner.1, prompt),
+        )?;
+        let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
+        conditioner.release()?;
+
+        ensure_not_cancelled(req)?;
+        let unet = SynchronizedPhase::new(self.load_unet()?, self.device.clone());
+        let encoder_hidden_states = unet.project_context(&context)?;
+        let sampler = match img2img {
+            Some((_, strength)) => {
+                KolorsEulerSampler::img2img(steps, strength).map_err(CandleError::Msg)?
+            }
+            None => KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?,
+        };
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
+        let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
+        let total = sampler.num_steps() as u32;
+        let mut latents = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            ensure_not_cancelled(req)?;
+            let seed = base_seed.wrapping_add(u64::from(index));
+            let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
+            let rendered = if let Some(name) = curated {
+                self.denoise_curated_with_unet(
+                    req,
+                    name,
+                    &noise,
+                    init_latents.as_ref(),
+                    img2img.map_or(1.0, |(_, strength)| strength),
+                    &unet,
+                    &encoder_hidden_states,
+                    &pooled,
+                    &time_ids,
+                    steps,
+                    use_guide,
+                    guidance,
+                    seed,
+                    on_progress,
+                )?
+            } else {
+                let mut current = match init_latents.as_ref() {
+                    Some(init) => sampler.add_noise(init, &noise)?,
+                    None => (&noise * sampler.init_noise_sigma() as f64)?,
+                };
+                let preview_counter =
+                    candle_gen::preview::PreviewCounter::with_steps(sampler.num_steps());
+                for step in 0..sampler.num_steps() {
+                    ensure_not_cancelled(req)?;
+                    let scaled = (&current / sampler.scale_in(step) as f64)?;
+                    candle_gen::preview::emit_preview_at(
+                        &req.preview,
+                        &preview_counter,
+                        step,
+                        || crate::preview::project_spatial_latents(&scaled),
+                    );
+                    let model_in = if use_guide {
+                        Tensor::cat(&[&scaled, &scaled], 0)?
+                    } else {
+                        scaled
+                    };
+                    let eps = unet.forward_projected(
+                        &model_in,
+                        sampler.timestep(step) as f64,
+                        &encoder_hidden_states,
+                        &pooled,
+                        &time_ids,
+                    )?;
+                    let eps = if use_guide {
+                        let chunks = eps.chunk(2, 0)?;
+                        (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance as f64)?)?
+                    } else {
+                        eps
+                    };
+                    current = (&current + (eps * sampler.step_dt(step) as f64)?)?;
+                    on_progress(Progress::Step {
+                        current: step as u32 + 1,
+                        total,
+                    });
+                }
+                current
+            };
+            latents.push(rendered);
+        }
+        unet.release()?;
+
+        ensure_not_cancelled(req)?;
+        // The native VAE is deliberately F32 for all physical tiers; PiD is a replacement decoder,
+        // not a co-resident fourth phase.
+        let decoder =
+            SynchronizedPhase::new((self.load_vae()?, self.load_pid()?), self.device.clone());
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            decoder.1.as_deref(),
+            req,
+            base_seed,
+            crate::MODEL_ID,
+        )?;
+        let mut images = Vec::with_capacity(latents.len());
+        for latent in &latents {
+            ensure_not_cancelled(req)?;
+            on_progress(Progress::Decoding);
+            images.push(common::decode(&decoder.0, pid_decoder.as_ref(), latent)?);
+        }
+        drop(pid_decoder);
+        decoder.release()?;
+        Ok(images)
+    }
+
     /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native
     /// leading-Euler default. Drives the unified [`gen_core::sampling`] solver menu (`euler` /
     /// `euler_ancestral` / `heun` / `dpmpp_2m` / `dpmpp_sde` / `uni_pc` / `lcm` / `ddim`) over a
@@ -514,6 +713,42 @@ impl Pipeline {
         init_latents: Option<&Tensor>,
         strength: f32,
         components: &Components,
+        encoder_hidden_states: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+        steps: usize,
+        use_guide: bool,
+        guidance: f32,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        self.denoise_curated_with_unet(
+            req,
+            sampler,
+            noise,
+            init_latents,
+            strength,
+            &components.unet,
+            encoder_hidden_states,
+            pooled,
+            time_ids,
+            steps,
+            use_guide,
+            guidance,
+            seed,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_curated_with_unet(
+        &self,
+        req: &GenerationRequest,
+        sampler: &str,
+        noise: &Tensor,
+        init_latents: Option<&Tensor>,
+        strength: f32,
+        unet: &KolorsUnet,
         encoder_hidden_states: &Tensor,
         pooled: &Tensor,
         time_ids: &Tensor,
@@ -553,7 +788,7 @@ impl Pipeline {
                 } else {
                     x_in.clone()
                 };
-                let eps = components.unet.forward_projected(
+                let eps = unet.forward_projected(
                     &model_in,
                     t as f64,
                     encoder_hidden_states,
@@ -618,13 +853,101 @@ impl Pipeline {
         Ok(vae_encoder.encode_mean(&input)?)
     }
 
+    fn encode_reference_with(
+        &self,
+        vae_encoder: &VaeMomentsEncoder,
+        image: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let (in_w, in_h) = (image.width as usize, image.height as usize);
+        let expected =
+            gen_core::imageops::checked_image_buffer_len(in_w, in_h, 3).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "kolors: invalid reference dimensions {}x{}",
+                    image.width, image.height
+                ))
+            })?;
+        if image.pixels.len() != expected {
+            return Err(CandleError::Msg(format!(
+                "kolors: reference pixel buffer {} != {in_w}x{in_h}x3",
+                image.pixels.len()
+            )));
+        }
+        let (out_w, out_h) = (width as usize, height as usize);
+        let resized = resize_lanczos_u8(&image.pixels, in_h, in_w, out_h, out_w)?;
+        let data: Vec<f32> = resized
+            .into_iter()
+            .map(|pixel| pixel / 127.5 - 1.0)
+            .collect();
+        let input = Tensor::from_vec(data, (out_h, out_w, 3), &self.device)?
+            .permute((2, 0, 1))?
+            .unsqueeze(0)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        Ok(vae_encoder.encode_mean(&input)?)
+    }
+
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
     /// local (not in [`crate::common`]) because it threads the cached [`Components`]; the shared
     /// [`common::cfg_batch_context`] takes this as a closure so the CFG-concat convention is the only
     /// shared piece — the ChatGLM3 tokenize/encode specifics stay per-site.
     fn encode(&self, components: &Components, prompt: &str) -> Result<(Tensor, Tensor)> {
-        let tokens = components.tokenizer.encode(prompt)?;
-        Ok(components.chatglm.encode_prompt(&tokens)?)
+        self.encode_with(&components.tokenizer, &components.chatglm, prompt)
+    }
+
+    fn encode_with(
+        &self,
+        tokenizer: &KolorsTokenizer,
+        chatglm: &ChatGlmModel,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor)> {
+        let tokens = tokenizer.encode(prompt)?;
+        Ok(chatglm.encode_prompt(&tokens)?)
+    }
+}
+
+/// Own one staged component group and synchronize its device work before release.  Explicit
+/// `release` catches synchronization failures; `Drop` supplies the same cleanup for cancellation,
+/// error, and unwind paths where there is no result channel.
+pub(crate) struct SynchronizedPhase<T> {
+    value: Option<T>,
+    device: Device,
+}
+
+impl<T> SynchronizedPhase<T> {
+    pub(crate) fn new(value: T, device: Device) -> Self {
+        Self {
+            value: Some(value),
+            device,
+        }
+    }
+    pub(crate) fn release(mut self) -> Result<()> {
+        self.device.synchronize()?;
+        drop(self.value.take());
+        Ok(())
+    }
+}
+
+impl<T> std::ops::Deref for SynchronizedPhase<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref().expect("staged phase released")
+    }
+}
+
+impl<T> std::ops::DerefMut for SynchronizedPhase<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.as_mut().expect("staged phase released")
+    }
+}
+
+impl<T> Drop for SynchronizedPhase<T> {
+    fn drop(&mut self) {
+        if self.value.is_some() {
+            let _ = self.device.synchronize();
+            drop(self.value.take());
+        }
     }
 }
 
@@ -669,7 +992,11 @@ fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, f32)>> {
 /// missing config is treated as dense; the downstream loader gives the precise "missing X" error). Used
 /// for the ChatGLM3 `text_encoder/` group thread (the per-Linear `.scales` detection is
 /// [`QLinear::linear_detect_gs`]'s job, so this only recovers the grid, never gates the packed path).
-fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
+/// Read the physical MLX packing grid from a component config.  The conditioned
+/// IP/Control providers use this too: their base snapshot is the same canonical
+/// q4/q8 artifact as the registered route, so treating those paths as dense
+/// would either decode u32 codes as weights or silently cross a tier.
+pub(crate) fn detect_packed_group(cfg_path: &Path) -> Result<Option<usize>> {
     if !cfg_path.is_file() {
         return Ok(None);
     }
@@ -726,6 +1053,7 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
     /// path — it was previously dropped on the floor by txt2img, silently rendering the native
@@ -887,6 +1215,39 @@ mod tests {
         let encode = &source[encode_start..encode_end];
         assert!(encode.contains("candle_gen::cached(&components.vae_encoder"));
         assert!(encode.contains("VaeMomentsEncoder::new"));
+    }
+
+    #[test]
+    fn synchronized_phase_releases_on_success_error_and_panic() {
+        struct Probe(std::sync::Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let device = Device::Cpu;
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        SynchronizedPhase::new(Probe(drops.clone()), device.clone())
+            .release()
+            .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let error_path = || -> Result<()> {
+            let _phase = SynchronizedPhase::new(Probe(drops.clone()), device.clone());
+            Err(CandleError::Msg("injected phase error".into()))
+        };
+        assert!(error_path().is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        let unwind = std::panic::catch_unwind({
+            let drops = drops.clone();
+            move || {
+                let _phase = SynchronizedPhase::new(Probe(drops), Device::Cpu);
+                panic!("injected phase panic");
+            }
+        });
+        assert!(unwind.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     /// sc-10819: `detect_packed_unet` returns `Some((file, group))` when `unet/config.json` carries a

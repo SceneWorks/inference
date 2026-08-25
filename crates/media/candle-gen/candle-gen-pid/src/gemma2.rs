@@ -15,7 +15,7 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Linear, Module};
+use candle_gen::quant::{linear_from_weights, QLinear};
 use candle_gen::{Result, Weights};
 
 use crate::nn::rms;
@@ -53,9 +53,91 @@ impl Gemma2Config {
     }
 }
 
-/// Bias-less Linear over a raw `{key}` weight (Gemma projections carry no bias).
-fn lin(w: &Weights, key: &str) -> Result<Linear> {
-    Ok(Linear::new(w.require(key)?, None))
+/// Bias-less Gemma projection. Published SANA tiers replace only these `.weight` tensors with the
+/// MLX affine triple, so this packed-detecting seam keeps PiD's dense behavior unchanged while
+/// letting SANA consume the hosted q4/q8 text encoder without a dense fallback.
+fn lin(w: &Weights, key: &str) -> Result<QLinear> {
+    let base = key.strip_suffix(".weight").ok_or_else(|| {
+        candle_gen::CandleError::Msg(format!("gemma projection key lacks .weight suffix: {key}"))
+    })?;
+    linear_from_weights(w, base, false)
+}
+
+/// Validate the full Gemma affine tier before building any layer. SANA publishes this component as
+/// one coherent q4 or q8 tier: allowing one missing sidecar to fall through to a dense `Linear`
+/// would interpret U32 codes as weights and fail only after the expensive pipeline has started.
+fn validate_packed_tier(w: &Weights, prefix: &str, cfg: &Gemma2Config) -> Result<Option<usize>> {
+    const GROUP: usize = 64;
+    const TARGETS: [&str; 7] = [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ];
+    let bases = (0..cfg.num_layers).flat_map(|index| {
+        TARGETS
+            .iter()
+            .map(move |tail| format!("{prefix}layers.{index}.{tail}"))
+    });
+    let bases = bases.collect::<Vec<_>>();
+    let packed = bases.iter().any(|base| {
+        w.contains(&format!("{base}.scales"))
+            || w.require(&format!("{base}.weight"))
+                .map(|weight| weight.dtype() == DType::U32)
+                .unwrap_or(false)
+    });
+    if !packed {
+        return Ok(None);
+    }
+
+    let mut bits = None;
+    for base in bases {
+        let weight_key = format!("{base}.weight");
+        let scales_key = format!("{base}.scales");
+        let biases_key = format!("{base}.biases");
+        for key in [&weight_key, &scales_key, &biases_key] {
+            if !w.contains(key) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "Gemma packed tier is incomplete: missing {key}; every attention/MLP projection \
+                     must carry group-{GROUP} MLX weight/scales/biases parts"
+                )));
+            }
+        }
+        let weight = w.require(&weight_key)?;
+        let scales = w.require(&scales_key)?;
+        let biases = w.require(&biases_key)?;
+        if weight.dtype() != DType::U32 || scales.dims2()? != biases.dims2()? {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "Gemma packed tier has invalid affine parts for {base}: expected U32 weight and equal rank-2 scales/biases"
+            )));
+        }
+        let (out, packed_cols) = weight.dims2()?;
+        let (scale_out, scale_cols) = scales.dims2()?;
+        if out != scale_out || scale_cols == 0 {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "Gemma packed tier has invalid group-{GROUP} geometry for {base}"
+            )));
+        }
+        let this_bits = candle_gen::quant::mlx_packed_bits_gs(packed_cols, scale_cols, GROUP);
+        if !matches!(this_bits, 4 | 8) {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "Gemma packed tier has unsupported Q{this_bits} layout for {base}; expected Q4 or Q8 group-{GROUP}"
+            )));
+        }
+        if let Some(expected) = bits {
+            if expected != this_bits {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "Gemma packed tier mixes Q{expected} and Q{this_bits} projections; select one coherent Q4 or Q8 tier"
+                )));
+            }
+        } else {
+            bits = Some(this_bits);
+        }
+    }
+    Ok(bits)
 }
 
 /// `weight + 1.0` (Gemma RMSNorm scale), pre-folded at load so [`crate::nn::rms`] applies it directly.
@@ -117,10 +199,10 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
 }
 
 struct Attention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -172,9 +254,9 @@ impl Attention {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
@@ -237,6 +319,7 @@ pub struct Gemma2 {
 impl Gemma2 {
     /// `prefix` is `"model."` for the HF checkpoint layout.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &Gemma2Config) -> Result<Self> {
+        validate_packed_tier(w, prefix, cfg)?;
         let layers = (0..cfg.num_layers)
             .map(|i| Layer::from_weights(w, &format!("{prefix}layers.{i}"), cfg))
             .collect::<Result<Vec<_>>>()?;
@@ -304,5 +387,61 @@ impl Gemma2 {
                 Ok(causal.broadcast_add(&key_add)?)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::quant::{pack_mlx_affine, MLX_GROUP_SIZE};
+    use std::collections::HashMap;
+
+    #[test]
+    fn sana_gemma_q4_and_q8_projection_parts_never_take_the_dense_loader() {
+        let dev = Device::Cpu;
+        let base = "model.layers.0.self_attn.q_proj";
+        let dense = Tensor::from_vec(
+            (0..64).map(|index| index as f32 / 64.0).collect::<Vec<_>>(),
+            (1, 64),
+            &dev,
+        )
+        .unwrap();
+        for bits in [4, 8] {
+            let (wq, scales, biases) = pack_mlx_affine(&dense, bits, MLX_GROUP_SIZE).unwrap();
+            let mut map = HashMap::new();
+            map.insert(format!("{base}.weight"), wq);
+            map.insert(format!("{base}.scales"), scales);
+            map.insert(format!("{base}.biases"), biases);
+            let projection = lin(&Weights::from_map(map), &format!("{base}.weight")).unwrap();
+            assert!(
+                projection.is_quantized(),
+                "SANA Gemma Q{bits} projection must load from packed parts, never dense"
+            );
+        }
+    }
+
+    #[test]
+    fn orphaned_sana_gemma_u32_codes_fail_before_layer_construction() {
+        let dev = Device::Cpu;
+        let cfg = Gemma2Config {
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 64,
+            intermediate_size: 64,
+            rope_theta: 10_000.0,
+            attn_softcap: 50.0,
+            query_pre_attn_scalar: 64.0,
+            rms_eps: 1e-6,
+        };
+        let dense = Tensor::zeros((1, 64), DType::F32, &dev).unwrap();
+        let (wq, _, _) = pack_mlx_affine(&dense, 4, MLX_GROUP_SIZE).unwrap();
+        let mut map = HashMap::new();
+        map.insert("layers.0.self_attn.q_proj.weight".into(), wq);
+        let error = validate_packed_tier(&Weights::from_map(map), "", &cfg)
+            .expect_err("orphaned U32 Gemma codes must fail before construction")
+            .to_string();
+        assert!(error.contains("packed tier is incomplete"), "got: {error}");
     }
 }

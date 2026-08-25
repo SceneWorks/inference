@@ -27,7 +27,7 @@ use mlx_gen::{
     require_control, run_flow_sampler_with_latent_hook, Capabilities, Conditioning,
     ConditioningKind, ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, SizeFloor, TimestepConvention,
+    Result, TimestepConvention,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -63,17 +63,14 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
             supports_guidance: true,
-            supports_true_cfg: false,
             // Control (required, the pose/union skeleton) + an optional img2img Reference init.
             conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
             // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
             supports_lora: true,
             supports_lokr: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.
@@ -82,37 +79,21 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
                 s.push("flow_match_euler");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
             requires_sigma_shift: true,
             // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
             // Mistral-3 text encoder drops after the prompt encode, then the control transformer (dev
             // DiT + control branch) + VAE load, bounding peak to `max(TE, DiT+control+VAE)`.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
             // sc-18317: the dev-control route shares the base double/single stacks, so it shares
             // their activation levers; `generate` threads the request through
             // `MemoryConfig::with_request` into `Flux2ControlTransformer::forward_with_mem`.
             execution: crate::chunk::EXECUTION_SURFACE,
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -589,6 +570,17 @@ impl Generator for Flux2DevControl {
             self.memory_numeric_tier,
         )
     }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_dev_request(
+            &self.memory_strategy,
+            context,
+            self.memory_numeric_tier,
+        )
+    }
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
@@ -605,6 +597,13 @@ pub(crate) const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
         provider_id: FLUX2_DEV_CONTROL_ID,
         contract: crate::memory_strategy::registered_dev_control_contract,
         safety_check: crate::memory_strategy::registered_dev_control_safety_check,
+    };
+
+pub(crate) const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: FLUX2_DEV_CONTROL_ID,
+        valid_fixtures: crate::memory_strategy::registered_dev_fixture,
+        begin_request: crate::memory_strategy::registered_dev_begin_request,
     };
 
 #[cfg(test)]
@@ -709,7 +708,7 @@ mod tests {
             calibration_fingerprint: String::new(),
             load_shape: contract.load_shape,
             mode: MemoryMode::TextToImage,
-            has_reference: false,
+            has_reference: true,
             use_pid: false,
             has_phases: false,
             geometry: MemoryGeometry {
@@ -717,7 +716,7 @@ mod tests {
                 height: 768,
                 batch: 1,
                 frames: 1,
-                reference_count: 0,
+                reference_count: 1,
             },
             overlay: Some(crate::memory_strategy::DEV_CONTROL_OVERLAY.to_owned()),
             budget: MemoryBudget {
@@ -819,12 +818,18 @@ mod tests {
                 assert!(contract.calibration.is_none());
                 assert_eq!(contract.asset_facts, Default::default());
                 assert!(contract.conformance_errors().is_empty());
-                assert!(contract.strategies.iter().all(|capability| {
-                    capability.strategy == MemoryStrategy::Resident
-                        && capability.support == gen_core::MemoryStrategySupport::Implemented
-                        || capability.strategy != MemoryStrategy::Resident
-                            && capability.support == gen_core::MemoryStrategySupport::Missing
-                }));
+                assert!(contract
+                    .strategies
+                    .iter()
+                    .all(|capability| match capability.strategy {
+                        MemoryStrategy::Resident => {
+                            capability.support == gen_core::MemoryStrategySupport::Implemented
+                        }
+                        MemoryStrategy::StagedResidency => {
+                            capability.support == gen_core::MemoryStrategySupport::Implemented
+                        }
+                        _ => capability.support == gen_core::MemoryStrategySupport::Missing,
+                    }));
                 let tier = MemoryNumericTier {
                     precision: Precision::Bf16,
                     quant: Some(quant),

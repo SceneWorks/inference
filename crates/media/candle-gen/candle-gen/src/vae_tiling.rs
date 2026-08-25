@@ -334,18 +334,33 @@ where
 ///
 /// Whole-decode VAE tiling is not normalization-correct: every tile computes GroupNorm against its
 /// own crop, while a dense decode normalizes against the whole image. This context reduces the full
-/// activation once to per-batch/per-group mean and inverse standard deviation, then applies those
-/// same statistics to halo-expanded convolution crops. Only the tiny statistics tensors are kept;
-/// the full normalized activation is never materialized.
+/// activation once to per-batch/per-group mean and standard deviation, then applies those same
+/// statistics to halo-expanded convolution crops. Only the tiny statistics tensors are kept; the
+/// full normalized activation is never materialized.
 ///
 /// The arithmetic tracks [`candle_nn::GroupNorm`] exactly, including its dtype dance: statistics and
 /// the normalize are computed in f32 for f16/bf16 inputs, and the result is cast back **before** the
 /// per-channel affine, which is where candle applies it.
+///
+/// **"Exactly" is literal, and load-bearing (sc-19447).** The standard deviation is stored and
+/// [`apply`](Self::apply) *divides* by it, rather than storing `1/σ` once and multiplying — which
+/// would hoist one reciprocal out of the per-crop loop but round every normalized element twice
+/// where candle rounds once (candle's `GroupNorm` is a `broadcast_div` by `(var + eps).sqrt()`).
+/// The consumer routes a decode through candle's `GroupNorm` when dense and through this type when
+/// bounded, so a reassociation here is a real divergence between the two renders of one image: it
+/// is ~1 ULP per element at a single layer, but it compounds through the decoder and is
+/// target-dependent. Across an SDXL VAE decode it measured 9.54e-7 on `aarch64` macOS and 1.073e-6
+/// on `x86_64` Linux — one defect, landing either side of a 1e-6 bound on target alone, which is
+/// how it stayed buried until the decode ran on Linux. Dividing makes the whole-activation apply
+/// **bit-identical** to candle on every target, so `candle-gen-sdxl`'s decoder-level fall-through
+/// control and this module's `whole_activation_matches_candle_group_norm` both assert exact
+/// equality instead of a machine-calibrated tolerance. Do not reintroduce the reciprocal.
 pub struct GlobalGroupNorm {
     /// `[B, G, 1]`, f32.
     mean: Tensor,
-    /// `[B, G, 1]`, f32 — `1 / sqrt(var + eps)`.
-    inv_std: Tensor,
+    /// `[B, G, 1]`, f32 — `sqrt(var + eps)`. Stored un-inverted so [`apply`](Self::apply) can
+    /// divide exactly as candle does; see the type-level note.
+    std: Tensor,
     /// `[1, C, 1, 1]`, input dtype.
     weight: Tensor,
     /// `[1, C, 1, 1]`, input dtype.
@@ -390,10 +405,11 @@ impl GlobalGroupNorm {
         let mean = (grouped.sum_keepdim(2)? / hidden as f64)?;
         let centered = grouped.broadcast_sub(&mean)?;
         let var = (centered.sqr()?.sum_keepdim(2)? / hidden as f64)?;
-        let inv_std = (var + eps)?.sqrt()?.recip()?;
+        // NOT `.recip()` — `apply` divides by this, matching candle's `broadcast_div` bit for bit.
+        let std = (var + eps)?.sqrt()?;
         Ok(Self {
             mean,
-            inv_std,
+            std,
             weight: weight.reshape((1, c, 1, 1))?,
             bias: bias.reshape((1, c, 1, 1))?,
             groups,
@@ -420,7 +436,7 @@ impl GlobalGroupNorm {
             .reshape((b, self.groups, hidden))?
             .to_dtype(internal)?
             .broadcast_sub(&self.mean)?
-            .broadcast_mul(&self.inv_std)?;
+            .broadcast_div(&self.std)?;
         Ok(grouped
             .to_dtype(self.dtype)?
             .reshape((b, c, h, w))?
@@ -545,6 +561,15 @@ mod global_group_norm_tests {
 
     /// Applied to the whole activation, the global-statistics normalize must reproduce candle's own
     /// `GroupNorm` — otherwise the layer-wise path would be tracking the wrong dense reference.
+    ///
+    /// **Exactly** (sc-19447): every step — the `(B, G, hidden)` partition, the reduction order, the
+    /// `/hidden` divides, the `+eps`, the `sqrt`, the divide by σ and the affine — is candle's, so
+    /// there is no rounding left for the two to disagree about and the assertion is bit-equality on
+    /// every target. It was a `< 1e-6` tolerance while [`GlobalGroupNorm`] multiplied by a stored
+    /// `1/σ`; that spare rounding stayed under the bound here at one layer but compounded past it
+    /// across a full SDXL VAE decode on `x86_64`. A tolerance would have hidden that, so this is
+    /// deliberately the strictest form the arithmetic admits: any reassociation reintroduced into
+    /// `apply` reds this test directly, at its source, rather than in a downstream consumer.
     #[test]
     fn whole_activation_matches_candle_group_norm() {
         let (b, c, h, w, groups) = (2, 8, 5, 7, 4);
@@ -558,7 +583,12 @@ mod global_group_norm_tests {
         let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
         let got = global.apply(&x).unwrap();
         assert_eq!(got.dims(), dense.dims());
-        assert!(max_abs(&got, &dense) < 1e-6);
+        let delta = max_abs(&got, &dense);
+        assert!(
+            delta == 0.0,
+            "the whole-activation apply must BE candle's GroupNorm, not merely approximate it: \
+             max|delta|={delta:.3e}"
+        );
     }
 
     /// The layer-wise pair — global statistics plus halo/core convolution tiling — must track the

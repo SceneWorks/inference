@@ -20,7 +20,7 @@
 //! ```sh
 //! KOLORS_PREVIEW_SNAPSHOT=E:\huggingface\hub\models--Kwai-Kolors--Kolors-diffusers\snapshots\<rev> \
 //! KOLORS_PREVIEW_ARTIFACT_DIR=E:\out\sc-16954 \
-//!   cargo test -p candle-gen-kolors --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-kolors --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

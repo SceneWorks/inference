@@ -82,7 +82,7 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 59 rows over 68 registered ids: the fifteen trainer ids reuse their generator's row, and nine ids
+/// 60 rows over 69 registered ids: the fifteen trainer ids reuse their generator's row, and nine ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -325,6 +325,14 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "ltx_2_3",
         components: &["ltx_2_3", "gemma_3_12b_it"],
+    },
+    // --- minimax-h3 --------------------------------------------------------------------------
+    // One repository, two licences: the DiT / VAEs / tokenizer are the territorially-exclusive
+    // MiniMax H3 Community License, while the bundled `text_encoder/` is byte-identical upstream
+    // Qwen3-VL-32B-Instruct under Apache-2.0. Both are rowed, because both are loaded.
+    ProviderComponents {
+        provider_id: "minimax_h3",
+        components: &["minimax_h3", "qwen3_vl_32b_instruct"],
     },
     // --- mochi -------------------------------------------------------------------------------
     // No adapters, ControlNets, refiners or safety models.
@@ -868,8 +876,8 @@ mod tests {
             .map(|(id, _)| id.to_string())
             .collect();
 
-        assert_eq!(registered.len(), 68, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 59);
+        assert_eq!(registered.len(), 69, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 60);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 9);
 
@@ -936,7 +944,7 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            20,
+            21,
             "the complete ids are the mapped ids minus the pinned-incomplete ones"
         );
 
@@ -1113,7 +1121,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 59);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 60);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

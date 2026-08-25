@@ -874,7 +874,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn write_minimal_safetensors(path: &Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }

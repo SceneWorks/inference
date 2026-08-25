@@ -7,7 +7,7 @@
 //! (set `ZIMAGE_SNAPSHOT` or populate the HF hub cache); run it on the self-hosted Apple-Silicon
 //! runner or a populated dev box.
 
-mod common;
+use crate::common;
 
 use gen_core_testkit::Profile;
 use mlx_gen::{LoadSpec, WeightsSource};

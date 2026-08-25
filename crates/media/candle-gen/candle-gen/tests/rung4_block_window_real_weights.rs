@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! SC15792_Q4=<snapshot>/q4/transformer/model.safetensors \
-//! cargo test -p candle-gen --features cuda --release --test rung4_block_window_real_weights \
+//! cargo test -p candle-gen --features cuda --release --test integration rung4_block_window_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -59,7 +59,7 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::quant::MLX_GROUP_SIZE;
 use candle_gen::{CandleError, Result};
 
-mod rung4_support;
+use crate::rung4_support;
 use rung4_support::{
     compute_into, disclose_host, env_path_opt, env_usize, linear_fit, materialize,
     quiesce_and_reset, Block, Pool, Tier, GIB, MIB,

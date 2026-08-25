@@ -149,11 +149,12 @@ use mlx_gen::asset_facts::{
 };
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyParameters, MemoryStrategySupport, Result as CoreResult, TransformerComponent,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
+    Result as CoreResult, TransformerComponent,
 };
 #[cfg(test)]
 use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
@@ -703,6 +704,7 @@ fn control_resident_components(
             kind: MemoryComponentKind::ControlBranch,
             resident_bytes: stack_bytes,
             bounded_by: streamable.then_some(MemoryStrategy::BoundedTransformerResidency),
+            residency: MemoryComponentResidency::WholeRender,
         });
     }
     if persistent_bytes > 0 {
@@ -711,6 +713,7 @@ fn control_resident_components(
             kind: MemoryComponentKind::ControlBranch,
             resident_bytes: persistent_bytes,
             bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
         });
     }
     Ok(components)

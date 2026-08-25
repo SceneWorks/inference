@@ -17,7 +17,7 @@
 //!       so any divergence is purely the kernel (our source-built MLX vs the fork's wheel), K-dependent.
 //!
 //! `#[ignore]`d — needs the probe golden. Run:
-//!   cargo test -p mlx-gen-z-image --release --test qmm_smallk -- --ignored --nocapture
+//!   cargo test -p mlx-gen-z-image --release --test integration qmm_smallk:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_rs::ops::{eq, quantize, quantized_matmul};
@@ -32,8 +32,7 @@ fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
 }
 
-/// `(peak-relative, mean-relative)` error vs golden `b`.
-mod common;
+use crate::common;
 use common::rel;
 
 #[test]

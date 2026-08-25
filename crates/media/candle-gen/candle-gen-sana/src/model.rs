@@ -31,14 +31,15 @@
 //! rejected rather than silently dropped.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
 
+use crate::memory_strategy::{AdmissionRegistry, SanaLoadSeal, SanaVariant};
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline, SanaSprintPipeline};
 
 /// Registry id for SANA-1.6B 1024px (must match the SceneWorks worker's routing / `payload.model`).
@@ -70,6 +71,9 @@ pub struct SanaGenerator {
     device: Device,
     /// Cached composed pipeline. `Mutex` because `Generator` is shared and `generate` takes `&self`.
     pipeline: Mutex<Option<std::sync::Arc<SanaPipeline>>>,
+    load_seal: Arc<SanaLoadSeal>,
+    memory_admission: AdmissionRegistry,
+    lifecycle: Mutex<()>,
 }
 
 trait BaseBatchPipeline {
@@ -80,6 +84,7 @@ trait BaseBatchPipeline {
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
     ) -> candle_gen::Result<Self::Conditioning>;
+    #[allow(clippy::too_many_arguments)]
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
@@ -88,6 +93,7 @@ trait BaseBatchPipeline {
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image>;
 }
 
@@ -110,14 +116,24 @@ impl BaseBatchPipeline for SanaPipeline {
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress, preview)
+        self.generate_with_conditioning_memory(
+            req,
+            conditioning,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
     }
 }
 
 impl SanaGenerator {
     /// Get the cached pipeline, building (and caching) it from the snapshot on the first call.
     fn pipeline(&self) -> gen_core::Result<std::sync::Arc<SanaPipeline>> {
+        self.load_seal.ensure_unchanged()?;
         let mut guard = candle_gen::lock_recover(&self.pipeline);
         if let Some(p) = guard.as_ref() {
             return Ok(p.clone());
@@ -136,8 +152,9 @@ impl SanaGenerator {
 /// introspection and capability advertisement. True-CFG text-to-image and singular-reference img2img:
 /// negative prompt + guidance scale, flow-match Euler over the unified curated sampler/scheduler menu
 /// (epic 7114).
-/// Control/IP-adapter overlays, LoRA, and quantization are not wired on the candle base path. Backend
-/// `"candle"`, `mac_only = false`.
+/// Control/IP-adapter overlays and LoRA are not wired on the candle base path. The production route
+/// is sealed to the immutable dense upstream snapshot; packed Q4/Q8 and NVFP4 are not advertised.
+/// Backend `"candle"`, `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
@@ -154,45 +171,22 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // A singular reference is latent-init img2img; control/IP-adapter overlays remain unwired.
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
             // native loop (`req.sampler == None`) stays the byte-exact default.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
-            // SANA is the f32/bf16 weight path; no load-time quantization is wired yet.
+            // A packed quant selector cannot relabel or convert the sealed dense snapshot at load.
             supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
-            // No candle `render_sequential` residency seam wired (sc-11126).
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16959: the base flow lane emits per-step latent previews through
             // `crate::preview::base_hook` over the epic-16624 BASE DC-AE fit — not Sprint's.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            supports_sequential_offload: true,
+            ..Default::default()
         },
     }
 }
@@ -220,10 +214,7 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
             // epic-7114 `Solver`; only the engine-default sentinel is advertised.
             samplers: vec!["default"],
@@ -233,32 +224,12 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
-            mac_only: false,
             supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16959: the SCM lane emits per-step latent previews through
             // `crate::preview::sprint_hook` over the epic-16624 SPRINT fit, with the `1/σ_data`
             // correction the SCM driver's pre-scaled running latent needs.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -313,8 +284,7 @@ fn resolve_reference<'a>(
 
 /// Construct the (lazy) candle SANA-1.6B generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `Sana_1600M_1024px_diffusers`-layout snapshot. LoRA/LoKr
-/// adapters, on-the-fly quantization, and control/IP-adapter overlays are rejected (not wired —
-/// refusing is more honest than silently dropping; the worker falls back to Python).
+/// adapters, control/IP-adapter overlays, and packed tier selectors are rejected.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -326,9 +296,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
+    if let Some(quant) = spec.quantize {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_1600m does not support on-the-fly Q4/Q8 quantization yet".into(),
+            format!("candle sana_1600m has no packed {quant:?} route; only the immutable dense checkpoint is executable"),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -336,19 +306,30 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle sana_1600m does not support LoRA/LoKr adapters yet".into(),
         ));
     }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
         return Err(gen_core::Error::Unsupported(
             "candle sana_1600m supports plain txt2img and singular-reference img2img, not control / \
              IP-adapter overlays"
                 .into(),
         ));
     }
+    let load_seal = Arc::new(SanaLoadSeal::capture(SanaVariant::Base, spec)?);
     let device = candle_gen::default_device()?;
     Ok(Box::new(SanaGenerator {
         descriptor: descriptor(),
         root,
         device,
         pipeline: Mutex::new(None),
+        load_seal,
+        memory_admission: AdmissionRegistry::new(MODEL_ID),
+        lifecycle: Mutex::new(()),
     }))
 }
 
@@ -372,7 +353,8 @@ fn generate_base_images(
         .unwrap_or((None, None));
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
-    let guidance = req.guidance.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
+    let guidance_scale = req.true_cfg.or(req.guidance);
+    let guidance = guidance_scale.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
     let conditioning = pipeline
         .encode_batch(
             &SanaGenerateRequest {
@@ -381,7 +363,7 @@ fn generate_base_images(
                 height: req.height,
                 width: req.width,
                 steps,
-                guidance_scale: req.guidance,
+                guidance_scale,
                 seed: None,
                 sampler: req.sampler.as_deref(),
                 scheduler: req.scheduler.as_deref(),
@@ -401,7 +383,7 @@ fn generate_base_images(
                     height: req.height,
                     width: req.width,
                     steps,
-                    guidance_scale: req.guidance,
+                    guidance_scale,
                     seed: Some(seed),
                     sampler: req.sampler.as_deref(),
                     scheduler: req.scheduler.as_deref(),
@@ -413,6 +395,7 @@ fn generate_base_images(
                 &req.cancel,
                 on_progress,
                 preview,
+                req.memory,
             )
             .map_err(gen_core::Error::from)
     })
@@ -427,20 +410,85 @@ impl Generator for SanaGenerator {
         validate_request(&self.descriptor, req)
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(self.load_seal.contract())
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.load_seal, &self.memory_admission, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            &self.load_seal,
+            self.memory_admission.clone(),
+            self.device.clone(),
+            context,
+        )
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume(req)?;
+        self.load_seal.ensure_unchanged()?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        let pipeline = self.pipeline()?;
-
         let preview = crate::preview::base_hook(&req.preview);
-        let images =
-            generate_base_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?;
+        let images = if req.memory.is_some_and(|memory| memory.stage_residency) {
+            let resident = candle_gen::lock_recover(&self.pipeline).take();
+            drop(resident);
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            let reference = resolve_reference(req, MODEL_ID)?;
+            let (init_image, strength) = reference
+                .map(|(image, strength)| (Some(image), Some(strength)))
+                .unwrap_or((None, None));
+            let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+            let seeds = (0..req.count)
+                .map(|index| base_seed.wrapping_add(index as u64))
+                .collect::<Vec<_>>();
+            let staged = SanaGenerateRequest {
+                prompt: &req.prompt,
+                negative_prompt: req.negative_prompt.as_deref(),
+                height: req.height,
+                width: req.width,
+                steps: req.steps.map(|steps| steps as usize),
+                guidance_scale: req.true_cfg.or(req.guidance),
+                seed: None,
+                sampler: req.sampler.as_deref(),
+                scheduler: req.scheduler.as_deref(),
+                init_image,
+                strength,
+            };
+            crate::pipeline::generate_base_staged(
+                &self.root,
+                &staged,
+                &seeds,
+                req.memory.expect("staged branch has memory"),
+                &self.device,
+                &req.cancel,
+                on_progress,
+                &preview,
+                || self.load_seal.ensure_unchanged(),
+            )
+            .map_err(gen_core::Error::from)?
+        } else {
+            let pipeline = self.pipeline()?;
+            generate_base_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -453,10 +501,14 @@ pub struct SanaSprintGenerator {
     root: PathBuf,
     device: Device,
     pipeline: Mutex<Option<std::sync::Arc<SanaSprintPipeline>>>,
+    load_seal: Arc<SanaLoadSeal>,
+    memory_admission: AdmissionRegistry,
+    lifecycle: Mutex<()>,
 }
 
 impl SanaSprintGenerator {
     fn pipeline(&self) -> gen_core::Result<std::sync::Arc<SanaSprintPipeline>> {
+        self.load_seal.ensure_unchanged()?;
         let mut guard = candle_gen::lock_recover(&self.pipeline);
         if let Some(p) = guard.as_ref() {
             return Ok(p.clone());
@@ -474,6 +526,7 @@ trait SprintBatchPipeline {
     type Conditioning;
 
     fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning>;
+    #[allow(clippy::too_many_arguments)]
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
@@ -482,6 +535,7 @@ trait SprintBatchPipeline {
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image>;
 }
 
@@ -500,8 +554,17 @@ impl SprintBatchPipeline for SanaSprintPipeline {
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning(req, conditioning, device, cancel, on_progress, preview)
+        self.generate_with_conditioning_memory(
+            req,
+            conditioning,
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
     }
 }
 
@@ -548,6 +611,7 @@ fn generate_sprint_images(
                 &req.cancel,
                 on_progress,
                 preview,
+                req.memory,
             )
             .map_err(gen_core::Error::from)
     })
@@ -556,7 +620,7 @@ fn generate_sprint_images(
 /// Construct the (lazy) candle **SANA-Sprint** generator (sc-11781) from a [`LoadSpec`]. Identical
 /// snapshot contract to [`load`] (`transformer/ vae/ text_encoder/ tokenizer/`), but the transformer
 /// loads the Sprint config (guidance embedder + qk-norm) and the CFG-free SCM few-step pipeline drives
-/// it. LoRA/LoKr adapters, on-the-fly quantization, and control/IP-adapter overlays are rejected.
+/// it. LoRA/LoKr adapters, control/IP-adapter overlays, and packed tier selectors are rejected.
 pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -568,9 +632,9 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if spec.quantize.is_some() {
+    if let Some(quant) = spec.quantize {
         return Err(gen_core::Error::Unsupported(
-            "candle sana_sprint_1600m does not support on-the-fly Q4/Q8 quantization yet".into(),
+            format!("candle sana_sprint_1600m has no packed {quant:?} route; only the immutable dense checkpoint is executable"),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -578,19 +642,30 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle sana_sprint_1600m does not support LoRA/LoKr adapters yet".into(),
         ));
     }
-    if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
+    if spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.pid.is_some()
+        || spec.identity.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+    {
         return Err(gen_core::Error::Unsupported(
             "candle sana_sprint_1600m supports plain txt2img and singular-reference img2img, not \
              control / IP-adapter overlays"
                 .into(),
         ));
     }
+    let load_seal = Arc::new(SanaLoadSeal::capture(SanaVariant::Sprint, spec)?);
     let device = candle_gen::default_device()?;
     Ok(Box::new(SanaSprintGenerator {
         descriptor: sprint_descriptor(),
         root,
         device,
         pipeline: Mutex::new(None),
+        load_seal,
+        memory_admission: AdmissionRegistry::new(SPRINT_MODEL_ID),
+        lifecycle: Mutex::new(()),
     }))
 }
 
@@ -603,20 +678,85 @@ impl Generator for SanaSprintGenerator {
         validate_request(&self.descriptor, req)
     }
 
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(self.load_seal.contract())
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.load_seal, &self.memory_admission, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::begin_request(
+            &self.load_seal,
+            self.memory_admission.clone(),
+            self.device.clone(),
+            context,
+        )
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume(req)?;
+        self.load_seal.ensure_unchanged()?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        let pipeline = self.pipeline()?;
-
         let preview = crate::preview::sprint_hook(&req.preview);
-        let images =
-            generate_sprint_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?;
+        let images = if req.memory.is_some_and(|memory| memory.stage_residency) {
+            let resident = candle_gen::lock_recover(&self.pipeline).take();
+            drop(resident);
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            let reference = resolve_reference(req, SPRINT_MODEL_ID)?;
+            let (init_image, strength) = reference
+                .map(|(image, strength)| (Some(image), Some(strength)))
+                .unwrap_or((None, None));
+            let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+            let seeds = (0..req.count)
+                .map(|index| base_seed.wrapping_add(index as u64))
+                .collect::<Vec<_>>();
+            let staged = SanaGenerateRequest {
+                prompt: &req.prompt,
+                negative_prompt: None,
+                height: req.height,
+                width: req.width,
+                steps: req.steps.map(|steps| steps as usize),
+                guidance_scale: req.guidance,
+                seed: None,
+                sampler: None,
+                scheduler: None,
+                init_image,
+                strength,
+            };
+            crate::pipeline::generate_sprint_staged(
+                &self.root,
+                &staged,
+                &seeds,
+                req.memory.expect("staged branch has memory"),
+                &self.device,
+                &req.cancel,
+                on_progress,
+                &preview,
+                || self.load_seal.ensure_unchanged(),
+            )
+            .map_err(gen_core::Error::from)?
+        } else {
+            let pipeline = self.pipeline()?;
+            generate_sprint_images(pipeline.as_ref(), req, &self.device, on_progress, &preview)?
+        };
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -674,6 +814,7 @@ mod tests {
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
             _preview: &candle_gen::preview::PreviewHook<'_>,
+            _memory: Option<gen_core::GenerationMemory>,
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
@@ -702,6 +843,7 @@ mod tests {
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
             _preview: &candle_gen::preview::PreviewHook<'_>,
+            _memory: Option<gen_core::GenerationMemory>,
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
@@ -718,7 +860,8 @@ mod tests {
         let request = GenerationRequest {
             prompt: "cond".into(),
             negative_prompt: Some("uncond".into()),
-            guidance: Some(4.5),
+            guidance: Some(1.0),
+            true_cfg: Some(4.5),
             seed: Some(u64::MAX - 1),
             count: 4,
             ..req(256, 256)
@@ -871,7 +1014,8 @@ mod tests {
     /// `load` is lazy, so a nonexistent weights dir still resolves (no file I/O until `generate`).
     #[test]
     fn registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let (_temp, root) = crate::memory_strategy::fixture_snapshot(SanaVariant::Base);
+        let spec = LoadSpec::new(WeightsSource::Dir(root));
         let g = crate::provider_registry()
             .unwrap()
             .load(MODEL_ID, &spec)
@@ -948,12 +1092,16 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_rejects_every_false_packed_tier_and_external_component() {
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load(&quant).is_err(), "dense Candle must reject Q8");
+        let q4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(load(&q4).is_err(), "dense Candle must reject Q4");
+        let nvfp4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Nvfp4);
+        let error = load(&nvfp4)
+            .err()
+            .expect("NVFP4 must not be relabeled as affine Q4");
+        assert!(error.to_string().contains("no packed"));
         let control = LoadSpec::new(WeightsSource::Dir("/snap".into()))
             .with_control(WeightsSource::Dir("/ctrl".into()));
         assert!(matches!(
@@ -964,10 +1112,15 @@ mod tests {
 
     #[test]
     fn canceled_requests_fail_before_lazy_weight_loading_for_both_variants() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let request = req(256, 256);
         request.cancel.cancel();
-        for generator in [load(&spec).unwrap(), load_sprint(&spec).unwrap()] {
+        let (_base_temp, base_root) = crate::memory_strategy::fixture_snapshot(SanaVariant::Base);
+        let (_sprint_temp, sprint_root) =
+            crate::memory_strategy::fixture_snapshot(SanaVariant::Sprint);
+        for generator in [
+            load(&LoadSpec::new(WeightsSource::Dir(base_root))).unwrap(),
+            load_sprint(&LoadSpec::new(WeightsSource::Dir(sprint_root))).unwrap(),
+        ] {
             let error = generator.generate(&request, &mut |_| {}).unwrap_err();
             assert!(matches!(error, gen_core::Error::Canceled));
         }
@@ -982,7 +1135,8 @@ mod tests {
     /// `load_sprint` is lazy, so a nonexistent weights dir still resolves.
     #[test]
     fn sprint_registers_and_resolves_as_candle() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let (_temp, root) = crate::memory_strategy::fixture_snapshot(SanaVariant::Sprint);
+        let spec = LoadSpec::new(WeightsSource::Dir(root));
         let g = crate::provider_registry()
             .unwrap()
             .load(SPRINT_MODEL_ID, &spec)
@@ -1013,6 +1167,7 @@ mod tests {
         );
         assert_eq!(d.capabilities.samplers, vec!["default"]);
         assert_eq!(d.capabilities.schedulers, vec!["default"]);
+        assert!(d.capabilities.supported_quants.is_empty());
         assert!(!d.capabilities.mac_only, "candle is Windows/CUDA");
     }
 
@@ -1023,15 +1178,12 @@ mod tests {
     }
 
     #[test]
-    fn sprint_load_rejects_single_file_and_unwired_surfaces() {
+    fn sprint_load_rejects_single_file_and_packed_tier_selector() {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_sprint(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load_sprint(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_sprint(&quant).is_err());
     }
 
     /// CRITICAL base-unchanged regression: adding the Sprint adapter must NOT perturb the base
@@ -1055,11 +1207,15 @@ mod tests {
             candle_gen::curated_scheduler_names()
         );
         // Both ids resolve independently through the registry.
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let (_base_temp, base_root) = crate::memory_strategy::fixture_snapshot(SanaVariant::Base);
+        let (_sprint_temp, sprint_root) =
+            crate::memory_strategy::fixture_snapshot(SanaVariant::Sprint);
+        let base_spec = LoadSpec::new(WeightsSource::Dir(base_root));
+        let sprint_spec = LoadSpec::new(WeightsSource::Dir(sprint_root));
         assert_eq!(
             crate::provider_registry()
                 .unwrap()
-                .load(MODEL_ID, &spec)
+                .load(MODEL_ID, &base_spec)
                 .unwrap()
                 .descriptor()
                 .id,
@@ -1068,7 +1224,7 @@ mod tests {
         assert_eq!(
             crate::provider_registry()
                 .unwrap()
-                .load(SPRINT_MODEL_ID, &spec)
+                .load(SPRINT_MODEL_ID, &sprint_spec)
                 .unwrap()
                 .descriptor()
                 .id,

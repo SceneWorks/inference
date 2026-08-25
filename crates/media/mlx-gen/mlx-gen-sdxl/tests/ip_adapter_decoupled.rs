@@ -1,7 +1,7 @@
 //! sc-3059: SDXL IP-Adapter decoupled cross-attention engine checks (real weights).
 //!
 //! `#[ignore]`d — needs the SDXL base snapshot + `h94/IP-Adapter` (`ip-adapter-plus_sdxl_vit-h`).
-//! Run: cargo test -p mlx-gen-sdxl --release --test ip_adapter_decoupled -- --ignored --nocapture
+//! Run: cargo test -p mlx-gen-sdxl --release --test integration ip_adapter_decoupled:: -- --ignored --nocapture
 //!
 //! Validates the injection primitive + the 70-layer walk-order remap WITHOUT a deep golden:
 //!   1. Installing the real K/V pairs must succeed AND every cross-attn `forward_with_ip` reshape

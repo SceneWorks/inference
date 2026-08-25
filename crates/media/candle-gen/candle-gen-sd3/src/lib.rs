@@ -31,6 +31,7 @@ pub mod clip_tokenizer;
 pub mod conditioning;
 pub mod config;
 pub mod memory;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
@@ -56,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -103,6 +104,11 @@ pub struct Sd3Generator {
     /// (`start_step > 0`), so a txt2img-only workload never builds it. Cached here (not in `Components`)
     /// because it loads in f32 for the deterministic mean-encode while `Components` is bf16.
     vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
+    /// Serializes cache transition + generation so a staged request cannot race a resident warm hit.
+    lifecycle: Mutex<()>,
+    memory_contract: gen_core::MemoryProviderContract,
+    load_receipt: Option<memory_strategy::Sd35LoadReceipt>,
+    memory_admission: memory_strategy::AdmissionRegistry,
 }
 
 impl Sd3Generator {
@@ -117,6 +123,9 @@ impl Sd3Generator {
 
     /// Get the cached components, loading (and caching) them on a miss.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
         // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
         Ok(candle_gen::cached(&self.components, || {
             pipe.load_components()
@@ -127,14 +136,88 @@ impl Sd3Generator {
     /// miss. Only reached when a request carries a reference that yields a structure-preserving denoise
     /// (`start_step > 0`), so a txt2img-only workload never builds it.
     fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
         // The inner `?` bridges the candle-side `load_vae_encoder` error into `gen_core::Error`.
         candle_gen::cached(&self.vae_encoder, || Ok(Arc::new(pipe.load_vae_encoder()?)))
+    }
+}
+
+fn evict_warm_for_staged<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    candle_gen::lock_recover(slot).take()
+}
+
+fn release_warm_after_synchronize<T>(device: &Device, component: T) -> gen_core::Result<()> {
+    match device.synchronize() {
+        Ok(()) => {
+            drop(component);
+            Ok(())
+        }
+        Err(error) => {
+            std::mem::forget(component);
+            Err(gen_core::Error::backend(error))
+        }
     }
 }
 
 impl Generator for Sd3Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(receipt) = &self.load_receipt else {
+            self.memory_admission.clear();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{}: immutable load receipt is missing", self.model_id()),
+            };
+        };
+        if let Err(error) = receipt.ensure_unchanged().and_then(|()| {
+            memory_strategy::validate_context(
+                receipt.route,
+                &self.memory_contract,
+                context,
+                receipt.tier,
+            )
+        }) {
+            self.memory_admission.clear();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+        match self.memory_admission.approve(context) {
+            Ok(()) => gen_core::MemorySafetyDecision::Accept,
+            Err(error) => gen_core::MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let receipt = self.load_receipt.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{}: immutable load receipt is missing",
+                self.model_id()
+            ))
+        })?;
+        memory_strategy::begin_request(
+            receipt,
+            &self.memory_contract,
+            self.memory_admission.clone(),
+            self.device.clone(),
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -155,6 +238,29 @@ impl Generator for Sd3Generator {
                 req.width, req.height
             )));
         }
+        if req.frames.is_some_and(|frames| frames != 1) || req.image_reference_count() > 1 {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: image generation requires one frame and either T2I/ref0 or I2I/ref1"
+            )));
+        }
+        let valid_strength = |strength: Option<f32>| {
+            strength.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        };
+        if !valid_strength(req.strength)
+            || req
+                .conditioning
+                .iter()
+                .any(|conditioning| match conditioning {
+                    gen_core::Conditioning::Reference { strength, .. } => {
+                        !valid_strength(*strength)
+                    }
+                    _ => false,
+                })
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: I2I strength must be finite and in [0, 1]"
+            )));
+        }
         Ok(())
     }
 
@@ -164,6 +270,18 @@ impl Generator for Sd3Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume(req)?;
+        if let Some(receipt) = &self.load_receipt {
+            receipt.ensure_unchanged()?;
+        }
+        let memory = req.memory.unwrap_or_default();
+        if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode, attention chunking, and transformer windowing are Missing",
+                self.model_id()
+            )));
+        }
         // The light `Pipeline` handle carries the snapshot/device/variant; the heavy components come
         // from the cache. The rich-`CandleError` tail (including the typed `Canceled`) bridges into
         // `gen_core::Error` via `?`.
@@ -175,6 +293,23 @@ impl Generator for Sd3Generator {
             self.quant,
             &self.adapters,
         );
+        if memory.stage_residency {
+            let warm = (
+                evict_warm_for_staged(&self.components),
+                evict_warm_for_staged(&self.vae_encoder),
+            );
+            release_warm_after_synchronize(&self.device, warm)?;
+            let verify = || {
+                self.load_receipt
+                    .as_ref()
+                    .ok_or_else(|| candle_gen::CandleError::Msg("SD3.5 receipt missing".into()))?
+                    .ensure_unchanged()
+                    .map_err(|error| candle_gen::CandleError::Msg(error.to_string()))
+            };
+            let images = pipe.render_staged(req, on_progress, &verify)?;
+            return Ok(GenerationOutput::Images(images));
+        }
+
         let components = self.components(&pipe)?;
 
         // img2img / `Reference` (sc-11784): resolve the single reference + its effective strength, and —
@@ -251,7 +386,6 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // (no CFG, no negative branch).
             supports_negative_prompt: cfg,
             supports_guidance: cfg,
-            supports_true_cfg: false,
             // img2img reference-guided latent-init (sc-11784): a single `Conditioning::Reference` seeds
             // the denoise from the VAE-encoded reference (`render` + `encode_reference`) — real CFG
             // (Large/Medium) or the distilled loop (Turbo) over the reduced `start_step..` σ tail. NOT
@@ -263,40 +397,20 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            mac_only: false,
             // The MMDiT projections fold to Q4_0/Q8_0 at load (sc-7879, dequant-on-forward); the TE +
             // VAE stay dense. All three variants share the quant path.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // SD3.5 is a flow-match model; the resolution-independent σ-shift is applied by the
             // pipeline, so it does not require the loader to pre-shift.
             requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // sc-16958: every SD3.5 route emits per-step latent previews. All three variants share
             // one `run_flow_sampler` site, so the flag is variant-independent — see [`crate::preview`]
             // for the lane enumeration and the reused epic-16624 16-channel fit.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -338,18 +452,36 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    // sc-7879: Q4/Q8 quantize the MMDiT at load (dequant-on-forward). `Quant` only has Q4/Q8, so any
-    // requested level is supported; `None` ⇒ dense bf16.
-    let quant = spec.quantize;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support control / IP-adapter overlays (txt2img only)"
+            "candle {id} does not support control / IP-adapter overlays"
         )));
     }
     // sc-7881: LoRA/LoKr adapters are merged into the MMDiT at load (kohya `lora_sd3` fused-QKV +
     // diffusers-named); they are validated/folded lazily on the first `generate`. No refusal here.
     // SD3.5 is a bf16 model; the device is the backend selected at compile time.
     let device = candle_gen::default_device()?;
+    let route = match variant {
+        Variant::Large => memory_strategy::Sd35Route::Large,
+        Variant::LargeTurbo => memory_strategy::Sd35Route::LargeTurbo,
+        Variant::Medium => memory_strategy::Sd35Route::Medium,
+    };
+    let (load_receipt, memory_contract, quant) =
+        match memory_strategy::Sd35LoadReceipt::capture(route, spec) {
+            Ok(receipt) => {
+                let quant = receipt.tier;
+                let contract = memory_strategy::contract_from_receipt(spec, &receipt);
+                (Some(receipt), contract, quant)
+            }
+            #[cfg(test)]
+            Err(_) if !root.exists() => {
+                let mut fixture_spec = spec.clone();
+                fixture_spec.resolved_route = Some(id.to_owned());
+                let contract = memory_strategy::weights_free_contract(id, &fixture_spec)?;
+                (None, contract, spec.quantize)
+            }
+            Err(error) => return Err(error),
+        };
     Ok(Box::new(Sd3Generator {
         descriptor: descriptor_for(variant),
         root,
@@ -360,6 +492,10 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
         vae_encoder: Mutex::new(None),
+        lifecycle: Mutex::new(()),
+        memory_contract,
+        load_receipt,
+        memory_admission: memory_strategy::AdmissionRegistry::new(id),
     }))
 }
 
@@ -378,12 +514,118 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(LARGE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
         .register_generator(MEDIUM_REGISTRATION)
         .register_trainer(training::LARGE_TRAINER_REGISTRATION)
-        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION)
+        .register_trainer(training::MEDIUM_TRAINER_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_memory_behavior(LARGE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_behavior(MEDIUM_MEMORY_BEHAVIOR)
+}
+
+macro_rules! memory_surface {
+    ($contract_fn:ident, $fixture_fn:ident, $surface_fn:ident, $registration:ident, $id:expr) => {
+        fn $contract_fn(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            memory_strategy::provider_contract($id, spec)
+        }
+        fn $fixture_fn(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            memory_strategy::weights_free_contract($id, spec)
+        }
+        fn $surface_fn(
+            surface: &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+            memory_strategy::weights_free_surface_contract($id, surface)
+        }
+        const $registration: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+            provider_id: $id,
+            contract: $contract_fn,
+            safety_check: memory_strategy::registered_safety_check,
+        };
+    };
+}
+
+memory_surface!(
+    large_memory_contract,
+    large_weights_free_contract,
+    large_surface_contract,
+    LARGE_MEMORY_REGISTRATION,
+    MODEL_ID
+);
+memory_surface!(
+    turbo_memory_contract,
+    turbo_weights_free_contract,
+    turbo_surface_contract,
+    TURBO_MEMORY_REGISTRATION,
+    MODEL_ID_TURBO
+);
+memory_surface!(
+    medium_memory_contract,
+    medium_weights_free_contract,
+    medium_surface_contract,
+    MEDIUM_MEMORY_REGISTRATION,
+    MODEL_ID_MEDIUM
+);
+
+macro_rules! memory_behavior {
+    ($name:ident, $id:expr) => {
+        const $name: gen_core::MemoryBehaviorRegistration = gen_core::MemoryBehaviorRegistration {
+            provider_id: $id,
+            valid_fixtures: memory_strategy::registered_valid_fixture,
+            begin_request: |spec, contract, context| {
+                memory_strategy::registered_begin_request($id, spec, contract, context)
+            },
+        };
+    };
+}
+
+memory_behavior!(LARGE_MEMORY_BEHAVIOR, MODEL_ID);
+memory_behavior!(TURBO_MEMORY_BEHAVIOR, MODEL_ID_TURBO);
+memory_behavior!(MEDIUM_MEMORY_BEHAVIOR, MODEL_ID_MEDIUM);
+
+/// Register exhaustive weights-free q4/q8/bf16 contract surfaces on every platform.
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(LARGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: large_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: large_surface_contract,
+            },
+        )
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID_TURBO,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: turbo_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID_TURBO,
+                contract: turbo_surface_contract,
+            },
+        )
+        .register_memory_strategy(MEDIUM_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            provider_id: MODEL_ID_MEDIUM,
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            contract: medium_weights_free_contract,
+        })
+        .register_memory_contract_surface_resolver(
+            gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID_MEDIUM,
+                contract: medium_surface_contract,
+            },
+        )
 }
 
 /// Build the complete explicit Candle SD3 provider catalog.
@@ -403,6 +645,42 @@ mod explicit_registry_tests {
 
         assert_eq!(
             explicit,
+            ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
+        );
+    }
+
+    /// The registry-level memory lifecycle seams must be reachable on a build with no CUDA
+    /// feature: building the provider catalog is contract-only (no device, no weights), so
+    /// `register_providers` publishes the memory-strategy, weights-free contract-fixture and
+    /// memory-behavior rows on every platform. Gating these behind `cuda` left registry
+    /// lifecycle conformance running on no CPU CI configuration at all.
+    #[test]
+    fn register_providers_publishes_memory_lifecycle_seams_without_cuda() {
+        let registry = super::provider_registry().unwrap();
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(
+            strategies,
+            ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
+        );
+        assert_eq!(
+            fixtures,
+            ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
+        );
+        assert_eq!(
+            behaviors,
             ["sd3_5_large", "sd3_5_large_turbo", "sd3_5_medium"]
         );
     }
@@ -616,14 +894,18 @@ mod tests {
     #[test]
     fn load_accepts_quant_and_adapter_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
+        // `/snap` exists on Ubuntu hosts. This test exercises lazy load-shape admission, not a
+        // physical checkpoint receipt, so use a process-unique guaranteed-missing root.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("missing-sd3-snapshot");
         // sc-7879: Q4/Q8 quant is ACCEPTED (the MMDiT folds at load); loading is lazy so this builds
         // the generator without touching the (nonexistent) snapshot.
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        let quant = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q8);
         assert!(
             load(&quant).is_ok(),
             "Q8 quant load must be accepted (sc-7879)"
         );
-        let quant4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        let quant4 = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
         assert!(
             load(&quant4).is_ok(),
             "Q4 quant load must be accepted (sc-7879)"
@@ -632,7 +914,7 @@ mod tests {
         // sc-7881: LoRA/LoKr adapters are now ACCEPTED (merged into the MMDiT at load, lazily). The
         // spec is stashed; the actual merge happens on the first `generate` against a real snapshot.
         for kind in [AdapterKind::Lora, AdapterKind::Lokr] {
-            let adapter = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+            let adapter = LoadSpec::new(WeightsSource::Dir(root.clone())).with_adapters(vec![
                 AdapterSpec::new("/lora.safetensors".into(), 1.0, kind),
             ]);
             assert!(

@@ -186,6 +186,14 @@ impl Attention {
         })
     }
 
+    #[cfg(test)]
+    fn all_projections_packed(&self) -> bool {
+        self.to_q.is_packed()
+            && self.to_k.is_packed()
+            && self.to_v.is_packed()
+            && self.to_out.is_packed()
+    }
+
     /// Visit this attention's four adaptable projections (`{prefix}.{to_q,to_k,to_v,to_out.0}`) for the
     /// additive-adapter walk (sc-10094).
     fn visit_adaptable_mut(
@@ -248,6 +256,11 @@ impl Ffn {
             out: src.qlinear(cfg.ffn_dim, cfg.dim, "net.2", true)?,
         })
     }
+
+    #[cfg(test)]
+    fn all_projections_packed(&self) -> bool {
+        self.proj.is_packed() && self.out.is_packed()
+    }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.out.forward(&self.proj.forward(x)?.gelu()?)
     }
@@ -281,6 +294,13 @@ impl Block {
     /// its behavior is byte-identical to before.
     pub(crate) fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         Self::build(cfg, WeightSrc::dense(vb))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_projections_packed(&self) -> bool {
+        self.attn1.all_projections_packed()
+            && self.attn2.all_projections_packed()
+            && self.ffn.all_projections_packed()
     }
 
     /// Build a block from `src` — the ONE builder the dense/MLX-packed path (`WeightSrc::Dense`) and the

@@ -1,7 +1,7 @@
 //! Ignored real-weights smoke for JoyCaption.
 //!
 //! Run with a cached `fancyfeast/llama-joycaption-beta-one-hf-llava` snapshot:
-//!   cargo test -p mlx-gen-joycaption --test generate_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-joycaption --test integration generate_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

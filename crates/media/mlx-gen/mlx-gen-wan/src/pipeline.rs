@@ -1752,53 +1752,24 @@ pub fn preprocess_ti2v_image(image: &Image, width: u32, height: u32) -> Result<A
         .expand_dims(0)?) // [1, 1, H, W, 3]
 }
 
-/// Build the TI2V-5B mask-blend tensors (port of `i2v_utils.build_i2v_mask`):
-///  - `mask` `[z, T_lat, h_lat, w_lat]` (f32): `0.0` for the first latent temporal frame (all
-///    channels/spatial), `1.0` elsewhere — the latent the first frame is frozen, the rest denoise.
-///  - `mask_tokens` `[1, L]` (f32): the channel-0 mask subsampled to the patch grid (`0.0` for the
-///    first-frame tokens, `1.0` for the rest), `L` = the DiT patch-token count `(T_lat/pt)·(h_lat/ph)·
-///    (w_lat/pw)`. Token order is temporal-slowest (matching [`crate::patchify::patchify`]).
+/// Build the TI2V-5B mask-blend tensors (port of `i2v_utils.build_i2v_mask`, generalized to the
+/// Wan-native multi-keyframe pins of epic 3040 and to per-pin **strength**, sc-19571):
+///  - `mask` `[z, T_lat, h_lat, w_lat]` (f32): `1 − strength` at each pinned latent temporal frame
+///    (all channels/spatial), `1.0` elsewhere. `strength = 1.0` fully freezes the frame (mask `0`,
+///    the historical hard pin); `strength = 0.0` leaves it free to denoise; anything between is a
+///    partial pin, which is the whole point of the knob.
+///  - `mask_tokens` `[1, L]` (f32): the channel-0 mask subsampled to the patch grid (`1 − strength`
+///    for each pinned frame's tokens, `1.0` for the rest), `L` = the DiT patch-token count
+///    `(T_lat/pt)·(h_lat/ph)·(w_lat/pw)`. Token order is temporal-slowest (matching
+///    [`crate::patchify::patchify`]).
+///
+/// `pins` are `(latent_frame, strength)` pairs: first_last_frame is `[(0, s0), (t_lat-1, s1)]`, a
+/// single `Reference` image is `[(0, s)]`. Latent indices `>= t_lat` are ignored (the caller
+/// validates); the same weight drives both the clean-latent blend and the per-token diffusion
+/// timestep, so one number controls the whole pin. **Byte-for-byte the same construction as
+/// candle's `candle_gen_wan::pipeline::build_ti2v_mask`** — the two lanes must not diverge here.
 pub fn build_ti2v_mask(
-    z_dim: usize,
-    t_lat: usize,
-    h_lat: usize,
-    w_lat: usize,
-    patch_size: (usize, usize, usize),
-) -> (Array, Array) {
-    let plane = h_lat * w_lat;
-    // mask: 1.0 everywhere except temporal index 0 (= 0.0).
-    let mut mask = vec![1f32; z_dim * t_lat * plane];
-    for c in 0..z_dim {
-        let base = c * t_lat * plane; // temporal index 0 of channel c
-        for p in 0..plane {
-            mask[base + p] = 0.0;
-        }
-    }
-    let mask = Array::from_slice(
-        &mask,
-        &[z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32],
-    );
-
-    // mask_tokens: subsample channel 0 by the patch grid. mask is 0 only at temporal index 0, so a
-    // token is 0 iff its source temporal index `t'·pt == 0` (i.e. `t' == 0`) → the first `hg·wg`
-    // tokens (temporal-slowest order) are 0, the rest 1.
-    let (pt, ph, pw) = patch_size;
-    let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
-    let mut tok = vec![1f32; tg * hg * wg];
-    for v in tok.iter_mut().take(hg * wg) {
-        *v = 0.0;
-    }
-    let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
-    (mask, mask_tokens)
-}
-
-/// Multi-keyframe generalization of [`build_ti2v_mask`] (epic 3040, Wan-native first_last_frame):
-/// pin the latent temporal frames in `indices` (mask `0.0` there, `1.0` elsewhere) instead of only
-/// frame 0. first_last_frame = `indices = [0, t_lat-1]`. `mask` `[z, T_lat, h, w]` + `mask_tokens`
-/// `[1, L]` (the `hg·wg` tokens of each pinned frame are `0`). Indices must be `< t_lat`; out-of-range
-/// indices are ignored (the caller validates). With `indices = [0]` this is exactly `build_ti2v_mask`.
-pub fn build_ti2v_multi_mask(
-    indices: &[usize],
+    pins: &[(usize, f32)],
     z_dim: usize,
     t_lat: usize,
     h_lat: usize,
@@ -1808,14 +1779,9 @@ pub fn build_ti2v_multi_mask(
     let plane = h_lat * w_lat;
     let mut mask = vec![1f32; z_dim * t_lat * plane];
     for c in 0..z_dim {
-        for &t in indices {
-            if t >= t_lat {
-                continue;
-            }
+        for &(t, strength) in pins.iter().filter(|&&(t, _)| t < t_lat) {
             let base = (c * t_lat + t) * plane;
-            for p in 0..plane {
-                mask[base + p] = 0.0;
-            }
+            mask[base..base + plane].fill(1.0 - strength);
         }
     }
     let mask = Array::from_slice(
@@ -1826,13 +1792,10 @@ pub fn build_ti2v_multi_mask(
     let (pt, ph, pw) = patch_size;
     let (tg, hg, wg) = (t_lat / pt, h_lat / ph, w_lat / pw);
     let mut tok = vec![1f32; tg * hg * wg];
-    for &t in indices {
+    for &(t, strength) in pins {
         let tg_idx = t / pt;
-        if tg_idx >= tg {
-            continue;
-        }
-        for k in 0..(hg * wg) {
-            tok[tg_idx * hg * wg + k] = 0.0;
+        if tg_idx < tg {
+            tok[(tg_idx * hg * wg)..((tg_idx + 1) * hg * wg)].fill(1.0 - strength);
         }
     }
     let mask_tokens = Array::from_slice(&tok, &[1, (tg * hg * wg) as i32]);
@@ -3146,7 +3109,7 @@ mod tests {
     #[test]
     fn build_ti2v_mask_freezes_first_frame() {
         // z=2, T_lat=2, h=w=2, patch (1,2,2) → grid (2,1,1) → L=2 tokens.
-        let (mask, tokens) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0)], 2, 2, 2, 2, (1, 2, 2));
         assert_eq!(mask.shape(), &[2, 2, 2, 2]);
         // Per channel (8 vals): temporal 0 → 0.0 (4 spatial), temporal 1 → 1.0 (4 spatial).
         assert_eq!(
@@ -3159,10 +3122,9 @@ mod tests {
     }
 
     #[test]
-    fn build_ti2v_multi_mask_freezes_first_and_last() {
+    fn build_ti2v_mask_pins_first_and_last() {
         // first_last_frame: z=1, T_lat=3, h=w=2, patch (1,2,2) → grid (3,1,1) → 3 tokens.
-        // Pin frames [0, 2] (first + last). With indices=[0] it must equal build_ti2v_mask.
-        let (mask, tokens) = build_ti2v_multi_mask(&[0, 2], 1, 3, 2, 2, (1, 2, 2));
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0), (2, 1.0)], 1, 3, 2, 2, (1, 2, 2));
         assert_eq!(mask.shape(), &[1, 3, 2, 2]);
         // temporal 0 → 0 (4), temporal 1 → 1 (4), temporal 2 → 0 (4).
         assert_eq!(
@@ -3171,11 +3133,44 @@ mod tests {
         );
         // token mask: frame0 + frame2 tokens 0, frame1 token 1.
         assert_eq!(tokens.as_slice::<f32>(), &[0., 1., 0.]);
-        // Single-index [0] reproduces build_ti2v_mask exactly.
-        let (m1, t1) = build_ti2v_multi_mask(&[0], 2, 2, 2, 2, (1, 2, 2));
-        let (m0, t0) = build_ti2v_mask(2, 2, 2, 2, (1, 2, 2));
-        assert_eq!(m1.as_slice::<f32>(), m0.as_slice::<f32>());
-        assert_eq!(t1.as_slice::<f32>(), t0.as_slice::<f32>());
+    }
+
+    /// sc-19571: the per-pin strength must land in BOTH masks as `1 − strength`, with each pin
+    /// carrying its OWN weight — the defect this replaced built a hard 0/1 mask from the indices
+    /// alone, so every value below is one a `strength`-blind builder cannot produce. Deliberately
+    /// **non-default**: 1.0 (the old hard pin) appears nowhere as a strength here.
+    #[test]
+    fn build_ti2v_mask_threads_per_pin_strength() {
+        // z=1, T_lat=3, h=w=2, patch (1,2,2) → grid (3,1,1) → 3 tokens. First pinned at 0.25,
+        // last at 0.75 — different from each other, so a builder that reused one strength for
+        // every pin is also caught.
+        let (mask, tokens) = build_ti2v_mask(&[(0, 0.25), (2, 0.75)], 1, 3, 2, 2, (1, 2, 2));
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0.75, 0.75, 0.75, 0.75, 1., 1., 1., 1., 0.25, 0.25, 0.25, 0.25],
+            "latent mask must be 1 − strength at each pin, per pin"
+        );
+        assert_eq!(
+            tokens.as_slice::<f32>(),
+            &[0.75, 1., 0.25],
+            "token mask must carry the same per-pin 1 − strength"
+        );
+        // strength 0.0 is a no-op pin: the frame denoises exactly as if it were never pinned.
+        let (free, free_tokens) = build_ti2v_mask(&[(0, 0.0)], 1, 2, 1, 1, (1, 1, 1));
+        assert_eq!(free.as_slice::<f32>(), &[1., 1.]);
+        assert_eq!(free_tokens.as_slice::<f32>(), &[1., 1.]);
+
+        // **Cross-lane pin.** These are the literal inputs and expected values in candle's
+        // `candle_gen_wan::pipeline::ti2v_tests::mask_and_keyframe_scatter_pin_first_and_last`, so
+        // the two backends are gated against the same numbers rather than each against its own idea
+        // of the construction — the divergence that let one lane honor the knob while the other
+        // silently dropped it is exactly what this asserts away.
+        let (mask, tokens) = build_ti2v_mask(&[(0, 1.0), (2, 0.25)], 1, 3, 2, 2, (1, 2, 2));
+        assert_eq!(
+            mask.as_slice::<f32>(),
+            &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.75, 0.75, 0.75, 0.75]
+        );
+        assert_eq!(tokens.as_slice::<f32>(), &[0.0, 1.0, 0.75]);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! `ChatGLMTokenizer(prompt, padding="max_length", max_length=256, truncation=True)` across an EN /
 //! EN-long(truncated) / CN / mixed / empty battery.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --test tokenizer_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --test integration tokenizer_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::all_close;
 use mlx_rs::Array;

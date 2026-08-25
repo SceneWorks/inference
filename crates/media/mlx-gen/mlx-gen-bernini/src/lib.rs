@@ -141,6 +141,18 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
     register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
 }
 
+/// Resolve the full Bernini video's load-exact packed tier. The renderer-only sibling is not a
+/// public video route and returns `None` rather than lending its partial artifact surface.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+    if provider_id != bernini::MODEL_ID {
+        return Ok(None);
+    }
+    memory_strategy::resolved_numeric_tier(spec).map(Some)
+}
+
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
@@ -242,20 +254,51 @@ mod explicit_registry_tests {
         }
     }
 
-    /// A weights-free snapshot dir carrying only the dual-expert `config.json` both loaders read.
-    /// `num_layers` is an explicit override so a test can load a trunk shape the ladder does NOT
-    /// declare, which is what the depth guard exists for.
+    fn write_dense_tier_header(path: &std::path::Path) {
+        let tensors = serde_json::json!({
+            "block.weight": {
+                "dtype": "BF16",
+                "shape": [2, 64],
+                "data_offsets": [0, 256]
+            }
+        });
+        let mut header = serde_json::to_vec(&tensors).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + 256, 0);
+        std::fs::write(path, file).unwrap();
+    }
+
+    /// A weights-free snapshot dir carrying the dense tier manifests/headers the full provider
+    /// safety boundary resolves. `num_layers` is an explicit override so a test can load a trunk
+    /// shape the ladder does NOT declare, which is what the depth guard exists for.
     fn snapshot_dir(num_layers: Option<usize>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let mut config = serde_json::json!({
             "model_type": "t2v",
             "dim": 5120,
             "dual_model": true,
+            "quantization": null,
         });
         if let Some(num_layers) = num_layers {
             config["num_layers"] = serde_json::json!(num_layers);
         }
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("qwen2_5_vl_config.json"),
+            serde_json::json!({ "quantization": null }).to_string(),
+        )
+        .unwrap();
+        for name in [
+            "high_noise_model.safetensors",
+            "low_noise_model.safetensors",
+            "qwen2_5_vl.safetensors",
+        ] {
+            write_dense_tier_header(&dir.path().join(name));
+        }
         dir
     }
 
@@ -316,7 +359,6 @@ mod explicit_registry_tests {
 
             let declaration = fixture_contract(provider_id).unwrap();
             for strategy in [
-                MemoryStrategy::StagedResidency,
                 MemoryStrategy::BoundedDecode,
                 MemoryStrategy::BoundedAttention,
                 MemoryStrategy::BoundedTransformerResidency,
@@ -426,7 +468,6 @@ mod explicit_registry_tests {
             assert!(model.begin_memory_strategy_request(&windowed).is_err());
 
             for unaffected in [
-                MemoryStrategy::StagedResidency,
                 MemoryStrategy::BoundedDecode,
                 MemoryStrategy::BoundedAttention,
             ] {
@@ -473,7 +514,7 @@ mod explicit_registry_tests {
                         "{provider_id}: bernini reads no GenerationPhase"
                     );
                     assert!(fixture.request.phases.is_none(), "{provider_id}");
-                    assert_eq!(fixture.request.frames, Some(1), "{provider_id}");
+                    assert_eq!(fixture.request.frames, Some(45), "{provider_id}");
                     descriptor
                         .capabilities
                         .validate_request(descriptor.id, &fixture.request)

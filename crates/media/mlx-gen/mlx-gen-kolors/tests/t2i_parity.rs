@@ -15,9 +15,9 @@
 //! add-embedding), the CFG combine, and the Euler step — and the full render (gate B) is a coherence
 //! + cross-backend-delta report, not a bit gate.
 //!
-//! Run: `cargo test -p mlx-gen-kolors --release --test t2i_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-kolors --release --test integration t2i_parity:: -- --ignored --nocapture`
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::DiffusionSampler;

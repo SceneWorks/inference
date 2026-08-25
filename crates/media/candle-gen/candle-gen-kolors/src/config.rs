@@ -18,8 +18,10 @@
 //! by this registered generator rather than silently dropped (the false-capability trap).
 
 use candle_gen::gen_core::{
-    Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant, SizeFloor,
+    Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant, StepSupport,
 };
+
+use crate::sampler::NUM_TRAIN_TIMESTEPS;
 
 /// Registry id — matches the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -63,7 +65,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Kolors uses real classifier-free guidance over the ChatGLM3 conditioning.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // The registered generator accepts one Reference as a deterministic latent-init img2img.
             // ControlNet-pose and IP-Adapter remain separate, already-wired bespoke providers.
             conditioning: vec![ConditioningKind::Reference],
@@ -84,41 +85,27 @@ pub fn descriptor() -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["discrete"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
+            // Kolors' train-timestep count is a real upper bound (see the mlx twin and F-124):
+            // above it every timestep collapses to 1 and the render is silent garbage. Declared
+            // so a consumer can read the bound without dispatching a job (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: NUM_TRAIN_TIMESTEPS as u32,
+            },
             // Packed q4/q8 MLX-tier inference (sc-10819, epic 9083): the `SceneWorks/kolors-mlx` tier
             // packs the SDXL-family UNet + the four ChatGLM3 projections (VAE dense), and the candle
             // loader packed-detects it from disk (`pipeline::load_components`). Advertise Q4/Q8; the
             // `LoadSpec::quantize` overlay is an advisory no-op on an already-packed tier (as with
             // sdxl/boogu/flux2-dev). bf16 tiers stay dense (Quant::None).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16954): both lanes of this registered route
             // emit -- the curated driver lane and the native leading-Euler loop -- as do the
             // name-driven pose-control and IP-Adapter providers. Kolors adds no fit of its own; it
             // projects through `candle_gen_sdxl::preview` (one byte-identical VAE file).
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
             // sc-18317: Kolors runs real classifier-free guidance, and the one convention this lane
             // implements is the doubled `[uncond, cond]` batch `common::cfg_batch_context` builds.
             // Declaring the single mode makes it planner-selectable and makes `sequential` a refusal
@@ -129,7 +116,7 @@ pub fn descriptor() -> ModelDescriptor {
                 ),
                 ..candle_gen::gen_core::ExecutionSurface::default()
             },
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

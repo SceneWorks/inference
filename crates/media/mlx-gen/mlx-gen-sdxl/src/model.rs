@@ -17,7 +17,7 @@ use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, Scheduler, SizeFloor, Solver, TcdSampler, WeightsSource,
+    Quant, Residency, Result, Scheduler, Solver, TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
@@ -34,7 +34,7 @@ use crate::loader;
 use crate::pipeline::{
     denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
     denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
-    encode_conditioning, encode_init_latents, preprocess_control_image, text_time_ids,
+    encode_conditioning_windows, encode_init_latents, preprocess_control_image, text_time_ids,
     ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -118,6 +118,34 @@ fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
     }
 }
 
+/// ControlNet can share the CFG-free Lightning denoise loop: it builds a one-row control context,
+/// produces residuals for that same row, and [`crate::pipeline::forward_eps`] injects them before
+/// the U-Net prediction. The other acceleration profiles have not been validated with ControlNet,
+/// so keep that boundary explicit rather than accepting a combination just because the common loop
+/// happens to be mechanically capable of running it.
+///
+/// Lightning is distilled CFG-free. In particular, an omitted guidance value resolves to its normal
+/// `1.0` default; an explicitly larger value must be rejected rather than silently running a
+/// two-row CFG path against a checkpoint trained for a single conditioned prediction.
+fn validate_control_acceleration(sampler: &str, guidance: Option<f32>) -> Result<()> {
+    if !ACCEL_SAMPLERS.contains(&sampler) {
+        return Ok(());
+    }
+    if sampler != "lightning" {
+        return Err(Error::Msg(format!(
+            "sdxl: ControlNet is supported with the CFG-free `lightning` acceleration sampler only \
+             (got {sampler:?})"
+        )));
+    }
+    if guidance.is_some_and(|value| value > 1.0) {
+        return Err(Error::Msg(
+            "sdxl: ControlNet with the CFG-free `lightning` sampler requires guidance <= 1.0"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TARGETS["sdxl"]`).
 pub const MODEL_ID: &str = "sdxl";
 
@@ -145,7 +173,6 @@ pub fn descriptor() -> ModelDescriptor {
             // SDXL uses real classifier-free guidance: honors the negative prompt + a CFG scale.
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // img2img Reference (sc-2638) + masked inpaint/outpaint (Mask, sc-3057) + tile-ControlNet
             // detail (Control, sc-3058 — requires a control checkpoint via LoadSpec::control). LoRA
             // (kohya `lora_unet_` + PEFT, sc-2639) and LoKr (sc-2640 — Rust is more capable than the
@@ -196,28 +223,10 @@ pub fn descriptor() -> ModelDescriptor {
             // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
             // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -995,14 +1004,12 @@ impl Sdxl {
         }
         // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
         // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
-        // summed. Needs the ancestral path; not combined with an inpaint mask in this build.
+        // summed. The common denoiser correctly carries those residuals through Lightning's one-row,
+        // CFG-free loop; LCM/Hyper remain deliberately unsupported until separately characterized.
+        // Control still does not combine with an inpaint mask in this build.
         let control_reqs = self.resolve_control(req)?;
         if !control_reqs.is_empty() {
-            if is_accel {
-                return Err(Error::Msg(
-                    "sdxl: ControlNet is not supported with the acceleration samplers".into(),
-                ));
-            }
+            validate_control_acceleration(sampler_name, req.guidance)?;
             if control_reqs.len() != self.control_count {
                 return Err(Error::Msg(format!(
                     "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
@@ -1026,9 +1033,13 @@ impl Sdxl {
         // `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle loads below —
         // bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders
         // (byte-identical to the pre-sc-10839 `encode_conditioning`).
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows, not truncated. The
+        // window count is decided ONCE here, as the max over both CFG rows, so `[cond, uncond]` stay
+        // stackable and the negative prompt takes exactly the same path as the positive one. A
+        // request whose rows both fit is a single window that IS the pre-sc-20528 token batch.
         let tokens = self
             .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
+            .tokenize_windows(&req.prompt, if cfg_on { Some(negative) } else { None })?;
 
         // ── Ladder request resolution (SC-15525) ────────────────────────────────────────────────
         // Rung 1 is request-scoped from here on: the load-time `OffloadPolicy` is only the default a
@@ -1071,7 +1082,7 @@ impl Sdxl {
             req.use_pid,
             on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
-                encode_conditioning(&text.0, &text.1, &tokens)
+                encode_conditioning_windows(&text.0, &text.1, &tokens)
             },
             // Materialize the conditioning + pooled while the encoders are still alive (Sequential
             // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
@@ -1831,6 +1842,30 @@ mod tests {
                 ancestral_strength_schedule(steps, max_time, strength),
                 previous
             );
+        }
+    }
+
+    #[test]
+    fn control_acceleration_admission_is_lightning_only_and_cfg_free() {
+        // The ordinary no-ControlNet acceleration paths keep their established defaults. This
+        // contract applies only to the control-aware path, where a Lightning checkpoint must never
+        // be silently driven through CFG.
+        assert_eq!(accel_defaults("lightning"), (4, 1.0, 0.0));
+        assert!(validate_control_acceleration("euler_ancestral", Some(7.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", None).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(1.0)).is_ok());
+        assert!(validate_control_acceleration("lightning", Some(0.5)).is_ok());
+
+        let guidance = validate_control_acceleration("lightning", Some(1.01))
+            .unwrap_err()
+            .to_string();
+        assert!(guidance.contains("guidance <= 1.0"), "got: {guidance}");
+
+        for sampler in ["lcm", "hyper"] {
+            let err = validate_control_acceleration(sampler, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("lightning"), "{sampler}: {err}");
         }
     }
 

@@ -578,8 +578,8 @@ fn base_preview_observes_heun_outer_steps_only_and_is_output_inert() {
 ///
 /// Run:
 ///   SANA_PIPELINE_WEIGHTS=/path/Sana_1600M_1024px_diffusers \
-///     cargo test -p mlx-gen-sana --release --test pipeline_contract \
-///       -- --ignored --nocapture real_weight_1024_e2e
+///     cargo test -p mlx-gen-sana --release --test integration \
+///       -- --ignored --nocapture pipeline_contract::real_weight_1024_e2e
 #[test]
 #[ignore = "needs a Sana_1600M_1024px_diffusers snapshot; set SANA_PIPELINE_WEIGHTS"]
 fn real_weight_1024_e2e() {

@@ -10,7 +10,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadPhase, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, PerComponentBytes, Progress, Quant, SizeFloor, WeightsSource,
+    OffloadPolicy, PerComponentBytes, Progress, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -25,8 +25,9 @@ use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::vace::{
     build_vace_control, crossing_index, denoise_vace_range, prepare_masks, prepare_video_latents,
-    WanVaceTransformer,
+    vace_control_scales, WanVaceTransformer,
 };
+use crate::vace_fun_tier::VaceFunTierPaths;
 use crate::vae16::WanVae16;
 use crate::wan14b::staged_expert_swap;
 
@@ -73,10 +74,6 @@ fn expert_schedule_crossing(steps: usize, sampler: Sampler, shift: f64) -> gen_c
     Ok(crossing)
 }
 
-fn weighted_control_scale(control_scale: Option<f32>, masking_strength: f32) -> f32 {
-    control_scale.unwrap_or(1.0) * masking_strength
-}
-
 #[derive(Clone)]
 struct SharedComponents {
     te: Arc<Umt5Encoder>,
@@ -101,6 +98,7 @@ fn selected_adapters(adapters: &[AdapterSpec], expert: MoeExpert) -> Vec<Adapter
 
 struct Pipeline {
     root: PathBuf,
+    tier: Option<VaceFunTierPaths>,
     device: Device,
     text_cfg: TextEncoderConfig,
     vae_cfg: Vae16Config,
@@ -109,9 +107,15 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
+    fn new(
+        root: &Path,
+        device: &Device,
+        adapters: Vec<AdapterSpec>,
+        tier: Option<VaceFunTierPaths>,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
+            tier,
             device: device.clone(),
             text_cfg: TextEncoderConfig::umt5_xxl(),
             vae_cfg: Vae16Config::wan21(),
@@ -121,6 +125,19 @@ impl Pipeline {
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
+        if let Some(tier) = &self.tier {
+            if matches!(sub, "transformer" | "transformer_2") {
+                return tier.component_vb(sub, dtype, &self.device);
+            }
+            return crate::text_encode::component_vb(
+                self.shared_root(),
+                sub,
+                dtype,
+                &self.device,
+                MODEL_ID_VACE_FUN,
+                "Wan2.2 VACE-Fun A14B split packed tier",
+            );
+        }
         crate::text_encode::component_vb(
             &self.root,
             sub,
@@ -131,17 +148,30 @@ impl Pipeline {
         )
     }
 
+    /// The snapshot root that owns the dense shared components. A hosted split tier carries only
+    /// the two packed experts; its text encoder, VAE, and tokenizer are siblings at this root.
+    fn shared_root(&self) -> &Path {
+        self.tier
+            .as_ref()
+            .map(VaceFunTierPaths::shared_root)
+            .unwrap_or(&self.root)
+    }
+
+    fn build_tokenizer(&self) -> CResult<candle_gen::gen_core::tokenizer::TextTokenizer> {
+        crate::text_encode::build_umt5_tokenizer(
+            self.shared_root(),
+            &self.text_cfg,
+            MODEL_ID_VACE_FUN,
+        )
+    }
+
     fn load_shared(&self) -> CResult<SharedComponents> {
         let te = Umt5Encoder::new(
             &self.text_cfg,
             self.component_vb("text_encoder", ENC_DTYPE)?,
         )?;
         let vae = WanVae16::new_with_encoder(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
-        let tok = crate::text_encode::build_umt5_tokenizer(
-            &self.root,
-            &self.text_cfg,
-            MODEL_ID_VACE_FUN,
-        )?;
+        let tok = self.build_tokenizer()?;
         Ok(SharedComponents {
             te: Arc::new(te),
             vae: Arc::new(vae),
@@ -163,15 +193,10 @@ impl Pipeline {
         };
         let adapters = selected_adapters(&self.adapters, expert);
         let vb = self.component_vb(sub, DIT_DTYPE)?;
-        if vb.contains_tensor("proj_out.scales") {
+        if vb.contains_tensor("blocks.0.attn1.to_q.scales") && !adapters.is_empty() {
             return Err(CandleError::Msg(format!(
-                "{MODEL_ID_VACE_FUN}: packed VACE experts are not supported by the Candle VACE \
-                 transformer; use the dense bf16 tier{}",
-                if adapters.is_empty() {
-                    ""
-                } else {
-                    " (adapters were not applied)"
-                }
+                "{MODEL_ID_VACE_FUN}: adapters on a packed VACE-Fun tier are not implemented; \
+                 refusing to materialize dense weights for the {expert:?} expert"
             )));
         }
         if adapters.is_empty() {
@@ -269,11 +294,10 @@ impl Pipeline {
             control,
             // VACE exposes one conditioning scale for the whole hint stack. Multiplying it by the
             // requested masking strength weights the mask/video control without thresholding a soft
-            // mask away in `prepare_video_latents`.
-            scales: vec![
-                weighted_control_scale(req.control_scale, clip.masking_strength);
-                self.vace_cfg.vace_layers.len()
-            ],
+            // mask away in `prepare_video_latents`. Resolved by the shared `vace.rs` seam so this
+            // route and the single-expert one cannot drift; pinned by
+            // `render_binds_scales_to_the_shared_resolver`.
+            scales: vace_control_scales(req, self.vace_cfg.vace_layers.len()),
             pos,
             neg,
             cos,
@@ -337,6 +361,7 @@ impl Pipeline {
         prepared: Prepared,
         vae: &WanVae16,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
+        decode_cap: Option<u32>,
     ) -> CResult<(Vec<Image>, u32)> {
         let t = prepared.latents.dim(2)?;
         let latents = if prepared.num_ref > 0 {
@@ -346,7 +371,7 @@ impl Pipeline {
         } else {
             prepared.latents
         };
-        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
+        let decoded = vae.decode_budgeted_with_cancel_and_tile_cap(&latents, cancel, decode_cap)?;
         Ok((frames_to_images(&decoded)?, prepared.fps))
     }
 }
@@ -374,8 +399,10 @@ pub struct WanVaceFunGenerator {
     device: Device,
     adapters: Vec<AdapterSpec>,
     offload: OffloadPolicy,
+    tier: Option<VaceFunTierPaths>,
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
 }
 
 impl WanVaceFunGenerator {
@@ -505,10 +532,24 @@ impl Generator for WanVaceFunGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate_request(req)?;
-        let pipeline = Pipeline::new(&self.root, &self.device, self.adapters.clone());
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
+        let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(
+            self.offload,
+            self.i2v_memory.is_some(),
+            req,
+        );
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let pipeline = Pipeline::new(
+            &self.root,
+            &self.device,
+            self.adapters.clone(),
+            self.tier.clone(),
+        );
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
-        let (mut prepared, resident_shared) = match self.offload {
+        let (mut prepared, resident_shared) = match effective_offload {
             OffloadPolicy::Resident => {
                 let shared = self.shared(&pipeline)?;
                 let prepared = pipeline.prepare(req, &shared)?;
@@ -527,7 +568,7 @@ impl Generator for WanVaceFunGenerator {
         let timesteps = (0..prepared.steps)
             .map(|step| scheduler.timestep(step))
             .collect::<Vec<_>>();
-        match self.offload {
+        match effective_offload {
             OffloadPolicy::Resident => {
                 let experts = self.experts(&pipeline)?;
                 let steps = prepared.steps;
@@ -614,11 +655,34 @@ impl Generator for WanVaceFunGenerator {
             }
         };
         on_progress(Progress::Decoding);
-        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel)?;
+        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
         Ok(GenerationOutput::Video {
             frames,
             fps,
             audio: None,
+        })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|p| &p.contract)
+    }
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || gen_core::MemorySafetyDecision::Reject {
+                reason: "wan2_2_vace_fun_14b loaded route has no sealed memory contract".to_owned(),
+            },
+            |p| crate::i2v_memory_strategy::safety_check(p, context),
+        )
+    }
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        self.i2v_memory.as_ref().map_or(Ok(None), |p| {
+            crate::i2v_memory_strategy::begin_request(p, self.device.clone(), context)
         })
     }
 }
@@ -638,38 +702,18 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
-            supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
+            // The public Candle route is the immutable dense bf16 VACE-Fun snapshot.
+            // Do not advertise dormant packed tiers: they have no provider receipt.
+            supported_quants: &[],
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -695,9 +739,18 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
+    let tier = VaceFunTierPaths::detect(&root)?;
+    if let Some(tier) = &tier {
+        // Preserve structural validation so malformed packed layouts fail deterministically;
+        // a valid packed layout is still not an admitted public Candle artifact.
+        tier.validate_requested_quant(spec.quantize)?;
+        return Err(gen_core::Error::Unsupported(
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; packed tiers are not a supported provider artifact".into(),
+        ));
+    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "wan2_2_vace_fun_14b on-the-fly quantization is not supported; use dense bf16".into(),
+            "wan2_2_vace_fun_14b Candle accepts only the sealed public raw dense bf16 snapshot; quantized tiers are not supported".into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -706,14 +759,26 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         ));
     }
     let device = candle_gen::default_device()?;
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_VACE_FUN)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(
+            spec,
+            MODEL_ID_VACE_FUN,
+        )?)
+    } else {
+        None
+    };
     Ok(Box::new(WanVaceFunGenerator {
         descriptor: descriptor(),
         root,
         device,
         adapters: spec.adapters.clone(),
         offload: spec.offload_policy,
+        tier,
         shared: Mutex::new(None),
         experts: Mutex::new(None),
+        i2v_memory,
     }))
 }
 
@@ -725,6 +790,8 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vace::weighted_control_scale;
+    use candle_gen::gen_core::Quant;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
 
@@ -767,6 +834,36 @@ mod tests {
             )
             .expect("VACE-Fun registration is lazy");
         assert!(generator.validate(&request()).is_ok());
+    }
+
+    #[test]
+    fn split_tier_loads_tokenizer_from_the_shared_parent_root() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let tier_root = snapshot.path().join("q8");
+        std::fs::create_dir(&tier_root).unwrap();
+        for component in ["text_encoder", "vae", "tokenizer"] {
+            std::fs::create_dir(snapshot.path().join(component)).unwrap();
+        }
+        // The tier directory deliberately has no tokenizer/: hosted split tiers keep this file at
+        // the parent snapshot alongside the dense TE/VAE components.
+        std::fs::write(
+            snapshot.path().join("tokenizer/tokenizer.json"),
+            r#"{
+  "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+  "normalizer": null, "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null, "decoder": null,
+  "model": { "type": "WordLevel", "vocab": { "<unk>": 0 }, "unk_token": "<unk>" }
+}"#,
+        )
+        .unwrap();
+        let tier = VaceFunTierPaths::test_paths(
+            tier_root.clone(),
+            snapshot.path().to_path_buf(),
+            Quant::Q8,
+        );
+        let pipeline = Pipeline::new(&tier_root, &Device::Cpu, Vec::new(), Some(tier));
+        assert_eq!(pipeline.shared_root(), snapshot.path());
+        assert!(pipeline.build_tokenizer().is_ok());
     }
 
     #[test]
@@ -988,6 +1085,8 @@ mod tests {
 
     #[test]
     fn quantized_load_fails_closed_before_any_weight_or_adapter_load() {
+        assert!(descriptor().capabilities.supported_quants.is_empty());
+        assert!(descriptor().capabilities.supports_sequential_offload);
         let spec = LoadSpec::new(WeightsSource::Dir("/snapshot".into())).with_quant(Quant::Q8);
         assert!(matches!(
             load(&spec).err().expect("quantized load must fail"),

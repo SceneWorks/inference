@@ -39,7 +39,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, SizeFloor, WeightsSource,
+    ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 pub use config::{MochiConfig, MochiVaeConfig};
@@ -103,40 +103,15 @@ pub fn descriptor() -> ModelDescriptor {
             supports_true_cfg: true,
             // Text-to-video only in the base preview (I2V = a follow-on).
             conditioning: Vec::new(),
-            supports_lora: false,
-            supports_lokr: false,
             // A single fixed flow-match Euler integrator is wired; no selectable sampler/scheduler axis.
             samplers: Vec::new(),
-            schedulers: Vec::new(),
-            supported_guidance_methods: Vec::new(),
             // Width/height must be divisible by SIZE_MULTIPLE (VAE 8× spatial × DiT patch 2). 480p target = 848×480.
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             // Quant tiers are pre-quantized per-tier checkpoints (epic 1788 / A6) — NOT on-the-fly requant.
             supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

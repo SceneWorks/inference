@@ -3,12 +3,13 @@
 Real-weight memory harnesses now have one persisted observation boundary:
 
 ```text
-MEMORY_EVIDENCE_V1 {"schema_version":1,...}
+MEMORY_EVIDENCE_V1 {"schema_version":2,...}
 ```
 
 The payload is compact JSON emitted by `gen_core::MemoryEvidenceLogRecord::to_json_line`. It carries
-the complete `MemoryEvidenceKey` (including backend, numeric tier and component floors, load shape,
-mode, overlay, geometry with `reference_count`, exact engaged composition, and parameters), the
+the complete `MemoryEvidenceKey` (including model family, resolved route, backend, numeric tier and
+component floors, load shape, mode, reference shape, overlay, geometry with `reference_count`,
+output FPS, exact engaged composition, and parameters), the
 declared and observed calibration identities, predicted and observed absolute live-allocation peaks,
 exact inference and SceneWorks Git revisions, harness version, and parity contract/result.
 Each record also carries the exact model revision, the SHA-256 of the canonical dereferenced model

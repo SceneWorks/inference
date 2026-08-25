@@ -11,7 +11,7 @@
 //! ```text
 //! set LTX_SNAPSHOT=C:\Users\…\models--Lightricks--LTX-2.3\snapshots\<hash>
 //! set LTX_GEMMA_DIR=C:\Users\…\models--google--gemma-3-12b-it\snapshots\<hash>
-//! cargo test -p candle-gen-ltx --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-ltx --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 #![cfg(feature = "cuda")]
 

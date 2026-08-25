@@ -38,7 +38,7 @@
 //!
 //! ```text
 //! KOLORS_LADDER_ROOT=<the SceneWorks/kolors-mlx snapshot root, containing q4/ q8/ bf16/> \
-//!   cargo test -p mlx-gen-kolors --test memory_ladder_real_weights -- --ignored --test-threads=1
+//!   cargo test -p mlx-gen-kolors --test integration memory_ladder_real_weights:: -- --ignored --test-threads=1
 //! ```
 //!
 //! The env var is the only input: nothing here derives a cache location (epic 13657).
@@ -144,12 +144,11 @@ fn request(memory: Option<GenerationMemory>, edge: u32, steps: u32) -> Generatio
     }
 }
 
-/// One measured row: the request's ACTIVE-bytes peak, its pixels, and its wall clock.
+/// One measured row: the request's ACTIVE-bytes peak, its pixels, and diagnostic wall clock.
 ///
-/// `wall` exists because rung 4's re-materialization latency is a real hazard — 70 blocks across 11
-/// re-opens, once per denoise step — and a peak-only row cannot answer it. It is a wall clock, so it
-/// is the softest number in this file: it moves with thermal state and with whatever else the
-/// machine is doing. It is therefore *reported* and bounded loosely, never asserted tightly.
+/// Rung 4 re-materializes blocks, so the clock remains useful output for a human investigating a
+/// run. It is deliberately not evidence: thermal state and unrelated host work can change it
+/// without changing the allocation or output contract this harness grades.
 struct Row {
     peak_gib: f64,
     pixels: Vec<u8>,
@@ -202,6 +201,80 @@ fn max_delta(a: &[u8], b: &[u8]) -> u32 {
         .map(|(x, y)| x.abs_diff(*y) as u32)
         .max()
         .unwrap_or(0)
+}
+
+/// Grade the rung-4 product claim, never a host-dependent duration.
+///
+/// The independent mutation test below makes all three legs non-vacuous: a missing evaluation or
+/// output check, an inert stream, and corrupt peak accounting each reject their synthetic row.
+fn assert_rung_four_evidence(control: &Row, row: &Row, window: u32, require_peak_reduction: bool) {
+    assert!(
+        control.peak_gib.is_finite()
+            && row.peak_gib.is_finite()
+            && control.peak_gib > 0.0
+            && row.peak_gib > 0.0,
+        "cadence {window} has invalid ACTIVE-byte accounting: control {:.4} GiB, row {:.4} GiB",
+        control.peak_gib,
+        row.peak_gib
+    );
+    assert_eq!(
+        control.pixels, row.pixels,
+        "cadence {window} is a residency change, not an arithmetic one — a streamed block must be \
+         byte-identical to its resident twin"
+    );
+    if require_peak_reduction {
+        assert!(
+            row.peak_gib < control.peak_gib * 0.97,
+            "cadence {window} must bound the request peak by more than the 3% margin ({:.4} vs \
+             {:.4} GiB)",
+            row.peak_gib,
+            control.peak_gib
+        );
+    }
+}
+
+#[test]
+fn rung_four_evidence_rejects_output_loss_inert_stream_and_corrupt_peak_accounting() {
+    let control = Row {
+        peak_gib: 100.0,
+        pixels: vec![1, 2, 3],
+        wall: std::time::Duration::ZERO,
+    };
+    let valid = Row {
+        peak_gib: 90.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert_rung_four_evidence(&control, &valid, 1, true);
+
+    let changed_output = Row {
+        pixels: vec![1, 2, 4],
+        ..valid
+    };
+    assert!(std::panic::catch_unwind(|| {
+        assert_rung_four_evidence(&control, &changed_output, 1, true)
+    })
+    .is_err());
+
+    let inert_stream = Row {
+        peak_gib: 100.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert!(std::panic::catch_unwind(|| {
+        assert_rung_four_evidence(&control, &inert_stream, 1, true)
+    })
+    .is_err());
+
+    let corrupt_accounting = Row {
+        peak_gib: 0.0,
+        pixels: control.pixels.clone(),
+        wall: std::time::Duration::ZERO,
+    };
+    assert!(std::panic::catch_unwind(|| {
+        assert_rung_four_evidence(&control, &corrupt_accounting, 1, true)
+    })
+    .is_err());
 }
 
 fn mean_delta(a: &[u8], b: &[u8]) -> f64 {
@@ -942,23 +1015,18 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
 
-/// **The rung-4 cadence sweep** — the whole published domain, peak *and* wall clock — plus the
-/// bit-identity proof that the eleven streamed sub-stacks reproduce the resident ones exactly.
+/// **The rung-4 cadence sweep** — allocation and output evidence for every published cadence.
 ///
-/// Three facts the domain's publication rests on:
+/// Two deterministic facts the product claim rests on:
 ///
 /// 1. **every cadence bounds the peak** (each row below the staged control by a 3% margin);
-/// 2. **every cadence bounds it to the SAME value** — the finding that makes the wider cadences
-///    worth publishing, because it means they give up no memory at all. Asserted at 1%, far outside
-///    the observed spread (the peak rows reproduce to the millibyte across runs);
-/// 3. **widening the cadence buys time back**, which is what makes the domain a frontier rather than
-///    four spellings of one choice.
+/// 2. **every cadence preserves the output exactly**. The default row also asserts flat peak
+///    accounting; a timing sample is printed only as diagnostic context.
 ///
 /// `KOLORS_WINDOW_PROBE_TIER` / `KOLORS_WINDOW_PROBE_SIZE` re-run the sweep at another tier or
-/// output edge. In probe mode the flatness and wall-clock assertions are **reported rather than
-/// asserted** — flatness is a claim about the default configuration, and a wall clock is meaningless
-/// on a loaded machine. What stays asserted in BOTH modes is what is true of every configuration:
-/// each cadence bounds the request peak below the control, and every row is byte-identical to it.
+/// output edge. In probe mode flatness is reported rather than asserted. What stays asserted in
+/// BOTH modes is what is true of every configuration: each cadence bounds the request peak below
+/// the control, and every row is byte-identical to it.
 #[test]
 #[ignore = "needs a real SceneWorks/kolors-mlx snapshot (set KOLORS_LADDER_ROOT)"]
 fn transformer_window_sweep_and_streamed_output_identity() {
@@ -1002,51 +1070,23 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         rows.push((*window, row));
     }
 
-    // **Byte-identity is asserted in BOTH modes**: a streamed block is re-materialized through the
-    // same constructor with the same replayed tier, so only residency differs — at every tier and
-    // every geometry, with no exceptions.
-    //
+    // The default `Dit` cell is peak-bearing and must reduce the request peak. A probe can target a
+    // conditioning-bearing cell where a correct `Dit` stream does not move the whole-request peak;
+    // it still grades accounting and output identity, but reports rather than asserts that reduction.
     // Scope note: every `LoadSpec` in this sweep carries `ip_adapter: None` and no adapters, so
     // `ip_expected` is false and the `BlockAdapters` are empty — this loop discriminates the TIER
     // replay and nothing about the IP/adapter replay. That half is carried end to end by
     // `the_rung_four_stream_replays_an_installed_ip_adapter`, and at the unit level by
     // `mlx_gen_sdxl::block_stream`'s own tests.
     for (window, row) in &rows {
-        assert_eq!(
-            control.pixels, row.pixels,
-            "cadence {window} is a residency change, not an arithmetic one — a streamed block must \
-             be byte-identical to its resident twin"
-        );
-    }
-    // **The peak bound is asserted at the DEFAULT configuration only**, and that is a measurement
-    // rather than caution. This sweep runs the `Dit` scope, which bounds the DENOISE phase — and the
-    // denoise phase is not peak-bearing at every advertised cell. At `bf16` 512² the conditioning
-    // phase carries the request peak (`the_text_encoder_window_scope_cannot_move_the_request_peak`)
-    // and the `Dit` scope there measures **+0.04%**: a correct, complete bound on a phase that is
-    // not the maximum. Asserting a peak drop in probe mode would therefore assert something
-    // measurably false, and the right answer at that cell is the `TextEncoder` scope
-    // (`the_text_encoder_window_bounds_the_conditioning_bearing_cell`, −22.19%), not a tighter
-    // cadence.
-    for (window, row) in &rows {
-        if probe {
-            continue;
-        }
-        assert!(
-            row.peak_gib < control.peak_gib * 0.97,
-            "cadence {window} must bound the request peak by more than the 3% margin ({:.4} vs \
-             {:.4} GiB)",
-            row.peak_gib,
-            control.peak_gib
-        );
+        assert_rung_four_evidence(&control, row, *window, !probe);
     }
 
     let tightest = &rows.first().expect("a non-empty domain").1;
     let widest = &rows.last().expect("a non-empty domain").1;
     let spread = 100.0 * (widest.peak_gib - tightest.peak_gib).abs() / tightest.peak_gib;
-    let speedup = tightest.wall.as_secs_f64() / widest.wall.as_secs_f64();
     println!(
-        "[sc-15521 rung4 sweep {tier} {edge}²] peak spread across the domain {spread:.2}%, widest \
-         cadence {speedup:.1}× faster than the tightest{}",
+        "[sc-15521 rung4 sweep {tier} {edge}²] peak spread across the domain {spread:.2}%{}",
         if probe {
             " (probe mode: reported, not asserted)"
         } else {
@@ -1061,11 +1101,6 @@ fn transformer_window_sweep_and_streamed_output_identity() {
         "the published cadences no longer bound the peak to the same value ({spread:.2}% spread). \
          TRANSFORMER_WINDOW_SIZES' flat column and the phase-separation mechanism it rests on must \
          be re-derived before the domain is published again"
-    );
-    assert!(
-        speedup > 1.5,
-        "widening the cadence no longer buys time back ({speedup:.2}×) — the domain is a frontier \
-         only if it does, otherwise it is four spellings of one choice"
     );
 }
 

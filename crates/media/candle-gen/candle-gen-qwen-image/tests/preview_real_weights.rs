@@ -20,7 +20,7 @@
 //! QWEN_PREVIEW_EDIT_DIR=E:\models\qwen-image-edit-2511-mlx\q4 \
 //! QWEN_PREVIEW_EDIT_REFERENCE=E:\out\sc-16952\t2i_final.png \
 //! QWEN_PREVIEW_ARTIFACT_DIR=E:\out\sc-16952 \
-//!   cargo test -p candle-gen-qwen-image --release --features cuda --test preview_real_weights \
+//!   cargo test -p candle-gen-qwen-image --release --features cuda --test integration preview_real_weights:: \
 //!     -- --ignored --nocapture
 //! ```
 //!

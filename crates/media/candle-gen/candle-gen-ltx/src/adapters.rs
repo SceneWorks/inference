@@ -32,6 +32,13 @@ const PATH_PREFIXES: [&str; 6] = [
     "",
 ];
 
+/// `rerank_conditioning_safe=true` identifies the published cond_safe Eros adapter. Unlike a
+/// generic user adapter, this artifact has a fixed complete AudioVideo surface and must never load
+/// as a video-only subset.
+const COND_SAFE_METADATA_KEY: &str = "rerank_conditioning_safe";
+const COND_SAFE_TARGETS: usize = 1_660;
+const COND_SAFE_TENSORS: usize = 3_320;
+
 /// Result of installing one or more LTX LoRA/LoKr adapters.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct AdditiveReport {
@@ -44,7 +51,7 @@ pub struct AdditiveReport {
 struct PendingLora {
     a: Tensor,
     b: Tensor,
-    scale: f64,
+    pass_scales: Vec<f64>,
     /// Index of the selected [`AdapterSpec`] that supplied this residual.
     source: usize,
 }
@@ -61,7 +68,10 @@ struct LokrGroup {
 
 struct PendingLokr {
     factors: LokrGroup,
-    scale: f64,
+    /// Alpha/rank and any LyCORIS module scale. User pass strengths remain separate so the
+    /// structured residual can select stage one or two without rebuilding the DiT.
+    factor_scale: f64,
+    pass_scales: Vec<f64>,
     /// Index of the selected [`AdapterSpec`] that supplied this residual.
     source: usize,
 }
@@ -121,6 +131,18 @@ fn strip_path_prefix(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Map published diffusers/PEFT LTX module names onto Candle's provider namespace.
+///
+/// `cond_safe` uses the rootless `diffusion_model.` namespace while Candle's dense and split-tier
+/// builders are rooted at `model.diffusion_model.`. The two layouts describe the same AudioVideo
+/// tree; normalize the wrapper before routing rather than treating the 1,660 non-video projections
+/// as unknown. Keep the Lightricks projection spelling (`to_out.0`, `ff.net.0.proj`, `ff.net.2`) —
+/// the tier's `to_out`/`ff.proj_*` spellings are already translated by its VarBuilder remapper and
+/// must never leak into adapter matching.
+fn normalize_ltx_adapter_path(path: &str) -> String {
+    strip_path_prefix(path).to_string()
+}
+
 fn classify_lora_key(key: &str) -> Option<(String, Role)> {
     let key = strip_path_prefix(key);
     for (suffix, role) in [
@@ -133,7 +155,7 @@ fn classify_lora_key(key: &str) -> Option<(String, Role)> {
         (".alpha", Role::Alpha),
     ] {
         if let Some(path) = key.strip_suffix(suffix) {
-            return Some((path.to_string(), role));
+            return Some((normalize_ltx_adapter_path(path), role));
         }
     }
     None
@@ -150,41 +172,61 @@ fn classify_lokr_key(key: &str) -> Option<(String, &'static str)> {
         "lokr_w2",
     ] {
         if let Some(path) = key.strip_suffix(&format!(".{suffix}")) {
-            return Some((path.to_string(), suffix));
+            return Some((normalize_ltx_adapter_path(path), suffix));
         }
     }
     None
 }
 
-fn effective_scale(spec: &AdapterSpec) -> Result<f64> {
+/// User strengths for the distilled LTX stages. A scalar remains uniform for third-party adapters;
+/// Eros supplies the explicit two-stage `[stage1, stage2]` vector.
+fn effective_pass_scales(spec: &AdapterSpec) -> Result<Vec<f64>> {
     if spec.moe_expert.is_some() {
         return Err(CandleError::Msg(format!(
             "ltx: adapter {} specifies a Wan MoE expert; LTX has one video DiT",
             spec.path.display()
         )));
     }
-    let scale = match &spec.pass_scales {
-        None => spec.scale as f64,
-        // Shared Eros/LTX load specs carry the MLX two-stage `[primary, secondary]` pair. Candle is
-        // single-stage, so it consumes the primary pass scale and deliberately ignores the absent
-        // upsampler pass. Longer vectors cannot be interpreted truthfully.
-        Some(scales) if matches!(scales.len(), 1 | 2) => scales[0] as f64,
+    let scales: Vec<f64> = match &spec.pass_scales {
+        None => vec![spec.scale as f64],
+        Some(scales) if scales.len() == 2 => scales.iter().copied().map(f64::from).collect(),
         Some(scales) => {
             return Err(CandleError::Msg(format!(
-            "ltx: adapter {} has {} pass_scales entries; candle LTX-2.3 accepts one single-stage \
-                 scale or the shared two-stage [primary, secondary] shape",
+            "ltx: adapter {} has {} pass_scales entries; omit pass_scales for a uniform scalar \
+                 strength, or provide the exact two-stage [stage1, stage2] shape",
             spec.path.display(),
             scales.len()
         )))
         }
     };
-    if !scale.is_finite() {
+    if scales.iter().any(|scale| !scale.is_finite()) {
         return Err(CandleError::Msg(format!(
-            "ltx: adapter {} effective scale must be finite",
+            "ltx: adapter {} effective pass scales must be finite",
             spec.path.display()
         )));
     }
-    Ok(scale)
+    Ok(scales)
+}
+
+fn is_cond_safe(file: &AdapterFile) -> bool {
+    file.meta
+        .get(COND_SAFE_METADATA_KEY)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn validate_cond_safe_completeness(
+    file: &AdapterFile,
+    lora_tensors: usize,
+    targets: usize,
+) -> Result<()> {
+    if is_cond_safe(file) && (lora_tensors != COND_SAFE_TENSORS || targets != COND_SAFE_TARGETS) {
+        return Err(CandleError::Msg(format!(
+            "ltx: cond_safe adapter declares {COND_SAFE_METADATA_KEY}=true but has {targets} LoRA \
+             targets / {lora_tensors} LoRA tensors; expected the complete {COND_SAFE_TARGETS} targets \
+             / {COND_SAFE_TENSORS} tensors (partial cond_safe adapters are unsafe)"
+        )));
+    }
+    Ok(())
 }
 
 /// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
@@ -198,7 +240,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
 
     for (source, spec) in specs.iter().enumerate() {
         ensure_no_diff_patch(spec)?;
-        let scale = effective_scale(spec)?;
+        let pass_scales = effective_pass_scales(spec)?;
         let file = read_adapter(&spec.path)?;
         let format = classify_format(spec, &file)?;
         if format == AdapterFormat::Lokr {
@@ -206,7 +248,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
                 file.meta.get("rank").map(String::as_str),
                 file.meta.get("alpha").map(String::as_str),
             )?;
-            let full_scale = scale * alpha as f64 / rank as f64;
+            let factor_scale = alpha as f64 / rank as f64;
             let mut groups: BTreeMap<String, LokrGroup> = BTreeMap::new();
             for (key, tensor) in &file.tensors {
                 if let Some((path, factor)) = classify_lokr_key(key) {
@@ -227,7 +269,8 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
             for (path, factors) in groups {
                 pending_lokr.entry(path).or_default().push(PendingLokr {
                     factors,
-                    scale: full_scale,
+                    factor_scale,
+                    pass_scales: pass_scales.clone(),
                     source,
                 });
             }
@@ -235,7 +278,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
         }
         if format == AdapterFormat::ThirdPartyLokr {
             for (raw_path, group) in parse_lokr_thirdparty(&file)? {
-                let path = strip_path_prefix(&raw_path).to_string();
+                let path = normalize_ltx_adapter_path(&raw_path);
                 let lycoris_scale = if let Some(factor) = group.w1_a.as_ref() {
                     let rank = factor.dims()[1] as f64;
                     group.alpha.map_or(1.0, |alpha| alpha as f64 / rank)
@@ -255,7 +298,8 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
                         w2_a: group.w2_a,
                         w2_b: group.w2_b,
                     },
-                    scale: scale * lycoris_scale,
+                    factor_scale: lycoris_scale,
+                    pass_scales: pass_scales.clone(),
                     source,
                 });
             }
@@ -263,21 +307,26 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
         }
 
         let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+        let mut lora_tensors = 0;
         for (key, tensor) in &file.tensors {
             match classify_lora_key(key) {
                 Some((path, Role::Down)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().down = Some(tensor.clone())
                 }
                 Some((path, Role::Up)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().up = Some(tensor.clone())
                 }
                 Some((path, Role::Alpha)) => {
+                    lora_tensors += 1;
                     triples.entry(path).or_default().alpha =
                         Some(read_scalar(key, "alpha", tensor)?)
                 }
                 None => report.skipped_keys += 1,
             }
         }
+        validate_cond_safe_completeness(&file, lora_tensors, triples.len())?;
         let metadata = LoraAdapterMeta::from_file_metadata(&file.meta);
         for (path, triple) in triples {
             let (down, up) = match (triple.down, triple.up) {
@@ -324,7 +373,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
             pending.entry(path).or_default().push(PendingLora {
                 a,
                 b,
-                scale,
+                pass_scales: pass_scales.clone(),
                 source,
             });
         }
@@ -351,11 +400,11 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
                         residual.b.dims()
                     )));
                 }
-                linear.push_additive_lora(
+                linear.push_additive_lora_per_pass(
                     residual.a.to_device(&device)?,
                     residual.b.to_device(&device)?,
-                    residual.scale,
-                );
+                    residual.pass_scales.clone(),
+                )?;
                 report.applied += 1;
                 applied_by_spec[residual.source] += 1;
             }
@@ -366,7 +415,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
             for residual in residuals {
                 let group = &residual.factors;
                 let factors = LokrFactors::build(
-                    residual.scale,
+                    residual.factor_scale,
                     (out_features, in_features),
                     group.w1.as_ref(),
                     group.w1_a.as_ref(),
@@ -385,7 +434,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
                 let factors = factors
                     .to_device(&device)
                     .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
-                linear.push_additive_lokr(factors);
+                linear.push_additive_lokr_per_pass(factors, residual.pass_scales.clone())?;
                 report.applied += 1;
                 applied_by_spec[residual.source] += 1;
             }
@@ -427,7 +476,7 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, Module};
@@ -457,34 +506,127 @@ mod tests {
         }
     }
 
+    /// The published cond_safe adapter has 1,660 paired LoRA targets / 3,320 tensors. Its
+    /// diffusers `diffusion_model.` wrapper is intentionally different from Candle's
+    /// `model.diffusion_model.` builder root, but after normalization the complete AudioVideo
+    /// surface must be present. The historical video-only visitor covered 768 tensors; accepting
+    /// any such partial map would recreate the noise-render regression.
     #[test]
-    fn shared_eros_pass_scales_use_the_primary_stage() {
-        let mut spec = AdapterSpec::new("eros.safetensors".into(), 0.25, AdapterKind::Lora);
-        spec.pass_scales = Some(vec![0.8, 0.2]);
-        assert_eq!(effective_scale(&spec).unwrap(), 0.8_f32 as f64);
+    fn cond_safe_key_mapping_is_complete_over_all_3320_tensors() {
+        let mut provider_paths = BTreeSet::new();
+        for stream in ["", "audio_"] {
+            provider_paths.insert(format!("{stream}patchify_proj"));
+            provider_paths.insert(format!("{stream}proj_out"));
+            for controller in [
+                format!("{stream}adaln_single"),
+                format!("{stream}prompt_adaln_single"),
+                if stream.is_empty() {
+                    "av_ca_video_scale_shift_adaln_single".into()
+                } else {
+                    "av_ca_audio_scale_shift_adaln_single".into()
+                },
+                if stream.is_empty() {
+                    "av_ca_a2v_gate_adaln_single".into()
+                } else {
+                    "av_ca_v2a_gate_adaln_single".into()
+                },
+            ] {
+                provider_paths.insert(format!("{controller}.emb.timestep_embedder.linear_1"));
+                provider_paths.insert(format!("{controller}.emb.timestep_embedder.linear_2"));
+                provider_paths.insert(format!("{controller}.linear"));
+            }
+        }
+        for block in 0..48 {
+            for attention in [
+                "attn1",
+                "attn2",
+                "audio_attn1",
+                "audio_attn2",
+                "audio_to_video_attn",
+                "video_to_audio_attn",
+            ] {
+                for projection in ["to_q", "to_k", "to_v", "to_out.0", "to_gate_logits"] {
+                    provider_paths.insert(format!(
+                        "transformer_blocks.{block}.{attention}.{projection}"
+                    ));
+                }
+            }
+            for feed_forward in ["ff", "audio_ff"] {
+                provider_paths.insert(format!(
+                    "transformer_blocks.{block}.{feed_forward}.net.0.proj"
+                ));
+                provider_paths.insert(format!("transformer_blocks.{block}.{feed_forward}.net.2"));
+            }
+        }
+        assert_eq!(provider_paths.len(), 1_660);
 
-        spec.pass_scales = Some(vec![0.6]);
-        assert_eq!(effective_scale(&spec).unwrap(), 0.6_f32 as f64);
-
-        spec.pass_scales = Some(vec![0.6, 0.4, 0.2]);
-        let error = effective_scale(&spec).unwrap_err().to_string();
-        assert!(error.contains("3 pass_scales") && error.contains("[primary, secondary]"));
+        let mut mapped = BTreeSet::new();
+        let mut mapped_tensors = 0;
+        for path in &provider_paths {
+            for suffix in ["lora_A.weight", "lora_B.weight"] {
+                let key = format!("diffusion_model.{path}.{suffix}");
+                let (mapped_path, _) = classify_lora_key(&key).expect("published PEFT key");
+                assert!(
+                    provider_paths.contains(&mapped_path),
+                    "unmapped target: {key}"
+                );
+                mapped.insert(mapped_path);
+                mapped_tensors += 1;
+            }
+        }
+        assert_eq!(mapped_tensors, 3_320);
+        assert_eq!(mapped, provider_paths);
     }
 
     #[test]
-    fn effective_scale_rejects_non_finite_spec_and_primary_pass_scale() {
+    fn cond_safe_partial_surface_is_rejected_before_provider_matching() {
+        let file = AdapterFile {
+            tensors: HashMap::new(),
+            meta: HashMap::from([(COND_SAFE_METADATA_KEY.into(), "true".into())]),
+        };
+        let error = validate_cond_safe_completeness(&file, 768, 384)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("384 LoRA targets / 768 LoRA tensors"));
+        assert!(error.contains("1660 targets / 3320 tensors"));
+        assert!(error.contains("partial cond_safe adapters are unsafe"));
+    }
+
+    #[test]
+    fn eros_pass_scales_preserve_both_distilled_stages() {
+        let mut spec = AdapterSpec::new("eros.safetensors".into(), 0.25, AdapterKind::Lora);
+        spec.pass_scales = Some(vec![0.8, 0.2]);
+        assert_eq!(
+            effective_pass_scales(&spec).unwrap(),
+            vec![0.8_f32 as f64, 0.2_f32 as f64]
+        );
+
+        spec.pass_scales = Some(vec![0.6]);
+        let error = effective_pass_scales(&spec).unwrap_err().to_string();
+        assert!(error.contains("1 pass_scales") && error.contains("omit pass_scales"));
+
+        spec.pass_scales = None;
+        assert_eq!(effective_pass_scales(&spec).unwrap(), vec![0.25]);
+
+        spec.pass_scales = Some(vec![0.6, 0.4, 0.2]);
+        let error = effective_pass_scales(&spec).unwrap_err().to_string();
+        assert!(error.contains("3 pass_scales") && error.contains("[stage1, stage2]"));
+    }
+
+    #[test]
+    fn effective_pass_scales_reject_non_finite_entries() {
         let spec = AdapterSpec::new("nan.safetensors".into(), f32::NAN, AdapterKind::Lora);
-        assert!(effective_scale(&spec)
+        assert!(effective_pass_scales(&spec)
             .unwrap_err()
             .to_string()
-            .contains("effective scale must be finite"));
+            .contains("effective pass scales must be finite"));
 
         let mut spec = AdapterSpec::new("inf.safetensors".into(), 1.0, AdapterKind::Lora);
         spec.pass_scales = Some(vec![f32::INFINITY, 0.25]);
-        assert!(effective_scale(&spec)
+        assert!(effective_pass_scales(&spec)
             .unwrap_err()
             .to_string()
-            .contains("effective scale must be finite"));
+            .contains("effective pass scales must be finite"));
     }
 
     #[test]

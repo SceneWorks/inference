@@ -5,7 +5,7 @@
 //! Run:
 //!   SAM3_WEIGHTS=.../model.safetensors \
 //!   SAM3_E2E_FIXTURE=scripts/spikes/sam3_oracle/e2e_fixture.safetensors \
-//!     cargo test -p mlx-gen-sam3 --release --test quant_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-sam3 --release --test integration quant_smoke:: -- --ignored --nocapture
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Instance, Sam3ImageSegmenter, Sam3Tracker};

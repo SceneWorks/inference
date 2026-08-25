@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! KREA_RAW_DIR=/path/to/models--SceneWorks--krea-2-raw-mlx/snapshots/<rev>/q8 \
-//!   cargo test -p mlx-gen-krea --release --test raw_img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration raw_img2img_real_weights:: -- --ignored --nocapture
 //! ```
 //! (With no env, auto-resolves the newest cached `SceneWorks/krea-2-raw-mlx` q8 turnkey.) PNGs +
 //! a `SUMMARY` table land in `/tmp/krea_raw_img2img`.

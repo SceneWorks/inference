@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! set WAN14B_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-T2V-A14B-Diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-wan --features cuda --release --test conformance_14b -- --ignored
+//! cargo test -p candle-gen-wan --features cuda --release --test integration conformance_14b:: -- --ignored
 //! ```
 #![cfg(feature = "cuda")]
 

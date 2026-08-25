@@ -3,7 +3,7 @@
 //! `#[ignore]`d — needs the real `Qwen/Qwen-Image` snapshot (env `MLX_GEN_QWEN_SNAPSHOT`, else the HF
 //! cache) and the golden produced by `tools/dump_qwen_image_img2img_golden.py` (gitignored, local).
 //! Run with:
-//!   cargo test -p mlx-gen-qwen-image --release --test img2img_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration img2img_real_weights:: -- --ignored --nocapture
 //!
 //! Stage gates isolate each new piece — the schedule + `init_time_step`, the LANCZOS preprocess, the
 //! VAE encode, and the noise blend — then the final gates drive the **public**

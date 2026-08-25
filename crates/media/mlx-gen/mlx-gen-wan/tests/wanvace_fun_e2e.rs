@@ -20,7 +20,7 @@
 //! `t5_encoder.safetensors`/`vae.safetensors`/`tokenizer.json`). Point at an explicit assembled dir
 //! with `WANVACE_FUN_DIR=/path`, or let the test assemble from the local HF cache
 //! (`linoyts/Wan2.2-VACE-Fun-14B-diffusers` + a cached `SceneWorks/wan2.2-{t2v,i2v}-a14b-mlx` base).
-//! Run: `cargo test -p mlx-gen-wan --release --test wanvace_fun_e2e -- --ignored --nocapture`.
+//! Run: `cargo test -p mlx-gen-wan --release --test integration wanvace_fun_e2e:: -- --ignored --nocapture`.
 
 use std::path::PathBuf;
 

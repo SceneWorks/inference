@@ -153,6 +153,7 @@ pub use gen_core::tiling::VideoDecodeMemoryProfile;
 // ControlNet loads AND the FLUX-family IP-Adapter / PuLID EVA-CLIP towers all share. It had drifted into
 // `candle-gen-sdxl`, making that pipeline crate a de-facto commons crate that PuLID/FLUX pulled the whole
 // ~12k-LOC SDXL crate in for. Hoisted here; `candle-gen-sdxl::weights` re-exports it for compatibility.
+pub mod logical_weights;
 pub mod weights;
 pub use weights::Weights;
 
@@ -190,6 +191,11 @@ pub use residency::{
 // the two original functions, so existing consumers are unchanged.
 #[cfg(feature = "cuda")]
 pub mod cuda_mempool;
+
+// sc-19545: the runtime arch-coverage diagnostic. NOT cuda-gated as a whole — the comparison is a
+// pure function over a baked-in ladder, so it stays unit-testable on the CPU/Metal lanes, which are
+// the only ones most contributors can run. Only the device read inside it is cuda-gated.
+pub mod cuda_arch;
 
 // Rung-4 bounded transformer residency, the candle half (SC-15792, epic 15448). The schedule lives
 // in `gen_core::block_window` (hoisted by SC-15790 so candle would not fork it); this binds candle's
@@ -324,6 +330,13 @@ pub fn default_device() -> Result<candle_core::Device> {
     let dev = candle_core::Device::new_metal(0)?;
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let dev = candle_core::Device::Cpu;
+    // sc-19545: warn (once per process, NON-fatally) if this GPU's architecture is served by no
+    // rung of the quantized-kernel fatbin. Uncovered means Q4/Q8 matmuls return ZEROS without
+    // erroring, so the symptom is a black render behind a green exit code. This is the CUDA
+    // construction chokepoint, hence the cheapest place to say so. See `cuda_arch` for why it warns
+    // rather than fails, and what has to be verified before that could change.
+    #[cfg(feature = "cuda")]
+    cuda_arch::warn_if_device_uncovered(&dev);
     Ok(dev)
 }
 

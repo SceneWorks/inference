@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! set WAN_SNAPSHOT=C:\Users\…\models--Wan-AI--Wan2.2-TI2V-5B-Diffusers\snapshots\<hash>
-//! cargo test -p candle-gen-wan --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-wan --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 #![cfg(feature = "cuda")]
 

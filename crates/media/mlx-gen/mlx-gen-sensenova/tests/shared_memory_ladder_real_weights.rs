@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! SENSENOVA_LADDER_PROVIDER=sensenova_u1_8b SENSENOVA_LADDER_ROOT=/.../q8 \
-//! cargo test -p mlx-gen-sensenova --release --test shared_memory_ladder_real_weights \
+//! cargo test -p mlx-gen-sensenova --release --test integration shared_memory_ladder_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 

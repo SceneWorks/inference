@@ -9,7 +9,7 @@
 //! `tests/fixtures/caption_upsample_golden.safetensors`
 //! (← `tools/dump_flux2_dev_caption_upsample_golden.py`):
 //!
-//!   cargo test -p mlx-gen-flux2 --test caption_upsample_golden -- --ignored --nocapture
+//!   cargo test -p mlx-gen-flux2 --test integration caption_upsample_golden:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

@@ -5,7 +5,7 @@
 //! Validates the link the unit/parity tests can't: a genuine third-party file (kohya/lycoris keys —
 //! `<prefix>_<flattened.path>.{lokr_*,hada_*}` + per-module `.alpha`, NO `networkType` metadata)
 //! resolves against the real model's module names and installs a forward-time delta. Run:
-//!   MLX_GEN_FLUX2_SNAPSHOT=… cargo test -p mlx-gen-flux2 --test thirdparty_lycoris_real_weights -- --ignored --nocapture
+//!   MLX_GEN_FLUX2_SNAPSHOT=… cargo test -p mlx-gen-flux2 --test integration thirdparty_lycoris_real_weights:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

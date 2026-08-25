@@ -12,7 +12,7 @@
 //!   FLUX2_VAE_ENCODE_GOLDENS  — flux2_vae_encode_golden.safetensors
 //!                               (default: .scratch/flux2-vae-encode-goldens/…)
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
-//!   cargo test -p candle-gen-flux2 --features cuda --test vae_encode_parity -- --nocapture
+//!   cargo test -p candle-gen-flux2 --features cuda --test integration vae_encode_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -46,6 +46,7 @@ fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
 }
 
 #[test]
+#[ignore = "needs the FLUX.2 vae snapshot (FLUX2_VAE_DIR) + goldens (FLUX2_VAE_ENCODE_GOLDENS)"]
 fn flux2_vae_encode_matches_reference() -> Result<()> {
     let vae_dir = match std::env::var("FLUX2_VAE_DIR") {
         Ok(d) => d,

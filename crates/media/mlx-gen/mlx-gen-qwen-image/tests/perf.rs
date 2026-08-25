@@ -21,7 +21,7 @@
 //!
 //! Run it:
 //! ```text
-//! cargo test --release -p mlx-gen-qwen-image --test perf -- --ignored --nocapture
+//! cargo test --release -p mlx-gen-qwen-image --test integration perf:: -- --ignored --nocapture
 //! ```
 //! Override geometry with `QWEN_PERF_SIZE` (square px, default 1024) / `QWEN_PERF_TXT` (text seq, 128).
 

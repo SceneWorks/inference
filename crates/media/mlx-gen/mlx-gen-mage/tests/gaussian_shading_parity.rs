@@ -16,7 +16,7 @@
 //!   production tensor against `tools/golden/mage_flow_noise_golden.safetensors`. Regenerate with
 //!   `MAGE_DEVICE=cpu … tools/dump_mage_flow_golden.py --stage noise` (sc-14250: an MPS dump is
 //!   silently corrupt), then:
-//!   `cargo test -p mlx-gen-mage --test gaussian_shading_parity -- --ignored --nocapture`
+//!   `cargo test -p mlx-gen-mage --test integration gaussian_shading_parity:: -- --ignored --nocapture`
 
 use std::path::Path;
 

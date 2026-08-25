@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use candle_gen::gen_core::Quant;
+use candle_gen::quant::MLX_GROUP_SIZE;
 use candle_gen::{CandleError, Result as CResult};
 use serde_json::Value;
 
@@ -52,6 +54,9 @@ pub struct Scail2Config {
     pub replace_h_shift: usize,
     /// RoPE W-shift applied to the spatially-downsampled pose chunk (120).
     pub pose_w_shift: usize,
+    /// The hosted MLX-affine DiT tier, when `config.json` declares one.  Only the block
+    /// attention/FFN projections are packed; the surrounding SCAIL2 tensors remain dense.
+    pub packed_quant: Option<Quant>,
 }
 
 impl Default for Scail2Config {
@@ -80,6 +85,7 @@ impl Scail2Config {
             vae_z_dim: 16,
             replace_h_shift: 120,
             pose_w_shift: 120,
+            packed_quant: None,
         }
     }
 
@@ -106,8 +112,42 @@ impl Scail2Config {
             set_usize(&v, "num_heads", &mut cfg.num_heads);
             set_usize(&v, "num_layers", &mut cfg.num_layers);
             set_usize(&v, "mask_dim", &mut cfg.mask_dim);
+            cfg.packed_quant = packed_quantization(&v)?;
         }
         Ok(cfg)
+    }
+}
+
+/// Parse the SCAIL2 hosted-tier marker.  This is intentionally stricter than generic packed
+/// detection: this provider consumes the published group-64 affine Q4/Q8 layout only.  A malformed
+/// marker must never let U32 code words fall through the dense loader.
+fn packed_quantization(v: &Value) -> CResult<Option<Quant>> {
+    let Some(q) = v.get("quantization") else {
+        return Ok(None);
+    };
+    let Some(q) = q.as_object() else {
+        return Err(CandleError::Msg(
+            "scail2: config.json quantization must be an object".into(),
+        ));
+    };
+    let bits = q.get("bits").and_then(Value::as_u64).ok_or_else(|| {
+        CandleError::Msg("scail2: packed quantization must declare bits 4 or 8".into())
+    })?;
+    let group_size = q
+        .get("group_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(MLX_GROUP_SIZE as u64);
+    if group_size != MLX_GROUP_SIZE as u64 {
+        return Err(CandleError::Msg(format!(
+            "scail2: packed quantization group_size must be {MLX_GROUP_SIZE}, got {group_size}"
+        )));
+    }
+    match bits {
+        4 => Ok(Some(Quant::Q4)),
+        8 => Ok(Some(Quant::Q8)),
+        _ => Err(CandleError::Msg(format!(
+            "scail2: packed quantization bits must be 4 or 8, got {bits}"
+        ))),
     }
 }
 
@@ -132,5 +172,26 @@ mod tests {
         assert_eq!(c.mask_dim, 28);
         assert_eq!(c.head_dim(), 128);
         assert_eq!(c.vae_z_dim, 16);
+        assert_eq!(c.packed_quant, None);
+    }
+
+    #[test]
+    fn hosted_affine_marker_accepts_q4_q8_and_rejects_other_formats() {
+        for (bits, want) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            assert_eq!(
+                packed_quantization(&serde_json::json!({
+                    "quantization": { "bits": bits, "group_size": 64 }
+                }))
+                .unwrap(),
+                Some(want)
+            );
+        }
+        for marker in [
+            serde_json::json!({ "quantization": { "bits": 3 } }),
+            serde_json::json!({ "quantization": { "bits": 4, "group_size": 32 } }),
+            serde_json::json!({ "quantization": true }),
+        ] {
+            assert!(packed_quantization(&marker).is_err(), "{marker}");
+        }
     }
 }

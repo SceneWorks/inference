@@ -10,7 +10,7 @@
 //! sc-3187 decode and sc-3188/3189 image gen). Small image-token ids (10/11) via
 //! [`T2iModel::with_image_token_ids`], mirroring the dump.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test interleave_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration interleave_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel};

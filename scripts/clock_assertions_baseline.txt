@@ -1,0 +1,61 @@
+# Per-file counts from scripts/check_clock_assertions.py (sc-19556).
+# A RATCHET, not a zero-gate: --check-baseline fails only when a count RISES or a new
+# flagged file appears. See that script's header for why zero is not the target and
+# why the total is a triage inbox size rather than a defect count.
+# 218 assertion(s) across 56 file(s); 2516 .rs file(s) scanned.
+crates/audio/candle-audio-acestep/src/model.rs: 5
+crates/audio/candle-audio-acestep/src/text.rs: 2
+crates/audio/candle-audio-acestep/tests/conformance.rs: 1
+crates/audio/candle-audio-chatterbox/src/s3tokenizer.rs: 11
+crates/audio/candle-audio-chatterbox/tests/conformance.rs: 3
+crates/audio/candle-audio-mmaudio/src/generator.rs: 4
+crates/audio/candle-audio-mmaudio/src/generator_44k.rs: 1
+crates/audio/candle-audio-mmaudio/tests/conformance_video_to_audio.rs: 1
+crates/audio/candle-audio-mmaudio/tests/conformance_video_to_audio_44k.rs: 1
+crates/audio/candle-audio-moss-sfx/src/config.rs: 1
+crates/audio/candle-audio-moss-sfx/src/model.rs: 1
+crates/audio/candle-audio-moss-sfx/src/pipeline.rs: 2
+crates/audio/candle-audio-moss-sfx/src/text.rs: 2
+crates/audio/candle-audio-moss-sfx/tests/conformance.rs: 1
+crates/audio/candle-audio-moss-tts-realtime/src/model.rs: 1
+crates/audio/candle-audio-openvoice/tests/conformance.rs: 1
+crates/audio/candle-audio-stable-audio-3/src/dit.rs: 3
+crates/audio/candle-audio-stable-audio-3/src/model.rs: 3
+crates/audio/candle-audio-stable-audio-3/tests/audio_edit.rs: 27
+crates/audio/candle-audio-stable-audio-3/tests/conformance.rs: 2
+crates/audio/candle-audio-stable-audio-3/tests/dit_oracle.rs: 1
+crates/audio/candle-audio-stable-audio-3/tests/listening_stimuli.rs: 1
+crates/audio/candle-audio-stable-audio-3/tests/provider.rs: 4
+crates/audio/candle-audio-stable-audio-3/tests/reference_audio.rs: 4
+crates/audio/candle-audio-stable-audio-3/tests/same_oracle.rs: 1
+crates/audio/candle-audio/src/harness.rs: 19
+crates/contracts/core-llm/src/template.rs: 1
+crates/contracts/gen-core/src/generator.rs: 9
+crates/contracts/gen-core/src/transcribe.rs: 1
+crates/llm/mlx-llm/server/src/main.rs: 8
+crates/media/candle-gen/candle-gen-anima/src/lib.rs: 1
+crates/media/candle-gen/candle-gen-joycaption/src/lib.rs: 2
+crates/media/candle-gen/candle-gen-minimax-h3/src/denoise/geometry.rs: 7
+crates/media/candle-gen/candle-gen-minimax-h3/src/pipeline.rs: 7
+crates/media/candle-gen/candle-gen-minimax-h3/tests/dit_parity.rs: 2
+crates/media/candle-gen/candle-gen-sana/tests/depthwise_conv_gpu.rs: 1
+crates/media/candle-gen/candle-gen-z-image/tests/packed_tier_validate.rs: 1
+crates/media/mlx-gen/mlx-gen-anima/tests/training.rs: 2
+crates/media/mlx-gen/mlx-gen-krea-realtime/src/pipeline.rs: 4
+crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs: 1
+crates/media/mlx-gen/mlx-gen-ltx/tests/vae_decode_sweep.rs: 4
+crates/media/mlx-gen/mlx-gen-mage/tests/config_conformance.rs: 1
+crates/media/mlx-gen/mlx-gen-mage/tests/gaussian_shading_parity.rs: 1
+crates/media/mlx-gen/mlx-gen-minimax-h3/src/cost.rs: 2
+crates/media/mlx-gen/mlx-gen-minimax-h3/src/denoise/geometry.rs: 4
+crates/media/mlx-gen/mlx-gen-minimax-h3/src/model.rs: 1
+crates/media/mlx-gen/mlx-gen-minimax-h3/src/pipeline.rs: 16
+crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adaln_evict_memory.rs: 2
+crates/media/mlx-gen/mlx-gen-minimax-h3/tests/dit_parity.rs: 2
+crates/media/mlx-gen/mlx-gen-minimax-h3/tests/duration_sweep_real.rs: 9
+crates/media/mlx-gen/mlx-gen-minimax-h3/tests/first_light.rs: 1
+crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs: 3
+crates/media/mlx-gen/mlx-gen-z-image/src/model.rs: 2
+crates/media/mlx-gen/mlx-gen-z-image/src/model_base_control.rs: 1
+crates/media/mlx-gen/src/diagnostics.rs: 1
+crates/media/mlx-gen/src/memory_probe.rs: 18

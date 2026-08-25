@@ -51,8 +51,6 @@ use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
 
-use crate::pipeline::Components;
-
 /// The latent channel count the reused fit is defined over, re-exported from the owner so this crate
 /// cannot drift from it by restating a number.
 pub use candle_gen_flux2::preview::PREVIEW_LATENT_CHANNELS;
@@ -70,13 +68,27 @@ pub use candle_gen_flux2::preview::PACKED_LATENT_CHANNELS;
 /// Errors on any layout that is not this route's packed shape. The caller's frame is then lost and
 /// swallowed by [`candle_gen::preview::emit_preview_at`], the intended decorative-failure behaviour.
 pub fn project_packed_tokens(
-    comps: &Components,
+    comps: &crate::pipeline::Components,
     z: &Tensor,
     grid_h: usize,
     grid_w: usize,
 ) -> Result<Image> {
     check_packed_layout(z, grid_h, grid_w)?;
     let raw = crate::pipeline::raw_latent(comps, z, grid_h, grid_w)?;
+    candle_gen_flux2::preview::project_raw_latents(&raw)
+}
+
+/// Staged twin of [`project_packed_tokens`]. Only the two small BN tensors are retained from the
+/// optional-encode phase; decoder weights are released before the DiT opens.
+pub(crate) fn project_packed_tokens_with_stats(
+    bn_std: &Tensor,
+    bn_mean: &Tensor,
+    z: &Tensor,
+    grid_h: usize,
+    grid_w: usize,
+) -> Result<Image> {
+    check_packed_layout(z, grid_h, grid_w)?;
+    let raw = crate::pipeline::raw_latent_with_stats(bn_std, bn_mean, z, grid_h, grid_w)?;
     candle_gen_flux2::preview::project_raw_latents(&raw)
 }
 

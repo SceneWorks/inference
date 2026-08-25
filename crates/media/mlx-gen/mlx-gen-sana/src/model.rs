@@ -36,8 +36,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, SizeFloor,
-    WeightsSource,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
@@ -100,7 +99,6 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             // No SANA LoRA wiring yet (reserved for a later story).
             supports_lora: false,
-            supports_lokr: false,
             // Flow-match Euler over the unified curated sampler/scheduler framework (epic 7114); the
             // native loop (`req.sampler == None`) stays the byte-exact default. `"default"` is the
             // engine-default sentinel the manifest drift guard always allows.
@@ -114,7 +112,6 @@ pub fn descriptor() -> ModelDescriptor {
                 s.push("default");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -128,8 +125,6 @@ pub fn descriptor() -> ModelDescriptor {
             // offline by `crate::convert` and self-describing on load, so a `spec.quantize` is
             // advisory (the resolved tier dir dictates the actual precision; see [`load`]).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
@@ -137,23 +132,8 @@ pub fn descriptor() -> ModelDescriptor {
             // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -180,12 +160,9 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
             supports_negative_prompt: false,
             supports_guidance: true,
-            supports_true_cfg: false,
             // img2img (sc-10190): reference-seeded, via the SCM/TrigFlow renoise at the start angle.
             // Distilled/few-step → the strength window is narrow (validate on-device).
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
-            supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
             // epic-7114 `Solver`; only the engine-default sentinel is advertised.
             samplers: vec!["default"],
@@ -200,30 +177,12 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard
             // quant-tier routing; `spec.quantize` is advisory (resolved tier dir dictates precision).
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
             // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

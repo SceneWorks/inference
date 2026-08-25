@@ -12,10 +12,10 @@
 //! # 1) capture a real 1024-native latent (→4096² output) from a Krea run:
 //! PID_CAPTURE_LATENT=/tmp/pid_ab.safetensors KREA_PID_SIZE=1024 \
 //!   PID_QWEN_SAFETENSORS=.../pid_qwenimage_2kto4k.safetensors PID_GEMMA_DIR=.../snapshots/<snap> \
-//!   cargo test -p mlx-gen-krea --release --test pid_decode_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea --release --test integration pid_decode_real_weights:: -- --ignored --nocapture
 //! # 2) run the A/B on the capture:
 //! PID_AB_CAPTURE=/tmp/pid_ab.safetensors PID_QWEN_SAFETENSORS=.../pid_qwenimage_2kto4k.safetensors \
-//!   cargo test -p mlx-gen-pid --release --test tiling_ab -- --ignored --nocapture
+//!   cargo test -p mlx-gen-pid --release --test integration tiling_ab:: -- --ignored --nocapture
 //! ```
 
 use mlx_gen::decoder::LatentDecoder;

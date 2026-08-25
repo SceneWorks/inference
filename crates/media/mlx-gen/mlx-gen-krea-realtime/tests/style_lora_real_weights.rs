@@ -32,7 +32,7 @@
 //! ```text
 //! KREA_REALTIME_SNAPSHOT_DIR=~/.cache/krea-realtime-mlx-snapshot/q4 \
 //! KREA_STYLE_LORA=~/.cache/wan-loras/origami/origami_000000500.safetensors \
-//!   cargo test -p mlx-gen-krea-realtime --test style_lora_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-krea-realtime --test integration style_lora_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! Env: `KREA_REALTIME_SNAPSHOT_DIR`, `KREA_STYLE_LORA` (a real Wan style LoRA `.safetensors`),

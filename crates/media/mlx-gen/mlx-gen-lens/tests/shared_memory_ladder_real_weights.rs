@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! LENS_LADDER_PROVIDER=lens LENS_LADDER_TIER=q4 LENS_LADDER_ROOT=/.../lens-mlx/.../q4 \
-//! cargo test -p mlx-gen-lens --release --test shared_memory_ladder_real_weights \
+//! cargo test -p mlx-gen-lens --release --test integration shared_memory_ladder_real_weights:: \
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 

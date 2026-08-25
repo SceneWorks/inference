@@ -7,7 +7,7 @@
 //! ```sh
 //! MLX_GEN_ZIMAGE_SNAPSHOT=/path/to/z-image-turbo-mlx/bf16 \
 //! ZIMAGE_PREVIEW_ARTIFACT_DIR=/path/to/artifacts \
-//!   cargo test --release -p mlx-gen-z-image --test fit_preview_rgb -- --ignored --nocapture
+//!   cargo test --release -p mlx-gen-z-image --test integration fit_preview_rgb:: -- --ignored --nocapture
 //! ```
 
 use std::fmt::Write as _;

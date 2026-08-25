@@ -31,7 +31,7 @@ use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
-    OffloadPolicy, Progress, Quant, SizeFloor, WeightsSource,
+    OffloadPolicy, Progress, Quant, WeightsSource,
 };
 use candle_gen::{check_cancel, CandleError, Result as CResult};
 
@@ -664,9 +664,12 @@ impl Pipeline {
         // sc-12758: free-aware budgeted **spatial** tiling for the z16 decode. Falls back to plain
         // `decode` when a single high-res frame already fits (behavior-identical when the budget is
         // ample); tiles the 42 GB A14B decode spike down to fit a small card otherwise.
-        let decoded = comps
-            .vae
-            .decode_budgeted_with_cancel(&latents, &req.cancel)?;
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let decoded = comps.vae.decode_budgeted_with_cancel_and_tile_cap(
+            &latents,
+            &req.cancel,
+            decode_cap,
+        )?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -846,7 +849,8 @@ impl Pipeline {
         // sc-12758: the experts + TE are offloaded by now, so the decode budgets against nearly the
         // whole card. Free-aware budgeted spatial tiling drives the 42 GB z16 decode spike down to fit
         // the free VRAM — the sole thing that kept the A14B off a 24 GB card (denoise is only ~11 GB).
-        let decoded = vae.decode_budgeted_with_cancel(&latents, cancel)?;
+        let decode_cap = crate::i2v_memory_strategy::selected_decode_cap(req)?;
+        let decoded = vae.decode_budgeted_with_cancel_and_tile_cap(&latents, cancel, decode_cap)?;
         let images = frames_to_images(&decoded)?;
         Ok((images, knobs.fps))
     }
@@ -1031,6 +1035,8 @@ pub struct Wan14bGenerator {
     /// peak on a 24 GB card. The resident [`components`](Self::components) cache stays untouched under
     /// `Sequential` — the staged path never populates it.
     offload: OffloadPolicy,
+    i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
 }
 
@@ -1105,6 +1111,9 @@ impl Generator for Wan14bGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        if let Some(prepared) = &self.i2v_memory {
+            crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
+        }
         let pipe = match &self.comfyui {
             Some(experts) => {
                 Pipeline::load_comfyui(&self.root, &self.device, self.variant, experts.clone())
@@ -1119,18 +1128,62 @@ impl Generator for Wan14bGenerator {
         // Sequential offload (sc-12733): stage load→use→drop each heavy component so the denoise peak is
         // one expert instead of TE + both experts + VAE co-resident. Resident (default): the cached
         // `Components` bundle, unchanged path. The staged path never populates the resident cache.
-        let (frames, fps) = match self.offload {
-            OffloadPolicy::Sequential => pipe.render_sequential(req, on_progress)?,
-            OffloadPolicy::Resident => {
-                let components = self.components(&pipe)?;
-                pipe.render(req, &components, on_progress)?
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        let staged =
+            self.offload == OffloadPolicy::Sequential || crate::i2v_memory_strategy::staged(req);
+        let (frames, fps) = if staged {
+            let mut components = candle_gen::lock_recover(&self.components);
+            if components.is_some() {
+                self.device
+                    .synchronize()
+                    .map_err(gen_core::Error::backend)?;
+                drop(components.take());
             }
+            drop(components);
+            pipe.render_sequential(req, on_progress)?
+        } else {
+            let components = self.components(&pipe)?;
+            pipe.render(req, &components, on_progress)?
         };
         Ok(GenerationOutput::Video {
             frames,
             fps,
             audio: None,
         })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.i2v_memory.as_ref().map(|prepared| &prepared.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        self.i2v_memory.as_ref().map_or_else(
+            || {
+                if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                    gen_core::MemorySafetyDecision::Accept
+                } else {
+                    gen_core::MemorySafetyDecision::Reject {
+                        reason: format!("{} has no prepared I2V memory receipt", self.variant.id()),
+                    }
+                }
+            },
+            |prepared| crate::i2v_memory_strategy::safety_check(prepared, context),
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        match &self.i2v_memory {
+            Some(prepared) => {
+                crate::i2v_memory_strategy::begin_request(prepared, self.device.clone(), context)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1150,7 +1203,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: match variant {
                 Variant::T2v => vec![],
                 Variant::I2v => vec![ConditioningKind::Reference],
@@ -1159,41 +1211,19 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_lokr: true,
             // Curated `uni_pc` (sc-7296) → Wan's native UniPC; `euler` flow Euler. Legacy `unipc` alias.
             samplers: vec!["uni_pc", "euler", "unipc"],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
-            mac_only: false,
             // Q4/Q8 packed MLX tiers (sc-10025): both dual-expert `WanTransformer` backbones load packed
             // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).
             // Tier ingestion (MLX layout + key remap) is sc-10026.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // A14B honors `OffloadPolicy::Sequential` (epic 12732, sc-12733): the staged
             // `render_sequential` offloads UMT5 during denoise and holds only the ACTIVE MoE expert
             // resident (never both), dropping the pre-decode peak on a 24 GB card. Advertised so the
             // worker's fit-gate can tell "bounds peak here" from a no-op fallback.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -1239,6 +1269,14 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12733).
     let offload = spec.offload_policy;
+    let i2v_memory = if variant == Variant::I2v
+        && spec.resolved_route.as_deref() == Some(MODEL_ID_I2V_14B)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_I2V_14B)?)
+    } else {
+        None
+    };
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1247,6 +1285,8 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         adapters: spec.adapters.clone(),
         comfyui: None,
         offload,
+        i2v_memory,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }
@@ -1345,6 +1385,8 @@ fn build_comfyui_generator(
             vae_file,
         })),
         offload,
+        i2v_memory: None,
+        lifecycle: Mutex::new(()),
         components: Mutex::new(None),
     })
 }

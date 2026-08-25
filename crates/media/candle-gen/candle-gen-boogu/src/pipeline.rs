@@ -55,7 +55,7 @@ pub(crate) const DEFAULT_TURBO_SIGMA: f32 = 0.001;
 
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count.
 const SPATIAL_SCALE: u32 = 8;
-const LATENT_CHANNELS: usize = 16;
+pub(crate) const LATENT_CHANNELS: usize = 16;
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Boogu prompts are short).
 /// Enforced up front by [`crate::tokenizer::BooguTokenizer`] so an over-length prompt returns a clear
@@ -168,6 +168,402 @@ pub(crate) fn load_components(
     })
 }
 
+/// Text-only phase bundle used by the request-selected staged-residency path.
+pub(crate) struct StagedText {
+    tok: BooguTokenizer,
+    te: BooguTextEncoder,
+}
+
+/// Denoise-only phase bundle. It is synchronized and dropped before decode weights are loaded.
+pub(crate) struct StagedDenoise {
+    dit: BooguTransformer,
+}
+
+pub(crate) struct StagedDecode {
+    vae: Arc<AutoEncoderKL>,
+    pid: Option<Arc<PidEngine>>,
+}
+
+#[cfg(test)]
+impl StagedDenoise {
+    const RESIDENT_COMPONENTS: &'static [&'static str] = &["transformer"];
+}
+
+#[cfg(test)]
+impl StagedDecode {
+    const NATIVE_RESIDENT_COMPONENTS: &'static [&'static str] = &["vae"];
+}
+
+pub(crate) fn load_staged_text(root: &Path, device: &Device) -> Result<StagedText> {
+    let tok = BooguTokenizer::from_snapshot(root, device, MAX_TEXT_TOKENS)?;
+    let te_w = load_te_weights(root, device)?;
+    let te = BooguTextEncoder::load(
+        &te_w,
+        "model.language_model",
+        &BooguTextEncoderConfig::qwen3_vl_8b(),
+        MAX_TEXT_TOKENS,
+    )?;
+    Ok(StagedText { tok, te })
+}
+
+pub(crate) fn load_staged_denoise(root: &Path, device: &Device) -> Result<StagedDenoise> {
+    let cfg = BooguConfig::from_snapshot(root)?;
+    let dit_w = Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    let dit = BooguTransformer::load(&dit_w, &cfg)?;
+    Ok(StagedDenoise { dit })
+}
+
+pub(crate) fn load_staged_decode(
+    root: &Path,
+    device: &Device,
+    pid_spec: Option<&PidWeights>,
+) -> Result<StagedDecode> {
+    let vae = Arc::new(AutoEncoderKL::new(
+        &VaeConfig::z_image(),
+        vae_varbuilder(&root.join("vae"), device)?,
+    )?);
+    let pid = match pid_spec {
+        Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
+        None => None,
+    };
+    Ok(StagedDecode { vae, pid })
+}
+
+pub(crate) enum StagedCondition {
+    Base {
+        cond: Tensor,
+        uncond: Option<Tensor>,
+        clean: Option<Tensor>,
+        start_step: usize,
+    },
+    Turbo {
+        cond: Tensor,
+        clean: Option<Tensor>,
+        start_step: usize,
+    },
+    Edit {
+        cond: Tensor,
+        uncond: Option<Tensor>,
+        ref_latents: Vec<Tensor>,
+    },
+}
+
+pub(crate) fn stage_encode_base(
+    text: &StagedText,
+    encoder: Option<&Encoder>,
+    req: &GenerationRequest,
+    default_steps: usize,
+    device: &Device,
+) -> Result<StagedCondition> {
+    let reference = resolve_reference(req, crate::BOOGU_IMAGE_ID)?;
+    let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
+    let start_step = reference
+        .map(|(_, strength)| init_time_step(steps, strength))
+        .unwrap_or(0);
+    let clean = match (reference, start_step) {
+        (Some((image, _)), start) if start > 0 => Some(encode_reference(
+            encoder.ok_or_else(|| {
+                CandleError::Msg("boogu: active reference omitted the staged VAE encoder".into())
+            })?,
+            image,
+            req.width,
+            req.height,
+            device,
+        )?),
+        _ => None,
+    };
+    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let cond = text.te.last_hidden(&text.tok.encode_t2i(&req.prompt)?)?;
+    let uncond = if guidance > 1.0 {
+        Some(text.te.last_hidden(&text.tok.encode_negative()?)?)
+    } else {
+        None
+    };
+    Ok(StagedCondition::Base {
+        cond,
+        uncond,
+        clean,
+        start_step,
+    })
+}
+
+pub(crate) fn stage_encode_turbo(
+    text: &StagedText,
+    encoder: Option<&Encoder>,
+    req: &GenerationRequest,
+    device: &Device,
+) -> Result<StagedCondition> {
+    let reference = resolve_reference(req, crate::BOOGU_IMAGE_TURBO_ID)?;
+    let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
+    let start_step = reference
+        .map(|(_, strength)| init_time_step(steps, strength))
+        .unwrap_or(0);
+    let clean = match (reference, start_step) {
+        (Some((image, _)), start) if start > 0 => Some(encode_reference(
+            encoder.ok_or_else(|| {
+                CandleError::Msg("boogu: active reference omitted the staged VAE encoder".into())
+            })?,
+            image,
+            req.width,
+            req.height,
+            device,
+        )?),
+        _ => None,
+    };
+    let cond = text.te.last_hidden(&text.tok.encode_t2i(&req.prompt)?)?;
+    Ok(StagedCondition::Turbo {
+        cond,
+        clean,
+        start_step,
+    })
+}
+
+pub(crate) fn stage_encode_edit(
+    text: &StagedText,
+    edit: &EditComponents,
+    req: &GenerationRequest,
+    references: &[&Image],
+    device: &Device,
+) -> Result<StagedCondition> {
+    validate_edit_reference_dims(references)?;
+    let ref_latents = references
+        .iter()
+        .map(|reference| vae_encode(&edit.vae_encoder, reference, device))
+        .collect::<Result<Vec<_>>>()?;
+    let cond =
+        encode_image_instruction_parts(&text.tok, &text.te, edit, references, &req.prompt, device)?;
+    let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
+        Some(text.te.last_hidden(&text.tok.encode_negative()?)?)
+    } else {
+        None
+    };
+    Ok(StagedCondition::Edit {
+        cond,
+        uncond,
+        ref_latents,
+    })
+}
+
+pub(crate) fn stage_denoise_base(
+    heavy: &StagedDenoise,
+    req: &GenerationRequest,
+    encoded: StagedCondition,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Tensor>> {
+    let StagedCondition::Base {
+        cond,
+        uncond,
+        clean,
+        start_step,
+    } = encoded
+    else {
+        return Err(CandleError::Msg(
+            "boogu: crossed staged Base conditioning".into(),
+        ));
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let native = base_native_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule(
+        req.scheduler.as_deref(),
+        base_shift_mu(),
+        steps,
+        &native,
+    );
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let run_sigmas = &sigmas[start..];
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let x_t = blend_reference(clean.as_ref(), noise, sigmas[start])?;
+        let preview_hook = crate::preview::hook(&req.preview);
+        candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            run_sigmas,
+            x_t,
+            seed,
+            &req.cancel,
+            on_progress,
+            Some(&preview_hook),
+            |x, timestep| {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let cond_v = heavy.dit.forward(x, &t, &cond)?;
+                let pred = match &uncond {
+                    Some(uncond) => {
+                        let uncond_v = heavy.dit.forward(x, &t, uncond)?;
+                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    }
+                    None => cond_v,
+                };
+                Ok(pred.to_dtype(DType::F32)?.neg()?)
+            },
+        )
+    })
+}
+
+pub(crate) fn stage_denoise_turbo(
+    heavy: &StagedDenoise,
+    req: &GenerationRequest,
+    encoded: StagedCondition,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Tensor>> {
+    let StagedCondition::Turbo {
+        cond,
+        clean,
+        start_step,
+    } = encoded
+    else {
+        return Err(CandleError::Msg(
+            "boogu: crossed staged Turbo conditioning".into(),
+        ));
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let is_img2img = clean.is_some() && start_step > 0;
+    if is_img2img || req.sampler.is_some() || req.scheduler.is_some() {
+        let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+        let start = start_step.min(sigmas.len().saturating_sub(1));
+        return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            let noise = init_noise(req.height, req.width, seed, 0, device)?;
+            let x_t = blend_reference(clean.as_ref(), noise, sigmas[start])?;
+            let preview_hook = crate::preview::hook(&req.preview);
+            candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas[start..],
+                x_t,
+                seed,
+                &req.cancel,
+                on_progress,
+                Some(&preview_hook),
+                |x, timestep| {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    Ok(heavy
+                        .dit
+                        .forward(x, &t, &cond)?
+                        .to_dtype(DType::F32)?
+                        .neg()?)
+                },
+            )
+        });
+    }
+    let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
+        let preview_counter = crate::preview::native_counter(steps);
+        for i in 0..steps {
+            if req.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            preview_hook.emit_step(&preview_counter, i, &lat);
+            let sigma = sigmas[i];
+            let t = Tensor::from_vec(vec![sigma], (1,), device)?;
+            let pred = heavy.dit.forward(&lat, &t, &cond)?;
+            lat =
+                (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
+            if i + 1 < steps {
+                let sigma_next = sigmas[i + 1];
+                let noise = init_noise(
+                    req.height,
+                    req.width,
+                    seed.wrapping_add(candle_gen::STEP_RNG_SALT),
+                    (i + 1) as u64,
+                    device,
+                )?;
+                lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
+            }
+            on_progress(Progress::Step {
+                current: (i + 1) as u32,
+                total: steps as u32,
+            });
+        }
+        Ok(lat)
+    })
+}
+
+pub(crate) fn stage_denoise_edit(
+    heavy: &StagedDenoise,
+    req: &GenerationRequest,
+    encoded: StagedCondition,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Tensor>> {
+    let StagedCondition::Edit {
+        cond,
+        uncond,
+        ref_latents,
+    } = encoded
+    else {
+        return Err(CandleError::Msg(
+            "boogu: crossed staged Edit conditioning".into(),
+        ));
+    };
+    let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
+    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let native = base_native_sigmas(steps);
+    let sigmas = candle_gen::resolve_flow_schedule(
+        req.scheduler.as_deref(),
+        base_shift_mu(),
+        steps,
+        &native,
+    );
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
+        candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            noise,
+            seed,
+            &req.cancel,
+            on_progress,
+            Some(&preview_hook),
+            |x, timestep| {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let cond_v = heavy.dit.forward_edit(x, &ref_latents, &t, &cond)?;
+                let pred = match &uncond {
+                    Some(uncond) => {
+                        let uncond_v = heavy.dit.forward_edit(x, &ref_latents, &t, uncond)?;
+                        (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
+                    }
+                    None => cond_v,
+                };
+                Ok(pred.to_dtype(DType::F32)?.neg()?)
+            },
+        )
+    })
+}
+
+pub(crate) fn stage_decode(
+    decode_components: &StagedDecode,
+    req: &GenerationRequest,
+    provider: &str,
+    latents: Vec<Tensor>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let pid = candle_gen_pid::resolve_pid_decoder(
+        decode_components.pid.as_deref(),
+        req,
+        req.seed.unwrap_or_else(gen_core::default_seed),
+        provider,
+    )?;
+    latents
+        .into_iter()
+        .map(|latent| {
+            on_progress(Progress::Decoding);
+            decode(&decode_components.vae, pid.as_ref(), &latent)
+        })
+        .collect()
+}
+
 /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot's `vae/` dir at the VAE dtype.
 fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
     candle_gen::load_sorted_mmap(dir, VAE_DTYPE, device, "boogu")
@@ -231,6 +627,7 @@ pub(crate) fn render_base(
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
         let x_t = blend_reference(clean, noise, sigmas[start])?;
+        let preview_hook = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
@@ -239,7 +636,7 @@ pub(crate) fn render_base(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview_hook),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward(x, &t, &cond)?;
@@ -325,6 +722,7 @@ pub(crate) fn render_turbo(
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
             let x_t = blend_reference(clean, noise, sigmas[start])?;
+            let preview_hook = crate::preview::hook(&req.preview);
             let lat = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
@@ -333,7 +731,7 @@ pub(crate) fn render_turbo(
                 seed,
                 &req.cancel,
                 on_progress,
-                None,
+                Some(&preview_hook),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                     let v = comps.dit.forward(x, &t, &cond)?;
@@ -349,10 +747,16 @@ pub(crate) fn render_turbo(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
+        let preview_counter = crate::preview::native_counter(steps);
         for i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
+            // Match the shared sampler contract: preview the running state entering this outer step.
+            // For i > 0 this is the previous clean estimate after DMD re-noise, which is also the
+            // tensor the DiT consumes below. The transient x0 estimate is never previewed twice.
+            preview_hook.emit_step(&preview_counter, i, &lat);
             let sigma = sigmas[i];
             let t = Tensor::from_vec(vec![sigma], (1,), device)?;
             let pred = comps.dit.forward(&lat, &t, &cond)?;
@@ -439,18 +843,7 @@ pub(crate) fn render_edit(
     // Each reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
     // an /8 latent ⇒ multiple of 16), matching the mlx twin's
     // `validate_multiple_of(reference, RES_MULTIPLE)`.
-    for (i, r) in references.iter().enumerate() {
-        if !r.width.is_multiple_of(crate::SIZE_MULTIPLE)
-            || !r.height.is_multiple_of(crate::SIZE_MULTIPLE)
-        {
-            return Err(CandleError::Msg(format!(
-                "boogu_image_edit: reference {i} dims must be multiples of {} (got {}x{})",
-                crate::SIZE_MULTIPLE,
-                r.width,
-                r.height
-            )));
-        }
-    }
+    validate_edit_reference_dims(references)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -492,6 +885,7 @@ pub(crate) fn render_edit(
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let preview_hook = crate::preview::hook(&req.preview);
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
@@ -500,7 +894,7 @@ pub(crate) fn render_edit(
             seed,
             &req.cancel,
             on_progress,
-            None,
+            Some(&preview_hook),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
@@ -520,6 +914,22 @@ pub(crate) fn render_edit(
     })
 }
 
+fn validate_edit_reference_dims(references: &[&Image]) -> Result<()> {
+    for (i, r) in references.iter().enumerate() {
+        if !r.width.is_multiple_of(crate::SIZE_MULTIPLE)
+            || !r.height.is_multiple_of(crate::SIZE_MULTIPLE)
+        {
+            return Err(CandleError::Msg(format!(
+                "boogu_image_edit: reference {i} dims must be multiples of {} (got {}x{})",
+                crate::SIZE_MULTIPLE,
+                r.width,
+                r.height
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Image-conditioned instruction features for the edit path: preprocess each reference, run the
 /// Qwen3-VL vision tower **per reference** (separately — no cross-image attention in the ViT, matching
 /// Qwen3-VL's per-image encoding), render the chat template with one `<|image_pad|>` block per
@@ -527,6 +937,17 @@ pub(crate) fn render_edit(
 /// `<|image_pad|>` block now carries that reference's merged vision embeds + deepstack injections.
 fn encode_image_instruction(
     comps: &Components,
+    edit: &EditComponents,
+    references: &[&Image],
+    instruction: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    encode_image_instruction_parts(&comps.tok, &comps.te, edit, references, instruction, device)
+}
+
+fn encode_image_instruction_parts(
+    tok: &BooguTokenizer,
+    te: &BooguTextEncoder,
     edit: &EditComponents,
     references: &[&Image],
     instruction: &str,
@@ -548,16 +969,8 @@ fn encode_image_instruction(
 
     // Chat template with one block of merged vision tokens (`<|image_pad|>`) per reference, then the
     // multi-image MLLM forward (per-block vision splice + 3-D MRoPE + deepstack injection).
-    let ids = comps
-        .tok
-        .encode_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
-    Ok(comps.te.last_hidden_with_images(
-        &ids,
-        &image_embeds,
-        &deepstacks,
-        &grids,
-        IMAGE_TOKEN_ID,
-    )?)
+    let ids = tok.encode_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
+    Ok(te.last_hidden_with_images(&ids, &image_embeds, &deepstacks, &grids, IMAGE_TOKEN_ID)?)
 }
 
 /// VAE-encode an RGB8 reference [`Image`] → clean latent `[1, 16, H/8, W/8]` (f32). Takes the latent
@@ -995,4 +1408,12 @@ mod tests {
             assert_eq!(renoise, again, "renoise draw must be deterministic");
         }
     }
+}
+#[test]
+fn staged_phase_bundles_never_co_reside_dit_and_native_vae() {
+    assert_eq!(StagedDenoise::RESIDENT_COMPONENTS, &["transformer"]);
+    assert_eq!(StagedDecode::NATIVE_RESIDENT_COMPONENTS, &["vae"]);
+    assert!(StagedDenoise::RESIDENT_COMPONENTS
+        .iter()
+        .all(|component| !StagedDecode::NATIVE_RESIDENT_COMPONENTS.contains(component)));
 }

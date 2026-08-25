@@ -229,6 +229,20 @@ def verify_materialization_provenance(
     )
 
 
+def snapshot_path(value: str) -> Path:
+    """Expand a leading `~` so a per-user snapshot variable resolves on any runner account.
+
+    The workflow's snapshot variables are moving to the `~/`-relative convention documented in
+    `resolve_snapshot_paths.py`: one repository variable names the same location on both macOS
+    boxes, whose homes differ (`/Users/michael` vs `/Users/MTrefry`), so a baked absolute value is
+    only correct on whichever box happens to claim the job. That workflow step expands the value
+    for the rest of a job, but these scripts are also run by hand and by an operator reproducing a
+    lane, and an unexpanded `~` reaching `Path` becomes a literal directory named `~` under the
+    checkout rather than an error naming the real problem.
+    """
+    return Path(value).expanduser()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -373,7 +387,7 @@ def verify_snapshot(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="model key in real-weight-models.toml")
-    parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--snapshot", required=True, type=snapshot_path)
     parser.add_argument(
         "--manifest",
         type=Path,

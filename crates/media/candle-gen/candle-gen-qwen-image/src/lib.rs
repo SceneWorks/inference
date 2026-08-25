@@ -224,8 +224,8 @@ use candle_gen::gen_core::tiling::TilingConfig;
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, PidWeights, Progress, Quant, SizeFloor, WeightsSource,
-    BASE_SNAPSHOT_COMPONENT, COMFYUI_VAE_COMPONENT,
+    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_VAE_COMPONENT,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
@@ -1061,7 +1061,6 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            conditioning: vec![],
             supports_lora: true,
             supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
@@ -1069,35 +1068,16 @@ pub fn descriptor() -> ModelDescriptor {
                 candle_gen::curated_scheduler_names(),
                 &["flow_match_euler"],
             ),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            mac_only: false,
             supported_quants: &[] as &[Quant],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
             requires_sigma_shift: true,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews: wired by sc-16952, advertised behind the source-verified
             // bidirectional guard sc-16951 added to `candle-gen-catalog`.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -1298,13 +1278,16 @@ pub fn register_providers(
             route_id: "qwen_image_control",
             provider_id: MODEL_ID,
         })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "qwen-image",
-            source: gen_core::ImportedModelSource::ComfyUiTree,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
+                backend: gen_core::CheckpointBackend::Candle,
+                source: gen_core::ImportedModelSource::ComfyUiTree,
+                operation: gen_core::ImportedModelOperation::Generate,
+                provider_id: MODEL_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            }],
+            ..gen_core::QWEN_IMAGE_CHECKPOINT_ADAPTER
         });
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
@@ -1498,14 +1481,19 @@ mod tests {
         let writer_source = source.clone();
         let writer = std::thread::spawn(move || {
             writer_first.wait();
-            #[cfg(unix)]
-            std::fs::rename(replacement, writer_source).unwrap();
-            #[cfg(not(unix))]
-            {
-                let bytes = std::fs::read(replacement).unwrap();
-                std::fs::write(writer_source, bytes).unwrap();
-            }
+            // A replacing rename, on every platform. The loader is holding `source` mmapped, and
+            // Windows refuses to truncate or write a file with an open mapped section
+            // (ERROR_USER_MAPPED_FILE, 1224), so the read+write swap this used off-Unix could only
+            // ever fail here. Rename can do it, with the same meaning on both: the mapping keeps
+            // consuming the original object while the pinned path comes to name a new one. The
+            // fingerprint still catches it on Windows via the file id and change time, which differ
+            // even when the two files share a size and mtime.
+            let swapped = std::fs::rename(replacement, writer_source);
+            // Release the loader whatever the swap did. A writer that returns — or panics — ahead
+            // of this barrier strands the load hook on it and hangs the whole test binary; the
+            // outcome is asserted on `join` instead, so a failed swap reads as a red test.
             writer_done.wait();
+            swapped
         });
 
         let hook_consumed = Arc::clone(&payload_consumed);
@@ -1527,7 +1515,10 @@ mod tests {
 
         let result = pipeline.load_transformer_seq();
         COMFYUI_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
-        writer.join().unwrap();
+        writer
+            .join()
+            .unwrap()
+            .expect("replace the pinned source mid-load");
 
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result

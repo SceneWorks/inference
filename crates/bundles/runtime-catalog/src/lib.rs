@@ -648,6 +648,7 @@ fn conditioning_name(conditioning: ConditioningKind) -> &'static str {
     match conditioning {
         ConditioningKind::Reference => "reference",
         ConditioningKind::ReferenceAudio => "referenceAudio",
+        ConditioningKind::ReferenceVideo => "referenceVideo",
         ConditioningKind::AudioEdit => "audioEdit",
         ConditioningKind::AudioEditRegions => "audioEditRegions",
         ConditioningKind::VoiceEmbedding => "voiceEmbedding",

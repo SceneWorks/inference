@@ -296,6 +296,13 @@ impl Weights {
             .collect()
     }
 
+    /// Consume the container into its raw tensor map (drops metadata and access bookkeeping).
+    /// The logical-weight reader uses this to unify the ordinary lazy loader with its fp8-view
+    /// loader, which never has metadata to begin with.
+    pub fn into_tensors(self) -> HashMap<String, Array> {
+        self.tensors
+    }
+
     pub fn len(&self) -> usize {
         self.tensors.len()
     }

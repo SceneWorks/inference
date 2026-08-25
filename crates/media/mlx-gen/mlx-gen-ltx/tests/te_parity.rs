@@ -5,7 +5,7 @@
 //! (gitignored). Runs the Rust `LtxTextEncoder` in bf16 (Gemma → feature extractor → connector)
 //! and checks `video_features` + `video_embeddings` reproduce the reference.
 //!
-//! Run: `cargo test -p mlx-gen-ltx --test te_parity -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-ltx --test integration te_parity:: -- --ignored --nocapture`
 
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
