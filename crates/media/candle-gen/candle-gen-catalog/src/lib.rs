@@ -4406,8 +4406,14 @@ mod tests {
         // The complete set of `LogicalKeyMapping` implementations reachable from the Candle
         // platform. Adding one without declaring it (or declaring one without adding it) fails
         // below.
+        //
+        // The Krea mapping carries a file-detected namespace prefix and an optional architecture
+        // config; neither affects `mapping_id`, so the id-surface check below uses the
+        // no-config, bare-prefix form.
+        let krea =
+            candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping::without_config("");
         let implementations: &[&dyn LogicalKeyMapping] =
-            &[&candle_gen_wan::WanNativeToDiffusersMapping];
+            &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea];
 
         let mut declared_here = 0usize;
         for adapter in registry.checkpoint_adapters() {
@@ -4456,6 +4462,14 @@ mod tests {
             Some("blocks.0.attn1.to_q.weight")
         );
         assert_eq!(wan.logical_key("vace_blocks.0.before_proj.weight"), None);
+
+        // ...and the Krea mapping really is the native-mmdit remap the Kitchen NVFP4 import plans
+        // through: a native key resolves to its diffusers name, a foreign one refuses.
+        assert_eq!(
+            krea.logical_key("blocks.0.attn.wq.weight").as_deref(),
+            Some("transformer_blocks.0.attn.to_q.weight")
+        );
+        assert_eq!(krea.logical_key("blocks.0.attn.bogus"), None);
     }
 
     #[test]

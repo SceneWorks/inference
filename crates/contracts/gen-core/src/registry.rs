@@ -357,7 +357,11 @@ pub const KREA_2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
             CheckpointCanonicalMappingRegistration {
                 dialect: "krea-native",
                 mapping_id: "krea-native-to-diffusers-v1",
-                plan_driven_backends: &[CheckpointBackend::Mlx],
+                // BOTH engines: `mlx_gen_krea::KreaNativeToDiffusersMapping` and, since sc-20651,
+                // `candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping`. One dialect, one
+                // canonical mapping id, two implementations — which is the shape this field exists
+                // to make checkable rather than assumed.
+                plan_driven_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
             },
             // NOT `identity-v1`. A Krea 2 checkpoint may carry *undescribed* fp8, and
             // `IdentityKeyMapping` accepts every on-disk key — including a scale companion under an
@@ -5421,9 +5425,11 @@ mod tests {
                 KREA_2_CHECKPOINT_ADAPTER.adapter_id,
                 &[
                     (
+                        // Implemented on BOTH engines since sc-20651 — one dialect, one canonical
+                        // mapping id, two implementations.
                         "krea-native",
                         "krea-native-to-diffusers-v1",
-                        &[CheckpointBackend::Mlx],
+                        &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
                     ),
                     (
                         "diffusers",
