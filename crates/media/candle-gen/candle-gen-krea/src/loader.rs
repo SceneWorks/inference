@@ -2979,6 +2979,246 @@ mod tests {
         Ok(())
     }
 
+    /// A packed-NVFP4 `to_q` projection built exactly as the trunk builds it, plus its `(out, in)`.
+    /// The forced residency makes the packed-native construction route reachable on a CPU lane
+    /// (`Nvfp4Linear` serves its dequant→bf16 fallback there — the ADDITIVE arm is host-side).
+    fn packed_nvfp4_to_q() -> (tempfile::TempDir, QLinear, usize, usize) {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+        let cfg = kitchen_nvfp4_config();
+        let w = Weights::from_native_file_forcing_packed_nvfp4(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("the forced-packed fixture plans");
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+        let proj = linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan)
+            .expect("the packed row builds an NVFP4 projection");
+        assert!(
+            proj.nvfp4().is_some(),
+            "the fixture must actually exercise the NVFP4 arm, not a dense fallback"
+        );
+        (tmp, proj, cfg.q_dim(), cfg.hidden_size)
+    }
+
+    fn f32s(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// **AC#1 — a LoRA installs over a PackedNvfp4 projection, and removing it restores the exact
+    /// base output** (sc-21483). The residual rides the shared `AdaptLinear` alongside the packed
+    /// forward: nothing is dequantized into a dense `[out, in]` weight, the projection is still an
+    /// NVFP4 leg afterwards, and `clear_adapters` is bit-exact because the base was never mutated.
+    #[test]
+    fn nvfp4_projection_hosts_an_additive_lora_and_removal_restores_the_base() -> Result<()> {
+        let (_tmp, mut proj, out_f, in_f) = packed_nvfp4_to_q();
+        assert!(
+            proj.as_additive_mut().is_some(),
+            "an NVFP4 projection must be exposed to adapter installation"
+        );
+        assert_eq!(proj.additive_shape(), (out_f, in_f));
+
+        let dev = Device::Cpu;
+        let x = Tensor::from_vec(
+            (0..2 * in_f)
+                .map(|i| (i % 9) as f32 * 0.05)
+                .collect::<Vec<_>>(),
+            (2, in_f),
+            &dev,
+        )?;
+        let bare = proj.forward(&x)?;
+
+        let rank = 2;
+        let a = Tensor::from_vec(
+            (0..in_f * rank)
+                .map(|i| (i % 5) as f32 * 0.02)
+                .collect::<Vec<_>>(),
+            (in_f, rank),
+            &dev,
+        )?;
+        let b = Tensor::from_vec(
+            (0..rank * out_f)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.03)
+                .collect::<Vec<_>>(),
+            (rank, out_f),
+            &dev,
+        )?;
+        proj.push_additive_lora(a.clone(), b.clone(), 0.6)?;
+        let adapted = proj.forward(&x)?;
+        assert!(
+            proj.nvfp4().is_some(),
+            "installing an adapter must NOT convert the base out of NVFP4"
+        );
+
+        let want = (x.matmul(&a)?.matmul(&b)? * 0.6)?;
+        let got = (&adapted - &bare)?;
+        let max = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            max < 1e-5,
+            "the additive arm did not contribute the LoRA delta: {max}"
+        );
+        let moved = (adapted - &bare)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(moved > 1e-4, "the adapter must actually move the output");
+
+        proj.clear_adapters();
+        assert_eq!(
+            f32s(&proj.forward(&x)?),
+            f32s(&bare),
+            "removing the adapter must restore the EXACT base output"
+        );
+        assert!(proj.nvfp4().is_some());
+        Ok(())
+    }
+
+    /// **AC#2 — an inadmissible adapter fails at install, and the NVFP4 base is never converted to
+    /// another numeric regime to make one fit** (sc-21483).
+    #[test]
+    fn nvfp4_projection_refuses_bad_adapters_and_every_requantization() -> Result<()> {
+        let (_tmp, mut proj, out_f, in_f) = packed_nvfp4_to_q();
+        let dev = Device::Cpu;
+
+        // Shape: `a` contracts against the wrong input width.
+        let a = Tensor::zeros((in_f / 2, 2), DType::F32, &dev)?;
+        let b = Tensor::zeros((2, out_f), DType::F32, &dev)?;
+        let error = proj
+            .push_additive_lora(a, b, 1.0)
+            .expect_err("a mis-shaped factor is refused at install")
+            .to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(error.contains("do not compose"), "{error}");
+
+        // Dtype: an additive residual is cast to the activation dtype per forward.
+        let a = Tensor::zeros((in_f, 2), DType::U32, &dev)?;
+        let b = Tensor::zeros((2, out_f), DType::F32, &dev)?;
+        let error = proj
+            .push_additive_lora(a, b, 1.0)
+            .expect_err("a non-float factor is refused at install")
+            .to_string();
+        assert!(error.contains("non-float dtype"), "{error}");
+
+        // …and nothing was attached by either refusal, so the projection still renders its base.
+        let x = Tensor::zeros((1, in_f), DType::F32, &dev)?;
+        proj.forward(&x)?;
+
+        // Regime: an NVFP4 base is never silently folded to q4/q8.
+        for quant in [
+            candle_gen::gen_core::Quant::Q4,
+            candle_gen::gen_core::Quant::Q8,
+        ] {
+            let error = proj
+                .quantize(quant)
+                .expect_err("an NVFP4 projection refuses an affine fold")
+                .to_string();
+            assert!(error.contains("cannot be re-quantized"), "{error}");
+            let error = proj
+                .quantize_onto(quant, &dev)
+                .expect_err("…on the CPU-staged path too")
+                .to_string();
+            assert!(error.contains("cannot be re-quantized"), "{error}");
+        }
+        assert!(proj.nvfp4().is_some(), "the base is still NVFP4");
+        Ok(())
+    }
+
+    /// **AC#1/AC#2 end-to-end through the shipping installer.** `install_additive` resolves a real
+    /// PEFT LoRA file onto an NVFP4 projection, and a factor that cannot compose is a hard error on
+    /// this host (not the skipped-key report the dense/packed hosts produce, because NVFP4 has no
+    /// fallback and would otherwise render silently un-adapted).
+    #[test]
+    fn install_additive_drives_and_guards_an_nvfp4_projection() -> Result<()> {
+        use crate::adapters::{AdditiveDit, AdditiveProj};
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+
+        struct OneProj {
+            path: &'static str,
+            proj: QLinear,
+        }
+        impl AdditiveDit for OneProj {
+            fn visit_additive(
+                &mut self,
+                f: &mut dyn FnMut(&str, &mut dyn AdditiveProj) -> candle_gen::Result<()>,
+            ) -> candle_gen::Result<()> {
+                f(self.path, &mut self.proj)
+            }
+            fn adapter_device(&self) -> Device {
+                Device::Cpu
+            }
+            fn adapter_surface_hint(&self) -> &'static str {
+                "nvfp4 fixture surface"
+            }
+        }
+
+        let dev = Device::Cpu;
+        let (_tmp, proj, out_f, in_f) = packed_nvfp4_to_q();
+        let path = "transformer_blocks.0.attn.to_q";
+        let bare = {
+            let x = Tensor::ones((1, in_f), DType::F32, &dev)?;
+            f32s(&proj.forward(&x)?)
+        };
+
+        let adapter_dir = tempfile::tempdir().unwrap();
+        let write_lora = |name: &str, rank: usize, in_dim: usize| -> std::path::PathBuf {
+            let file = adapter_dir.path().join(name);
+            let down = Tensor::from_vec(
+                (0..rank * in_dim)
+                    .map(|i| (i % 5) as f32 * 0.01)
+                    .collect::<Vec<_>>(),
+                (rank, in_dim),
+                &dev,
+            )
+            .unwrap();
+            let up = Tensor::from_vec(
+                (0..out_f * rank)
+                    .map(|i| ((i % 7) as f32 - 3.0) * 0.02)
+                    .collect::<Vec<_>>(),
+                (out_f, rank),
+                &dev,
+            )
+            .unwrap();
+            let mut map: HashMap<String, Tensor> = HashMap::new();
+            map.insert(format!("{path}.lora_A.weight"), down);
+            map.insert(format!("{path}.lora_B.weight"), up);
+            safetensors::save(&map, &file).unwrap();
+            file
+        };
+
+        // A well-formed adapter installs and moves the output — over a still-NVFP4 base.
+        let good = write_lora("good.safetensors", 2, in_f);
+        let mut dit = OneProj { path, proj };
+        let specs = vec![AdapterSpec::new(good, 1.0, AdapterKind::Lora)];
+        let report = crate::adapters::install_additive(&mut dit, &specs, 0)
+            .expect("a well-formed LoRA installs over the NVFP4 base");
+        assert_eq!(report.applied, 1);
+        assert!(dit.proj.nvfp4().is_some(), "the base stayed NVFP4");
+        let x = Tensor::ones((1, in_f), DType::F32, &dev)?;
+        let adapted = f32s(&dit.proj.forward(&x)?);
+        assert!(
+            adapted.iter().zip(&bare).any(|(a, b)| (a - b).abs() > 1e-4),
+            "the installed adapter must change the render"
+        );
+
+        // Removing it restores the exact base output.
+        dit.proj.clear_adapters();
+        assert_eq!(f32s(&dit.proj.forward(&x)?), bare);
+
+        // A factor that cannot compose is a hard admission error on this host, before any step.
+        let bad = write_lora("bad.safetensors", 2, in_f / 2);
+        let specs = vec![AdapterSpec::new(bad, 1.0, AdapterKind::Lora)];
+        let error = crate::adapters::install_additive(&mut dit, &specs, 0)
+            .expect_err("a mis-shaped factor must not be silently skipped on an NVFP4 host")
+            .to_string();
+        assert!(error.contains("do not compose"), "{error}");
+        assert!(
+            dit.proj.nvfp4().is_some(),
+            "the base is untouched by the refusal"
+        );
+        Ok(())
+    }
+
     /// Overwrite the byte of the block-scale companion that governs (row 0, block 0) — the swizzled
     /// slot the fixture's real scale occupies.
     fn corrupt_first_block_scale(path: &Path, value: u8) {

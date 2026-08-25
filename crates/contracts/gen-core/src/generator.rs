@@ -2512,6 +2512,33 @@ pub struct Capabilities {
     pub approximation: ApproximationSurface,
 }
 
+/// The one typed refusal for an **adapter-bearing** request against a descriptor whose advertised
+/// surface does not support adapters (sc-21483, epic 11037 E6).
+///
+/// The motivating case is an imported-model route whose binding declares `inherit_adapters = false`:
+/// [`crate::registry::ProviderRegistry::imported_model_descriptor`] withdraws
+/// [`Capabilities::supports_lora`] / [`Capabilities::supports_lokr`] from that route's descriptor,
+/// and this is what makes the withdrawal *observable*. Without it a withdrawn capability and an
+/// ignored adapter look identical from the outside: the load succeeds, the adapter is dropped on the
+/// floor, and the user gets an un-adapted render with no error — the sc-11993 silent-coercion class.
+///
+/// [`Error::Unsupported`] (never [`Error::Msg`]) so a consumer can tell a capability gap apart from a
+/// bad adapter file.
+pub fn reject_unsupported_adapters(
+    id: &str,
+    capabilities: &Capabilities,
+    adapter_count: usize,
+) -> Result<()> {
+    if adapter_count == 0 || capabilities.supports_lora || capabilities.supports_lokr {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{id}: this model route does not inherit adapters, so the {adapter_count} selected \
+         LoRA/LoKr adapter(s) cannot be applied; it is refused rather than silently rendered \
+         un-adapted"
+    )))
+}
+
 /// Generous upper sanity caps for the unbounded counter knobs (F-004). Not model limits — each model
 /// layers a tighter, better-messaged bound in its own `validate` (e.g. kolors caps `steps` at its
 /// train-timestep count); these sit ABOVE any real model bound so they only reject a pathological

@@ -85,7 +85,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::lock_recover;
 use candle_gen::quant::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+    ActPrecision, AdaptLinear, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass,
+    OutlierSparsity,
 };
 
 /// How the trunk should serve one projection's activations when running NVFP4.
@@ -512,7 +513,11 @@ impl ActProbe {
 /// A trunk projection served through [`Nvfp4Linear`], plus its instrumentation (name / probe /
 /// NaN-guard flag) — the `Nvfp4` arm of [`crate::quant::QLinear`].
 pub struct Nvfp4Proj {
-    inner: Box<Nvfp4Linear>,
+    /// The NVFP4 base wrapped in the ONE shared additive linear (sc-11091 / sc-21483), so a user
+    /// LoRA/LoKr rides *unmerged* alongside the packed forward exactly as it does on the dense and
+    /// MLX-packed arms. With no adapter attached this is byte-identical to the bare
+    /// [`Nvfp4Linear`] forward, so the SC#1/SC#2/SC#6 benches are unchanged.
+    inner: Box<AdaptLinear>,
     name: String,
     probe: Option<Arc<ActProbe>>,
     checked: bool,
@@ -522,12 +527,21 @@ pub struct Nvfp4Proj {
 impl Nvfp4Proj {
     pub(crate) fn new(inner: Nvfp4Linear, name: &str, plan: &DitPlan, act: ActPrecision) -> Self {
         Self {
-            inner: Box::new(inner),
+            inner: Box::new(AdaptLinear::from_nvfp4(inner)),
             name: name.to_string(),
             probe: plan.probe.clone(),
             checked: plan.checked,
             act,
         }
+    }
+
+    /// The adapter-capable host, for the additive installer (sc-21483).
+    pub(crate) fn adapt(&self) -> &AdaptLinear {
+        &self.inner
+    }
+
+    pub(crate) fn adapt_mut(&mut self) -> &mut AdaptLinear {
+        &mut self.inner
     }
 
     /// `y = x·Wᵀ (+ b)` through the NVFP4 path. Records the input activation first when a probe is
@@ -536,16 +550,39 @@ impl Nvfp4Proj {
         if let Some(p) = &self.probe {
             p.record(&self.name, self.act, x)?;
         }
+        let y = self.inner.forward(x)?;
         if self.checked {
-            self.inner.forward_checked(x)
-        } else {
-            self.inner.forward(x)
+            // The sc-11044 NaN guard, applied to the projection's FULL output — base plus any
+            // additive residual — so an adapter that collapses the signal fails just as loud as a
+            // W4A4 collapse would. Same single sum-of-squares reduction as
+            // `Nvfp4Linear::forward_checked`, which this replaces now that the residual stack sits
+            // between the packed GEMM and the caller.
+            let energy = y
+                .to_dtype(candle_gen::candle_core::DType::F32)?
+                .sqr()?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+            if !energy.is_finite() {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea NVFP4 `{}`: non-finite output (NaN/inf) from the {:?} regime — W4A4 \
+                     signal collapse, a bad activation, or a diverging additive residual; failing \
+                     loud (sc-11044 NaN guard)",
+                    self.name,
+                    self.inner
+                        .base_nvfp4()
+                        .expect("an Nvfp4Proj always holds an NVFP4 base")
+                        .regime(),
+                )));
+            }
         }
+        Ok(y)
     }
 
     /// The underlying NVFP4 linear (for report accounting).
     pub(crate) fn linear(&self) -> &Nvfp4Linear {
-        &self.inner
+        self.inner
+            .base_nvfp4()
+            .expect("an Nvfp4Proj always holds an NVFP4 base")
     }
 }
 

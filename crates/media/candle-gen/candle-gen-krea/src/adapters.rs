@@ -799,20 +799,32 @@ pub trait AdditiveProj {
     /// checked against before it is pushed.
     fn out_in(&self) -> (usize, usize);
     /// Push an additive LoRA residual `scale·((x·a)·b)` (`a`: `[in, rank]`, `b`: `[rank, out]`).
-    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64);
+    /// Fallible so a host with a strict numeric contract (NVFP4, sc-21483) can refuse an
+    /// inadmissible factor at install rather than at the first sampler step.
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()>;
     /// Push an additive structured-LoKr residual (the allocation-free Kronecker form).
-    fn add_lokr(&mut self, factors: LokrFactors);
+    fn add_lokr(&mut self, factors: LokrFactors) -> Result<()>;
+    /// Whether a factor this projection cannot host is an **error** rather than a skipped key.
+    /// `false` for the hosts that have a fallback (a dense base can fold, a packed base can be
+    /// dequantized), so a shape mismatch there keeps reading as "this key targeted another module".
+    /// `true` on NVFP4, which has no fallback at all — see
+    /// `crate::quant::QLinear::strict_adapter_admission`.
+    fn strict_admission(&self) -> bool {
+        false
+    }
 }
 
 impl AdditiveProj for AdaptLinear {
     fn out_in(&self) -> (usize, usize) {
         self.base_shape()
     }
-    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         self.push_lora(a, b, scale);
+        Ok(())
     }
-    fn add_lokr(&mut self, factors: LokrFactors) {
+    fn add_lokr(&mut self, factors: LokrFactors) -> Result<()> {
         self.push_lokr_structured(factors);
+        Ok(())
     }
 }
 
@@ -820,11 +832,14 @@ impl AdditiveProj for crate::quant::QLinear {
     fn out_in(&self) -> (usize, usize) {
         self.additive_shape()
     }
-    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
-        self.push_additive_lora(a, b, scale);
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        Ok(self.push_additive_lora(a, b, scale)?)
     }
-    fn add_lokr(&mut self, factors: LokrFactors) {
-        self.push_additive_lokr(factors);
+    fn add_lokr(&mut self, factors: LokrFactors) -> Result<()> {
+        Ok(self.push_additive_lokr(factors)?)
+    }
+    fn strict_admission(&self) -> bool {
+        self.strict_adapter_admission()
     }
 }
 
@@ -832,12 +847,14 @@ impl AdditiveProj for LoraLinear {
     fn out_in(&self) -> (usize, usize) {
         (self.out_features(), self.in_features())
     }
-    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         // The inherent inference-residual push (sc-11103) — NOT this trait method (distinct name).
         LoraLinear::push_additive_lora(self, a, b, scale);
+        Ok(())
     }
-    fn add_lokr(&mut self, factors: LokrFactors) {
+    fn add_lokr(&mut self, factors: LokrFactors) -> Result<()> {
         LoraLinear::push_additive_lokr(self, factors);
+        Ok(())
     }
 }
 
@@ -977,14 +994,25 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
     let mut skipped_keys = 0usize;
     dit.visit_additive(&mut |path, proj| {
         let (out_f, in_f) = proj.out_in();
+        let strict = proj.strict_admission();
         if let Some(list) = pending_lora.get(path) {
             matched.insert(path.to_string());
             for p in list {
                 if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                    // sc-21483: a host with no fallback (NVFP4) must not silently render unadapted.
+                    if strict {
+                        return Err(CandleError::Msg(format!(
+                            "krea: LoRA factors for `{path}` are a{:?}·b{:?}, which do not compose \
+                             against the base [out={out_f}, in={in_f}]; this projection's numeric \
+                             regime cannot be converted to accept them",
+                            p.a.dims(),
+                            p.b.dims(),
+                        )));
+                    }
                     skipped_keys += 1;
                     continue;
                 }
-                proj.add_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                proj.add_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale)?;
                 applied += 1;
                 applied_sources.insert(p.source);
             }
@@ -1004,7 +1032,7 @@ fn install_additive_inner<D: AdditiveDit + ?Sized>(
                     p.w2_b.as_ref(),
                 )? {
                     Some(factors) => {
-                        proj.add_lokr(factors.to_device(&device)?);
+                        proj.add_lokr(factors.to_device(&device)?)?;
                         applied += 1;
                         applied_sources.insert(p.source);
                     }

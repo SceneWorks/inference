@@ -6,7 +6,10 @@ use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::checkpoint_codec::{CheckpointCodecRegistration, CheckpointCodecRegistry};
-use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor, StepSupport};
+use crate::generator::{
+    reject_unsupported_adapters, ConditioningKind, Generator, Modality, ModelDescriptor,
+    StepSupport,
+};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::memory_strategy::{
     MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
@@ -2474,6 +2477,33 @@ impl ProviderRegistry {
         Some(descriptor)
     }
 
+    /// Admit — or refuse — an **adapter-bearing** load against an imported-model route (sc-21483,
+    /// epic 11037 E6).
+    ///
+    /// [`Self::imported_model_descriptor`] already withdraws `supports_lora`/`supports_lokr` from a
+    /// route whose binding declares `inherit_adapters = false`, but a withdrawn capability that
+    /// nothing consults is indistinguishable from an ignored adapter: the model would load, the
+    /// adapter would be dropped, and the render would silently be the un-adapted base. This is the
+    /// gate that turns that into a typed [`Error::Unsupported`] refusal at admission.
+    ///
+    /// A route that does inherit adapters, an adapter-free spec, and an unrouted family are all
+    /// `Ok(())` — this decides adapter admission only, never whether the route exists.
+    pub fn ensure_imported_model_adapters_allowed(
+        &self,
+        family: &str,
+        source: ImportedModelSource,
+        operation: ImportedModelOperation,
+        spec: &LoadSpec,
+    ) -> Result<()> {
+        if spec.adapters.is_empty() {
+            return Ok(());
+        }
+        let Some(descriptor) = self.imported_model_descriptor(family, source, operation) else {
+            return Ok(());
+        };
+        reject_unsupported_adapters(descriptor.id, &descriptor.capabilities, spec.adapters.len())
+    }
+
     /// Provider-owned warm 1024² activation transient for `id`.
     /// `Ok(None)` is the compatibility-safe unmeasured state, including for a known platform-composed
     /// memory route with no standalone generator registration; genuinely unknown ids remain errors.
@@ -4674,6 +4704,71 @@ mod tests {
             .unwrap();
         assert!(!imported.capabilities.supports_lora);
         assert!(!imported.capabilities.supports_lokr);
+
+        // sc-21483 (epic 11037 E6): the withdrawn capability must be *observable*. An adapter-bearing
+        // request against this route is a typed capability refusal, never a silently dropped adapter.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from("weights")));
+        spec.adapters = vec![crate::runtime::AdapterSpec::new(
+            std::path::PathBuf::from("adapter.safetensors"),
+            1.0,
+            crate::runtime::AdapterKind::Lora,
+        )];
+        let error = registry
+            .ensure_imported_model_adapters_allowed(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+                &spec,
+            )
+            .expect_err("an adapter-bearing request on a non-inheriting route is refused");
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "the refusal must be a typed capability error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("does not inherit adapters"),
+            "{error}"
+        );
+
+        // The same route with no adapter selected loads normally…
+        let bare = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from("weights")));
+        registry
+            .ensure_imported_model_adapters_allowed(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+                &bare,
+            )
+            .expect("an adapter-free request is unaffected");
+
+        // …and so does an adapter-bearing request against a route that DOES inherit adapters
+        // (`imported_route_resolves_descriptor` covers the inheriting fixture), proving the gate
+        // keys off the binding rather than blanket-refusing adapters.
+        registry
+            .ensure_imported_model_adapters_allowed(
+                "unrouted_family",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Generate,
+                &spec,
+            )
+            .expect("an unrouted family is not this gate's decision");
+    }
+
+    /// sc-21483: the shared refusal is capability-shaped, not route-shaped — a descriptor that
+    /// advertises either adapter form admits, one that advertises neither refuses.
+    #[test]
+    fn adapter_refusal_keys_off_the_advertised_capability() {
+        let mut capabilities = dummy_descriptor().capabilities;
+        capabilities.supports_lora = false;
+        capabilities.supports_lokr = false;
+        assert!(reject_unsupported_adapters("m", &capabilities, 0).is_ok());
+        assert!(reject_unsupported_adapters("m", &capabilities, 1).is_err());
+
+        capabilities.supports_lokr = true;
+        assert!(reject_unsupported_adapters("m", &capabilities, 2).is_ok());
+        capabilities.supports_lokr = false;
+        capabilities.supports_lora = true;
+        assert!(reject_unsupported_adapters("m", &capabilities, 2).is_ok());
     }
 
     const FIXTURE_DIALECTS: &[CheckpointDialectRegistration] = &[CheckpointDialectRegistration {
