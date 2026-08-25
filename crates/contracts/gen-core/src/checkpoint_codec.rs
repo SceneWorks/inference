@@ -473,6 +473,546 @@ pub trait LogicalKeyMapping {
     fn logical_shape(&self, _logical_key: &str) -> Option<Vec<usize>> {
         None
     }
+
+    /// The adapter's **declarative logical transform** for one on-disk tensor (sc-21547), when the
+    /// checkpoint's physical layout is not one-to-one with the architecture's logical weights.
+    ///
+    /// Fused checkpoint layouts are the reason this exists: a fused-QKV projection stores one
+    /// `[3·d, d]` matrix where the model wants three `[d, d]` weights, and a diffusers-vs-ComfyUI
+    /// AdaLN modulation stores `shift` and `scale` in the opposite order from the one the block
+    /// reads. Both are pure, deterministic **re-labellings of rows** — no arithmetic, no codec
+    /// knowledge — so the adapter declares them and the shared plan compiler consumes them (epic
+    /// requirement E1: no codec knowledge moves into a provider).
+    ///
+    /// `None` (the default) means the ordinary one-to-one route: [`Self::logical_key`] renames the
+    /// tensor and [`Self::logical_shape`] declares its geometry. A `Some` declaration **replaces**
+    /// both for that physical key — the compiler does not consult `logical_key` or `logical_shape`
+    /// for a transformed tensor, because a one-to-many tensor has no single logical key to key them
+    /// on; the declaration carries its own
+    /// [`LogicalTransformDeclaration::source_logical_shape`] instead.
+    ///
+    /// Every declaration is validated at plan time against the tensor's real geometry, its codec and
+    /// its planned residency ([`LogicalTransformError`]) — before any tensor payload is read.
+    fn logical_transform(&self, _physical_key: &str) -> Option<LogicalTransformDeclaration> {
+        None
+    }
+}
+
+/// A half-open row range `[start, start + len)` of a tensor's leading (output/row) axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowRange {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl RowRange {
+    pub const fn new(start: usize, len: usize) -> Self {
+        Self { start, len }
+    }
+
+    /// One past the last row, saturating (the compiler refuses an out-of-bounds range by name, so
+    /// saturation here only keeps the *diagnostic* arithmetic total).
+    pub const fn end(&self) -> usize {
+        self.start.saturating_add(self.len)
+    }
+}
+
+impl fmt::Display for RowRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rows {}..{}", self.start, self.end())
+    }
+}
+
+/// One logical weight an adapter derives from a physical tensor.
+///
+/// The two primitives compose, and every combination the story needs is a point in this space:
+/// a plain **rename** is `rows: None, half_swap: false`; a fused-QKV **row slice** is
+/// `rows: Some(..)`; an AdaLN **half swap** is `half_swap: true`; and a fused modulation that needs
+/// both is both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTransformOutput {
+    /// The canonical logical key this output is published under.
+    pub logical_key: String,
+    /// The contiguous slice of the source's leading axis this output takes. `None` is the whole
+    /// axis — the rename case, and the only shape a rank-0 source could accept.
+    pub rows: Option<RowRange>,
+    /// Exchange the two halves of *this output's* leading axis (after slicing).
+    ///
+    /// Supported for outputs whose tensor plans a **dense** residency only; a packed-native row
+    /// permutation would have to re-derive the codec's scale surface, which is exactly the codec
+    /// knowledge this seam keeps out of providers, so a half-swap on a packed row refuses at plan
+    /// time ([`LogicalTransformError::HalfSwapOnPackedResidency`]).
+    pub half_swap: bool,
+}
+
+impl LogicalTransformOutput {
+    /// A whole-tensor rename.
+    pub fn rename(logical_key: impl Into<String>) -> Self {
+        Self {
+            logical_key: logical_key.into(),
+            rows: None,
+            half_swap: false,
+        }
+    }
+
+    /// A contiguous row slice.
+    pub fn row_slice(logical_key: impl Into<String>, start: usize, len: usize) -> Self {
+        Self {
+            logical_key: logical_key.into(),
+            rows: Some(RowRange::new(start, len)),
+            half_swap: false,
+        }
+    }
+
+    /// A whole-tensor leading-axis half swap.
+    pub fn half_swap(logical_key: impl Into<String>) -> Self {
+        Self {
+            logical_key: logical_key.into(),
+            rows: None,
+            half_swap: true,
+        }
+    }
+
+    /// This output with its half-swap flag set (composes with [`Self::row_slice`]).
+    pub fn with_half_swap(mut self) -> Self {
+        self.half_swap = true;
+        self
+    }
+}
+
+/// The adapter's complete declaration for one physical tensor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTransformDeclaration {
+    /// The logical weights this tensor produces, in declaration order. Their row ranges must
+    /// **exactly partition** the source's leading axis — see
+    /// [`LogicalTransformError::SliceOverlap`] and [`LogicalTransformError::SliceGap`].
+    pub outputs: Vec<LogicalTransformOutput>,
+    /// The **physical** tensor's true (unpadded) logical shape, when the adapter knows it. This is
+    /// the transform's *input* geometry and plays exactly the role
+    /// [`LogicalKeyMapping::logical_shape`] plays for an untransformed key: without it a
+    /// block-padded codec row (MXFP8/NVFP4) cannot be materialized at all
+    /// ([`LogicalTensorPlan::undeclared_padded_storage`]).
+    pub source_logical_shape: Option<Vec<usize>>,
+}
+
+impl LogicalTransformDeclaration {
+    /// A declaration with no source-shape statement.
+    pub fn new(outputs: Vec<LogicalTransformOutput>) -> Self {
+        Self {
+            outputs,
+            source_logical_shape: None,
+        }
+    }
+
+    /// This declaration with the physical tensor's true logical shape attached.
+    pub fn with_source_logical_shape(mut self, shape: Vec<usize>) -> Self {
+        self.source_logical_shape = Some(shape);
+        self
+    }
+}
+
+/// The **resolved** transform one planned logical tensor applies to its physical source.
+///
+/// Present on a [`LogicalTensorPlan`] only when the transform actually does something: an adapter
+/// declaration that resolves to "the whole tensor, unswapped" is an ordinary rename and plans as
+/// `None`, so nothing downstream has to special-case the identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTensorTransform {
+    /// The physical tensor's **pre-transform** logical shape — what the codec decodes to before the
+    /// slice. Every decode arm reads its geometry from here (via
+    /// [`LogicalTensorPlan::source_shape`]); [`LogicalTensorPlan::shape`] is the post-transform
+    /// shape the model sees.
+    pub source_shape: Vec<usize>,
+    /// The rows of `source_shape[0]` this output takes.
+    pub rows: RowRange,
+    /// Exchange the two halves of the sliced output's leading axis.
+    pub half_swap: bool,
+}
+
+/// Why an adapter's [`LogicalTransformDeclaration`] cannot be compiled. Every variant names the
+/// logical key at fault, and every one is raised **before any tensor payload is materialized**.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalTransformError {
+    /// A declaration that produces no logical weights would silently drop the tensor.
+    NoOutputs,
+    /// Two outputs of the same declaration claim one logical key.
+    DuplicateLogicalKey { logical_key: String },
+    /// A zero-length slice produces an empty tensor.
+    EmptySlice { logical_key: String },
+    /// The source has no leading axis to slice (a rank-0 tensor).
+    SourceNotSliceable {
+        logical_key: String,
+        source_shape: Vec<usize>,
+    },
+    /// The slice runs past the end of the source's leading axis.
+    SliceOutOfBounds {
+        logical_key: String,
+        rows: RowRange,
+        source_rows: usize,
+    },
+    /// Two outputs claim overlapping rows.
+    SliceOverlap {
+        first_logical_key: String,
+        first: RowRange,
+        second_logical_key: String,
+        second: RowRange,
+    },
+    /// The outputs leave rows of the source unclaimed. Uncovered rows are a **silent drop** — the
+    /// most likely shape of an off-by-one in a fused-layout declaration — so the partition must be
+    /// exact rather than merely non-overlapping.
+    SliceGap {
+        /// The first uncovered row.
+        first_uncovered_row: usize,
+        /// The output that claims rows immediately after the gap, if any.
+        next_logical_key: Option<String>,
+        source_rows: usize,
+    },
+    /// A half swap needs an even number of rows to have two halves.
+    HalfSwapOddRows { logical_key: String, rows: usize },
+    /// A half swap was declared on a tensor this backend plans as packed-native. See
+    /// [`LogicalTransformOutput::half_swap`].
+    HalfSwapOnPackedResidency {
+        logical_key: String,
+        codec_id: &'static str,
+    },
+    /// A packed-native block-scaled row (NVFP4/MXFP8) was sliced at a boundary that does not fall on
+    /// the cuBLAS block-scale row tile ([`crate::comfy_quant::MXFP8_SCALE_ROW_TILE`]).
+    ///
+    /// The packed container keeps its block scales in the 128×4 swizzle, so a slice that cuts an
+    /// atom in half would have to *re-derive* the scale surface, and its padded scale tensor would
+    /// no longer sum to the source's — the plan's retained-companion pricing and the reader's
+    /// measurement would disagree by the padding. A tile-aligned slice takes whole atoms, which is
+    /// both sound and exactly priced; anything else refuses.
+    PackedSliceAlignment {
+        logical_key: String,
+        codec_id: &'static str,
+        rows: RowRange,
+        align: usize,
+    },
+    /// A packed-native slice of a tensor whose stored grid is **wider than the layer** (ComfyUI
+    /// block padding). The slice's row indices are the layer's; the stored payload's are the padded
+    /// grid's, and nothing in the packed container records the unpad, so the two cannot be
+    /// reconciled. Plan such a file with a dense residency policy.
+    PackedSliceOnPaddedGrid {
+        logical_key: String,
+        codec_id: &'static str,
+        source_rows: usize,
+        stored_rows: usize,
+    },
+    /// A packed-native slice whose source bytes do not divide evenly by its rows, so the output's
+    /// share of the stored payload is not an integral byte count. (Unreachable for the row-major
+    /// codecs in this table; refused rather than rounded.)
+    PackedSliceNotByteAligned {
+        logical_key: String,
+        codec_id: &'static str,
+        source_bytes: u64,
+        source_rows: usize,
+    },
+}
+
+impl fmt::Display for LogicalTransformError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOutputs => write!(
+                f,
+                "the adapter declares a logical transform with no outputs, which would drop the \
+                 tensor silently"
+            ),
+            Self::DuplicateLogicalKey { logical_key } => write!(
+                f,
+                "two outputs of this transform both publish logical key {logical_key:?}"
+            ),
+            Self::EmptySlice { logical_key } => write!(
+                f,
+                "output {logical_key:?} claims zero rows; an empty logical weight is never intended"
+            ),
+            Self::SourceNotSliceable {
+                logical_key,
+                source_shape,
+            } => write!(
+                f,
+                "output {logical_key:?} slices the leading axis of a tensor whose logical shape is \
+                 {source_shape:?}, which has no leading axis"
+            ),
+            Self::SliceOutOfBounds {
+                logical_key,
+                rows,
+                source_rows,
+            } => write!(
+                f,
+                "output {logical_key:?} claims {rows} but the tensor has only {source_rows} rows"
+            ),
+            Self::SliceOverlap {
+                first_logical_key,
+                first,
+                second_logical_key,
+                second,
+            } => write!(
+                f,
+                "outputs {first_logical_key:?} ({first}) and {second_logical_key:?} ({second}) \
+                 claim overlapping rows"
+            ),
+            Self::SliceGap {
+                first_uncovered_row,
+                next_logical_key,
+                source_rows,
+            } => match next_logical_key {
+                Some(next) => write!(
+                    f,
+                    "the transform leaves row {first_uncovered_row} of {source_rows} unclaimed \
+                     (the next output is {next:?}); the outputs must partition the tensor exactly, \
+                     or those rows are dropped silently"
+                ),
+                None => write!(
+                    f,
+                    "the transform claims only rows 0..{first_uncovered_row} of {source_rows}; the \
+                     outputs must partition the tensor exactly, or the remainder is dropped silently"
+                ),
+            },
+            Self::HalfSwapOddRows { logical_key, rows } => write!(
+                f,
+                "output {logical_key:?} declares a half swap over an odd row count ({rows}); a \
+                 half swap needs two equal halves"
+            ),
+            Self::HalfSwapOnPackedResidency {
+                logical_key,
+                codec_id,
+            } => write!(
+                f,
+                "output {logical_key:?} declares a half swap but codec {codec_id} plans a \
+                 packed-native residency for this tensor; permuting packed rows would require \
+                 re-deriving the codec's scale surface. Plan this file with a dense residency \
+                 policy, or declare the swap on a dense layer"
+            ),
+            Self::PackedSliceAlignment {
+                logical_key,
+                codec_id,
+                rows,
+                align,
+            } => write!(
+                f,
+                "output {logical_key:?} slices a packed-native {codec_id} tensor at {rows}, but a \
+                 packed block-scaled slice must start and end on a multiple of {align} (the \
+                 cuBLAS block-scale row tile) so it takes whole scale-factor atoms"
+            ),
+            Self::PackedSliceOnPaddedGrid {
+                logical_key,
+                codec_id,
+                source_rows,
+                stored_rows,
+            } => write!(
+                f,
+                "output {logical_key:?} slices a packed-native {codec_id} tensor whose stored grid \
+                 has {stored_rows} rows for a {source_rows}-row layer; the packed container cannot \
+                 express the unpad, so its rows cannot be sliced by the layer's indices"
+            ),
+            Self::PackedSliceNotByteAligned {
+                logical_key,
+                codec_id,
+                source_bytes,
+                source_rows,
+            } => write!(
+                f,
+                "output {logical_key:?} slices a packed-native {codec_id} tensor whose \
+                 {source_bytes} stored bytes do not divide evenly across its {source_rows} rows"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LogicalTransformError {}
+
+/// One validated output of a [`LogicalTransformDeclaration`], resolved against the tensor's real
+/// geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedTransformOutput {
+    logical_key: String,
+    rows: RowRange,
+    half_swap: bool,
+}
+
+impl ResolvedTransformOutput {
+    /// Whether this output is the whole tensor, unpermuted — the ordinary rename, which plans with
+    /// no [`LogicalTensorTransform`] at all.
+    fn is_identity(&self, source_rows: usize) -> bool {
+        self.rows == RowRange::new(0, source_rows) && !self.half_swap
+    }
+}
+
+/// Validate one adapter declaration against the tensor it governs and resolve every output's row
+/// range — **fail-closed, before any tensor payload is read** (epic requirement E2).
+///
+/// The declaration is checked against four independent facts, and the order of the checks is the
+/// order in which a defect is most usefully named: the declaration's own shape (outputs exist, keys
+/// are distinct), each output's slice against the real row count, the whole output set against the
+/// axis it must partition, and finally each output against the codec + residency the compiler
+/// picked for the tensor.
+fn resolve_logical_transform(
+    outputs: &[LogicalTransformOutput],
+    source_shape: &[usize],
+    stored_rows: usize,
+    codec_id: &'static str,
+    codec: &TensorCodecSpec,
+    mode: ResidencyMode,
+    source_bytes: u64,
+) -> Result<Vec<ResolvedTransformOutput>, LogicalTransformError> {
+    if outputs.is_empty() {
+        return Err(LogicalTransformError::NoOutputs);
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for output in outputs {
+        if !seen.insert(output.logical_key.as_str()) {
+            return Err(LogicalTransformError::DuplicateLogicalKey {
+                logical_key: output.logical_key.clone(),
+            });
+        }
+    }
+
+    // A rank-0 tensor has no leading axis: it can only be renamed, once.
+    let Some(source_rows) = source_shape.first().copied() else {
+        if let Some(output) = outputs
+            .iter()
+            .find(|output| output.rows.is_some() || output.half_swap)
+            .or_else(|| (outputs.len() > 1).then(|| &outputs[1]))
+        {
+            return Err(LogicalTransformError::SourceNotSliceable {
+                logical_key: output.logical_key.clone(),
+                source_shape: source_shape.to_vec(),
+            });
+        }
+        return Ok(vec![ResolvedTransformOutput {
+            logical_key: outputs[0].logical_key.clone(),
+            rows: RowRange::new(0, 0),
+            half_swap: false,
+        }]);
+    };
+
+    // Per-output geometry.
+    let mut resolved = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let rows = output.rows.unwrap_or(RowRange::new(0, source_rows));
+        if rows.len == 0 {
+            return Err(LogicalTransformError::EmptySlice {
+                logical_key: output.logical_key.clone(),
+            });
+        }
+        let end = rows.start.checked_add(rows.len).ok_or_else(|| {
+            LogicalTransformError::SliceOutOfBounds {
+                logical_key: output.logical_key.clone(),
+                rows,
+                source_rows,
+            }
+        })?;
+        if end > source_rows {
+            return Err(LogicalTransformError::SliceOutOfBounds {
+                logical_key: output.logical_key.clone(),
+                rows,
+                source_rows,
+            });
+        }
+        if output.half_swap && !rows.len.is_multiple_of(2) {
+            return Err(LogicalTransformError::HalfSwapOddRows {
+                logical_key: output.logical_key.clone(),
+                rows: rows.len,
+            });
+        }
+        resolved.push(ResolvedTransformOutput {
+            logical_key: output.logical_key.clone(),
+            rows,
+            half_swap: output.half_swap,
+        });
+    }
+
+    // The output set must partition the leading axis exactly: an overlap double-counts rows, a gap
+    // drops them.
+    let mut order: Vec<usize> = (0..resolved.len()).collect();
+    order.sort_by_key(|index| (resolved[*index].rows.start, resolved[*index].rows.len));
+    let mut covered = 0_usize;
+    for (position, index) in order.iter().enumerate() {
+        let output = &resolved[*index];
+        match output.rows.start.cmp(&covered) {
+            std::cmp::Ordering::Less => {
+                let previous = &resolved[order[position.saturating_sub(1)]];
+                return Err(LogicalTransformError::SliceOverlap {
+                    first_logical_key: previous.logical_key.clone(),
+                    first: previous.rows,
+                    second_logical_key: output.logical_key.clone(),
+                    second: output.rows,
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(LogicalTransformError::SliceGap {
+                    first_uncovered_row: covered,
+                    next_logical_key: Some(output.logical_key.clone()),
+                    source_rows,
+                })
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        covered = output.rows.end();
+    }
+    if covered != source_rows {
+        return Err(LogicalTransformError::SliceGap {
+            first_uncovered_row: covered,
+            next_logical_key: None,
+            source_rows,
+        });
+    }
+
+    // Codec + residency facts. Nothing below applies to a dense-fallback load: the codec has already
+    // produced an ordinary dense tensor by the time the transform runs.
+    if mode == ResidencyMode::Packed {
+        let block_scaled = matches!(
+            codec,
+            TensorCodecSpec::Mxfp8 { .. } | TensorCodecSpec::Nvfp4 { .. }
+        );
+        for output in &resolved {
+            if output.half_swap {
+                return Err(LogicalTransformError::HalfSwapOnPackedResidency {
+                    logical_key: output.logical_key.clone(),
+                    codec_id,
+                });
+            }
+            if output.is_identity(source_rows) {
+                continue;
+            }
+            if source_rows != stored_rows {
+                return Err(LogicalTransformError::PackedSliceOnPaddedGrid {
+                    logical_key: output.logical_key.clone(),
+                    codec_id,
+                    source_rows,
+                    stored_rows,
+                });
+            }
+            if block_scaled
+                && !(output
+                    .rows
+                    .start
+                    .is_multiple_of(crate::comfy_quant::MXFP8_SCALE_ROW_TILE)
+                    && output
+                        .rows
+                        .len
+                        .is_multiple_of(crate::comfy_quant::MXFP8_SCALE_ROW_TILE))
+            {
+                return Err(LogicalTransformError::PackedSliceAlignment {
+                    logical_key: output.logical_key.clone(),
+                    codec_id,
+                    rows: output.rows,
+                    align: crate::comfy_quant::MXFP8_SCALE_ROW_TILE,
+                });
+            }
+            if stored_rows == 0 || !source_bytes.is_multiple_of(stored_rows as u64) {
+                return Err(LogicalTransformError::PackedSliceNotByteAligned {
+                    logical_key: output.logical_key.clone(),
+                    codec_id,
+                    source_bytes,
+                    source_rows: stored_rows,
+                });
+            }
+        }
+    }
+
+    Ok(resolved)
 }
 
 /// The identity mapping for checkpoints already stored under canonical keys.
@@ -661,9 +1201,29 @@ pub struct LogicalTensorPlan {
     pub resident_encoding: WeightEncoding,
     pub codec: TensorCodecSpec,
     pub residency: PlannedResidency,
+    /// The adapter-declared transform this logical weight applies to its physical source (sc-21547),
+    /// or `None` for the ordinary one-to-one rename.
+    ///
+    /// When it is `Some`, several plan entries share one `physical_key`. Two consequences the
+    /// readers depend on: the file's physical-key surface is the **deduplicated** set of
+    /// [`LogicalWeightPlan::all_physical_keys`], and [`Self::source_bytes`] is carried by exactly
+    /// one output per physical tensor.
+    pub transform: Option<LogicalTensorTransform>,
 }
 
 impl LogicalTensorPlan {
+    /// The logical shape the codec decodes **before** this entry's transform: the physical tensor's
+    /// own geometry. Equal to [`Self::shape`] for an untransformed entry.
+    ///
+    /// Every backend decode arm that indexes the logical shape positionally must read it from here,
+    /// not from `shape` — `shape` is the post-slice shape the model sees, and handing it to a
+    /// whole-tensor dequantizer would decode the wrong geometry.
+    pub fn source_shape(&self) -> &[usize] {
+        match &self.transform {
+            Some(transform) => &transform.source_shape,
+            None => &self.shape,
+        }
+    }
     /// `Some(stored_shape)` when this entry is a **block-padded** codec row (MXFP8 or NVFP4) whose
     /// [`Self::shape`] is the padded *stored* grid only because the adapter's
     /// [`LogicalKeyMapping::logical_shape`] declared nothing — i.e. the plan does not know the
@@ -816,6 +1376,10 @@ impl LogicalWeightPlan {
     }
 
     /// Physical keys of the logical weights (companions excluded).
+    ///
+    /// **Not a set.** A tensor the adapter split with a [`LogicalTensorTransform`] contributes one
+    /// entry per logical output, all naming the same physical key, so a caller that wants the
+    /// file's tensor *surface* must deduplicate (see [`Self::all_physical_keys`]).
     pub fn physical_keys(&self) -> impl Iterator<Item = &str> {
         self.tensors
             .iter()
@@ -823,6 +1387,9 @@ impl LogicalWeightPlan {
     }
 
     /// Physical keys of everything the plan accounts for: weights and companions.
+    ///
+    /// May repeat a weight's key once per transformed logical output — deduplicate before
+    /// comparing it against a file's tensor set.
     pub fn all_physical_keys(&self) -> impl Iterator<Item = &str> {
         self.physical_keys().chain(
             self.companions
@@ -913,14 +1480,27 @@ impl LogicalWeightPlan {
                         // The stored encoding, exhaustively — NVFP4's nibbles already classify as
                         // `UInt8`, so no wildcard is needed to reach `U8`.
                         tensor.encoding.to_dtype(),
-                        match &tensor.codec {
-                            TensorCodecSpec::Mxfp8 { stored_shape, .. } => stored_shape.to_vec(),
-                            // NVFP4's resident packed form is the on-disk `U8` byte matrix
-                            // `[rows, cols / 2]`, not the logical element grid.
-                            TensorCodecSpec::Nvfp4 { stored_shape, .. } => {
-                                vec![stored_shape[0], stored_shape[1] / 2]
+                        {
+                            let mut stored = match &tensor.codec {
+                                TensorCodecSpec::Mxfp8 { stored_shape, .. } => {
+                                    stored_shape.to_vec()
+                                }
+                                // NVFP4's resident packed form is the on-disk `U8` byte matrix
+                                // `[rows, cols / 2]`, not the logical element grid.
+                                TensorCodecSpec::Nvfp4 { stored_shape, .. } => {
+                                    vec![stored_shape[0], stored_shape[1] / 2]
+                                }
+                                _ => tensor.shape.clone(),
+                            };
+                            // A transformed entry is resident as its *slice* of the stored grid, so
+                            // the header's `dtype x shape` keeps matching its `data_bytes`
+                            // (sc-21547). A packed slice never changes the trailing axes.
+                            if let (Some(transform), Some(rows)) =
+                                (tensor.transform.as_ref(), stored.first_mut())
+                            {
+                                *rows = transform.rows.len;
                             }
-                            _ => tensor.shape.clone(),
+                            stored
                         },
                     ),
                 };
@@ -1103,6 +1683,11 @@ pub enum LogicalWeightPlanError {
         /// The descriptor field names that disagree, in declaration order.
         disagreement: Vec<&'static str>,
     },
+    /// The adapter's declarative logical transform for this tensor is not compilable (sc-21547).
+    Transform {
+        physical_key: String,
+        error: LogicalTransformError,
+    },
 }
 
 impl fmt::Display for LogicalWeightPlanError {
@@ -1226,6 +1811,14 @@ impl fmt::Display for LogicalWeightPlanError {
                 tensor.full_precision_matrix_mult,
                 metadata,
                 disagreement.join(", ")
+            ),
+            Self::Transform {
+                physical_key,
+                error,
+            } => write!(
+                f,
+                "on-disk tensor {physical_key:?}: the family adapter's declared logical transform \
+                 is invalid: {error}"
             ),
         }
     }
@@ -1482,19 +2075,51 @@ pub fn compile_logical_weight_plan_with_metadata(
             continue;
         }
 
-        // A weight (or plain dense) tensor.
-        let logical_key = mapping.logical_key(&header.name).ok_or_else(|| {
-            LogicalWeightPlanError::UnmappedKey {
-                physical_key: header.name.clone(),
+        // A weight (or plain dense) tensor. The adapter either renames it one-to-one
+        // (`logical_key`) or declares a one-to-many transform (`logical_transform`, sc-21547); the
+        // two are alternatives, and a declaration carries its own source-shape statement.
+        let declaration = mapping.logical_transform(&header.name);
+        let declared_outputs: Vec<LogicalTransformOutput> = match &declaration {
+            Some(declaration) => declaration.outputs.clone(),
+            None => vec![LogicalTransformOutput::rename(
+                mapping.logical_key(&header.name).ok_or_else(|| {
+                    LogicalWeightPlanError::UnmappedKey {
+                        physical_key: header.name.clone(),
+                    }
+                })?,
+            )],
+        };
+        // Declaration-internal duplicates are named as such before the cross-tensor collision map
+        // sees them (where they would read as a tensor colliding with itself).
+        {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for output in &declared_outputs {
+                if !seen.insert(output.logical_key.as_str()) {
+                    return Err(LogicalWeightPlanError::Transform {
+                        physical_key: header.name.clone(),
+                        error: LogicalTransformError::DuplicateLogicalKey {
+                            logical_key: output.logical_key.clone(),
+                        },
+                    });
+                }
             }
-        })?;
-        if let Some(first) = owners.insert(logical_key.clone(), header.name.clone()) {
-            return Err(LogicalWeightPlanError::KeyCollision {
-                logical_key,
-                first_physical_key: first,
-                second_physical_key: header.name.clone(),
-            });
         }
+        for output in &declared_outputs {
+            if let Some(first) = owners.insert(output.logical_key.clone(), header.name.clone()) {
+                return Err(LogicalWeightPlanError::KeyCollision {
+                    logical_key: output.logical_key.clone(),
+                    first_physical_key: first,
+                    second_physical_key: header.name.clone(),
+                });
+            }
+        }
+        // The declared geometry of the tensor the codec decodes. For a transformed tensor this is
+        // the declaration's own statement — the outputs have no single logical key to key
+        // `logical_shape` on.
+        let declared_source_shape: Option<Vec<usize>> = match &declaration {
+            Some(declaration) => declaration.source_logical_shape.clone(),
+            None => mapping.logical_shape(&declared_outputs[0].logical_key),
+        };
         let encoding = WeightEncoding::from_dtype(header.dtype).ok_or_else(|| {
             LogicalWeightPlanError::UnclassifiedDtype {
                 physical_key: header.name.clone(),
@@ -1631,7 +2256,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                                 ),
                             });
                         }
-                        let declared = mapping.logical_shape(&logical_key);
+                        let declared = declared_source_shape.clone();
                         let logical = validate_mxfp8_geometry(
                             &header.shape,
                             &scale.shape,
@@ -1679,7 +2304,7 @@ pub fn compile_logical_weight_plan_with_metadata(
                                 ),
                             });
                         }
-                        let declared = mapping.logical_shape(&logical_key);
+                        let declared = declared_source_shape.clone();
                         let (stored, logical) = validate_nvfp4_geometry(
                             &header.shape,
                             &scale.shape,
@@ -1738,21 +2363,31 @@ pub fn compile_logical_weight_plan_with_metadata(
         } else {
             residency.residency(codec, &codec_spec, &header.shape)
         };
-        let resident_bytes = match mode {
-            ResidencyMode::Packed => header.data_bytes,
-            ResidencyMode::Dense => logical_shape
-                .iter()
-                .try_fold(1_u64, |count, dimension| {
-                    count.checked_mul(*dimension as u64)
-                })
-                .and_then(|count| count.checked_mul(codec.resident_encoding.element_bytes()))
-                .ok_or_else(|| LogicalWeightPlanError::GeometryMismatch {
-                    physical_key: header.name.clone(),
-                    encoding,
-                    declared_bytes: header.data_bytes,
-                    expected_bytes: u64::MAX,
-                })?,
-        };
+        // The adapter's declarative transform, resolved against this tensor's real geometry, its
+        // codec and the residency just chosen (sc-21547) — the last plan-time gate before the
+        // entries are emitted, and still before any tensor payload is read.
+        let outputs = resolve_logical_transform(
+            &declared_outputs,
+            &logical_shape,
+            header.shape.first().copied().unwrap_or(0),
+            codec.codec_id,
+            &codec_spec,
+            mode,
+            header.data_bytes,
+        )
+        .map_err(|error| LogicalWeightPlanError::Transform {
+            physical_key: header.name.clone(),
+            error,
+        })?;
+        let source_rows = logical_shape.first().copied().unwrap_or(0);
+        let stored_rows = header.shape.first().copied().unwrap_or(0);
+        // Every packed output owns its own copy of each retained **scalar** scale — those survive
+        // the decode as values on the materialized tensor, not as file rows — so a one-to-many
+        // transform retains one per output and the plan must price all of them (epic requirement
+        // E4's other half: no *under*-counting either). The block-scale surface does not multiply:
+        // a tile-aligned packed slice takes whole scale-factor atoms, so the per-output scale
+        // tensors partition the stored one exactly.
+        let scalar_scale_copies = outputs.len() as u64;
 
         // Record the layer's companions with the residency the mode implies.
         if let Some(base) = base {
@@ -1773,7 +2408,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let ScalarScaleSource::Companion { physical_key } = scale {
                         let scale_header = by_name[physical_key.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => scale_header.data_bytes,
+                            ResidencyMode::Packed => {
+                                scale_header.data_bytes.saturating_mul(scalar_scale_copies)
+                            }
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -1786,7 +2423,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                     if let Some(input_scale) = input_scale {
                         let input_header = by_name[input_scale.as_str()];
                         let retained = match mode {
-                            ResidencyMode::Packed => input_header.data_bytes,
+                            ResidencyMode::Packed => {
+                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
+                            }
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -1813,8 +2452,16 @@ pub fn compile_logical_weight_plan_with_metadata(
                     ] {
                         let Some(key) = key else { continue };
                         let companion_header = by_name[key];
+                        // The two scalar levels are retained once per logical output; the swizzled
+                        // block-scale surface partitions across them instead (sc-21547).
+                        let copies = match role {
+                            CompanionRole::WeightScale => 1,
+                            _ => scalar_scale_copies,
+                        };
                         let retained = match mode {
-                            ResidencyMode::Packed => companion_header.data_bytes,
+                            ResidencyMode::Packed => {
+                                companion_header.data_bytes.saturating_mul(copies)
+                            }
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(companion_header, role, &header.name, retained);
@@ -1841,7 +2488,9 @@ pub fn compile_logical_weight_plan_with_metadata(
                         // half of this arm can get here — the companion-surface check above refuses
                         // an `input_scale` on an `int8_tensorwise` layer by format.)
                         let retained = match mode {
-                            ResidencyMode::Packed => input_header.data_bytes,
+                            ResidencyMode::Packed => {
+                                input_header.data_bytes.saturating_mul(scalar_scale_copies)
+                            }
                             ResidencyMode::Dense => 0,
                         };
                         consume_companion(
@@ -1855,20 +2504,60 @@ pub fn compile_logical_weight_plan_with_metadata(
             }
         }
 
-        tensors.push(LogicalTensorPlan {
-            logical_key,
-            physical_key: header.name.clone(),
-            encoding,
-            shape: logical_shape,
-            source_bytes: header.data_bytes,
-            codec_id: codec.codec_id,
-            resident_encoding: codec.resident_encoding,
-            codec: codec_spec,
-            residency: PlannedResidency {
-                mode,
-                resident_bytes,
-            },
-        });
+        // One plan entry per logical output. The physical tensor's **source bytes are counted
+        // once** (epic requirement E4): the first output in declaration order carries them and its
+        // siblings carry zero, so a receipt that totals `source_bytes` over materialized tensors
+        // still totals the file exactly once. Resident bytes are attributed per output, and --
+        // because the outputs partition the leading axis -- they sum to the whole tensor's pricing.
+        for (position, output) in outputs.into_iter().enumerate() {
+            let mut shape = logical_shape.clone();
+            if let Some(rows) = shape.first_mut() {
+                *rows = output.rows.len;
+            }
+            let resident_bytes = match mode {
+                // A packed output is resident as its share of the stored payload; the identity
+                // takes the stored byte count verbatim rather than re-deriving it.
+                ResidencyMode::Packed => {
+                    if output.is_identity(source_rows) || stored_rows == 0 {
+                        header.data_bytes
+                    } else {
+                        header.data_bytes / stored_rows as u64 * output.rows.len as u64
+                    }
+                }
+                ResidencyMode::Dense => shape
+                    .iter()
+                    .try_fold(1_u64, |count, dimension| {
+                        count.checked_mul(*dimension as u64)
+                    })
+                    .and_then(|count| count.checked_mul(codec.resident_encoding.element_bytes()))
+                    .ok_or_else(|| LogicalWeightPlanError::GeometryMismatch {
+                        physical_key: header.name.clone(),
+                        encoding,
+                        declared_bytes: header.data_bytes,
+                        expected_bytes: u64::MAX,
+                    })?,
+            };
+            let transform = (!output.is_identity(source_rows)).then(|| LogicalTensorTransform {
+                source_shape: logical_shape.clone(),
+                rows: output.rows,
+                half_swap: output.half_swap,
+            });
+            tensors.push(LogicalTensorPlan {
+                logical_key: output.logical_key,
+                physical_key: header.name.clone(),
+                encoding,
+                shape,
+                source_bytes: if position == 0 { header.data_bytes } else { 0 },
+                codec_id: codec.codec_id,
+                resident_encoding: codec.resident_encoding,
+                codec: codec_spec.clone(),
+                residency: PlannedResidency {
+                    mode,
+                    resident_bytes,
+                },
+                transform,
+            });
+        }
     }
 
     // Every companion in the file must have been claimed by exactly one planned layer.
@@ -3446,5 +4135,442 @@ mod tests {
             resident[0].data_bytes
         );
         assert_eq!(resident[0].data_bytes, 4 * 8 * 4);
+    }
+
+    // ---- adapter-declared logical transforms (sc-21547) ---------------------------------------
+    //
+    // Fused checkpoint layouts (a fused-QKV projection; a diffusers-vs-ComfyUI AdaLN modulation)
+    // are one physical tensor and several logical weights. The adapter declares the re-labelling;
+    // the shared compiler validates it against the tensor's real geometry, codec and residency and
+    // prices every output. Nothing below reads a byte of tensor payload — that is the point.
+
+    /// A mapping that answers with whatever declaration the test installs for a physical key.
+    struct DeclaredTransforms {
+        transforms: BTreeMap<String, LogicalTransformDeclaration>,
+    }
+
+    impl DeclaredTransforms {
+        fn new(
+            transforms: impl IntoIterator<Item = (&'static str, LogicalTransformDeclaration)>,
+        ) -> Self {
+            Self {
+                transforms: transforms
+                    .into_iter()
+                    .map(|(key, declaration)| (key.to_owned(), declaration))
+                    .collect(),
+            }
+        }
+    }
+
+    impl LogicalKeyMapping for DeclaredTransforms {
+        fn mapping_id(&self) -> &'static str {
+            "declared-transforms-test"
+        }
+        fn logical_key(&self, physical_key: &str) -> Option<String> {
+            physical_key.strip_prefix("model.").map(str::to_owned)
+        }
+        fn logical_transform(&self, physical_key: &str) -> Option<LogicalTransformDeclaration> {
+            self.transforms.get(physical_key).cloned()
+        }
+    }
+
+    /// A policy that keeps every quantized row packed — the residency half of the transform rules
+    /// only has teeth against a backend that actually plans `Packed`.
+    struct AlwaysPacked;
+
+    impl CodecResidencyPolicy for AlwaysPacked {
+        fn residency(
+            &self,
+            _codec: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            _stored_shape: &[usize],
+        ) -> ResidencyMode {
+            if spec.full_precision_matrix_mult() || matches!(spec, TensorCodecSpec::Dense) {
+                ResidencyMode::Dense
+            } else {
+                ResidencyMode::Packed
+            }
+        }
+    }
+
+    /// The transform error a declaration produces for `model.w`, or a panic naming what it did
+    /// instead. Every one of these must be raised at *plan* time.
+    fn transform_defect(
+        headers: &[SafetensorsTensorHeader],
+        declaration: LogicalTransformDeclaration,
+    ) -> LogicalTransformError {
+        let mapping = DeclaredTransforms::new([("model.w", declaration)]);
+        match compile(headers, &no_descriptors(), &mapping, &baseline()) {
+            Err(LogicalWeightPlanError::Transform {
+                physical_key,
+                error,
+            }) => {
+                assert_eq!(physical_key, "model.w");
+                error
+            }
+            other => panic!("expected a transform refusal, got {other:?}"),
+        }
+    }
+
+    /// A fused-QKV row split: one `[96, 8]` matrix becomes three `[32, 8]` logical weights whose
+    /// keys and shapes are exactly the compiled plan's, whose resident pricing sums to the whole
+    /// tensor's, and whose **source bytes are counted once**.
+    #[test]
+    fn a_declared_row_split_publishes_priced_logical_outputs_and_counts_source_bytes_once() {
+        let headers = [header("model.w", Dtype::BF16, &[96, 8])];
+        let mapping = DeclaredTransforms::new([(
+            "model.w",
+            LogicalTransformDeclaration::new(vec![
+                LogicalTransformOutput::row_slice("attn.q", 0, 32),
+                LogicalTransformOutput::row_slice("attn.k", 32, 32),
+                LogicalTransformOutput::row_slice("attn.v", 64, 32),
+            ]),
+        )]);
+        let plan = compile(&headers, &no_descriptors(), &mapping, &baseline()).expect("plan");
+
+        assert_eq!(
+            plan.logical_keys().collect::<Vec<_>>(),
+            ["attn.k", "attn.q", "attn.v"],
+            "the plan is sorted by logical key"
+        );
+        for tensor in &plan.tensors {
+            assert_eq!(tensor.physical_key, "model.w");
+            assert_eq!(tensor.shape, vec![32, 8]);
+            assert_eq!(tensor.source_shape(), [96, 8]);
+            assert_eq!(tensor.residency.resident_bytes, 32 * 8 * 2);
+        }
+        let by_key: BTreeMap<&str, &LogicalTensorPlan> = plan
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.logical_key.as_str(), tensor))
+            .collect();
+        assert_eq!(
+            by_key["attn.k"].transform.as_ref().map(|t| t.rows),
+            Some(RowRange::new(32, 32))
+        );
+        assert!(by_key["attn.v"]
+            .transform
+            .as_ref()
+            .is_some_and(|t| !t.half_swap));
+
+        // E4: the physical tensor's bytes appear exactly once across the three entries, and the
+        // plan's own file total is untouched by the fan-out.
+        assert_eq!(
+            plan.tensors
+                .iter()
+                .map(|tensor| tensor.source_bytes)
+                .sum::<u64>(),
+            96 * 8 * 2
+        );
+        assert_eq!(plan.source_bytes, 96 * 8 * 2);
+        assert_eq!(plan.resident_bytes(), 96 * 8 * 2);
+        // Three logical weights, one physical tensor.
+        assert_eq!(plan.tensor_count(), 3);
+        assert_eq!(
+            plan.all_physical_keys().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["model.w"])
+        );
+    }
+
+    /// The AdaLN case: the whole tensor under one key, with its two halves exchanged. The shape is
+    /// unchanged, so only the transform records that the rows moved.
+    #[test]
+    fn a_declared_half_swap_keeps_the_shape_and_records_the_permutation() {
+        let headers = [header("model.w", Dtype::BF16, &[8, 4])];
+        let mapping = DeclaredTransforms::new([(
+            "model.w",
+            LogicalTransformDeclaration::new(vec![LogicalTransformOutput::half_swap(
+                "norm.modulation",
+            )]),
+        )]);
+        let plan = compile(&headers, &no_descriptors(), &mapping, &baseline()).expect("plan");
+        let tensor = &plan.tensors[0];
+        assert_eq!(tensor.logical_key, "norm.modulation");
+        assert_eq!(tensor.shape, vec![8, 4]);
+        let transform = tensor
+            .transform
+            .as_ref()
+            .expect("a swap is not the identity");
+        assert!(transform.half_swap);
+        assert_eq!(transform.rows, RowRange::new(0, 8));
+        assert_eq!(plan.resident_bytes(), 8 * 4 * 2);
+    }
+
+    /// A declaration that resolves to "the whole tensor, unpermuted" is an ordinary rename: it must
+    /// plan with **no** transform, so every existing consumer of an untransformed plan is untouched.
+    #[test]
+    fn a_declared_whole_tensor_rename_plans_as_the_identity() {
+        let headers = [header("model.w", Dtype::BF16, &[8, 4])];
+        for declaration in [
+            LogicalTransformDeclaration::new(vec![LogicalTransformOutput::rename("w")]),
+            LogicalTransformDeclaration::new(vec![LogicalTransformOutput::row_slice("w", 0, 8)]),
+        ] {
+            let mapping = DeclaredTransforms::new([("model.w", declaration)]);
+            let plan = compile(&headers, &no_descriptors(), &mapping, &baseline()).expect("plan");
+            assert_eq!(plan.tensors[0].logical_key, "w");
+            assert_eq!(plan.tensors[0].transform, None);
+            assert_eq!(plan.tensors[0].source_shape(), [8, 4]);
+        }
+    }
+
+    /// Every malformed declaration refuses, by name, before any tensor payload could be read. These
+    /// are the mutations of the fused-QKV split above: each one is a plausible off-by-one in an
+    /// adapter and each one would otherwise corrupt or silently drop weights.
+    #[test]
+    fn malformed_transform_declarations_refuse_at_plan_time() {
+        let headers = [header("model.w", Dtype::BF16, &[96, 8])];
+        let split = |q: (usize, usize), k: (usize, usize), v: (usize, usize)| {
+            LogicalTransformDeclaration::new(vec![
+                LogicalTransformOutput::row_slice("attn.q", q.0, q.1),
+                LogicalTransformOutput::row_slice("attn.k", k.0, k.1),
+                LogicalTransformOutput::row_slice("attn.v", v.0, v.1),
+            ])
+        };
+
+        // Overlap: `k` starts one row early, so row 31 would be published twice.
+        assert_eq!(
+            transform_defect(&headers, split((0, 32), (31, 33), (64, 32))),
+            LogicalTransformError::SliceOverlap {
+                first_logical_key: "attn.q".to_owned(),
+                first: RowRange::new(0, 32),
+                second_logical_key: "attn.k".to_owned(),
+                second: RowRange::new(31, 33),
+            }
+        );
+        // Gap: a short `q` leaves row 31 unclaimed — a silent drop, not a shape error.
+        assert_eq!(
+            transform_defect(&headers, split((0, 31), (32, 32), (64, 32))),
+            LogicalTransformError::SliceGap {
+                first_uncovered_row: 31,
+                next_logical_key: Some("attn.k".to_owned()),
+                source_rows: 96,
+            }
+        );
+        // Short by a whole slice at the end.
+        assert_eq!(
+            transform_defect(
+                &headers,
+                LogicalTransformDeclaration::new(vec![
+                    LogicalTransformOutput::row_slice("attn.q", 0, 32),
+                    LogicalTransformOutput::row_slice("attn.k", 32, 32),
+                ])
+            ),
+            LogicalTransformError::SliceGap {
+                first_uncovered_row: 64,
+                next_logical_key: None,
+                source_rows: 96,
+            }
+        );
+        // Out of bounds.
+        assert_eq!(
+            transform_defect(&headers, split((0, 32), (32, 32), (64, 40))),
+            LogicalTransformError::SliceOutOfBounds {
+                logical_key: "attn.v".to_owned(),
+                rows: RowRange::new(64, 40),
+                source_rows: 96,
+            }
+        );
+        // Zero-length.
+        assert_eq!(
+            transform_defect(&headers, split((0, 0), (0, 32), (32, 64))),
+            LogicalTransformError::EmptySlice {
+                logical_key: "attn.q".to_owned()
+            }
+        );
+        // Two outputs of one declaration under one key.
+        assert_eq!(
+            transform_defect(
+                &headers,
+                LogicalTransformDeclaration::new(vec![
+                    LogicalTransformOutput::row_slice("attn.q", 0, 48),
+                    LogicalTransformOutput::row_slice("attn.q", 48, 48),
+                ])
+            ),
+            LogicalTransformError::DuplicateLogicalKey {
+                logical_key: "attn.q".to_owned()
+            }
+        );
+        // A half swap needs two halves.
+        assert_eq!(
+            transform_defect(
+                &headers,
+                LogicalTransformDeclaration::new(vec![
+                    LogicalTransformOutput::row_slice("attn.q", 0, 31).with_half_swap(),
+                    LogicalTransformOutput::row_slice("attn.k", 31, 65),
+                ])
+            ),
+            LogicalTransformError::HalfSwapOddRows {
+                logical_key: "attn.q".to_owned(),
+                rows: 31,
+            }
+        );
+        // A declaration that publishes nothing.
+        assert_eq!(
+            transform_defect(&headers, LogicalTransformDeclaration::new(Vec::new())),
+            LogicalTransformError::NoOutputs
+        );
+        // A rank-0 tensor has no rows to slice.
+        assert_eq!(
+            transform_defect(
+                &[header("model.w", Dtype::BF16, &[])],
+                LogicalTransformDeclaration::new(vec![LogicalTransformOutput::row_slice(
+                    "scalar", 0, 1
+                )])
+            ),
+            LogicalTransformError::SourceNotSliceable {
+                logical_key: "scalar".to_owned(),
+                source_shape: Vec::new(),
+            }
+        );
+    }
+
+    /// A transform output that collides with **another** tensor's logical key is the ordinary
+    /// collision, reported as such (the mapping is not injective over the file).
+    #[test]
+    fn a_transform_output_that_collides_with_another_tensor_refuses_as_a_collision() {
+        let headers = [
+            header("model.w", Dtype::BF16, &[4, 8]),
+            header("model.attn.q", Dtype::BF16, &[2, 8]),
+        ];
+        let mapping = DeclaredTransforms::new([(
+            "model.w",
+            LogicalTransformDeclaration::new(vec![
+                LogicalTransformOutput::row_slice("attn.q", 0, 2),
+                LogicalTransformOutput::row_slice("attn.k", 2, 2),
+            ]),
+        )]);
+        assert!(matches!(
+            compile(&headers, &no_descriptors(), &mapping, &baseline()),
+            Err(LogicalWeightPlanError::KeyCollision { ref logical_key, .. })
+                if logical_key == "attn.q"
+        ));
+    }
+
+    /// An NVFP4 layer this backend keeps packed, split into two logical operands.
+    ///
+    /// The split is tile-aligned, so each output keeps its own share of the nibble payload and its
+    /// own whole scale-factor atoms: the tensor rows partition the stored bytes exactly, the
+    /// swizzled block-scale surface partitions rather than multiplies, and the two **scalar** scale
+    /// levels are retained once per output because each packed operand owns a copy.
+    #[test]
+    fn a_packed_nvfp4_row_split_prices_every_scale_level_exactly_once_per_owner() {
+        let headers = [
+            header("model.qkv.weight", Dtype::U8, &[256, 128]),
+            header("model.qkv.weight_scale", Dtype::F8_E4M3, &[256, 16]),
+            header("model.qkv.weight_scale_2", Dtype::F32, &[]),
+        ];
+        let metadata = r#"{"format_version": "1.0", "layers": {"qkv": {"format": "nvfp4"}}}"#;
+        let mapping = DeclaredTransforms::new([(
+            "model.qkv.weight",
+            LogicalTransformDeclaration::new(vec![
+                LogicalTransformOutput::row_slice("attn.q", 0, 128),
+                LogicalTransformOutput::row_slice("attn.k", 128, 128),
+            ])
+            .with_source_logical_shape(vec![256, 256]),
+        )]);
+        let plan = compile_logical_weight_plan_with_metadata(
+            &headers,
+            &no_descriptors(),
+            Some(metadata),
+            &mapping,
+            &full(),
+            &AlwaysPacked,
+        )
+        .expect("plan");
+
+        assert_eq!(plan.tensor_count(), 2);
+        for tensor in &plan.tensors {
+            assert_eq!(tensor.codec_id, NVFP4_CODEC.codec_id);
+            assert_eq!(tensor.residency.mode, ResidencyMode::Packed);
+            assert_eq!(tensor.shape, vec![128, 256]);
+            assert_eq!(tensor.source_shape(), [256, 256]);
+            // Half of the stored nibble payload each.
+            assert_eq!(tensor.residency.resident_bytes, 256 * 128 / 2);
+        }
+        let retained: BTreeMap<&str, u64> = plan
+            .companions
+            .iter()
+            .map(|companion| (companion.physical_key.as_str(), companion.resident_bytes))
+            .collect();
+        assert_eq!(
+            retained["model.qkv.weight_scale"],
+            256 * 16,
+            "the swizzled block scales partition across the outputs, they do not multiply"
+        );
+        assert_eq!(
+            retained["model.qkv.weight_scale_2"],
+            2 * 4,
+            "each packed operand owns its own copy of the per-tensor scale"
+        );
+        assert_eq!(plan.resident_bytes(), 256 * 128 + 256 * 16 + 2 * 4);
+        // Source bytes are still the file's, counted once.
+        assert_eq!(plan.source_bytes, 256 * 128 + 256 * 16 + 4);
+        assert_eq!(
+            plan.tensors
+                .iter()
+                .map(|tensor| tensor.source_bytes)
+                .sum::<u64>(),
+            256 * 128
+        );
+    }
+
+    /// The block-alignment rule the story names: a packed NVFP4 slice whose boundary cuts a
+    /// scale-factor atom refuses, and a half swap of packed rows refuses, because either would have
+    /// to re-derive the codec's scale surface. The same file plans fine under a dense policy — the
+    /// rule is about the packed representation, not the declaration.
+    #[test]
+    fn a_packed_block_scaled_slice_must_respect_the_scale_row_tile() {
+        let headers = [
+            header("model.qkv.weight", Dtype::U8, &[256, 128]),
+            header("model.qkv.weight_scale", Dtype::F8_E4M3, &[256, 16]),
+            header("model.qkv.weight_scale_2", Dtype::F32, &[]),
+        ];
+        let metadata = r#"{"format_version": "1.0", "layers": {"qkv": {"format": "nvfp4"}}}"#;
+        let misaligned = LogicalTransformDeclaration::new(vec![
+            LogicalTransformOutput::row_slice("attn.q", 0, 64),
+            LogicalTransformOutput::row_slice("attn.k", 64, 192),
+        ])
+        .with_source_logical_shape(vec![256, 256]);
+        let compile_with = |declaration: LogicalTransformDeclaration,
+                            policy: &dyn CodecResidencyPolicy| {
+            compile_logical_weight_plan_with_metadata(
+                &headers,
+                &no_descriptors(),
+                Some(metadata),
+                &DeclaredTransforms::new([("model.qkv.weight", declaration)]),
+                &full(),
+                policy,
+            )
+        };
+
+        match compile_with(misaligned.clone(), &AlwaysPacked) {
+            Err(LogicalWeightPlanError::Transform { error, .. }) => assert_eq!(
+                error,
+                LogicalTransformError::PackedSliceAlignment {
+                    logical_key: "attn.q".to_owned(),
+                    codec_id: NVFP4_CODEC.codec_id,
+                    rows: RowRange::new(0, 64),
+                    align: crate::comfy_quant::MXFP8_SCALE_ROW_TILE,
+                }
+            ),
+            other => panic!("expected an alignment refusal, got {other:?}"),
+        }
+        // Dequantized first, the same split is an ordinary row slice.
+        let dense = compile_with(misaligned, &DenseResidencyPolicy).expect("dense plan");
+        assert_eq!(dense.tensors.len(), 2);
+
+        let swapped =
+            LogicalTransformDeclaration::new(vec![LogicalTransformOutput::half_swap("attn.qkv")])
+                .with_source_logical_shape(vec![256, 256]);
+        match compile_with(swapped, &AlwaysPacked) {
+            Err(LogicalWeightPlanError::Transform { error, .. }) => assert_eq!(
+                error,
+                LogicalTransformError::HalfSwapOnPackedResidency {
+                    logical_key: "attn.qkv".to_owned(),
+                    codec_id: NVFP4_CODEC.codec_id,
+                }
+            ),
+            other => panic!("expected a packed half-swap refusal, got {other:?}"),
+        }
     }
 }

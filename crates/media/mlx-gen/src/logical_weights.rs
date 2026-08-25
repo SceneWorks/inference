@@ -163,6 +163,25 @@ pub fn read_logical_weights(
     plan: &LogicalWeightPlan,
     mode: LogicalReadMode<'_>,
 ) -> Result<LogicalWeights> {
+    // Adapter-declared logical transforms (sc-21547) are a Candle-side capability today: this
+    // reader removes each physical tensor from the map as it decodes, so a one-to-many entry would
+    // find its source already taken. Refuse by name rather than fail as a missing tensor — a
+    // transformed plan is not a plan this engine can honour, and silently reading only the first
+    // output would hand the model a fused matrix under a split key's name.
+    if let Some(transformed) = plan
+        .tensors
+        .iter()
+        .find(|tensor| tensor.transform.is_some())
+    {
+        return Err(Error::Msg(format!(
+            "logical weight read of {}: logical key {:?} is a declared transform of physical \
+             tensor {:?}, which this engine's reader does not implement; plan this checkpoint with \
+             a mapping that declares no logical transforms",
+            path.display(),
+            transformed.logical_key,
+            transformed.physical_key,
+        )));
+    }
     let mut physical = load_planned_file(path)?;
     let mut on_disk: Vec<&str> = physical.keys().map(String::as_str).collect();
     on_disk.sort_unstable();
@@ -2193,6 +2212,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: Vec::new(),
             source_bytes: 4,
@@ -2241,6 +2261,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: vec![CompanionTensorPlan {
                 physical_key: "model.w.weight_scale".to_owned(),
@@ -2305,6 +2326,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: Vec::new(),
             source_bytes: 2,

@@ -306,6 +306,59 @@ impl Nvfp4Tensor {
         })
     }
 
+    /// A contiguous **row slice** of this container, without dequantizing anything (sc-21547).
+    ///
+    /// This is what a fused-QKV checkpoint needs: one stored `[3·d, d]` NVFP4 matrix becomes three
+    /// `[d, d]` operands, each still packed. The nibble payload is row-major, so its slice is a
+    /// contiguous byte range; the block scales are **re-emitted** through
+    /// [`Self::scale_offset_for`] against the slice's own `sf_rows` rather than copied, because the
+    /// 128×4 swizzle interleaves rows within an atom and the destination has a different atom grid.
+    ///
+    /// `start` and `len` must both be multiples of [`SF_ATOM_ROWS`]. That is not a convenience
+    /// restriction: a slice that cut a scale-factor atom in half would leave the source's scale
+    /// bytes split across two padded destination tensors whose sizes no longer sum to the source's,
+    /// so the residency the plan priced and the residency the reader measures would disagree by the
+    /// padding. A tile-aligned slice takes whole atoms and the sizes partition exactly. The plan
+    /// compiler refuses a misaligned slice before any payload is read
+    /// (`LogicalTransformError::PackedSliceAlignment`); this is the container's own restatement of
+    /// the same rule, because the container is public and its callers are not all the reader.
+    pub fn slice_rows(&self, start: usize, len: usize) -> Result<Self> {
+        if len == 0 || start.saturating_add(len) > self.rows {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 row slice [{start}, {start}+{len}) is out of bounds for a {}-row tensor",
+                self.rows
+            )));
+        }
+        if !start.is_multiple_of(SF_ATOM_ROWS) || !len.is_multiple_of(SF_ATOM_ROWS) {
+            return Err(candle_core::Error::Msg(format!(
+                "nvfp4 row slice [{start}, {start}+{len}) must start and end on a multiple of \
+                 {SF_ATOM_ROWS} (the cuBLAS block-scale row tile) so it takes whole scale-factor \
+                 atoms"
+            )));
+        }
+        let row_bytes = self.cols_padded / 2;
+        let packed = self.packed[start * row_bytes..(start + len) * row_bytes].to_vec();
+        let blocks = self.blocks_per_row();
+        let sf_rows = round_up(len, SF_ATOM_ROWS);
+        let mut scales = vec![0u8; sf_rows * self.sf_cols];
+        for row in 0..len {
+            for blk in 0..blocks {
+                scales[Self::scale_offset_for(row, blk, sf_rows)] =
+                    self.scales[self.scale_offset(start + row, blk)];
+            }
+        }
+        Ok(Self {
+            rows: len,
+            cols: self.cols,
+            cols_padded: self.cols_padded,
+            packed,
+            scales,
+            sf_rows,
+            sf_cols: self.sf_cols,
+            global_scale: self.global_scale,
+        })
+    }
+
     /// Number of 16-element blocks per row (`cols_padded / 16`).
     #[inline]
     pub fn blocks_per_row(&self) -> usize {
@@ -545,6 +598,49 @@ mod tests {
         assert_eq!(e2m1_from_f32(-1.0) & 0x08, 0x08);
         // Ties-to-even at 2.5 (between 2.0@idx4 and 3.0@idx5) → even index 4 → 2.0.
         assert_eq!(E2M1_LUT[e2m1_from_f32(2.5) as usize], 2.0);
+    }
+
+    /// sc-21547. A fused checkpoint stores one matrix where the model wants several, so the
+    /// container must be sliceable **without dequantizing**: each slice keeps its own nibbles and
+    /// its own re-emitted block scales, and the slices' padded scale surfaces partition the
+    /// source's rather than duplicating it. A boundary that cut a scale-factor atom would break
+    /// that partition, so it refuses.
+    #[test]
+    fn a_row_slice_is_lossless_and_refuses_a_boundary_that_cuts_a_scale_atom() -> Result<()> {
+        let (rows, cols) = (256_usize, 64_usize);
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index % 97) as f32 - 48.0) / 16.0)
+            .collect();
+        let tensor = Nvfp4Tensor::pack_from_slice(&data, rows, cols)?;
+        let whole = tensor.dequantize_to_vec();
+
+        let top = tensor.slice_rows(0, 128)?;
+        let bottom = tensor.slice_rows(128, 128)?;
+        assert_eq!((top.rows, top.cols), (128, cols));
+        assert_eq!(top.global_scale, tensor.global_scale);
+        assert_eq!(
+            top.scales.len() + bottom.scales.len(),
+            tensor.scales.len(),
+            "tile-aligned slices take whole atoms, so their padded scale surfaces partition the \
+             source's"
+        );
+        assert_eq!(
+            top.packed.len() + bottom.packed.len(),
+            tensor.packed.len(),
+            "and the nibble payload partitions with them"
+        );
+        assert_eq!(top.dequantize_to_vec(), whole[..128 * cols]);
+        assert_eq!(bottom.dequantize_to_vec(), whole[128 * cols..]);
+
+        for (start, len) in [(0, 64), (64, 128), (0, 0)] {
+            let error = tensor
+                .slice_rows(start, len)
+                .expect_err("a misaligned or empty slice must refuse")
+                .to_string();
+            assert!(error.contains("nvfp4 row slice"), "{error}");
+        }
+        assert!(tensor.slice_rows(128, 256).is_err(), "out of bounds");
+        Ok(())
     }
 
     #[test]
