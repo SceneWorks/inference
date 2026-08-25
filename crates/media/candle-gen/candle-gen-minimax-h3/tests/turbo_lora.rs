@@ -2221,10 +2221,10 @@ fn trainer_dit_path() -> PathBuf {
     path
 }
 
-/// The independent receipt oracle deliberately promotes its comparison math to F32. Production
-/// stays native (the real DiT probe is BF16); this boundary only prevents Candle from rejecting a
-/// BF16 probe multiplied by the raw trainer factors, which are F32 in the exact artifact.
-fn independent_lora_residual_f32(
+/// The independent receipt oracle mirrors the native residual arithmetic without calling the
+/// conversion or installer: raw factors are cast to the probe's dtype before both GEMMs, then the
+/// scale is applied in that native dtype. Production keeps its own casts and add/subtract path.
+fn independent_lora_residual_native(
     x: &Tensor,
     down: &Tensor,
     q_up: &Tensor,
@@ -2232,15 +2232,8 @@ fn independent_lora_residual_f32(
     output_features: usize,
     scale: f32,
 ) -> Tensor {
-    let x = x
-        .to_dtype(DType::F32)
-        .expect("independent oracle input promoted to F32");
-    let down = down
-        .to_dtype(DType::F32)
-        .expect("independent oracle down factor at F32");
-    let q_up = q_up
-        .to_dtype(DType::F32)
-        .expect("independent oracle up factor at F32");
+    let down = independent_factor_at_activation_dtype(x, down);
+    let q_up = independent_factor_at_activation_dtype(x, q_up);
     x.reshape((x.elem_count() / hidden_size, hidden_size))
         .unwrap()
         .matmul(&down.t().unwrap().contiguous().unwrap())
@@ -2253,27 +2246,46 @@ fn independent_lora_residual_f32(
         .unwrap()
 }
 
+/// Candle's CPU backend does not implement BF16 matmul, so the CPU arm pins the exact cast and
+/// Q-slice inputs; the ignored CUDA receipt compares the installed delta against this oracle.
 #[test]
-fn independent_trainer_oracle_promotes_bf16_probe_against_f32_factors() {
+fn shared_a_fused_qkv_oracle_casts_raw_f32_factors_to_bf16_probe_dtype() {
     let cfg = dit_fixture_config();
+    let down = tensor(&[16, cfg.hidden_size], 0.123);
+    let fused_up = tensor(&[3 * cfg.inner_dim(), 16], 0.987);
     let x = bf16(&tensor(&[1, 3, cfg.hidden_size], 0.21028));
-    let down = tensor(&[16, cfg.hidden_size], 0.31);
-    let q_up = tensor(&[cfg.inner_dim(), 16], 0.71);
-    let actual = independent_lora_residual_f32(
-        &x,
-        &down,
-        &q_up,
-        cfg.hidden_size,
-        cfg.inner_dim(),
-        SC21028_RUNTIME_ADAPTER_SCALE,
-    );
-    assert_eq!(actual.dtype(), DType::F32);
+    let q_up = fused_up
+        .narrow(0, 0, cfg.inner_dim())
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let k_up = fused_up
+        .narrow(0, cfg.inner_dim(), cfg.inner_dim())
+        .unwrap()
+        .contiguous()
+        .unwrap();
     assert!(
-        actual.to_vec3::<f32>().unwrap()[0][0]
-            .iter()
-            .all(|value| value.is_finite()),
-        "mixed BF16/F32 independent oracle must remain finite"
+        rel_max_abs(&q_up, &k_up) > 1e-2,
+        "synthetic Q and K slices must be independently distinguishable"
     );
+    let native_down = independent_factor_at_activation_dtype(&x, &down);
+    let native_q_up = independent_factor_at_activation_dtype(&x, &q_up);
+    assert_eq!(native_down.dtype(), DType::BF16);
+    assert_eq!(native_q_up.dtype(), DType::BF16);
+    assert_eq!(
+        SC21028_RUNTIME_ADAPTER_SCALE, 0.5,
+        "the runtime receipt must retain its non-unit strength"
+    );
+    assert!(
+        rel_max_abs(&native_down.to_dtype(DType::F32).unwrap(), &down) > 1e-6,
+        "synthetic raw factors must not already be BF16-exact"
+    );
+}
+
+fn independent_factor_at_activation_dtype(x: &Tensor, factor: &Tensor) -> Tensor {
+    factor
+        .to_dtype(x.dtype())
+        .expect("independent oracle factor at probe dtype")
 }
 
 /// Independent oracle for the exact probe residual. It operates directly on the raw fused-QKV
@@ -2319,7 +2331,7 @@ fn exact_trainer_q_probe_residual(
         .expect("take the Q row block independently")
         .to_device(device)
         .unwrap();
-    independent_lora_residual_f32(
+    independent_lora_residual_native(
         x,
         &down,
         &q_up,
