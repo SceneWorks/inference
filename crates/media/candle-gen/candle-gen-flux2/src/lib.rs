@@ -48,6 +48,7 @@ pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
 pub mod quant;
+pub mod single_file;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
@@ -59,6 +60,7 @@ pub use config::SIZE_MULTIPLE;
 pub use control_provider::{Flux2Control, Flux2ControlPaths, Flux2ControlRequest};
 pub use convert::convert_and_assemble;
 pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
+pub use single_file::Flux2BflToDiffusersMapping;
 pub use transformer::{
     Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, CONTROL_IN_DIM,
 };
@@ -67,7 +69,7 @@ pub use transformer::{
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-caption-upsample-v2";
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -251,6 +253,18 @@ pub(crate) struct Pipeline {
     /// encoder / VAE / tokenizer still come from the resident snapshot `root`. `None` on every other
     /// path (registry txt2img, edit, control).
     pub(crate) comfyui_dit: Option<PinnedWeightsFile>,
+    /// A klein universal **single-file** DiT (epic 11037, sc-21485): a transformer-only BFL-keyed
+    /// `.safetensors` (dense bf16 or `.comfy_quant`-described NVFP4-mixed) consumed through the
+    /// shared logical-weight plan + declarative transforms instead of a provider-local converter.
+    /// The text encoder / VAE / tokenizer still come from the resident klein snapshot `root`.
+    /// `None` on every other path.
+    pub(crate) klein_dit: Option<PinnedWeightsFile>,
+    /// The klein single-file import's three correlated checkpoint facts (sc-21484 / epic E8), bound
+    /// to the verified source pin and filled once by [`Self::load_klein_planned_dit`]. Shared
+    /// (`Arc`) so a `Pipeline` clone observes the same cell, and empty on every non-klein-file
+    /// route — a directory load has no single source to bind facts to. Read through
+    /// [`Flux2Generator::checkpoint_weight_facts`].
+    pub(crate) klein_facts: Arc<OnceLock<gen_core::checkpoint_facts::CheckpointWeightFacts>>,
     pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
@@ -278,6 +292,8 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         }
     }
@@ -301,6 +317,8 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: None,
+            klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         }
     }
@@ -335,6 +353,43 @@ impl Pipeline {
             quant,
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
+            klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
+            adapters,
+        })
+    }
+
+    /// Same as [`load_with_text_encoder`](Self::load_with_text_encoder) but sourcing the klein DiT
+    /// from a universal BFL-keyed single file (sc-21485). `root` is the resident FLUX.2-klein-9B
+    /// diffusers snapshot supplying the Qwen3 text encoder / VAE / tokenizer (the single DiT file
+    /// carries none of those). Load-time Q4/Q8 folding is rejected upstream
+    /// ([`validate_load_spec`]) — the NVFP4 rows are already quantized and refuse a re-fold by
+    /// contract.
+    pub(crate) fn load_klein_single_file_with_text_encoder(
+        root: &Path,
+        text_encoder_source: gen_core::ValidatedEncoderSource,
+        device: &Device,
+        klein_dit: PinnedWeightsFile,
+        pid_spec: Option<PidWeights>,
+        adapters: Vec<gen_core::AdapterSpec>,
+    ) -> CResult<Self> {
+        klein_dit.ensure_unchanged().map_err(|error| {
+            CandleError::Msg(format!(
+                "flux2 klein single-file: validate transformer source: {error}"
+            ))
+        })?;
+        Ok(Self {
+            variant: Flux2Variant::Klein9b,
+            cfg: Flux2Variant::Klein9b.config(),
+            root: root.to_path_buf(),
+            text_encoder_source: TextEncoderSource::Validated(Box::new(text_encoder_source)),
+            device: device.clone(),
+            dtype: DType::F32,
+            quant: None,
+            pid_spec,
+            comfyui_dit: None,
+            klein_dit: Some(klein_dit),
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         })
     }
@@ -478,9 +533,10 @@ impl Pipeline {
     /// so it reuses the TE's freed allocator pool (capping peak at DiT+VAE, not TE+DiT+VAE). Same per-tier
     /// routing as the paired [`load_te_and_dit`](Self::load_te_and_dit) DiT half.
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
-        let mut dit = match &self.comfyui_dit {
-            Some(dit_file) => self.load_comfyui_dit(dit_file),
-            None => self.load_one_quantizable(
+        let mut dit = match (&self.comfyui_dit, &self.klein_dit) {
+            (Some(dit_file), _) => self.load_comfyui_dit(dit_file),
+            (None, Some(dit_file)) => self.load_klein_planned_dit(dit_file),
+            (None, None) => self.load_one_quantizable(
                 "transformer",
                 self.quant,
                 |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
@@ -558,10 +614,11 @@ impl Pipeline {
                     .into(),
             ));
         }
-        if self.comfyui_dit.is_some() {
-            return Err(CandleError::Msg(
-                "flux2_dev: streamed blocks require a directory-backed transformer tier".to_owned(),
-            ));
+        if self.comfyui_dit.is_some() || self.klein_dit.is_some() {
+            return Err(CandleError::Msg(format!(
+                "{}: streamed blocks require a directory-backed transformer tier",
+                self.variant.id()
+            )));
         }
         let packed = self.component_is_packed("transformer")?;
         let source_device = if self.quant.is_some() && !packed {
@@ -705,13 +762,60 @@ impl Pipeline {
         })
     }
 
+    /// Build the klein DiT from a universal BFL-keyed single file through the shared logical-weight
+    /// seam (epic 11037, sc-21485): plan the file's own descriptors against the engine codec table
+    /// and this device's residency policy, open the shared reader over the compiled plan, and let
+    /// the one transformer constructor tree consume Dense / `PackedNvfp4` logical projections. The
+    /// fused-QKV row slices and the AdaLN half swap arrive as plan-declared transforms
+    /// ([`single_file::Flux2BflToDiffusersMapping`]) — no provider-local format parsing, no
+    /// re-classification, no load-time quant fold (the packed rows are already quantized).
+    ///
+    /// On success the import's three correlated checkpoint facts (sc-21484, epic E8) are bound to
+    /// the verified source pin and retained on the pipeline; read them back through
+    /// [`Flux2Generator::checkpoint_weight_facts`].
+    fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
+        dit_file.read_unchanged(|dit_path| {
+            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
+            let residency = candle_gen::logical_weights::CandleCodecResidency::probe(&self.device);
+            let plan =
+                candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
+            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
+                dit_path,
+                plan,
+                &self.device,
+                residency.native_execution_capability(),
+            )?;
+            let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
+            let src =
+                single_file::PlannedDitWeights::new(reader, self.device.clone(), self.dtype, ctx);
+            let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
+            // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
+            // off the shared reader after the full materialization, so a contradiction between the
+            // stored codec inventory and what this run executed fails the load instead of shipping
+            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
+            // so facts are never reported about bytes that changed under the load) and RETAINED on
+            // the pipeline — the krea precedent — so a consumer reads them through
+            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
+            let facts = src
+                .checkpoint_weight_facts()?
+                .with_verified_source(dit_file)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            // Infallible in practice (one load per pipeline); a second load simply keeps the first
+            // set rather than racing.
+            let _ = self.klein_facts.set(facts);
+            self.device.synchronize()?;
+            Ok(dit)
+        })
+    }
+
     fn load_components(&self) -> CResult<Components> {
-        let (te, transformer) = match &self.comfyui_dit {
-            // In-place ComfyUI DiT (sc-10680): the Mistral TE is NOT in the single DiT file, so it comes
-            // from the snapshot through the same per-tier quant path (`load_te_seq` is the TE-only
-            // quantizable loader); the DiT is dequanted + quantized from the in-place file.
-            Some(_) => (self.load_te_seq()?, self.load_dit_seq()?),
-            None => self.load_te_and_dit()?,
+        let (te, transformer) = if self.comfyui_dit.is_some() || self.klein_dit.is_some() {
+            // Single-file DiT (dev ComfyUI sc-10680, klein universal sc-21485): the TE is NOT in
+            // the single DiT file, so it comes from the snapshot through the same per-tier quant
+            // path (`load_te_seq` is the TE-only quantizable loader); the DiT comes from the file.
+            (self.load_te_seq()?, self.load_dit_seq()?)
+        } else {
+            self.load_te_and_dit()?
         };
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         let tokenizer = self.build_tokenizer()?;
@@ -1161,6 +1265,25 @@ pub struct Flux2Generator {
     memory_admission: memory_strategy::Flux2AdmissionRegistry,
 }
 
+impl Flux2Generator {
+    /// The **three correlated facts** about a klein universal single-file import (sc-21484, epic
+    /// E8), tied to the verified source binding: what the source stores (per-codec tensor counts
+    /// and source bytes), what this host can execute natively, and what actually materialized —
+    /// split per execution representation and measured off the shared reader, never copied from the
+    /// plan.
+    ///
+    /// This is the surface a consumer reads to distinguish a source stored `nvfp4-v1` from a run
+    /// that executed it as packed W4A4 or as dense F32. `None` on every route with no single
+    /// planned source file: the resident-directory load, the dev ComfyUI single file (a
+    /// provider-local converter, not the plan seam), and a klein pipeline whose DiT has not been
+    /// materialized yet.
+    pub fn checkpoint_weight_facts(
+        &self,
+    ) -> Option<&gen_core::checkpoint_facts::CheckpointWeightFacts> {
+        self.pipe.klein_facts.get()
+    }
+}
+
 impl Generator for Flux2Generator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -1461,8 +1584,9 @@ fn generator_from_pipeline(
 /// complete diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`, `tokenizer/`). `flux2_dev`
 /// additionally accepts an imported ComfyUI DiT as [`WeightsSource::File`] when the companion snapshot
 /// is supplied under [`BASE_SNAPSHOT_COMPONENT`]. The same registry provider, cache identity, fit gate,
-/// PiD plumbing, and memory contract are used for both sources; `flux2_klein_9b` remains directory-only
-/// because its imported format is not implemented. Adapters / control overlays are rejected (not wired).
+/// PiD plumbing, and memory contract are used for both sources. `flux2_klein_9b` accepts a universal
+/// BFL-keyed transformer single file as [`WeightsSource::File`] (sc-21485), consumed through the shared
+/// logical-weight plan (dense bf16 or NVFP4-mixed; no load-time quant fold).
 /// `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
 /// then folded onto the GPU: **dev** quantizes the 32B DiT + the ~24B Mistral TE (neither fits dense);
 /// **klein** (sc-11031) quantizes ONLY the 9B DiT and keeps its 8B Qwen3 TE dense bf16 (epic 8506
@@ -1479,11 +1603,6 @@ pub(crate) fn validate_load_spec(
     spec.validate_prepared_file_pins()?;
     let id = variant.id();
     let _ = gen_core::require_base_snapshot(spec, id)?;
-    if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id} does not support imported single-file weights; only flux2_dev does"
-        )));
-    }
     match &spec.weights {
         WeightsSource::Dir(_) => {
             gen_core::reject_unknown_components(spec, &[], id)?;
@@ -1507,6 +1626,16 @@ pub(crate) fn validate_load_spec(
     if quant == Some(Quant::Nvfp4) {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support NVFP4 load-time folding"
+        )));
+    }
+    // The klein universal single-file source (sc-21485) carries its own quantization: its NVFP4
+    // rows are already packed and refuse a Q4/Q8 re-fold by contract (`AdaptLinear::quantize` on an
+    // NVFP4 base is a typed refusal), so a load-time fold request is rejected here by name rather
+    // than failing 100+ projections into the load.
+    if matches!(spec.weights, WeightsSource::File(_)) && !variant.is_dev() && quant.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id} single-file import is pre-quantized at the source (dense bf16 / NVFP4-mixed); \
+             load-time Q4/Q8 folding is not supported for this source"
         )));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -1542,15 +1671,26 @@ fn load_variant_concrete(
             let dit = spec
                 .weights_file_pin()?
                 .expect("File weights must resolve to a pin");
-            Pipeline::load_comfyui_with_text_encoder(
-                quant,
-                &root,
-                text_encoder_source,
-                &device,
-                dit,
-                spec.pid.clone(),
-                spec.adapters.clone(),
-            )?
+            if variant.is_dev() {
+                Pipeline::load_comfyui_with_text_encoder(
+                    quant,
+                    &root,
+                    text_encoder_source,
+                    &device,
+                    dit,
+                    spec.pid.clone(),
+                    spec.adapters.clone(),
+                )?
+            } else {
+                Pipeline::load_klein_single_file_with_text_encoder(
+                    &root,
+                    text_encoder_source,
+                    &device,
+                    dit,
+                    spec.pid.clone(),
+                    spec.adapters.clone(),
+                )?
+            }
         }
     };
     generator_from_pipeline(pipe, Some(spec))
@@ -1616,14 +1756,28 @@ pub fn register_providers(
             provider_id: config::FLUX2_DEV_ID,
         })
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
-            backend_bindings: &[gen_core::CheckpointBackendBindingRegistration {
-                backend: gen_core::CheckpointBackend::Candle,
-                source: gen_core::ImportedModelSource::ComfyUiTree,
-                operation: gen_core::ImportedModelOperation::Generate,
-                provider_id: config::FLUX2_DEV_ID,
-                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-                inherit_adapters: true,
-            }],
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::ComfyUiTree,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: config::FLUX2_DEV_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                // The klein universal single file (sc-21485): a standalone transformer-only
+                // BFL-keyed `.safetensors` (the `bfl` dialect) binds to `flux2_klein_9b`, NOT to
+                // the dev Comfy-tree route above — the two artifact shapes keep separate provider
+                // identities.
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: config::FLUX2_KLEIN_9B_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
             ..gen_core::FLUX2_CHECKPOINT_ADAPTER
         });
     #[cfg(feature = "cuda")]
@@ -2665,14 +2819,100 @@ mod tests {
         assert!(error.contains("changed after load"), "got: {error}");
     }
 
+    /// A klein single file still requires the companion base snapshot (the file has no TE / VAE /
+    /// tokenizer) — the generic base-snapshot gate, not a variant rejection (sc-21485: klein now
+    /// accepts single-file sources).
     #[test]
-    fn klein_rejects_single_file_source() {
+    fn klein_single_file_requires_base_snapshot() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/flux2.safetensors".into()));
         let err = load_klein(&spec)
             .err()
             .expect("expected an error")
             .to_string();
         assert!(err.contains(BASE_SNAPSHOT_COMPONENT), "got: {err}");
+    }
+
+    /// The klein universal single file is pre-quantized at the source (dense bf16 / NVFP4-mixed):
+    /// a load-time Q4/Q8 fold request is a typed refusal at validation, by name, rather than a
+    /// per-projection failure deep in the load (sc-21485).
+    #[test]
+    fn klein_single_file_rejects_load_time_quant_fold() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dit = dir.path().join("flux2-klein.safetensors");
+        std::fs::write(&dit, b"klein single file").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(dit))
+            .with_component(
+                BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(dir.path().join("snapshot")),
+            )
+            .with_quant(Quant::Q8);
+        spec.prepare_file_sources().unwrap();
+        let err = validate_load_spec(Flux2Variant::Klein9b, &spec)
+            .expect_err("Q8 fold over a pre-quantized single file must refuse")
+            .to_string();
+        assert!(
+            err.contains("pre-quantized") && err.contains("flux2_klein_9b"),
+            "got: {err}"
+        );
+        // Without the fold request the same spec passes validation (quant resolves to None).
+        let mut plain = LoadSpec::new(WeightsSource::File(
+            dir.path().join("flux2-klein.safetensors"),
+        ))
+        .with_component(
+            BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(dir.path().join("snapshot")),
+        );
+        plain.prepare_file_sources().unwrap();
+        assert_eq!(
+            validate_load_spec(Flux2Variant::Klein9b, &plain).expect("plain spec validates"),
+            None
+        );
+    }
+
+    /// Klein-versus-dev registry binding (sc-21485): the standalone transformer single file
+    /// (`TransformerFile`, the `bfl` dialect) routes to `flux2_klein_9b`, while the dev ComfyUI
+    /// tree import keeps `flux2_dev` — separate artifact shapes, separate provider identities,
+    /// both inheriting adapters and requiring the base snapshot.
+    #[test]
+    fn klein_single_file_and_dev_comfy_bind_to_their_own_providers() {
+        let registry = super::provider_registry().unwrap();
+        let klein = registry
+            .imported_model_descriptor(
+                "flux2",
+                gen_core::ImportedModelSource::TransformerFile,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("the klein single-file route is registered");
+        assert_eq!(klein.id, config::FLUX2_KLEIN_9B_ID);
+        assert!(klein.capabilities.supports_lora && klein.capabilities.supports_lokr);
+        assert_eq!(klein.required_components, &[BASE_SNAPSHOT_COMPONENT]);
+        let dev = registry
+            .imported_model_descriptor(
+                "flux2",
+                gen_core::ImportedModelSource::ComfyUiTree,
+                gen_core::ImportedModelOperation::Generate,
+            )
+            .expect("the dev ComfyUI route is registered");
+        assert_eq!(dev.id, config::FLUX2_DEV_ID);
+        // And the adapter's portable metadata declares the `bfl` dialect with the plan-driven
+        // Candle mapping this crate ships.
+        let adapter = registry
+            .checkpoint_adapters()
+            .find(|adapter| adapter.adapter_id == "flux2-comfyui-v1")
+            .expect("the flux2 checkpoint adapter is registered");
+        let bfl = adapter
+            .canonical_mappings
+            .iter()
+            .find(|mapping| mapping.dialect == "bfl")
+            .expect("the bfl dialect has a canonical mapping");
+        assert_eq!(
+            bfl.mapping_id,
+            single_file::Flux2BflToDiffusersMapping::MAPPING_ID
+        );
+        assert_eq!(
+            bfl.plan_driven_backends,
+            &[gen_core::CheckpointBackend::Candle]
+        );
     }
 
     /// Image construction is lazy and the legacy load policy no longer selects lifecycle behavior.

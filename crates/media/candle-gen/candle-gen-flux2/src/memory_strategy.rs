@@ -148,6 +148,86 @@ fn ggml_projection_bytes(
     })
 }
 
+/// The compute dtype every FLUX.2 candle component materializes at (`Pipeline::dtype` is
+/// `DType::F32`; the MMDiT math is parity-sensitive). Dense residency is therefore priced at 4
+/// bytes per **logical** element, NOT at the codec's bf16 resident encoding — `PlannedDitWeights`
+/// casts each decoded dense tensor to this dtype before it lands on the device.
+const COMPUTE_DTYPE_BYTES: u64 = 4;
+
+/// The residency policy the klein fit gate prices against: the SAME probe
+/// [`Flux2Pipeline::load_klein_planned_dit`](Pipeline::load_klein_planned_dit) runs, on the same
+/// process-default device the concrete loader selects
+/// ([`candle_gen::default_device`], `load_variant_concrete`). Pricing and loading must not disagree
+/// about whether an NVFP4 row stays packed — that disagreement IS the fit gate falsely rejecting or
+/// falsely admitting.
+///
+/// A device that will not construct is priced dense. That is the conservative direction (dense is
+/// the larger of the two residencies) and it is also the truth: a loader that cannot build the
+/// device cannot take the native leg either.
+fn klein_pricing_residency() -> candle_gen::logical_weights::CandleCodecResidency {
+    match candle_gen::default_device() {
+        Ok(device) => candle_gen::logical_weights::CandleCodecResidency::probe(&device),
+        Err(_) => candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    }
+}
+
+/// Price an imported klein BFL/NVFP4 single-file DiT from the **compiled plan** — the same plan the
+/// loader consumes (sc-21485 review, blocker).
+///
+/// # Why the header sum cannot do this
+///
+/// `f32_or_packed_tensor_headers` prices from on-disk tensor headers, and an NVFP4 layer's header
+/// is a `U8 [rows, cols / 2]` nibble matrix whose `weight_scale` companion looks like a
+/// source-only scale. Charging it `materialized_bytes(4)` costs 2 bytes per *logical* element and
+/// drops the block scales entirely, which is wrong in both directions and by different factors:
+///
+/// * on `sm_120` the rows stay [`ResidencyMode::Packed`] — nibbles plus both scale levels, roughly
+///   0.56 bytes per logical element — so the header sum over-prices by ~3.5x and the gate falsely
+///   rejects;
+/// * below the floor the rows fall to dense `F32` — 4 bytes per logical element — so the header sum
+///   under-prices by exactly 2x and the gate falsely admits.
+///
+/// The plan already knows both, per tensor, from the codec's own geometry. Packed rows take the
+/// plan's `residency.resident_bytes` (stored nibbles, already sliced for a transformed output) plus
+/// the retained companions' bytes; dense rows are re-priced at [`COMPUTE_DTYPE_BYTES`] over the
+/// **logical** shape, because this pipeline casts every dense decode to F32 rather than keeping the
+/// codec's bf16 resident encoding.
+/// `cfg` is the architecture whose true geometry the mapping declares — always
+/// `Flux2Variant::Klein9b.config()` in production; a parameter only so the unit test can pin the
+/// byte totals at a fixture width instead of the 9B one.
+fn klein_planned_dit_bytes(
+    dit_path: &std::path::Path,
+    cfg: &crate::config::Flux2Config,
+    residency: &dyn gen_core::checkpoint_codec::CodecResidencyPolicy,
+) -> gen_core::Result<u64> {
+    use gen_core::checkpoint_codec::ResidencyMode;
+
+    let mapping = crate::single_file::Flux2BflToDiffusersMapping::new(cfg);
+    let plan = candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, residency)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let overflow = || gen_core::Error::Msg("FLUX.2 imported DiT resident byte sum overflow".into());
+    let mut total = 0_u64;
+    for tensor in &plan.tensors {
+        let bytes = match tensor.residency.mode {
+            ResidencyMode::Packed => tensor.residency.resident_bytes,
+            ResidencyMode::Dense => tensor
+                .shape
+                .iter()
+                .try_fold(COMPUTE_DTYPE_BYTES, |acc: u64, dim| {
+                    acc.checked_mul(*dim as u64)
+                })
+                .ok_or_else(overflow)?,
+        };
+        total = total.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for companion in &plan.companions {
+        total = total
+            .checked_add(companion.resident_bytes)
+            .ok_or_else(overflow)?;
+    }
+    Ok(total)
+}
+
 fn f32_or_packed_component_bytes(
     path: &std::path::Path,
     quant: Option<Quant>,
@@ -331,11 +411,11 @@ pub(crate) fn composed_provider_contract_for(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let profile = profile(provider_id)?;
-    if provider_id == FLUX2_KLEIN_9B_ID && matches!(spec.weights, WeightsSource::File(_)) {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id} does not support imported single-file weights; only flux2_dev does"
-        )));
-    }
+    // Klein accepts imported single-file weights since sc-21485 (the universal BFL/NVFP4 single
+    // file); the File pricing arm below covers both variants. The remaining klein File refusal —
+    // a load-time Q4/Q8 fold over the pre-quantized source — lives in `validate_load_spec`, which
+    // `provider_contract_for` already routes through, so the loader and this contract refuse the
+    // same specs with the same message.
     let streamable = streamable(spec);
     let mut components = match &spec.weights {
         WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
@@ -357,7 +437,20 @@ pub(crate) fn composed_provider_contract_for(
                     false,
                 )?,
                 dit: spec.read_file_unchanged_if_prepared(dit, |p| {
-                    f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
+                    if provider_id == FLUX2_KLEIN_9B_ID {
+                        // The klein universal single file is consumed through the shared
+                        // logical-weight plan, so it is PRICED from that plan — see
+                        // `klein_planned_dit_bytes` for why the header sum cannot express NVFP4.
+                        // `quant` is always `None` here: `validate_load_spec` refuses a Q4/Q8 fold
+                        // over a pre-quantized klein source before this contract is composed.
+                        klein_planned_dit_bytes(
+                            p,
+                            &Flux2Variant::Klein9b.config(),
+                            &klein_pricing_residency(),
+                        )
+                    } else {
+                        f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
+                    }
                 })?,
                 vae: f32_or_packed_component_bytes(
                     &base.join("vae"),
@@ -1600,20 +1693,28 @@ mod tests {
         }
     }
 
+    /// Klein accepts File sources since sc-21485, so the loader/contract agreement is now pinned
+    /// on the one File-source refusal that remains: a load-time Q4/Q8 fold over the pre-quantized
+    /// single file. Both seams must reject the identical spec with the identical message.
     #[test]
-    fn klein_load_and_memory_contract_reject_the_same_file_source() {
-        let spec = LoadSpec::new(WeightsSource::File("/tmp/klein.safetensors".into()))
+    fn klein_load_and_memory_contract_reject_the_same_quantized_file_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("klein.safetensors");
+        std::fs::write(&file, b"klein single file").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(file))
             .with_component(
                 gen_core::BASE_SNAPSHOT_COMPONENT,
-                WeightsSource::Dir("/tmp/klein-base".into()),
-            );
+                WeightsSource::Dir(tmp.path().join("klein-base")),
+            )
+            .with_quant(Quant::Q8);
+        spec.prepare_file_sources().unwrap();
         let load_error = crate::load_klein(&spec)
             .err()
-            .expect("Klein loader must reject File")
+            .expect("Klein loader must reject a quantized File source")
             .to_string();
         let contract_error = klein_provider_contract(&spec).unwrap_err().to_string();
         assert_eq!(contract_error, load_error);
-        assert!(contract_error.contains("only flux2_dev"));
+        assert!(contract_error.contains("pre-quantized"), "{contract_error}");
     }
 
     fn capability(
@@ -1886,5 +1987,164 @@ mod tests {
         registry.consume_for_generate(&request).unwrap();
         assert!(registry.consume_for_generate(&request).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod klein_nvfp4_pricing_tests {
+    use super::*;
+    use candle_gen::gen_core::checkpoint_codec::{
+        CheckpointCodecRegistration, CodecResidencyPolicy, ResidencyMode, TensorCodecSpec,
+        NVFP4_CODEC,
+    };
+    use candle_gen::logical_weights::CandleCodecResidency;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// Residency policy forcing NVFP4 rows packed on any host — the CPU-lane stand-in for an
+    /// `sm_120` device, the same pattern `single_file`'s conformance tests use. Without it this
+    /// test could only ever observe the dense half of a two-sided pricing bug.
+    struct ForcePackedNvfp4;
+
+    impl CodecResidencyPolicy for ForcePackedNvfp4 {
+        fn residency(
+            &self,
+            codec: &CheckpointCodecRegistration,
+            spec: &TensorCodecSpec,
+            stored_shape: &[usize],
+        ) -> ResidencyMode {
+            if codec.codec_id == NVFP4_CODEC.codec_id {
+                return ResidencyMode::Packed;
+            }
+            CandleCodecResidency::DENSE.residency(codec, spec, stored_shape)
+        }
+    }
+
+    /// A klein-shaped NVFP4-**mixed** single file at fixture width, the real artifact's shape in
+    /// miniature: one dense BF16 embedder plus one `.comfy_quant`-described NVFP4 fused qkv with
+    /// both scale levels, declared file-wide the way the Kitchen exporter writes it.
+    ///
+    /// Geometry: `inner = 128` (NVFP4-legal: each 128-row qkv slice is exactly one scale-factor
+    /// atom tile), `in_channels = 8`.
+    fn fixture_cfg() -> crate::config::Flux2Config {
+        let mut cfg = Flux2Variant::Klein9b.config();
+        cfg.num_double_layers = 1;
+        cfg.num_single_layers = 1;
+        cfg.num_heads = 16;
+        cfg.head_dim = 8;
+        cfg.in_channels = 8;
+        cfg
+    }
+
+    fn write_nvfp4_mixed_klein_file(path: &Path) -> (usize, usize) {
+        let (inner, in_channels) = (128usize, 8usize);
+        let (rows, cols) = (3 * inner, inner);
+        let embedder = vec![0u8; inner * in_channels * 2];
+        let packed = vec![0u8; rows * cols / 2];
+        let scale_shape = candle_gen::gen_core::nvfp4_scale_shape([rows, cols]).to_vec();
+        let scales = vec![0x38u8; scale_shape.iter().product::<usize>()];
+        let global = 1.0f32.to_le_bytes();
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "img_in.weight",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::BF16,
+                vec![inner, in_channels],
+                &embedder,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "double_blocks.0.img_attn.qkv.weight",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::U8,
+                vec![rows, cols / 2],
+                &packed,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "double_blocks.0.img_attn.qkv.weight_scale",
+            ::safetensors::tensor::TensorView::new(
+                ::safetensors::Dtype::F8_E4M3,
+                scale_shape,
+                &scales,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "double_blocks.0.img_attn.qkv.weight_scale_2",
+            ::safetensors::tensor::TensorView::new(::safetensors::Dtype::F32, vec![], &global)
+                .unwrap(),
+        );
+        let metadata = std::collections::HashMap::from([(
+            "_quantization_metadata".to_string(),
+            r#"{"format_version": "1.0", "layers": {"double_blocks.0.img_attn.qkv": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [384, 128]}}}"#
+                .to_string(),
+        )]);
+        ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
+        (inner, in_channels)
+    }
+
+    /// sc-21485 review (blocker). The klein `WeightsSource::File` DiT is priced from the compiled
+    /// plan, so NVFP4 costs what it actually costs in BOTH residency modes.
+    ///
+    /// The two totals are derived here from the geometry, not read off the implementation:
+    ///
+    /// * dense — every logical element at the pipeline's F32 compute dtype (NOT the codec's bf16
+    ///   resident encoding, which `PlannedDitWeights` casts away): `img_in` 128x8 plus the three
+    ///   128x128 qkv slices, x4 bytes; retained companions cost nothing on a dense decode;
+    /// * packed — `img_in` still dense F32, but each qkv slice keeps its stored nibbles
+    ///   (128x128 four-bit codes = 8192 B), and the retained scale surface is charged: the E4M3
+    ///   block scales partition the stored `[384, 8]` `to_blocked` matrix exactly, and each of the
+    ///   three outputs retains its own copy of the scalar F32 global scale.
+    ///
+    /// Mutation witness (RUN, both modes): restore the old arm by making
+    /// `klein_planned_dit_bytes` delegate to
+    /// `f32_or_packed_component_bytes(path, None, "imported DiT", false, true)`. It charges the
+    /// packed `U8 [384, 64]` header `materialized_bytes(4)` and drops `weight_scale`, giving one
+    /// mode-independent total that over-prices the packed mode and under-prices the dense one —
+    /// precisely the false-reject / false-admit pair this test forbids.
+    #[test]
+    fn the_klein_file_dit_is_priced_from_the_plan_in_both_residency_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("klein-nvfp4-mixed.safetensors");
+        let (inner, in_channels) = write_nvfp4_mixed_klein_file(&path);
+        let cfg = fixture_cfg();
+        assert_eq!((cfg.inner_dim(), cfg.in_channels), (inner, in_channels));
+
+        let embedder_bytes = (inner * in_channels * 4) as u64;
+        let qkv_dense_bytes = (3 * inner * inner * 4) as u64;
+        let dense = klein_planned_dit_bytes(&path, &cfg, &CandleCodecResidency::DENSE)
+            .expect("dense pricing");
+        assert_eq!(dense, embedder_bytes + qkv_dense_bytes);
+        assert_eq!(dense, 200_704);
+
+        let qkv_nibble_bytes = (3 * inner * inner / 2) as u64;
+        let block_scale_bytes = candle_gen::gen_core::nvfp4_scale_shape([3 * inner, inner])
+            .iter()
+            .product::<usize>() as u64;
+        let global_scale_bytes = 3 * 4;
+        let packed =
+            klein_planned_dit_bytes(&path, &cfg, &ForcePackedNvfp4).expect("packed pricing");
+        assert_eq!(
+            packed,
+            embedder_bytes + qkv_nibble_bytes + block_scale_bytes + global_scale_bytes
+        );
+        assert_eq!(packed, 31_756);
+
+        // The two modes must not collapse onto one number: a pricing arm blind to residency is the
+        // defect, and `packed < dense` is the whole reason the native leg exists.
+        assert!(
+            packed < dense,
+            "packed NVFP4 residency must cost less than the dense fallback ({packed} vs {dense})"
+        );
+
+        // The header-sum arm this replaced is mode-independent and matches NEITHER total — the
+        // mutation above simply restores it.
+        let header_sum =
+            f32_or_packed_component_bytes(&path, None, "imported DiT", false, true).unwrap();
+        assert_ne!(header_sum, dense);
+        assert_ne!(header_sum, packed);
     }
 }

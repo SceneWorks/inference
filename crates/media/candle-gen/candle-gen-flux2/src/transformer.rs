@@ -104,6 +104,79 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
     x.transpose(1, 2)?.contiguous() // [B,H,S,head_dim]
 }
 
+/// Where DiT weights come from at construction (sc-21485): the diffusers-keyed **VarBuilder**
+/// tree (directory snapshots, the in-memory dev ComfyUI map), or the shared mapped logical-weight
+/// reader over a **planned** single-file checkpoint
+/// ([`crate::single_file::PlannedDitWeights`]), which can hand back packed NVFP4 projections a
+/// VarBuilder cannot express. One constructor tree serves both, so the model topology cannot
+/// drift between the two sources.
+#[derive(Clone)]
+pub(crate) enum DitWeights<'a> {
+    Vb(VarBuilder<'static>),
+    Planned {
+        src: &'a crate::single_file::PlannedDitWeights,
+        prefix: String,
+    },
+}
+
+impl<'a> DitWeights<'a> {
+    fn join(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}.{name}")
+        }
+    }
+
+    /// Push one dotted path segment (the `VarBuilder::pp` analog).
+    fn pp(&self, seg: impl std::string::ToString) -> DitWeights<'a> {
+        match self {
+            Self::Vb(vb) => Self::Vb(vb.pp(seg.to_string())),
+            Self::Planned { src, prefix } => Self::Planned {
+                src,
+                prefix: Self::join(prefix, &seg.to_string()),
+            },
+        }
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        match self {
+            Self::Vb(vb) => vb.contains_tensor(name),
+            Self::Planned { src, prefix } => src.contains(&Self::join(prefix, name)),
+        }
+    }
+
+    /// Build one projection under this prefix. The VarBuilder arm keeps the packed-tier detecting
+    /// [`QLinear::linear_detect`]; the planned arm constructs from the reader's Dense/`PackedNvfp4`
+    /// logical tensor — the plan's decision, never a re-classification here.
+    fn linear(&self, in_dim: usize, out_dim: usize, name: &str, bias: bool) -> Result<QLinear> {
+        match self {
+            Self::Vb(vb) => QLinear::linear_detect(in_dim, out_dim, vb, name, bias),
+            Self::Planned { src, prefix } => {
+                src.qlinear(&Self::join(prefix, name), in_dim, out_dim, bias)
+            }
+        }
+    }
+
+    /// Build one per-head RMSNorm (`{name}.weight`) at `eps`.
+    fn rms_norm(&self, dim: usize, eps: f64, name: &str) -> Result<RmsNorm> {
+        match self {
+            Self::Vb(vb) => rms_norm(dim, eps, vb.pp(name)),
+            Self::Planned { src, prefix } => {
+                let key = format!("{}.weight", Self::join(prefix, name));
+                src.rms_norm(&key, eps)
+            }
+        }
+    }
+
+    fn device(&self) -> Device {
+        match self {
+            Self::Vb(vb) => vb.device().clone(),
+            Self::Planned { src, .. } => src.device().clone(),
+        }
+    }
+}
+
 /// A sinusoidal-scalar embedding MLP: `timestep_embedding → linear_1 → silu → linear_2` → `[1, inner]`.
 /// Shared by the timestep and (dev) guidance branches of `time_guidance_embed`.
 struct SinEmbed {
@@ -113,11 +186,11 @@ struct SinEmbed {
 }
 
 impl SinEmbed {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear_1: QLinear::linear_detect(cfg.timestep_channels, inner, &vb, "linear_1", false)?,
-            linear_2: QLinear::linear_detect(inner, inner, &vb, "linear_2", false)?,
+            linear_1: vb.linear(cfg.timestep_channels, inner, "linear_1", false)?,
+            linear_2: vb.linear(inner, inner, "linear_2", false)?,
             channels: cfg.timestep_channels,
         })
     }
@@ -144,7 +217,7 @@ struct TimeGuidanceEmbed {
 }
 
 impl TimeGuidanceEmbed {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let timestep = SinEmbed::new(cfg, vb.pp("timestep_embedder"))?;
         // The guidance embedder exists only on dev; gate on the weight (mirrors the mlx `w.get(...)`
         // presence check) so a klein checkpoint loads without looking for absent keys.
@@ -184,10 +257,10 @@ struct Modulation {
 }
 
 impl Modulation {
-    fn new(cfg: &Flux2Config, sets: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, sets: usize, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_detect(inner, 3 * sets * inner, &vb, "linear", false)?,
+            linear: vb.linear(inner, 3 * sets * inner, "linear", false)?,
             sets,
         })
     }
@@ -231,25 +304,25 @@ struct DoubleAttention {
 }
 
 impl DoubleAttention {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
         Ok(Self {
-            to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", false)?,
-            to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", false)?,
-            to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", false)?,
+            to_q: vb.linear(inner, inner, "to_q", false)?,
+            to_k: vb.linear(inner, inner, "to_k", false)?,
+            to_v: vb.linear(inner, inner, "to_v", false)?,
             // `to_out.0`: the packed `.scales`/`.biases` siblings sit under the same dotted prefix, so
-            // pass the full `to_out.0` base to `linear_detect` (never `.pp("0")` past the sibling — the
+            // pass the full `to_out.0` base to `linear` (never `.pp("0")` past the sibling — the
             // sc-8670 remap trap the story flags).
-            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", false)?,
-            norm_q: rms_norm(hd, RMS_EPS, vb.pp("norm_q"))?,
-            norm_k: rms_norm(hd, RMS_EPS, vb.pp("norm_k"))?,
-            add_q: QLinear::linear_detect(inner, inner, &vb, "add_q_proj", false)?,
-            add_k: QLinear::linear_detect(inner, inner, &vb, "add_k_proj", false)?,
-            add_v: QLinear::linear_detect(inner, inner, &vb, "add_v_proj", false)?,
-            to_add_out: QLinear::linear_detect(inner, inner, &vb, "to_add_out", false)?,
-            norm_added_q: rms_norm(hd, RMS_EPS, vb.pp("norm_added_q"))?,
-            norm_added_k: rms_norm(hd, RMS_EPS, vb.pp("norm_added_k"))?,
+            to_out: vb.linear(inner, inner, "to_out.0", false)?,
+            norm_q: vb.rms_norm(hd, RMS_EPS, "norm_q")?,
+            norm_k: vb.rms_norm(hd, RMS_EPS, "norm_k")?,
+            add_q: vb.linear(inner, inner, "add_q_proj", false)?,
+            add_k: vb.linear(inner, inner, "add_k_proj", false)?,
+            add_v: vb.linear(inner, inner, "add_v_proj", false)?,
+            to_add_out: vb.linear(inner, inner, "to_add_out", false)?,
+            norm_added_q: vb.rms_norm(hd, RMS_EPS, "norm_added_q")?,
+            norm_added_k: vb.rms_norm(hd, RMS_EPS, "norm_added_k")?,
             heads: cfg.num_heads,
             head_dim: hd,
         })
@@ -329,10 +402,10 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(in_dim: usize, hidden: usize, vb: DitWeights<'_>) -> Result<Self> {
         Ok(Self {
-            linear_in: QLinear::linear_detect(in_dim, 2 * hidden, &vb, "linear_in", false)?,
-            linear_out: QLinear::linear_detect(hidden, in_dim, &vb, "linear_out", false)?,
+            linear_in: vb.linear(in_dim, 2 * hidden, "linear_in", false)?,
+            linear_out: vb.linear(hidden, in_dim, "linear_out", false)?,
         })
     }
 
@@ -354,7 +427,7 @@ struct DoubleBlock {
 }
 
 impl DoubleBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let ff_hidden = (cfg.mlp_ratio * inner as f32) as usize;
         Ok(Self {
@@ -419,17 +492,17 @@ struct SingleBlock {
 }
 
 impl SingleBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let mlp_hidden = cfg.single_mlp_hidden();
         let proj_out = 3 * inner + 2 * mlp_hidden;
         // The single block's projections nest under `attn.` in the diffusers checkpoint.
         let attn = vb.pp("attn");
         Ok(Self {
-            to_qkv_mlp: QLinear::linear_detect(inner, proj_out, &attn, "to_qkv_mlp_proj", false)?,
-            to_out: QLinear::linear_detect(inner + mlp_hidden, inner, &attn, "to_out", false)?,
-            norm_q: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_q"))?,
-            norm_k: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_k"))?,
+            to_qkv_mlp: attn.linear(inner, proj_out, "to_qkv_mlp_proj", false)?,
+            to_out: attn.linear(inner + mlp_hidden, inner, "to_out", false)?,
+            norm_q: attn.rms_norm(cfg.head_dim, RMS_EPS, "norm_q")?,
+            norm_k: attn.rms_norm(cfg.head_dim, RMS_EPS, "norm_k")?,
             inner,
             heads: cfg.num_heads,
             head_dim: cfg.head_dim,
@@ -482,10 +555,10 @@ struct NormOut {
 }
 
 impl NormOut {
-    fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: DitWeights<'_>) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_detect(inner, 2 * inner, &vb, "linear", false)?,
+            linear: vb.linear(inner, 2 * inner, "linear", false)?,
         })
     }
 
@@ -546,7 +619,27 @@ pub struct Flux2Transformer {
 
 impl Flux2Transformer {
     pub fn new(cfg: &Flux2Config, vb: VarBuilder<'static>) -> Result<Self> {
-        Self::new_with_blocks(cfg, vb, false, None, None)
+        Self::new_with_blocks(cfg, DitWeights::Vb(vb), false, None, None)
+    }
+
+    /// Build resident from a **planned single-file** weight source (sc-21485): the shared
+    /// logical-weight reader hands each projection back as Dense or `PackedNvfp4`, and this
+    /// constructor tree consumes either through [`DitWeights`]. Block streaming and load-time
+    /// quant folding do not apply to this source (the packed rows are already quantized).
+    pub(crate) fn new_planned(
+        cfg: &Flux2Config,
+        src: &crate::single_file::PlannedDitWeights,
+    ) -> Result<Self> {
+        Self::new_with_blocks(
+            cfg,
+            DitWeights::Planned {
+                src,
+                prefix: String::new(),
+            },
+            false,
+            None,
+            None,
+        )
     }
 
     pub fn visit_adaptable_mut(
@@ -636,23 +729,29 @@ impl Flux2Transformer {
         quant: Option<Quant>,
         target_device: Device,
     ) -> Result<Self> {
-        Self::new_with_blocks(cfg, vb, true, quant, Some(target_device))
+        Self::new_with_blocks(cfg, DitWeights::Vb(vb), true, quant, Some(target_device))
     }
 
     fn new_with_blocks(
         cfg: &Flux2Config,
-        vb: VarBuilder<'static>,
+        vb: DitWeights<'_>,
         stream_blocks: bool,
         quant: Option<Quant>,
         target_device: Option<Device>,
     ) -> Result<Self> {
         let inner = cfg.inner_dim();
         let blocks = if stream_blocks {
+            let DitWeights::Vb(weights) = &vb else {
+                candle_gen::candle_core::bail!(
+                    "FLUX.2 block streaming requires a VarBuilder-backed transformer tier; the \
+                     planned single-file source is resident-only"
+                )
+            };
             Flux2Blocks::Streamed {
-                weights: vb.clone(),
+                weights: weights.clone(),
                 config: Box::new(*cfg),
                 quant,
-                target_device: target_device.clone().unwrap_or_else(|| vb.device().clone()),
+                target_device: target_device.clone().unwrap_or_else(|| vb.device()),
             }
         } else {
             let mut double = Vec::with_capacity(cfg.num_double_layers);
@@ -669,11 +768,10 @@ impl Flux2Transformer {
             Flux2Blocks::Resident { double, single }
         };
         let mut transformer = Self {
-            x_embedder: QLinear::linear_detect(cfg.in_channels, inner, &vb, "x_embedder", false)?,
-            context_embedder: QLinear::linear_detect(
+            x_embedder: vb.linear(cfg.in_channels, inner, "x_embedder", false)?,
+            context_embedder: vb.linear(
                 cfg.joint_attention_dim,
                 inner,
-                &vb,
                 "context_embedder",
                 false,
             )?,
@@ -683,9 +781,9 @@ impl Flux2Transformer {
             mod_single: Modulation::new(cfg, 1, vb.pp("single_stream_modulation"))?,
             blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: QLinear::linear_detect(inner, cfg.out_channels, &vb, "proj_out", false)?,
+            proj_out: vb.linear(inner, cfg.out_channels, "proj_out", false)?,
             pos_embed: Flux2PosEmbed::new(cfg),
-            device: vb.device().clone(),
+            device: vb.device(),
             rope_cache: std::sync::Mutex::new(None),
         };
         if stream_blocks {
@@ -1035,8 +1133,10 @@ impl Flux2Transformer {
             |(mut txt, mut img), view, range| {
                 let blocks = range
                     .map(|idx| {
-                        let mut block =
-                            DoubleBlock::new(config, view.pp("transformer_blocks").pp(idx))?;
+                        let mut block = DoubleBlock::new(
+                            config,
+                            DitWeights::Vb(view.pp("transformer_blocks").pp(idx)),
+                        )?;
                         if let Some(quant) = quant {
                             block.quantize_onto(*quant, target_device)?;
                         }
@@ -1080,8 +1180,10 @@ impl Flux2Transformer {
             |mut hidden, view, range| {
                 let blocks = range
                     .map(|idx| {
-                        let mut block =
-                            SingleBlock::new(config, view.pp("single_transformer_blocks").pp(idx))?;
+                        let mut block = SingleBlock::new(
+                            config,
+                            DitWeights::Vb(view.pp("single_transformer_blocks").pp(idx)),
+                        )?;
                         if let Some(quant) = quant {
                             block.quantize_onto(*quant, target_device)?;
                         }
@@ -1134,11 +1236,11 @@ struct Flux2ControlBlock {
 }
 
 impl Flux2ControlBlock {
-    fn new(cfg: &Flux2Config, vb: VarBuilder, has_before_proj: bool) -> Result<Self> {
+    fn new(cfg: &Flux2Config, vb: VarBuilder<'static>, has_before_proj: bool) -> Result<Self> {
         let inner = cfg.inner_dim();
         // The control block's attn/ff/ff_context keys match a base double block 1:1 (diffusers naming,
         // `attn.to_out.0` read natively by `DoubleBlock`); load dense, quantized in place after load.
-        let base = DoubleBlock::new(cfg, vb.clone())?;
+        let base = DoubleBlock::new(cfg, DitWeights::Vb(vb.clone()))?;
         let after_proj = QLinear::linear_detect(inner, inner, &vb, "after_proj", true)?;
         let before_proj = if has_before_proj {
             Some(QLinear::linear_detect(
@@ -1188,7 +1290,7 @@ impl Flux2ControlBranch {
     /// Build from the Fun-Controlnet-Union checkpoint VarBuilder. Keys are un-prefixed for a real
     /// checkpoint (`control_img_in.*`, `control_transformer_blocks.{i}.*`). `control_layers =
     /// range(0, num_double_layers, 2)`.
-    pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Flux2Config, vb: VarBuilder<'static>) -> Result<Self> {
         let inner = cfg.inner_dim();
         let places = cfg.control_layer_places();
         let control_img_in =

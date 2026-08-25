@@ -41,6 +41,10 @@ metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda", "candle-llm/cuda"]
 
 [dev-dependencies]
+# Write single-file BFL fixtures carrying `__metadata__._quantization_metadata` + F8_E4M3/U8
+# companion tensors for the sc-21485 universal-import conformance tests (candle's `safetensors::save`
+# cannot attach metadata). Same version as candle-gen-krea's fixture writer.
+safetensors = "0.7"
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

@@ -4412,8 +4412,12 @@ mod tests {
         // no-config, bare-prefix form.
         let krea =
             candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping::without_config("");
+        // The FLUX.2 mapping carries the variant architecture config (it declares logical shapes
+        // and the fused-transform geometry from it); the id surface is config-independent.
+        let flux2_cfg = candle_gen_flux2::config::Flux2Variant::Klein9b.config();
+        let flux2 = candle_gen_flux2::Flux2BflToDiffusersMapping::new(&flux2_cfg);
         let implementations: &[&dyn LogicalKeyMapping] =
-            &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea];
+            &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea, &flux2];
 
         let mut declared_here = 0usize;
         for adapter in registry.checkpoint_adapters() {
@@ -4566,6 +4570,16 @@ mod tests {
                 source: ImportedModelSource::ComfyUiTree,
                 operation: ImportedModelOperation::Generate,
                 provider_id: candle_gen_flux2::config::FLUX2_DEV_ID,
+                required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            // sc-21485: the klein universal BFL transformer single file routes to
+            // `flux2_klein_9b` — a separate artifact shape from the dev ComfyUI tree above.
+            ImportedModelRegistration {
+                family: "flux2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: candle_gen_flux2::config::FLUX2_KLEIN_9B_ID,
                 required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
                 inherit_adapters: true,
             },
