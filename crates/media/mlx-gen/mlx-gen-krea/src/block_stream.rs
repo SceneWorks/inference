@@ -208,7 +208,13 @@ impl KreaBlockStream {
             KreaBlockSource::Diffusers(WeightsSource::Dir(dir)) => Weights::from_dir(dir),
             KreaBlockSource::Diffusers(WeightsSource::File(file)) => Weights::from_file(file),
             KreaBlockSource::Native(file) => file.read_unchanged(|path| {
-                let weights = crate::loader::normalized_native_weights_lazy(path)?;
+                // The stream owns the architecture config, so every reopened window plans at the
+                // architecture's true logical shapes (sc-20644) — the same declaration the
+                // whole-file load used, so a window can never disagree with it about geometry.
+                let weights = crate::loader::normalized_native_weights_lazy(
+                    path,
+                    crate::native_remap::DeclaredLogicalShapes::FromConfig(&self.cfg),
+                )?;
                 if record_native_window {
                     NATIVE_WINDOW_REOPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

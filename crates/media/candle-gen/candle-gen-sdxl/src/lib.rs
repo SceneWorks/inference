@@ -763,21 +763,73 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry.register_generator(REGISTRATION);
     register_memory_contract_surfaces(registry)
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: MODEL_ID,
-            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
-            inherit_adapters: true,
-        })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "sdxl",
-            source: gen_core::ImportedModelSource::FusedCheckpoint,
-            operation: gen_core::ImportedModelOperation::Edit,
-            provider_id: MODEL_ID,
-            required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::FusedCheckpoint,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: MODEL_ID,
+                    required_components: Some(pipeline::LDM_REQUIRED_COMPONENTS),
+                    inherit_adapters: true,
+                },
+                // **No `ImportedModelOperation::Edit` binding on Candle** (sc-20651 review, item 8).
+                //
+                // One was carried across from `main` when this epic replaced
+                // `register_imported_model` with the checkpoint adapter, on the reasoning that a
+                // capability `main` had added should not be silently dropped by the port. That
+                // reasoning was wrong about what `main` had added: the binding named
+                // `provider_id: MODEL_ID`, and `MODEL_ID`'s registered generator is
+                // [`SdxlGenerator`], whose descriptor advertises `conditioning: [Control]` on the
+                // registry route and `[]` on a plain load. `Capabilities::validate_request` rejects
+                // every conditioning kind a descriptor does not list, so an Edit import resolving
+                // through that binding got a generator that refuses `Conditioning::Reference` —
+                // i.e. the operation was **declared and unreachable**, which is worse than absent:
+                // SceneWorks stages components and routes a request that can only end in a refusal.
+                //
+                // It is not a wiring oversight; the fused route cannot reach the edit stack as
+                // either side is currently shaped. Naming the exact blockers, since "it's hard" is
+                // not evidence:
+                //
+                //  1. `registry.rs`'s builder requires a binding's `provider_id` to name a
+                //     **registered `Generator`**. `edit_provider::SdxlEdit` does not implement
+                //     `gen_core::Generator` at all — it has a bespoke `generate(&SdxlEditRequest,
+                //     &Image, ..)` / `generate_masked(.., &Image, &Image, ..)` surface that takes
+                //     the source image as a positional argument, not as request conditioning.
+                //  2. `SdxlEdit::load` takes `SdxlEditPaths { sdxl_base: PathBuf, .. }` and hands
+                //     it to `SdxlConditioner::load(root: &Path, ..)`, which reads the diffusers
+                //     `text_encoder/` + `text_encoder_2/` subtrees (`load_clip_tower_with_vb`, for
+                //     the bigG `text_projection` head) and to
+                //     `loaders::load_instantid_unet_with_adapters(root, ..)`, which reads `unet/`.
+                //     Both are directory-shaped. There is no `LdmComponents`-fed constructor for
+                //     either: `ldm::split_ldm_checkpoint` has exactly one caller, `load` below,
+                //     which threads its tensor maps into `pipeline::Pipeline` — a type `SdxlEdit`
+                //     does not use and cannot borrow a VAE **encoder** from (`Pipeline` builds only
+                //     `SdxlVaeDecoder` on the fused path; `VaeMomentsEncoder` has no fused caller).
+                //  3. `SdxlEditPaths.vae_fp16_fix` is required, but this route's
+                //     `LDM_REQUIRED_COMPONENTS` is `[tokenizer_clip_l, tokenizer_clip_bigg]` —
+                //     deliberately no VAE, because a fused checkpoint carries its own. Nothing on
+                //     the fused route can supply that field.
+                //  4. `memory_strategy::validate_bespoke_spec_common` (via
+                //     `SdxlEdit::load_admitted`) hard-requires
+                //     `matches!(spec.weights, WeightsSource::Dir(p) if p == base)` and refuses a
+                //     `WeightsSource::File` outright.
+                //
+                // Dropping the binding is structurally permitted: `SDXL_CHECKPOINT_ADAPTER`'s
+                // `eligible_backends` is `[Mlx, Candle]`, so the builder's per-operation
+                // completeness check (which fires only for a *sole* eligible backend) does not
+                // require Candle to implement every operation — the same way Candle Krea
+                // truthfully omits the MLX-only Pose route. MLX keeps its Edit binding, and its
+                // descriptor really does declare `Reference`/`Mask` and really does consume them.
+                //
+                // `SdxlEdit` itself is untouched and still reachable as the name-driven worker
+                // provider it has always been (a diffusers **snapshot dir** + a staged fp16-fix
+                // VAE). What is gone is only the claim that a *fused single-file import* can edit.
+                // Making that claim true is a feature, not a review fix: it needs
+                // `LdmComponents`-fed CLIP/UNet/VAE-encoder constructors plus an edit-capable
+                // registered generator id, mirroring `candle-gen-krea`'s `krea_2_edit`.
+            ],
+            ..gen_core::SDXL_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
 }
@@ -829,6 +881,61 @@ mod explicit_registry_tests {
         assert_eq!(
             imported.required_components,
             pipeline::LDM_REQUIRED_COMPONENTS
+        );
+    }
+
+    /// sc-20651 review (8). **Every checkpoint-import operation this crate binds must resolve to a
+    /// descriptor that can actually accept the conditioning that operation is made of.**
+    ///
+    /// This is deliberately not `assert_eq!(operations, [Generate])` — that would only pin today's
+    /// list and would go green again the moment someone re-adds an `Edit` binding pointing at a
+    /// txt2img generator, which is exactly the defect. Instead it asks the question the registry
+    /// consumer asks: resolve the binding the way SceneWorks does
+    /// (`imported_model_descriptor(family, source, operation)`), then check the resolved descriptor
+    /// against `Capabilities::accepts` for the kind that operation *requires*. An `Edit` route whose
+    /// descriptor cannot take a `Reference` is a route that can only ever refuse.
+    ///
+    /// `Generate` requires no conditioning, so it is checked for resolvability only.
+    #[test]
+    fn every_bound_import_operation_resolves_to_a_descriptor_that_accepts_its_conditioning() {
+        use gen_core::{ConditioningKind, ImportedModelOperation};
+
+        let registry = super::provider_registry().unwrap();
+        // The operation → conditioning kind an import of that operation cannot work without.
+        let required_kind = |operation: ImportedModelOperation| match operation {
+            ImportedModelOperation::Generate => None,
+            _ => Some(ConditioningKind::Reference),
+        };
+
+        let mut checked = 0;
+        for operation in [
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Edit,
+        ] {
+            let Some(descriptor) = registry.imported_model_descriptor(
+                "sdxl",
+                gen_core::ImportedModelSource::FusedCheckpoint,
+                operation,
+            ) else {
+                // Not bound at all is fine and honest — the adapter's `eligible_backends` is
+                // `[Mlx, Candle]`, so Candle is not obliged to implement every operation.
+                continue;
+            };
+            checked += 1;
+            if let Some(kind) = required_kind(operation) {
+                assert!(
+                    descriptor.capabilities.accepts(kind),
+                    "fused-checkpoint {operation:?} binds provider '{}', whose descriptor does not \
+                     accept {kind:?} — the operation is declared but every request through it is \
+                     refused by the capability floor",
+                    descriptor.id
+                );
+            }
+        }
+        // A guard that resolved nothing asks no question.
+        assert!(
+            checked > 0,
+            "no fused-checkpoint route resolved; this crate must bind at least Generate"
         );
     }
 }

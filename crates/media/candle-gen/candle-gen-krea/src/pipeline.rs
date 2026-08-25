@@ -947,7 +947,15 @@ fn load_native_dit_at_dtype(
         } else {
             device
         };
-        let mut dit_w = Weights::from_pinned_native_file(native_dit, source_device, dit_dtype)?;
+        // sc-20651: the architecture config goes IN, so the compiled plan can unpad a block-padded
+        // (Kitchen NVFP4) layer to its true geometry. Without it a padded layer would plan at its
+        // stored grid and refuse to materialize rather than promote padding to weights.
+        let mut dit_w = Weights::from_pinned_native_file_for(
+            native_dit,
+            source_device,
+            dit_dtype,
+            crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
         let native_nvfp4 = dit_w.is_native_nvfp4();
         if native_nvfp4 && !adapters.is_empty() {
             return Err(CandleError::Msg(

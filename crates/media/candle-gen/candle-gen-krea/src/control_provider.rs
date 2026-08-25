@@ -474,7 +474,13 @@ fn load_control_heavy(
             dit
         }
         ControlDitSource::Native(native_dit) => {
-            let mut dit_w = Weights::from_native_file(native_dit, device, DType::BF16)?;
+            // sc-20651: config in scope so the compiled plan unpads a block-padded import.
+            let mut dit_w = Weights::from_native_file_for(
+                native_dit,
+                device,
+                DType::BF16,
+                crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+            )?;
             crate::convert::validate_native_transformer(&dit_w, &cfg)?;
             let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
             let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;

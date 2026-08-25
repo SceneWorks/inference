@@ -31,6 +31,9 @@ mod int8_per_channel_numerics;
 #[path = "mlx_repack_real_weights.rs"]
 mod mlx_repack_real_weights;
 
+#[path = "nvfp4_comfy_real_weights.rs"]
+mod nvfp4_comfy_real_weights;
+
 #[path = "nvfp4_linear_gpu.rs"]
 mod nvfp4_linear_gpu;
 

@@ -505,10 +505,12 @@ mod tests {
         Ok(())
     }
 
-    /// **Fail-closed on an unmapped/foreign key (sc-14022).** A native single file carrying the full 430
-    /// plus one foreign tensor is rejected: coverage passes, but the on-disk count exceeds the expected
-    /// count, so the bijection check rejects the surplus (the candle analogue of the MLX remap's
-    /// `unmapped_key_fails_closed`). No stray weight loads silently.
+    /// **Fail-closed on an unmapped/foreign key (sc-14022, tightened by sc-20651).** A native single
+    /// file carrying the full 430 plus one foreign tensor is rejected — and since the import now
+    /// compiles a `gen_core` logical-weight plan at construction, it is rejected **at open**, naming
+    /// the exact tensor, before any weight is read. The surviving property is the one the test was
+    /// always about: no stray weight loads silently. What changed is how early, and how
+    /// specifically, the refusal lands.
     #[test]
     fn validate_native_foreign_key_fails_closed() -> Result<()> {
         let dev = Device::Cpu;
@@ -518,14 +520,27 @@ mod tests {
         let path = path_tmp.path().join("variant5.safetensors");
         write_native_stub_file(&path, &keys);
 
-        let w = Weights::from_native_file(&path, &dev, DType::F32)?;
-        let err = crate::convert::validate_native_transformer(&w, &Krea2Config::turbo())
-            .expect_err("an unmapped/foreign tensor must fail closed")
+        let err = Weights::from_native_file(&path, &dev, DType::F32)
+            .err()
+            .expect("an unmapped/foreign tensor must fail closed at open")
             .to_string();
         assert!(
-            err.contains("unmapped/foreign") || err.contains("bijection"),
-            "error must flag the foreign tensor: {err}"
+            err.contains("model.diffusion_model.blocks.0.attn.bogus"),
+            "error must name the foreign tensor: {err}"
         );
+        assert!(
+            err.contains("no canonical logical key"),
+            "the refusal must be the plan's unmapped-key one: {err}"
+        );
+
+        // The same fixture WITHOUT the foreign tensor opens, so the refusal above is about that one
+        // tensor and not about the fixture as a whole. (These stubs are 1-element tensors, so the
+        // architecture *shape* check is not what is under test here — the key surface is.)
+        let clean_path = path_tmp.path().join("variant5_clean.safetensors");
+        write_native_stub_file(&clean_path, &variant5_native_keys());
+        let clean = Weights::from_native_file(&clean_path, &dev, DType::F32)?;
+        validate_native_key_surface(&clean, &Krea2Config::turbo())?;
+
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         Ok(())
     }
@@ -547,13 +562,16 @@ mod tests {
 
         let foreign_path = root.join("variant4_foreign.safetensors");
         write_plain_int8_native_stub_file(&foreign_path, &keys, true);
-        let foreign = Weights::from_native_file(&foreign_path, &dev, DType::F32)?;
-        let err = validate_native_key_surface(&foreign, &Krea2Config::turbo())
-            .expect_err("a non-companion surplus tensor must still fail closed")
+        // sc-20651: the surplus tensor is now caught by the compiled plan at open, before any
+        // weight is read, rather than by the later key-surface diff. Same property, earlier seam.
+        let err = Weights::from_native_file(&foreign_path, &dev, DType::F32)
+            .err()
+            .expect("a non-companion surplus tensor must still fail closed")
             .to_string();
         assert!(
-            err.contains("unmapped/foreign"),
-            "error must flag the foreign tensor: {err}"
+            err.contains("model.diffusion_model.blocks.0.attn.bogus")
+                && err.contains("no canonical logical key"),
+            "error must name the foreign tensor: {err}"
         );
 
         Ok(())

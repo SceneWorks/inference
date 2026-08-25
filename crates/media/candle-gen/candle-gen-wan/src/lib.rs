@@ -39,6 +39,14 @@ pub mod dit_train;
 // dequantize per-matmul (ComfyUI-GGUF parity), NEVER pre-dequantized to dense at load. Selected on the
 // 5B by the `CANDLE_GEN_WAN_GGUF` sub-story-1 test seam (manifest/catalog routing is sub-story 2).
 mod gguf;
+// The GGUF container route's public surface (epic 20398, sc-20649/sc-20651): the registered codec
+// id this crate implements, the codec registry the route plans against, the refusing canonical
+// mapping the checkpoint registry names, the plan producer, and its typed refusals. The module
+// itself stays private — everything else in it is loader internals.
+pub use gguf::{
+    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_receipt, GgufDitPlan,
+    GgufPlanError, WanNativeToDiffusersMapping, GGUF_CODEC_IMPLEMENTATION_ID,
+};
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;
 pub mod model_vace;
@@ -1275,6 +1283,33 @@ pub fn register_providers(
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
     registry
+        // The Wan 2.2 ComfyUI expert pair (epic 20398, sc-20644). Registering it is what makes
+        // `ProviderRegistry::checkpoint_adapters` — and therefore SceneWorks'
+        // `inference_runtime::checkpoint_adapter("wan-video")` — actually resolve; the portable
+        // const alone is inert metadata that nothing can reach (review major 6).
+        //
+        // ONE binding, onto the T2V provider. `ImportedModelOperation` has no video vocabulary —
+        // T2V and I2V are the same `Generate` operation distinguished by an `i2v` flag on the
+        // loader, not by the operation enum — so a second binding for this (backend, source) is not
+        // expressible, and registering I2V as `Edit` would be a lie about what the enum means. The
+        // SceneWorks lane refuses an I2V expert pair by name for exactly this reason.
+        //
+        // `required_components` is `None`: `load_from_comfyui_experts` takes the UMT5 encoder, the
+        // VAE and the tokenizer from a resident snapshot tier that the CALLER resolves, not from
+        // caller-staged `LoadSpec` components.
+        .register_checkpoint_adapter(candle_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[candle_gen::gen_core::CheckpointBackendBindingRegistration {
+                backend: candle_gen::gen_core::CheckpointBackend::Candle,
+                source: candle_gen::gen_core::ImportedModelSource::ComfyUiTree,
+                operation: candle_gen::gen_core::ImportedModelOperation::Generate,
+                provider_id: config::MODEL_ID_T2V_14B,
+                required_components: None,
+                // `load_from_comfyui_experts` has no adapter seam, so the imported route must not
+                // advertise the provider's LoRA/LoKr flags.
+                inherit_adapters: false,
+            }],
+            ..candle_gen::gen_core::WAN_CHECKPOINT_ADAPTER
+        })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::I2V_14B_TRAINER_REGISTRATION)
         .register_trainer(training::TI2V_5B_TRAINER_REGISTRATION)
@@ -1329,6 +1364,79 @@ pub fn conservative_video_decode_memory_profile(
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    /// sc-20644 review major 6 — the Wan checkpoint adapter is REACHABLE from a built registry.
+    ///
+    /// The portable `WAN_CHECKPOINT_ADAPTER` const was declared but registered by no provider
+    /// crate, so `ProviderRegistry::checkpoint_adapters` never yielded it and SceneWorks'
+    /// `inference_runtime::checkpoint_adapter("wan-video")` answered `None`. A declaration nothing
+    /// can reach is inert metadata: AC1's "family truth comes from the adapter" was unmet in fact
+    /// however carefully the const was written.
+    ///
+    /// Reachability is asserted through the registry — the seam SceneWorks actually queries — not
+    /// against the const, which would pass whether or not anything registered it.
+    ///
+    /// Failing mutations: delete the `register_checkpoint_adapter` call from `register_providers`;
+    /// change the binding's `provider_id` to an id no generator registers.
+    #[test]
+    fn the_wan_checkpoint_adapter_is_reachable_from_the_built_registry() {
+        let registry = super::provider_registry().unwrap();
+
+        let adapter = registry
+            .checkpoint_adapters()
+            .find(|adapter| adapter.compatibility_projection.family == "wan-video")
+            .expect("the Wan adapter must be reachable by the projection SceneWorks keys on");
+        assert_eq!(adapter.adapter_id, "wan-comfyui-v1");
+
+        // The binding is real: exactly one, Candle, ComfyUI tree, onto a provider this registry
+        // actually registers.
+        let bindings = adapter.backend_bindings;
+        assert_eq!(
+            bindings.len(),
+            1,
+            "one binding is expressible for this (backend, source)"
+        );
+        let binding = &bindings[0];
+        assert_eq!(
+            binding.backend,
+            candle_gen::gen_core::CheckpointBackend::Candle
+        );
+        assert_eq!(
+            binding.source,
+            candle_gen::gen_core::ImportedModelSource::ComfyUiTree
+        );
+        assert_eq!(
+            binding.operation,
+            candle_gen::gen_core::ImportedModelOperation::Generate
+        );
+        assert!(
+            !binding.inherit_adapters,
+            "`load_from_comfyui_experts` has no adapter seam"
+        );
+        let registered: Vec<String> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id.to_string())
+            .collect();
+        assert!(
+            registered.iter().any(|id| id == binding.provider_id),
+            "the binding must point at a generator this registry registers; it names {:?} and the \
+             registry has {registered:?}",
+            binding.provider_id
+        );
+
+        // And the route the binding creates resolves, which is what SceneWorks' descriptor lookup
+        // does. This is the assertion that fails if the binding is registered but mis-keyed.
+        assert!(
+            registry
+                .imported_model_descriptor(
+                    "wan-video",
+                    candle_gen::gen_core::ImportedModelSource::ComfyUiTree,
+                    candle_gen::gen_core::ImportedModelOperation::Generate,
+                )
+                .is_some(),
+            "the registered binding must produce a resolvable imported-model route"
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
