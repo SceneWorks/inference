@@ -30,7 +30,7 @@ use std::fmt;
 use crate::comfy_quant::{
     parse_comfy_quant_descriptor, validate_mxfp8_geometry, validate_nvfp4_geometry,
     ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
-    Nvfp4GeometryError, QuantizationMetadataError,
+    Nvfp4GeometryError, PartialComfyQuantDescriptor, QuantizationMetadataError,
 };
 use crate::weightsmeta::{Dtype, SafetensorsTensorHeader};
 
@@ -1080,14 +1080,26 @@ pub enum LogicalWeightPlanError {
     /// state-dict prefix, or matches under more than one — the compiler will not guess which
     /// tensors a header-declared quantization governs.
     QuantizationMetadataLayer { layer: String, reason: String },
-    /// One layer is declared twice, by a `.comfy_quant` tensor and by the file-level metadata, with
-    /// two different descriptors. The whole descriptor is compared, not just its `format`:
-    /// `full_precision_matrix_mult` decides packed-vs-dense residency, so a silent resolution in
-    /// either declaration's favour would change how the layer is priced and run.
+    /// One layer is declared twice — by a `.comfy_quant` tensor and by the file-level metadata —
+    /// and the two declarations **contradict** each other. Every modelled field is compared, not
+    /// just `format`: `full_precision_matrix_mult` decides packed-vs-dense residency, so a silent
+    /// resolution in either declaration's favour would change how the layer is priced and run.
+    ///
+    /// # Field-presence semantics (sc-20651)
+    ///
+    /// The comparison is presence-aware, because the two routes do not carry the same objects on
+    /// real ComfyUI output. `kreamania_variant1.safetensors` declares each int8 projection as
+    /// `{"format": "int8_tensorwise", "per_row": true}` in its per-tensor blob and as a bare
+    /// `{"format": "int8_tensorwise"}` in the file-level table. The blob is authoritative (it sits
+    /// with the weight); the table entry is corroborating. A **strict subset** — keys the entry does
+    /// not declare — is not a conflict. A declared value that differs still is, so the sc-20641
+    /// conflict rule stands wherever both routes actually say something.
     DescriptorConflict {
         physical_key: String,
+        /// The authoritative per-tensor `.comfy_quant` declaration.
         tensor: ComfyQuantDescriptor,
-        metadata: ComfyQuantDescriptor,
+        /// The corroborating file-level entry, as declared (absent fields stay absent).
+        metadata: PartialComfyQuantDescriptor,
         /// The descriptor field names that disagree, in declaration order.
         disagreement: Vec<&'static str>,
     },
@@ -1208,12 +1220,11 @@ impl fmt::Display for LogicalWeightPlanError {
             } => write!(
                 f,
                 "weight {physical_key:?} is declared `{}` (full_precision_matrix_mult={}) by its \
-                 `.comfy_quant` tensor and `{}` (full_precision_matrix_mult={}) by \
+                 authoritative `.comfy_quant` tensor and {} by \
                  `__metadata__._quantization_metadata`; the two declarations disagree on {}",
                 tensor.format,
                 tensor.full_precision_matrix_mult,
-                metadata.format,
-                metadata.full_precision_matrix_mult,
+                metadata,
                 disagreement.join(", ")
             ),
         }
@@ -1274,7 +1285,21 @@ pub fn compile_logical_weight_plan(
 /// (`blocks.0.attn.wq` for `model.diffusion_model.blocks.0.attn.wq.weight`). The prefix is resolved
 /// **once**, from the whole declared layer set, and must be unique and consistent across every
 /// declared layer; anything else refuses rather than guessing which tensors a declaration governs.
-/// A layer declared by both routes must agree, or the plan refuses.
+///
+/// # Precedence when a layer is declared twice (sc-20651)
+///
+/// The two routes do **not** carry the same per-layer objects on real ComfyUI output, so they are
+/// not symmetric. The published KreaMania int8 artifacts write each of their 264 projections as
+/// `{"format": "int8_tensorwise", "per_row": true}` in the per-tensor blob and as a bare
+/// `{"format": "int8_tensorwise"}` in this table; parsing the file-level entry under the standalone
+/// rules refused the entire checkpoint on `Int8NotPerRow`.
+///
+/// * The per-tensor `.comfy_quant` blob is **authoritative** — it sits with the weight it describes.
+///   A file-level entry for the same layer is **corroborating**.
+/// * A corroborating entry that is a strict **subset** of the blob's fields does not refuse.
+/// * A corroborating entry whose declared **value** contradicts the blob still refuses with
+///   [`LogicalWeightPlanError::DescriptorConflict`] — the sc-20641 conflict rule stands.
+/// * A layer this table declares **alone** must stand on its own, and refuses exactly as before.
 pub fn compile_logical_weight_plan_with_metadata(
     headers: &[SafetensorsTensorHeader],
     descriptor_payloads: &BTreeMap<String, Vec<u8>>,
@@ -1292,17 +1317,25 @@ pub fn compile_logical_weight_plan_with_metadata(
         .collect();
 
     // ---- file-level descriptor table, resolved onto this file's layer bases ------------------
-    let mut descriptors: BTreeMap<String, ComfyQuantDescriptor> = BTreeMap::new(); // by layer base
+    //
+    // Parsed but deliberately NOT completed here (sc-20651). These entries are *corroborating*
+    // wherever a per-tensor `.comfy_quant` blob describes the same layer, and only a layer this
+    // table declares alone has to satisfy the standalone rules. Completing them up front is exactly
+    // what refused the real KreaMania int8 artifacts, whose file-level entries are a strict subset
+    // of their blobs — see [`PartialComfyQuantDescriptor`].
+    let mut metadata_descriptors: BTreeMap<String, (String, PartialComfyQuantDescriptor)> =
+        BTreeMap::new(); // physical layer base -> (name as declared in the table, entry)
     if let Some(payload) = quantization_metadata {
         let table = crate::comfy_quant::parse_quantization_metadata(payload)
             .map_err(|error| LogicalWeightPlanError::QuantizationMetadata { error })?;
         let prefix = resolve_metadata_prefix(&by_name, &table)?;
         for (layer, descriptor) in table {
-            descriptors.insert(format!("{prefix}{layer}"), descriptor);
+            metadata_descriptors.insert(format!("{prefix}{layer}"), (layer, descriptor));
         }
     }
 
     // ---- classify companions and validate descriptors, per layer ----------------------------
+    let mut descriptors: BTreeMap<String, ComfyQuantDescriptor> = BTreeMap::new(); // by layer base
     for header in by_name.values() {
         if header.name == LEGACY_MARKER_KEY
             || LEGACY_SCALE_SUFFIXES
@@ -1339,23 +1372,36 @@ pub fn compile_logical_weight_plan_with_metadata(
                 defect,
             }
         })?;
-        if let Some(previous) = descriptors.insert(base.to_owned(), descriptor) {
-            if previous != descriptor {
-                let mut disagreement = Vec::new();
-                if previous.format != descriptor.format {
-                    disagreement.push("format");
-                }
-                if previous.full_precision_matrix_mult != descriptor.full_precision_matrix_mult {
-                    disagreement.push("full_precision_matrix_mult");
-                }
+        // The blob is authoritative. A file-level entry for the same layer only has to be
+        // CONSISTENT with it: fields the entry omits are not a disagreement (the real-artifact
+        // precedent), a value that contradicts the blob still is.
+        if let Some((_, metadata)) = metadata_descriptors.remove(base) {
+            let disagreement = metadata.disagreement_with(&descriptor);
+            if !disagreement.is_empty() {
                 return Err(LogicalWeightPlanError::DescriptorConflict {
                     physical_key: weight_key,
                     tensor: descriptor,
-                    metadata: previous,
+                    metadata,
                     disagreement,
                 });
             }
         }
+        descriptors.insert(base.to_owned(), descriptor);
+    }
+
+    // Whatever is left in the table describes a layer with no `.comfy_quant` blob, so it is the only
+    // declaration that layer has and must stand on its own — the pre-sc-20651 behaviour, refusals
+    // included (the metadata-only NVFP4 form, sc-20641).
+    for (base, (declared_layer, metadata)) in metadata_descriptors {
+        let descriptor = metadata.into_complete().map_err(|defect| {
+            LogicalWeightPlanError::QuantizationMetadata {
+                error: QuantizationMetadataError::Layer {
+                    layer: declared_layer,
+                    defect,
+                },
+            }
+        })?;
+        descriptors.insert(base, descriptor);
     }
 
     let companion_owner = |name: &str| -> Option<(String, CompanionRole)> {
@@ -1856,7 +1902,7 @@ pub fn compile_logical_weight_plan_with_metadata(
 /// none, refuses instead of the compiler picking one.
 fn resolve_metadata_prefix(
     by_name: &BTreeMap<&str, &SafetensorsTensorHeader>,
-    table: &BTreeMap<String, ComfyQuantDescriptor>,
+    table: &BTreeMap<String, PartialComfyQuantDescriptor>,
 ) -> Result<String, LogicalWeightPlanError> {
     let (first, _) = table
         .iter()
@@ -2154,9 +2200,10 @@ mod tests {
                     format: ComfyQuantFormat::Nvfp4,
                     full_precision_matrix_mult: false,
                 },
-                metadata: ComfyQuantDescriptor {
+                metadata: PartialComfyQuantDescriptor {
                     format: ComfyQuantFormat::Float8E4M3Fn,
-                    full_precision_matrix_mult: false,
+                    full_precision_matrix_mult: None,
+                    per_row: None,
                 },
                 disagreement: vec!["format"],
             }
@@ -2178,9 +2225,10 @@ mod tests {
                     format: ComfyQuantFormat::Nvfp4,
                     full_precision_matrix_mult: false,
                 },
-                metadata: ComfyQuantDescriptor {
+                metadata: PartialComfyQuantDescriptor {
                     format: ComfyQuantFormat::Nvfp4,
-                    full_precision_matrix_mult: true,
+                    full_precision_matrix_mult: Some(true),
+                    per_row: None,
                 },
                 disagreement: vec!["full_precision_matrix_mult"],
             }
@@ -2188,6 +2236,123 @@ mod tests {
         assert!(
             error.to_string().contains("full_precision_matrix_mult"),
             "{error}"
+        );
+    }
+
+    /// sc-20651, the real-artifact precedent. `kreamania_variant1.safetensors` declares each of its
+    /// 264 int8 projections TWICE and the two declarations are **not** the same object: the
+    /// authoritative per-tensor blob says `{"format": "int8_tensorwise", "per_row": true}` while the
+    /// file-level table says a bare `{"format": "int8_tensorwise"}`. Parsing the file-level entry
+    /// under the standalone rules refused the whole checkpoint on `Int8NotPerRow`.
+    ///
+    /// The rule this pins, in both directions:
+    /// * a file-level entry that is a strict SUBSET of the blob (missing keys) is corroborating and
+    ///   must not refuse — in either field, and whichever route omits;
+    /// * a file-level entry whose declared VALUE contradicts the blob still refuses;
+    /// * a layer the table declares ALONE is unchanged: it must stand on its own.
+    ///
+    /// Mutation: restore blind file-level-first parsing (complete the table's entries before the
+    /// blobs are read) and the first assertion here refuses with `Int8NotPerRow`.
+    #[test]
+    fn a_file_level_entry_that_is_a_subset_of_its_tensor_blob_corroborates_it() {
+        let int8_headers = |descriptor_len: usize| {
+            [
+                header("model.q.weight", Dtype::I8, &[4, 8]),
+                header("model.q.weight_scale", Dtype::F32, &[4]),
+                header("model.q.comfy_quant", Dtype::U8, &[descriptor_len]),
+            ]
+        };
+        let compile = |blob: &[u8], payload: Option<&str>| {
+            let headers = int8_headers(blob.len());
+            let descriptors: BTreeMap<String, Vec<u8>> =
+                [("model.q.comfy_quant".to_owned(), blob.to_vec())].into();
+            compile_logical_weight_plan_with_metadata(
+                &headers,
+                &descriptors,
+                payload,
+                &StripPrefix,
+                &full(),
+                &DenseResidencyPolicy,
+            )
+        };
+        const PER_ROW: &[u8] = br#"{"format": "int8_tensorwise", "per_row": true}"#;
+        const BARE_TABLE: &str =
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "int8_tensorwise"}}}"#;
+
+        // THE REGRESSION: the real artifact's exact pair of declarations must plan.
+        let plan = compile(PER_ROW, Some(BARE_TABLE))
+            .expect("a bare file-level entry corroborates a per_row blob; it must not refuse");
+        assert_eq!(plan.codec_ids(), ["int8-per-row-v1"]);
+        assert_eq!(plan.tensors.len(), 1);
+        // Same plan as the blob alone: the corroborating entry adds nothing and takes nothing away.
+        assert_eq!(plan.tensors, compile(PER_ROW, None).unwrap().tensors);
+
+        // Subset in the other field, and in the other direction: the blob declares
+        // `full_precision_matrix_mult`, the table does not. Still corroborating, and the
+        // authoritative flag survives.
+        const FPMM: &[u8] =
+            br#"{"format": "int8_tensorwise", "per_row": true, "full_precision_matrix_mult": true}"#;
+        let plan = compile(FPMM, Some(BARE_TABLE)).expect("a subset entry must not refuse");
+        assert!(plan.tensors[0].codec.full_precision_matrix_mult());
+
+        // A declared value that CONTRADICTS the blob still refuses — sc-20641's rule stands.
+        let error = compile(
+            PER_ROW,
+            Some(
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "int8_tensorwise", "per_row": false}}}"#,
+            ),
+        )
+        .expect_err("a declared `per_row: false` contradicts the authoritative blob");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::DescriptorConflict {
+                physical_key: "model.q.weight".to_owned(),
+                tensor: ComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Int8TensorwisePerRow,
+                    full_precision_matrix_mult: false,
+                },
+                metadata: PartialComfyQuantDescriptor {
+                    format: ComfyQuantFormat::Int8TensorwisePerRow,
+                    full_precision_matrix_mult: None,
+                    per_row: Some(false),
+                },
+                disagreement: vec!["per_row"],
+            }
+        );
+        assert!(error.to_string().contains("per_row"), "{error}");
+        // The diagnostic renders the file-level entry as DECLARED — `(per_row=false)` alone, never
+        // the `full_precision_matrix_mult=false` default the producer never wrote. (The tensor half
+        // of the message does carry that field, because the blob's descriptor really is complete.)
+        assert!(
+            error
+                .to_string()
+                .contains("`int8_tensorwise` (per_row=false)"),
+            "{error}"
+        );
+
+        // A layer the table declares ALONE is unchanged: no blob corroborates it, so it must stand
+        // on its own and refuses with the same layer-named message as before.
+        let headers = [
+            header("model.q.weight", Dtype::I8, &[4, 8]),
+            header("model.q.weight_scale", Dtype::F32, &[4]),
+        ];
+        let error = compile_logical_weight_plan_with_metadata(
+            &headers,
+            &BTreeMap::new(),
+            Some(BARE_TABLE),
+            &StripPrefix,
+            &full(),
+            &DenseResidencyPolicy,
+        )
+        .expect_err("a metadata-only int8 layer has no authority to defer to");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::QuantizationMetadata {
+                error: QuantizationMetadataError::Layer {
+                    layer: "q".to_owned(),
+                    defect: ComfyQuantDescriptorError::Int8NotPerRow,
+                },
+            }
         );
     }
 

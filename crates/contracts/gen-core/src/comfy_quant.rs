@@ -36,8 +36,26 @@
 //! `{"format_version": "1.0", "layers": {"<layer>": {"format": "nvfp4"}, …}}` — whose layer names
 //! are often *relative* to the state-dict prefix the tensors carry (`blocks.0.attn.wq` for
 //! `model.diffusion_model.blocks.0.attn.wq.weight`). [`parse_quantization_metadata`] validates that
-//! object into the same [`ComfyQuantDescriptor`] values a `.comfy_quant` tensor would yield, and the
-//! plan compiler resolves the prefix exactly once and fails closed when it is not unique.
+//! object into a table of [`PartialComfyQuantDescriptor`], and the plan compiler resolves the prefix
+//! exactly once and fails closed when it is not unique.
+//!
+//! ## The two routes are NOT interchangeable (sc-20651)
+//!
+//! An earlier revision of this module claimed both routes "carry the same per-layer objects". Real
+//! ComfyUI output disproves it: `kreamania_variant1.safetensors` declares each of its 264 int8
+//! projections **twice** — the per-tensor blob as `{"format": "int8_tensorwise", "per_row": true}`
+//! and the file-level table as a bare `{"format": "int8_tensorwise"}`. Parsing the file-level entry
+//! under the standalone rules refused the whole checkpoint on `Int8NotPerRow`, even though the
+//! authoritative blob right next to the weight said `per_row: true`.
+//!
+//! The precedence rule the compiler applies, and the reason this module has two parse entry points:
+//!
+//! * the per-tensor `.comfy_quant` blob is **authoritative** — it sits with the weight it describes;
+//! * a file-level entry for the same layer is **corroborating**: a strict subset of the blob's
+//!   fields (keys it does not declare) must not refuse, while a declared value that *contradicts*
+//!   the blob still refuses as `LogicalWeightPlanError::DescriptorConflict`;
+//! * a layer the file-level table declares **alone** must still stand on its own, and is completed
+//!   through [`PartialComfyQuantDescriptor::into_complete`] with the same refusals as before.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -192,13 +210,115 @@ pub fn parse_comfy_quant_descriptor(
     descriptor_from_json(&json)
 }
 
+/// One layer descriptor as *declared*, before the completeness rules that only a standalone
+/// declaration has to satisfy — every modelled field kept as `Option` so "absent" and "declared
+/// `false`" stay distinguishable (sc-20651).
+///
+/// # Why this type exists
+///
+/// The two declaration routes are **not** interchangeable on real ComfyUI output. The published
+/// KreaMania int8 artifacts write the authoritative per-tensor `.comfy_quant` blob as
+/// `{"format": "int8_tensorwise", "per_row": true}` while the file-level
+/// `__metadata__._quantization_metadata` table writes the *same* layer as a bare
+/// `{"format": "int8_tensorwise"}`. An earlier revision of this module's docs asserted both routes
+/// "carry the same per-layer objects"; reading `kreamania_variant1.safetensors` (264 int8
+/// projections, 264 blobs, 264 file-level entries) disproved it.
+///
+/// So the file-level table parses into *this* type — declared fields only, no completeness check —
+/// and the plan compiler decides what a given layer's declaration set means:
+///
+/// * blob present ⇒ the blob is authoritative and this entry is corroborating. A strict **subset**
+///   (fields this entry does not declare) must not refuse; a declared field whose **value**
+///   conflicts still refuses (see `LogicalWeightPlanError::DescriptorConflict`).
+/// * blob absent ⇒ this entry is the only declaration, so it must stand on its own and goes through
+///   [`Self::into_complete`] — which is exactly the pre-sc-20651 behaviour for a metadata-only file
+///   (the ComfyUI Kitchen NVFP4 converters' form, sc-20641).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartialComfyQuantDescriptor {
+    pub format: ComfyQuantFormat,
+    pub full_precision_matrix_mult: Option<bool>,
+    /// Only meaningful for `int8_tensorwise`; `None` everywhere else (the key is refused as an
+    /// unknown field on any other format).
+    pub per_row: Option<bool>,
+}
+
+impl PartialComfyQuantDescriptor {
+    /// Apply the rules a **standalone** declaration must satisfy and produce the validated
+    /// descriptor: today that is int8's `per_row: true`, the only int8 layout either backend
+    /// decodes. Absent optional fields take their ComfyUI defaults.
+    pub fn into_complete(self) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
+        if self.format == ComfyQuantFormat::Int8TensorwisePerRow && self.per_row != Some(true) {
+            return Err(ComfyQuantDescriptorError::Int8NotPerRow);
+        }
+        Ok(ComfyQuantDescriptor {
+            format: self.format,
+            full_precision_matrix_mult: self.full_precision_matrix_mult.unwrap_or(false),
+        })
+    }
+
+    /// The field names on which this (corroborating) declaration **contradicts** an authoritative
+    /// per-tensor descriptor, in declaration order. Presence-aware: a field this declaration omits
+    /// is not a disagreement, only a declared value that differs is. Empty ⇒ the two declarations
+    /// are consistent and the authoritative one stands.
+    pub fn disagreement_with(&self, tensor: &ComfyQuantDescriptor) -> Vec<&'static str> {
+        let mut disagreement = Vec::new();
+        if self.format != tensor.format {
+            disagreement.push("format");
+        }
+        if self
+            .full_precision_matrix_mult
+            .is_some_and(|declared| declared != tensor.full_precision_matrix_mult)
+        {
+            disagreement.push("full_precision_matrix_mult");
+        }
+        // `per_row` does not survive into `ComfyQuantDescriptor` — the int8 format variant *is* the
+        // per-row layout — so a declared `per_row: false` on an int8 layer contradicts the
+        // authoritative blob just as surely as a format mismatch would.
+        if self.per_row == Some(false) && tensor.format == ComfyQuantFormat::Int8TensorwisePerRow {
+            disagreement.push("per_row");
+        }
+        disagreement
+    }
+}
+
+impl fmt::Display for PartialComfyQuantDescriptor {
+    /// Renders only what the declaration actually carries, so a diagnostic never invents a default
+    /// the producer never wrote.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`", self.format)?;
+        let mut declared = Vec::new();
+        if let Some(flag) = self.full_precision_matrix_mult {
+            declared.push(format!("full_precision_matrix_mult={flag}"));
+        }
+        if let Some(flag) = self.per_row {
+            declared.push(format!("per_row={flag}"));
+        }
+        if declared.is_empty() {
+            f.write_str(" (no other field declared)")
+        } else {
+            write!(f, " ({})", declared.join(", "))
+        }
+    }
+}
+
 /// The shared validation half of [`parse_comfy_quant_descriptor`]: one already-parsed JSON value
-/// describing a single layer. The file-level `_quantization_metadata` form
-/// ([`parse_quantization_metadata`]) carries the *same* per-layer objects, so both routes accept and
-/// refuse exactly the same descriptors rather than each growing its own rules.
+/// describing a single layer, validated as a **standalone** declaration.
+///
+/// The file-level `_quantization_metadata` form ([`parse_quantization_metadata`]) parses through
+/// [`partial_descriptor_from_json`] instead, because a real ComfyUI file's two routes do *not*
+/// carry the same per-layer objects — see [`PartialComfyQuantDescriptor`].
 pub fn descriptor_from_json(
     json: &serde_json::Value,
 ) -> Result<ComfyQuantDescriptor, ComfyQuantDescriptorError> {
+    partial_descriptor_from_json(json)?.into_complete()
+}
+
+/// Parse one layer descriptor object into its declared fields, applying every rule that does not
+/// depend on the declaration standing alone: JSON shape, `format` support, the ConvRot refusal,
+/// field types, and the unknown-key refusal.
+pub fn partial_descriptor_from_json(
+    json: &serde_json::Value,
+) -> Result<PartialComfyQuantDescriptor, ComfyQuantDescriptorError> {
     let object = json
         .as_object()
         .ok_or(ComfyQuantDescriptorError::NotAnObject)?;
@@ -215,8 +335,8 @@ pub fn descriptor_from_json(
         }
     })?;
     let full_precision_matrix_mult = match object.get("full_precision_matrix_mult") {
-        None => false,
-        Some(serde_json::Value::Bool(flag)) => *flag,
+        None => None,
+        Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => {
             return Err(ComfyQuantDescriptorError::NonBooleanField {
                 field: "full_precision_matrix_mult",
@@ -228,9 +348,6 @@ pub fn descriptor_from_json(
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => return Err(ComfyQuantDescriptorError::NonBooleanField { field: "per_row" }),
     };
-    if format == ComfyQuantFormat::Int8TensorwisePerRow && per_row != Some(true) {
-        return Err(ComfyQuantDescriptorError::Int8NotPerRow);
-    }
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
             || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow);
@@ -238,9 +355,10 @@ pub fn descriptor_from_json(
             return Err(ComfyQuantDescriptorError::UnknownField { field: key.clone() });
         }
     }
-    Ok(ComfyQuantDescriptor {
+    Ok(PartialComfyQuantDescriptor {
         format,
         full_precision_matrix_mult,
+        per_row,
     })
 }
 
@@ -307,11 +425,18 @@ impl std::error::Error for QuantizationMetadataError {}
 /// table the plan compiler consumes, keyed by the metadata's own layer names (which may be relative
 /// to the tensors' state-dict prefix — the compiler resolves that).
 ///
-/// Every layer object goes through [`descriptor_from_json`], so an `nvfp4` layer that also declares
-/// an unmodelled key is refused here exactly as a `.comfy_quant` tensor would be.
+/// Every layer object goes through [`partial_descriptor_from_json`], so an `nvfp4` layer that also
+/// declares an unmodelled key is refused here exactly as a `.comfy_quant` tensor would be.
+///
+/// The table's entries stay **partial** (sc-20651): a real ComfyUI int8 file declares the layer here
+/// as a bare `{"format": "int8_tensorwise"}` while its authoritative per-tensor blob carries
+/// `per_row: true`, so the completeness rules can only be applied once the compiler knows whether a
+/// blob corroborates the entry. See [`PartialComfyQuantDescriptor`]; a layer this table declares
+/// *alone* is completed with [`PartialComfyQuantDescriptor::into_complete`] by the compiler and
+/// refuses exactly as before.
 pub fn parse_quantization_metadata(
     payload: &str,
-) -> Result<BTreeMap<String, ComfyQuantDescriptor>, QuantizationMetadataError> {
+) -> Result<BTreeMap<String, PartialComfyQuantDescriptor>, QuantizationMetadataError> {
     let json: serde_json::Value =
         serde_json::from_str(payload).map_err(|error| QuantizationMetadataError::NotJson {
             detail: error.to_string(),
@@ -334,11 +459,12 @@ pub fn parse_quantization_metadata(
     }
     let mut table = BTreeMap::new();
     for (layer, value) in layers {
-        let descriptor =
-            descriptor_from_json(value).map_err(|defect| QuantizationMetadataError::Layer {
+        let descriptor = partial_descriptor_from_json(value).map_err(|defect| {
+            QuantizationMetadataError::Layer {
                 layer: layer.clone(),
                 defect,
-            })?;
+            }
+        })?;
         table.insert(layer.clone(), descriptor);
     }
     Ok(table)
@@ -1410,12 +1536,44 @@ mod tests {
         assert_eq!(table.len(), 2);
         assert_eq!(
             table["blocks.0.attn.wq"],
-            ComfyQuantDescriptor {
+            // Declared fields only (sc-20651): an entry that says nothing about
+            // `full_precision_matrix_mult` must stay distinguishable from one that declares `false`.
+            PartialComfyQuantDescriptor {
                 format: ComfyQuantFormat::Nvfp4,
-                full_precision_matrix_mult: false
+                full_precision_matrix_mult: None,
+                per_row: None,
             }
         );
-        assert!(table["blocks.0.mlp.up"].full_precision_matrix_mult);
+        assert_eq!(
+            table["blocks.0.mlp.up"].full_precision_matrix_mult,
+            Some(true)
+        );
+        // Completing a standalone entry fills the ComfyUI defaults.
+        assert_eq!(
+            table["blocks.0.attn.wq"].into_complete(),
+            Ok(ComfyQuantDescriptor {
+                format: ComfyQuantFormat::Nvfp4,
+                full_precision_matrix_mult: false
+            })
+        );
+        // …and a bare int8 entry, which every real ComfyUI file writes, is only refusable as a
+        // STANDALONE declaration — the table itself parses it (sc-20651).
+        let int8 = parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "int8_tensorwise"}}}"#,
+        )
+        .expect("a bare int8 entry is a well-formed table entry");
+        assert_eq!(
+            int8["q"],
+            PartialComfyQuantDescriptor {
+                format: ComfyQuantFormat::Int8TensorwisePerRow,
+                full_precision_matrix_mult: None,
+                per_row: None,
+            }
+        );
+        assert_eq!(
+            int8["q"].into_complete(),
+            Err(ComfyQuantDescriptorError::Int8NotPerRow)
+        );
 
         assert!(matches!(
             parse_quantization_metadata("{"),
