@@ -2221,6 +2221,61 @@ fn trainer_dit_path() -> PathBuf {
     path
 }
 
+/// The independent receipt oracle deliberately promotes its comparison math to F32. Production
+/// stays native (the real DiT probe is BF16); this boundary only prevents Candle from rejecting a
+/// BF16 probe multiplied by the raw trainer factors, which are F32 in the exact artifact.
+fn independent_lora_residual_f32(
+    x: &Tensor,
+    down: &Tensor,
+    q_up: &Tensor,
+    hidden_size: usize,
+    output_features: usize,
+    scale: f32,
+) -> Tensor {
+    let x = x
+        .to_dtype(DType::F32)
+        .expect("independent oracle input promoted to F32");
+    let down = down
+        .to_dtype(DType::F32)
+        .expect("independent oracle down factor at F32");
+    let q_up = q_up
+        .to_dtype(DType::F32)
+        .expect("independent oracle up factor at F32");
+    x.reshape((x.elem_count() / hidden_size, hidden_size))
+        .unwrap()
+        .matmul(&down.t().unwrap().contiguous().unwrap())
+        .unwrap()
+        .matmul(&q_up.t().unwrap().contiguous().unwrap())
+        .unwrap()
+        .affine(scale as f64, 0.0)
+        .unwrap()
+        .reshape((1, 3, output_features))
+        .unwrap()
+}
+
+#[test]
+fn independent_trainer_oracle_promotes_bf16_probe_against_f32_factors() {
+    let cfg = dit_fixture_config();
+    let x = bf16(&tensor(&[1, 3, cfg.hidden_size], 0.21028));
+    let down = tensor(&[16, cfg.hidden_size], 0.31);
+    let q_up = tensor(&[cfg.inner_dim(), 16], 0.71);
+    let actual = independent_lora_residual_f32(
+        &x,
+        &down,
+        &q_up,
+        cfg.hidden_size,
+        cfg.inner_dim(),
+        SC21028_RUNTIME_ADAPTER_SCALE,
+    );
+    assert_eq!(actual.dtype(), DType::F32);
+    assert!(
+        actual.to_vec3::<f32>().unwrap()[0][0]
+            .iter()
+            .all(|value| value.is_finite()),
+        "mixed BF16/F32 independent oracle must remain finite"
+    );
+}
+
 /// Independent oracle for the exact probe residual. It operates directly on the raw fused-QKV
 /// trainer tensors and applies the non-unit runtime adapter strength itself, never calling either
 /// conversion or installer under test. This artifact's alpha/rank is the identity 16/16; the
@@ -2264,19 +2319,14 @@ fn exact_trainer_q_probe_residual(
         .expect("take the Q row block independently")
         .to_device(device)
         .unwrap();
-    x.reshape((x.elem_count() / cfg.hidden_size, cfg.hidden_size))
-        .unwrap()
-        .matmul(&down.t().unwrap().contiguous().unwrap())
-        .unwrap()
-        .matmul(&q_up.t().unwrap().contiguous().unwrap())
-        .unwrap()
-        .affine(
-            ((alpha / rank as f32) * SC21028_RUNTIME_ADAPTER_SCALE) as f64,
-            0.0,
-        )
-        .unwrap()
-        .reshape((1, 3, cfg.inner_dim()))
-        .unwrap()
+    independent_lora_residual_f32(
+        x,
+        &down,
+        &q_up,
+        cfg.hidden_size,
+        cfg.inner_dim(),
+        (alpha / rank as f32) * SC21028_RUNTIME_ADAPTER_SCALE,
+    )
 }
 
 fn converted_lora_module(key: &str) -> Option<&str> {
