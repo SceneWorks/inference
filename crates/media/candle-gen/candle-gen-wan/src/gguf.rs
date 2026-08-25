@@ -80,6 +80,22 @@ pub(crate) fn load_wan_dit_gguf(
     load_wan_dit_gguf_with_receipt(path, cfg, device, dtype).map(|(dit, _)| dit)
 }
 
+/// [`load_wan_dit_gguf_with_facts`] wired to the provider-build seam (sc-11045 fix round,
+/// BLOCKER 1): load the DiT, then publish the read's validated [`CheckpointWeightFacts`] into the
+/// clonable sink whose sibling lives on the `WanGenerator`, so a consumer across the worker
+/// boundary reads them through [`candle_gen::gen_core::Generator::checkpoint_weight_facts`].
+pub(crate) fn load_wan_dit_gguf_publishing(
+    path: &Path,
+    cfg: &TransformerConfig,
+    device: &Device,
+    dtype: candle_gen::candle_core::DType,
+    facts: &candle_gen::gen_core::CheckpointFactsSink,
+) -> CResult<WanTransformer> {
+    let (dit, loaded_facts) = load_wan_dit_gguf_with_facts(path, cfg, device, dtype)?;
+    facts.publish(loaded_facts);
+    Ok(dit)
+}
+
 /// `load_wan_dit_gguf` plus the read's [`LogicalWeightReceipt`] — the registered-codec route's
 /// truthful accounting of what the container left resident (measured from the materialized
 /// `QTensor`s, not predicted from the header).
@@ -1068,6 +1084,56 @@ mod tests {
     /// Return `NativeExecutionCapability::dense_only()` from `native_execution_capability()`:
     /// `checkpoint_weight_facts()` fails with a `NativeWithoutCapability` message naming
     /// `gguf-container-v1` and this test goes red at the `expect`.
+    /// **sc-11045 fix round (BLOCKER 1): the GGUF facts cross the worker boundary.** The
+    /// generator's sink clone travels into the `Pipeline` it builds, the publishing loader writes
+    /// the load's validated facts into it, and the consumer reads them back **through the trait,
+    /// UFCS** — the surface a `Box<dyn Generator>` actually has. Before this fix
+    /// `load_wan_dit_gguf_with_facts` was dead public API and `WanGenerator` never overrode the
+    /// trait, so a worker could only ever see `None`.
+    ///
+    /// # Mutation
+    ///
+    /// Delete the `facts.publish(...)` line in `load_wan_dit_gguf_publishing`, or the
+    /// `checkpoint_weight_facts` override on `WanGenerator`: the `expect` below goes red.
+    #[test]
+    fn the_gguf_load_publishes_facts_to_the_generator_trait_surface() {
+        use candle_gen::gen_core::{Generator, LoadSpec, WeightsSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = gguf_cfg();
+        let tensors = native_wan_tensors(&cfg);
+        let path = write_gguf(&tmp, &tensors, "trait-surface");
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        let generator =
+            crate::build_generator_with_source(&spec, crate::DitSource::NativeGguf(path.clone()))
+                .expect("the lazy generator builds");
+        assert!(
+            Generator::checkpoint_weight_facts(&generator).is_none(),
+            "before the DiT loads there is no measured receipt to report"
+        );
+
+        // The pipeline the generator mints carries a clone of ITS sink — publish through it the
+        // way `Pipeline::build_dit`'s GGUF branch does (the fixture config passed explicitly; the
+        // production branch passes the 5B config the same way).
+        let pipe = generator.pipeline();
+        let _dit = crate::gguf::load_wan_dit_gguf_publishing(
+            &path,
+            &cfg,
+            &Device::Cpu,
+            DType::F32,
+            &pipe.facts,
+        )
+        .expect("the fixture GGUF loads and publishes");
+
+        let facts = Generator::checkpoint_weight_facts(&generator)
+            .expect("the trait surface exposes what the GGUF load published");
+        assert!(facts.source().declares(GGUF_CONTAINER_CODEC.codec_id));
+        assert!(facts.executes_natively(GGUF_CONTAINER_CODEC.codec_id));
+        assert!(facts.is_complete());
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn the_gguf_receipt_builds_valid_checkpoint_weight_facts() {
         let tmp = tempfile::tempdir().unwrap();
