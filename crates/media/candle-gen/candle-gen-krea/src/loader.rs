@@ -620,18 +620,27 @@ impl Weights {
         }
     }
 
-    /// True when `diffusers_weight` is one of this file's **descriptor-declared** NVFP4 weights.
+    /// True when `diffusers_weight` is one of this file's **descriptor-declared** NVFP4 weights
+    /// *and* the descriptor permits a quantized matmul on it.
     ///
     /// The authority is the compiled plan: the producer's `.comfy_quant` /
     /// `_quantization_metadata` declaration for that layer resolved to the `nvfp4-v1` codec row.
     /// The predicate this replaced was `dtype == U8`, which is not a format at all — every packed
     /// container, every byte buffer and every future `U8`-stored codec answers it — and which, by
     /// construction, could never see `full_precision_matrix_mult` or any other descriptor field.
+    ///
+    /// `full_precision_matrix_mult` is answered **here**, not only at the read site, and that
+    /// placement is the whole point: `linear_detect_planned` routes a `false` to
+    /// `QLinear::dense(linear(..))`, so a layer the producer flagged takes the dense fallback the
+    /// flag is asking for. Refusing it at the read site instead would fail the entire load over a
+    /// layer the checkpoint told us how to handle. (The read site refuses it too — that arm is for
+    /// a caller that skipped this predicate, not the route.)
     fn is_native_nvfp4_weight(&self, diffusers_weight: &str) -> bool {
         self.native_nvfp4
-            && self
-                .planned(diffusers_weight)
-                .is_some_and(|tensor| tensor.codec_id == NVFP4_CODEC.codec_id)
+            && self.planned(diffusers_weight).is_some_and(|tensor| {
+                tensor.codec_id == NVFP4_CODEC.codec_id
+                    && !tensor.codec.full_precision_matrix_mult()
+            })
     }
 
     /// Read one prepacked Kitchen NVFP4 triplet into Candle's canonical host container. The global
@@ -2619,6 +2628,45 @@ mod tests {
         ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
     }
 
+    /// [`write_kitchen_nvfp4_native_file`] whose one NVFP4 layer additionally declares
+    /// `full_precision_matrix_mult` — the producer saying "do not run a quantized matmul here".
+    fn write_kitchen_nvfp4_native_file_full_precision(path: &Path) {
+        let declared = path.with_extension("declared.safetensors");
+        write_kitchen_nvfp4_native_file(&declared);
+        // SAFETY: read-only mmap of a file this test just wrote.
+        let st = unsafe { MmapedSafetensors::new(&declared) }.expect("fixture opens");
+        let owned: Vec<(String, ::safetensors::Dtype, Vec<usize>, Vec<u8>)> = st
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| {
+                (
+                    name,
+                    view.dtype(),
+                    view.shape().to_vec(),
+                    view.data().to_vec(),
+                )
+            })
+            .collect();
+        let tensors: std::collections::BTreeMap<&str, ::safetensors::tensor::TensorView<'_>> =
+            owned
+                .iter()
+                .map(|(name, dtype, shape, data)| {
+                    (
+                        name.as_str(),
+                        ::safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+        let metadata = std::collections::HashMap::from([(
+            "_quantization_metadata".to_string(),
+            r#"{"format_version": "1.0", "layers": {"model.diffusion_model.blocks.0.attn.wq": {"format": "nvfp4", "full_precision_matrix_mult": true}}}"#
+                .to_string(),
+        )]);
+        ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
+        std::fs::remove_file(&declared).ok();
+    }
+
     /// [`write_kitchen_nvfp4_native_file`] with the `_quantization_metadata` declaration REMOVED and
     /// nothing else changed — the structural NVFP4 triplet is still on disk, so a storage-shape
     /// predicate still reads it as NVFP4.
@@ -2812,6 +2860,69 @@ mod tests {
             error.contains("uint8") && error.contains("no checkpoint codec is registered"),
             "the refusal must be the plan's unregistered-format one: {error}"
         );
+    }
+
+    /// **A `full_precision_matrix_mult` layer takes the DENSE fallback, it does not fail the load.**
+    ///
+    /// The flag is the producer saying "this layer must not run a quantized matmul" — a routing
+    /// instruction the checkpoint supplies, not an error. So it is answered by the *predicate*
+    /// (`is_native_nvfp4_weight`), which is what `linear_detect_planned` branches on, and the layer
+    /// resolves to a dense `QLinear` exactly as Kitchen's deliberately-dense projections do. The
+    /// read site refuses it as well, for a caller that reaches past the predicate.
+    ///
+    /// This is a descriptor field the `dtype == U8` predicate could not see at all: it would have
+    /// packed the layer and handed it to the NVFP4 GEMM.
+    #[test]
+    fn a_full_precision_matrix_mult_layer_routes_dense_instead_of_failing_the_load() {
+        let dev = Device::Cpu;
+        let path_tmp = tempfile::tempdir().unwrap();
+        let path = path_tmp.path().join("variant7_fpmm.safetensors");
+        write_kitchen_nvfp4_native_file_full_precision(&path);
+        let cfg = kitchen_nvfp4_config();
+
+        let w = Weights::from_native_file_for(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("a full-precision-flagged NVFP4 layer must not stop the import");
+        assert!(w.is_native_nvfp4(), "the file is still an NVFP4 checkpoint");
+        assert!(
+            !w.is_native_nvfp4_weight("transformer_blocks.0.attn.to_q.weight"),
+            "a full_precision_matrix_mult layer must not be claimed for the packed route"
+        );
+
+        // The route therefore builds a DENSE projection for it.
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+        let projection = linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan)
+            .expect("the flagged layer loads through the dense fallback the descriptor asks for");
+        assert!(
+            projection.nvfp4().is_none(),
+            "a full_precision_matrix_mult layer must not become an NVFP4 projection"
+        );
+
+        // And the read site still refuses a caller that reaches past the predicate.
+        let error = w
+            .get_native_nvfp4("transformer_blocks.0.attn.to_q.weight")
+            .expect_err("the packed read must refuse a full-precision layer")
+            .to_string();
+        assert!(
+            error.contains("full_precision_matrix_mult"),
+            "the refusal must name the descriptor field: {error}"
+        );
+
+        // Contrast: the same fixture WITHOUT the flag does take the packed route.
+        let unflagged_path = path_tmp.path().join("variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&unflagged_path);
+        let unflagged = Weights::from_native_file_for(
+            &unflagged_path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("the unflagged fixture imports");
+        assert!(unflagged.is_native_nvfp4_weight("transformer_blocks.0.attn.to_q.weight"));
     }
 
     /// **Materializing a padded NVFP4 layer without a declared logical shape is refused.** With no
