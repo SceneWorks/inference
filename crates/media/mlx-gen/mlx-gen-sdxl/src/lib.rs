@@ -182,6 +182,14 @@ pub fn register_providers(
             provider_id: MODEL_ID,
             contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: MODEL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(MODEL_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION)
 }
@@ -193,6 +201,57 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    /// One line per selector: the whole ladder's per-surface disposition, in rung order 0..4.
+    /// `I` = Implemented, `S` = StructurallyNotApplicable, `-` = Missing.
+    fn ladder_lines(provider_id: &str) -> Vec<String> {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let registry = super::provider_registry().unwrap();
+        registry
+            .memory_contract_surfaces()
+            .unwrap()
+            .iter()
+            .filter(|surface| surface.contract.provider_id == provider_id)
+            .map(|surface| {
+                let ladder: String = MemoryStrategy::ALL
+                    .iter()
+                    .map(
+                        |strategy| match surface.contract.capability(*strategy).unwrap().support {
+                            MemoryStrategySupport::Implemented => 'I',
+                            MemoryStrategySupport::StructurallyNotApplicable { .. } => 'S',
+                            MemoryStrategySupport::Missing => '-',
+                        },
+                    )
+                    .collect();
+                format!("{} {ladder}", surface.selector.id())
+            })
+            .collect()
+    }
+
+    /// sc-21510: rung 4 is tier-agnostic. The selector names an already-resolved artifact tier, so a
+    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. Every other
+    /// (surface, rung) disposition is unchanged.
+    #[test]
+    fn published_ladder_surface_is_pinned_per_selector() {
+        assert_eq!(
+            ladder_lines(super::MODEL_ID),
+            [
+                "bf16:resident:eager II---",
+                "bf16:resident:deferred II--I",
+                "bf16:sequential:eager II---",
+                "bf16:sequential:deferred II--I",
+                "q4:resident:eager II---",
+                "q4:resident:deferred II--I",
+                "q4:sequential:eager II---",
+                "q4:sequential:deferred II--I",
+                "q8:resident:eager II---",
+                "q8:resident:deferred II--I",
+                "q8:sequential:eager II---",
+                "q8:sequential:deferred II--I",
+            ]
+        );
+    }
+
     #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
