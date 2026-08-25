@@ -2056,6 +2056,48 @@ expected_files = [
   "tokenizer/tokenizer_config.json",
 ]
 
+# ── MiniMax-H3 VRAM campaign (sc-20754) ──────────────────────────────────────────────────────────
+#
+# A dedicated exact allow-list keeps the normal `minimax-h3` header/decode slice small. The CUDA
+# VRAM campaign needs the dense root transformer and every text-encoder shard, whereas ordinary
+# lanes do not. The workflow deliberately refuses the runner's Hugging Face cache snapshot because
+# its reparse-point blob links cannot be memmapped by candle; an operator must hardlink/copy-stage
+# this exact projection. Both indexes are expected so verification follows their weight maps and
+# fails loudly for a missing shard rather than discovering it during a render.
+[[models]]
+key = "minimax-h3-vram"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "very-large"
+profiles = ["media-cuda"]
+environment = ["CANDLE_MINIMAX_H3_SNAPSHOT"]
+download_files = [
+  "text_encoder/config.json",
+  "text_encoder/model-00001-of-00014.safetensors",
+  "text_encoder/model-00002-of-00014.safetensors",
+  "text_encoder/model-00003-of-00014.safetensors",
+  "text_encoder/model-00004-of-00014.safetensors",
+  "text_encoder/model-00005-of-00014.safetensors",
+  "text_encoder/model-00006-of-00014.safetensors",
+  "text_encoder/model-00007-of-00014.safetensors",
+  "text_encoder/model-00008-of-00014.safetensors",
+  "text_encoder/model-00009-of-00014.safetensors",
+  "text_encoder/model-00010-of-00014.safetensors",
+  "text_encoder/model-00011-of-00014.safetensors",
+  "text_encoder/model-00012-of-00014.safetensors",
+  "text_encoder/model-00013-of-00014.safetensors",
+  "text_encoder/model-00014-of-00014.safetensors",
+  "text_encoder/model.safetensors.index.json",
+  "transformer/*",
+]
+expected_files = [
+  "text_encoder/config.json",
+  "text_encoder/model.safetensors.index.json",
+  "transformer/config.json",
+  "transformer/diffusion_pytorch_model.safetensors.index.json",
+]
+
 # ── MiniMax-H3 text encoder, layer-50 tap only (sc-19438) ───────────────────────────────────────
 # The SAME repository and the SAME pinned revision as `minimax-h3` above, materialized into the
 # SAME `MINIMAX_H3_SNAPSHOT` directory. It is a separate key rather than more entries on that row
@@ -2208,7 +2250,7 @@ expected_files = [
 [[models]]
 key = "minimax-h3-mlx-bf16"
 repository = "SceneWorks/minimax-h3-mlx"
-revision = "f22bc294f46894584645aec59a513ee411450c96"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
 license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
@@ -2231,7 +2273,7 @@ expected_files = [
 [[models]]
 key = "minimax-h3-mlx-q8"
 repository = "SceneWorks/minimax-h3-mlx"
-revision = "f22bc294f46894584645aec59a513ee411450c96"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
 license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]
@@ -2248,7 +2290,7 @@ expected_files = [
 [[models]]
 key = "minimax-h3-mlx-q4"
 repository = "SceneWorks/minimax-h3-mlx"
-revision = "f22bc294f46894584645aec59a513ee411450c96"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
 license = "MiniMax H3 Community License Agreement"
 size_class = "very-large"
 profiles = ["media-macos"]

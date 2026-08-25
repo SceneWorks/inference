@@ -18,9 +18,8 @@
 //!    localised to a single scale atom). The throughput multiple against bf16 dense is
 //!    **reported, not gated** (the spike saw 1.9–3.7×); see the note in
 //!    `nvfp4_gemm_throughput_vs_bf16` for why a wall-clock ratio cannot be an assertion
-//!    (sc-19505). ⚠️ That demotion **gives up** the "is it faster" half of this item — a
-//!    driver/algo regression returning a working-but-slow FP4 algo is now gated nowhere, and
-//!    needs an algo-identity instrument to recover (sc-19556).
+//!    (sc-19505). The selected FP4 tensor-core algorithm/configuration is instead observed
+//!    after the first dispatch and proven to be cached unchanged for the shape (sc-19556).
 //! 4. **K-alignment** (**handoff item (b)**) — the GPU-confirmed requirement is K a multiple of 32
 //!    (K∈{16,48} → `NOT_SUPPORTED`; K∈{32,64,128} accepted); this pins the enforced bound.
 
@@ -128,6 +127,62 @@ fn run_gemm(dev: &Device, lt: &CublasLt, m: usize, k: usize, n: usize) -> (Vec<f
     (got, dq_ref)
 }
 
+/// Offset of a logical scale byte in the packer's column-major 128×4 atom layout. This is test-side
+/// input construction, deliberately independent of the staging destination calculation below.
+fn packed_scale_offset(row: usize, block: usize, sf_rows: usize) -> usize {
+    let (m_atom, mr) = (row / 128, row % 128);
+    let (k_atom, kc) = (block / 4, block % 4);
+    let num_m_atoms = sf_rows / 128;
+    (m_atom + num_m_atoms * k_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+/// Offset of a logical scale byte in cuBLASLt's row-major 128×4 destination atom layout. Kept in
+/// this device test rather than calling the private staging helper so this remains a real byte oracle.
+fn staged_scale_offset(row: usize, block: usize, sf_cols: usize) -> usize {
+    let (m_atom, mr) = (row / 128, row % 128);
+    let (k_atom, kc) = (block / 4, block % 4);
+    let num_k_atoms = sf_cols / 4;
+    (k_atom + num_k_atoms * m_atom) * 512 + (mr % 32) * 16 + (mr / 32) * 4 + kc
+}
+
+#[test]
+fn staged_nvfp4_scales_match_row_major_byte_oracle() {
+    let Some((_dev, lt)) = nvfp4_device() else {
+        return;
+    };
+
+    // Eight 16-value blocks make two K atoms. Thirty-two logical rows give exactly 256 distinct
+    // UE4M3 bytes while retaining the padded 128×4 atom shape that cuBLASLt consumes.
+    let (rows, cols_padded, sf_rows, sf_cols) = (32usize, 128usize, 128usize, 8usize);
+    let mut scales = vec![0u8; sf_rows * sf_cols];
+    let mut expected = vec![0u8; sf_rows * sf_cols];
+    for row in 0..rows {
+        for block in 0..sf_cols {
+            let byte = (row * sf_cols + block) as u8;
+            scales[packed_scale_offset(row, block, sf_rows)] = byte;
+            expected[staged_scale_offset(row, block, sf_cols)] = byte;
+        }
+    }
+    let packed = Nvfp4Tensor {
+        rows,
+        cols: cols_padded,
+        cols_padded,
+        packed: vec![0u8; rows * cols_padded / 2],
+        scales,
+        sf_rows,
+        sf_cols,
+        global_scale: 1.0,
+    };
+
+    let staged = lt.stage_nvfp4(&packed).unwrap();
+    assert_eq!(
+        staged.scales_to_host(&lt).unwrap(),
+        expected,
+        "staged NVFP4 scales must exactly re-tile logical (row, block) bytes into cuBLASLt's \
+         row-major 128x4 atom layout"
+    );
+}
+
 #[test]
 fn nvfp4_gemm_roundtrip_vs_bf16_dense() {
     let Some((dev, lt)) = nvfp4_device() else {
@@ -206,6 +261,34 @@ fn nvfp4_gemm_throughput_vs_bf16() {
     // Warm up both paths (the FP4 warmup also primes the per-shape algo cache so the loop times the
     // kernel, not the one-off cuBLASLt heuristic search).
     let _ = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
+    let selected = lt
+        .selected_nvfp4_algorithm_identity(m, k, n)
+        .expect("FP4 descriptor heuristic must select and cache a cuBLASLt algorithm");
+    // `tile_id == 0` and `stages_id == 0` are cuBLASLt's UNDEFINED defaults. A selected
+    // configuration with either value would be a default-only false green: the FP4 descriptor
+    // found an opaque algo, but did not identify a concrete tensor-core tile/pipeline for this
+    // launch. `inner_shape_id` is recorded for evidence but may validly be undefined on an
+    // otherwise concrete driver configuration. Do not pin the nonzero values: algorithm/config
+    // IDs legitimately differ by CUDA driver.
+    assert_ne!(
+        selected.tile_id, 0,
+        "FP4 descriptor selected an undefined cuBLASLt tile: {selected:?}"
+    );
+    assert_ne!(
+        selected.stages_id, 0,
+        "FP4 descriptor selected undefined cuBLASLt pipeline stages: {selected:?}"
+    );
+    let _ = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
+    assert_eq!(
+        lt.nvfp4_heuristic_selection_count(m, k, n),
+        1,
+        "repeated staged FP4 GEMM must reuse the cached cuBLASLt heuristic selection"
+    );
+    assert_eq!(
+        lt.selected_nvfp4_algorithm_identity(m, k, n),
+        Some(selected),
+        "repeated staged FP4 GEMM must reuse the exact selected cuBLASLt configuration"
+    );
     let _ = x_bf16.matmul(&w_bf16.t().unwrap()).unwrap();
     dev.synchronize().unwrap();
 
@@ -243,15 +326,9 @@ fn nvfp4_gemm_throughput_vs_bf16() {
     // arm) — so a device that cannot deliver an FP4 kernel panics at those `.unwrap()`s and never
     // reaches a timer. `nvfp4_device()` has already screened out the pre-Blackwell case above.
     //
-    // ⚠️ But one real claim DOES lapse here, and it is not noise. `mult > 1.0` also covered a
-    // driver/algo regression in which cuBLASLt returns *an* FP4 algo that is SLOWER than bf16
-    // dense. The `.unwrap()`s above cannot see that — a slow algo is still an algo, and the
-    // heuristic search succeeds. That is this file's own published item 3, "is it faster"
-    // (sc-11039), and after this change it is gated NOWHERE. It is given up deliberately, not
-    // covered by something else: re-gating it needs an instrument that names what the heuristic
-    // actually selected — an algo-identity / kernel-name assertion — rather than a throughput
-    // ratio, which is unfixable on a shared runner at any threshold. Tracked in sc-19556, and not
-    // attempted here because no lane can execute this file to validate a replacement (below).
+    // The selected tile/MMA configuration above carries the non-timing identity claim that the
+    // former `mult > 1.0` clock assertion only approximated. It remains tied to the FP4
+    // descriptor and is not a driver-incidental numeric ID contract.
     //
     // What the clock did carry, and the unwraps do not, is that this staged/algo-cached path is
     // still numerically right at a DiT shape — the round-trip test only reaches 256³ through the
