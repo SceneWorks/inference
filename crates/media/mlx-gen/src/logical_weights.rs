@@ -50,6 +50,7 @@ use gen_core::checkpoint_codec::{
     WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
+use gen_core::checkpoint_facts::ExecutionRepresentation;
 use gen_core::weightsmeta::Dtype as HeaderDtype;
 use gen_core::ProviderRegistryBuilder;
 use mlx_rs::ops::indexing::IndexOp;
@@ -579,6 +580,11 @@ fn measure_residency(
             .entry(tensor.codec_id)
             .or_insert(CodecResidencyReport {
                 codec_id: tensor.codec_id,
+                // MLX plans under `DenseResidencyPolicy` only — every codec row decodes to its
+                // dense resident encoding here, so every row this backend reports is a
+                // dense fallback and none of them may ever be labelled native (sc-21484). The
+                // retained-companion assertion below is the same invariant, stated on bytes.
+                representation: ExecutionRepresentation::DenseFallback,
                 tensor_count: 0,
                 source_bytes: 0,
                 resident_bytes: 0,

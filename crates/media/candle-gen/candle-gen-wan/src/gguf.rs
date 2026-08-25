@@ -42,9 +42,9 @@ use candle_gen::candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_gen::candle_core::{Device, Error as CError, Result as CResult, Shape, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    CheckpointCodecRegistry, CodecResidencyReport, LogicalKeyMapping, LogicalReadMaterialization,
-    LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, PlannedResidency, ResidencyMode,
-    TensorCodecSpec, WeightEncoding, GGUF_CONTAINER_CODEC,
+    CheckpointCodecRegistry, CodecResidencyReport, ExecutionRepresentation, LogicalKeyMapping,
+    LogicalReadMaterialization, LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt,
+    PlannedResidency, ResidencyMode, TensorCodecSpec, WeightEncoding, GGUF_CONTAINER_CODEC,
 };
 
 use crate::comfyui::remap_wan_key;
@@ -556,6 +556,9 @@ impl GgufDit {
             materialization: LogicalReadMaterialization::Materialized,
             residency: vec![CodecResidencyReport {
                 codec_id: GGUF_CONTAINER_CODEC.codec_id,
+                // Every GGUF row plans `Packed` (the ggml blocks stay resident as stored and the
+                // forward dequantizes per matmul), so the whole read is one native-packed row.
+                representation: ExecutionRepresentation::NativePacked,
                 tensor_count: plan.tensor_count(),
                 source_bytes: plan.source_bytes,
                 resident_bytes,

@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use candle_gen::gen_core::checkpoint_codec::{
     LogicalTensorPlan, LogicalWeightPlan, LogicalWeightReceipt, NVFP4_CODEC,
 };
+use candle_gen::gen_core::checkpoint_facts::CheckpointWeightFacts;
 use candle_gen::logical_weights::{
     plan_logical_weights, CandleCodecResidency, LogicalTensor, LogicalWeightReader,
 };
@@ -409,8 +410,16 @@ impl Weights {
         // The shared reader over the same pinned bytes: opening it re-verifies the on-disk tensor
         // surface against the plan, so source drift between planning and reading refuses here —
         // before any generator construction begins.
-        let logical = LogicalWeightReader::open(pinned_source.loader_path(), logical_plan, device)
-            .map_err(|error| Error::Msg(error.to_string()))?;
+        // The capability the facts are validated against is rendered from the *same* residency
+        // policy that priced the plan (sc-21484), so a forced-packed test route and a real
+        // `sm_120` probe stay consistent, and a dense-only host cannot produce a native row.
+        let logical = LogicalWeightReader::open_with_capability(
+            pinned_source.loader_path(),
+            logical_plan,
+            device,
+            residency.native_execution_capability(),
+        )
+        .map_err(|error| Error::Msg(error.to_string()))?;
         let result = Self {
             st,
             pinned_source: Some(pinned_source.clone()),
@@ -482,6 +491,31 @@ impl Weights {
     /// free.
     pub fn logical_weight_receipt(&self) -> Option<LogicalWeightReceipt> {
         Some(self.logical.as_ref()?.receipt())
+    }
+
+    /// The **three correlated facts** about this import (sc-21484), tied to the verified source
+    /// binding: what the source stores (per-codec tensor counts and source bytes), what this host
+    /// can execute natively, and what actually materialized — split per execution representation
+    /// and measured, never copied from the plan.
+    ///
+    /// This is the surface the SceneWorks half consumes to distinguish a source stored `nvfp4-v1`
+    /// from a run that executed it as packed W4A4 or as dense BF16. `Ok(None)` when the source has
+    /// no plan (the directory/packed-tier path); `Err` when the pinned file changed under the load,
+    /// so facts are never reported about bytes that are gone.
+    pub fn checkpoint_weight_facts(&self) -> Result<Option<CheckpointWeightFacts>> {
+        let Some(logical) = self.logical.as_ref() else {
+            return Ok(None);
+        };
+        let facts = logical
+            .checkpoint_weight_facts()
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        let facts = match self.pinned_source.as_ref() {
+            Some(pin) => facts
+                .with_verified_source(pin)
+                .map_err(|error| Error::Msg(error.to_string()))?,
+            None => facts,
+        };
+        Ok(Some(facts))
     }
 
     /// Install a pre-built [`Int8Context`] as this weight set's shared handle (sc-12301).
@@ -2634,6 +2668,84 @@ mod tests {
             preserved.nvfp4().is_none(),
             "Kitchen profile's dense BF16/F32 projections must not be requantized"
         );
+        Ok(())
+    }
+
+    /// **sc-21484: the loaded checkpoint exposes the three facts, tied to the verified source
+    /// binding.** The provider-level handoff the SceneWorks half consumes — source-codec inventory,
+    /// host capability, measured receipt — asserted on the same Kitchen fixture through both the
+    /// CPU (dense-fallback) and the forced-packed route.
+    #[test]
+    fn checkpoint_weight_facts_report_the_source_the_capability_and_the_representation(
+    ) -> Result<()> {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+        let cfg = kitchen_nvfp4_config();
+        let dit = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+
+        // ---- the CPU host: NVFP4 source, dense-fallback execution ---------------------------
+        let w = Weights::from_native_file_for(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        for base in ["transformer_blocks.0.attn.to_q", "img_in"] {
+            linear_detect_planned(&w, base, false, &dit)?;
+        }
+        let facts = w
+            .checkpoint_weight_facts()?
+            .expect("a single-file native import has a plan");
+        assert!(
+            facts.source().declares(NVFP4_CODEC.codec_id),
+            "the source stores nvfp4-v1 whatever this host can run"
+        );
+        assert!(
+            !facts.executes_natively(NVFP4_CODEC.codec_id),
+            "a CPU host executes the declared dense fallback and must never be labelled native"
+        );
+        assert!(facts.capability().is_dense_only());
+        assert!(facts.is_complete(), "every projection was constructed");
+        // AC1: tied to the verified source binding, not to a path string.
+        let binding = facts.source_binding().expect("the pin is carried through");
+        assert_eq!(
+            binding.canonical_path(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+
+        // ---- the forced-packed (sm_120-equivalent) host: same source, native execution -------
+        let packed = Weights::from_native_file_forcing_packed_nvfp4(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        for base in ["transformer_blocks.0.attn.to_q", "img_in"] {
+            linear_detect_planned(&packed, base, false, &dit)?;
+        }
+        let packed_facts = packed
+            .checkpoint_weight_facts()?
+            .expect("a single-file native import has a plan");
+        assert!(packed_facts.executes_natively(NVFP4_CODEC.codec_id));
+        assert!(packed_facts
+            .capability()
+            .executes_natively(NVFP4_CODEC.codec_id));
+        // Fact 2 is the same file on both hosts; only fact 3 moved.
+        assert_eq!(
+            packed_facts
+                .source()
+                .entry(NVFP4_CODEC.codec_id)
+                .unwrap()
+                .tensor_count,
+            facts
+                .source()
+                .entry(NVFP4_CODEC.codec_id)
+                .unwrap()
+                .tensor_count
+        );
+        assert!(packed_facts.resident_bytes() < facts.resident_bytes());
         Ok(())
     }
 
