@@ -2662,10 +2662,18 @@ fn resolve_metadata_prefix(
     }
 }
 
-/// What one codec left resident after a read.
+/// What one codec left resident after a read, **in one execution representation**.
+///
+/// A codec that materialized some tensors natively packed and others through its dense fallback —
+/// the mixed-hardware NVFP4 case, where a padded or mis-aligned layer falls back on the same device
+/// that runs its siblings packed — reports **two** rows, one per
+/// [`ExecutionRepresentation`](crate::checkpoint_facts::ExecutionRepresentation). Collapsing them
+/// into one total is exactly how a dense BF16 decode ends up labelled native (sc-21484).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecResidencyReport {
     pub codec_id: &'static str,
+    /// The representation these tensors were actually materialized as.
+    pub representation: crate::checkpoint_facts::ExecutionRepresentation,
     pub tensor_count: usize,
     /// Bytes read from the source file for these tensors (from the plan; companions included).
     pub source_bytes: u64,
@@ -3410,12 +3418,14 @@ mod tests {
             residency: vec![
                 CodecResidencyReport {
                     codec_id: "a",
+                    representation: crate::checkpoint_facts::ExecutionRepresentation::DenseFallback,
                     tensor_count: 1,
                     source_bytes: 4,
                     resident_bytes: 4,
                 },
                 CodecResidencyReport {
                     codec_id: "b",
+                    representation: crate::checkpoint_facts::ExecutionRepresentation::NativePacked,
                     tensor_count: 1,
                     source_bytes: 6,
                     resident_bytes: 12,

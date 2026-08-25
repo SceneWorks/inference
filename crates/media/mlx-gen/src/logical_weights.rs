@@ -50,6 +50,7 @@ use gen_core::checkpoint_codec::{
     WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
+use gen_core::checkpoint_facts::ExecutionRepresentation;
 use gen_core::weightsmeta::Dtype as HeaderDtype;
 use gen_core::ProviderRegistryBuilder;
 use mlx_rs::ops::indexing::IndexOp;
@@ -585,6 +586,13 @@ fn measure_residency(
 ) -> Result<Vec<CodecResidencyReport>> {
     let mut by_codec: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
     let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+    // A transformed tensor contributes one plan entry per logical output, all naming the same
+    // physical key (sc-21547), and exactly one of them carries `source_bytes` while its siblings
+    // carry zero — the plan compiler's convention. So a plain sum totals the file once, and
+    // de-duplicating by physical key here would be wrong: `plan.tensors` is sorted by logical key,
+    // so the byte-carrying output is not generally the first sighting of a fused key. Tensor
+    // counts and resident bytes stay per-logical: each output is separately decoded and separately
+    // occupies memory.
     for tensor in &plan.tensors {
         codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
         let array = logical.require(&tensor.logical_key)?;
@@ -598,6 +606,11 @@ fn measure_residency(
             .entry(tensor.codec_id)
             .or_insert(CodecResidencyReport {
                 codec_id: tensor.codec_id,
+                // MLX plans under `DenseResidencyPolicy` only — every codec row decodes to its
+                // dense resident encoding here, so every row this backend reports is a
+                // dense fallback and none of them may ever be labelled native (sc-21484). The
+                // retained-companion assertion below is the same invariant, stated on bytes.
+                representation: ExecutionRepresentation::DenseFallback,
                 tensor_count: 0,
                 source_bytes: 0,
                 resident_bytes: 0,
@@ -610,23 +623,26 @@ fn measure_residency(
         let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
             continue;
         };
+        // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
+        // this seam — so every companion is consumed by its decode and retains nothing. Adding
+        // the plan's own number in would make the receipt a *copy* of the plan on exactly the
+        // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
+        // packed policy ever reaches this backend, the read refuses rather than silently
+        // agreeing with a residency it never measured.
+        //
+        // Checked outside the `by_codec` lookup below, so a companion whose owner's row is absent
+        // still cannot smuggle a retained residency past this refusal.
+        if companion.resident_bytes != 0 {
+            return Err(Error::Msg(format!(
+                "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
+                 this backend decodes every codec through its dense fallback and measures no \
+                 retained companion; replan with a dense residency policy, or teach \
+                 `measure_residency` to measure the retained form",
+                companion.physical_key, companion.resident_bytes
+            )));
+        }
         if let Some(report) = by_codec.get_mut(codec_id) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-            // MLX plans under `DenseResidencyPolicy` only — there is no packed fp8/int8 matmul on
-            // this seam — so every companion is consumed by its decode and retains nothing. Adding
-            // the plan's own number in would make the receipt a *copy* of the plan on exactly the
-            // row the receipt/plan pair exists to cross-check. Assert the invariant instead: if a
-            // packed policy ever reaches this backend, the read refuses rather than silently
-            // agreeing with a residency it never measured.
-            if companion.resident_bytes != 0 {
-                return Err(Error::Msg(format!(
-                    "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
-                     this backend decodes every codec through its dense fallback and measures no \
-                     retained companion; replan with a dense residency policy, or teach \
-                     `measure_residency` to measure the retained form",
-                    companion.physical_key, companion.resident_bytes
-                )));
-            }
         }
     }
     Ok(by_codec.into_values().collect())

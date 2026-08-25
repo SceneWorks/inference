@@ -52,6 +52,9 @@ use gen_core::checkpoint_codec::{
     WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
+use gen_core::checkpoint_facts::{
+    CheckpointWeightFacts, ExecutionRepresentation, NativeExecutionCapability,
+};
 use gen_core::ProviderRegistryBuilder;
 
 use crate::quant::Nvfp4Tensor;
@@ -117,6 +120,26 @@ impl CandleCodecResidency {
         fp8_e4m3_native: false,
         nvfp4_native: false,
     };
+
+    /// Render this policy as the backend-neutral **host capability** that crosses the worker
+    /// boundary (sc-21484): the codec rows this host can execute in their stored packing, with no
+    /// checkpoint in hand.
+    ///
+    /// This is the declaration [`gen_core::checkpoint_facts::CheckpointWeightFacts`] checks a
+    /// native receipt row against, so a host below a floor cannot produce facts that label its run
+    /// native. Datacenter `sm_100` is below the NVFP4 leg's `(12, 0)` floor
+    /// ([`crate::quant::NVFP4_COMPUTE_CAP_FLOOR`]) and so lists nothing here — the exclusion is the
+    /// floor comparison itself, not a special case.
+    pub fn native_execution_capability(&self) -> NativeExecutionCapability {
+        let mut ids: Vec<&'static str> = Vec::new();
+        if self.fp8_e4m3_native {
+            ids.push(FP8_E4M3_SCALAR_CODEC.codec_id);
+        }
+        if self.nvfp4_native {
+            ids.push(NVFP4_CODEC.codec_id);
+        }
+        NativeExecutionCapability::new(ids)
+    }
 
     /// Probe the device's eligibility for each native leg. Non-CUDA devices (and every build
     /// without the `cuda` feature) are dense-only; a CUDA device whose capability cannot be read is
@@ -469,11 +492,33 @@ pub struct LogicalWeightReader {
     /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
     /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
     measured: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// The host's native-execution declaration, carried from the same
+    /// [`CandleCodecResidency`] that priced the plan (sc-21484). A native receipt row is only
+    /// representable when this licenses it.
+    capability: NativeExecutionCapability,
 }
 
 impl LogicalWeightReader {
     /// mmap `path` and verify its tensor surface equals the plan's before anything materializes.
+    ///
+    /// The host capability is probed from `device`. A loader that priced its plan under an
+    /// explicitly constructed [`CandleCodecResidency`] must use
+    /// [`Self::open_with_capability`] instead, so the capability the facts are validated against is
+    /// the one the plan was priced under.
     pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> Result<Self> {
+        let capability = CandleCodecResidency::probe(device).native_execution_capability();
+        Self::open_with_capability(path, plan, device, capability)
+    }
+
+    /// [`Self::open`] with the host capability supplied by the caller — the residency policy that
+    /// priced this plan, rendered through
+    /// [`CandleCodecResidency::native_execution_capability`].
+    pub fn open_with_capability(
+        path: &Path,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+    ) -> Result<Self> {
         // SAFETY: read-only mmap of a weight file; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::new(path)? };
         let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
@@ -521,7 +566,13 @@ impl LogicalWeightReader {
             device: device.clone(),
             by_logical_key,
             measured: std::sync::Mutex::new(BTreeMap::new()),
+            capability,
         })
+    }
+
+    /// This host's native-execution declaration — the capability the plan was priced under.
+    pub fn native_execution_capability(&self) -> &NativeExecutionCapability {
+        &self.capability
     }
 
     /// The plan this reader materializes.
@@ -562,30 +613,53 @@ impl LogicalWeightReader {
     /// the receipt covers the plan's whole surface: its per-codec `resident_bytes` are directly
     /// comparable to the plan's pricing and its `source_bytes` total the plan's
     /// (weights + companions + descriptor payloads all attributed).
+    ///
+    /// # Source bytes count each *physical* tensor once
+    ///
+    /// A transformed tensor contributes one plan entry per logical output, all naming the same
+    /// physical key (sc-21547). Their source bytes must still total the file **once**, and the
+    /// rule that makes that true lives in the plan compiler, not here: exactly one output per
+    /// physical tensor carries `source_bytes` and its siblings carry zero
+    /// ([`LogicalTensorPlan::transform`]). So this loop simply *sums* — summing a plain sum is
+    /// what makes it correct, and de-duplicating by physical key here would be actively wrong,
+    /// because `plan.tensors` is sorted by logical key and the byte-carrying output is not
+    /// generally the first one a fused key is seen at.
+    ///
+    /// `gen_core::checkpoint_facts::SourceCodecSummary` sums under the same convention, and
+    /// [`CheckpointWeightFacts::new`] cross-checks the two totals per codec. `tensor_count` and
+    /// `resident_bytes` stay **per logical row** — each output is separately counted and
+    /// separately occupies memory; only the source bytes are shared.
     pub fn receipt(&self) -> LogicalWeightReceipt {
         let measured = self
             .measured
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut residency: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
-        let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+        let mut residency: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
+            BTreeMap::new();
+        let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
+            BTreeMap::new();
         let mut tensor_count = 0usize;
         let mut source_bytes = 0u64;
         for tensor in &self.plan.tensors {
             let Some(resident) = measured.get(&tensor.logical_key) else {
                 continue;
             };
-            codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+            // The representation this row was *actually* materialized as. It is read from the
+            // planned residency because that is what `decode` dispatched on — the reader never
+            // substitutes one for the other (a `Packed` fp8 plan on a non-`cuda` build is a typed
+            // refusal, not a dense decode), so plan mode and outcome cannot disagree here.
+            let representation = ExecutionRepresentation::from_residency(tensor.residency.mode);
+            let key = (tensor.codec_id, representation);
+            codec_by_owner.insert(tensor.physical_key.as_str(), key);
             tensor_count += 1;
             source_bytes = source_bytes.saturating_add(tensor.source_bytes);
-            let report = residency
-                .entry(tensor.codec_id)
-                .or_insert(CodecResidencyReport {
-                    codec_id: tensor.codec_id,
-                    tensor_count: 0,
-                    source_bytes: 0,
-                    resident_bytes: 0,
-                });
+            let report = residency.entry(key).or_insert(CodecResidencyReport {
+                codec_id: tensor.codec_id,
+                representation,
+                tensor_count: 0,
+                source_bytes: 0,
+                resident_bytes: 0,
+            });
             report.tensor_count += 1;
             report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
             // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] read
@@ -599,11 +673,11 @@ impl LogicalWeightReader {
         // A companion's source bytes belong to the codec row of the layer that owns it, and only
         // once that layer has actually materialized.
         for companion in &self.plan.companions {
-            let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
+            let Some(key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
                 continue;
             };
             source_bytes = source_bytes.saturating_add(companion.source_bytes);
-            if let Some(report) = residency.get_mut(codec_id) {
+            if let Some(report) = residency.get_mut(key) {
                 report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
             }
         }
@@ -614,6 +688,20 @@ impl LogicalWeightReader {
             materialization: LogicalReadMaterialization::Materialized,
             residency: residency.into_values().collect(),
         }
+    }
+
+    /// The **three correlated facts** about this load (sc-21484): the source-codec inventory
+    /// compiled from the plan, the measured receipt split per execution representation, and this
+    /// host's native-execution capability — validated against each other by
+    /// [`CheckpointWeightFacts::new`].
+    ///
+    /// This is the surface a consumer across the worker boundary reads instead of joining a plan
+    /// and a receipt by hand: it answers "the source is stored `nvfp4-v1`" and "this run executed
+    /// it dense" as *separate* questions that cannot contradict one another. It errors only when
+    /// they already do, which on this reader means a contract bug rather than input.
+    pub fn checkpoint_weight_facts(&self) -> Result<CheckpointWeightFacts> {
+        CheckpointWeightFacts::new(&self.plan, self.capability.clone(), self.receipt())
+            .map_err(|error| CandleError::Msg(error.to_string()))
     }
 }
 
@@ -2229,6 +2317,231 @@ mod tests {
         assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
     }
 
+    /// One NVFP4 layer plus a dense sibling — the fixture the handoff-contract tests read as both a
+    /// native and a non-native host.
+    fn nvfp4_and_dense_fixture(path: &Path, rows: usize, cols: usize) {
+        let values = nvfp4_fixture_values(rows, cols);
+        let (packed, scales, global, _) = nvfp4_reference_quantize(&values, rows, cols);
+        write_safetensors_with_metadata(
+            path,
+            &[
+                ("model.q.weight", "U8", &[rows, cols / 2], packed),
+                ("model.q.weight_scale", "F8_E4M3", &[256, 8], scales),
+                (
+                    "model.q.weight_scale_2",
+                    "F32",
+                    &[],
+                    global.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.norm.weight",
+                    "F32",
+                    &[4],
+                    vec![0u8; 4 * std::mem::size_of::<f32>()],
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#,
+            )],
+        );
+    }
+
+    /// **sc-21484 handoff contract: the source codec and the executed representation are separate,
+    /// correlated facts.**
+    ///
+    /// The same file, read on two hosts. Both report the source as `nvfp4-v1` with the same tensor
+    /// count and source bytes — that fact is device-independent. Only the *receipt* differs, and
+    /// only the native host's receipt carries a
+    /// [`ExecutionRepresentation::NativePacked`] row. This is exactly what the SceneWorks half
+    /// reads to tell "stored NVFP4" from "ran NVFP4".
+    #[test]
+    fn checkpoint_facts_separate_the_nvfp4_source_from_the_representation_executed() {
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-facts.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+
+        let facts_for = |residency: CandleCodecResidency| {
+            let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
+            let reader = LogicalWeightReader::open_with_capability(
+                &path,
+                plan.clone(),
+                &Device::Cpu,
+                residency.native_execution_capability(),
+            )
+            .expect("open");
+            for tensor in &plan.tensors {
+                reader.read(&tensor.logical_key).expect("read");
+            }
+            (plan, reader)
+        };
+
+        // ---- a non-native host: the declared dense fallback (AC3) ---------------------------
+        let (dense_plan, dense_reader) = facts_for(CandleCodecResidency::DENSE);
+        let dense = dense_reader.checkpoint_weight_facts().expect("facts");
+        assert!(
+            dense.source().declares(NVFP4_CODEC.codec_id),
+            "the source is stored nvfp4-v1 on every host"
+        );
+        let dense_entry = dense.source().entry(NVFP4_CODEC.codec_id).expect("row");
+        assert_eq!(dense_entry.tensor_count, 1);
+        assert_eq!(dense_entry.planned_native_packed_tensors, 0);
+        assert!(
+            !dense.executes_natively(NVFP4_CODEC.codec_id),
+            "a host below the sm_120 floor never labels its run native NVFP4"
+        );
+        assert!(dense.capability().is_dense_only());
+        assert!(dense
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+            .is_none());
+        let dense_row = dense
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("a dense-fallback row");
+        assert_eq!(dense_row.tensor_count, 1);
+        assert!(dense.is_complete());
+        assert_eq!(dense.resident_bytes(), dense_plan.resident_bytes());
+
+        // ---- a native host: the same source, executed packed --------------------------------
+        let (packed_plan, packed_reader) = facts_for(CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        });
+        let packed = packed_reader.checkpoint_weight_facts().expect("facts");
+        // Fact 2 is identical across the two hosts — it is a property of the file.
+        let packed_entry = packed.source().entry(NVFP4_CODEC.codec_id).expect("row");
+        assert_eq!(packed_entry.tensor_count, dense_entry.tensor_count);
+        assert_eq!(packed_entry.source_bytes, dense_entry.source_bytes);
+        // Fact 3 is not.
+        assert_eq!(packed_entry.planned_native_packed_tensors, 1);
+        assert!(packed.executes_natively(NVFP4_CODEC.codec_id));
+        assert!(packed
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .is_none());
+        assert_eq!(packed.resident_bytes(), packed_plan.resident_bytes());
+        assert!(
+            packed.resident_bytes() < dense.resident_bytes(),
+            "packed execution is resident at the NVFP4 footprint, not the bf16 one"
+        );
+        // The dense sibling is its own codec row on both hosts and is never confused with either.
+        assert!(packed.source().declares(DENSE_F32_CODEC.codec_id));
+        assert!(!packed.executes_natively(DENSE_F32_CODEC.codec_id));
+    }
+
+    /// **sc-21484 mutation gate.** Two doctored receipts the handoff contract must reject, run
+    /// against the engine's own dense-host read:
+    ///
+    /// * relabel the dense-fallback NVFP4 row `native-packed` — the lie AC3 forbids;
+    /// * alias the source codec to `int8-per-row-v1` — the "call it q4" lie AC2 forbids.
+    ///
+    /// Both are rejected by [`CheckpointWeightFacts::new`], which is the only constructor, so a
+    /// consumer cannot be handed either.
+    #[test]
+    fn a_doctored_receipt_cannot_relabel_the_representation_or_alias_the_source() {
+        use gen_core::checkpoint_facts::CheckpointWeightFactsError;
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-mutation.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+        let capability = CandleCodecResidency::DENSE.native_execution_capability();
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            capability.clone(),
+        )
+        .expect("open");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("read");
+        }
+        let honest = reader.receipt();
+        // The honest receipt validates.
+        CheckpointWeightFacts::new(&plan, capability.clone(), honest.clone()).expect("honest");
+
+        let nvfp4_row = |receipt: &LogicalWeightReceipt| {
+            receipt
+                .residency
+                .iter()
+                .position(|row| row.codec_id == NVFP4_CODEC.codec_id)
+                .expect("the read has an nvfp4 row")
+        };
+
+        // Mutation 1: this dense decode, labelled native.
+        let mut relabelled = honest.clone();
+        let index = nvfp4_row(&relabelled);
+        relabelled.residency[index].representation = ExecutionRepresentation::NativePacked;
+        let error = CheckpointWeightFacts::new(&plan, capability.clone(), relabelled)
+            .expect_err("a dense fallback must not be labelled native");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::NativeWithoutCapability {
+                codec_id: NVFP4_CODEC.codec_id,
+                tensor_count: 1,
+            }
+        );
+
+        // Mutation 2: this NVFP4 source, aliased to the int-affine row a `q4` product fact would
+        // carry.
+        let mut aliased = honest;
+        let index = nvfp4_row(&aliased);
+        aliased.residency[index].codec_id = INT8_PER_ROW_CODEC.codec_id;
+        let error = CheckpointWeightFacts::new(&plan, capability, aliased)
+            .expect_err("a receipt must not re-label the source codec");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::UnplannedCodec {
+                codec_id: INT8_PER_ROW_CODEC.codec_id,
+            }
+        );
+    }
+
+    /// **AC3: `sm_100` is excluded from the native gate, and the capability says so.**
+    ///
+    /// Datacenter Blackwell reports compute capability `(10, 0)`, which is numerically *below* the
+    /// consumer `sm_120` floor this leg's `VEC16_UE4M3` kernel needs. The exclusion is the floor
+    /// comparison itself — asserted here on the shared predicate and on the rendered capability, so
+    /// a future floor edit that let `sm_100` through reds this test rather than shipping a host
+    /// that labels a run it cannot execute.
+    #[test]
+    fn the_nvfp4_native_gate_excludes_sm_100_and_the_capability_reflects_the_floor() {
+        use crate::quant::{compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor};
+
+        assert!(
+            !compute_cap_meets_nvfp4_floor((10, 0)),
+            "datacenter sm_100 is outside this leg"
+        );
+        assert!(!compute_cap_meets_nvfp4_floor((11, 9)));
+        assert!(compute_cap_meets_nvfp4_floor((12, 0)));
+
+        // A host at sm_100 probes `nvfp4_native: false`, so its capability lists nothing and no
+        // receipt it produces can carry a native NVFP4 row.
+        let sm_100 = CandleCodecResidency {
+            fp8_e4m3_native: compute_cap_meets_fp8_floor((10, 0)),
+            nvfp4_native: compute_cap_meets_nvfp4_floor((10, 0)),
+        };
+        let capability = sm_100.native_execution_capability();
+        assert!(!capability.executes_natively(NVFP4_CODEC.codec_id));
+        // sm_100 clears the fp8 sm_89 floor, so the capability is not vacuously empty — the NVFP4
+        // absence is a real, codec-specific exclusion.
+        assert!(capability.executes_natively(FP8_E4M3_SCALAR_CODEC.codec_id));
+
+        let sm_120 = CandleCodecResidency {
+            fp8_e4m3_native: compute_cap_meets_fp8_floor((12, 0)),
+            nvfp4_native: compute_cap_meets_nvfp4_floor((12, 0)),
+        };
+        assert!(sm_120
+            .native_execution_capability()
+            .executes_natively(NVFP4_CODEC.codec_id));
+        assert!(CandleCodecResidency::DENSE
+            .native_execution_capability()
+            .is_dense_only());
+    }
+
     /// sc-20641 review. ComfyUI pads NVFP4 storage to 16, so a layer can be stored WIDER than it
     /// is — `in_features = 60` stores `K = 64`, which passes the FP4 leg's 32-alignment rule. The
     /// packed container holds the stored grid and carries no unpad, so repacking such a layer hands
@@ -3062,5 +3375,98 @@ mod tests {
         assert_eq!(receipt.tensor_count, 3);
         assert_eq!(receipt.resident_bytes(), plan.resident_bytes());
         assert_eq!(receipt.source_bytes, plan.source_bytes);
+    }
+
+    /// **A real fused load produces valid [`CheckpointWeightFacts`] (sc-21484 review).**
+    ///
+    /// The review's major finding: the receipt producer and `SourceCodecSummary::of` must count
+    /// source bytes by the *same* rule, or a perfectly valid fused load hard-errors
+    /// `SourceBytesExceedPlan` and `checkpoint_weight_facts()` becomes unusable the moment
+    /// sc-21547's transforms are in play.
+    ///
+    /// Both now simply **sum** plan entries, which is correct because the compiler carries the
+    /// physical tensor's `source_bytes` on exactly one output and zeroes its siblings. This drives
+    /// that end to end on a real fused-QKV plan compiled by [`FusedLayouts`] — no hand-built
+    /// receipt, no hand-built plan.
+    ///
+    /// # Mutation
+    ///
+    /// De-duplicate by physical key in either accounting (`receipt()` or `SourceCodecSummary::of`)
+    /// — the shape an earlier draft of this story had. `plan.tensors` is sorted by logical key, so
+    /// the first sighting of `model.qkv.weight` is `attn.k.weight`, whose `source_bytes` is ZERO;
+    /// the deduping side loses the real bytes and the two accountings disagree. Dedup in `of()`
+    /// alone reds this at `CodecSourceBytesExceedEntry`; dedup in `receipt()` alone reds the
+    /// `receipt.source_bytes` assertion below.
+    #[test]
+    fn a_real_fused_plan_yields_valid_checkpoint_weight_facts() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused-facts.safetensors");
+        let qkv: Vec<f32> = (0..6)
+            .flat_map(|row| [10.0 * row as f32, 10.0 * row as f32 + 1.0])
+            .collect();
+        write_safetensors(
+            &path,
+            &[("model.qkv.weight", "BF16", &[6, 2], bf16_bytes(&qkv))],
+        );
+        let mapping = FusedLayouts {
+            source_logical_shape: None,
+            part_rows: 2,
+        };
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+
+        // The premise this test rests on: three logical outputs of ONE physical tensor, sorted so
+        // that the byte-carrying output is NOT the first sighting of the fused key.
+        assert_eq!(plan.tensors.len(), 3);
+        assert!(plan
+            .tensors
+            .iter()
+            .all(|tensor| tensor.physical_key == "model.qkv.weight"));
+        assert_eq!(plan.tensors[0].logical_key, "attn.k.weight");
+        assert_eq!(
+            plan.tensors[0].source_bytes, 0,
+            "the first entry of the fused key is a zero-carrying sibling"
+        );
+        assert_eq!(
+            plan.tensors.iter().map(|t| t.source_bytes).sum::<u64>(),
+            plan.source_bytes,
+            "summing plan entries totals the file exactly once"
+        );
+
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            NativeExecutionCapability::dense_only(),
+        )
+        .expect("a fused plan names exactly the file's tensor set");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("logical output");
+        }
+
+        let receipt = reader.receipt();
+        assert_eq!(
+            receipt.tensor_count, 3,
+            "three LOGICAL outputs materialized"
+        );
+        assert_eq!(
+            receipt.source_bytes, plan.source_bytes,
+            "one PHYSICAL tensor's source bytes, totalled once"
+        );
+
+        // The whole point: this receipt validates against the plan it came from.
+        let facts = reader
+            .checkpoint_weight_facts()
+            .expect("the fused load is valid");
+        assert!(facts.is_complete());
+        assert_eq!(
+            facts
+                .source()
+                .entry(DENSE_BF16_CODEC.codec_id)
+                .expect("the bf16 row")
+                .source_bytes,
+            plan.source_bytes,
+            "both accountings of the fused tensor's source bytes agree"
+        );
     }
 }

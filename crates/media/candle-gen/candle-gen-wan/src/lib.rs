@@ -44,8 +44,9 @@ mod gguf;
 // mapping the checkpoint registry names, the plan producer, and its typed refusals. The module
 // itself stays private — everything else in it is loader internals.
 pub use gguf::{
-    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_receipt, GgufDitPlan,
-    GgufPlanError, WanNativeToDiffusersMapping, GGUF_CODEC_IMPLEMENTATION_ID,
+    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_facts,
+    load_wan_dit_gguf_with_receipt, GgufDitPlan, GgufPlanError, WanNativeToDiffusersMapping,
+    GGUF_CODEC_IMPLEMENTATION_ID,
 };
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;

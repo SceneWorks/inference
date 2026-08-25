@@ -21,7 +21,9 @@ use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::checkpoint_codec::{ResidencyMode, NVFP4_CODEC};
-use candle_gen::gen_core::{GenerationOutput, GenerationRequest, Generator, Image};
+use candle_gen::gen_core::{
+    ExecutionRepresentation, GenerationOutput, GenerationRequest, Generator, Image,
+};
 use candle_gen::logical_weights::LogicalTensor;
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::native_mapping::DeclaredLogicalShapes;
@@ -203,8 +205,14 @@ fn cpu_load_takes_the_declared_dense_fallback() {
     let row = receipt
         .residency
         .iter()
-        .find(|row| row.codec_id == NVFP4_CODEC.codec_id)
-        .expect("the materialized row is reported");
+        // `(codec_id, representation)` is the row key, so the lookup must name both: on
+        // `codec_id` alone this would happily accept a `NativePacked` row, and this test is
+        // asserting the CPU host took the declared DENSE fallback.
+        .find(|row| {
+            row.codec_id == NVFP4_CODEC.codec_id
+                && row.representation == ExecutionRepresentation::DenseFallback
+        })
+        .expect("the materialized row is reported as a dense fallback");
     assert_eq!(row.resident_bytes, first_nvfp4.residency.resident_bytes);
     // The dense fallback is the codec's decode, not raw bytes: a bf16 tensor of the logical shape.
     assert!(matches!(
