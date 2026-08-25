@@ -67,7 +67,7 @@ fn curated_samplers_preserve_identity() {
     };
     let scrfd = Weights::from_file(env_path("INSTANTID_SCRFD")).expect("load scrfd");
     let arcface = Weights::from_file(env_path("INSTANTID_ARCFACE")).expect("load arcface");
-    let model = InstantId::load(&paths)
+    let mut model = InstantId::load(&paths)
         .expect("load InstantID")
         .with_face(&scrfd, &arcface)
         .expect("attach face stack");

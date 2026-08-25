@@ -37,6 +37,7 @@ pub mod loader;
 /// Multi-phase Krea denoise primitive (epic 13879, sc-13887 — the candle mirror of mlx-gen-krea's
 /// sc-13884). Pure host-side decomposition of an ordered phase list over ONE shared sigma schedule.
 pub mod multiphase;
+pub mod native_mapping;
 /// The NVFP4 precision seam for the Krea 2 DiT trunk (sc-12110, epic 11037) — the epic's SC#1/SC#2
 /// validation vehicle. See [`nvfp4_dit`].
 pub mod nvfp4_dit;
@@ -2754,29 +2755,34 @@ pub fn register_providers(
         .register_memory_behavior(TURBO_EDIT_MEMORY_BEHAVIOR)
         .register_memory_behavior(CONTROL_MEMORY_BEHAVIOR);
     registry
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::Generate,
-            provider_id: KREA_2_TURBO_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::Edit,
-            provider_id: KREA_2_TURBO_EDIT_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: gen_core::ImportedModelSource::TransformerFile,
-            operation: gen_core::ImportedModelOperation::MultiPhase,
-            provider_id: KREA_2_RAW_ID,
-            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Generate,
+                    provider_id: KREA_2_TURBO_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Edit,
+                    provider_id: KREA_2_TURBO_EDIT_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::MultiPhase,
+                    provider_id: KREA_2_RAW_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..gen_core::KREA_2_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(control_trainer::CONTROL_TRAINER_REGISTRATION)

@@ -24,6 +24,7 @@
 
 pub mod config;
 pub mod loader;
+pub mod memory_strategy;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
@@ -108,9 +109,32 @@ pub struct BooguGenerator {
     /// tower. Accel-independent (no attention-dispatch toggle), so one cached instance serves every
     /// request. Mirrors Z-Image's `vae_encoder` cache.
     img2img_encoder: Mutex<Option<Arc<Encoder>>>,
+    memory_strategy: Option<memory_strategy::PreparedMemory>,
+    memory_admission: memory_strategy::AdmissionRegistry,
+    /// Serializes warm and staged ownership. A staged request evicts all warm provider caches before
+    /// loading its text phase and cannot race a resident request that would repopulate them.
+    request_lock: Mutex<()>,
 }
 
 impl BooguGenerator {
+    fn staged_boundary(
+        &self,
+        req: &GenerationRequest,
+        phase: gen_core::MemoryPhase,
+    ) -> gen_core::Result<()> {
+        candle_gen::check_cancel(&req.cancel)?;
+        if req
+            .memory
+            .is_some_and(|memory| memory.calibration_error_phase == Some(phase))
+        {
+            return Err(gen_core::Error::Msg(format!(
+                "{}: injected memory-strategy calibration error at {phase:?}",
+                self.descriptor.id
+            )));
+        }
+        Ok(())
+    }
+
     fn components(&self) -> gen_core::Result<Arc<Components>> {
         candle_gen::cached(&self.components, || {
             Ok(Arc::new(pipeline::load_components(
@@ -172,11 +196,192 @@ impl BooguGenerator {
         };
         Ok((clean, start_step))
     }
+
+    fn generate_staged(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<Vec<Image>> {
+        // Evict every reloadable warm cache before phase A. The request lock held by `generate`
+        // makes this eviction and the subsequent staged body exclusive, so no concurrent resident
+        // request can repopulate a cache between phases.
+        *self
+            .components
+            .lock()
+            .map_err(|_| gen_core::Error::Msg("boogu: poisoned warm component cache".into()))? =
+            None;
+        *self
+            .edit_components
+            .lock()
+            .map_err(|_| gen_core::Error::Msg("boogu: poisoned warm edit cache".into()))? = None;
+        *self
+            .img2img_encoder
+            .lock()
+            .map_err(|_| gen_core::Error::Msg("boogu: poisoned warm reference cache".into()))? =
+            None;
+
+        let result = (|| {
+            if req.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            on_progress(Progress::Loading(gen_core::LoadPhase::TextEncoder));
+            self.staged_boundary(req, gen_core::MemoryPhase::Conditioning)?;
+            let text = pipeline::load_staged_text(&self.root, &self.device)?;
+            let encoded = match self.variant {
+                Variant::Base | Variant::Turbo => {
+                    let default_steps = if self.variant == Variant::Base {
+                        pipeline::DEFAULT_STEPS
+                    } else {
+                        pipeline::DEFAULT_TURBO_STEPS
+                    };
+                    let active = pipeline::resolve_reference(req, self.descriptor.id)?.is_some_and(
+                        |(_, strength)| {
+                            pipeline::init_time_step(
+                                req.steps.map(|s| s as usize).unwrap_or(default_steps),
+                                strength,
+                            ) > 0
+                        },
+                    );
+                    let encoder = active
+                        .then(|| pipeline::load_vae_encoder(&self.root, &self.device))
+                        .transpose()?;
+                    if self.variant == Variant::Base {
+                        pipeline::stage_encode_base(
+                            &text,
+                            encoder.as_ref(),
+                            req,
+                            pipeline::DEFAULT_STEPS,
+                            &self.device,
+                        )?
+                    } else {
+                        pipeline::stage_encode_turbo(&text, encoder.as_ref(), req, &self.device)?
+                    }
+                }
+                Variant::Edit => {
+                    let references = resolve_edit_references(req)?;
+                    let edit = pipeline::load_edit_components(&self.root, &self.device)?;
+                    pipeline::stage_encode_edit(&text, &edit, req, &references, &self.device)?
+                }
+            };
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            drop(text);
+            if req.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+
+            on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
+            self.staged_boundary(req, gen_core::MemoryPhase::Denoise)?;
+            let denoise = pipeline::load_staged_denoise(&self.root, &self.device)?;
+            let latents = match self.variant {
+                Variant::Base => {
+                    pipeline::stage_denoise_base(&denoise, req, encoded, &self.device, on_progress)?
+                }
+                Variant::Turbo => pipeline::stage_denoise_turbo(
+                    &denoise,
+                    req,
+                    encoded,
+                    &self.device,
+                    on_progress,
+                )?,
+                Variant::Edit => {
+                    pipeline::stage_denoise_edit(&denoise, req, encoded, &self.device, on_progress)?
+                }
+            };
+            self.device
+                .synchronize()
+                .map_err(gen_core::Error::backend)?;
+            drop(denoise);
+            if req.cancel.is_cancelled() {
+                return Err(gen_core::Error::Canceled);
+            }
+            self.staged_boundary(req, gen_core::MemoryPhase::Decode)?;
+            let decode = pipeline::load_staged_decode(&self.root, &self.device, None)?;
+            pipeline::stage_decode(&decode, req, self.descriptor.id, latents, on_progress)
+                .map_err(gen_core::Error::backend)
+        })();
+        let cleanup = self.device.synchronize().map_err(gen_core::Error::backend);
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(images), Ok(())) => Ok(images),
+        }
+    }
 }
 
 impl Generator for BooguGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref().map(|memory| &memory.contract)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let Some(memory) = &self.memory_strategy else {
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: format!("{} has no exact Boogu artifact receipt", self.descriptor.id),
+            };
+        };
+        if let Err(error) = memory.receipt.ensure_unchanged() {
+            self.memory_admission.clear_approval();
+            return gen_core::MemorySafetyDecision::Reject {
+                reason: error.to_string(),
+            };
+        }
+        match memory_strategy::safety_check(
+            self.descriptor.id,
+            &memory.contract,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: memory.receipt.tier,
+                component_precision_floors: &[],
+            },
+            context,
+        ) {
+            gen_core::MemorySafetyDecision::Accept => {
+                match self.memory_admission.approve(context) {
+                    Ok(()) => gen_core::MemorySafetyDecision::Accept,
+                    Err(error) => gen_core::MemorySafetyDecision::Reject {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            reject => {
+                self.memory_admission.clear_approval();
+                reject
+            }
+        }
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let memory = self.memory_strategy.as_ref().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{} has no exact Boogu artifact receipt",
+                self.descriptor.id
+            ))
+        })?;
+        memory.receipt.ensure_unchanged()?;
+        memory_strategy::begin_request(
+            self.descriptor.id,
+            &memory.contract,
+            gen_core::MemoryNumericTier {
+                precision: gen_core::Precision::Bf16,
+                quant: memory.receipt.tier,
+                component_precision_floors: &[],
+            },
+            self.device.clone(),
+            context,
+            self.memory_admission.clone(),
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -215,7 +420,49 @@ impl Generator for BooguGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let _request = self.request_lock.lock().map_err(|_| {
+            gen_core::Error::Msg(format!(
+                "{}: poisoned request ownership lock",
+                self.descriptor.id
+            ))
+        })?;
         self.validate(req)?;
+        self.memory_admission.consume_for_generate(req)?;
+        if let Some(memory) = &self.memory_strategy {
+            memory.receipt.ensure_unchanged()?;
+            if req.memory.is_some() {
+                memory_strategy::validate_generation_request(self.descriptor.id, req)?;
+            }
+            if req.memory.is_some_and(|request| request.stage_residency)
+                && !matches!(
+                    memory
+                        .contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .map(|capability| &capability.support),
+                    Some(gen_core::MemoryStrategySupport::Implemented)
+                )
+            {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{}: staged residency is outside this exact load receipt",
+                    self.descriptor.id
+                )));
+            }
+        } else if req.memory.is_some_and(|memory| {
+            memory.stage_residency
+                || memory.tile_vae_decode
+                || memory.chunk_attention
+                || memory.stream_transformer_blocks
+        }) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: optimized memory execution requires an exact artifact receipt",
+                self.descriptor.id
+            )));
+        }
+        if req.memory.is_some_and(|memory| memory.stage_residency) {
+            return Ok(GenerationOutput::Images(
+                self.generate_staged(req, on_progress)?,
+            ));
+        }
         let comps = self.components()?;
         let images = match self.variant {
             Variant::Turbo => {
@@ -380,7 +627,19 @@ fn build(
             descriptor.id
         )));
     }
+    let memory_strategy =
+        if root.exists() && memory_strategy::canonical_load_identity(descriptor.id, spec) {
+            Some(memory_strategy::PreparedMemory::prepare(
+                descriptor.id,
+                spec,
+            )?)
+        } else {
+            // Imported/custom snapshots retain the historical resident loader without an eager digest
+            // pass. They have no optimized contract, and a direct optimized request fails closed.
+            None
+        };
     let device = candle_gen::default_device()?;
+    let memory_admission = memory_strategy::AdmissionRegistry::new(descriptor.id);
     Ok(Box::new(BooguGenerator {
         descriptor,
         root,
@@ -393,6 +652,9 @@ fn build(
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
         img2img_encoder: Mutex::new(None),
+        memory_strategy,
+        memory_admission,
+        request_lock: Mutex::new(()),
     }))
 }
 
@@ -426,11 +688,74 @@ candle_gen::register_generators! {
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(TURBO_REGISTRATION)
-        .register_generator(EDIT_REGISTRATION)
+        .register_generator(EDIT_REGISTRATION);
+    register_memory_contract_surfaces(registry)
+        .register_memory_behavior(BASE_MEMORY_BEHAVIOR)
+        .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
+        .register_memory_behavior(EDIT_MEMORY_BEHAVIOR)
 }
+
+pub fn register_memory_contract_surfaces(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    registry
+        .register_memory_strategy(BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: BOOGU_IMAGE_ID,
+            contract: memory_strategy::weights_free_base,
+        })
+        .register_memory_strategy(TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: BOOGU_IMAGE_TURBO_ID,
+            contract: memory_strategy::weights_free_turbo,
+        })
+        .register_memory_strategy(EDIT_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
+            surface_specs: gen_core::candle_memory_contract_surface_specs,
+            provider_id: BOOGU_IMAGE_EDIT_ID,
+            contract: memory_strategy::weights_free_edit,
+        })
+}
+
+const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: BOOGU_IMAGE_ID,
+    contract: memory_strategy::registered_base,
+    safety_check: memory_strategy::registered_safety_check,
+};
+const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: BOOGU_IMAGE_TURBO_ID,
+    contract: memory_strategy::registered_turbo,
+    safety_check: memory_strategy::registered_safety_check,
+};
+const EDIT_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: BOOGU_IMAGE_EDIT_ID,
+    contract: memory_strategy::registered_edit,
+    safety_check: memory_strategy::registered_safety_check,
+};
+
+const BASE_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: BOOGU_IMAGE_ID,
+        valid_fixtures: memory_strategy::valid_fixtures,
+        begin_request: memory_strategy::registered_begin,
+    };
+const TURBO_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: BOOGU_IMAGE_TURBO_ID,
+        valid_fixtures: memory_strategy::valid_fixtures,
+        begin_request: memory_strategy::registered_begin,
+    };
+const EDIT_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: BOOGU_IMAGE_EDIT_ID,
+        valid_fixtures: memory_strategy::valid_fixtures,
+        begin_request: memory_strategy::registered_begin,
+    };
 
 /// Build the complete explicit Candle Boogu provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
@@ -452,11 +777,101 @@ mod explicit_registry_tests {
             ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
         );
     }
+
+    /// The registry-level memory lifecycle seams must be reachable on a build with no CUDA
+    /// feature: building the provider catalog is contract-only (no device, no weights), so
+    /// `register_providers` publishes the memory-strategy, weights-free contract-fixture and
+    /// memory-behavior rows on every platform. Gating these behind `cuda` left registry
+    /// lifecycle conformance running on no CPU CI configuration at all.
+    #[test]
+    fn register_providers_publishes_memory_lifecycle_seams_without_cuda() {
+        let registry = super::provider_registry().unwrap();
+
+        let strategies: Vec<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixtures: Vec<&str> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behaviors: Vec<&str> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+
+        assert_eq!(
+            strategies,
+            ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
+        );
+        assert_eq!(
+            fixtures,
+            ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
+        );
+        assert_eq!(
+            behaviors,
+            ["boogu_image", "boogu_image_turbo", "boogu_image_edit"]
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn weights_free_generator() -> BooguGenerator {
+        BooguGenerator {
+            descriptor: descriptor(),
+            root: PathBuf::from("/nonexistent"),
+            variant: Variant::Base,
+            device: Device::Cpu,
+            pid_spec: None,
+            components: Mutex::new(None),
+            edit_components: Mutex::new(None),
+            img2img_encoder: Mutex::new(None),
+            memory_strategy: None,
+            memory_admission: memory_strategy::AdmissionRegistry::new(BOOGU_IMAGE_ID),
+            request_lock: Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn staged_boundaries_honor_every_fault_and_cancellation_before_loading() {
+        let generator = weights_free_generator();
+        for phase in [
+            gen_core::MemoryPhase::Conditioning,
+            gen_core::MemoryPhase::Denoise,
+            gen_core::MemoryPhase::Decode,
+        ] {
+            let mut memory = gen_core::GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            };
+            memory.authorize_calibration_fault(phase);
+            let request = GenerationRequest {
+                memory: Some(memory),
+                ..Default::default()
+            };
+            let error = generator.staged_boundary(&request, phase).unwrap_err();
+            assert!(error.to_string().contains(&format!("{phase:?}")));
+
+            let clean = GenerationRequest {
+                memory: Some(gen_core::GenerationMemory {
+                    stage_residency: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            generator.staged_boundary(&clean, phase).unwrap();
+        }
+
+        let canceled = GenerationRequest::default();
+        canceled.cancel.cancel();
+        assert!(matches!(
+            generator.staged_boundary(&canceled, gen_core::MemoryPhase::Conditioning),
+            Err(gen_core::Error::Canceled)
+        ));
+    }
 
     #[test]
     fn registers_all_three_ids_as_candle() {

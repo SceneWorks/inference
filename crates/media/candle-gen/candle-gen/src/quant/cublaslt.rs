@@ -133,6 +133,54 @@ pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weig
     Ok(PerChannelInt8Weight { q, scale })
 }
 
+/// **Locked-decision-7 8-bit floor**, as a `(major, minor)` compute capability: the whole 8-bit
+/// track (fp8 E4M3 *and* int8 IGEMM, which the hardware would allow at 8.0) is gated at sm_89.
+///
+/// The one definition of the threshold. `CublasLt::meets_fp8_floor` applies it to a bound handle's
+/// capability; callers that only have a `candle_core::Device` — the logical-weight residency policy
+/// decides packed-vs-dense at *plan* time, long before any GEMM handle exists, and building one
+/// would allocate the handle's 32 MiB workspace — read the capability off the device and apply it
+/// here. Neither re-spells `(8, 9)`.
+pub const FP8_COMPUTE_CAP_FLOOR: (i32, i32) = (8, 9);
+
+/// Whether a `(major, minor)` compute capability meets [`FP8_COMPUTE_CAP_FLOOR`].
+pub fn compute_cap_meets_fp8_floor(cap: (i32, i32)) -> bool {
+    cap >= FP8_COMPUTE_CAP_FLOOR
+}
+
+/// **NVFP4 floor**, as a `(major, minor)` compute capability: consumer Blackwell `sm_120` (cap
+/// 12.0). The master-gate spike (sc-11038) confirmed cuBLASLt dispatches a real `CUDA_R_4F_E2M1` +
+/// `VEC16_UE4M3` tensor-core kernel there — plain `sm_120`, not `sm_120a`; datacenter `sm_100` is
+/// out of epic scope.
+///
+/// The one definition of the threshold, in the same shape as [`FP8_COMPUTE_CAP_FLOOR`] and for the
+/// same reason: `CublasLt::meets_nvfp4_floor` applies it to a bound handle, while the
+/// logical-weight residency policy (sc-20641) decides packed-vs-dense at *plan* time, before any
+/// GEMM handle exists, and reads the capability straight off the `Device`. Neither re-spells 12.0.
+pub const NVFP4_COMPUTE_CAP_FLOOR: (i32, i32) = (12, 0);
+
+/// Whether a `(major, minor)` compute capability meets [`NVFP4_COMPUTE_CAP_FLOOR`].
+pub fn compute_cap_meets_nvfp4_floor(cap: (i32, i32)) -> bool {
+    cap >= NVFP4_COMPUTE_CAP_FLOOR
+}
+
+/// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
+/// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
+/// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so
+/// cuBLASLt's FP4 block-scaled path requires **K a multiple of 32** (two NVFP4 blocks), *not* the
+/// single 16-element block and *not* the 64-element 4-block scale atom. The sc-11040 packer pads
+/// `cols_padded` only to a multiple of 16, so an `in_features` in e.g. `[33,47]` packs to K=48 and
+/// is rejected by `check_nvfp4_alignment` with a clear message.
+///
+/// Lives outside `cuda_impl` (sc-20641) so the plan-time layout predicate — which must answer
+/// "would this layer's stored geometry be accepted?" on every build, including the Metal and CPU
+/// lanes that unit-test it — shares the one definition instead of re-spelling 32.
+pub const NVFP4_K_ALIGN: usize = 32;
+
+/// The output-row (N) multiple the cuBLASLt NVFP4 path requires, paired with [`NVFP4_K_ALIGN`] by
+/// `check_nvfp4_alignment` and by the plan-time predicate.
+pub const NVFP4_N_ALIGN: usize = 16;
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -457,10 +505,10 @@ mod cuda_impl {
         }
 
         /// True iff the device meets the sc-9299 sm_89 floor (fp8 needs 8.9; int8 IGEMM 8.0, but the
-        /// whole 8-bit track is floored at 8.9 per locked-decision-7).
+        /// whole 8-bit track is floored at 8.9 per locked-decision-7). The threshold itself lives in
+        /// [`super::FP8_COMPUTE_CAP_FLOOR`] so the plan-time residency policy shares it.
         pub fn meets_fp8_floor(&self) -> Result<bool> {
-            let (maj, min) = self.compute_cap()?;
-            Ok(maj > 8 || (maj == 8 && min >= 9))
+            Ok(super::compute_cap_meets_fp8_floor(self.compute_cap()?))
         }
 
         /// True iff the device can run the NVFP4 block-scaled FP4 GEMM (sc-11039). The master-gate
@@ -469,9 +517,10 @@ mod cuda_impl {
         /// `sm_120a`. Datacenter `sm_100` is out of epic scope; the floor is cap ≥ 12.0. Below this the
         /// caller falls back to the dequant→bf16 dense path (the same fallback the non-cuda build takes
         /// by construction — this whole handle is `#[cfg(feature = "cuda")]`).
+        /// The threshold itself lives in [`super::NVFP4_COMPUTE_CAP_FLOOR`] so the plan-time
+        /// residency policy shares it (sc-20641); this never re-derives it.
         pub fn meets_nvfp4_floor(&self) -> Result<bool> {
-            let (maj, _min) = self.compute_cap()?;
-            Ok(maj >= 12)
+            Ok(super::compute_cap_meets_nvfp4_floor(self.compute_cap()?))
         }
 
         /// **fp8 E4M3 GEMM**: `D = (scale_w·scale_x) · (X · Wᵀ)` → bf16 `(M, N)`.
@@ -1807,14 +1856,9 @@ mod cuda_impl {
         Ok(())
     }
 
-    /// The required padded-K multiple for the NVFP4 cuBLASLt path (sc-11039 handoff item (b),
-    /// GPU-confirmed on the RTX PRO 6000). The `nvfp4_k_alignment_probe` swept K on live hardware:
-    /// K∈{32,64,128} are ACCEPTED (bit-accurate), K∈{16,48} return `CUBLAS_STATUS_NOT_SUPPORTED` — so
-    /// cuBLASLt's FP4 block-scaled path requires **K a multiple of 32** (two NVFP4 blocks), *not* the
-    /// single 16-element block and *not* the 64-element 4-block scale atom. The sc-11040 packer pads
-    /// `cols_padded` only to a multiple of 16, so an `in_features` in e.g. `[33,47]` packs to K=48 and
-    /// is rejected here with a clear message (follow-up: have the packer pad K to 32).
-    pub const NVFP4_K_ALIGN: usize = 32;
+    /// Imported from the always-compiled half of this module (sc-20641) so the `cuda` callers
+    /// below and the plan-time layout predicate share one definition.
+    use super::{NVFP4_K_ALIGN, NVFP4_N_ALIGN};
 
     fn check_nvfp4_alignment(k: usize, n: usize) -> Result<()> {
         if !k.is_multiple_of(NVFP4_K_ALIGN) {
@@ -1824,8 +1868,8 @@ mod cuda_impl {
                  in_features that rounds to a multiple of {NVFP4_K_ALIGN}"
             );
         }
-        if !n.is_multiple_of(16) {
-            candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of 16");
+        if !n.is_multiple_of(NVFP4_N_ALIGN) {
+            candle_core::bail!("cuBLASLt NVFP4: N ({n}) must be a multiple of {NVFP4_N_ALIGN}");
         }
         Ok(())
     }
@@ -1845,8 +1889,11 @@ mod cuda_impl {
     }
 }
 
+// `NVFP4_K_ALIGN` / `NVFP4_N_ALIGN` are NOT re-exported here: sc-20641 moved them to this module's
+// always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
+// only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, NVFP4_K_ALIGN};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

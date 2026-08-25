@@ -1,11 +1,11 @@
 //! Real-weights smoke for the candle SenseNova-U1 **understanding** surface (sc-5501): VQA
 //! ([`T2iModel::vqa`]) + Document-Studio interleave ([`T2iModel::interleave_gen`]). Drives the
-//! off-registry `load_understanding` entry the worker uses. Build with `--features cuda` on the
-//! Blackwell box; the dense base model is ~35 GB.
+//! diagnostics-only raw loader. Build with `--features cuda,real-weight-diagnostics` on the
+//! Blackwell box; production workers use the admitted typed runtime.
 //!
 //! ```text
 //! set SENSENOVA_SNAPSHOT=C:\Users\…\snapshots\<hash>
-//! cargo run -p candle-gen-sensenova --features cuda --release --example sensenova-understanding
+//! cargo run -p candle-gen-sensenova --features cuda,real-weight-diagnostics --release --example sensenova-understanding
 //! ```
 
 use std::error::Error;
@@ -13,7 +13,8 @@ use std::error::Error;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen_sensenova::{
-    load_understanding, tensor_to_image, Sampler, T2iOptions, INTERLEAVE_SYSTEM_MESSAGE,
+    load_understanding_for_diagnostics, tensor_to_image, Sampler, T2iOptions,
+    INTERLEAVE_SYSTEM_MESSAGE,
 };
 
 /// A synthetic `[3,H,W]` RGB gradient in `[0,1]` on CPU (the engine relocates it to the model device):
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let snap = std::env::var("SENSENOVA_SNAPSHOT")
         .map_err(|_| "set SENSENOVA_SNAPSHOT to a SenseNova-U1-8B-MoT snapshot dir")?;
     eprintln!("loading {snap} …");
-    let (model, tok) = load_understanding(std::path::Path::new(&snap))?;
+    let (model, tok) = load_understanding_for_diagnostics(std::path::Path::new(&snap))?;
     eprintln!("loaded.");
 
     // ---- VQA: image + question → text answer ----

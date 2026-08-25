@@ -58,6 +58,8 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, Precision, WeightsSource};
 
+use crate::native_remap::DeclaredLogicalShapes;
+
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
@@ -437,6 +439,11 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         }
         None => 0,
     };
+    // The base tier owns the architecture config the imported file is loaded against, so admission
+    // prices the DiT at the SAME declared logical shapes the load will use (sc-20644): otherwise an
+    // MXFP8 layer would be priced at its 32-padded storage while the load unpads it, and this
+    // projection is the one both native contracts read.
+    let base_cfg = base_architecture_config(provider_id, base_snapshot_dir)?;
     let selected_text_encoder =
         crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
     let expected_language_bits =
@@ -470,7 +477,12 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     let components = mlx_gen::PerComponentBytes {
         text_encoder: selected_text_encoder_bytes,
         dit: spec.read_file_unchanged_if_prepared(dit_file, |p| {
-            native_dit_transformer_bytes(provider_id, p, spec.quantize)
+            native_dit_transformer_bytes(
+                provider_id,
+                p,
+                spec.quantize,
+                DeclaredLogicalShapes::from_base(base_cfg.as_ref()),
+            )
         })?,
         vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?
             .saturating_add(alternate_decoder_bytes),
@@ -493,28 +505,83 @@ pub(crate) fn native_memory_strategy_contract(
     native_memory_strategy_contract_from_spec(provider_id, &spec, base_snapshot_dir, false)
 }
 
-/// Resident bytes of a community single-file native DiT: I8 projections materialize to bf16, their
-/// scale/descriptor companion tensors are consumed and dropped, everything else is stored as-is.
+/// The architecture config of the base tier an imported single file is loaded against — the one
+/// [`crate::native_remap::KreaNativeToDiffusersMapping`] derives its declared logical shapes from
+/// (sc-20644).
+///
+/// `Ok(None)` **only** when the base carries no `transformer/config.json` at all — a checked
+/// absence, not a failed read. Admission runs against bases that predate/omit the transformer
+/// config, and this projection must not start refusing them; with no config the plan simply
+/// declares nothing, which is the pre-sc-20644 behaviour
+/// ([`crate::native_remap::DeclaredLogicalShapes::NotInScope`]).
+///
+/// A config that IS present but unreadable or invalid propagates as an error — it is never
+/// degraded into `None`, which would silently price MXFP8 at its 32-padded storage while the load
+/// unpads it.
+pub(crate) fn base_architecture_config(
+    provider_id: &str,
+    base_snapshot_dir: &std::path::Path,
+) -> CoreResult<Option<crate::config::Krea2Config>> {
+    if !base_snapshot_dir
+        .join("transformer")
+        .join("config.json")
+        .is_file()
+    {
+        return Ok(None);
+    }
+    crate::config::Krea2Config::from_snapshot(base_snapshot_dir)
+        .map(Some)
+        .map_err(|error| {
+            CoreError::Msg(format!(
+                "{provider_id}: base architecture config for '{}': {error}",
+                base_snapshot_dir.display()
+            ))
+        })
+}
+
+/// Resident bytes of a community single-file native DiT, priced from the compiled logical-weight
+/// plan (sc-20385): each layer's planned dense-fallback residency — I8 codes and fp8 values
+/// materialize to bf16 (MXFP8 unpadded to its logical shape), scale/descriptor companions are
+/// consumed — with the optional load-time group quantization projected onto the quant-target
+/// projections. A file the plan compiler refuses (unregistered format, malformed descriptor)
+/// cannot be priced and fails closed here, exactly as the load itself would.
 /// The SINGLE projection both native contracts read (the t2i one above and the pose-control one in
 /// `crate::memory_strategy`), so the two can never disagree about what a native file costs resident.
 pub(crate) fn native_dit_transformer_bytes(
     provider_id: &str,
     dit_file: &std::path::Path,
     quant: Option<mlx_gen::Quant>,
+    shapes: crate::native_remap::DeclaredLogicalShapes<'_>,
 ) -> CoreResult<u64> {
-    projected_safetensors_bytes(dit_file, |tensor| {
-        if tensor.name.ends_with(".weight_scale") || tensor.name.ends_with(".comfy_quant") {
-            ResidentProjection::Omit
-        } else if let Some(quant) = quant.filter(|_| {
-            crate::native_remap::native_dit_key_to_diffusers(&tensor.name)
-                .is_some_and(|name| crate::convert::is_transformer_quant_target(&name))
-        }) {
+    let plan = mlx_gen::logical_weights::plan_logical_weights(
+        dit_file,
+        &crate::native_remap::KreaNativeToDiffusersMapping::new(shapes),
+    )
+    .map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
+    // The plan's resident headers are logical-keyed (diffusers names) at the dense resident dtype,
+    // so the quant-target predicate applies directly and `Stored` means "the planned resident
+    // bytes", not the on-disk packing.
+    // A plan whose residency has no per-element width (a GGUF container) cannot be priced this way
+    // and refuses by name rather than emitting a header that contradicts its own byte count.
+    let resident = plan.resident_tensor_headers().map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
+    mlx_gen::asset_facts::projected_tensor_headers_bytes(&resident, |tensor| {
+        if let Some(quant) =
+            quant.filter(|_| crate::convert::is_transformer_quant_target(&tensor.name))
+        {
             ResidentProjection::GroupQuantized {
                 bits: quant.bits(),
                 group_size: crate::quant::GROUP_SIZE as usize,
             }
-        } else if tensor.dtype == mlx_gen::gen_core::weightsmeta::Dtype::I8 {
-            ResidentProjection::Bfloat16
         } else {
             ResidentProjection::Stored
         }
@@ -836,7 +903,7 @@ mod tests {
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
@@ -847,18 +914,83 @@ mod tests {
     }
 
     fn write_native_i8_safetensors(path: &std::path::Path) {
-        let mut header = br#"{
-            "model.diffusion_model.proj.weight":{"dtype":"I8","shape":[2,64],"data_offsets":[0,128]},
-            "model.diffusion_model.proj.weight_scale":{"dtype":"F32","shape":[2],"data_offsets":[128,136]},
-            "model.diffusion_model.proj.comfy_quant":{"dtype":"U8","shape":[2],"data_offsets":[136,138]}
-        }"#.to_vec();
+        // A real (tiny) int8-per-row layer: since sc-20385 the resident pricing compiles the
+        // logical-weight plan, so the descriptor payload must be the genuine ComfyUI JSON, not
+        // filler bytes.
+        let descriptor = br#"{"format":"int8_tensorwise","per_row":true}"#;
+        let mut header = format!(
+            concat!(
+                r#"{{"model.diffusion_model.blocks.0.attn.wq.weight":{{"dtype":"I8","shape":[2,64],"data_offsets":[0,128]}},"#,
+                r#""model.diffusion_model.blocks.0.attn.wq.weight_scale":{{"dtype":"F32","shape":[2],"data_offsets":[128,136]}},"#,
+                r#""model.diffusion_model.blocks.0.attn.wq.comfy_quant":{{"dtype":"U8","shape":[{len}],"data_offsets":[136,{end}]}}}}"#
+            ),
+            len = descriptor.len(),
+            end = 136 + descriptor.len()
+        )
+        .into_bytes();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
-        bytes.extend([0_u8; 138]);
+        bytes.extend([0_u8; 136]);
+        bytes.extend(descriptor);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// **sc-20644: a config read that FAILS is never degraded into "no config declared".** Absence
+    /// of `transformer/config.json` is a checked condition that yields `None` (the pre-sc-20644
+    /// padded-shape behaviour, which this projection must keep accepting); a config that is present
+    /// but malformed surfaces as a provider-scoped error, because silently returning `None` there
+    /// would price an MXFP8 import at its 32-padded storage while the load unpads it.
+    #[test]
+    fn base_architecture_config_separates_an_absent_config_from_a_failed_read() {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("krea-base-cfg-{}-", std::process::id()))
+            .tempdir()
+            .unwrap();
+
+        // No transformer/config.json at all → the named "not in scope" state.
+        assert_eq!(
+            base_architecture_config("krea_2_turbo", tmp.path()).unwrap(),
+            None
+        );
+
+        // Present and well-formed → the architecture it declares.
+        let transformer = tmp.path().join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"num_attention_heads":48,"attention_head_dim":128}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            base_architecture_config("krea_2_turbo", tmp.path())
+                .unwrap()
+                .map(|cfg| cfg.hidden_size),
+            Some(48 * 128)
+        );
+
+        // Present but unparseable → an error, NOT `None`.
+        std::fs::write(transformer.join("config.json"), "{not json").unwrap();
+        let error = base_architecture_config("krea_2_turbo", tmp.path())
+            .expect_err("a malformed base config must surface, not degrade to `None`")
+            .to_string();
+        assert!(
+            error.contains("krea_2_turbo") && error.contains("base architecture config"),
+            "unexpected error: {error}"
+        );
+
+        // Present, parseable, but architecturally invalid → also an error.
+        std::fs::write(
+            transformer.join("config.json"),
+            r#"{"num_attention_heads":48,"attention_head_dim":128,"num_key_value_heads":7}"#,
+        )
+        .unwrap();
+        assert!(
+            base_architecture_config("krea_2_turbo", tmp.path()).is_err(),
+            "an invalid architecture must surface, not degrade to `None`"
+        );
     }
 
     fn fixture(tmp: &tempfile::TempDir) -> (std::path::PathBuf, LoadSpec) {

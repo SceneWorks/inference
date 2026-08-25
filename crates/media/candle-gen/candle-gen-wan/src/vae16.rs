@@ -538,11 +538,33 @@ impl WanVae16 {
     }
 
     pub fn decode_budgeted_with_cancel(&self, z: &Tensor, cancel: &CancelFlag) -> CResult<Tensor> {
+        self.decode_budgeted_with_cancel_and_tile_cap(z, cancel, None)
+    }
+
+    /// Budgeted z16 decode intersected with a provider-selected maximum spatial tile edge.
+    ///
+    /// `max_tile_edge` is the request-scoped rung-2 seam used by Bernini still generation. It does
+    /// not replace the live free-VRAM plan: it can only keep or shrink that plan. This makes the
+    /// selected cap load-bearing at the final decode without weakening the existing budget and
+    /// im2col guards.
+    ///
+    /// A selected cap **always** routes through [`decode_tiled_with_cancel`](Self::decode_tiled_with_cancel),
+    /// including when the output already fits inside one tile. Engaging only above the cap made
+    /// BoundedDecode a no-op at exactly the fitting geometries it is admitted for — a 512×512 output
+    /// at `decode_tile_edge = 512` ran the untiled path while the rung reported itself engaged, so
+    /// the observed peak belonged to a policy the request never selected. This matches the LTX
+    /// precedent in `candle-gen-ltx`'s `decode_budgeted_with_spatial_cap`.
+    pub fn decode_budgeted_with_cancel_and_tile_cap(
+        &self,
+        z: &Tensor,
+        cancel: &CancelFlag,
+        max_tile_edge: Option<u32>,
+    ) -> CResult<Tensor> {
         let (_b, _c, f, h, w) = z.dims5()?;
         let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
         let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
         let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
-        match auto_tiling_budgeted_wan_z16(out_h, out_w, out_f)? {
+        match wan_z16_decode_plan(out_h, out_w, out_f, max_tile_edge)? {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
         }
@@ -833,6 +855,56 @@ pub fn auto_tiling_budgeted_wan_z16(
     plan_wan_z16_tiling(height, width, out_frames, wan_z16_vae_safe_budget_gib())
 }
 
+/// The live free-VRAM plan for this output, intersected with a request-selected spatial cap.
+pub fn wan_z16_decode_plan(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    max_tile_edge: Option<u32>,
+) -> CResult<Option<TilingConfig>> {
+    apply_decode_tile_cap(
+        auto_tiling_budgeted_wan_z16(height, width, out_frames)?,
+        max_tile_edge,
+    )
+}
+
+/// Intersect a budgeted plan with the request-scoped BoundedDecode cap.
+///
+/// The cap can only keep or shrink the budgeted tile, and once a cap is selected the result is
+/// **always** a tiled plan — even when the whole output fits inside one tile. Returning `None` for
+/// a fitting geometry would run the untiled decoder while the rung reported BoundedDecode engaged,
+/// which is the no-op this function exists to prevent; `candle-gen-ltx`'s
+/// `decode_budgeted_with_spatial_cap` takes the same position.
+fn apply_decode_tile_cap(
+    plan: Option<TilingConfig>,
+    max_tile_edge: Option<u32>,
+) -> CResult<Option<TilingConfig>> {
+    let Some(max_tile_edge) = max_tile_edge else {
+        return Ok(plan);
+    };
+    let max_tile_edge = i32::try_from(max_tile_edge).map_err(|_| {
+        candle_gen::candle_core::Error::Msg("wan z16 decode tile cap exceeds i32".into())
+    })?;
+    if !WAN_Z16_VAE_SPATIAL_PX.contains(&max_tile_edge) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "wan z16 decode tile cap {max_tile_edge} is outside the production domain {:?}",
+            WAN_Z16_VAE_SPATIAL_PX
+        ))
+        .into());
+    }
+    let budget_edge = plan
+        .as_ref()
+        .and_then(|cfg| cfg.spatial.map(|spatial| spatial.tile_px));
+    let tile_px = budget_edge.map_or(max_tile_edge, |edge| edge.min(max_tile_edge));
+    Ok(Some(TilingConfig {
+        spatial: Some(SpatialTiling {
+            tile_px,
+            overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+        }),
+        temporal: plan.and_then(|cfg| cfg.temporal),
+    }))
+}
+
 /// Pure z16 spatial tile selector (the `safe_gib` ceiling injected so it is unit-testable without a
 /// GPU). Supplies the z16 candidate grid + cost model to the shared [`vae_tiling::plan_tiling`]; same
 /// `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as the z48 half.
@@ -1091,6 +1163,79 @@ mod budget_tests {
                 "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_decode_plan_tests {
+    //! sc-20799: a selected BoundedDecode tile edge must reach the tiled decoder at **every**
+    //! admitted geometry, including the ones that already fit inside one tile.
+    //!
+    //! The rung was previously engaged only when the output exceeded the cap, so a 512x512 output
+    //! admitted at `decode_tile_edge = 512` ran the untiled path while the contract reported
+    //! BoundedDecode engaged — the observed peak then belonged to a policy the request never
+    //! selected. `candle-gen-ltx`'s `decode_budgeted_with_spatial_cap` always routes through
+    //! `decode_tiled`; this half now matches it.
+
+    use candle_gen::gen_core::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
+
+    use super::{apply_decode_tile_cap, WAN_Z16_VAE_SPATIAL_OVERLAP_PX, WAN_Z16_VAE_SPATIAL_PX};
+
+    #[test]
+    fn a_selected_cap_always_produces_a_tiled_plan_even_when_one_tile_suffices() {
+        // `None` is the budgeted verdict "the whole output fits untiled" — exactly the fitting
+        // geometry where the rung used to become a no-op.
+        for &edge in WAN_Z16_VAE_SPATIAL_PX.iter() {
+            let plan = apply_decode_tile_cap(None, Some(edge as u32))
+                .unwrap()
+                .expect("a selected cap must never fall back to the untiled decoder");
+            let spatial = plan.spatial.expect("a capped plan is spatially tiled");
+            assert_eq!(spatial.tile_px, edge);
+            assert_eq!(spatial.overlap_px, WAN_Z16_VAE_SPATIAL_OVERLAP_PX);
+            assert!(plan.temporal.is_none());
+        }
+    }
+
+    #[test]
+    fn the_cap_can_only_shrink_the_budgeted_tile_and_preserves_the_temporal_half() {
+        let budgeted = |tile_px| {
+            Some(TilingConfig {
+                spatial: Some(SpatialTiling {
+                    tile_px,
+                    overlap_px: WAN_Z16_VAE_SPATIAL_OVERLAP_PX,
+                }),
+                temporal: Some(TemporalTiling {
+                    tile_frames: 8,
+                    overlap_frames: 2,
+                }),
+            })
+        };
+        let smallest = *WAN_Z16_VAE_SPATIAL_PX.iter().min().unwrap();
+        let largest = *WAN_Z16_VAE_SPATIAL_PX.iter().max().unwrap();
+
+        // A tighter live budget wins over a looser selected cap.
+        let plan = apply_decode_tile_cap(budgeted(smallest), Some(largest as u32))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.spatial.unwrap().tile_px, smallest);
+        assert_eq!(plan.temporal.unwrap().tile_frames, 8);
+
+        // A tighter selected cap wins over a looser live budget.
+        let plan = apply_decode_tile_cap(budgeted(largest), Some(smallest as u32))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.spatial.unwrap().tile_px, smallest);
+        assert_eq!(plan.temporal.unwrap().overlap_frames, 2);
+    }
+
+    #[test]
+    fn no_cap_preserves_the_budgeted_plan_and_an_off_domain_cap_is_refused() {
+        assert!(apply_decode_tile_cap(None, None).unwrap().is_none());
+        let off_domain = WAN_Z16_VAE_SPATIAL_PX.iter().max().unwrap() + 1;
+        let error = apply_decode_tile_cap(None, Some(off_domain as u32))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the production domain"), "{error}");
     }
 }
 

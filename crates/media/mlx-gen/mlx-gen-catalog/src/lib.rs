@@ -81,7 +81,12 @@ pub fn benchmark_toggle_capabilities(provider_id: &str) -> Option<&'static [&'st
 }
 
 /// Add every provider shipped by the MLX media platform to an explicit registry builder.
+///
+/// The engine's checkpoint codec table is registered here, exactly once, before any family crate:
+/// codecs are engine-level (sc-20634), so no family `register_providers` may register one, and the
+/// builder refuses a duplicate row outright.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
+    let registry = mlx_gen::logical_weights::register_checkpoint_codecs(registry);
     let registry = mlx_gen_anima::register_providers(registry);
     let registry = mlx_gen_bernini::register_providers(registry);
     let registry = mlx_gen_boogu::register_providers(registry);
@@ -138,13 +143,21 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<ProviderRegistry> {
         .build()
 }
 
-/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Today only
-/// Wan TI2V-5B exposes this surface; every other route returns `None` rather than synthesizing a tier
-/// from the requested quantization field.
+/// Resolve a provider-owned, load-exact numeric tier for calibrated MLX video admission. Bernini
+/// validates its paired planner/renderer packed manifests and headers; Krea and Wan validate their
+/// immutable packed surfaces. Other routes return `None` rather than synthesizing a tier.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,
     spec: &media::LoadSpec,
 ) -> media::gen_core::Result<Option<media::gen_core::MemoryNumericTier>> {
+    if let Some(tier) = mlx_gen_bernini::resolved_video_memory_numeric_tier(provider_id, spec)? {
+        return Ok(Some(tier));
+    }
+    if provider_id == mlx_gen_krea_realtime::MODEL_ID {
+        return mlx_gen_krea_realtime::resolved_numeric_tier(spec)
+            .map(Some)
+            .map_err(|error| media::gen_core::Error::Msg(error.to_string()));
+    }
     mlx_gen_wan::resolved_video_memory_numeric_tier(provider_id, spec)
 }
 
@@ -246,6 +259,248 @@ pub fn conservative_video_decode_memory_profile(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_mlx_bindings() {
+        use mlx_gen::gen_core::{
+            CheckpointBackend, ImportedModelOperation, ImportedModelRegistration,
+            ImportedModelSource, KREA_2_CHECKPOINT_ADAPTER, MAGE_FLOW_CHECKPOINT_ADAPTER,
+            SDXL_CHECKPOINT_ADAPTER,
+        };
+
+        let registry = super::provider_registry().unwrap();
+        let expected = [
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &MAGE_FLOW_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+        ];
+        let adapters: Vec<_> = registry.checkpoint_adapters().collect();
+        assert_eq!(adapters.len(), expected.len());
+        for portable in expected {
+            let bound = adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == portable.adapter_id)
+                .unwrap_or_else(|| panic!("missing MLX adapter {}", portable.adapter_id));
+            assert!(
+                bound.has_same_portable_metadata(portable),
+                "{} drifted from portable metadata",
+                portable.adapter_id
+            );
+            assert!(bound
+                .backend_bindings
+                .iter()
+                .all(|binding| binding.backend == CheckpointBackend::Mlx));
+        }
+
+        let binding_operations = |adapter_id| {
+            adapters
+                .iter()
+                .copied()
+                .find(|adapter| adapter.adapter_id == adapter_id)
+                .unwrap()
+                .backend_bindings
+                .iter()
+                .map(|binding| binding.operation)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            binding_operations(KREA_2_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+                ImportedModelOperation::Pose,
+                ImportedModelOperation::MultiPhase,
+            ]
+        );
+        assert_eq!(
+            binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
+            [
+                ImportedModelOperation::Generate,
+                ImportedModelOperation::Edit,
+            ]
+        );
+        assert_eq!(
+            binding_operations(MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id),
+            [ImportedModelOperation::Generate]
+        );
+        let mage = adapters
+            .iter()
+            .copied()
+            .find(|adapter| adapter.adapter_id == MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id)
+            .expect("the real Mage MLX adapter is registered");
+        assert_eq!(mage.family, "mage_flow");
+        assert_eq!(mage.compatibility_projection.family, "mage-flow");
+        for adapter in &adapters {
+            for operation in adapter.operations {
+                assert!(
+                    adapter
+                        .backend_bindings
+                        .iter()
+                        .any(|binding| binding.operation == *operation),
+                    "the real MLX catalog leaves {} {operation:?} implementation-free",
+                    adapter.adapter_id
+                );
+            }
+        }
+        let expected_legacy_projection = [
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Edit,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_EDIT_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Pose,
+                provider_id: mlx_gen_krea::KREA_2_TURBO_CONTROL_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "krea_2",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::MultiPhase,
+                provider_id: mlx_gen_krea::KREA_2_RAW_ID,
+                required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "mage-flow",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "mage_flow_base",
+                required_components: Some(mlx_gen_mage::REQUIRED_COMPONENTS),
+                inherit_adapters: false,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Generate,
+                provider_id: mlx_gen_sdxl::MODEL_ID,
+                required_components: Some(&[mlx_gen_sdxl::LDM_TOKENIZER_COMPONENT]),
+                inherit_adapters: true,
+            },
+            ImportedModelRegistration {
+                family: "sdxl",
+                source: ImportedModelSource::FusedCheckpoint,
+                operation: ImportedModelOperation::Edit,
+                provider_id: mlx_gen_sdxl::MODEL_ID,
+                required_components: Some(&[mlx_gen_sdxl::LDM_TOKENIZER_COMPONENT]),
+                inherit_adapters: true,
+            },
+        ];
+        assert_eq!(
+            registry.imported_models().copied().collect::<Vec<_>>(),
+            expected_legacy_projection,
+            "the legacy catalog surface must be the exact pre-registry compatibility projection"
+        );
+    }
+
+    #[test]
+    fn checkpoint_codecs_register_once_and_every_row_has_an_engine_implementation() {
+        use mlx_gen::logical_weights::{BASELINE_CODECS, CODEC_IMPLEMENTATION_IDS};
+
+        let registry = super::provider_registry().unwrap();
+        let registered: Vec<_> = registry.checkpoint_codecs().codecs().copied().collect();
+        assert_eq!(
+            registered, BASELINE_CODECS,
+            "the composed MLX catalog must carry the engine codec table exactly once, no family \
+             crate may add or repeat a row"
+        );
+        let mut registered_ids: Vec<&str> = registered.iter().map(|codec| codec.codec_id).collect();
+        registered_ids.sort_unstable();
+        let mut implemented: Vec<&str> = CODEC_IMPLEMENTATION_IDS.to_vec();
+        implemented.sort_unstable();
+        assert_eq!(
+            registered_ids, implemented,
+            "every registered codec row needs a decode implementation and vice versa"
+        );
+        // The portable dense bf16 codec is what the Krea 2 dense walking skeleton reads through.
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(mlx_gen::gen_core::WeightEncoding::DenseBf16)
+            .is_some());
+    }
+
+    /// Every `mapping_id` the composed MLX catalog registers resolves to a real
+    /// `LogicalKeyMapping` on this backend, **or** is explicitly declared not plan-driven here
+    /// (sc-20651). Previously this only covered Krea, so the other adapters' declared ids — none of
+    /// which had an implementation anywhere — went unproven in both directions.
+    #[test]
+    fn canonical_mappings_are_backed_by_declared_implementations() {
+        use mlx_gen::gen_core::{CheckpointBackend, LogicalKeyMapping};
+
+        let registry = super::provider_registry().unwrap();
+        let krea_config = mlx_gen_krea::Krea2Config::turbo();
+        // The complete set of `LogicalKeyMapping` implementations reachable from the MLX platform.
+        let implementations: &[&dyn LogicalKeyMapping] = &[
+            &mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(),
+            &mlx_gen_krea::KreaDiffusersKeyMapping::new(&krea_config),
+        ];
+
+        let mut declared_here = 0usize;
+        for adapter in registry.checkpoint_adapters() {
+            for mapping in adapter.canonical_mappings {
+                let implemented = implementations
+                    .iter()
+                    .any(|implementation| implementation.mapping_id() == mapping.mapping_id);
+                let declared = mapping
+                    .plan_driven_backends
+                    .contains(&CheckpointBackend::Mlx);
+                assert_eq!(
+                    implemented,
+                    declared,
+                    "adapter {} dialect {:?}: mapping id {:?} is {} on MLX but {} — a declared \
+                     mapping must resolve to a real implementation, and an implementation must be \
+                     declared (loader-native dialects declare no backend at all)",
+                    adapter.adapter_id,
+                    mapping.dialect,
+                    mapping.mapping_id,
+                    if implemented {
+                        "implemented"
+                    } else {
+                        "unimplemented"
+                    },
+                    if declared {
+                        "declared plan-driven"
+                    } else {
+                        "declared loader-native"
+                    },
+                );
+                declared_here += usize::from(declared);
+            }
+        }
+        assert_eq!(
+            declared_here,
+            implementations.len(),
+            "every MLX mapping implementation must be claimed by exactly one registered dialect"
+        );
+
+        // And the native mapping really is the remap the provider loads through.
+        assert_eq!(
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
+                .logical_key("model.diffusion_model.blocks.0.attn.wq.weight")
+                .as_deref(),
+            Some("transformer_blocks.0.attn.to_q.weight")
+        );
+        assert_eq!(
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
+                .logical_key("foreign.weight"),
+            None
+        );
+    }
+
+    #[test]
     fn benchmark_capabilities_are_explicit_for_every_p6_provider() {
         use std::collections::BTreeSet;
 
@@ -268,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_video_memory_apis_do_not_expand_beyond_wan_ti2v_5b() {
+    fn selected_video_memory_apis_stay_provider_owned() {
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()));
         for provider in [
             "unknown",
@@ -287,6 +542,7 @@ mod tests {
                 None
             );
         }
+        assert!(super::resolved_video_memory_numeric_tier("bernini", &spec).is_err());
     }
 
     #[test]
@@ -673,22 +929,24 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 50);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 49);
+        assert_eq!(registry.memory_strategy_registrations().len(), 53);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 50);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
-        assert_eq!(resident_only, ["flux2_dev_control"]);
+        assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b", "svd_xt"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // 47 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync: it ships all three tiers and both materialization
-        // shapes). Two video providers publish narrower, truthful inventories instead: LTX has no
-        // deferred/block-window loader, so it witnesses the eager half; TI2V-5B admits only a BF16
-        // Resident/Eager load, so it witnesses one selector per tier. Spelling the sum out this way
-        // keeps a future provider's narrowing visible in the diff rather than folded into a single
-        // total.
-        assert_eq!(surfaces.len(), 47 * 12 + 6 + 3);
+        // 48 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
+        // joined them in the sc-17137 sync, and FLUX.2 Dev Control has its exact fixture): these
+        // providers publish every tier and materialization selector, even where a provider correctly
+        // classifies a strategy as Missing. Two video providers publish narrower, truthful
+        // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
+        // half; TI2V-5B admits only a BF16 Resident/Eager load, so it witnesses one selector per
+        // tier. SVD is instead covered by the separate resident-only witness assertion above.
+        // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
+        // rather than folded into a single total.
+        assert_eq!(surfaces.len(), 48 * 12 + 6 + 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

@@ -1201,6 +1201,7 @@ mod tests {
             let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
             let record = MemoryEvidenceLogRecord {
                 key: MemoryEvidenceKey {
+                    model_family: "sana".to_owned(),
                     resolved_route: crate::MODEL_ID.to_owned(),
                     backend: MemoryBackend::Mlx,
                     tier: MemoryNumericTier {
@@ -1210,6 +1211,7 @@ mod tests {
                     },
                     load_shape: spec.load_shape,
                     mode: mlx_gen::gen_core::MemoryMode::TextToImage,
+                    reference_shape: mlx_gen::gen_core::MemoryReferenceShape::None,
                     overlay: None,
                     geometry: MemoryGeometry {
                         width: 1024,
@@ -1218,6 +1220,7 @@ mod tests {
                         frames: 1,
                         reference_count: 0,
                     },
+                    frames_per_second: None,
                     strategy,
                     engaged_composition: contract.engaged_composition(strategy),
                     parameters: MemoryStrategyParameters::default(),

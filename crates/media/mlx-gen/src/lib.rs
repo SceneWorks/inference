@@ -39,6 +39,7 @@ pub mod block_residency;
 pub mod capability;
 pub mod error;
 pub mod img2img;
+pub mod logical_weights;
 pub mod memory;
 pub mod mllm;
 pub mod nn;
