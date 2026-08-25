@@ -714,6 +714,50 @@ impl LogicalTensorPlan {
             self.codec_id, self.physical_key, self.logical_key
         ))
     }
+
+    /// The one refusal message both engines emit when a **matrix codec** row (`mxfp8-v1`,
+    /// `nvfp4-v1`, `int8-per-row-v1`) carries a logical [`Self::shape`] that is not rank 2.
+    ///
+    /// Those three codecs decode an `[out, in]` grid: every backend arm indexes `shape[0]` /
+    /// `shape[1]` positionally and hands the pair to this crate's `[rows, cols]` reference decoders
+    /// ([`crate::decode_mxfp8`], [`crate::decode_nvfp4`], [`crate::decode_int8_per_row`]).
+    ///
+    /// [`compile_logical_weight_plan_with_metadata`] already refuses any descriptor-bearing layer
+    /// whose stored header is not rank 2, and the MXFP8/NVFP4 geometry validators refuse a declared
+    /// logical shape that is not rank 2 either — so a plan that came from the compiler cannot reach
+    /// those arms at another rank. This is the **local** restatement of that contract at the sites
+    /// that depend on it: each engine's logical-weight read is a public entry taking a
+    /// caller-supplied [`LogicalWeightPlan`] whose fields are public, so without this guard a plan
+    /// that did not come from the compiler panics on an out-of-bounds index instead of refusing by
+    /// name. It lives here, beside [`Self::undeclared_padded_storage_refusal`], so both engines
+    /// refuse the same plan with the same diagnosis rather than keeping two copies that can drift
+    /// (nothing compiles both backends at once: mlx-gen is macOS-only and candle-gen's quantized
+    /// legs are `cuda`-gated).
+    ///
+    /// Dense and scalar-fp8 rows are rank-agnostic — they carry the logical shape through whole
+    /// (ComfyUI casts biases and modulation vectors to fp8 too) — so they answer `None`: imposing a
+    /// floor on them would refuse real checkpoints.
+    pub fn matrix_rank_refusal(&self) -> Option<String> {
+        const MATRIX_RANK: usize = 2;
+        match &self.codec {
+            TensorCodecSpec::Mxfp8 { .. }
+            | TensorCodecSpec::Nvfp4 { .. }
+            | TensorCodecSpec::Int8PerRow { .. } => {}
+            TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => return None,
+        }
+        if self.shape.len() == MATRIX_RANK {
+            return None;
+        }
+        Some(format!(
+            "codec {}: tensor {:?} decodes as an [out, in] matrix — expected rank {MATRIX_RANK}, \
+             observed rank {} (planned logical shape {:?}); this plan did not come from the \
+             checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
+            self.codec_id,
+            self.physical_key,
+            self.shape.len(),
+            self.shape,
+        ))
+    }
 }
 
 /// What a companion tensor is for.
@@ -895,6 +939,24 @@ impl LogicalWeightPlan {
 ///
 /// See [`LogicalWeightPlan::resident_tensor_headers`]; the one case today is the GGUF container
 /// row, whose ggml blocks have no per-element width to re-price from.
+///
+/// # Deliberately NOT `#[non_exhaustive]` (sc-20651 feature-end review, minor 13)
+///
+/// Marking it `#[non_exhaustive]` would let a future variant be added without touching any
+/// consumer. That is the wrong trade here, twice over:
+///
+/// * gen-core is a **workspace-internal contract crate** with no downstream users outside this
+///   repo, so there is no compatibility to buy — the only thing `#[non_exhaustive]` would purchase
+///   is that a new refusal reason slips past the code that has to react to it.
+/// * Every other error enum on this seam ([`LogicalWeightPlanError`] here,
+///   `candle_gen_wan::gguf::GgufPlanError`) is exhaustive for the same reason, and
+///   `mlx-gen-minimax-h3`'s residency test states the rule outright: list every variant so a new
+///   one **reds the code that must handle it**.
+///
+/// The consequence is intended and is a *compile* error, never a silent one: a second variant here
+/// stops `candle_gen_wan::gguf`'s `resident_tensor_headers_refuse_a_gguf_backed_plan` from
+/// compiling (it destructures `NoPerElementWidth` irrefutably), which is exactly the prompt to
+/// decide what that test should now assert. Whoever adds the variant owns that edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResidentTensorHeadersError {
     /// The tensor's resident encoding has no integral bytes-per-element, so a synthesized

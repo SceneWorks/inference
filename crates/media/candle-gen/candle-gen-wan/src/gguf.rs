@@ -1100,10 +1100,21 @@ mod tests {
     /// and a Q4_K weight that dequantized to garbage would pass all of it. This pins the values.
     ///
     /// One `block_q4_K` is built here byte by byte in the ggml wire layout, written into a real
-    /// `.gguf`, read back through the **production** reader (`gguf_file::Content::tensor` — the
-    /// call [`GgufDit::open`] makes) and dequantized through the **production** path
-    /// (`QTensor::dequantize` — the call [`GgufDit::dense`] makes for sidecars and
-    /// `MatmulStrategy::DequantDense` makes per matmul for the k-quant Linears).
+    /// `.gguf`, and asserted against the reference **twice**:
+    ///
+    /// 1. at the raw seam — `gguf_file::Content::tensor` + `QTensor::dequantize`, the two calls
+    ///    the loader makes;
+    /// 2. through the loader itself — [`GgufDit::open_with`] (the drivable form of
+    ///    [`GgufDit::open`], driven here with the production mapping and the production
+    ///    `gguf_codec_registry`) followed by [`GgufDit::dense`]. This is what makes the
+    ///    "production path" claim above load-bearing rather than a comment: it pins the plan
+    ///    compile, the native→diffusers remap and the resident-`QTensor` dequantization as one
+    ///    chain onto these values, so a regression anywhere along it reds here.
+    ///
+    /// The k-quant *Linear* path (`GgufDit::qlinear` →
+    /// `candle_gen::quant::MatmulStrategy::DequantDense`) dequantizes per matmul rather than at
+    /// load, so it is not driven here — but it dequantizes the **same** resident `Arc<QTensor>`
+    /// [`GgufDit::dense`] reads below, and the test asserts that identity rather than assuming it.
     ///
     /// The expected values are computed **here**, from the ggml Q4_K spec (llama.cpp
     /// `k_quants.c`: `dequantize_row_q4_K` + `get_scale_min_k4`) — nothing in the expectation
@@ -1240,6 +1251,46 @@ mod tests {
             "the fixture must produce a wide value spread, got {} distinct values",
             distinct.len()
         );
+
+        // ── and through the loader, so the claim above is asserted rather than asserted-about ──
+        // `open_with` is `GgufDit::open` with the two collaborators injected; both are the
+        // production ones here, so this drives the whole chain: header parse → plan compile →
+        // native→diffusers remap → materialize → `GgufDit::dense`'s `QTensor::dequantize`.
+        let dit = GgufDit::open_with(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            &WanNativeToDiffusersMapping,
+            gguf_codec_registry(),
+        )
+        .expect("the golden container opens through the loader");
+        // The remap really fired: the loader keys the block at its diffusers name.
+        let logical = "blocks.0.attn1.to_q.weight";
+        let resident = dit
+            .require(logical)
+            .unwrap_or_else(|error| panic!("fixture check: {error}"));
+        assert_eq!(
+            resident.dtype(),
+            GgmlDType::Q4K,
+            "the loader must hold the block STILL QUANTIZED — dequantizing at load is the \
+             behaviour this whole route exists to avoid"
+        );
+        // `qlinear` hands exactly this `Arc<QTensor>` to `MatmulStrategy::DequantDense`, so the
+        // values pinned below are the values that path dequantizes.
+        assert_eq!(
+            resident.data().unwrap().as_ref(),
+            block.as_slice(),
+            "the resident QTensor must be the fixture's bytes"
+        );
+        let through_loader: Vec<f32> = dit
+            .dense(logical, Shape::from((1, 256)))
+            .expect("the resident block dequantizes through the loader")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(through_loader, expected, "loader dequantize vs ggml spec");
+
         std::fs::remove_file(&path).ok();
     }
 

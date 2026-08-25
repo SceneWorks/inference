@@ -528,34 +528,6 @@ fn guard_stored(
     Ok(())
 }
 
-/// The matrix codecs (`mxfp8-v1`, `nvfp4-v1`, `int8-per-row-v1`) decode a **rank-2** `[out, in]`
-/// logical grid: their arms below index `tensor.shape[0]` / `tensor.shape[1]` directly and hand the
-/// pair to `gen_core`'s `[rows, cols]` reference decoders (`decode_mxfp8`, `decode_nvfp4`,
-/// `decode_int8_per_row`).
-///
-/// `gen_core::compile_logical_weight_plan_with_metadata` already refuses any descriptor-bearing
-/// layer whose stored header is not rank 2, and the MXFP8/NVFP4 geometry validators refuse a
-/// declared logical shape that is not rank 2 either — so a plan that came from the compiler cannot
-/// reach these arms at another rank. This is the **local** restatement of that contract at the site
-/// that depends on it: [`read_logical_weights`] is a public entry taking a caller-supplied
-/// [`LogicalWeightPlan`] whose fields are public, so without this guard a plan that did not come
-/// from the compiler panics on an out-of-bounds index instead of refusing by name.
-fn require_matrix_rank(tensor: &LogicalTensorPlan) -> Result<()> {
-    const MATRIX_RANK: usize = 2;
-    if tensor.shape.len() != MATRIX_RANK {
-        return Err(CandleError::Msg(format!(
-            "codec {}: tensor {:?} decodes as an [out, in] matrix — expected rank {MATRIX_RANK}, \
-             observed rank {} (planned logical shape {:?}); this plan did not come from the \
-             checkpoint plan compiler, which enforces rank {MATRIX_RANK} for this codec",
-            tensor.codec_id,
-            tensor.physical_key,
-            tensor.shape.len(),
-            tensor.shape,
-        )));
-    }
-    Ok(())
-}
-
 fn upload_bf16(values: Vec<f32>, shape: &[usize], device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
         .to_dtype(DType::BF16)?
@@ -579,17 +551,12 @@ fn decode(
         return Err(CandleError::Msg(refusal));
     }
 
-    // Rank floor for the arms that index the logical shape positionally — see
-    // [`require_matrix_rank`]. Checked before `guard_stored` so a wrong-rank plan is diagnosed as
-    // the rank defect it is rather than as a stored-shape drift.
-    match &tensor.codec {
-        TensorCodecSpec::Mxfp8 { .. }
-        | TensorCodecSpec::Nvfp4 { .. }
-        | TensorCodecSpec::Int8PerRow { .. } => require_matrix_rank(tensor)?,
-        // The dense rows and the scalar-fp8 cast are rank-agnostic: they carry the logical shape
-        // through whole (ComfyUI casts biases and modulation vectors to fp8 too), so no floor
-        // applies and imposing one here would refuse real checkpoints.
-        TensorCodecSpec::Dense | TensorCodecSpec::ScalarFp8 { .. } => {}
+    // Rank floor for the arms below that index the logical shape positionally — see
+    // [`LogicalTensorPlan::matrix_rank_refusal`]. Checked before `guard_stored` so a wrong-rank plan
+    // is diagnosed as the rank defect it is rather than as a stored-shape drift. The refusal text is
+    // gen-core's, so both engines refuse the same plan with the same diagnosis.
+    if let Some(refusal) = tensor.matrix_rank_refusal() {
+        return Err(CandleError::Msg(refusal));
     }
 
     let view = st.get(&tensor.physical_key)?;
