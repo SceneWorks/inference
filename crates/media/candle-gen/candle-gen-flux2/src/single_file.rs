@@ -118,7 +118,7 @@ const SINGLE_RENAMES: &[(&str, &str)] = &[
     ("norm.key_norm.weight", "attn.norm_k.weight"),
 ];
 
-/// Split `bare` (already prefix-stripped) as `{table_prefix}.{index}.{suffix}`, returning
+/// Split `bare` as `{table_prefix}.{index}.{suffix}`, returning
 /// `(index, suffix)`; `None` when it is not under `table_prefix` or has no well-formed index.
 fn block_suffix<'k>(bare: &'k str, table_prefix: &str) -> Option<(usize, &'k str)> {
     let rest = bare.strip_prefix(table_prefix)?.strip_prefix('.')?;
@@ -132,13 +132,28 @@ fn block_suffix<'k>(bare: &'k str, table_prefix: &str) -> Option<(usize, &'k str
 /// AdaLN half swap declared as plan-time transforms (sc-21547) and the architecture's true
 /// geometry declared from the variant config.
 ///
-/// `prefix` is the namespace detected on the file being planned (`""` for the bare-keyed
-/// community export; `"model.diffusion_model."` for a wrapper-module export). A property of the
-/// *file*, not of the dialect, so it is carried on the value — and `logical_key` refuses a key
-/// that does not carry it rather than accepting both spellings.
+/// # Bare keys only, deliberately (sc-21485 review, minor 5)
+///
+/// This mapping reads the **bare** BFL namespace, the shape the klein community single file
+/// ships, and it is the only namespace the `bfl` dialect's registry signature
+/// (`flux2-klein-bfl-v1`) claims. An earlier revision carried a detected `prefix` so a
+/// `model.diffusion_model.`-nested export could route here too; that branch was unreachable in
+/// production and is gone:
+///
+/// * a prefixed key set already satisfies `flux2-comfyui-v1`
+///   (`model.diffusion_model.double_blocks.0.img_attn.qkv.weight`), so routing sends it to the
+///   `comfyui` dialect and the 32B **dev** provider before this mapping is ever constructed;
+/// * registering a prefixed `bfl` signature would make BOTH adapters claim the same file, so
+///   making the branch reachable is not a local change to this type — it needs the `comfyui`
+///   signature tightened first.
+///
+/// Carrying the parameter anyway implied a routing capability that does not exist. Today a
+/// prefixed klein file routes to dev and refuses there; if that ever needs fixing, the fix belongs
+/// in `FLUX2_CHECKPOINT_ADAPTER`'s signatures, and this mapping grows the namespace back with a
+/// routing test alongside it. A prefixed key reaching *here* is unmapped at plan time — the
+/// fail-closed answer.
 #[derive(Clone, Copy, Debug)]
 pub struct Flux2BflToDiffusersMapping<'a> {
-    prefix: &'a str,
     cfg: &'a Flux2Config,
 }
 
@@ -146,27 +161,8 @@ impl<'a> Flux2BflToDiffusersMapping<'a> {
     /// The id the `FLUX2_CHECKPOINT_ADAPTER` registry row declares for the `bfl` dialect.
     pub const MAPPING_ID: &'static str = "flux2-bfl-to-diffusers-v1";
 
-    /// The namespace prefix used by files whose DiT nests under a wrapper module.
-    pub const DIFFUSION_MODEL_PREFIX: &'static str = "model.diffusion_model.";
-
-    pub const fn new(prefix: &'a str, cfg: &'a Flux2Config) -> Self {
-        Self { prefix, cfg }
-    }
-
-    /// Detect the file's namespace prefix from its key set: every key nested under
-    /// [`Self::DIFFUSION_MODEL_PREFIX`] selects it, anything else selects the bare namespace. A
-    /// *mixed* file refuses at plan time (the un-prefixed keys are unmapped under the detected
-    /// prefix), which is the correct fail-closed answer for a spliced checkpoint.
-    pub fn detect_prefix<S: AsRef<str>>(keys: &[S]) -> &'static str {
-        let all_prefixed = !keys.is_empty()
-            && keys
-                .iter()
-                .all(|key| key.as_ref().starts_with(Self::DIFFUSION_MODEL_PREFIX));
-        if all_prefixed {
-            Self::DIFFUSION_MODEL_PREFIX
-        } else {
-            ""
-        }
+    pub const fn new(cfg: &'a Flux2Config) -> Self {
+        Self { cfg }
     }
 
     fn inner(&self) -> usize {
@@ -231,7 +227,7 @@ impl LogicalKeyMapping for Flux2BflToDiffusersMapping<'_> {
     }
 
     fn logical_key(&self, physical_key: &str) -> Option<String> {
-        let bare = physical_key.strip_prefix(self.prefix)?;
+        let bare = physical_key;
         for (src, dst) in TOP_RENAMES {
             if bare == *src {
                 return Some((*dst).to_owned());
@@ -261,7 +257,7 @@ impl LogicalKeyMapping for Flux2BflToDiffusersMapping<'_> {
     }
 
     fn logical_transform(&self, physical_key: &str) -> Option<LogicalTransformDeclaration> {
-        let bare = physical_key.strip_prefix(self.prefix)?;
+        let bare = physical_key;
         let inner = self.inner();
         if bare == ADALN_SOURCE {
             // BFL packs `(shift, scale)`; diffusers reads `(scale, shift)`. This tensor is dense
@@ -504,7 +500,7 @@ mod tests {
     }
 
     fn mapping_for(cfg: &Flux2Config) -> Flux2BflToDiffusersMapping<'_> {
-        Flux2BflToDiffusersMapping::new("", cfg)
+        Flux2BflToDiffusersMapping::new(cfg)
     }
 
     #[test]
@@ -531,6 +527,19 @@ mod tests {
         // Foreign keys refuse: dev's guidance embedder and the BFL-official `.scale` per-head-norm
         // spelling are NOT this dialect, so a dev checkpoint cannot slip through the klein route.
         assert_eq!(mapping.logical_key("guidance_in.in_layer.weight"), None);
+        // sc-21485 review (minor 5): this dialect is the BARE namespace, the only one
+        // `flux2-klein-bfl-v1` claims. A `model.diffusion_model.`-nested key is routed to the
+        // `comfyui` dialect (the dev provider) long before this mapping is built, so there is no
+        // prefix branch here — and a prefixed key that somehow reaches it is unmapped, which the
+        // plan compiler turns into a named refusal rather than a silent skip.
+        assert_eq!(
+            mapping.logical_key("model.diffusion_model.img_in.weight"),
+            None
+        );
+        assert_eq!(
+            mapping.logical_transform("model.diffusion_model.double_blocks.0.img_attn.qkv.weight"),
+            None
+        );
         assert_eq!(
             mapping.logical_key("double_blocks.0.img_attn.norm.query_norm.scale"),
             None

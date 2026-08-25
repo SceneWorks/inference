@@ -1694,6 +1694,21 @@ pub enum LogicalWeightPlanError {
         /// The descriptor field names that disagree, in declaration order.
         disagreement: Vec<&'static str>,
     },
+    /// A block-scaled descriptor declared an `orig_shape` (the Kitchen exporter's pre-quantization
+    /// geometry) that is not the logical shape this plan derived from the stored grid plus the
+    /// adapter's declaration (sc-21485 review).
+    ///
+    /// The declaration is never an input — geometry authority stays with the stored shapes — so the
+    /// only two possibilities are "it agrees, and corroborates the packed geometry" and "it
+    /// disagrees, and one of the two is wrong about the layer". The second refuses here, by name,
+    /// rather than being type-checked and dropped.
+    DescriptorOrigShape {
+        physical_key: String,
+        /// The descriptor's declared pre-quantization shape.
+        declared: Vec<usize>,
+        /// The logical shape the plan derived independently.
+        logical: Vec<usize>,
+    },
     /// The adapter's declarative logical transform for this tensor is not compilable (sc-21547).
     Transform {
         physical_key: String,
@@ -1822,6 +1837,16 @@ impl fmt::Display for LogicalWeightPlanError {
                 tensor.full_precision_matrix_mult,
                 metadata,
                 disagreement.join(", ")
+            ),
+            Self::DescriptorOrigShape {
+                physical_key,
+                declared,
+                logical,
+            } => write!(
+                f,
+                "weight {physical_key:?} declares `orig_shape` {declared:?} but its stored geometry \
+                 and the adapter's declaration give the logical shape {logical:?}; the descriptor \
+                 and the checkpoint disagree about this layer"
             ),
             Self::Transform {
                 physical_key,
@@ -2138,7 +2163,7 @@ pub fn compile_logical_weight_plan_with_metadata(
             }
         })?;
         let base = header.name.strip_suffix(".weight");
-        let descriptor = base.and_then(|base| descriptors.get(base)).copied();
+        let descriptor = base.and_then(|base| descriptors.get(base));
         // Descriptor ↔ stored-dtype agreement first: "declared e4m3 but stored bf16" is the exact
         // defect, not a missing codec row.
         if let Some(descriptor) = descriptor {
@@ -2366,6 +2391,25 @@ pub fn compile_logical_weight_plan_with_metadata(
                 }
             }
         };
+
+        // The block-scaled provenance `orig_shape`, checked rather than merely type-checked
+        // (sc-21485 review). `logical_shape` was derived independently — from the stored grid's
+        // geometry plus, where the adapter declared one, its logical shape — so an `orig_shape`
+        // that agrees is free corroboration of the packed geometry and one that differs means the
+        // exporter's declaration and the checkpoint disagree about the layer. Only block-scaled
+        // descriptors can carry the key at all (`partial_descriptor_from_json` refuses it elsewhere
+        // as an unknown field), so this covers exactly NVFP4 and MXFP8.
+        if let Some(declared_orig) =
+            descriptor.and_then(|descriptor| descriptor.orig_shape.as_deref())
+        {
+            if declared_orig != logical_shape.as_slice() {
+                return Err(LogicalWeightPlanError::DescriptorOrigShape {
+                    physical_key: header.name.clone(),
+                    declared: declared_orig.to_vec(),
+                    logical: logical_shape.clone(),
+                });
+            }
+        }
 
         // Residency: the backend's packed-vs-dense decision, priced per tensor. A layer flagged
         // `full_precision_matrix_mult` never runs packed.
@@ -2867,6 +2911,68 @@ mod tests {
         ));
     }
 
+    /// sc-21485 review. The Kitchen provenance `orig_shape` is **checked** against the logical
+    /// shape the plan derived from the stored grid, not type-checked and dropped: an agreeing
+    /// declaration corroborates the packed geometry, a differing one refuses by name.
+    ///
+    /// Mutation witness: delete the `DescriptorOrigShape` equality check in
+    /// `compile_logical_weight_plan_with_metadata` and the mismatch arm below goes green — which is
+    /// exactly the "type-checked then discarded" behaviour this test exists to forbid.
+    #[test]
+    fn a_declared_orig_shape_must_equal_the_derived_logical_shape() {
+        // Stored U8 [32, 32] ⇒ 64 four-bit codes per row ⇒ logical [32, 64].
+        let headers = [
+            header("model.q.weight", Dtype::U8, &[32, 32]),
+            header("model.q.weight_scale", Dtype::F8_E4M3, &[128, 4]),
+            header("model.q.weight_scale_2", Dtype::F32, &[]),
+        ];
+        let compile_meta = |payload: &str| {
+            compile_logical_weight_plan_with_metadata(
+                &headers,
+                &no_descriptors(),
+                Some(payload),
+                &StripPrefix,
+                &full(),
+                &DenseResidencyPolicy,
+            )
+        };
+
+        // The true pre-quantization shape: accepted, and the plan is unchanged by its presence.
+        let corroborated = compile_meta(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [32, 64]}}}"#,
+        )
+        .expect("an orig_shape equal to the derived logical shape corroborates");
+        assert_eq!(corroborated.tensors[0].shape, vec![32, 64]);
+
+        // The STORED byte grid is not the logical shape; declaring it refuses by name.
+        let error = compile_meta(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "orig_shape": [32, 32]}}}"#,
+        )
+        .expect_err("an orig_shape that is not the logical shape must refuse");
+        assert_eq!(
+            error,
+            LogicalWeightPlanError::DescriptorOrigShape {
+                physical_key: "model.q.weight".to_owned(),
+                declared: vec![32, 32],
+                logical: vec![32, 64],
+            },
+            "{error}"
+        );
+        assert!(error.to_string().contains("model.q.weight"), "{error}");
+
+        // A transposed declaration is the same class of disagreement — the check is equality, not
+        // an element-count comparison that a transpose would slip through.
+        assert!(
+            matches!(
+                compile_meta(
+                    r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "orig_shape": [64, 32]}}}"#,
+                ),
+                Err(LogicalWeightPlanError::DescriptorOrigShape { .. })
+            ),
+            "a transposed orig_shape must refuse"
+        );
+    }
+
     /// sc-20641. A layer declared by BOTH routes must agree; a disagreement refuses rather than one
     /// route silently winning.
     #[test]
@@ -2907,11 +3013,13 @@ mod tests {
                 tensor: ComfyQuantDescriptor {
                     format: ComfyQuantFormat::Nvfp4,
                     full_precision_matrix_mult: false,
+                    orig_shape: None,
                 },
                 metadata: PartialComfyQuantDescriptor {
                     format: ComfyQuantFormat::Float8E4M3Fn,
                     full_precision_matrix_mult: None,
                     per_row: None,
+                    orig_shape: None,
                 },
                 disagreement: vec!["format"],
             }
@@ -2932,11 +3040,13 @@ mod tests {
                 tensor: ComfyQuantDescriptor {
                     format: ComfyQuantFormat::Nvfp4,
                     full_precision_matrix_mult: false,
+                    orig_shape: None,
                 },
                 metadata: PartialComfyQuantDescriptor {
                     format: ComfyQuantFormat::Nvfp4,
                     full_precision_matrix_mult: Some(true),
                     per_row: None,
+                    orig_shape: None,
                 },
                 disagreement: vec!["full_precision_matrix_mult"],
             }
@@ -3018,11 +3128,13 @@ mod tests {
                 tensor: ComfyQuantDescriptor {
                     format: ComfyQuantFormat::Int8TensorwisePerRow,
                     full_precision_matrix_mult: false,
+                    orig_shape: None,
                 },
                 metadata: PartialComfyQuantDescriptor {
                     format: ComfyQuantFormat::Int8TensorwisePerRow,
                     full_precision_matrix_mult: None,
                     per_row: Some(false),
+                    orig_shape: None,
                 },
                 disagreement: vec!["per_row"],
             }

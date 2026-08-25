@@ -110,7 +110,7 @@ fn linked_and_managed_copies_share_one_plan_and_one_render() {
     let device = candle_gen::default_device().expect("device");
     let residency = CandleCodecResidency::probe(&device);
     let cfg = Flux2Variant::Klein9b.config();
-    let mapping = Flux2BflToDiffusersMapping::new("", &cfg);
+    let mapping = Flux2BflToDiffusersMapping::new(&cfg);
     let plan_managed = plan_logical_weights(&managed, &mapping, &residency).expect("managed plan");
     let plan_linked = plan_logical_weights(&linked, &mapping, &residency).expect("linked plan");
     let summary = plan_semantic_summary(&plan_managed);
@@ -189,12 +189,63 @@ fn write_synthetic_lora(dir: &std::path::Path) -> PathBuf {
     path
 }
 
+/// Deterministic tiny **LoKr** over the same NVFP4-packed double-block `to_q` (AC3 names LoRA and
+/// LoKr; both ride the one `AdaptLinear` additive seam, sc-11091 / sc-21483).
+///
+/// `to_q` is `[4096, 4096]`, so the Kronecker factorisation is `out = 64·64`, `in = 64·64` — two
+/// `[64, 64]` full factors, no low-rank split. PEFT-stamped metadata (`networkType=lokr`) is what
+/// the loader's declared-kind check reads, so it is written here rather than inferred.
+fn write_synthetic_lokr(dir: &std::path::Path) -> PathBuf {
+    use std::collections::BTreeMap;
+    let side = 64usize;
+    let f32_bytes =
+        |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let ramp = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n).map(|i| ((i % 13) as f32 - 6.0) * scale).collect()
+    };
+    let payloads: Vec<(String, Vec<usize>, Vec<u8>)> = vec![
+        (
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w1".into(),
+            vec![side, side],
+            f32_bytes(&ramp(side * side, 0.05)),
+        ),
+        (
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w2".into(),
+            vec![side, side],
+            f32_bytes(&ramp(side * side, 0.05)),
+        ),
+    ];
+    let tensors: BTreeMap<&str, ::safetensors::tensor::TensorView<'_>> = payloads
+        .iter()
+        .map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                ::safetensors::tensor::TensorView::new(
+                    ::safetensors::Dtype::F32,
+                    shape.clone(),
+                    bytes,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let metadata = std::collections::HashMap::from([
+        ("networkType".to_string(), "lokr".to_string()),
+        ("rank".to_string(), "1".to_string()),
+        ("alpha".to_string(), "1".to_string()),
+    ]);
+    let path = dir.join("sc21485-synthetic-lokr.safetensors");
+    ::safetensors::serialize_to_file(tensors, Some(metadata), &path).unwrap();
+    path
+}
+
 #[test]
 #[ignore = "needs the pinned NVFP4 klein single file + base snapshot + CUDA (env-driven)"]
 fn adapter_inheritance_composes_over_the_packed_projections() {
     let managed = managed_nvfp4_file();
     let tmp = tempfile::tempdir().expect("temp dir");
     let lora = write_synthetic_lora(tmp.path());
+    let lokr = write_synthetic_lokr(tmp.path());
 
     let base = render(&managed, Vec::new());
     let adapted = render(
@@ -212,5 +263,29 @@ fn adapter_inheritance_composes_over_the_packed_projections() {
         base, adapted,
         "a LoRA over the packed projections must change the fixed-seed render \
          (an unchanged render is the silent-un-adapted class, epic E6)"
+    );
+
+    // AC3's other half. The LoKr residual is the deferred Kronecker-vector identity — it never
+    // materializes the `[out, in]` delta — so "it loaded" is NOT evidence it applied; only a
+    // changed fixed-seed render is.
+    let lokr_adapted = render(
+        &managed,
+        vec![AdapterSpec {
+            path: lokr,
+            scale: 1.0,
+            kind: AdapterKind::Lokr,
+            pass_scales: None,
+            moe_expert: None,
+        }],
+    );
+    assert_eq!(base.len(), lokr_adapted.len());
+    assert_ne!(
+        base, lokr_adapted,
+        "a LoKr over the packed projections must change the fixed-seed render"
+    );
+    assert_ne!(
+        adapted, lokr_adapted,
+        "the LoRA and LoKr arms must not collapse onto one render — that would mean neither \
+         residual is actually keyed to its own factors"
     );
 }

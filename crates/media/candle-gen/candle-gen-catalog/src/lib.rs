@@ -4415,7 +4415,7 @@ mod tests {
         // The FLUX.2 mapping carries the variant architecture config (it declares logical shapes
         // and the fused-transform geometry from it); the id surface is config-independent.
         let flux2_cfg = candle_gen_flux2::config::Flux2Variant::Klein9b.config();
-        let flux2 = candle_gen_flux2::Flux2BflToDiffusersMapping::new("", &flux2_cfg);
+        let flux2 = candle_gen_flux2::Flux2BflToDiffusersMapping::new(&flux2_cfg);
         let implementations: &[&dyn LogicalKeyMapping] =
             &[&candle_gen_wan::WanNativeToDiffusersMapping, &krea, &flux2];
 

@@ -122,13 +122,20 @@ impl fmt::Display for ComfyQuantFormat {
 }
 
 /// A validated `.comfy_quant` descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComfyQuantDescriptor {
     pub format: ComfyQuantFormat,
     /// ComfyUI's per-layer "dequantize and multiply in full precision" flag: the layer keeps its
     /// packed storage but never takes a quantized matmul. A codec plan treats it as "dense fallback
     /// residency, even where a native path exists".
     pub full_precision_matrix_mult: bool,
+    /// The Kitchen exporter's declared **pre-quantization** shape, retained (block-scaled formats
+    /// only — see [`partial_descriptor_from_json`]). Not an authority: the plan compiler checks it
+    /// against the logical shape it derived from the stored geometry + the adapter's declaration
+    /// and refuses a mismatch by name
+    /// (`LogicalWeightPlanError::DescriptorOrigShape`), so a declaration that agrees is free
+    /// corroboration of the packed geometry and one that differs cannot be ignored.
+    pub orig_shape: Option<Vec<usize>>,
 }
 
 /// Why a `.comfy_quant` blob is not a descriptor this workspace accepts. Every variant is a
@@ -271,13 +278,17 @@ pub fn parse_comfy_quant_descriptor(
 /// * blob absent ⇒ this entry is the only declaration, so it must stand on its own and goes through
 ///   [`Self::into_complete`] — which is exactly the pre-sc-20651 behaviour for a metadata-only file
 ///   (the ComfyUI Kitchen NVFP4 converters' form, sc-20641).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialComfyQuantDescriptor {
     pub format: ComfyQuantFormat,
     pub full_precision_matrix_mult: Option<bool>,
     /// Only meaningful for `int8_tensorwise`; `None` everywhere else (the key is refused as an
     /// unknown field on any other format).
     pub per_row: Option<bool>,
+    /// Only meaningful for the block-scaled formats (`nvfp4`/`mxfp8`); `None` everywhere else (the
+    /// key is refused as an unknown field on any other format). See
+    /// [`ComfyQuantDescriptor::orig_shape`] for what the plan compiler does with it.
+    pub orig_shape: Option<Vec<usize>>,
 }
 
 impl PartialComfyQuantDescriptor {
@@ -291,6 +302,7 @@ impl PartialComfyQuantDescriptor {
         Ok(ComfyQuantDescriptor {
             format: self.format,
             full_precision_matrix_mult: self.full_precision_matrix_mult.unwrap_or(false),
+            orig_shape: self.orig_shape,
         })
     }
 
@@ -315,6 +327,16 @@ impl PartialComfyQuantDescriptor {
         if self.per_row == Some(false) && tensor.format == ComfyQuantFormat::Int8TensorwisePerRow {
             disagreement.push("per_row");
         }
+        // Two block-scaled declarations of the same layer that name different pre-quantization
+        // shapes cannot both be corroboration; the blob stays authoritative and the table refuses.
+        if self
+            .orig_shape
+            .as_deref()
+            .zip(tensor.orig_shape.as_deref())
+            .is_some_and(|(declared, blob)| declared != blob)
+        {
+            disagreement.push("orig_shape");
+        }
         disagreement
     }
 }
@@ -330,6 +352,9 @@ impl fmt::Display for PartialComfyQuantDescriptor {
         }
         if let Some(flag) = self.per_row {
             declared.push(format!("per_row={flag}"));
+        }
+        if let Some(shape) = self.orig_shape.as_deref() {
+            declared.push(format!("orig_shape={shape:?}"));
         }
         if declared.is_empty() {
             f.write_str(" (no other field declared)")
@@ -389,10 +414,18 @@ pub fn partial_descriptor_from_json(
     // The block-scaled formats' provenance trio (sc-21485): real ComfyUI Kitchen exports (e.g. the
     // pinned `wikeeyang/Flux2-Klein-9B-True-V2` NVFP4-mixed file) write `group_size`, `orig_dtype`
     // and `orig_shape` alongside `format`. None of them may *redefine* the layout — the block
-    // length is a property of the format — so each is validated against the one layout this
-    // workspace models and then dropped: a matching declaration is corroboration, a differing one
-    // refuses. Geometry authority stays with the stored shapes + the adapter's declared logical
-    // shape, exactly as for a file that omits the trio.
+    // length is a property of the format — so `group_size` is validated against the one layout this
+    // workspace models and then dropped, `orig_dtype` is type-checked and dropped (nothing here
+    // decodes from it; the stored dtype is the authority), and `orig_shape` is RETAINED for the
+    // plan compiler to check against the logical shape it derives from the stored geometry plus the
+    // adapter's declaration. Geometry authority therefore still stays with the stored shapes,
+    // exactly as for a file that omits the trio — the declaration is corroboration that must agree,
+    // never an input.
+    //
+    // Scope: `orig_dtype`/`orig_shape` are accepted **only** on the block-scaled formats, the
+    // documented scope. On any other format they refuse as unknown fields, the same fail-closed
+    // treatment `per_row` gets outside int8.
+    let block_scaled = matches!(format, ComfyQuantFormat::Nvfp4 | ComfyQuantFormat::Mxfp8);
     if let Some(group_size) = object.get("group_size") {
         let expected = match format {
             ComfyQuantFormat::Nvfp4 => Some(NVFP4_BLOCK),
@@ -408,27 +441,35 @@ pub fn partial_descriptor_from_json(
             });
         }
     }
-    if let Some(orig_dtype) = object.get("orig_dtype") {
-        if !orig_dtype.is_string() {
-            return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
-                field: "orig_dtype",
-            });
+    if block_scaled {
+        if let Some(orig_dtype) = object.get("orig_dtype") {
+            if !orig_dtype.is_string() {
+                return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_dtype",
+                });
+            }
         }
     }
-    if let Some(orig_shape) = object.get("orig_shape") {
-        let well_formed = orig_shape
-            .as_array()
-            .is_some_and(|dims| dims.iter().all(|dim| dim.as_u64().is_some()));
-        if !well_formed {
-            return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
-                field: "orig_shape",
+    let orig_shape = match object.get("orig_shape").filter(|_| block_scaled) {
+        None => None,
+        Some(orig_shape) => {
+            let dims: Option<Vec<usize>> = orig_shape.as_array().and_then(|dims| {
+                dims.iter()
+                    .map(|dim| dim.as_u64().map(|dim| dim as usize))
+                    .collect()
             });
+            Some(
+                dims.ok_or(ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_shape",
+                })?,
+            )
         }
-    }
+    };
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
             || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow)
-            || matches!(key.as_str(), "group_size" | "orig_dtype" | "orig_shape");
+            || key == "group_size"
+            || (matches!(key.as_str(), "orig_dtype" | "orig_shape") && block_scaled);
         if !known {
             return Err(ComfyQuantDescriptorError::UnknownField { field: key.clone() });
         }
@@ -437,6 +478,7 @@ pub fn partial_descriptor_from_json(
         format,
         full_precision_matrix_mult,
         per_row,
+        orig_shape,
     })
 }
 
@@ -1354,7 +1396,8 @@ mod tests {
             parse_comfy_quant_descriptor(br#"{"format": "float8_e4m3fn"}"#),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Float8E4M3Fn,
-                full_precision_matrix_mult: false
+                full_precision_matrix_mult: false,
+                orig_shape: None,
             })
         );
         assert_eq!(
@@ -1363,7 +1406,8 @@ mod tests {
             ),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Float8E5M2,
-                full_precision_matrix_mult: true
+                full_precision_matrix_mult: true,
+                orig_shape: None,
             })
         );
         assert_eq!(
@@ -1784,6 +1828,7 @@ mod tests {
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: None,
                 per_row: None,
+                orig_shape: None,
             }
         );
         assert_eq!(
@@ -1792,10 +1837,11 @@ mod tests {
         );
         // Completing a standalone entry fills the ComfyUI defaults.
         assert_eq!(
-            table["blocks.0.attn.wq"].into_complete(),
+            table["blocks.0.attn.wq"].clone().into_complete(),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Nvfp4,
-                full_precision_matrix_mult: false
+                full_precision_matrix_mult: false,
+                orig_shape: None,
             })
         );
         // …and a bare int8 entry, which every real ComfyUI file writes, is only refusable as a
@@ -1810,10 +1856,11 @@ mod tests {
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: None,
+                orig_shape: None,
             }
         );
         assert_eq!(
-            int8["q"].into_complete(),
+            int8["q"].clone().into_complete(),
             Err(ComfyQuantDescriptorError::Int8NotPerRow)
         );
 
@@ -1890,12 +1937,20 @@ mod tests {
                 }
             })
         );
-        // The real Kitchen provenance trio is accepted — and validated, not ignored: the pinned
-        // sc-21485 artifact's exact per-layer shape.
-        assert!(parse_quantization_metadata(
+        // The real Kitchen provenance trio is accepted, with the pinned sc-21485 artifact's exact
+        // per-layer shape. `group_size` and `orig_dtype` are validated here and dropped;
+        // `orig_shape` is RETAINED, because the plan compiler checks it against the logical shape it
+        // derives independently (see `checkpoint_codec`'s
+        // `a_declared_orig_shape_must_equal_the_derived_logical_shape`).
+        let trio = parse_quantization_metadata(
             r#"{"format_version": "1.0", "layers": {"double_blocks.0.img_attn.qkv": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [12288, 4096]}}}"#
         )
-        .is_ok());
+        .expect("the real Kitchen trio parses");
+        assert_eq!(
+            trio["double_blocks.0.img_attn.qkv"].orig_shape.as_deref(),
+            Some(&[12288usize, 4096][..]),
+            "orig_shape must survive the parse — a dropped one cannot be checked downstream"
+        );
         assert_eq!(
             parse_quantization_metadata(
                 r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "group_size": 16, "orig_shape": "big"}}}"#
@@ -1907,6 +1962,36 @@ mod tests {
                 }
             })
         );
+        // Scope (sc-21485 review): the provenance pair belongs to the BLOCK-SCALED formats only.
+        // On any other format the keys refuse as unknown, the same fail-closed treatment `per_row`
+        // gets outside int8 — admitting them everywhere would loosen the parser past its documented
+        // scope.
+        assert!(parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "mxfp8", "orig_dtype": "torch.bfloat16", "orig_shape": [8, 16]}}}"#
+        )
+        .is_ok());
+        for (format, field) in [
+            ("float8_e4m3fn", "orig_dtype"),
+            ("float8_e5m2", "orig_shape"),
+            ("int8_tensorwise", "orig_shape"),
+        ] {
+            let declaration = match field {
+                "orig_dtype" => r#""orig_dtype": "torch.bfloat16""#,
+                _ => r#""orig_shape": [8, 16]"#,
+            };
+            assert_eq!(
+                parse_quantization_metadata(&format!(
+                    r#"{{"format_version": "1.0", "layers": {{"q": {{"format": "{format}", {declaration}}}}}}}"#
+                )),
+                Err(QuantizationMetadataError::Layer {
+                    layer: "q".to_owned(),
+                    defect: ComfyQuantDescriptorError::UnknownField {
+                        field: field.to_owned()
+                    }
+                }),
+                "{format} must not admit {field}"
+            );
+        }
         for error in [
             QuantizationMetadataError::NotAnObject,
             QuantizationMetadataError::Layers,

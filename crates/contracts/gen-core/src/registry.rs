@@ -653,14 +653,26 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
             dialect: "comfyui",
             required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
         },
-        // The bare-keyed FLUX.2 Klein transformer single file (sc-21485): community BFL keys with
-        // `.weight` per-head norm spellings and NO `guidance_in.*` (klein is CFG-free-distilled).
-        // The AdaLN key pins the final-layer topology the half-swap transform is declared for.
+        // The bare-keyed FLUX.2 Klein transformer single file (sc-21485).
+        //
+        // A signature is an ALL-PRESENT name list, so it can only assert what a file *has* — it
+        // cannot express "and no `guidance_in.*`". The discrimination therefore has to come from a
+        // name only klein spells: the community klein export writes its per-head norms as
+        // `...norm.query_norm.weight`, while the BFL-official FLUX.2-**dev** export spells the same
+        // tensor `...norm.query_norm.scale` (see `candle-gen-flux2::single_file`, whose mapping
+        // refuses the `.scale` spelling). The first two names alone match a bare-keyed dev file
+        // too, which would import a 32B dev checkpoint as `flux2_klein_9b` and only fail later, at
+        // plan time.
+        //
+        // So: the qkv name pins the fused-attention topology, the AdaLN name pins the final-layer
+        // topology the half-swap transform is declared for, and the per-head-norm name is what
+        // makes this klein rather than dev.
         CheckpointSignatureRegistration {
             id: "flux2-klein-bfl-v1",
             dialect: "bfl",
             required_tensor_names: &[
                 "double_blocks.0.img_attn.qkv.weight",
+                "double_blocks.0.img_attn.norm.query_norm.weight",
                 "final_layer.adaLN_modulation.1.weight",
             ],
         },
@@ -5644,6 +5656,71 @@ mod tests {
                  undescribed fp8 at unit scale — silently wrong rather than refused"
             );
         }
+    }
+
+    /// sc-21485 review. A signature is an all-present name list, so `flux2-klein-bfl-v1` must be
+    /// discriminated by a name only the klein community export carries. A bare-keyed
+    /// FLUX.2-**dev** BFL file shares the fused-qkv and AdaLN names; it differs by spelling the
+    /// per-head norms `.scale` (and by carrying `guidance_in.*`, which no all-present list can
+    /// assert the absence of).
+    ///
+    /// Mutation witness: drop `double_blocks.0.img_attn.norm.query_norm.weight` from the
+    /// registration and the dev key set below starts claiming the klein signature — the
+    /// misrouting this test forbids.
+    #[test]
+    fn the_klein_bfl_signature_does_not_claim_a_bare_keyed_dev_file() {
+        /// The rule a signature declares: every required name is present in the file's key set.
+        fn claims(signature: &CheckpointSignatureRegistration, keys: &[&str]) -> bool {
+            signature
+                .required_tensor_names
+                .iter()
+                .all(|name| keys.contains(name))
+        }
+        let klein_signature = FLUX2_CHECKPOINT_ADAPTER
+            .signatures
+            .iter()
+            .find(|signature| signature.id == "flux2-klein-bfl-v1")
+            .expect("the klein bfl signature is registered");
+
+        // The klein community export (`wikeeyang/Flux2-Klein-9B-True-V2`): bare BFL keys, `.weight`
+        // per-head norms, no guidance embedder.
+        let klein: &[&str] = &[
+            "img_in.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+            "double_blocks.0.img_attn.norm.query_norm.weight",
+            "double_blocks.0.img_attn.norm.key_norm.weight",
+            "single_blocks.0.linear1.weight",
+            "final_layer.adaLN_modulation.1.weight",
+            "final_layer.linear.weight",
+        ];
+        assert!(claims(klein_signature, klein), "klein must be claimed");
+
+        // The BFL-official FLUX.2-dev export: the SAME fused-qkv and AdaLN names, the `.scale`
+        // per-head-norm spelling, and the guidance embedder klein does not have.
+        let dev: &[&str] = &[
+            "img_in.weight",
+            "guidance_in.in_layer.weight",
+            "guidance_in.out_layer.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+            "double_blocks.0.img_attn.norm.query_norm.scale",
+            "double_blocks.0.img_attn.norm.key_norm.scale",
+            "single_blocks.0.linear1.weight",
+            "final_layer.adaLN_modulation.1.weight",
+            "final_layer.linear.weight",
+        ];
+        assert!(
+            !claims(klein_signature, dev),
+            "a bare-keyed FLUX.2-dev file must NOT claim the klein signature (it would import a \
+             32B dev checkpoint as flux2_klein_9b and fail only at plan time)"
+        );
+
+        // The comment on the registration must not claim a discrimination the names cannot make.
+        assert!(
+            klein_signature
+                .required_tensor_names
+                .contains(&"double_blocks.0.img_attn.norm.query_norm.weight"),
+            "the klein-only per-head-norm spelling is what carries the discrimination"
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub use transformer::{
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-caption-upsample-v2";
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -259,6 +259,12 @@ pub(crate) struct Pipeline {
     /// The text encoder / VAE / tokenizer still come from the resident klein snapshot `root`.
     /// `None` on every other path.
     pub(crate) klein_dit: Option<PinnedWeightsFile>,
+    /// The klein single-file import's three correlated checkpoint facts (sc-21484 / epic E8), bound
+    /// to the verified source pin and filled once by [`Self::load_klein_planned_dit`]. Shared
+    /// (`Arc`) so a `Pipeline` clone observes the same cell, and empty on every non-klein-file
+    /// route — a directory load has no single source to bind facts to. Read through
+    /// [`Flux2Generator::checkpoint_weight_facts`].
+    pub(crate) klein_facts: Arc<OnceLock<gen_core::checkpoint_facts::CheckpointWeightFacts>>,
     pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
@@ -287,6 +293,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         }
     }
@@ -311,6 +318,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         }
     }
@@ -346,6 +354,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
             klein_dit: None,
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         })
     }
@@ -380,6 +389,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: Some(klein_dit),
+            klein_facts: Arc::new(OnceLock::new()),
             adapters,
         })
     }
@@ -759,13 +769,13 @@ impl Pipeline {
     /// fused-QKV row slices and the AdaLN half swap arrive as plan-declared transforms
     /// ([`single_file::Flux2BflToDiffusersMapping`]) — no provider-local format parsing, no
     /// re-classification, no load-time quant fold (the packed rows are already quantized).
+    ///
+    /// On success the import's three correlated checkpoint facts (sc-21484, epic E8) are bound to
+    /// the verified source pin and retained on the pipeline; read them back through
+    /// [`Flux2Generator::checkpoint_weight_facts`].
     fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
         dit_file.read_unchanged(|dit_path| {
-            let headers = gen_core::safetensors_path_tensor_headers(dit_path)
-                .map_err(|error| CandleError::Msg(error.to_string()))?;
-            let keys: Vec<&str> = headers.iter().map(|header| header.name.as_str()).collect();
-            let prefix = single_file::Flux2BflToDiffusersMapping::detect_prefix(&keys);
-            let mapping = single_file::Flux2BflToDiffusersMapping::new(prefix, &self.cfg);
+            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
             let residency = candle_gen::logical_weights::CandleCodecResidency::probe(&self.device);
             let plan =
                 candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
@@ -782,12 +792,17 @@ impl Pipeline {
             // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
             // off the shared reader after the full materialization, so a contradiction between the
             // stored codec inventory and what this run executed fails the load instead of shipping
-            // a dishonest report.
-            let facts = src.checkpoint_weight_facts()?;
-            eprintln!(
-                "[sc-21485] flux2_klein_9b single-file import: {}",
-                sanitize_log_text(&format!("{facts:?}"))
-            );
+            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
+            // so facts are never reported about bytes that changed under the load) and RETAINED on
+            // the pipeline — the krea precedent — so a consumer reads them through
+            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
+            let facts = src
+                .checkpoint_weight_facts()?
+                .with_verified_source(dit_file)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            // Infallible in practice (one load per pipeline); a second load simply keeps the first
+            // set rather than racing.
+            let _ = self.klein_facts.set(facts);
             self.device.synchronize()?;
             Ok(dit)
         })
@@ -1248,6 +1263,25 @@ pub struct Flux2Generator {
     loaded_quant: Option<Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
     memory_admission: memory_strategy::Flux2AdmissionRegistry,
+}
+
+impl Flux2Generator {
+    /// The **three correlated facts** about a klein universal single-file import (sc-21484, epic
+    /// E8), tied to the verified source binding: what the source stores (per-codec tensor counts
+    /// and source bytes), what this host can execute natively, and what actually materialized —
+    /// split per execution representation and measured off the shared reader, never copied from the
+    /// plan.
+    ///
+    /// This is the surface a consumer reads to distinguish a source stored `nvfp4-v1` from a run
+    /// that executed it as packed W4A4 or as dense F32. `None` on every route with no single
+    /// planned source file: the resident-directory load, the dev ComfyUI single file (a
+    /// provider-local converter, not the plan seam), and a klein pipeline whose DiT has not been
+    /// materialized yet.
+    pub fn checkpoint_weight_facts(
+        &self,
+    ) -> Option<&gen_core::checkpoint_facts::CheckpointWeightFacts> {
+        self.pipe.klein_facts.get()
+    }
 }
 
 impl Generator for Flux2Generator {
