@@ -868,6 +868,128 @@ mod audio_config_tests {
 }
 
 #[cfg(test)]
+mod caption_feature_version_tests {
+    use super::*;
+
+    // Detector collapse (sc-18757/#688, 2026-08-19 coordinator review): candle-gen-ltx no longer
+    // duplicates upstream's V1/V2 detection logic — `gen_core::ltx_checkpoint::caption_feature_
+    // version` (imported above) is the single shared detector both backends fold onto. These
+    // tests are KEPT (per the coordinator's explicit instruction) but now call that shared
+    // function directly with JSON fixtures instead of a local `KeyPresence`-array twin.
+
+    #[test]
+    fn ltx_2_3_selects_v2() {
+        // Acceptance (sc-18763): the extractor version chosen for the shipped LTX-2.3 flags is V2.
+        // `AvConfig::ltx_2_3()` carries the value the shipped config resolves to by construction;
+        // cross-check it against the detector run on the real shipped shape directly.
+        assert_eq!(
+            AvConfig::ltx_2_3().caption_feature_version,
+            CaptionFeatureVersion::V2
+        );
+        let legacy = serde_json::json!({
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+        });
+        assert_eq!(
+            caption_feature_version(&legacy).unwrap(),
+            CaptionFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn no_keys_present_selects_v1_not_an_error() {
+        let v = caption_feature_version(&serde_json::json!({})).unwrap();
+        assert_eq!(v, CaptionFeatureVersion::V1);
+    }
+
+    #[test]
+    fn legacy_two_key_shape_selects_v2() {
+        // The exact shape the already-hosted SceneWorks/ltx-2.3-mlx tier carries.
+        let legacy = serde_json::json!({
+            "caption_projection_first_linear": false,
+            "caption_projection_second_linear": false,
+        });
+        assert_eq!(
+            caption_feature_version(&legacy).unwrap(),
+            CaptionFeatureVersion::V2
+        );
+    }
+
+    #[test]
+    fn partial_v2_key_set_errors_loudly_instead_of_falling_back_to_v1() {
+        // A DIFFERENT 2-of-4 pair than the legacy shape — must not be widened into the carve-out.
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": true,
+            "caption_projection_first_linear": false,
+        });
+        let err = caption_feature_version(&corrupted).expect_err("partial V2 key set must error");
+        let msg = err.to_string();
+        assert!(msg.contains("partial"), "unexpected error message: {msg}");
+        assert!(msg.contains("caption_proj_input_norm"));
+        assert!(msg.contains("caption_projection_second_linear"));
+    }
+
+    #[test]
+    fn legacy_shape_with_a_true_value_is_not_the_carve_out() {
+        // Same two key names as the legacy shape, but `true` instead of `false` — exact-match, not
+        // name-only.
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": true,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("a wrong-valued near-miss of the legacy shape must not resolve V2");
+        assert!(err.to_string().contains("partial"));
+    }
+
+    #[test]
+    fn all_four_keys_present_but_wrong_value_errors_loudly() {
+        // Deliberately-corrupted combo: all 4 present (not partial), but one disagrees with
+        // `CAPTION_V2_EXPECTED_CONFIG` — the reference itself raises `NotImplementedError` on this
+        // shape.
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": false,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        });
+        let err =
+            caption_feature_version(&corrupted).expect_err("mismatched V2 key value must error");
+        let msg = err.to_string();
+        assert!(msg.contains("caption_proj_before_connector"), "{msg}");
+    }
+
+    #[test]
+    fn present_non_bool_value_errors_as_unknown_config_not_silent_v1() {
+        // sc-18763 coordinator review point 3: a key present with a non-bool value must count as
+        // PRESENT and then fail the value comparison — errors, never silently absent/V1.
+        let corrupted = serde_json::json!({
+            "caption_proj_before_connector": Value::Null,
+            "caption_projection_first_linear": false,
+            "caption_proj_input_norm": false,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("a present non-bool value must error, not resolve V1");
+        assert!(err.to_string().contains("caption_proj_before_connector"));
+    }
+
+    #[test]
+    fn present_non_bool_value_in_a_partial_set_still_counts_as_present() {
+        // A non-bool value at a legacy-shape key position is NOT the legacy shape (that requires
+        // an exact boolean `false`), and still counts as declared (not "missing") — with only 2 of
+        // 4 keys declared here, this is "partial".
+        let corrupted = serde_json::json!({
+            "caption_projection_first_linear": Value::Null,
+            "caption_projection_second_linear": false,
+        });
+        let err = caption_feature_version(&corrupted)
+            .expect_err("must error, not silently resolve to the legacy V2 shape");
+        assert!(err.to_string().contains("partial"));
+    }
+}
+
+#[cfg(test)]
 mod component_config_tests {
     use super::*;
 

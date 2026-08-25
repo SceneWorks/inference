@@ -655,14 +655,14 @@ mod real {
             }
         }
         let ids = Tensor::from_vec(ids, (k, max_l), device).unwrap();
-        let (cos, sin) = model.rope_tables(&pos, k as i32, max_l as i32).unwrap();
+        let tables = model.rope_tables(&pos, k as i32, max_l as i32).unwrap();
         let mask = Tensor::from_vec(mask, (k, 1, max_l, max_l), device)
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
         let mut cache = model.new_cache();
         let _ = model
-            .decode_logits_masked(&ids, &mut cache, &cos, &sin, &mask)
+            .decode_logits_masked(&ids, &mut cache, &tables, &mask)
             .unwrap();
     }
 

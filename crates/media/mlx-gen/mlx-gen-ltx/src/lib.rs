@@ -43,6 +43,8 @@ pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod convert;
+pub mod diff_vae;
+pub mod duration_head;
 pub mod enhance;
 pub mod gemma;
 pub mod image_crf;
@@ -75,6 +77,11 @@ pub use conditioning::{
 pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
+pub use diff_vae::{
+    DiffVaeTiling, ModelOutputType, NaDiffusionDecoder, NaDiffusionDecoderConfig,
+    DIFFUSION_DECODER_COMPONENT,
+};
+pub use duration_head::DurationHead;
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
 pub use image_crf::{condition_image_for_checkpoint, default_image_recompress};
 pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};

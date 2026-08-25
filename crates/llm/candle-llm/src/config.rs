@@ -228,6 +228,62 @@ impl Gemma4Config {
         }
     }
 
+    /// `first_kv_shared_layer_idx = num_hidden_layers - num_kv_shared_layers`, or `None` when the
+    /// model has no sharing tail. Upstream guards on `num_kv_shared_layers > 0`, so a `0` setting
+    /// must **not** mark every layer shared (`len - 0 == len` would already say that, but the guard
+    /// is what makes the intent explicit).
+    pub fn first_kv_shared_layer(&self) -> Option<usize> {
+        (self.num_kv_shared_layers > 0).then(|| {
+            self.layer_types
+                .len()
+                .saturating_sub(self.num_kv_shared_layers)
+        })
+    }
+
+    /// Whether decoder layer `i` is a **KV-sharing** layer: it projects no keys or values of its
+    /// own (`k_proj` / `v_proj` / `k_norm` are absent from the checkpoint) and attends the stored
+    /// K/V of [`Gemma4Config::kv_donor`] instead.
+    pub fn is_kv_shared(&self, layer_idx: usize) -> bool {
+        self.first_kv_shared_layer().is_some_and(|f| layer_idx >= f)
+    }
+
+    /// Whether layer `i` must **publish** its keys/values for the sharing tail — upstream's
+    /// `store_full_length_kv`: the last layer of each type before `first_kv_shared_layer_idx`.
+    pub fn stores_shared_kv(&self, layer_idx: usize) -> bool {
+        let Some(first) = self.first_kv_shared_layer() else {
+            return false;
+        };
+        if layer_idx >= first {
+            return false;
+        }
+        let kind = self.layer_type(layer_idx);
+        // The last layer of this type strictly before the tail — i.e. no later pre-tail layer
+        // shares its type.
+        !(layer_idx + 1..first).any(|j| self.layer_type(j) == kind)
+    }
+
+    /// The layer whose stored K/V layer `i` attends, or `None` when `i` projects its own: the last
+    /// pre-tail layer of `i`'s **own type** (a sliding layer never reuses a full layer's keys —
+    /// their head dims do not even match).
+    pub fn kv_donor(&self, layer_idx: usize) -> Option<usize> {
+        if !self.is_kv_shared(layer_idx) {
+            return None;
+        }
+        let first = self.first_kv_shared_layer()?;
+        let kind = self.layer_type(layer_idx);
+        (0..first).rev().find(|&j| self.layer_type(j) == kind)
+    }
+
+    /// This layer's MLP inner width given the model's `intermediate_size` — doubled on the
+    /// KV-sharing tail when `use_double_wide_mlp` is set, which is the only place upstream applies
+    /// it (the layers that saved a K/V projection spend the parameters on a wider MLP instead).
+    pub fn layer_intermediate_size(&self, layer_idx: usize, intermediate_size: i32) -> i32 {
+        match self.use_double_wide_mlp && self.is_kv_shared(layer_idx) {
+            true => intermediate_size * 2,
+            false => intermediate_size,
+        }
+    }
+
     /// Resolve `layer_types`: the explicit `config.json` array when present, else upstream's default
     /// 5:1 schedule (`sliding_attention` unless `(i + 1) % 6 == 0`). Either way the **last** layer is
     /// forced to `full_attention`, as upstream does.

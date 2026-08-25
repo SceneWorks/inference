@@ -6,11 +6,28 @@
 //!
 //! The projection lives at the checkpoint's top level (`text_embedding_projection.video_aggregate_
 //! embed.*`); the connector under `model.diffusion_model.video_embeddings_connector.*`. Runs bf16.
+//!
+//! sc-18763: the math below (`normed_hidden`) is the V2 (`PER_TOKEN_RMS`) caption feature
+//! extractor, and it's the ONLY one this crate implements. Construction (both
+//! [`LtxTextEncoder::new`] and [`LtxTextEncoder::new_av`], via `require_v2` below) validates
+//! against [`AvConfig::ltx_2_3`](crate::config::AvConfig::ltx_2_3)'s `caption_feature_version` —
+//! the same production-canonical LTX-2.3 constant the AvDiT build path uses, itself validated
+//! through `gen_core::ltx_checkpoint::caption_feature_version` (sc-18757's shared, upstream-
+//! mirroring detector both backends fold onto as of the 2026-08-19 coordinator review — this
+//! crate previously carried its own duplicate detection logic here).
+//!
+//! This is still a **compile-time constant check**, not a per-checkpoint one: `LtxTextEncoder`'s
+//! constructors don't yet take a loaded `AvConfig`/bundle (that threading is a separate, larger
+//! surface change outside this story's scope), so the gate below only catches the constant
+//! drifting away from what the shared detector accepts — not a real checkpoint's own config. Real
+//! per-checkpoint threading for this specific gate remains open, matching `AvConfig`'s own
+//! module-level note on split-bundle loading (sc-18757).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
 
-use crate::config::{ConnectorConfig, GemmaConfig};
+use crate::config::{AvConfig, ConnectorConfig, GemmaConfig};
 use crate::connector::Connector;
 use crate::gemma::GemmaEncoder;
 use crate::quant::{qlinear, QLinear};
@@ -46,6 +63,7 @@ impl LtxTextEncoder {
         gemma_cfg: &GemmaConfig,
         conn_cfg: &ConnectorConfig,
     ) -> Result<Self> {
+        require_v2()?;
         let device = gemma_vb.device().clone();
         let gemma = GemmaEncoder::new(gemma_vb, gemma_cfg)?;
         // Packed-detecting aggregate projection (sc-9417): dense in the hosted tier, but routed through
@@ -128,18 +146,44 @@ impl LtxTextEncoder {
     /// Encode `input_ids` `[1,L]` (u32) + `mask01` (1 for valid, left-padded) → `video_embeddings`
     /// `[1, L, 4096]` (bf16).
     pub fn encode(&self, input_ids: &Tensor, mask01: &[u32]) -> Result<Tensor> {
+        Ok(self.encode_with_features(input_ids, mask01)?.1)
+    }
+
+    /// Like [`Self::encode`] but also returns the pre-connector `video_features` `[1, L, 4096]`
+    /// (bf16) — the feature-extractor output entering the connector (post-projection, post-norm).
+    /// sc-18763: this is the "connector input" the acceptance-criterion golden-parity gate checks;
+    /// mirrors mlx-gen-ltx `text_encoder.rs`'s `encode_with_features`.
+    pub fn encode_with_features(
+        &self,
+        input_ids: &Tensor,
+        mask01: &[u32],
+    ) -> Result<(Tensor, Tensor)> {
         let hiddens = self.gemma.forward(input_ids, mask01)?; // 49 × (1,L,3840)
         let normed = self.normed_hidden(&hiddens, mask01)?;
         let scaled = (normed * self.rescale)?;
         let features = self.aggregate.forward(&scaled)?; // (1,L,4096)
         let nv = mask01.iter().filter(|&&m| m != 0).count();
-        self.connector.forward(&features, nv)
+        let embeddings = self.connector.forward(&features, nv)?;
+        Ok((features, embeddings))
     }
 
     /// Encode once and project BOTH the video (4096) and audio (2048) contexts, sharing the Gemma
     /// hidden states + per-token-RMS concat (sc-5495). Requires [`Self::new_av`]. Returns
     /// `(video_embeddings [1,L,4096], audio_embeddings [1,L,2048])` (bf16).
     pub fn encode_both(&self, input_ids: &Tensor, mask01: &[u32]) -> Result<(Tensor, Tensor)> {
+        let (_, _, video, audio_ctx) = self.encode_both_with_features(input_ids, mask01)?;
+        Ok((video, audio_ctx))
+    }
+
+    /// Like [`Self::encode_both`] but also returns the pre-connector `(video_features,
+    /// audio_features)` — the feature-extractor outputs entering each connector (post-projection,
+    /// post-norm). Requires [`Self::new_av`]. Mirrors mlx-gen-ltx `text_encoder.rs`'s
+    /// `encode_av_with_features`.
+    pub fn encode_both_with_features(
+        &self,
+        input_ids: &Tensor,
+        mask01: &[u32],
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let audio = self.audio.as_ref().ok_or_else(|| {
             candle_gen::candle_core::Error::Msg(
                 "ltx: audio text head not loaded (use new_av)".into(),
@@ -152,6 +196,40 @@ impl LtxTextEncoder {
         let video = self.connector.forward(&v_feat, nv)?;
         let a_feat = audio.aggregate.forward(&(normed * audio.rescale)?)?;
         let audio_ctx = audio.connector.forward(&a_feat, nv)?;
-        Ok((video, audio_ctx))
+        Ok((v_feat, a_feat, video, audio_ctx))
+    }
+}
+
+/// sc-18763: reject construction unless the crate's caption-feature-extractor selection resolves
+/// to V2 — `normed_hidden` above is the V2 math unconditionally, and running it against anything
+/// else would silently produce plausible-looking, wrong conditioning. `new_av` delegates to `new`,
+/// so this one call site covers both constructors.
+///
+/// This currently checks a **hardcoded, compile-time constant**
+/// ([`AvConfig::ltx_2_3`](crate::config::AvConfig::ltx_2_3)'s `caption_feature_version`), not a
+/// live per-checkpoint config value — `LtxTextEncoder`'s constructors don't yet take a loaded
+/// `AvConfig`, so this is not the same thing as the split-bundle, per-checkpoint reads
+/// `AvConfig::from_bundle` performs elsewhere in this crate (sc-18757). It still catches a real
+/// class of bug (someone editing the constant away from what the shared detector accepts without
+/// noticing), just not a per-checkpoint one yet. Do not describe this as "config-driven" the way
+/// the mlx backend's genuinely-JSON-driven check is (sc-18763 coordinator review).
+fn require_v2() -> Result<()> {
+    let version = AvConfig::ltx_2_3().caption_feature_version;
+    if version != CaptionFeatureVersion::V2 {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
+             selected {version:?}, which this port does not implement"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    use super::*;
+
+    #[test]
+    fn require_v2_accepts_the_shipped_ltx_2_3_flags() {
+        require_v2().expect("the hardcoded LTX-2.3 flags must resolve to V2");
     }
 }

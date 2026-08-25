@@ -279,35 +279,32 @@ fn build_empty_causal_lm(cfg: ModelConfig) -> Result<CausalLm, candle_llm::Error
     CausalLm::from_weights(&Weights::from_map(HashMap::new(), Device::Cpu), "", cfg)
 }
 
-/// The generic decoder must **refuse Gemma 4 by name** until sc-18760 / sc-18761 wire the
-/// per-layer-type attention block.
+/// The generic decoder no longer **refuses Gemma 4 by name** — sc-18761 replaced sc-18769's
+/// placeholder guard with the real per-layer-type attention block.
 ///
-/// This story makes a Gemma 4 config parse, which is what turns a previously-clear "unsupported
-/// architecture" refusal into a cryptic missing-`v_proj` failure three quarters of the way through
-/// a load. The typed refusal replaces it, and names both the reason and the successor stories.
+/// The guard used to fire before any tensor was looked up. Now the architecture is accepted and the
+/// load proceeds, so an *empty* weight map fails on the first missing weight instead. Asserting the
+/// failure mode (a weight lookup, not an architecture refusal) is what keeps a future re-introduced
+/// blanket guard from passing this file silently; the decoder's actual numbers are pinned in
+/// `tests/gemma4_decoder.rs` against the shared cross-backend goldens.
 #[test]
-fn generic_decoder_declines_gemma4_until_the_decoder_stories_land() {
+fn generic_decoder_accepts_gemma4_and_fails_only_on_missing_weights() {
     let cfg: Value = serde_json::from_str(GEMMA4_CONFIG).unwrap();
     let cfg = ModelConfig::from_json(&cfg).expect("the config layer must still parse it");
     assert!(cfg.is_gemma4());
     match build_empty_causal_lm(cfg) {
         Err(e) => {
             let m = e.to_string();
-            assert!(m.contains("Gemma 4"), "{m}");
             assert!(
-                m.contains("sc-18760"),
-                "the refusal must name the successor: {m}"
+                m.contains("embed_tokens"),
+                "an empty weight map must fail on the first weight, not on the architecture: {m}"
             );
             assert!(
-                m.contains("sc-18761"),
-                "the refusal must name the successor: {m}"
-            );
-            assert!(
-                !m.contains("v_proj"),
-                "must refuse up front, not die on a weight lookup: {m}"
+                !m.contains("sc-18761"),
+                "the placeholder architecture refusal must be gone: {m}"
             );
         }
-        Ok(_) => panic!("the uniform decoder must not claim to have built a Gemma 4 model"),
+        Ok(_) => panic!("an empty weight map cannot produce a model"),
     }
 }
 
