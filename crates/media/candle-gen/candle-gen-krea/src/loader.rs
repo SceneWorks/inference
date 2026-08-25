@@ -2617,6 +2617,41 @@ mod tests {
         ::safetensors::serialize_to_file(tensors, Some(metadata), path).unwrap();
     }
 
+    /// [`write_kitchen_nvfp4_native_file`] with the `_quantization_metadata` declaration REMOVED and
+    /// nothing else changed — the structural NVFP4 triplet is still on disk, so a storage-shape
+    /// predicate still reads it as NVFP4.
+    fn write_kitchen_nvfp4_native_file_without_declaration(path: &Path) {
+        let declared = path.with_extension("declared.safetensors");
+        write_kitchen_nvfp4_native_file(&declared);
+        // SAFETY: read-only mmap of a file this test just wrote.
+        let st = unsafe { MmapedSafetensors::new(&declared) }.expect("fixture opens");
+        let owned: Vec<(String, ::safetensors::Dtype, Vec<usize>, Vec<u8>)> = st
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| {
+                (
+                    name,
+                    view.dtype(),
+                    view.shape().to_vec(),
+                    view.data().to_vec(),
+                )
+            })
+            .collect();
+        let tensors: std::collections::BTreeMap<&str, ::safetensors::tensor::TensorView<'_>> =
+            owned
+                .iter()
+                .map(|(name, dtype, shape, data)| {
+                    (
+                        name.as_str(),
+                        ::safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+        ::safetensors::serialize_to_file(tensors, None, path).unwrap();
+        std::fs::remove_file(&declared).ok();
+    }
+
     #[test]
     fn kitchen_nvfp4_native_file_uses_prepacked_projection_and_preserves_dense_layers() -> Result<()>
     {
@@ -2692,9 +2727,13 @@ mod tests {
         Ok(())
     }
 
-    /// **A dense sibling is not NVFP4 just because the file is.** `img_in` carries no descriptor, so
-    /// the plan gives it a dense codec and the NVFP4 read site refuses it by name — where the old
-    /// `dtype == U8` predicate answered on storage alone and would have taken any `U8` payload.
+    /// **A dense sibling is not NVFP4 just because the file is.** `img_in` carries no NVFP4
+    /// declaration, so the plan gives it a dense codec and the NVFP4 read site refuses it by name
+    /// and by codec id rather than reaching for `{base}.weight_scale` and reporting a missing
+    /// tensor. (This half does not by itself distinguish the old `dtype == U8` predicate — `img_in`
+    /// is `F32` — that is what
+    /// [`tests::an_undeclared_u8_projection_is_refused_at_open_instead_of_imported_as_nvfp4`]
+    /// pins.)
     #[test]
     fn nvfp4_read_refuses_a_layer_the_descriptor_does_not_declare() {
         let dev = Device::Cpu;
@@ -2718,6 +2757,58 @@ mod tests {
         assert!(
             error.contains("img_in.weight") && error.contains("nvfp4-v1"),
             "the refusal must name the layer and the codec it is not: {error}"
+        );
+    }
+
+    /// **sc-20651 blocker 1: an UNDECLARED `U8` projection is refused at open, not imported as
+    /// NVFP4.**
+    ///
+    /// This is the divergence the bespoke predicate could not see. The fixture is byte-identical to
+    /// the Kitchen one except that its `_quantization_metadata` is gone: the structural triplet
+    /// (`U8 [out, in/2]` + `F8_E4M3` blocked scales + `F32 weight_scale_2`) is still there, so
+    /// `dtype == U8` still answers "NVFP4" and the old import decoded the layer as NVFP4 nibbles on
+    /// nothing but storage shape. Some other producer's `U8` payload in that same shape would have
+    /// been read as NVFP4 too, silently.
+    ///
+    /// With the plan compiled at open, the producer's declaration is the authority: an undescribed
+    /// `U8` weight matches no registered safetensors codec row and the import refuses, naming the
+    /// tensor, before any weight is read.
+    #[test]
+    fn an_undeclared_u8_projection_is_refused_at_open_instead_of_imported_as_nvfp4() {
+        let dev = Device::Cpu;
+        let path_tmp = tempfile::tempdir().unwrap();
+        let declared = path_tmp.path().join("declared.safetensors");
+        let undeclared = path_tmp.path().join("undeclared.safetensors");
+        write_kitchen_nvfp4_native_file(&declared);
+        write_kitchen_nvfp4_native_file_without_declaration(&undeclared);
+        let cfg = kitchen_nvfp4_config();
+
+        // The declared file imports.
+        Weights::from_native_file_for(
+            &declared,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .expect("a declared Kitchen NVFP4 file imports");
+
+        // The SAME tensors without the declaration do not.
+        let error = Weights::from_native_file_for(
+            &undeclared,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .err()
+        .expect("an undescribed U8 projection must not be imported as NVFP4 on storage shape alone")
+        .to_string();
+        assert!(
+            error.contains("model.diffusion_model.blocks.0.attn.wq.weight"),
+            "the refusal must name the tensor: {error}"
+        );
+        assert!(
+            error.contains("uint8") && error.contains("no checkpoint codec is registered"),
+            "the refusal must be the plan's unregistered-format one: {error}"
         );
     }
 

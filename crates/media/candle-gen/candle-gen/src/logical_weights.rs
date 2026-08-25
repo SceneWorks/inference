@@ -304,7 +304,7 @@ pub enum LogicalTensor {
         codes: Tensor,
         /// The `weight_scale` value (1.0 for the plain undescribed cast).
         weight_scale: f32,
-        /// Whether [`Self::weight_scale`] was **read from a `{layer}.weight_scale` companion row**
+        /// Whether the sibling `weight_scale` was **read from a `{layer}.weight_scale` companion row**
         /// (`true`) or is the plain undescribed cast's synthetic unit scale (`false`).
         ///
         /// This is a residency-accounting fact, not a decode fact — `matmul_fp8` takes the same

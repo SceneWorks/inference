@@ -37,9 +37,6 @@ pub mod loader;
 /// Multi-phase Krea denoise primitive (epic 13879, sc-13887 — the candle mirror of mlx-gen-krea's
 /// sc-13884). Pure host-side decomposition of an ordered phase list over ONE shared sigma schedule.
 pub mod multiphase;
-/// The `krea-native` dialect's canonical logical-key mapping (epic 20398, sc-20651) — what lets a
-/// Candle Krea import plan through `candle_gen::logical_weights` instead of a private dtype
-/// heuristic. See [`native_mapping`].
 pub mod native_mapping;
 /// The NVFP4 precision seam for the Krea 2 DiT trunk (sc-12110, epic 11037) — the epic's SC#1/SC#2
 /// validation vehicle. See [`nvfp4_dit`].

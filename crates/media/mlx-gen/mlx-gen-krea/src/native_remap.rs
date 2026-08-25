@@ -184,7 +184,12 @@ pub struct KreaDiffusersKeyMapping<'cfg> {
 }
 
 impl<'cfg> KreaDiffusersKeyMapping<'cfg> {
-    pub const MAPPING_ID: &'static str = "krea-2-diffusers-v1";
+    /// Deliberately **not** spelled `MAPPING_ID`. The cross-backend workspace gate compares
+    /// published consts of a `candle-gen-X`/`mlx-gen-X` pair by NAME, and `MAPPING_ID` already
+    /// names the `krea-native` dialect's id on both backends. Two different dialects under one
+    /// const name would either red that gate or, worse, be silenced by an exemption that hides a
+    /// real future divergence — so the diffusers dialect's id carries the dialect in its name.
+    pub const DIFFUSERS_MAPPING_ID: &'static str = "krea-2-diffusers-v1";
 
     pub const fn new(cfg: &'cfg Krea2Config) -> Self {
         Self { cfg }
@@ -193,7 +198,7 @@ impl<'cfg> KreaDiffusersKeyMapping<'cfg> {
 
 impl LogicalKeyMapping for KreaDiffusersKeyMapping<'_> {
     fn mapping_id(&self) -> &'static str {
-        Self::MAPPING_ID
+        Self::DIFFUSERS_MAPPING_ID
     }
 
     fn logical_key(&self, physical_key: &str) -> Option<String> {

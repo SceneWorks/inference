@@ -20,9 +20,9 @@
 //! optionally namespaced under `model.diffusion_model.`; the Candle
 //! [`Krea2Transformer`](crate::transformer::Krea2Transformer) reads the **diffusers** schema. This
 //! module is the native → diffusers direction, i.e. the exact inverse of
-//! [`convrot_diffusers_to_native`](crate::loader::convrot_diffusers_to_native) — which is the map
+//! [`crate::loader::convrot_diffusers_to_native`] — which is the map
 //! validated exhaustively against the real 878-tensor ConvRot header. The inverse property is not
-//! asserted by eye: [`tests::mapping_is_the_exact_inverse_of_the_authoritative_forward_map`] drives
+//! asserted by eye: `mapping_is_the_exact_inverse_of_the_authoritative_forward_map` drives
 //! every diffusers key the architecture contains through the forward map and back.
 //!
 //! `mapping_id` is [`KreaNativeToDiffusersMapping::MAPPING_ID`], the id the portable
