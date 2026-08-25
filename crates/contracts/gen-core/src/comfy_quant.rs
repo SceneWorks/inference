@@ -155,11 +155,28 @@ pub enum ComfyQuantDescriptorError {
     NonBooleanField {
         field: &'static str,
     },
-    /// A key this workspace does not model. ComfyUI writes exactly `format`,
-    /// `full_precision_matrix_mult`, and (int8) `per_row`; anything else could redefine the layout
-    /// (`group_size`, a future `layout`) and is refused rather than ignored.
+    /// A key this workspace does not model. ComfyUI writes `format`,
+    /// `full_precision_matrix_mult`, (int8) `per_row`, and — on the block-scaled formats — the
+    /// provenance trio `group_size` / `orig_dtype` / `orig_shape` (validated separately); anything
+    /// else could redefine the layout (a future `layout`) and is refused rather than ignored.
     UnknownField {
         field: String,
+    },
+    /// `group_size` declared with a value other than the format's own fixed block length, or on a
+    /// format with no block axis at all (sc-21485). The block length is a property of the FORMAT
+    /// (`nvfp4` = 16, `mxfp8` = 32) — a differing declaration is a layout this workspace does not
+    /// model, so it refuses rather than being read as informational.
+    GroupSizeMismatch {
+        declared: String,
+        format: ComfyQuantFormat,
+        expected: Option<usize>,
+    },
+    /// `orig_dtype` present but not a JSON string, or `orig_shape` present but not an array of
+    /// non-negative integers (sc-21485). Both are producer provenance this workspace validates by
+    /// type and does not consume — but a malformed value means the descriptor dialect is not the
+    /// one modelled here, and that fails closed.
+    MalformedProvenanceField {
+        field: &'static str,
     },
 }
 
@@ -191,6 +208,27 @@ impl fmt::Display for ComfyQuantDescriptorError {
                 f,
                 "descriptor field {field:?} is not part of the ComfyUI `.comfy_quant` convention \
                  this workspace models; refusing rather than guessing the layout"
+            ),
+            Self::GroupSizeMismatch {
+                declared,
+                format,
+                expected,
+            } => match expected {
+                Some(expected) => write!(
+                    f,
+                    "descriptor declares `group_size` {declared} but format `{format}` has the \
+                     fixed block length {expected}; refusing rather than guessing the layout"
+                ),
+                None => write!(
+                    f,
+                    "descriptor declares `group_size` {declared} on format `{format}`, which has \
+                     no block axis; refusing rather than guessing the layout"
+                ),
+            },
+            Self::MalformedProvenanceField { field } => write!(
+                f,
+                "descriptor field `{field}` is malformed (expected the ComfyUI provenance shape); \
+                 refusing rather than guessing the layout"
             ),
         }
     }
@@ -348,9 +386,49 @@ pub fn partial_descriptor_from_json(
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => return Err(ComfyQuantDescriptorError::NonBooleanField { field: "per_row" }),
     };
+    // The block-scaled formats' provenance trio (sc-21485): real ComfyUI Kitchen exports (e.g. the
+    // pinned `wikeeyang/Flux2-Klein-9B-True-V2` NVFP4-mixed file) write `group_size`, `orig_dtype`
+    // and `orig_shape` alongside `format`. None of them may *redefine* the layout — the block
+    // length is a property of the format — so each is validated against the one layout this
+    // workspace models and then dropped: a matching declaration is corroboration, a differing one
+    // refuses. Geometry authority stays with the stored shapes + the adapter's declared logical
+    // shape, exactly as for a file that omits the trio.
+    if let Some(group_size) = object.get("group_size") {
+        let expected = match format {
+            ComfyQuantFormat::Nvfp4 => Some(NVFP4_BLOCK),
+            ComfyQuantFormat::Mxfp8 => Some(MXFP8_BLOCK),
+            _ => None,
+        };
+        let declared = group_size.as_u64().map(|value| value as usize);
+        if expected.is_none() || declared != expected {
+            return Err(ComfyQuantDescriptorError::GroupSizeMismatch {
+                declared: group_size.to_string(),
+                format,
+                expected,
+            });
+        }
+    }
+    if let Some(orig_dtype) = object.get("orig_dtype") {
+        if !orig_dtype.is_string() {
+            return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
+                field: "orig_dtype",
+            });
+        }
+    }
+    if let Some(orig_shape) = object.get("orig_shape") {
+        let well_formed = orig_shape
+            .as_array()
+            .is_some_and(|dims| dims.iter().all(|dim| dim.as_u64().is_some()));
+        if !well_formed {
+            return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
+                field: "orig_shape",
+            });
+        }
+    }
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
-            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow);
+            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow)
+            || matches!(key.as_str(), "group_size" | "orig_dtype" | "orig_shape");
         if !known {
             return Err(ComfyQuantDescriptorError::UnknownField { field: key.clone() });
         }
@@ -1339,9 +1417,13 @@ mod tests {
                 },
             ),
             (
+                // Scalar fp8 has no block axis at all: a declared `group_size` is a layout this
+                // workspace does not model (sc-21485 refined the refusal from UnknownField).
                 br#"{"format": "float8_e4m3fn", "group_size": 32}"#,
-                ComfyQuantDescriptorError::UnknownField {
-                    field: "group_size".to_owned(),
+                ComfyQuantDescriptorError::GroupSizeMismatch {
+                    declared: "32".to_owned(),
+                    format: ComfyQuantFormat::Float8E4M3Fn,
+                    expected: None,
                 },
             ),
             (
@@ -1799,8 +1881,29 @@ mod tests {
             ),
             Err(QuantizationMetadataError::Layer {
                 layer: "blocks.3.attn.wq".to_owned(),
-                defect: ComfyQuantDescriptorError::UnknownField {
-                    field: "group_size".to_owned()
+                // 32 is MXFP8's block, not NVFP4's fixed 16 — a layout redefinition, refused by
+                // name (sc-21485).
+                defect: ComfyQuantDescriptorError::GroupSizeMismatch {
+                    declared: "32".to_owned(),
+                    format: ComfyQuantFormat::Nvfp4,
+                    expected: Some(NVFP4_BLOCK),
+                }
+            })
+        );
+        // The real Kitchen provenance trio is accepted — and validated, not ignored: the pinned
+        // sc-21485 artifact's exact per-layer shape.
+        assert!(parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"double_blocks.0.img_attn.qkv": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [12288, 4096]}}}"#
+        )
+        .is_ok());
+        assert_eq!(
+            parse_quantization_metadata(
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "group_size": 16, "orig_shape": "big"}}}"#
+            ),
+            Err(QuantizationMetadataError::Layer {
+                layer: "q".to_owned(),
+                defect: ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_shape"
                 }
             })
         );

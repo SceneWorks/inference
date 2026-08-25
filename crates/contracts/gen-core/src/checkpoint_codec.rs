@@ -3803,15 +3803,17 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("model.q"), "{error}");
+        // Scalar fp8 has no block axis, so a declared `group_size` refuses as the layout
+        // redefinition it is (sc-21485 refined the refusal from UnknownField).
         let error = make(r#"{"format": "float8_e4m3fn", "group_size": 64}"#).unwrap_err();
         assert!(
             matches!(
                 &error,
                 LogicalWeightPlanError::Descriptor {
                     layer,
-                    defect: ComfyQuantDescriptorError::UnknownField { field },
+                    defect: ComfyQuantDescriptorError::GroupSizeMismatch { expected: None, .. },
                     ..
-                } if layer == "model.q" && field == "group_size"
+                } if layer == "model.q"
             ),
             "{error:?}"
         );

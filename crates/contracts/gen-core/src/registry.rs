@@ -647,15 +647,38 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
     adapter_id: "flux2-comfyui-v1",
     family: "flux2",
     compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "flux2" },
-    signatures: &[CheckpointSignatureRegistration {
-        id: "flux2-comfyui-v1",
-        dialect: "comfyui",
-        required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
-    }],
-    dialects: &[CheckpointDialectRegistration {
-        id: "comfyui",
-        source: ImportedModelSource::ComfyUiTree,
-    }],
+    signatures: &[
+        CheckpointSignatureRegistration {
+            id: "flux2-comfyui-v1",
+            dialect: "comfyui",
+            required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
+        },
+        // The bare-keyed FLUX.2 Klein transformer single file (sc-21485): community BFL keys with
+        // `.weight` per-head norm spellings and NO `guidance_in.*` (klein is CFG-free-distilled).
+        // The AdaLN key pins the final-layer topology the half-swap transform is declared for.
+        CheckpointSignatureRegistration {
+            id: "flux2-klein-bfl-v1",
+            dialect: "bfl",
+            required_tensor_names: &[
+                "double_blocks.0.img_attn.qkv.weight",
+                "final_layer.adaLN_modulation.1.weight",
+            ],
+        },
+    ],
+    dialects: &[
+        CheckpointDialectRegistration {
+            id: "comfyui",
+            source: ImportedModelSource::ComfyUiTree,
+        },
+        // A standalone transformer-only `.safetensors` in the original (ComfyUI/BFL) key
+        // convention — the shape `wikeeyang/Flux2-Klein-9B-True-V2` ships (sc-21485). Distinct
+        // from `comfyui`: that source is a file inside a ComfyUI folder tree and binds to the
+        // 32B dev provider; this one is the 9B klein community single file.
+        CheckpointDialectRegistration {
+            id: "bfl",
+            source: ImportedModelSource::TransformerFile,
+        },
+    ],
     component_topology: &[
         CheckpointComponentRegistration {
             role: "transformer",
@@ -672,12 +695,22 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
         component_role: "base-snapshot",
         compatible_families: &["flux2"],
     }],
-    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
-        dialect: "comfyui",
-        mapping_id: "flux2-comfyui-to-diffusers-v1",
-        // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
-        plan_driven_backends: &[],
-    }],
+    canonical_mappings: &[
+        CheckpointCanonicalMappingRegistration {
+            dialect: "comfyui",
+            mapping_id: "flux2-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
+        },
+        // Plan-driven on Candle (sc-21485): `candle_gen_flux2::single_file` ships the
+        // `LogicalKeyMapping` with this id — renames plus the declarative fused-QKV row slices
+        // and the AdaLN half swap — and the klein single-file loader plans through it.
+        CheckpointCanonicalMappingRegistration {
+            dialect: "bfl",
+            mapping_id: "flux2-bfl-to-diffusers-v1",
+            plan_driven_backends: &[CheckpointBackend::Candle],
+        },
+    ],
     config_recovery: &[CheckpointConfigRecoveryRegistration {
         field: "architecture",
         recovery_id: "flux2-signature-v1",
@@ -5550,7 +5583,16 @@ mod tests {
             ),
             (
                 FLUX2_CHECKPOINT_ADAPTER.adapter_id,
-                &[("comfyui", "flux2-comfyui-to-diffusers-v1", &[])],
+                &[
+                    ("comfyui", "flux2-comfyui-to-diffusers-v1", &[]),
+                    // sc-21485: the klein universal single file plans through the Candle
+                    // `Flux2BflToDiffusersMapping`.
+                    (
+                        "bfl",
+                        "flux2-bfl-to-diffusers-v1",
+                        &[CheckpointBackend::Candle],
+                    ),
+                ],
             ),
             (
                 WAN_CHECKPOINT_ADAPTER.adapter_id,

@@ -331,11 +331,11 @@ pub(crate) fn composed_provider_contract_for(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let profile = profile(provider_id)?;
-    if provider_id == FLUX2_KLEIN_9B_ID && matches!(spec.weights, WeightsSource::File(_)) {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id} does not support imported single-file weights; only flux2_dev does"
-        )));
-    }
+    // Klein accepts imported single-file weights since sc-21485 (the universal BFL/NVFP4 single
+    // file); the File pricing arm below covers both variants. The remaining klein File refusal —
+    // a load-time Q4/Q8 fold over the pre-quantized source — lives in `validate_load_spec`, which
+    // `provider_contract_for` already routes through, so the loader and this contract refuse the
+    // same specs with the same message.
     let streamable = streamable(spec);
     let mut components = match &spec.weights {
         WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
@@ -1600,20 +1600,28 @@ mod tests {
         }
     }
 
+    /// Klein accepts File sources since sc-21485, so the loader/contract agreement is now pinned
+    /// on the one File-source refusal that remains: a load-time Q4/Q8 fold over the pre-quantized
+    /// single file. Both seams must reject the identical spec with the identical message.
     #[test]
-    fn klein_load_and_memory_contract_reject_the_same_file_source() {
-        let spec = LoadSpec::new(WeightsSource::File("/tmp/klein.safetensors".into()))
+    fn klein_load_and_memory_contract_reject_the_same_quantized_file_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("klein.safetensors");
+        std::fs::write(&file, b"klein single file").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::File(file))
             .with_component(
                 gen_core::BASE_SNAPSHOT_COMPONENT,
-                WeightsSource::Dir("/tmp/klein-base".into()),
-            );
+                WeightsSource::Dir(tmp.path().join("klein-base")),
+            )
+            .with_quant(Quant::Q8);
+        spec.prepare_file_sources().unwrap();
         let load_error = crate::load_klein(&spec)
             .err()
-            .expect("Klein loader must reject File")
+            .expect("Klein loader must reject a quantized File source")
             .to_string();
         let contract_error = klein_provider_contract(&spec).unwrap_err().to_string();
         assert_eq!(contract_error, load_error);
-        assert!(contract_error.contains("only flux2_dev"));
+        assert!(contract_error.contains("pre-quantized"), "{contract_error}");
     }
 
     fn capability(

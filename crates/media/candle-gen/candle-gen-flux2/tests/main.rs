@@ -23,6 +23,9 @@ mod control_parity;
 #[path = "convert_real_weights.rs"]
 mod convert_real_weights;
 
+#[path = "klein_single_file_real_weights.rs"]
+mod klein_single_file_real_weights;
+
 #[path = "preview_real_weights.rs"]
 mod preview_real_weights;
 
