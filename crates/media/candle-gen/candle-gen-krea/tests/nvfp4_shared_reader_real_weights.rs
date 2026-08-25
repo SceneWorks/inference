@@ -9,9 +9,13 @@
 //!    checkpoint-plan route. Source location is an identity fact, never an execution input.
 //! 2. [`sm120_rows_stay_packed_and_the_receipt_matches_the_plan`] — on this box's `sm_120` CUDA
 //!    device, every eligible NVFP4 row is priced `Packed`, the whole trunk constructs through the
-//!    shared reader, and the measured receipt equals the plan's pricing.
-//! 3. [`cpu_load_takes_the_declared_dense_fallback`] — the same checkpoint on the CPU prices every
-//!    NVFP4 row `Dense` and materializes the declared bf16 fallback, receipt matching.
+//!    shared reader, and the measured receipt reconciles with the plan's pricing **through the
+//!    typed demotions** the mixed policy's W4A16 rows record (sc-11045 fix round).
+//! 3. [`cpu_load_takes_the_declared_dense_fallback`] — the same checkpoint prices every NVFP4 row
+//!    `Dense` when loaded onto the CPU **device** and materializes the declared bf16 fallback,
+//!    receipt matching. (It still needs a `--features cuda` *build* like the rest of this file —
+//!    "CPU" here is the bound device, not the build; the pre-fix doc overclaimed a CPU-only
+//!    probe.)
 //!
 //! Run pinned to the quiet GPU: `CUDA_VISIBLE_DEVICES=1`, with `KREAMANIA_VARIANT7` pointing at
 //! the NVFP4 DiT file and `KREA_BASE_SNAPSHOT` at the Krea 2 base component snapshot.
@@ -147,8 +151,11 @@ fn sm120_rows_stay_packed_and_the_receipt_matches_the_plan() {
         "the pinned checkpoint must have packed-eligible rows on an sm_120 device"
     );
 
-    // Construct the whole trunk through the shared reader, then compare the measured receipt to
-    // the plan (E8: the receipt is what happened; the plan is what was declared; they must agree).
+    // Construct the whole trunk through the shared reader, then reconcile the measured receipt
+    // against the plan (E8: the receipt is what happened; the plan is what was declared). Since
+    // the sc-11045 fix round the two agree THROUGH the typed demotions: the mixed policy's W4A16
+    // outlier class holds dense bf16, not the packed pricing, and says so instead of labelling
+    // itself native.
     let dit = Krea2Transformer::load(&w, &cfg).expect("the trunk constructs");
     let receipt = w.logical_weight_receipt().expect("receipt");
     assert_eq!(
@@ -156,17 +163,50 @@ fn sm120_rows_stay_packed_and_the_receipt_matches_the_plan() {
         plan.tensor_count(),
         "constructing the trunk must materialize every planned tensor through the reader"
     );
-    assert_eq!(
-        receipt.resident_bytes(),
-        plan.resident_bytes(),
-        "the measured residency must equal the plan's pricing"
-    );
     assert_eq!(receipt.source_bytes, plan.source_bytes);
+    // The facts assemble — validation IS the demotion-adjusted planned-vs-measured equality on a
+    // complete load, so `expect` here is the E8 gate.
+    let facts = w
+        .checkpoint_weight_facts()
+        .expect("the pinned source is unchanged")
+        .expect("a native import has a plan");
+    assert!(facts.is_complete());
+    assert!(
+        facts.executes_natively(NVFP4_CODEC.codec_id),
+        "the mixed policy must keep the compute bulk genuinely packed on sm_120"
+    );
+    let packed_row = facts
+        .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+        .expect("a native-packed row exists on sm_120");
+    assert!(packed_row.tensor_count > 0);
+    assert!(
+        !facts.receipt().demotions.is_empty(),
+        "the W4A16 outlier class must be demoted, never labelled native (E5)"
+    );
+    // Every packed-priced row is either genuinely packed or explicitly demoted — none vanish.
+    assert_eq!(
+        packed_row.tensor_count + facts.receipt().demotions.len(),
+        packed_rows,
+        "packed + demoted must partition the plan's packed pricing"
+    );
+    // And the demoted bytes are the VRAM-side reality: they equal the trunk's own regime-aware
+    // dequant-bf16 accounting, measured off the constructed layers by an independent producer.
+    let report = dit.nvfp4_report();
+    let demoted_bytes: u64 = facts
+        .receipt()
+        .demotions
+        .iter()
+        .map(|demotion| demotion.resident_bytes)
+        .sum();
+    assert_eq!(
+        demoted_bytes, report.dequant_bf16_bytes as u64,
+        "the receipt's demoted bytes must equal the trunk's measured dequant-bf16 residency"
+    );
     drop(dit);
 }
 
 #[test]
-#[ignore = "requires the local pinned Krea 2 NVFP4 checkpoint (CPU-only probe)"]
+#[ignore = "requires the local pinned Krea 2 NVFP4 checkpoint (CPU device; still a cuda-feature build)"]
 fn cpu_load_takes_the_declared_dense_fallback() {
     let path = env_path("KREAMANIA_VARIANT7");
     let cfg = Krea2Config::turbo();

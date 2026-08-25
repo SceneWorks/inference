@@ -115,25 +115,35 @@ fn nvfp4_device() -> Option<Device> {
 }
 
 /// The **bf16** snapshot root — SC#1's baseline tier and the master NVFP4 packs from.
-fn bf16_root() -> Option<PathBuf> {
-    match std::env::var("KREA_TURBO_BF16_DIR").ok().map(PathBuf::from) {
-        Some(p) if p.join("transformer").is_dir() => Some(p),
-        _ => {
-            eprintln!("[sc-12110] KREA_TURBO_BF16_DIR unset/invalid; skipping");
-            None
-        }
-    }
+///
+/// **Panics** with the named env variable when unset, or when the path exists but lacks the
+/// `transformer/` dir it must hold (sc-11045 fix round, MAJOR 8): these tests run only under an
+/// explicit `--ignored` selection, so a mis-provisioned box must go red, never silently skip the
+/// epic's numbers of record.
+fn bf16_root() -> PathBuf {
+    let p = PathBuf::from(std::env::var("KREA_TURBO_BF16_DIR").expect(
+        "set KREA_TURBO_BF16_DIR to the Krea 2 Turbo bf16 snapshot dir (the SC#1 baseline tier)",
+    ));
+    assert!(
+        p.join("transformer").is_dir(),
+        "KREA_TURBO_BF16_DIR={} has no transformer/ dir — not a Krea snapshot root",
+        p.display()
+    );
+    p
 }
 
-/// The **q4** snapshot root — SC#2's honest baseline (the tier NVFP4 replaces).
-fn q4_root() -> Option<PathBuf> {
-    match std::env::var("KREA_TURBO_Q4_DIR").ok().map(PathBuf::from) {
-        Some(p) if p.join("transformer").is_dir() => Some(p),
-        _ => {
-            eprintln!("[sc-12110] KREA_TURBO_Q4_DIR unset/invalid; skipping");
-            None
-        }
-    }
+/// The **q4** snapshot root — SC#2's honest baseline (the tier NVFP4 replaces). Same fail-loud
+/// contract as [`bf16_root`].
+fn q4_root() -> PathBuf {
+    let p = PathBuf::from(std::env::var("KREA_TURBO_Q4_DIR").expect(
+        "set KREA_TURBO_Q4_DIR to the Krea 2 Turbo q4 snapshot dir (the SC#2 baseline tier)",
+    ));
+    assert!(
+        p.join("transformer").is_dir(),
+        "KREA_TURBO_Q4_DIR={} has no transformer/ dir — not a Krea snapshot root",
+        p.display()
+    );
+    p
 }
 
 /// Load a tier's `transformer/` weight set at its native dtype.
@@ -308,6 +318,20 @@ fn time_steps(
     warmup: usize,
     steps: usize,
 ) -> f64 {
+    let per_step = time_steps_each(model, ctx, dev, warmup, steps);
+    per_step.iter().sum::<f64>() / per_step.len() as f64
+}
+
+/// [`time_steps`]'s per-step form (sc-11045 fix round, the E9 harness): each timed step's ms,
+/// individually synchronized, so a caller can take a **median** — the statistic the E9 floor is
+/// stated over, robust to a one-off allocator or scheduler hiccup a mean would smear in.
+fn time_steps_each(
+    model: &Krea2Transformer,
+    ctx: &Tensor,
+    dev: &Device,
+    warmup: usize,
+    steps: usize,
+) -> Vec<f64> {
     let sigmas = turbo_sigmas(TURBO_STEPS);
     let x = init_latent(dev, EDGE);
     let t = Tensor::from_vec(vec![sigmas[0]], (1,), dev).expect("timestep");
@@ -317,12 +341,26 @@ fn time_steps(
         // real rather than a measure of launch-queue depth.
         let _ = to_vec_f32(&v.narrow(0, 0, 1).unwrap().flatten_all().unwrap());
     }
-    let t0 = Instant::now();
-    for _ in 0..steps {
-        let v = model.forward(&x, &t, ctx).expect("timed forward");
-        let _ = to_vec_f32(&v.narrow(0, 0, 1).unwrap().flatten_all().unwrap());
+    (0..steps)
+        .map(|_| {
+            let t0 = Instant::now();
+            let v = model.forward(&x, &t, ctx).expect("timed forward");
+            let _ = to_vec_f32(&v.narrow(0, 0, 1).unwrap().flatten_all().unwrap());
+            t0.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect()
+}
+
+/// The median of a per-step timing series.
+fn median_ms(per_step: &[f64]) -> f64 {
+    let mut sorted = per_step.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite timings"));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
     }
-    t0.elapsed().as_secs_f64() * 1000.0 / steps as f64
 }
 
 // ==============================================================================================
@@ -403,7 +441,7 @@ fn time_steps(
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
     assert_exclusive_gpu("SC#1 throughput");
 
     let ctx = encode_context(&root, &dev);
@@ -526,6 +564,128 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 }
 
 // ==============================================================================================
+// (1b) E9 — the epic's asserted step-speed floor (sc-11045 fix round, MAJOR 9).
+// ==============================================================================================
+
+/// **E9: the NVFP4 lane must be ≥ 1.08× dense bf16 at 1024², median ms/step — ASSERTED.**
+///
+/// The SC#1 table above deliberately asserts no bar (it exists to answer the throughput question
+/// honestly, and records why ~2× is structurally out of reach); E9 is the epic's *product*
+/// criterion, and this is its measurement harness: a fixed-seed Krea 1024² profile, the median
+/// ms/step over [`E9_MEASURE_STEPS`] individually-synchronized steps, dense bf16 (the SC#1
+/// baseline tier) against **the shipping mixed policy served from the pinned native NVFP4
+/// single file** — the production checkpoint route, not a bench-only pack.
+///
+/// It runs once on the terminal lane. **If the number misses the floor, this test failing IS the
+/// product-decision trigger** — do not soften the bar or widen the tolerance; the measured
+/// history (sc-12110: mixed 1.10× vs dense bf16 post-sc-12207/sc-12078) says 1.08 clears with a
+/// small honest margin, so a red here means a real regression in the lane.
+///
+/// Alongside the timing it re-asserts, on the same load:
+/// * **planned-vs-resident byte agreement** — the checkpoint facts assemble (`is_complete`, the
+///   validator's demotion-adjusted equality) and the receipt's demoted bytes equal the trunk's
+///   own measured dequant-bf16 residency;
+/// * **the sc-11044 no-NaN check** — a short real denoise of the timed trunk ends finite.
+///
+/// Needs `KREA_TURBO_BF16_DIR` (baseline tier) and `KREAMANIA_VARIANT7` (the pinned NVFP4 single
+/// file), an exclusive `sm_120` device.
+const E9_STEP_SPEED_FLOOR: f64 = 1.08;
+/// Timed steps per regime (after 2 warmup steps). Odd, so the median is a real sample.
+const E9_MEASURE_STEPS: usize = 9;
+
+#[test]
+#[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + the pinned NVFP4 single file + an sm_120 device"]
+fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
+    use candle_gen::gen_core::checkpoint_codec::NVFP4_CODEC;
+    use candle_gen::gen_core::ExecutionRepresentation;
+    use candle_gen_krea::native_mapping::DeclaredLogicalShapes;
+
+    let Some(dev) = nvfp4_device() else { return };
+    let root = bf16_root();
+    let nvfp4_file = PathBuf::from(std::env::var("KREAMANIA_VARIANT7").expect(
+        "set KREAMANIA_VARIANT7 to the pinned krea2_turbo_nvfp4.safetensors single file",
+    ));
+    assert_exclusive_gpu("E9 median step-speed floor");
+
+    let ctx = encode_context(&root, &dev);
+    let warmup = 2usize;
+
+    // Baseline: the dense bf16 tier, dropped before the NVFP4 trunk loads.
+    let bf16_each = {
+        let baseline = build(&root, &dev, DType::BF16, &DitPlan::baseline(), "dense bf16");
+        time_steps_each(&baseline, &ctx, &dev, warmup, E9_MEASURE_STEPS)
+    };
+
+    // The shipping mixed policy, through the production checkpoint route (the plan-driven native
+    // import `Krea2Transformer::load` selects `Nvfp4Quant::Mixed` for).
+    let cfg = Krea2Config::turbo();
+    let w = Weights::from_native_file_for(
+        &nvfp4_file,
+        &dev,
+        DType::BF16,
+        DeclaredLogicalShapes::FromConfig(&cfg),
+    )
+    .expect("the pinned NVFP4 single file plans");
+    assert!(w.is_native_nvfp4(), "the fixture must be the NVFP4 checkpoint");
+    let mixed = Krea2Transformer::load(&w, &cfg).expect("the shipping mixed trunk constructs");
+
+    // Planned-vs-resident agreement: the facts validator enforces the demotion-adjusted equality
+    // on this complete load, and the demoted bytes match the trunk's own measured accounting.
+    let facts = w
+        .checkpoint_weight_facts()
+        .expect("the pinned source is unchanged")
+        .expect("a native import has a plan");
+    assert!(facts.is_complete());
+    assert!(facts.executes_natively(NVFP4_CODEC.codec_id));
+    let packed_row = facts
+        .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+        .expect("the mixed policy keeps packed rows on sm_120");
+    assert!(packed_row.tensor_count > 0);
+    let report = mixed.nvfp4_report();
+    let demoted_bytes: u64 = facts
+        .receipt()
+        .demotions
+        .iter()
+        .map(|demotion| demotion.resident_bytes)
+        .sum();
+    assert_eq!(
+        demoted_bytes, report.dequant_bf16_bytes as u64,
+        "receipt demotions must equal the trunk's measured dequant-bf16 residency"
+    );
+
+    let mixed_each = time_steps_each(&mixed, &ctx, &dev, warmup, E9_MEASURE_STEPS);
+
+    // The no-NaN witness on the very trunk that was timed (sc-11044; the full-denoise form is
+    // nvfp4_krea_dit_sc3).
+    let latent = run_denoise(&mixed, &ctx, &dev, 2, None);
+    let energy: f32 = to_vec_f32(&latent).iter().map(|v| v * v).sum();
+    assert!(
+        energy.is_finite(),
+        "the timed mixed trunk must denoise finite (sc-11044 NaN guard)"
+    );
+
+    let (bf16_median, mixed_median) = (median_ms(&bf16_each), median_ms(&mixed_each));
+    let ratio = bf16_median / mixed_median;
+    eprintln!("\n[sc-11045] ===== E9 MEDIAN STEP-SPEED — Krea 2 Turbo, 1024², exclusive GPU =====");
+    eprintln!("[sc-11045] dense bf16 : median {bf16_median:>9.1} ms/step over {E9_MEASURE_STEPS} steps ({bf16_each:.1?})");
+    eprintln!(
+        "[sc-11045] NVFP4 mixed: median {mixed_median:>9.1} ms/step over {E9_MEASURE_STEPS} steps ({mixed_each:.1?}) — {}/{} fp4-lit",
+        report.fp4_lit, report.n_quantized
+    );
+    eprintln!("[sc-11045] E9 ratio  : {ratio:.3}× (floor {E9_STEP_SPEED_FLOOR}×)");
+    assert!(
+        report.fp4_lit > 0,
+        "no FP4 layer lit — the mixed lane silently fell back and the ratio measures nothing"
+    );
+    assert!(
+        ratio >= E9_STEP_SPEED_FLOOR,
+        "E9: the shipping NVFP4 mixed policy measured {ratio:.3}x vs dense bf16 at 1024^2 \
+         (median over {E9_MEASURE_STEPS} steps), below the {E9_STEP_SPEED_FLOOR}x floor. This \
+         failure is the product-decision trigger; do not soften the bar"
+    );
+}
+
+// ==============================================================================================
 // (2) SC#2 — parity against the Q4 tier (the honest baseline).
 // ==============================================================================================
 
@@ -595,8 +755,8 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
 #[ignore = "real-weight GPU test: needs BOTH the Krea 2 Turbo bf16 and q4 snapshots + an sm_120 device"]
 fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(bf16) = bf16_root() else { return };
-    let Some(q4) = q4_root() else { return };
+    let bf16 = bf16_root();
+    let q4 = q4_root();
 
     let ctx = encode_context(&bf16, &dev);
     let steps = TURBO_STEPS;
@@ -781,7 +941,7 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_real_activation_outlier_sparsity() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
 
     let ctx = encode_context(&root, &dev);
     let probe = Arc::new(ActProbe::new());
@@ -911,7 +1071,7 @@ fn nvfp4_krea_dit_real_activation_outlier_sparsity() {
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc6_resident_vram_per_regime() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
 
     eprintln!("\n[sc-12110] ===== SC#6 RESIDENT VRAM PER REGIME (Krea 2 Turbo trunk) =====");
     eprintln!(
@@ -1039,7 +1199,7 @@ fn nvfp4_krea_dit_sc6_resident_vram_per_regime() {
 fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
     use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
 
     /// `CublasLt::WORKSPACE` — the predicted per-handle cost this regression must recover as its slope.
     const WORKSPACE: usize = 32 * 1024 * 1024;
@@ -1284,7 +1444,7 @@ fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc3_no_nan_across_full_denoise() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
 
     let ctx = encode_context(&root, &dev);
     for (tag, quant) in [
@@ -1335,7 +1495,7 @@ fn nvfp4_krea_dit_sc3_no_nan_across_full_denoise() {
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot"]
 fn nvfp4_krea_dit_lane_surface_and_final_head_are_correct() {
     let Some(dev) = nvfp4_device() else { return };
-    let Some(root) = bf16_root() else { return };
+    let root = bf16_root();
 
     let cfg = Krea2Config::from_snapshot(&root).expect("krea config");
     let m = build(

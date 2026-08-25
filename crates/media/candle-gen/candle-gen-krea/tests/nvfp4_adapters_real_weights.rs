@@ -45,9 +45,13 @@ use candle_gen_krea::{Krea2Config, Krea2Transformer};
 /// `applied > 0` assertion this replaces could not tell "one projection matched" from "all did".
 const MIN_APPLIED_TARGETS: usize = 256;
 
-/// The pinned NVFP4 DiT, the base component snapshot, and a real Krea 2 LoRA. `None` (with a
-/// printed reason) when the box is not provisioned, so the lane stays skippable.
-fn fixtures() -> Option<(PathBuf, PathBuf, PathBuf)> {
+/// The pinned NVFP4 DiT, the base component snapshot, and a real Krea 2 LoRA.
+///
+/// **Panics** (naming every missing variable) when the box is not provisioned — the sibling
+/// `nvfp4_shared_reader_real_weights` convention, unified by the sc-11045 fix round (MAJOR 8):
+/// these tests only run under an explicit `--ignored` selection, so a missing fixture is an
+/// operator mistake that must go red, never a green skip.
+fn fixtures() -> (PathBuf, PathBuf, PathBuf) {
     let mut missing = Vec::new();
     let mut get = |name: &str| match std::env::var(name) {
         Ok(v) => Some(PathBuf::from(v)),
@@ -60,11 +64,11 @@ fn fixtures() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let base = get("KREA_BASE_SNAPSHOT");
     let lora = get("KREA_2_LORA");
     match (dit, base, lora) {
-        (Some(dit), Some(base), Some(lora)) => Some((dit, base, lora)),
-        _ => {
-            eprintln!("skipping: set {}", missing.join(", "));
-            None
-        }
+        (Some(dit), Some(base), Some(lora)) => (dit, base, lora),
+        _ => panic!(
+            "this explicitly-selected real-weight test is missing its fixtures: set {}",
+            missing.join(", ")
+        ),
     }
 }
 
@@ -128,9 +132,7 @@ fn differing_pixels(a: &Image, b: &Image) -> usize {
 #[test]
 #[ignore = "requires explicitly scheduled CUDA and the local pinned Krea 2 NVFP4 checkpoint + a Krea 2 LoRA"]
 fn nvfp4_lora_render_differs_and_zero_scale_restores_the_base_exactly() {
-    let Some((dit, base, lora)) = fixtures() else {
-        return;
-    };
+    let (dit, base, lora) = fixtures();
 
     let baseline = render(&dit, &base, &[]);
     let adapted = render(&dit, &base, &lora_spec(&lora, 1.0));
@@ -161,9 +163,7 @@ fn nvfp4_lora_render_differs_and_zero_scale_restores_the_base_exactly() {
 #[test]
 #[ignore = "requires explicitly scheduled CUDA and the local pinned Krea 2 NVFP4 checkpoint + a Krea 2 LoRA"]
 fn nvfp4_trunk_keeps_every_packed_projection_after_a_real_lora_install() {
-    let Some((dit_path, _base, lora)) = fixtures() else {
-        return;
-    };
+    let (dit_path, _base, lora) = fixtures();
 
     let cfg = Krea2Config::turbo();
     let device = Device::new_cuda(0).expect("CUDA device");
