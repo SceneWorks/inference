@@ -12,7 +12,7 @@
 //!     `Generator` path with the distilled defaults.
 //!
 //! Requires the local checkpoint + distill LoRA + dumped golden; none are in CI. Run:
-//!   cargo test -p mlx-gen-sensenova --test fast_realweight -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sensenova --test integration fast_realweight:: -- --ignored --nocapture
 //! Override the snapshot with `SENSENOVA_SNAPSHOT`; point `SENSENOVA_DISTILL_LORA` at the LoRA file.
 //! sc-13664 deleted the production env / HF-cache scan, so `SENSENOVA_DISTILL_LORA` is now a
 //! **test-only** convenience: this harness reads it and passes the explicit path to

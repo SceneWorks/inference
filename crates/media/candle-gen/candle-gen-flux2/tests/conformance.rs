@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! set FLUX2_SNAPSHOT=C:\Users\…\models--black-forest-labs--FLUX.2-klein-9B\snapshots\<hash>
-//! cargo test -p candle-gen-flux2 --features cuda --release --test conformance -- --ignored
+//! cargo test -p candle-gen-flux2 --features cuda --release --test integration conformance:: -- --ignored
 //! ```
 #![cfg(feature = "cuda")]
 

@@ -4,7 +4,7 @@
 //! `XLabs-AI/flux-ip-adapter` `ip_adapter.safetensors`. Run:
 //!
 //! ```text
-//! cargo test -p mlx-gen-flux --release --test ip_adapter_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-flux --release --test integration ip_adapter_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! This validates the IP-Adapter primitive in isolation from the 24 GB FLUX transformer (the full

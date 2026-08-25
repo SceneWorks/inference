@@ -11,7 +11,7 @@
 //! the resolution noise_scale) end to end. Cross-build: f32, tolerance covers the SDPA-vs-eager +
 //! MLX-Metal-vs-torch f32 floor accumulated over the steps.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test t2i_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration t2i_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel, T2iOptions};

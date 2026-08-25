@@ -4,7 +4,7 @@
 //! (or `CLIP_VIT_L_SNAPSHOT`). Run:
 //!
 //! ```text
-//! cargo test -p mlx-gen-flux --release --test ip_image_encoder_real_weights -- --ignored --nocapture
+//! cargo test -p mlx-gen-flux --release --test integration ip_image_encoder_real_weights:: -- --ignored --nocapture
 //! ```
 //!
 //! What this proves:
@@ -136,8 +136,8 @@ fn read_f32_le(path: &str) -> Vec<f32> {
 /// ```text
 /// ~/mlx-flux-venv/bin/python tools/clip_vit_l_parity_ref.py /tmp/clip_l
 /// CLIP_VIT_L_PIXELS=/tmp/clip_l.pixels CLIP_VIT_L_REF=/tmp/clip_l.embeds \
-///   cargo test -p mlx-gen-flux --release --test ip_image_encoder_real_weights \
-///   ip_image_embeds_torch_parity -- --ignored --nocapture
+///   cargo test -p mlx-gen-flux --release --test integration \
+///   ip_image_encoder_real_weights::ip_image_embeds_torch_parity -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "torch parity: needs tools/clip_vit_l_parity_ref.py output (CLIP_VIT_L_PIXELS + CLIP_VIT_L_REF)"]

@@ -39,13 +39,12 @@
 //!
 //! ## What this family actually buys, measured (q4 unless stated, Apple/Metal, 1024², 4 steps)
 //!
-//! | composition | request peak | vs baseline | ms/step | output |
-//! |---|---:|---:|---:|---|
-//! | resident | 19.5296 GiB | — | 849 | — |
-//! | + rung 1 | **16.0411** | **−17.86%** | 883 | byte-identical |
-//! | + rung 4 `Dit`, cadence 1 (default) | **14.8840** | **−7.21%** vs staged | 3745 | byte-identical |
-//! | + rung 4 `Dit`, cadence 10 (selectable) | **14.8840** | **−7.21%** vs staged | 1507 | byte-identical |
-//! | bf16 @ 512², + rung 4 `Both` | **4.5436** | **−60.02%** vs staged | 2043 | byte-identical |
+//! | composition | request peak | vs baseline | output |
+//! |---|---:|---:|---|
+//! | resident | 19.5296 GiB | — | — |
+//! | + rung 1 | **16.0411** | **−17.86%** | byte-identical |
+//! | + rung 4 `Dit`, any published cadence | **14.8840** | **−7.21%** vs staged | byte-identical |
+//! | bf16 @ 512², + rung 4 `Both` | **4.5436** | **−60.02%** vs staged | byte-identical |
 //!
 //! Per tier at 1024², rung 4 `Dit` against that tier's own staged control:
 //! q4 **−7.21%**, q8 **−12.72%**, bf16 **−21.37%** — the saving is the whole `transformer_blocks`
@@ -62,11 +61,11 @@ use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
@@ -299,23 +298,13 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 ///
 /// **Read this as an observation, not as a gated invariant.** Exactly one row is asserted — q4 /
 /// 1024², the sweep's default tier and geometry, which is also the catalog's default tier. The 512²
-/// row comes from re-running under `KOLORS_WINDOW_PROBE_SIZE`, and in that mode the flatness and
-/// wall-clock assertions are reported rather than asserted. And even the asserted row is asserted by
-/// an `#[ignore]`d real-weight test, so it is gated by a human running it against cached weights,
-/// not by CI.
+/// row comes from re-running under `KOLORS_WINDOW_PROBE_SIZE`, and in that mode flatness is reported
+/// rather than asserted. Even the asserted row is an `#[ignore]`d real-weight test, run by a human
+/// against cached weights rather than CI.
 ///
-/// Wall clock falls monotonically with cadence (1024² q4: 3745 → 1507 ms/step, **2.5× cheaper**;
-/// 512² q4: 5347 → 990, **5.4×**). Absolute numbers track machine load — the same rows measured
-/// 4268 → 1621 on a busier pass with **the peak column unchanged to the millibyte** — so the ratio
-/// is the quantity worth quoting and the wall-clock assertions in the sweep are deliberately loose.
-///
-/// ### Rung 4's *relative* latency cost grows as the output shrinks
-///
-/// Against each geometry's own unwindowed control, at the shipped cadence of 1: **4.2× at 1024²,
-/// 10.5× at 512².** That is arithmetic, not a regression appearing at small outputs — a re-open is
-/// weight I/O, so its cost is fixed and area-independent, while the control's per-step forward
-/// scales with area. It is also the strongest argument a selector has for *choosing* a wide cadence:
-/// at 512² q4, cadence 10 lands on the identical 4.6924 GiB peak and is 5.4× faster.
+/// Wall-clock samples remain diagnostic output only. The product evidence is the allocator
+/// high-water and byte-identical output: when every cadence has the same peak, the table makes no
+/// time/memory-frontier claim.
 ///
 /// ## The mechanism is PHASE SEPARATION, and the arithmetic says so at every tier
 ///
@@ -384,10 +373,6 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 ///
 /// **The tightest cadence**, which is what every other MLX adopter on this ladder defaults to.
 ///
-/// The honest counter-argument is recorded because it is a good one: on every configuration measured
-/// here cadence 10's peak equals cadence 1's **to the millibyte**, while cadence 10 is 2.5–5.4×
-/// faster. Read as a table of two rows, 10 dominates.
-///
 /// It is still not the default, and the reason is what the flat column *depends on* rather than what
 /// its endpoints happen to tie at. Flatness is the consequence of an inequality
 /// ([`TRANSFORMER_WINDOW_SIZES`]) that this family satisfies at both measured geometries and that
@@ -397,9 +382,8 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// A default is the value a caller gets *without asking*, so it has to be the bound rung 4 can
 /// always make good on.
 ///
-/// The other three cadences remain published and selectable, and at 1024² a selector that does not
-/// need the tighter bound should absolutely pick 10 and take the 2.5× wall-clock saving; it just has
-/// to *choose* it, against calibration for that cadence, rather than receive it by omission.
+/// The other three cadences remain published and selectable. Their allocation and output evidence is
+/// intentionally separate from host-dependent diagnostic timing.
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 
 /// The rung-4 **component scopes** this provider implements — and Kolors is the first MLX provider
@@ -507,10 +491,8 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// Load shape is a typed evidence-key axis carried separately on [`MemoryCalibrationIdentity`]; this
 /// content fingerprint stays shape-independent.
 ///
-/// **The paired evidence must be keyed per cadence, not per rung.** The cadences differ by up to
-/// 2.8× in wall clock, so a selector weighing peak against time needs a row per candidate rather
-/// than one row for the rung. `MemoryFormulaVariable::TransformerWindowSize` is already declared on
-/// the formula for exactly this.
+/// `MemoryFormulaVariable::TransformerWindowSize` remains declared on the formula: cadence is an
+/// executable request parameter even where the measured request peak is identical.
 ///
 /// **This fingerprint is coupled to rung 2.** The cadence rows are all measured with
 /// [`DECODE_SUPPORT`] `Missing`, and the reason they are flat is that the *decode* carries the peak.
@@ -774,6 +756,7 @@ fn push_overlay(
         // No published rung bounds an overlay on this family: rung 4's window covers the U-Net's
         // `Transformer2D` sub-stacks and ChatGLM3's `GlmBlock`s, and nothing else.
         bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
     });
 }
 

@@ -13,7 +13,7 @@
 //!   SAM3_WEIGHTS=<facebook/sam3 snapshot> \
 //!   SAM3_GEOMETRY_FIXTURE=<.../geometry_fixture.safetensors> \
 //!   SAM3_GEOMETRY_E2E_FIXTURE=<.../geometry_e2e_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test geometry_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration geometry_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

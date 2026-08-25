@@ -19,9 +19,13 @@ pub use mlp::TextMlp;
 // The HF half-split text RoPE is identical across families and now lives in core (F-006).
 pub use mlx_gen::nn::TextRope;
 
-/// mlx `nn.RMSNorm` default eps — used by the per-head `q_norm`/`k_norm` (which the fork
-/// constructs without an explicit eps). The block-level layer norms use `rms_norm_eps` (1e-6).
-pub(crate) const QK_NORM_EPS: f32 = 1e-5;
+/// Epsilon for the per-head `q_norm`/`k_norm`. Z-Image's text encoder is exactly Qwen3-4B, whose
+/// released `config.json` carries `rms_norm_eps: 1e-06` and declares no separate qk-norm epsilon —
+/// HF's `Qwen3Attention` builds both per-head norms with `config.rms_norm_eps`, the same value the
+/// block-level norms take. This read 1e-5, the `mlx_rs::fast::rms_norm` library default left in
+/// place where the fork passes no explicit eps, until the sc-17137 sync review settled it against
+/// the checkpoint. `ENCODER_CONTRACT.qk_norm_eps` in `lib.rs` publishes the same number.
+pub(crate) const QK_NORM_EPS: f32 = 1e-6;
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix (so flat fixtures and
 /// real `layers.{i}` trees both resolve without a stray leading dot).

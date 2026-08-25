@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! CLIP_VIT_L_SNAPSHOT=/path/to/clip-vit-large-patch14 \
-//!   cargo test -p mlx-gen-clip --test real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-clip --test integration real_weights:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

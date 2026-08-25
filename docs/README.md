@@ -16,6 +16,9 @@ Documentation for the SceneWorks inference workspace.
   inventory (14 safetensors files, header-only Range reads, authenticated capture), and the
   pre-change `dump-engine-capabilities` baseline every later LTX-2.5 story cites instead of
   re-deriving.
+- **[MiniMax-H3 withheld upstream components](reference/minimax-h3-withheld-upstream-components.md)**
+  — what `H3-Context-IR`, `H3-Regenerate-2K`, sparse-attention inference and the `<d>` dialogue
+  markers cost this port, what the crates do instead, and what would change if upstream publishes.
 
 ## Architecture
 

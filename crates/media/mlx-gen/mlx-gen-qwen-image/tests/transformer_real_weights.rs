@@ -6,7 +6,7 @@
 //! - **3D RoPE**: my `QwenRope3d` vs the fork's `QwenEmbedRopeMLX` (no weights).
 //! - **One dual-stream block** at small dims with the fork's synthetic weights + rope.
 //!
-//! Run: `cargo test -p mlx-gen-qwen-image --release --test transformer_real_weights -- --ignored`
+//! Run: `cargo test -p mlx-gen-qwen-image --release --test integration transformer_real_weights:: -- --ignored`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_qwen_image::transformer::{QwenRope3d, QwenTransformerBlock};

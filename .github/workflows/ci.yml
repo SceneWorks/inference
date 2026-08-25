@@ -189,6 +189,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Validate normalized workspace
         run: ./scripts/check-workspace.py
+      # sc-19556. A RATCHET against scripts/clock_assertions_baseline.txt, not a zero-gate: the
+      # residual clock-bound assertions are real and tracked, and a gate demanding zero would be
+      # switched off within a week. This reds only when a file's count RISES or a newly flagged
+      # file appears — i.e. when a PR adds an assertion whose truth depends on how busy the runner
+      # was. `workspace` is the right lane because select_lanes.py never skips it, so the ratchet
+      # sees every PR regardless of which crates it touched.
+      - name: Ratchet wall-clock-dependent assertions
+        run: python3 scripts/check_clock_assertions.py --check-baseline .
       # Installed BEFORE the tooling tests, not after: `test_mmaudio_reference.py` regenerates the
       # MMAudio parity fixtures' deterministic inputs (a 28 MP synthetic clip) and compares digests,
       # which needs numpy. Leaving this after the discover step would turn that gate into an import
@@ -231,10 +239,47 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
+  # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
+  # like the real checkpoint it stands in for and then leave it unwritten, which is free on APFS and
+  # ext4 but allocates every cluster on NTFS unless the file is flagged sparse first. The assertions
+  # that pin the flag are therefore `#[cfg(windows)]`, and before this lane NOTHING executed them:
+  # `contracts` runs on ubuntu-latest, where those blocks compile out, and `windows-cuda-check`
+  # builds its test binaries with `--no-run`. A regression that made every multi-GB fixture allocate
+  # its full length again -- the failure that filled the Windows CUDA box's system drive twice and
+  # ended a candle-worker run with StorageFull, os error 112 -- was green on every automatic lane.
+  #
+  # Deliberately HOSTED windows-latest, not the self-hosted `[windows, cuda]` pair. The testkit
+  # links no tensor library and no CUDA (see its Cargo.toml), so it builds cold in well under a
+  # minute of hosted time, and the four self-hosted runners stay free for work that needs a GPU box.
+  # Keep it that way: moving this to a self-hosted label would cost a whole lane on the scarcest
+  # resource in this repo to run a test that needs nothing but a filesystem.
+  contracts-windows:
+    name: contracts testkit (Windows)
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Save only on `main` -- see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
+      # package set. This lane is here only for the assertions that need a real NTFS volume.
+      - name: Test contracts testkit on NTFS
+        run: cargo test --locked -p sceneworks-gen-core-testkit
+
   # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
   # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
   # steps, with the same commands and the same step names, and all four are gated on the same
   # `changes.outputs.candle_cpu` and listed in the `gate` job's `needs:`.
+  #
+  # (sc-19447 later split `candle-cpu-test`'s single invocation in two and gave the `candle-gen*`
+  # half `--tests`, so that job now carries two steps rather than one. Nothing was dropped there
+  # either; see the notes on those steps.)
   #
   # Why split rather than trim: the serial ordering was never a correctness requirement. Measured
   # over nine successful PR runs on 2026-08-15, the steps were independent and the job was bounded
@@ -331,9 +376,101 @@ jobs:
         # provider test binaries exceeds the hosted runner's memory-backed linker capacity and
         # crashes lld with SIGBUS. That was observed even with the Clippy tree already reclaimed, so
         # moving Clippy to its own runner does not lift it.
+        #
+        # `--lib` here is deliberate for these three groups and is NOT the sc-19447 defect:
+        #   * candle-llm's `conformance` target already executes in `candle-cpu-conformance`;
+        #   * `candle-audio*`'s integration targets are named one by one in that same job's SA3
+        #     step, a choice `scripts/tests/test_sa3_ci_target_coverage.py` polices — widening
+        #     them to `--tests` here would link SA3's real-weight-only binaries for zero cases and
+        #     silently make that guard redundant;
+        #   * runtime-cpu has no `tests/` directory at all.
+        # `candle-gen*` moved to its own invocation below because it was the group that had no
+        # `--tests` runner anywhere.
         run: >-
           cargo test --locked --lib -j 1
-          -p candle-llm -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p 'candle-audio*' -p runtime-cpu
+      # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
+      # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
+      # under all-target Clippy without running them, `windows-cuda-check` compiles them
+      # `--no-run`, `macos-metal` Clippies candle without testing it, and the only `--tests` runner
+      # for the family is the `workflow_dispatch`-only `windows-cuda` job. An entire epic's
+      # candle-side parity evidence therefore compiled green and was never evaluated.
+      #
+      # `--tests` over the whole `candle-gen*` glob rather than a curated `--test` list, which is
+      # the shape the sibling `macos-metal` job already uses for `mlx-gen*`. A curated list would
+      # need ~25 separate invocations and would rot the moment a target is added — the exact drift
+      # `test_sa3_ci_target_coverage.py` exists to catch on the audio side. The glob cannot drift,
+      # and `scripts/tests/test_candle_gen_ci_target_coverage.py` pins that it stays a glob that
+      # covers every crate carrying weight-free cases.
+      #
+      # Weight-bound cases stay out of this lane by ONE of two mechanisms, and only these two are
+      # trustworthy: `#[ignore]` (libtest reports `ignored`) or a file-level `#![cfg(feature =
+      # "cuda")]` (the target compiles to an empty binary). They stay reachable from the manual
+      # `windows-cuda` dispatch and from `real-weights.yml`, which is the deliberate split — see
+      # sc-19447 for the per-target classification and for the real-weight targets no lane names.
+      #
+      # A THIRD mechanism existed and was NOT trustworthy: 14 cases carried neither marker and
+      # instead printed `SKIP` and `return`ed when their guard was unsatisfied. libtest reports
+      # those as **passed**. Widening this step to `--tests` would therefore have converted "never
+      # evaluated" into "reported as evaluated" — the exact defect class sc-19447 exists to remove,
+      # laundered rather than fixed.
+      #
+      # THE 14 WERE NOT ONE KIND, and sc-19447 converted all of them to `#[ignore]` as though they
+      # were. THE REAL SPLIT IS 13 + 1:
+      #   * 13 are ENV-GATED and weight-bound — `candle-gen-flux2`'s `vae_encode_parity` and all
+      #     eleven `candle-gen-lens` `*_parity` targets (12 files; `encoder_quant_parity` carries
+      #     two such cases and factors its guard into a helper, so a body-only reading of the
+      #     sources undercounts). For these, `#[ignore]` is right: their weights are not on any
+      #     runner, so no lane should run them, and `real-weights.yml` opts in explicitly.
+      #   * 1 is DEVICE-GATED and weight-free, and it was LANE-REACHABLE: `candle-gen`'s
+      #     `cuda_quant_smoke::cuda_qmatmul_matches_cpu`, the sole canary for the sc-7544 silent-
+      #     zeros GGUF QMatMul regression. It gates on `default_device().is_cuda()`, not on an env
+      #     var, and the `windows-cuda` job below runs `--features cuda` with **no `-- --ignored`**
+      #     — so `#[ignore]` did not park it beside the weight-bound twelve, it SILENCED it on the
+      #     one lane that has ever executed it. It is `#![cfg(feature = "cuda")]` now: excluded
+      #     from this lane by the second trustworthy mechanism above (empty binary on
+      #     `ubuntu-latest`), and executed rather than `ignored` under `--features cuda`. Do not
+      #     re-`#[ignore]` it — see that file's module header.
+      #
+      # `scripts/tests/test_candle_gen_ci_target_coverage.py` refuses to count a self-skipping
+      # case as weight-free coverage and fails on any new one, so the class cannot re-enter
+      # silently. sd3's `reference_manifests_are_consistent_if_present` is deliberately NOT in that
+      # set: its references are committed to the repo, so it really does assert on every run.
+      #
+      # `-j 1` is carried over from the step above for the same lld/SIGBUS reason, and matters more
+      # here: this invocation links ~176 additional test binaries. `--lib` is redundant next to
+      # `--tests` (cargo's `--tests` already selects the lib's own test target — verified: both
+      # forms produce the same 210 binaries) and is kept only so this reads identically to the
+      # `macos-metal` invocation it is modelled on.
+      #
+      # MEASURED COST, so the widening is a deliberate choice rather than a silent one (sc-19447
+      # AC1). The number that governs is the HOSTED one; a local aarch64 figure understates it by
+      # roughly 5x and must not be quoted as the budget.
+      #
+      # HOSTED LINUX (ubuntu-latest, this job, wall-clock from the Actions API):
+      #   before  run 32328255786  main @f17c8254   job 528s   `Test Candle packages` 466s
+      #   after   run 32383334859  PR   @9ff4cecb3  job 1304s  `Test Candle packages` 261s
+      #                                                        + this step             999s
+      #   => +776s (+12m56s) on the job, a 2.47x increase. Run 32376222131 (@d308b185f) logged
+      #      1011s for this same step independently, so 999s is not a one-off.
+      #   Compare the JOB totals, not the steps: `Test Candle packages` also moved (466s -> 261s)
+      #   and no cause for that has been established — a main push saves the rust-cache while a PR
+      #   only restores it, so the two runs did not start from the same warmth. Attributing the
+      #   step-level delta to this change would be a guess; the job total is what was measured.
+      #
+      # LOCAL aarch64 (warm deps, only `candle-gen*` rebuilt, same `-j 1` / `RUST_TEST_THREADS=1`):
+      #   ~+2m43s. Recorded only to show the two do not agree — do NOT budget from it.
+      #
+      # WALL CLOCK vs RUNNER MINUTES — these are different costs and only one of them is free:
+      #   * Wall clock: unaffected. `macos-metal` (3391s in run 32383334859, with the `CI gate` job
+      #     starting 4s after it) is the binding constraint; this job now finishes ~40m before it.
+      #   * Runner minutes: ~13 additional minutes of hosted Linux on EVERY candle-touching PR.
+      #     That is the real price, it is paid per push, and it is the first thing to re-measure
+      #     (or to split across runners) if the candle lane's cost is ever questioned.
+      - name: Test Candle gen packages and integration targets
+        run: >-
+          cargo test --locked --lib --tests -j 1
+          -p 'candle-gen*'
 
   candle-cpu-conformance:
     name: Candle CPU conformance + SA3 gates (Linux)
@@ -402,6 +539,28 @@ jobs:
       # Cargo config is intentionally overridable so hosted CI exercises the
       # correct non-NAX path; a 26.2+ self-hosted lane is still needed for NAX.
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      # Line tables only, no full DWARF, for every profile this lane builds. Measured 2026-08-23
+      # (run 32630010202): with full debuginfo the broad `--lib --tests` graph alone grew `target/`
+      # to 35 GB, which is what forced the two mid-job `cargo clean`s — and each clean threw away
+      # the restored libmlx.a, so `pmetal-mlx-sys` (≈6 min of cmake on the 3-core hosted M1) was
+      # rebuilt FOUR times in one job, ~24 of its 61 minutes, against 6.7 minutes of actual test
+      # execution. Nothing in CI reads the DWARF; line tables keep panic backtraces addressable.
+      # `test` inherits `dev`, but it is set explicitly so a future `[profile.test]` block cannot
+      # silently re-inflate this lane. Do NOT reintroduce `cargo clean` between the cargo steps:
+      # the `Disk after ...` probes below are the evidence that it is no longer needed.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      # Build-override debuginfo MUST match the profile debuginfo above, or this lane still
+      # builds libmlx three times per cold job. Measured locally 2026-08-23 (unit graphs +
+      # `-vv` OUT_DIR hashes): with the cargo default (build scripts/proc-macros at debug=0),
+      # `cargo build` lets bindgen's host-side `bitflags` share the target-side dev unit while
+      # `cargo check`/`clippy` and `cargo test` give it a separate build-override unit — so the
+      # bindgen → build-script → `pmetal-mlx-sys` metadata hash differs per command and each
+      # step gets its own OUT_DIR and its own ≈6 min cmake build of libmlx. With build-override
+      # aligned, Clippy, the `--lib --tests` run, and the LLM+audio bundle all resolve to ONE
+      # OUT_DIR (only the LLM-only bundle still differs, via `syn` feature unification).
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Toolchain versions
@@ -409,6 +568,62 @@ jobs:
           sw_vers
           xcodebuild -version
           cmake --version
+      # sc-19556 CI-disk mitigation. On 2026-08-19 this lane hit the runner's disk wall three
+      # attempts running: attempt 1 died with `ar: libmlx.a: No space left on device` inside the
+      # MLX native build during "Test LLM+audio macOS bundle", and attempts 2-3 killed the runner
+      # outright (it could no longer write its own `_diag` log). Two things stack up:
+      #   * the hosted `macos-15-arm64` image ships NINE Xcode installs (16.0 through 26.3) plus the
+      #     Android SDK. This lane uses exactly one Xcode and no Android at all, so that payload is
+      #     pure dead weight sitting on the same volume as `target/`.
+      #   * this lane runs four cargo invocations with four different feature sets, and on any branch
+      #     whose manifest set differs from `main` the rust-cache restore is a prefix match
+      #     ("full match: false" — the failing run restored `...-c5bb8f3b` under key `...-e634915e`),
+      #     so the restored ~1.2 GB target/ is kept AND a second generation of artifacts is built on
+      #     top of it. Branches whose manifests match `main` get "full match: true" and never build
+      #     that second generation, which is why they passed the same day on the same image.
+      # The second generation has since been shrunk (line-tables-only debuginfo, see the job `env`),
+      # but the image payload is still dead weight, so it is still pruned — in the BACKGROUND.
+      # Measured at 3.6 min on the critical path when it ran inline; `sudo rm -rf` of eight Xcode
+      # bundles is pure I/O that overlaps fine with the cache restore and the first cargo build.
+      # Only non-active Xcodes and the Android SDK are removed, so nothing a later step selects
+      # can disappear under it. The log is printed by the final disk probe. This step is
+      # diagnostics + deletion only: it never fails the job.
+      - name: Reclaim runner disk (background)
+        run: |
+          set +e
+          echo "--- disk before reclaim ---"
+          df -h /
+          cat > "$RUNNER_TEMP/reclaim-runner-disk.sh" <<'EOS'
+          set +e
+          resolve() { ( cd "$1" >/dev/null 2>&1 && pwd -P ); }
+          keep="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer.*##')"
+          case "$keep" in
+            /Applications/Xcode*.app)
+              keep_real="$(resolve "$keep")"
+              echo "active Xcode: $keep_real"
+              for app in /Applications/Xcode*.app; do
+                [ -e "$app" ] || continue
+                if [ "$(resolve "$app")" = "$keep_real" ]; then
+                  echo "keep  $app"
+                  continue
+                fi
+                echo "prune $app"
+                sudo rm -rf "$app"
+              done
+              ;;
+            *)
+              # DEVELOPER_DIR is CommandLineTools or unset — we cannot tell which Xcode the later
+              # steps will select, so prune nothing rather than guess.
+              echo "active developer dir is '${keep:-<none>}', not an Xcode bundle; skipping Xcode prune"
+              ;;
+          esac
+          sudo rm -rf "$HOME/Library/Android" "$HOME/.android"
+          echo "--- disk after reclaim ---"
+          df -h /
+          EOS
+          nohup bash "$RUNNER_TEMP/reclaim-runner-disk.sh" > "$RUNNER_TEMP/reclaim-runner-disk.log" 2>&1 &
+          echo "reclaim running in background (pid $!); log: $RUNNER_TEMP/reclaim-runner-disk.log"
+          exit 0
       - name: Ensure Metal compiler
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then
@@ -419,6 +634,29 @@ jobs:
         run: |
           rustup show
           rustup component add clippy
+      - name: Fetch prebuilt MLX (sc-21382)
+        # pmetal-mlx-sys's cmake build of libmlx is ≈6 min on this runner on every cache miss
+        # (plus a network fetch of MLX). The SceneWorks/mlx-rs fork publishes that build per
+        # commit (`prebuilt-<sha12>` releases, cell = target × deployment target × Debug/Release);
+        # scripts/fetch-prebuilt-mlx.sh picks the asset for the rev pinned in Cargo.lock and this
+        # job's MACOSX_DEPLOYMENT_TARGET, exports PMETAL_MLX_PREBUILT_DIR and PMETAL_METALLIB_PATH
+        # (sc-20799 -- with a prebuilt or a warm cargo cache pmetal-mlx-sys's build.rs does not
+        # re-run, so nothing populates ~/.cache/pmetal/lib and the test binaries, which have no
+        # compiled-in metallib, cannot load one). build.rs links the archives only
+        # after checking the manifest against its own key -- a mismatch FAILS the build. The one
+        # failure tolerated here is "no prebuilt published for this rev yet" (exit 1), which is
+        # exactly the case where building from source is right; it is surfaced as a workflow
+        # annotation so a rev bump that forgot to publish is visible. Anything else is an error.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
       - name: Cache Cargo and MLX native build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -442,11 +680,23 @@ jobs:
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos
-      - name: Reclaim Clippy and rustdoc artifacts before linking MLX tests
-        # The complete all-target Clippy graph plus rustdoc output exhausted the hosted macOS disk
-        # while the broad test graph was linking. Both gates have already succeeded, so rebuild the
-        # narrower lib/test profile from a clean target before the existing post-test reclamation.
-        run: cargo clean
+      # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
+      # else in this job, so it is free to drop before the four cargo invocations start stacking
+      # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
+      # the 2026-08-19 disk failures had no data for. Diagnostics only; never fails the job.
+      - name: Disk after rustdoc
+        if: always()
+        run: |
+          set +e
+          rm -rf target/doc
+          df -h /
+          du -sh target 2>/dev/null
+          exit 0
+      # There is deliberately NO `cargo clean` here any more. Until 2026-08-23 one sat between
+      # rustdoc and the test build because the full-debuginfo test graph did not fit next to the
+      # Clippy graph; it also discarded the rust-cache-restored `pmetal-mlx-sys` output, so libmlx
+      # was rebuilt from cmake for the test step. With line-tables-only debuginfo (job `env`) both
+      # graphs fit and the native build is reused.
       # Deliberately NOT given `-j 1` or `--test-threads` (sc-16049). Test concurrency is already
       # pinned at 1: the root `.cargo/config.toml` force-sets `RUST_TEST_THREADS = 1` (MLX's shared
       # Metal device is not thread-safe) and cargo runs test binaries one at a time, so exactly one
@@ -465,19 +715,48 @@ jobs:
         run: >-
           cargo test --locked --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
-      - name: Reclaim broad MLX test artifacts before bundle profiles
-        # The complete MLX test graph has already passed. Its linked test artifacts do not fit on
-        # the hosted macOS image alongside the separately compiled runtime bundle profiles and the
-        # Candle Metal Clippy graph, so discard them before continuing with those unchanged gates.
-        # This mirrors the hosted Linux lane's post-Clippy reclamation boundary.
-        run: cargo clean
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after MLX package tests
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
+      # Likewise no `cargo clean` before the bundle profiles (removed 2026-08-23): the bundle
+      # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
+      # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after LLM-only bundle
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
       # profile — and this is the one platform where that combination is cross-backend.
       - name: Test LLM+audio macOS bundle
         run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
+      # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
+      # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
+      # only; never fails the job.
+      - name: Disk after LLM+audio bundle
+        if: always()
+        run: |
+          set +e
+          echo "--- background reclaim log ---"
+          cat "$RUNNER_TEMP/reclaim-runner-disk.log" 2>/dev/null || echo "(no reclaim log)"
+          echo "--- disk ---"
+          df -h /
+          du -sh target 2>/dev/null
+          du -sh target/debug/build/pmetal-mlx-sys-*/out 2>/dev/null
+          exit 0
       # The metal twin of the cuda gate on `windows-cuda-check`. This was a bare `cargo check` and so
       # had two holes, both of the sc-11990 shape: it never linted `#[cfg(feature = "metal")]` code
       # (no lane passes --features metal to Clippy), and without --all-targets it did not even
@@ -507,6 +786,20 @@ jobs:
           xcrun metal --version
           rustc --version
           cargo --version
+      - name: Fetch prebuilt MLX (sc-21382)
+        # Same contract as the `macos-metal` step of this name; this lane's cell is 26.2/Debug and
+        # the self-hosted runner keeps the extracted tarball in ~/.cache/pmetal/prebuilt across
+        # runs, so after the first fetch this is a no-op.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
       # DELIBERATELY NO `save-if: main`, unlike the PR lanes (see the note on the `workspace` job's
       # cache step). `macos-nax` is manual and never runs on `main`, so a main-only save would leave
       # it nothing to restore; it also contributed no entry to the 2026-08-15 cache inventory. Do
@@ -572,6 +865,36 @@ jobs:
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.
       CARGO_BUILD_JOBS: "12"
+      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545).
+      #
+      # This pool is `MICHAEL-TRX50`: 2x RTX PRO 6000, 97887 MiB each, driver 596.36. "80 is
+      # Ampere, the box is Blackwell" therefore reads as an obvious bug, and is not one.
+      # `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture ladder, never the hardware. It
+      # seeds one cudaforge `-gencode`; `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and
+      # `compute_120` PTX on top (sc-7544), so the shipped `libmoe.a` is a fatbin that runs Ampere
+      # -> Ada -> Hopper -> Blackwell from one binary. Set this to 120 and the bottom rung
+      # disappears: quantized models stop working on every pre-Blackwell customer GPU, and the
+      # dense PTX floor rises to `compute_120` so even dense models stop loading there.
+      #
+      # The hazard the number LOOKS like -- quantized matmuls silently returning zeros -- is real,
+      # was sc-7544, and is fixed. What must actually hold is that the runner's arch is served by
+      # SOME rung, which is a different claim from "the cap matches the GPU". Concretely, the
+      # ladder is sm_80 (this value) + sm_90 + sm_120 SASS + `compute_120` PTX, so this pool's
+      # cards are covered natively.
+      #
+      # KNOWN GAP, recorded so it is not rediscovered: **datacenter Blackwell sm_100 (B100/B200) is
+      # NOT covered** on the quant path. Major 10 is served neither by the sm_9x/sm_12x cubins
+      # (SASS is compatible only upward WITHIN one major) nor by the `compute_120` PTX floor (120 >
+      # 100). build.rs states this is deliberate. If such a card ever joins this pool, quantized
+      # matmuls return zeros silently -- add `code=sm_100` to build.rs, do NOT touch this value.
+      #
+      # sm_120 for the current cards is a SPEC fact, not a CI measurement: no lane has ever queried
+      # `compute_cap`, and nothing in this repository does. `nvidia-smi` here reports only the
+      # truncated model name and memory.
+      #
+      # NOTHING ENFORCES ANY OF THIS. sc-19545 verified it by hand and wrote it down; a drift guard
+      # was explicitly scoped out. If someone edits this value, the first symptom is black
+      # renders on customer GPUs, not a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -797,6 +1120,7 @@ jobs:
       - format
       - workspace
       - contracts
+      - contracts-windows
       - candle-cpu-lint
       - candle-cpu-test
       - candle-cpu-conformance

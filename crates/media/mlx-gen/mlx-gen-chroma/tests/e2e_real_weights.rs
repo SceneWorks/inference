@@ -1,7 +1,7 @@
 //! sc-3839/sc-3840: real-weight e2e parity vs torch `diffusers` ChromaPipeline, f32 both sides.
 //! Goldens = `tools/dump_chroma_e2e_golden.py {hd,base,flash}`. `#[ignore]` — each needs the
 //! corresponding ~18GB snapshot; run with
-//! `cargo test -p mlx-gen-chroma --test e2e_real_weights -- --ignored --nocapture`.
+//! `cargo test -p mlx-gen-chroma --test integration e2e_real_weights:: -- --ignored --nocapture`.
 //!
 //! HD is the comprehensive gate (masked T5 encode + single real-weight DiT forward + full image).
 //! base/flash reuse the identical model path (validated on HD) and differ only in the sigma schedule

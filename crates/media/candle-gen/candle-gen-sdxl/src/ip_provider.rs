@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
-use candle_gen::gen_core::{AdapterSpec, Image, PreviewSink, Progress, WeightsSource};
+use candle_gen::gen_core::{
+    AdapterSpec, Image, LoadSpec, MemoryRunContext, PreviewSink, Progress, WeightsSource,
+};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
 // `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
 use candle_gen::gen_core::PidWeights;
@@ -32,8 +34,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::denoise::{
-    decode_image, denoise_curated, denoise_ip_multi_control, seeded_prior, seeded_sigma_prior,
-    text_time_ids, Denoiser,
+    decode_image_with_tiling, denoise_curated, denoise_ip_multi_control, seeded_prior,
+    seeded_sigma_prior, text_time_ids, Denoiser,
 };
 use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
 use crate::loaders::{load_instantid_unet_with_adapters, load_sdxl_vae};
@@ -42,7 +44,7 @@ use crate::sampler::EulerAncestralSampler;
 use crate::unet::UNet2DConditionModel;
 use crate::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
-use crate::{conditioning::SdxlConditioner, SdxlVaeDecoder, PID_BACKBONE};
+use crate::{conditioning::SdxlConditioner, SdxlArtifactSeal, SdxlVaeDecoder, PID_BACKBONE};
 
 /// The IP-Adapter compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the CLIP image encoder runs at this dtype too).
@@ -174,6 +176,7 @@ pub struct IpAdapterSdxl {
     /// SDXL provider.
     pid: Option<PidEngine>,
     device: Device,
+    memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
 }
 
 impl IpAdapterSdxl {
@@ -225,7 +228,24 @@ impl IpAdapterSdxl {
             sampler: EulerAncestralSampler::sdxl(),
             pid: None,
             device,
+            memory_admission: None,
         })
+    }
+
+    /// Load only after the worker's exact selector decision has been bound to the same physical
+    /// base, IP bundle, image encoder, components, adapters, tier, and request context.
+    pub fn load_admitted(
+        paths: &IpAdapterSdxlPaths,
+        spec: &LoadSpec,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        crate::memory_strategy::validate_ip_spec(paths, spec)?;
+        let seal = SdxlArtifactSeal::capture_for(spec, crate::SdxlSurface::Bespoke)?;
+        crate::memory_strategy::validate_context(seal.contract(), &context, &seal)?;
+        crate::memory_strategy::validate_bespoke_context(&context)?;
+        let mut model = Self::load(paths)?;
+        model.memory_admission = Some((seal, context));
+        Ok(model)
     }
 
     /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
@@ -269,6 +289,21 @@ impl IpAdapterSdxl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        let memory = if let Some((seal, context)) = &self.memory_admission {
+            crate::memory_strategy::validate_bespoke_request(
+                seal,
+                context,
+                req.width,
+                req.height,
+                1,
+                req.use_pid,
+                "character_image",
+            )?;
+            seal.contract().generation_memory(&context.selection)
+        } else {
+            None
+        };
+        let _attention = crate::enter_attention_memory(memory);
         reject_zero_steps(req.steps)?;
         let cfg_on = req.guidance > 1.0;
 
@@ -357,7 +392,8 @@ impl IpAdapterSdxl {
         // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref, Some(&req.cancel))
+        let tiling = crate::denoise::decode_tiling(memory);
+        decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond

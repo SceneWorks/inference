@@ -71,7 +71,10 @@ pub use block_stream::{
 };
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
-pub use loader::{load_text_encoder, load_transformer, load_transformer_from_native_file};
+pub use loader::{
+    last_native_file_receipt, load_text_encoder, load_transformer,
+    load_transformer_from_native_file, reset_native_file_receipt,
+};
 pub use memory::{control_geometry_fits, require_control_geometry};
 pub use model::{
     descriptor, edit_descriptor, load, load_edit, load_from_native_dit_file, load_raw,
@@ -86,7 +89,10 @@ pub use multiphase::{
     resolve_phase_slices, resolve_phases, total_phase_steps, PhaseSlice, ResolvedPhase,
     ResolvedPhaseAdapter,
 };
-pub use native_remap::{native_dit_key_to_diffusers, remap_native_dit_to_diffusers};
+pub use native_remap::{
+    diffusers_logical_shape, native_dit_key_to_diffusers, remap_native_dit_to_diffusers,
+    DeclaredLogicalShapes, KreaDiffusersKeyMapping, KreaNativeToDiffusersMapping,
+};
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, MultiPhasePlan, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
@@ -221,37 +227,42 @@ pub fn register_providers(
             },
         )
         .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
-            provider_id: KREA_2_TURBO_ID,
-            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
-            provider_id: KREA_2_TURBO_EDIT_ID,
-            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
-            operation: mlx_gen::gen_core::ImportedModelOperation::Pose,
-            provider_id: KREA_2_TURBO_CONTROL_ID,
-            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
-        })
-        .register_imported_model(mlx_gen::gen_core::ImportedModelRegistration {
-            family: "krea_2",
-            source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
-            operation: mlx_gen::gen_core::ImportedModelOperation::MultiPhase,
-            provider_id: KREA_2_RAW_ID,
-            required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
-            inherit_adapters: true,
+        .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
+            backend_bindings: &[
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Generate,
+                    provider_id: KREA_2_TURBO_ID,
+                    required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Edit,
+                    provider_id: KREA_2_TURBO_EDIT_ID,
+                    required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::Pose,
+                    provider_id: KREA_2_TURBO_CONTROL_ID,
+                    required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+                mlx_gen::gen_core::CheckpointBackendBindingRegistration {
+                    backend: mlx_gen::gen_core::CheckpointBackend::Mlx,
+                    source: mlx_gen::gen_core::ImportedModelSource::TransformerFile,
+                    operation: mlx_gen::gen_core::ImportedModelOperation::MultiPhase,
+                    provider_id: KREA_2_RAW_ID,
+                    required_components: Some(&[mlx_gen::BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
+            ],
+            ..mlx_gen::gen_core::KREA_2_CHECKPOINT_ADAPTER
         })
         .register_trainer(training::TRAINER_REGISTRATION)
 }
@@ -264,7 +275,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 #[cfg(test)]
 mod explicit_registry_tests {
     fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
@@ -382,7 +393,10 @@ mod explicit_registry_tests {
                 0
             };
             assert_eq!(footprint.text_encoder, language + vision, "{id}");
-            assert_eq!(footprint.dit, mlx_gen::safetensors_path_bytes(&dit), "{id}");
+            // sc-20385: the DiT is priced from the logical-weight plan -- a dense bf16 fixture's
+            // resident bytes are its tensor data bytes (the header is not resident), not the file
+            // length.
+            assert_eq!(footprint.dit, 2, "{id}");
             assert_eq!(
                 footprint.vae,
                 mlx_gen::safetensors_path_bytes(base.join("vae")),

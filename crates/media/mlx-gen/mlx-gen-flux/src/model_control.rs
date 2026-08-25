@@ -35,7 +35,7 @@ use mlx_gen::{
     require_control, run_flow_sampler_with_latent_hook, AcceptedControlKinds, Capabilities,
     ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, SizeFloor, TimestepConvention,
+    Quant, Residency, Result, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -74,14 +74,11 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false,
             // dev consumes its guidance scale as an embedded scalar (FLUX.1-dev pattern), not CFG.
             supports_guidance: true,
-            supports_true_cfg: false,
             // Control (required) — the structural hint (pose/canny/depth, input-agnostic).
             conditioning: vec![ConditioningKind::Control],
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // LoRA/LoKr target the base DiT (the control branch is never an adapter target).
             supports_lora: true,
             supports_lokr: true,
@@ -96,34 +93,17 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
                 s.push("linear");
                 s
             },
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
             requires_sigma_shift: FluxVariant::Dev.requires_sigma_shift(),
             // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
             // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
             // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

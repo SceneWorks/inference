@@ -6,7 +6,7 @@
 //! (`tools/dump_sensenova_it2i_realweight.py`). Also asserts [`T2iModel::preprocess_image`] matches
 //! the reference `pixel_values` and the prompt query encodes to the reference's condition ids.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test it2i_realweight -- --ignored --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration it2i_realweight:: -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

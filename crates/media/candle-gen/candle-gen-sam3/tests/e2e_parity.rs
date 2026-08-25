@@ -8,7 +8,7 @@
 //! Run (CUDA build on the Blackwell box):
 //!   SAM3_WEIGHTS=<facebook/sam3 snapshot dir OR model.safetensors> \
 //!   SAM3_E2E_FIXTURE=<.../sam3_oracle/e2e_fixture.safetensors> \
-//!     cargo test -p candle-gen-sam3 --release --features cuda --test e2e_parity -- --ignored --nocapture
+//!     cargo test -p candle-gen-sam3 --release --features cuda --test integration e2e_parity:: -- --ignored --nocapture
 
 use std::path::Path;
 

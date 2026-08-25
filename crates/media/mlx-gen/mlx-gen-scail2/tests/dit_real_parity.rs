@@ -16,7 +16,7 @@
 //! ```
 //!
 //! `#[ignore]` (needs the ~31 GB snapshot + the locally-generated fixtures). Run on macOS with
-//! `cargo test -p mlx-gen-scail2 --test dit_real_parity -- --ignored --nocapture`.
+//! `cargo test -p mlx-gen-scail2 --test integration dit_real_parity:: -- --ignored --nocapture`.
 
 use std::path::PathBuf;
 

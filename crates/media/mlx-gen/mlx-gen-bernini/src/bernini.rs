@@ -47,8 +47,7 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, SizeFloor,
-    WeightsSource,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 
 use mlx_gen_wan::config::WanModelConfig;
@@ -539,25 +538,18 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
                 ConditioningKind::VideoClip,
             ],
-            supports_lora: false,
-            supports_lokr: false,
             samplers: vec!["unipc"],
-            schedulers: Vec::new(),
-            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
             mac_only: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             supports_kv_cache: true,
-            requires_sigma_shift: false,
             // Bernini is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds NO
             // component weights on the generator and loads per generate in phase order — planner
             // (Qwen2.5-VL-7B) → drop → UMT5-XXL T5 → drop → the two co-resident MoE experts + z16 VAE —
@@ -570,22 +562,7 @@ pub fn descriptor() -> ModelDescriptor {
             // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
             supports_sequential_offload: false,
             unconditionally_engages_staged_residency: true,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }
@@ -709,6 +686,9 @@ impl Bernini {
         // request gets the same rejection on both backends.
         validate_bernini_geometry(self.descriptor.id, req)?;
         validate_conditioning_video_clips(req)?;
+        // sc-20264 — refuse the per-clip knobs this engine does not implement rather than reading
+        // them off the request and dropping them.
+        reject_unimplemented_video_clip_knobs(self.descriptor.id, req)?;
         Ok(())
     }
 
@@ -974,11 +954,15 @@ impl Bernini {
 
         // Source ids (videos first, then images — mirrors `PackedForward::build_combos`/packing_vae).
         let (nv, ni) = (src_videos.len(), src_images.len());
-        let sids = assign_source_ids(
-            nv + ni,
-            self.knobs.max_trained_src_id,
-            self.knobs.interpolate_src_id,
-        );
+        // ADS2V is trained with its mandatory source-video/reference-video/first-image triplet;
+        // extra images interpolate over that three-source range. Keep this execution schedule in
+        // lockstep with the request receipt used for admission evidence.
+        let trained_sources = if req.video_mode.as_deref() == Some("ads2v") {
+            3.0
+        } else {
+            self.knobs.max_trained_src_id
+        };
+        let sids = assign_source_ids(nv + ni, trained_sources, self.knobs.interpolate_src_id);
         let video_srcs: Vec<(Array, f64)> = src_videos
             .iter()
             .enumerate()
@@ -1058,7 +1042,7 @@ impl Bernini {
                 cfg.dim / cfg.num_heads,
                 cfg.out_dim,
                 cfg.patch_size,
-                self.knobs.max_trained_src_id,
+                trained_sources,
                 self.knobs.interpolate_src_id,
             );
             let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
@@ -1143,6 +1127,58 @@ fn validate_conditioning_video_clips(req: &GenerationRequest) -> Result<()> {
                     frames.len()
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the [`Conditioning::VideoClip`] knobs Bernini does not implement (sc-20264).
+///
+/// Bernini consumes a `VideoClip` as a **source clip to condition on**: `collect_conditioning` /
+/// `generate_impl` VAE-encode `frames` and hand the latents to the MAR sampler as conditioning
+/// tokens. Neither of the variant's two numeric fields has a mechanism here:
+///
+/// * `strength` is the `1 − strength` denoise mask of the LTX in-context append path. Bernini's
+///   conditioning enters through the guidance mode (`omega_vid` / `omega_img` / `omega_txt`) and the
+///   ViT/VAE conditioning stack, not through a per-clip denoise mask there is anything to weight.
+/// * `frame_idx` is the output latent frame the clip is appended at. Bernini conditions on the clip
+///   as a whole and renders its own `req.frames`-length timeline from scratch — the clip is never
+///   spliced in at an offset.
+///
+/// Until sc-20264 both were read off the request and thrown away — every construction site binds
+/// `Conditioning::VideoClip { frames, .. }`. The sc-19571 rule is that a control either works or is
+/// refused with a clear error, so this is the refusal, and it fires **only on a non-default value**:
+/// the contract defaults (`strength = 1.0`, `frame_idx = 0`) pass through unchanged, which is every
+/// request SceneWorks builds today.
+///
+/// Checked over **every** clip, not the first: Bernini's multi-video modes carry several, so
+/// guarding only clip one would leave the rest silently dropped.
+///
+/// Shared by BOTH providers this crate registers — `bernini` (here) and `bernini_renderer`
+/// (`pipeline.rs`) — since they take the same conditioning through the same encode path.
+///
+/// Typed [`Error::Unsupported`], not [`Error::Msg`]: the worker classifies `Unsupported` as a
+/// user-facing invalid-payload refusal and `Msg` as an opaque internal engine failure.
+pub(crate) fn reject_unimplemented_video_clip_knobs(
+    id: &str,
+    req: &GenerationRequest,
+) -> Result<()> {
+    for clip in req.video_clips() {
+        if clip.strength != 1.0 {
+            return Err(Error::Unsupported(format!(
+                "{id} does not implement VideoClip strength (got {}); remove it or leave it at the \
+                 default 1.0 — Bernini conditions through its guidance mode and has no per-clip \
+                 denoise mask to weight",
+                clip.strength
+            )));
+        }
+        if clip.frame_idx != 0 {
+            return Err(Error::Unsupported(format!(
+                "{id} does not implement VideoClip frame_idx (got {}); remove it or leave it at \
+                 the default 0 — Bernini conditions on the clip as a whole and renders its own \
+                 timeline, so there is no position to splice it at",
+                clip.frame_idx
+            )));
         }
     }
     Ok(())
@@ -1309,6 +1345,160 @@ mod tests {
         assert!(validate_conditioning_video_clips(&req(vec![])).is_ok());
         // a bad clip among several valid ones is still caught.
         assert!(validate_conditioning_video_clips(&req(vec![clip(5), clip(0)])).is_err());
+    }
+
+    /// sc-20264 — `VideoClip.strength` and `frame_idx` were silently dropped (every construction
+    /// site binds `VideoClip { frames, .. }`). Each is now a typed `Unsupported` naming the field
+    /// and the model, on BOTH ids this crate registers.
+    ///
+    /// Non-default values throughout: at the contract defaults the refusal must not fire, which the
+    /// companion test pins.
+    #[test]
+    fn non_default_video_clip_knobs_are_refused_by_name() {
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: vec![Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0u8; 2 * 2 * 3],
+            }],
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = reject_unimplemented_video_clip_knobs(id, &req(conditioning))
+                    .expect_err("a non-default knob must be refused");
+                assert!(
+                    matches!(err, Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+        }
+
+        // Every clip is inspected, not just the first — the multi-video modes carry several.
+        let two_clips = GenerationRequest {
+            conditioning: vec![clip(0, 1.0), clip(7, 1.0)],
+            ..Default::default()
+        };
+        let err = reject_unimplemented_video_clip_knobs(MODEL_ID, &two_clips)
+            .expect_err("clip two's frame_idx must be refused");
+        assert!(err.to_string().contains("frame_idx"), "got: {err}");
+    }
+
+    /// A weights-free snapshot root both MLX bernini ids will `load` from.
+    ///
+    /// Unlike candle, neither MLX `load` is lazy past its config: each reads `config.json` and
+    /// rejects a non-dual-expert model before constructing the Generator, so a bare `/nonexistent`
+    /// dir silently resolves to the 5B preset and fails. A dir holding only the two-key dual-expert
+    /// `config.json` is enough — `BerniniKnobs::from_dir` treats an absent sidecar as defaults, and
+    /// no safetensors is touched until `generate`. That makes the registered `Generator` drivable
+    /// through `validate` here with no weights at all.
+    fn weightless_snapshot_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"model_type": "t2v", "dim": 5120, "dual_model": true}"#,
+        )
+        .expect("write config.json");
+        dir
+    }
+
+    /// sc-20264 (adversarial-review follow-up) — the refusal is pinned **through
+    /// `Generator::validate`**, not by calling the helper.
+    ///
+    /// A helper-only test leaves the wiring unbound: deleting the
+    /// `reject_unimplemented_video_clip_knobs(...)` line from either provider's validate body keeps
+    /// every helper assertion green while the knobs go back to being silently dropped. Both MLX
+    /// bernini ids are drivable weights-free off [`weightless_snapshot_root`], so this pins the real
+    /// registered `Generator` the way the candle sibling does.
+    #[test]
+    fn generator_validate_refuses_non_default_video_clip_knobs_on_both_ids() {
+        let root = weightless_snapshot_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        let registry = crate::provider_registry().unwrap();
+        // 5 frames: `1 + 4·k`, so the clip clears the shape guards that run first and the refusal
+        // is what the request actually trips.
+        let clip = |frame_idx: i32, strength: f32| Conditioning::VideoClip {
+            frames: (0..5)
+                .map(|_| Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0u8; 16 * 16 * 3],
+                })
+                .collect(),
+            frame_idx,
+            strength,
+        };
+        let req = |c: Conditioning| GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 256,
+            height: 256,
+            frames: Some(5),
+            conditioning: vec![c],
+            ..Default::default()
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            let g = registry
+                .load(id, &spec)
+                .unwrap_or_else(|e| panic!("{id}: weights-free load: {e}"));
+            for (conditioning, field) in [(clip(0, 0.6), "strength"), (clip(4, 1.0), "frame_idx")] {
+                let err = g
+                    .validate(&req(conditioning))
+                    .expect_err("a non-default knob must be refused at validate");
+                assert!(
+                    matches!(err, mlx_gen::gen_core::Error::Unsupported(_)),
+                    "{id}/{field}: typed Unsupported, got {err:?}"
+                );
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{id}/{field}: names the field: {msg}");
+                assert!(msg.contains(id), "{id}/{field}: names the model: {msg}");
+            }
+            // The contract defaults must NOT be refused by this check — whatever else validate
+            // decides about the request, it must not be these fields.
+            if let Err(e) = g.validate(&req(clip(0, 1.0))) {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("does not implement VideoClip"),
+                    "{id}: default knobs must pass the refusal: {msg}"
+                );
+            }
+        }
+    }
+
+    /// sc-20264 — the refusal fires only on a value a caller actually set. The contract defaults
+    /// (`strength = 1.0`, `frame_idx = 0`) — every request SceneWorks builds today — pass through,
+    /// as does a request carrying no clip at all.
+    #[test]
+    fn default_video_clip_knobs_still_pass_unchanged() {
+        let default_clip = Conditioning::VideoClip {
+            frames: vec![Image {
+                width: 2,
+                height: 2,
+                pixels: vec![0u8; 2 * 2 * 3],
+            }],
+            frame_idx: 0,
+            strength: 1.0,
+        };
+        for id in [MODEL_ID, crate::pipeline::MODEL_ID] {
+            assert!(reject_unimplemented_video_clip_knobs(
+                id,
+                &GenerationRequest {
+                    conditioning: vec![default_clip.clone()],
+                    ..Default::default()
+                }
+            )
+            .is_ok());
+            assert!(
+                reject_unimplemented_video_clip_knobs(id, &GenerationRequest::default()).is_ok()
+            );
+        }
     }
 
     /// `grid_tokens` = t·h·w / merge².

@@ -3,7 +3,7 @@
 //!
 //! `#[ignore]`d — needs the real `Kwai-Kolors/Kolors-diffusers` snapshot in the HF cache (or
 //! `KOLORS_SNAPSHOT`), with the materialized `tokenizer/tokenizer.json`. Run:
-//!   cargo test -p mlx-gen-kolors --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/ChatGLM3-encoded and cached, AdamW training drives the epsilon flow down, and an adapter is
@@ -11,7 +11,7 @@
 //! onto a fresh Kolors-loaded U-Net (Kolors' U-Net == the SDXL `UNet2DConditionModel`) — merging into
 //! every trained target and forwarding finite under Kolors conditioning shapes.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
@@ -283,7 +283,7 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 
 /// sc-5637 — preview samples. Proves the Kolors render path (install in-progress adapter → ChatGLM
 /// CFG denoise → VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-kolors --release --test trainer_e2e -- --ignored --nocapture kolors_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-kolors --release --test integration -- --ignored --nocapture trainer_e2e::kolors_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real Kolors weights (+ tokenizer.json overlay)"]
 fn kolors_trainer_emits_preview_samples() {

@@ -228,6 +228,7 @@ mod explicit_registry_tests {
             ("connector.safetensors", "F32", 11, 4),
             ("transformer.safetensors", "F32", 13, 4),
             ("upsampler.safetensors", "BF16", 17, 2),
+            ("vae_encoder.safetensors", "BF16", 37, 2),
             ("vae_decoder.safetensors", "BF16", 19, 2),
             ("audio_vae.safetensors", "BF16", 23, 2),
             ("vocoder.safetensors", "BF16", 29, 2),
@@ -272,14 +273,17 @@ mod explicit_registry_tests {
                 .support,
             MemoryStrategySupport::Implemented
         ));
-        // Gemma + connector are retained as bf16, transformer + upsampler preserve storage, and all
-        // three decode components are unconditionally materialized as f32.
-        assert_eq!(contract.asset_facts.conditioning_bytes, 31 * 2 + 11 * 2);
+        // Gemma + connector are retained as bf16, the request-scoped VAE encoder and all three
+        // decode components materialize as f32, and transformer + upsampler preserve storage.
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes,
+            31 * 2 + 11 * 2 + 37 * 4
+        );
         assert_eq!(contract.asset_facts.transformer_bytes, 13 * 4 + 17 * 2);
         assert_eq!(contract.asset_facts.decoder_bytes, 19 * 4 + 23 * 4 + 29 * 4);
         assert_eq!(
             contract.asset_facts.base_bytes,
-            31 * 2 + 11 * 2 + 13 * 4 + 17 * 2 + 19 * 4 + 23 * 4 + 29 * 4
+            31 * 2 + 11 * 2 + 37 * 4 + 13 * 4 + 17 * 2 + 19 * 4 + 23 * 4 + 29 * 4
         );
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,

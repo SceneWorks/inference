@@ -4,9 +4,9 @@
 //!
 //! `#[ignore]` — needs the converted snapshot (~53 GB). Run:
 //!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
-//!     cargo test -p mlx-gen-ideogram --test edit_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-ideogram --test integration edit_smoke:: -- --ignored --nocapture
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

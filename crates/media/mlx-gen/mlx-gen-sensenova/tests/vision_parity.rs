@@ -4,7 +4,7 @@
 //! on a 4×4 patch grid. Exercises the full-kernel `patch_embedding` + GELU, the interleaved 2D
 //! RoPE, and the 2×2-strided `dense_embedding` patch-merge.
 //!
-//! Run: `cargo test -p mlx-gen-sensenova --test vision_parity -- --nocapture`
+//! Run: `cargo test -p mlx-gen-sensenova --test integration vision_parity:: -- --nocapture`
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, NeoVisionEmbedder};

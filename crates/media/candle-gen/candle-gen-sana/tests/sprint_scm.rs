@@ -13,30 +13,11 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{CancelFlag, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
 use candle_gen::{ScmScheduler, Weights};
-use candle_gen_sana::{denoise_sprint, SanaTransformer, SanaTransformerConfig};
+use candle_gen_sana::{denoise_sprint, SanaTransformer};
 
-/// Tiny SANA-Sprint config (guidance embedder + qk-norm ON), matching the fixture the parity test uses.
-fn tiny_sprint_config() -> SanaTransformerConfig {
-    SanaTransformerConfig {
-        in_channels: 4,
-        out_channels: 4,
-        num_attention_heads: 2,
-        attention_head_dim: 8, // inner = 16
-        num_layers: 2,
-        num_cross_attention_heads: 2,
-        cross_attention_head_dim: 8,
-        caption_channels: 24,
-        mlp_ratio: 2.5,
-        patch_size: 1,
-        norm_eps: 1e-6,
-        caption_norm_eps: 1e-5,
-        attn_qk_norm_eps: 1e-5,
-        attn_eps: 1e-15,
-        guidance_embeds: true,
-        guidance_embeds_scale: 0.1,
-        qk_norm: true,
-    }
-}
+use crate::common;
+
+use common::tiny_sprint_config;
 
 /// Build the tiny Sprint trunk from the committed golden (the `w.`-prefixed weights only).
 fn tiny_sprint_trunk() -> SanaTransformer {

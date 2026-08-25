@@ -440,7 +440,18 @@ mod tests {
             cos: Array::from_slice(&[1.0f32; 2], &[1, 2]),
             sin: Array::from_slice(&[0.0f32; 2], &[1, 2]),
         };
-        assert!(apply_rope(&x, &rope).is_err());
+        // Asserted by MESSAGE (sc-19488): the rejection must come from a table-shape guard, not
+        // from a downstream reshape blowing up on the wrong element count. The guard moved when
+        // SC-18319 replaced this file's local rotation with the shared kernel: it is now
+        // `qkv::apply_rope`'s pre-reshape element-count check, so the message pinned here is the
+        // shared kernel's rather than the retired `mage_flow: msrope table is` one.
+        let msg = apply_rope(&x, &rope)
+            .expect_err("a [1, 2] msrope table cannot rotate this stream")
+            .to_string();
+        assert!(
+            msg.contains("qkv::apply_rope: cos table has"),
+            "the table-shape guard must be what rejects this, not the reshape below it: {msg}"
+        );
     }
 
     /// A tiny 1-head, head_dim-4 joint attention (dim 4) built from zeroed weights — enough to

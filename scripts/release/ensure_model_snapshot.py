@@ -22,6 +22,7 @@ if __package__:
         expected_materialization_receipt,
         load_model,
         materialization_payload_files,
+        snapshot_path,
         verify_model_payload_files,
         verify_snapshot,
         verify_snapshot_payload,
@@ -35,6 +36,7 @@ else:
         expected_materialization_receipt,
         load_model,
         materialization_payload_files,
+        snapshot_path,
         verify_model_payload_files,
         verify_snapshot,
         verify_snapshot_payload,
@@ -42,6 +44,170 @@ else:
 
 
 Download = Callable[..., Any]
+
+
+def hf_cache_location(snapshot: Path) -> tuple[Path, str, str] | None:
+    """Split a hub-cache path into `(root, repo_directory, revision_directory)`, else None.
+
+    A hub cache lays a repo out as `<root>/models--<org>--<name>/{blobs,refs,snapshots}`, so the
+    root is simply the grandparent of the `snapshots/<revision>` directory. Recovering it is what
+    makes the cache-resident case self-healing rather than an operator chore: `snapshot_download`
+    given `cache_dir=<root>` and NO `local_dir` writes *through* the cache -- blob, ref and
+    snapshot symlink together -- and lands the result at exactly this path.
+
+    That is the distinction the Windows CUDA lane fell down on. `local_dir=<this path>` makes
+    `huggingface_hub` resolve each blob into the cache (i.e. into this very directory) and then
+    copy it to `local_dir`, which is the same file: `shutil.SameFileError`. Anything that did not
+    collide would land outside the cache's own bookkeeping.
+
+    The two NAME segments come back with the root because the caller has to check them: the hub
+    derives both from the repo id and the revision, so a path whose `models--*` or terminal
+    segment disagrees with the manifest is a mispointed variable, and healing it would fetch into
+    a sibling directory rather than this one.
+
+    Anchored at the TAIL, not at any `snapshots` component: the path a lane hands over IS the
+    snapshot directory, so the layout has to be its last three segments. A `hub/` ancestor is NOT
+    required, because `HF_HUB_CACHE` can put that layout under any directory name.
+    """
+    parts = snapshot.parts
+    if len(parts) < 3 or parts[-2] != "snapshots" or not parts[-3].startswith("models--"):
+        return None
+    # `Path(*parts[:0])` is `.`, the right root for a cache named relative to the cwd.
+    return Path(*parts[:-3]), parts[-3], parts[-1]
+
+
+def _download_kwargs(model: dict) -> dict:
+    """Return the manifest-derived kwargs shared by the cache-heal and plain-directory fetches."""
+    kwargs = {
+        "repo_id": model["repository"],
+        "revision": model["revision"],
+        # Public release fixtures stay explicitly anonymous. Gated checkpoints
+        # opt in to the runner's configured Hugging Face credential without
+        # placing the token in the workflow or command line.
+        "token": bool(model.get("requires_auth", False)),
+    }
+    # Optional per-model download allow-list. When set, materialize ONLY these repo-relative paths
+    # (snapshot_download `allow_patterns`) instead of the whole repo — for repos whose pinned
+    # checkpoints are a small fraction of a large repo (e.g. `hkchengrex/MMAudio` ships ~46 GB of
+    # training checkpoints + weight variants the inference stack never loads). Absent ⇒ whole-repo
+    # download, the default for every other model. `verify_snapshot` still enforces `expected_files`,
+    # so an under-fetch (a needed file left off the list) fails loudly right after download.
+    #
+    # The allow-list is scoped by the MODEL, not by where the bytes land, so a cache-resident
+    # target is constrained identically -- an MMAudio-shaped row must not become a whole-repo
+    # fetch just because the lane points at a cache.
+    allow_patterns = model.get("download_files")
+    if allow_patterns:
+        kwargs["allow_patterns"] = list(allow_patterns)
+    return kwargs
+
+
+def _retire_stale_materialization_provenance(model: dict, snapshot: Path) -> None:
+    """Drop provenance an interrupted earlier attempt left behind, after a complete refetch.
+
+    A canonical model at a cache-shaped path can carry a `MATERIALIZATION_INCOMPLETE` marker: the
+    staging path publishes it before any transfer, so any interruption of a main-era run against
+    this destination leaves one. `verify_materialization_provenance` refuses on that marker
+    unconditionally, and nothing on the cache-heal path used to remove it — so the heal re-fetched
+    multi-GB through the cache, failed verification on the marker again, and reported the failure as
+    an `expected_files` shortfall. Every run, forever. The staging path recovers the same state by
+    unlinking and restaging; this is that semantics for the destinations staging does not own.
+
+    Only ever called after the cache-correct fetch has returned, so the marker is describing an
+    attempt that has been superseded byte for byte. A stray receipt is dropped for the same reason
+    and on the same evidence — the caller only heals models that declare no alternate source, so
+    any receipt here is left over from a manifest row that no longer exists, and the staging path
+    already unlinks it (`receipt_path.unlink(missing_ok=True)`) before its own download.
+    """
+    for name in (MATERIALIZATION_INCOMPLETE, MATERIALIZATION_RECEIPT):
+        path = snapshot / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError(
+                f"{model['key']} snapshot at {snapshot} carries an unsafe {name} entry, so the "
+                "cache-correct fetch cannot retire it. Remove it by hand and re-run."
+            )
+        if not path.exists():
+            continue
+        print(
+            f"retiring the superseded {name} left in {snapshot} by an earlier interrupted "
+            "materialization",
+            flush=True,
+        )
+        path.unlink()
+
+
+def _heal_in_cache(
+    model: dict,
+    snapshot: Path,
+    location: tuple[Path, str, str],
+    download: Download,
+    *,
+    require_materialization_provenance: bool = False,
+) -> bool:
+    """Materialize a cache-resident snapshot through the cache itself, then re-verify.
+
+    The FIRST refusal is a precondition, checked before a byte moves. The hub derives both name
+    segments deterministically -- `models--<org>--<name>` from the repo id, and the terminal
+    directory from the resolved revision -- so a path whose segments disagree with the manifest
+    row is a mispointed variable. Healing it would still succeed: `cache_dir` sends the fetch to
+    the repo's OWN directory under this root, filling a sibling of the path the lane asked for,
+    which then fails verification after a multi-GB download. Refusing up front costs nothing and
+    names the discrepancy instead of reporting it as a missing-files shortfall.
+
+    The refusals AFTER the download are backstops, not the ordinary path: they fire only when the
+    cache-correct fetch has already run, so the problem can no longer be repaired by telling the
+    operator to run that fetch by hand.
+    """
+    cache_root, repo_directory, revision_directory = location
+    expected_repo_directory = "models--" + model["repository"].replace("/", "--")
+    if repo_directory != expected_repo_directory or revision_directory != model["revision"]:
+        raise RuntimeError(
+            f"{model['key']} snapshot variable points into the Hugging Face cache at "
+            f"{cache_root} at the wrong repository/revision: expected "
+            f"{expected_repo_directory}/snapshots/{model['revision']}, path says "
+            f"{repo_directory}/snapshots/{revision_directory} ({snapshot}). Refusing to fetch -- "
+            f"materializing {model['repository']}@{model['revision']} through this cache would "
+            "fill that repo's own sibling directory and leave this path exactly as wrong as it "
+            "is. Correct the lane's snapshot variable."
+        )
+    print(
+        f"materializing {model['repository']}@{model['revision']} through the Hugging Face "
+        f"cache at {cache_root} (cache_dir, no local_dir)",
+        flush=True,
+    )
+    try:
+        download(cache_dir=str(cache_root), **_download_kwargs(model))
+    except Exception as error:
+        raise RuntimeError(
+            f"{model['key']} snapshot at {snapshot} is cache-resident and the cache-correct "
+            f"fetch into {cache_root} failed: {error}. Check that "
+            f"{model['repository']}@{model['revision']} is reachable from this runner's "
+            "credential and that the volume has room, or point this lane's snapshot variable "
+            "at a plain directory outside any models--*/snapshots/* layout."
+        ) from error
+    # Nothing is written into the snapshot directory by hand -- no revision marker. The cache
+    # names the revision in the directory itself, and `verify_snapshot` reads it from there. What
+    # an EARLIER attempt wrote by hand is retired, though: an incomplete marker left in a canonical
+    # cache directory outlives the interruption it recorded and would otherwise fail every future
+    # run, after the download, with a message about the wrong thing.
+    _retire_stale_materialization_provenance(model, snapshot)
+    try:
+        verify_snapshot(
+            model,
+            snapshot,
+            require_materialization_provenance=require_materialization_provenance,
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{model['key']} snapshot at {snapshot} still does not satisfy the pin after "
+            f"materializing through the Hugging Face cache at {cache_root}: {error}. The "
+            "cache-correct fetch already ran, so this is not the SameFileError shape it "
+            f"replaced -- verify that {model['repository']}@{model['revision']} publishes "
+            "every path in the manifest's expected_files (and that download_files, if set, "
+            "covers them), or point this lane's snapshot variable at a plain directory "
+            "outside any models--*/snapshots/* layout."
+        ) from error
+    return True
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -226,6 +392,26 @@ def ensure_snapshot(
             if actual_revision != model["revision"]:
                 raise initial_error
 
+    # A COMPLETE snapshot already returned above, from `verify_snapshot`. Reaching here means the
+    # pinned revision is absent or short of `expected_files`, and WHERE it lives decides how it is
+    # fetched. A cache-resident target is materialized through the cache; only a plain directory
+    # takes `local_dir`, which is what exploded on the Windows CUDA box when it was aimed at
+    # `<cache>/hub/models--*/snapshots/<revision>`.
+    # Alternate-source (receipt) models never take the heal: their bytes come from a different
+    # repository/revision than the canonical layout the cache directory names, so a `cache_dir`
+    # fetch could not land them at this path. The staging projection below handles a cache-shaped
+    # destination for them (see
+    # `test_materialization_replaces_stale_destination_symlinks_and_extra_payload`).
+    location = hf_cache_location(snapshot)
+    if location is not None and expected_materialization_receipt(model) is None:
+        return _heal_in_cache(
+            model,
+            snapshot,
+            location,
+            download,
+            require_materialization_provenance=require_materialization_provenance,
+        )
+
     receipt = expected_materialization_receipt(model)
     source_repository = (
         receipt["materialization_repository"] if receipt is not None else model["repository"]
@@ -343,7 +529,7 @@ def download_snapshot(**kwargs: Any) -> Any:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="model key in real-weight-models.toml")
-    parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--snapshot", required=True, type=snapshot_path)
     parser.add_argument(
         "--manifest",
         type=Path,

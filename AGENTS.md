@@ -15,6 +15,14 @@ fixtures and tooling live in `release/` and `scripts/release/`.
 
 - `./scripts/check-workspace.py` validates workspace membership and dependency
   boundaries; run it after manifest or crate-layout changes.
+- `python3 scripts/check_clock_assertions.py --check-baseline .` must pass
+  before every push: it is the ratchet on wall-clock-dependent test assertions
+  (baseline `scripts/clock_assertions_baseline.txt`; `--write-baseline` only
+  with a recorded justification), and CI's `workspace` job runs the same check.
+- `scripts/git-hooks/pre-push` runs both checks automatically before each push
+  (seconds-fast; no builds, no tests). Install it once per clone with
+  `git config core.hooksPath scripts/git-hooks`; skip a single push with
+  `git push --no-verify`.
 - `python3 -m unittest discover -s scripts/tests -v` runs repository tooling
   tests.
 - `cargo test --locked -p core-llm -p core-llm-testkit` runs a focused contract

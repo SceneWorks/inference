@@ -60,10 +60,24 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 /// every default (unset-negative) render — an earlier `is_empty() → Vec::new()` shortcut produced
 /// 77×EOS with NO BOS, changing every hidden state and shifting the pooled-at-argmax EOS selection
 /// from index 1 to 0 (F-004; same bug family as z-image sc-8958).
+///
+/// An over-long prompt is **truncated** here, deliberately: SD3.5 carries its long-form prompt on
+/// the 256-token T5 lane, and diffusers' `_get_clip_prompt_embeds` likewise tokenizes CLIP with
+/// `truncation=True, max_length=77`. The two CLIP lanes (L and bigG) share this one id sequence.
 fn clip_token_ids(tokenizer: &ClipBpeTokenizer, prompt: &str) -> Result<Vec<i32>> {
     let mut ids = tokenizer.tokenize(prompt)?;
     if ids.len() > CLIP_MAX_LENGTH {
         ids.truncate(CLIP_MAX_LENGTH);
+        // sc-20528: restore the EOS the truncation just cut off. Until sc-20528,
+        // `ClipBpeTokenizer::tokenize` capped at 77 itself and wrote eos into the last slot; it now
+        // returns the full encoding (SDXL windows it instead), so a bare `truncate` would hand the
+        // encoder `[BOS, 76 content]` with NO end-of-text token. `ClipTextEncoder::forward` pools
+        // at `argmax(row)` — EOS is the highest CLIP id, so with no EOS present the pooled vector
+        // (SD3's adaLN conditioning, and half of the 2048-wide pooled projection) would be gathered
+        // at whichever content token happened to hold the largest id: silent quality loss on every
+        // >77-token SD3.5 render and on SD3 LoRA training captions. Terminating the window keeps
+        // the pre-sc-20528 ids byte-for-byte.
+        ids[CLIP_MAX_LENGTH - 1] = tokenizer.eos_id();
     }
     Ok(ids)
 }
@@ -506,6 +520,66 @@ mod tests {
             row,
             expected.as_slice(),
             "padded tokenize(\"\") matches by-hand"
+        );
+    }
+
+    /// sc-20528: a prompt past CLIP's window must still END in EOS. `ClipBpeTokenizer::tokenize`
+    /// used to cap at 77 and write eos into the last slot; it now returns the full encoding, so
+    /// `clip_token_ids`' truncation has to re-terminate the window itself. Without that, the row is
+    /// `[BOS, 76 content]` and `ClipTextEncoder::forward`'s `argmax` EOS-pooling gathers at an
+    /// arbitrary content token — silently wrong adaLN conditioning on long SD3.5 prompts and on SD3
+    /// LoRA training captions (`training.rs` → `encode_prompt`).
+    #[test]
+    fn over_long_prompt_truncates_to_an_eos_terminated_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tok = synthetic_clip_tokenizer(&tmp);
+        // The synthetic vocab holds only single-char words, so "a " x100 is a legal ~100-word prompt.
+        let prompt = "a ".repeat(100);
+
+        // The tokenizer itself no longer caps — that is what makes the re-termination load-bearing.
+        assert_eq!(tok.tokenize(&prompt).unwrap().len(), 102, "BOS + 100 + EOS");
+        assert_eq!(
+            tok.eos_id(),
+            CLIP_EOS_ID,
+            "synthetic eos is the real CLIP eos"
+        );
+
+        let ids = clip_token_ids(&tok, &prompt).unwrap();
+        assert_eq!(ids.len(), CLIP_MAX_LENGTH, "exactly one CLIP window");
+        assert_eq!(ids[0], 49406, "the window still opens with BOS");
+        assert_eq!(
+            ids[CLIP_MAX_LENGTH - 1],
+            CLIP_EOS_ID,
+            "the truncated window must be EOS-terminated"
+        );
+        assert!(
+            ids[1..CLIP_MAX_LENGTH - 1].iter().all(|&t| t == 320),
+            "the surviving 75 slots are content"
+        );
+        // EOS appears exactly once, at the end — so `argmax` pools at the true end of text.
+        assert_eq!(
+            ids.iter().position(|&t| t == CLIP_EOS_ID),
+            Some(CLIP_MAX_LENGTH - 1),
+            "argmax EOS-pooling must land on the final slot"
+        );
+    }
+
+    /// The other half of the contract: a prompt inside the window is passed through untouched, so
+    /// every ≤77-token SD3.5 render keeps its pre-sc-20528 ids byte for byte.
+    #[test]
+    fn short_prompt_clip_ids_are_the_tokenizer_encoding_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tok = synthetic_clip_tokenizer(&tmp);
+        for prompt in ["", "a", "a b", "a b a b a"] {
+            assert_eq!(
+                clip_token_ids(&tok, prompt).unwrap(),
+                tok.tokenize(prompt).unwrap(),
+                "{prompt:?} fits the window and must not be rewritten"
+            );
+        }
+        assert_eq!(
+            clip_token_ids(&tok, "a b").unwrap(),
+            vec![49406, 320, 321, 49407]
         );
     }
 

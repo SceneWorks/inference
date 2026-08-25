@@ -2,14 +2,14 @@
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + the golden from
 //! `tools/dump_sdxl_text_encoder_golden.py`. Run with:
-//!   cargo test -p mlx-gen-sdxl --release --test text_encoder_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration text_encoder_real_weights:: -- --ignored --nocapture
 //!
 //! Validates the SDXL conditioning exactly as the reference builds it:
 //! `concat(te1.hidden_states[-2], te2.hidden_states[-2])` (penultimate layer, before final LN) and
 //! `te2.pooled` (projected EOS). Reference + Rust both f32, so tolerances are tight — this isolates
 //! the encoder math (the production fp16 rounding is absorbed into the e2e gate, S5).
 
-mod common;
+use crate::common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::{load_text_encoder_1, load_text_encoder_2};

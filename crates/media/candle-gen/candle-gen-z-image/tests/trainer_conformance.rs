@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! set Z_IMAGE_SNAPSHOT=C:\Users\…\models--Tongyi-MAI--Z-Image-Turbo\snapshots\<hash>
-//! cargo test -p candle-gen-z-image --features cuda --release --test trainer_conformance -- --ignored --nocapture
+//! cargo test -p candle-gen-z-image --features cuda --release --test integration trainer_conformance:: -- --ignored --nocapture
 //! ```
 //!
 //! `trainer_conformance` constructs a fresh trainer per `train()`-invoking check (the cancellation

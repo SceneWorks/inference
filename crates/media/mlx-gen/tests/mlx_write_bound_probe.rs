@@ -18,7 +18,7 @@
 //! Run explicitly:
 //!
 //! ```text
-//! cargo test -p mlx-gen --test mlx_write_bound_probe -- --ignored --nocapture --test-threads=1
+//! cargo test -p mlx-gen --test integration mlx_write_bound_probe:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Probe rules (avoid the false greens that hid this): **position-dependent** data (`i % 251`);

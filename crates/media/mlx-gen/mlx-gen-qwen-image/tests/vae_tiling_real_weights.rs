@@ -6,7 +6,7 @@
 //!   3. the full tiled decode matches the untiled decode within blend tolerance, for both a random and
 //!      a VAE-encoded latent (no seams → coherent).
 //!
-//!   cargo test -p mlx-gen-qwen-image --release --test vae_tiling_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-qwen-image --release --test integration vae_tiling_real_weights:: -- --ignored --nocapture
 
 use mlx_gen::tiling::{SpatialTiling, TilingConfig};
 use mlx_gen_qwen_image::{load_vae, QwenVae};

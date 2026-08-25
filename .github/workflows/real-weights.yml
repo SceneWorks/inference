@@ -12,6 +12,10 @@ name: Real-weight validation
 #   rw-mage     Qwen-Image + Qwen-Image-Edit + Fun-Controlnet-Union  ~170 GiB  nax-macos-2
 #               MLX re-hosts, both PiD students, Gemma-2-2B,
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
+#   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB BOTH boxes
+#               FL2VA/audio_vae/ + tokenizer/ + the TE shard index,
+#               PLUS the ~840 KB operator diffusers VAE reference
+#               (`MINIMAX_H3_VIDEO_VAE_REFERENCE`)  (sc-18932)
 #   rw-sa3      Stable Audio 3 / SAME + F3 Krea q4 base cache        pinned    nax-macos
 #   rw-krea     Krea Realtime 14B + Wan style/distill LoRAs          ~20 GiB   nax-macos-2
 #   rw-audio    Kokoro, MOSS SFX/TTSD/TTS-Realtime, ACE-Step, ...    ~42 GiB   nax-macos-2
@@ -40,6 +44,14 @@ name: Real-weight validation
 # in Actions, so it cannot self-heal. Therefore: **every box carrying `rw-mage` must have the bundle
 # provisioned by hand, and adding the label to a box without it is what actually breaks `mlx-media`
 # — not moving the label around.**
+#
+# sc-18932 added a SECOND asset in that class, and it is a per-box requirement for the same reason:
+# `MINIMAX_H3_VIDEO_VAE_REFERENCE`, the ~840 KB `(latent, decoded)` pair produced by running the
+# official diffusers `AutoencoderKLMiniMaxH3` over the real `vae/`. It exists on no Hub, this
+# workflow refuses to regenerate it (no approved wheel lock is a torch environment), and without it
+# `mlx-minimax-h3` fails closed on its last step — deliberately, because that step is the only gate
+# in either backend that can catch a layout error against real weights. Producer command and the
+# variable convention are in that job.
 #
 # Both boxes had the bundle when checked on 2026-08-05, but that historical fact is not a current
 # label or filesystem guarantee. `Require operator-provisioned Mage oracle seed` remains the live
@@ -113,7 +125,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -121,6 +133,17 @@ on:
         default: ""
       migrate_mage_edit_variant_manifest:
         description: Converge and durably certify the exact Mage manifest pair on the active rw-mage seed after full validation (media only)
+        type: boolean
+        required: false
+        default: false
+      # sc-17156 — OFF by default and deliberately not a `profile` option, so it can never ride a
+      # bulk `all` sweep. The two reasons are in the step itself; the short version is that the box
+      # behind `[self-hosted, windows, cuda, real-weights]` is ONE machine (`MICHAEL-TRX50`) with two
+      # listeners, `default_device()` hardcodes `cuda:0`, and the probe's own idle-baseline guard
+      # turns a co-tenant into a red rather than a wrong number — so a multi-hour render must be
+      # dispatched alone rather than raced against whatever else the sweep put on the card.
+      minimax_h3_vram_probe:
+        description: Measure MiniMax-H3 candle vramGbByTier (minimax-h3 profile; needs the FULL snapshot and an idle card)
         type: boolean
         required: false
         default: false
@@ -341,8 +364,8 @@ jobs:
 
             # Gate 1 — conversion faithfulness: the published pack must be BIT-identical to the
             # in-app load-time pack, or the shipped tier and a dense-source render diverge.
-            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
-              packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+            cargo test --locked --release -p mlx-gen-chroma --test integration \
+              auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
               --test-threads=1 | tee "$RUNNER_TEMP/chroma-q$bits-identity.log"
             sed -n 's/^.*SC16462_IDENTITY //p' "$RUNNER_TEMP/chroma-q$bits-identity.log" \
               >> "$RUNNER_TEMP/chroma-sc16462-identity.jsonl"
@@ -352,8 +375,8 @@ jobs:
             # actually smaller. Deliberately NO pixel-identity threshold against the bf16-auxiliary
             # render: packing the text encoder to the selected tier is supposed to move the
             # conditioning, and gating on identity would only pass by not doing the work.
-            cargo test --locked --release -p mlx-gen-chroma --test auxiliary_tier_comparison \
-              compare_auxiliary_widths -- --ignored --exact --nocapture --test-threads=1 \
+            cargo test --locked --release -p mlx-gen-chroma --test integration \
+              auxiliary_tier_comparison::compare_auxiliary_widths -- --ignored --exact --nocapture --test-threads=1 \
               | tee "$RUNNER_TEMP/chroma-q$bits-comparison.log"
             sed -n 's/^.*auxiliaries @ //p' "$RUNNER_TEMP/chroma-q$bits-comparison.log" \
               >> "$RUNNER_TEMP/chroma-sc16462-comparison.jsonl"
@@ -498,8 +521,8 @@ jobs:
             SC16462_BASELINE="$CHROMA_SNAPSHOT/q$bits" \
             SC16462_OUT="$CHROMA_BUILT/q$bits" \
             SC16462_MODEL="$CHROMA_MODEL" \
-              cargo test --locked --release -p mlx-gen-chroma --test auxiliary_pack_identity \
-                packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
+              cargo test --locked --release -p mlx-gen-chroma --test integration \
+                auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization -- --ignored --exact --nocapture \
                 --test-threads=1
             cp -R "$CHROMA_BUILT/q$bits/identity-q$bits" "$CHROMA_PACKED/q$bits"
             diff -qr -x text_encoder -x vae "$CHROMA_SNAPSHOT/q$bits" "$CHROMA_PACKED/q$bits"
@@ -785,7 +808,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-kolors \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -897,7 +920,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-sdxl-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-sdxl \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -993,7 +1016,7 @@ jobs:
           export DECODE_QUALITY_IMPLEMENTATION_FINGERPRINT
           log="$RUNNER_TEMP/decode-quality-v2-chroma-$QUALITY_MODEL-${{ matrix.candidate.geometry }}.log"
           out="$(cargo test --locked --release -p mlx-gen-chroma \
-            --test decode_quality_admission production_latent_quality_admission \
+            --test integration decode_quality_admission::production_latent_quality_admission \
             -- --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$log" /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
           python3.12 scripts/ci/collect_decode_quality_admission.py \
@@ -1183,8 +1206,8 @@ jobs:
             # `--exact` AFTER `--`: it is a libtest flag, and libtest is also what consumes
             # `--ignored`. The filter itself is cargo's positional test-name argument.
             out="$(cargo test --locked --release -p mlx-gen-chroma \
-              --test memory_ladder_real_weights \
-              "$name" -- --exact --ignored --test-threads=1 --nocapture 2>&1 \
+              --test integration \
+              memory_ladder_real_weights::"$name" -- --exact --ignored --test-threads=1 --nocapture 2>&1 \
               | tee "$RUNNER_TEMP/chroma-ladder-$name.log" /dev/stderr)"
             echo "::endgroup::"
             # A rename, a typo, or a lost `#[ignore]` all produce "0 passed" and exit 0. This is
@@ -1259,7 +1282,7 @@ jobs:
       - name: Run Mage request-memory lifecycle
         run: >-
           cargo test --locked --release -p mlx-gen-mage
-          --test request_memory_scope_real_weights -- --ignored --nocapture
+          --test integration request_memory_scope_real_weights:: -- --ignored --nocapture
 
   # sc-18249: the SANA tiled-decode drift ceiling (`DECODE_TILING_MEAN_ABS_U8 = 6.0`) was enforced
   # only by `#[ignore]` real-weight tests no workflow referenced — the exact sc-17250 shape: a
@@ -1354,16 +1377,16 @@ jobs:
           # carry). Per invocation rather than aggregate, so one invocation matching two tests
           # can never cover for the other matching none.
           out="$(cargo test --locked --release -p mlx-gen-sana \
-            --test memory_ladder_real_weights \
-            the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            memory_ladder_real_weights::the_tiled_decode_drift_is_resampled_across_production_latents -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$SANA_DRIFT_LOG" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::the resample test did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
             exit 1
           fi
           out="$(cargo test --locked --release -p mlx-gen-sana \
-            --test memory_ladder_real_weights \
-            the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            memory_ladder_real_weights::the_published_decode_tile_domain_is_swept_against_the_whole_image_decode -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee -a "$SANA_DRIFT_LOG" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::the domain sweep did not run exactly one passing test — a rename or a filter typo would make this step vacuously green" >&2
@@ -1490,8 +1513,8 @@ jobs:
           mkdir -p "$MEMORY_EVIDENCE_OUTPUT_DIR"
           set -o pipefail
           cargo test --locked --release -p mlx-gen-z-image \
-            --test sequential_residency_real_weights \
-            sequential_bounds_peak_within_declared_decode_drift -- --ignored --exact --test-threads=1 --nocapture \
+            --test integration \
+            sequential_residency_real_weights::sequential_bounds_peak_within_declared_decode_drift -- --ignored --exact --test-threads=1 --nocapture \
             2>&1 | tee "$MEMORY_EVIDENCE_LOG"
           python3.12 scripts/release/verify_model_snapshot.py \
             --model z-image-turbo \
@@ -1575,8 +1598,8 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model qwen3-0.6b --snapshot "$MLX_LLM_QWEN3_MODEL"
       - name: Run representative conformance
         run: |
-          cargo test --locked -p mlx-llm --test conformance real_model_passes_core_llm_conformance -- --ignored --nocapture
-          cargo test --locked -p mlx-llm --test conformance real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p mlx-llm --test integration conformance::real_model_passes_core_llm_conformance -- --ignored --nocapture
+          cargo test --locked -p mlx-llm --test integration conformance::real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
 
   # sc-17250: the 16 GB JoyCaption snapshot was maintained on a runner for a year while NO workflow
   # ran the four `#[ignore]` tests it backs — golden-token VLM parity that was protecting nothing.
@@ -1658,8 +1681,8 @@ jobs:
           run_one() {
             local name="$1"
             local out
-            out="$(cargo test --locked --release -p mlx-llm --test joycaption \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            out="$(cargo test --locked --release -p mlx-llm --test integration \
+              joycaption::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -1783,8 +1806,8 @@ jobs:
         run: |
           set -o pipefail
           out="$(SDXL_SNAPSHOT="$SDXL_N1_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-sdxl --test vae_real_weights \
-            native_decode_seam_is_byte_exact_to_pre_seam_engine \
+            cargo test --locked --release -p mlx-gen-sdxl --test integration \
+            vae_real_weights::native_decode_seam_is_byte_exact_to_pre_seam_engine \
             -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
       - name: Derive immutable Mage oracle cache key
@@ -2000,8 +2023,8 @@ jobs:
           echo "MAGE_FLOW_TE_GOLDEN=$MAGE_GOLDEN_DIR/mage_flow_te_golden.safetensors" >> "$GITHUB_ENV"
       - name: Run provider conformance
         run: >-
-          cargo test --locked -p mlx-gen-z-image --test conformance
-          z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked -p mlx-gen-z-image --test integration
+          conformance::z_image_turbo_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-17739 — the first real-weight gate `mlx-gen-lens` has ever had. Run as TWO cargo
       # invocations, deliberately: each conformance run holds a ~21 GiB model resident across ~8
       # renders, and running both ids in one process was SIGKILLed on the dev Mac. Separate processes
@@ -2010,12 +2033,12 @@ jobs:
       # covers the guided `[pos; neg]` path. Both resolve from the one snapshot.
       - name: Run Lens provider conformance (turbo — the CFG-off default path)
         run: >-
-          cargo test --locked --release -p mlx-gen-lens --test conformance
-          lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked --release -p mlx-gen-lens --test integration
+          conformance::lens_turbo_satisfies_gen_core_contract -- --ignored --nocapture
       - name: Run Lens provider conformance (base — the guided path)
         run: >-
-          cargo test --locked --release -p mlx-gen-lens --test conformance
-          lens_base_satisfies_gen_core_contract -- --ignored --nocapture
+          cargo test --locked --release -p mlx-gen-lens --test integration
+          conformance::lens_base_satisfies_gen_core_contract -- --ignored --nocapture
       # sc-14038 DoD gate — the ONLY automatic run of the Qwen3-VL text-encoder parity suite. It
       # needs both the 8.875 GB `text_encoder/` component and the CPU-dumped boundary golden,
       # neither of which the PR lanes have. It also carries the self-invalidating assertion that
@@ -2023,11 +2046,11 @@ jobs:
       # numerically (today it cannot, so `verify_text_config` guards that instead).
       - name: Run Mage-Flow text-encoder parity
         run: >-
-          cargo test --locked --release -p mlx-gen-mage --test te_parity_real_weights
+          cargo test --locked --release -p mlx-gen-mage --test integration te_parity_real_weights::
           -- --ignored --nocapture
       - name: Run Mage-VAE all-geometry parity
         run: >-
-          cargo test --locked --release -p mlx-gen-mage --test vae_decode_real_weights
+          cargo test --locked --release -p mlx-gen-mage --test integration vae_decode_real_weights::
           -- --ignored --nocapture
       # SC-15507: one loaded provider executes A -> B -> A request scopes, observes cancellation at
       # Mage's terminal post-trace check, injects an error outcome after real work, and proves both
@@ -2039,21 +2062,21 @@ jobs:
           MAGE_REQUEST_SCOPE_QUANT: bf16
         run: >-
           cargo test --locked --release -p mlx-gen-mage
-          --test request_memory_scope_real_weights -- --ignored --nocapture
+          --test integration request_memory_scope_real_weights:: -- --ignored --nocapture
       - name: Run Mage-Flow instruction-edit parity
         run: |
           status=0
           MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
+            cargo test --locked --release -p mlx-gen-mage --test integration edit_real_weights:: \
             -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_BASE_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_base_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+            cargo test --locked --release -p mlx-gen-mage --test integration \
+            edit_real_weights::fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           MAGE_EDIT_SNAPSHOT="$MAGE_EDIT_TURBO_SNAPSHOT" \
             MAGE_EDIT_GOLDEN_NAME=mage_flow_edit_turbo_golden.safetensors \
-            cargo test --locked --release -p mlx-gen-mage --test edit_real_weights \
-            fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
+            cargo test --locked --release -p mlx-gen-mage --test integration \
+            edit_real_weights::fixed_instruction_edit_matches_the_torch_reference -- --ignored --nocapture || status=$?
           exit "$status"
       - name: Atomically promote the verified Mage manifests into this runner's operator seed
         if: github.event_name == 'workflow_dispatch' && inputs.profile == 'media' && inputs.migrate_mage_edit_variant_manifest && steps.mage-seed-recovery.outputs.completed != 'true'
@@ -2346,8 +2369,8 @@ jobs:
         run: |
           set -o pipefail
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-qwen-image --test vae_real_weights \
-            native_decode_seam_is_byte_exact_and_precancelled \
+            cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+            vae_real_weights::native_decode_seam_is_byte_exact_and_precancelled \
             -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           grep -qE "test result: ok\. 1 passed" <<<"$out"
       # EVERY step below selects by NAME with `--exact` and asserts the run count. All three halves of
@@ -2381,8 +2404,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_CONTROL_WEIGHTS="$QWEN_CONTROL_UNION_SNAPSHOT/bf16/model.safetensors" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test control_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              control_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2398,8 +2421,8 @@ jobs:
           run_one() {
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test unified_sampler_smoke \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              unified_sampler_smoke::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2420,8 +2443,8 @@ jobs:
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
               QWEN_CONTROL_WEIGHTS="$QWEN_CONTROL_UNION_SNAPSHOT/bf16/model.safetensors" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test sequential_residency_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              sequential_residency_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2440,8 +2463,8 @@ jobs:
           name=bounded_window_is_distinct_from_the_unbounded_stream_control
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/q8" QWEN_RUNG4_TIER=q8 \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test block_residency_real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            block_residency_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2460,8 +2483,8 @@ jobs:
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test lightning_render_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              lightning_render_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2497,8 +2520,8 @@ jobs:
           name=edit_generate_is_deterministic_rust
           out="$(QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test edit_real_weights \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            edit_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2527,8 +2550,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test adapter_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              adapter_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2568,8 +2591,8 @@ jobs:
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
             QWEN_LIGHTNING_SNAPSHOT="$QWEN_LIGHTNING_SNAPSHOT" \
             cargo test --locked --release -p mlx-gen-qwen-image \
-            --test fit_preview_rgb \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            --test integration \
+            fit_preview_rgb::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2605,8 +2628,8 @@ jobs:
             local name="$1" out
             out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
               QWEN_IMAGE_EDIT_SNAPSHOT="$QWEN_IMAGE_EDIT_MLX_SNAPSHOT/q8" \
-              cargo test --locked --release -p mlx-gen-qwen-image --test perf \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+              perf::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2687,8 +2710,8 @@ jobs:
               PID_QWEN_SAFETENSORS="$PID_QWEN_SNAPSHOT/pid_qwenimage_2kto4k.safetensors" \
               PID_GEMMA_DIR="$PID_GEMMA_SNAPSHOT" \
               cargo test --locked --release -p mlx-gen-qwen-image \
-              --test pid_decode_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              pid_decode_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2705,8 +2728,8 @@ jobs:
             out="$(PID_FLUX_SAFETENSORS="$PID_FLUX_SNAPSHOT/pid_flux_2kto4k.safetensors" \
               PID_GEMMA_DIR="$PID_GEMMA_SNAPSHOT" \
               cargo test --locked --release -p mlx-gen-flux \
-              --test pid_decode_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              --test integration \
+              pid_decode_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -2775,8 +2798,8 @@ jobs:
           set -o pipefail
           name=dump_runb_latents
           out="$(MLX_GEN_QWEN_SNAPSHOT="$QWEN_IMAGE_MLX_SNAPSHOT/bf16" \
-            cargo test --locked --release -p mlx-gen-qwen-image --test dump_runb_latents \
-            "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            cargo test --locked --release -p mlx-gen-qwen-image --test integration \
+            dump_runb_latents::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
             exit 1
@@ -2895,7 +2918,7 @@ jobs:
         run: |
           set -o pipefail
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test integration generate_smoke:: \
             -- --ignored --nocapture --test-threads 1 \
             --skip kv_cache_residency_at_the_production_geometry \
             --skip long_clip_coherence_under_the_bounded_window \
@@ -2928,8 +2951,8 @@ jobs:
                 "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             else
               out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-                cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-                "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+                cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+                generate_smoke::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             fi
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
@@ -2964,8 +2987,8 @@ jobs:
             out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
               KREA_STYLE_LORA="$KREA_STYLE_LORA_SNAPSHOT/origami_000000500.safetensors" \
               KREA_DISTILL_LORA="$KREA_DISTILL_LORA_SNAPSHOT/Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors" \
-              cargo test --locked --release -p mlx-gen-krea-realtime --test style_lora_real_weights \
-              "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+              cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+              style_lora_real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
             if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
               echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
               return 1
@@ -3260,8 +3283,8 @@ jobs:
           # run whose measured cells someone needs to read. Extraction and upload are separate `always()`
           # steps for the same reason.
           out="$(KREA_REALTIME_SNAPSHOT_DIR="$KREA_REALTIME_SNAPSHOT/q4" \
-            cargo test --locked --release -p mlx-gen-krea-realtime --test generate_smoke \
-            "$name" -- --exact --ignored --nocapture 2>&1 \
+            cargo test --locked --release -p mlx-gen-krea-realtime --test integration \
+            generate_smoke::"$name" -- --exact --ignored --nocapture 2>&1 \
             | tee "$RUNNER_TEMP/s18-sweep.log" /dev/stderr)"
           if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
             echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
@@ -3328,6 +3351,425 @@ jobs:
             ${{ runner.temp }}/s18-sweep.log
             ${{ runner.temp }}/gpu-fault-evidence/memory.csv
             ${{ runner.temp }}/gpu-fault-evidence/gpu-events.txt
+
+  # sc-18932 — the FIRST MiniMax-H3 lane in this repository, and what it fixes is narrower than
+  # "missing coverage". `MINIMAX_H3_SNAPSHOT` is read by ~30 `#[ignore]`d tests across BOTH backends
+  # and was referenced by no workflow at all, so not one of them could run anywhere except by hand on
+  # a dev box. The tests themselves are correct — they ASSERT on the variable rather than returning
+  # early, so an unset snapshot fails at exit 101 instead of printing `ok` in 0.00 s — which is why
+  # this was invisible: there was never a vacuous green to notice, just silence.
+  #
+  # MEASURED ON nax-macos, release profile, warm weights. Re-measured 2026-08-15 for sc-19445 /
+  # sc-19438, which took this lane from nine invocations to TWELVE: all twelve total ~9.4 s of test
+  # time (the six header/config gates ~1.9 s, the three decodes 1.02 + 0.63 + 0.24 s, the VAE
+  # decode parity 0.88 s, the VAE ENCODE parity 1.40 s, the conditioner parity 3.28 s — all six
+  # figures are `cargo test` reported TEST time, not step wall clock). MLX mmaps and materializes
+  # per tensor, so "load the 9.7 GB VAE" is 22 ms. The `timeout-minutes` below is therefore
+  # ENTIRELY cold build (5m36s for the mlx-gen tree measured here) plus a possible **70.21 GB**
+  # first transfer — the 11.638 GB `minimax-h3` slice plus the 58.568 GB `minimax-h3-text-encoder`
+  # one — not test time. That transfer is why the budget is 150 minutes rather than 60.
+  #
+  # Both slice figures are byte sums over this pinned revision's own files, taken 2026-08-15
+  # (`vae/` 10.4156 + `audio_vae/` 0.6054 + `FL2VA/audio_vae/` 0.6055 + `tokenizer/` 0.0115 + the TE
+  # index; and shards 1-12 of `text_encoder/` at 4.932 + 11 x 4.876). An earlier revision of this
+  # block said 63.1 GB, which reused 51.5 GB — a RESIDENCY figure (66.715 minus the 15.209 GB
+  # trimmable tail) — as if it were a transfer figure. It is 7.1 GB short; do not reintroduce it.
+  #
+  # TIME IS NOT THE ONLY BUDGET, and this block recorded only the time one. The largest memory
+  # consumer here is the LAST step — which since sc-19438 is the CONDITIONER parity, which maps
+  # shards 1-12 of the dense Qwen3-VL-32B text encoder WHOLE (58.568 GB; the layer-0-49 tap's own
+  # parameters are 50.316 GB of that), not the ~9.70 GiB VAE parity
+  # that used to hold that title and is now second. Both figures below are still worth stating
+  # plainly, because the reason the VAE one used to be overstated was a dtype error. MEASURED from
+  # the published safetensors headers (snapshot 939557dc): **`vae/` ships F32 — all 703 tensors, 0
+  # of them bf16, 9.7002 GiB / 10.4155 GB.** The sc-18740 decode parity gate and the sc-19445
+  # encode parity gate both build at `Dtype::Float32` — the same cast on the same component, in
+  # both cases carried deliberately to keep the comparison about layout rather than about bf16
+  # rounding. That is a NO-OP CAST holding ~9.70 GiB, NOT the ~19.4 GB that a "9.7 GB bf16 `vae/`
+  # materialized at f32" reading produces; there is no doubling because there is no bf16 to double. The bf16 component in this
+  # checkpoint is `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this lane
+  # does not load. The two video decode smokes cast the OTHER way — `Dtype::Bfloat16` downcasts that
+  # same F32 component — so they materialize about half the parity gate, out of the same ~10 GB of
+  # mapped source bytes their `#[ignore]` strings quote. `audio_vae/` is likewise all F32 (1087
+  # tensors, 0.5637 GiB) and is loaded at f32 with nothing to cast, so its ~0.6 GB is right as
+  # written. These are component sizes derived from the published headers, not peaks measured on
+  # either runner.
+  #
+  # It matters because `rw-mage` is registered on BOTH Macs (below) and this lane has never run on
+  # either. The only host figure this repository carries for `nax-macos-2` is the ~101 GiB in
+  # `scripts/ci/s18_memory_preflight.py`, and that was inferred from `active+wired` sampling during
+  # an S18 sweep rather than read off the box — and it is a physical-RAM-shaped number, which is not
+  # the Metal working-set budget. `Record the macOS device inventory` below prints both, labelled
+  # separately, so this lane's first run retires the constant instead of leaving it as an errand.
+  #
+  # `rw-mage` rather than a new label: a label no runner carries does not fail, it queues silently
+  # until the run is cancelled (see this file's header), and `rw-mage` is registered on BOTH Macs.
+  # The 11.638 GB `minimax-h3` slice and the 58.568 GB `minimax-h3-text-encoder` one both self-heal
+  # from the Hub on either box. The three diffusers/conditioner reference artifacts do NOT — see
+  # the steps that require them.
+  mlx-minimax-h3:
+    name: MLX MiniMax-H3 real weights
+    # Selectable on its own so the 70.21 GB fetch does not require running the Mage-oracle job that
+    # shares the `media` profile — the same split `krea-realtime` gets, for the same reason.
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    # 60 -> 150 (sc-19438). The 60 was sized for an 11.638 GB first transfer plus nine gates; this
+    # lane now also materializes the 58.568 GB text-encoder row and runs two more, one of which maps
+    # twelve shards and forwards 50 layers. A COLD first run on the second Mac is the case this has
+    # to cover, and the transfer dominates it — the twelve gates together are ~9.4 s of test time
+    # (header block above) against 70.21 GB of bytes.
+    #
+    # 150 RE-CHECKED against 70.21 GB rather than the 63.1 GB it was first sized on: 150 minus the
+    # 5m36s measured cold build leaves ~144 min for the fetch, i.e. the lane survives any sustained
+    # Hub throughput above ~8.1 MB/s. The correction moved that required floor from ~7.3 to
+    # ~8.1 MB/s — an 11% tightening of a bound that was never close — which is why the number
+    # stands rather than rising. No cold fetch has ever been timed on either Mac, so that floor is
+    # the whole justification; if this lane does time out, record the first run's actual transfer
+    # rate here rather than reflex-bumping the budget.
+    timeout-minutes: 150
+    env:
+      # The snapshot ROOT — the directory holding `vae/`, not `vae/` itself. Every test in the family
+      # joins its own component onto this (`vae/`, `audio_vae/`, `FL2VA/audio_vae/`, `tokenizer/`,
+      # `text_encoder/`), so pointing it one level in silently breaks all of them at once.
+      MINIMAX_H3_SNAPSHOT: ${{ vars.MINIMAX_H3_SNAPSHOT }}
+      # An OPERATOR-PROVISIONED file, not a snapshot: the `(latent, decoded)` pair
+      # `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py` writes by running the official
+      # diffusers `AutoencoderKLMiniMaxH3` over the real `vae/`. ~840 KB, deliberately uncommitted
+      # (real-weight bytes). Same class as `MAGE_ORACLE_SEED_DIR`: it exists on no Hub, this workflow
+      # deliberately refuses to regenerate it in Actions (that would need a pinned torch+diffusers
+      # environment, and none of the four approved wheel locks is one), and it cannot self-heal.
+      MINIMAX_H3_VIDEO_VAE_REFERENCE: ${{ vars.MINIMAX_H3_VIDEO_VAE_REFERENCE }}
+      # sc-19445 — the ENCODE half's equivalent: the `(pixels, posterior mean, posterior std)`
+      # triples `crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_encode_real.py` writes from
+      # the same official class over the same `vae/`. ~5.7 MB. Same class, same provenance rule and
+      # the same inability to self-heal as the decode reference above; it is a SECOND artifact
+      # because the encode half is the half `load_decode_only` never selects, and it carried no
+      # real-weight gate at all between sc-17148 and sc-19445.
+      MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE: ${{ vars.MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE }}
+      # sc-19438 — the ~226 KB `(input_ids, context)` pair
+      # `crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py` writes by running the OFFICIAL
+      # conditioner (`Qwen3VLForConditionalGeneration`, `hidden_states[50]`, `add_special_tokens=False`
+      # and no chat template) over the real `text_encoder/`.
+      #
+      # Produced against the DENSE published component, never against sc-19120's packed tier. The
+      # packed tier is this repository's own repack, so a golden built from it would share the
+      # repack's layout and could only prove the two agree with each other — layout.rs Rule 3, and
+      # the exact mechanism by which sc-18740 shipped green.
+      #
+      # THE PACKED TIER IS THEREFORE NOT COVERED BY ANY WORKFLOW. The chain that would cover it
+      # exists in source — `te_tier_real_weights.rs`'s `the_packed_context_tracks_the_dense_one`
+      # pins packed against dense, and the gate at the end of this job pins dense against the
+      # official conditioner — but the first link is executed by NO job in this file, so packed is
+      # covered only when someone runs it by hand. Wiring it needs the `minimax-h3-mlx-*` tier rows
+      # materialized on this runner, which this lane does not do.
+      MINIMAX_H3_TE_REFERENCE: ${{ vars.MINIMAX_H3_TE_REFERENCE }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Repository variables hold ONE value for every runner in a label pool, but the two
+      # macOS boxes do not share a home directory. A `~/`-relative value is resolved here
+      # against the home of whichever runner actually claimed this job; absolute values
+      # pass through untouched, so variables can be flipped one at a time.
+      #
+      # THIS IS ALSO THE ANSWER FOR THE THREE OPERATOR ARTIFACTS, not just for the snapshot.
+      # `rw-mage` is registered on BOTH `nax-macos` and `nax-macos-2`, whose homes are
+      # `/Users/michael` and `/Users/MTrefry`, and `runs-on` label matching deliberately does not
+      # say which box claims a job — so a baked absolute `/Users/michael/...` value reds whichever
+      # box did not. Set each of the three artifact variables to a `~/`-relative value and place a
+      # copy at that location on both boxes. The require steps below still see an absolute path,
+      # because this step has already expanded it.
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+          MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE MINIMAX_H3_TE_REFERENCE
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
+      # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
+      - name: Require the operator-provisioned snapshot path
+        run: |
+          if [[ -z "$MINIMAX_H3_SNAPSHOT" ]]; then
+            echo "Repository variable MINIMAX_H3_SNAPSHOT is unset; this lane cannot resolve its snapshot path" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_SNAPSHOT" != /* ]]; then
+            echo "MINIMAX_H3_SNAPSHOT must be an absolute path, got: $MINIMAX_H3_SNAPSHOT" >&2
+            exit 1
+          fi
+      # Both variables, matching `Resolve runner-local snapshot paths` exactly — a lane that resolves
+      # a path the report omits is silently exempt from the only disk accounting either Mac gets
+      # (`test_every_resolving_lane_reports_what_it_costs`). The reference file is ~840 KB rather than
+      # a snapshot, so what its line is worth here is PRESENCE, not bytes: it is the one asset in this
+      # lane that cannot self-heal, and the run log is the only place its absence is visible before
+      # the last step fails on it.
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MINIMAX_H3_SNAPSHOT MINIMAX_H3_VIDEO_VAE_REFERENCE
+          MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE MINIMAX_H3_TE_REFERENCE
+      # Report-only, and it exists to RETIRE an unmeasured constant rather than leave it as a human
+      # errand — the same job `Record the CUDA device inventory` does for the Windows lane below,
+      # in the shape that step uses: a presence guard, `continue-on-error: true`, and no assertion
+      # of any kind. The step above measures DISK; this one measures the other axis. `rw-mage` is on
+      # both Macs, this lane's parity gate holds ~9.70 GiB at f32 (the all-F32 `vae/` component, no
+      # doubling — see the header; ~20 GB was the pre-sc-19414 misreading), and the only host figure
+      # this repository carries for `nax-macos-2` is a ~101 GiB number inferred from sampling in
+      # `scripts/ci/s18_memory_preflight.py`. One run puts a real one in the log, for ~1 s.
+      #
+      # THE TWO NUMBERS ARE DIFFERENT QUANTITIES and neither is derivable from the other, so both
+      # are printed and both are labelled. `hw.memsize` is physical RAM. Metal's
+      # `recommendedMaxWorkingSetSize` is the per-device working-set budget the driver advertises,
+      # and it is the one an MLX allocation is actually sized against — on `nax-macos` (Mac17,6)
+      # they read 128.00 GiB and 107.52 GiB respectively, measured on the box 2026-08-13. Sizing a
+      # Metal workload against the RAM figure overstates the budget by ~20 GiB on that box alone.
+      #
+      # `swift` because there is no sysctl for the Metal figure: it comes from `MTLDevice`, and
+      # `system_profiler SPDisplaysDataType` (used by the SA3 lanes here) does not report it. A
+      # runner without the toolchain prints the RAM half and says so rather than failing.
+      - name: Record the macOS device inventory
+        continue-on-error: true
+        run: |
+          sysctl -n hw.model hw.memsize | awk '
+            NR == 1 { print "host.hw_model=" $0 }
+            NR == 2 { printf "host.hw_memsize=%.2f GiB (%s bytes, physical RAM)\n", $0 / 1073741824, $0 }'
+          if ! command -v swift > /dev/null 2>&1; then
+            echo "metal.recommendedMaxWorkingSetSize=<not captured — swift is not on this runner's PATH>"
+            exit 0
+          fi
+          swift - <<'SWIFT'
+          import Foundation
+          import Metal
+
+          if let device = MTLCreateSystemDefaultDevice() {
+              let bytes = device.recommendedMaxWorkingSetSize
+              print("metal.device=\(device.name)")
+              print(String(format: "metal.recommendedMaxWorkingSetSize=%.2f GiB (%llu bytes, NOT hw.memsize)",
+                           Double(bytes) / 1073741824.0, bytes))
+          } else {
+              print("metal.recommendedMaxWorkingSetSize=<not captured — no default Metal device>")
+          }
+          SWIFT
+      # Fetches the 11.638 GB `download_files` slice of the 196 GB repository, never the whole thing;
+      # see the `minimax-h3` row in release/real-weight-models.toml for the per-component breakdown
+      # and for which two components are deliberately left out.
+      - name: Materialize and verify immutable snapshot
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "$MINIMAX_H3_SNAPSHOT"
+      # sc-19438 — a SECOND key against the same repository, revision and directory, carrying the
+      # twelve shards production's `TE_SHARDS` maps (58.568 GB of the 66.715 GB component; the
+      # layer-50 tap itself only reaches into the first eleven). It is a separate row precisely so
+      # the Windows CUDA lane, which materializes `minimax-h3` by key and reads none of this, does
+      # not pay for it. See its note in release/real-weight-models.toml for why twelve rather than
+      # fourteen, and for the test that panics if any of the twelve is missing.
+      - name: Materialize and verify the text-encoder shards the layer-50 tap reads
+        run: |
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model minimax-h3-text-encoder --snapshot "$MINIMAX_H3_SNAPSHOT"
+      # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, never `--ignored` as a
+      # blanket. `--exact` before the `--` is REJECTED by cargo, which reports the rejection as exit 0;
+      # and with the flag accepted but no count assertion a rename yields "0 passed; N filtered out"
+      # and still exits 0, so the step would go green gating nothing. Both halves are required.
+      #
+      # These five read safetensors HEADERS and JSON only — no weight I/O, no Metal — which is why
+      # they run on every invocation of this lane rather than behind a dispatch profile.
+      - name: Run MiniMax-H3 header and config gates
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one declared_tensor_names_match_the_published_checkpoint
+          # sc-19445. The key-set proof above cannot see a tensor read at the wrong LEVEL: the
+          # shipped encoder is six levels of 128..1024 with downsamplers on 0-3 only and residual
+          # projections on 1/3/5 only, and the committed fixture is a four-level 32-channel toy
+          # whose spatial and temporal factor lists are the SAME list. This derives every one of
+          # the 118 encode shapes from the config and judges them against the published headers.
+          run_one declared_encoder_shapes_match_the_published_checkpoint
+          run_one declared_audio_tensor_names_match_the_published_checkpoint
+          run_one published_audio_configs_reproduce_the_declared_geometry
+          run_one te_layer_50_tap_is_exhaustive_and_the_tail_is_trimmable
+          run_one real_tokenizer_resolves_the_minimax_special_tokens
+      # The decodes. ~10 GB resident for the video VAE and ~0.6 GB for the audio one on MLX — well
+      # under the f32 candle figures in the crate docs, because these load the checkpoint's own bf16
+      # lazily. That is true of THESE THREE only: the parity gate below is f32 and is this lane's
+      # memory peak, so this is not the step to size the runner against.
+      - name: Run MiniMax-H3 VAE decode smokes
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one real_weight_decode_produces_a_plausible_video
+          run_one real_weight_multi_chunk_decode_blends_the_seam
+          run_one real_weight_audio_decode_produces_a_plausible_stereo_track
+      # sc-17151's tripwire, and the ONLY two of its arms this lane's bytes can run. A tripwire no
+      # job pulls is a tripwire for whoever remembers to run it, so the story's "fails if any phase
+      # regresses" acceptance needs a selection here and not only a `#[ignore]` string.
+      #
+      # WHY NOT THE te/dit ARMS. `--test staged_residency`'s `a_bounded_slab_handoff_leaves_nothing_
+      # behind` and `a_held_component_trips_both_handoff_gates` are cheap in MEMORY (60 tensors each)
+      # and not in DISK: `Weights::from_dir` opens the whole component directory, and this row's
+      # `download_files` is a deliberate 11.638 GB slice carrying NO `transformer/` shards and NO
+      # `text_encoder/` shards (only the TE index). They would fail at `from_dir`, before reaching a
+      # gate. Provisioning them is +124 GB on both Macs and is a separate decision.
+      #
+      # The two below drive the identical `phase()` helper and the identical predicates over the
+      # components the slice DOES carry whole — `vae/` (10.42 GB) and `audio_vae/` (0.605 GB) — so
+      # the clean arm is the regression gate and the control arm proves it can come back false.
+      # ~11 GB resident, under the parity gate below. Every OTHER arm of `staged_residency.rs`,
+      # `ref2va_checkpoint.rs` and `te_tier_generate_stages.rs` is OPERATOR-ONLY: it needs the full
+      # 196 GB snapshot and runs only where someone has one.
+      - name: Run MiniMax-H3 staged-residency tripwires
+        run: |
+          set -o pipefail
+          run_one() {
+            local name="$1" out
+            out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+              staged_residency::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+            if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+              return 1
+            fi
+          }
+          run_one the_video_decoder_hands_off_cleanly
+          run_one a_held_decoder_trips_both_handoff_gates
+      # LAST, and deliberately so. This is the only gate in either backend that can catch a LAYOUT
+      # error against real weights — the sc-18740 class, where an FFN gate/value half-swap shipped
+      # green because every self-generated number simply re-derived whatever the port did. It needs an
+      # artifact this workflow cannot produce, so an operator who has not placed that file yet gets a
+      # red AFTER the other eight gates have already reported, rather than instead of them.
+      #
+      # Produce it on a box that holds the full snapshot, from a torch+diffusers environment:
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_real.py \
+      #     --out ~/minimax-h3-real-vae-reference.safetensors
+      # then set the repository variable to `~/minimax-h3-real-vae-reference.safetensors` (the leading
+      # `~/` is resolved per-runner above). EVERY box carrying `rw-mage` needs its own copy, exactly
+      # as this file's header says of the Mage oracle bundle.
+      - name: Require the operator-provisioned diffusers VAE reference
+        run: |
+          if [[ -z "$MINIMAX_H3_VIDEO_VAE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_VIDEO_VAE_REFERENCE is unset; the sc-18740 layout gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_VIDEO_VAE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_REFERENCE must be an absolute path, got: $MINIMAX_H3_VIDEO_VAE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_VIDEO_VAE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_VIDEO_VAE_REFERENCE" >&2
+            exit 1
+          fi
+      # THIS LANE'S MEMORY PEAK, and the reason the job header carries a memory budget at all. The
+      # test builds the VAE at `Dtype::Float32` (`tests/real_weights.rs`, the `f32 to keep the
+      # comparison about layout rather than about bf16 rounding` line). **The checkpoint is ALREADY
+      # F32** — 703 of 703 `vae/` tensors, measured from the published headers — so that is a no-op
+      # cast holding ~9.70 GiB / 10.42 GB of parameters, not the ~19.4 GB this comment used to
+      # claim; `vae/` was never bf16, and nothing here doubles. It is still this lane's peak,
+      # because the two video smokes above DOWNCAST the same component to bf16 and so materialize
+      # about half of it. Casting this one down too would be cheaper and would also delete the gate:
+      # at bf16 the residual it compares against diffusers is dominated by rounding, not by layout.
+      #
+      # DECLARED, not measured on a runner: `Record the macOS device inventory` above is what puts a
+      # real capacity for the box that claimed this job in the log, and `hw.memsize` and the Metal
+      # working-set budget are reported there as the two separate numbers they are.
+      - name: Run MiniMax-H3 video VAE parity against official diffusers
+        run: |
+          set -o pipefail
+          name=real_weight_decode_matches_the_official_diffusers_vae
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+      # sc-19445 — the ENCODE half's layout gate, and the same fail-closed shape as the decode one
+      # above for the same reason: it needs an artifact this workflow cannot produce, so it must be
+      # possible to tell "the operator has not staged the file" from "the port is wrong".
+      #
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_video_vae_encode_real.py \
+      #     --out ~/minimax-h3-real-vae-encode-reference.safetensors
+      #
+      # then set the repository variable to `~/minimax-h3-real-vae-encode-reference.safetensors`
+      # and place a copy at that path on BOTH `rw-mage` boxes (see the resolve step's note).
+      - name: Require the operator-provisioned diffusers VAE ENCODE reference
+        run: |
+          if [[ -z "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE is unset; the sc-19445 encoder level-indexing gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE must be an absolute path, got: $MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE" >&2
+            exit 1
+          fi
+      # Loads the full 703-tensor `vae/` at f32 (~9.70 GiB — the component ships all-F32, so f32 is
+      # a no-op cast) and encodes the three probes the reference carries. Gated on relative
+      # max-abs-diff against a measured 1.789e-3 floor; the cosine and the two norms it prints
+      # beside that are deliberately NOT asserted on.
+      - name: Run MiniMax-H3 video VAE ENCODE parity against official diffusers
+        run: |
+          set -o pipefail
+          name=real_weight_encode_matches_the_official_diffusers_vae
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
+      # sc-19438 — the conditioner gate. LAST, and it is this lane's true memory peak: ~52 GB
+      # resident for layers 0-49 of the dense Qwen3-VL-32B text encoder, against the ~9.70 GiB of
+      # the VAE steps above.
+      #
+      #   MINIMAX_H3_SNAPSHOT=<root> python3 crates/media/mlx-gen/tools/dump_minimax_h3_te_real.py \
+      #     --out ~/minimax-h3-real-te-reference.safetensors
+      #
+      # Run that on its own: the conditioner is ~62 GB on the torch side and does NOT release
+      # inside a process on MPS. The artifact itself is ~226 KB. Set the repository variable to
+      # `~/minimax-h3-real-te-reference.safetensors` and place a copy on both `rw-mage` boxes.
+      - name: Require the operator-provisioned conditioner reference
+        run: |
+          if [[ -z "$MINIMAX_H3_TE_REFERENCE" ]]; then
+            echo "Repository variable MINIMAX_H3_TE_REFERENCE is unset; the sc-18741 conditioner gate cannot run and this lane refuses to report green without it" >&2
+            exit 1
+          fi
+          if [[ "$MINIMAX_H3_TE_REFERENCE" != /* ]]; then
+            echo "MINIMAX_H3_TE_REFERENCE must be an absolute path, got: $MINIMAX_H3_TE_REFERENCE" >&2
+            exit 1
+          fi
+          if [[ ! -s "$MINIMAX_H3_TE_REFERENCE" ]]; then
+            echo "MINIMAX_H3_TE_REFERENCE names no non-empty file on this runner: $MINIMAX_H3_TE_REFERENCE" >&2
+            exit 1
+          fi
+      # Its own `cargo test` process, which is the point: the 58.568 GB of text-encoder shards this
+      # maps (shards 1-12 in full; the tap's own parameters are 50.316 GB of that) must not be
+      # resident alongside anything else, and a per-step process is what guarantees the previous
+      # step's VAE has been reaped.
+      - name: Run MiniMax-H3 conditioner parity against the official text encoder
+        run: |
+          set -o pipefail
+          name=real_weight_te_context_matches_the_official_conditioner
+          out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+            real_weights::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+          if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+            echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+            exit 1
+          fi
 
   # sc-16981: this was ONE `Candle audio real weights` job running 30 real-weight invocations back
   # to back. The 2026-08-02 weekly (run 30741567385) was the first time it actually executed since
@@ -4539,6 +4981,16 @@ jobs:
     env:
       SA3_SAME_L_CASE: standalone
       SA3_TEST_CUDA: "1"
+      # 80 IS CORRECT ON A BLACKWELL BOX, AND RAISING IT TO 120 IS A REGRESSION (sc-19545). This
+      # is the first of thirteen sites in this file; the full reasoning is on the same declaration
+      # in `ci.yml`. In one paragraph: `CUDA_COMPUTE_CAP` names the BOTTOM RUNG of an architecture
+      # ladder, not the hardware. It seeds one cudaforge `-gencode`, and
+      # `vendor/candle-kernels/build.rs` appends sm_90, sm_120 and `compute_120` PTX above it
+      # (sc-7544), so `libmoe.a` is a fatbin covering Ampere -> Blackwell from one binary. Setting
+      # this to the runner's own 120 deletes the Ampere rung and lifts the dense PTX floor with it.
+      # NOTHING ENFORCES THIS. sc-19545 verified all 15 sites (13 here, 2 in `ci.yml`) by hand and
+      # a drift guard was deliberately scoped out, so the value is load-bearing but unguarded: an
+      # edit here surfaces as black renders on customer GPUs, never as a red build.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
@@ -5408,7 +5860,7 @@ jobs:
           for %%R in (resident staged attention blocks) do (
             set "MAGE_MEMORY_RUNG=%%R"
             set "MAGE_MEMORY_OUT=%RUNNER_TEMP%\mage-memory-%%R.rgb"
-            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test memory_ladder_real_weights representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
+            cargo test --locked --release -p candle-gen-mage --features cuda,testkit --test integration memory_ladder_real_weights::representative_route_exercises_advertised_rung -- --ignored --exact --nocapture || exit /b 1
           )
       - name: Upload Mage rung outputs
         if: always()
@@ -5647,13 +6099,13 @@ jobs:
         run: |
           call "%VCVARS%"
           set "MAGE_CONFORMANCE_FAILED=0"
-          cargo test --locked -p candle-gen-z-image --features cuda --test conformance z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test real_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test cuda_1024 -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
-          cargo test --locked --release -p candle-gen-mage --features cuda --test edit_parity -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked -p candle-gen-z-image --features cuda --test integration conformance::z_image_conformance -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration real_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration cuda_1024:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+          cargo test --locked --release -p candle-gen-mage --features cuda --test integration edit_parity:: -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           for %%T in (q4 q8 bf16) do (
             set "MAGE_QUANT_TIER=%%T"
-            cargo test --locked --release -p candle-gen-mage --features cuda --test quant_real_weights registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
+            cargo test --locked --release -p candle-gen-mage --features cuda --test integration quant_real_weights::registered_tier_matches_independent_oracle_and_vram_budget -- --ignored --nocapture || set "MAGE_CONFORMANCE_FAILED=1"
           )
           if not "%MAGE_CONFORMANCE_FAILED%"=="0" exit /b 1
 
@@ -5732,11 +6184,11 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test conformance sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_conformance -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration conformance::sdxl_cfg_off_guidance_one_render -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib edit_validate::real_weight_edit -- --ignored --nocapture || exit /b 1
           cargo test --locked -p candle-gen-sdxl --features cuda --release --lib ip_validate::real_weight_ip_adapter -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-gen-sdxl --features cuda --release --test trainer_e2e sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-gen-sdxl --features cuda --release --test integration trainer_e2e::sdxl_trainer_lora_trains_reloads_and_renders -- --ignored --nocapture || exit /b 1
 
   candle-mmaudio:
     name: Candle mmaudio real weights (CUDA)
@@ -5879,3 +6331,398 @@ jobs:
           type "%log%"
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
           exit /b 0
+
+  # sc-18932 — the candle half of the MiniMax-H3 wiring. Same defect as `mlx-minimax-h3` above:
+  # `candle-gen-minimax-h3/tests/real_weights.rs` (sc-17154) reads `MINIMAX_H3_SNAPSHOT` and no
+  # workflow set it, so its eight tests ran nowhere. This is NOT sc-18677 — that story provisioned
+  # the weights on this runner and generalized `windows-candle.yml`, which lives in the SceneWorks
+  # repository; the inference-side inventory row and this lane are what was left over.
+  #
+  # WHAT THIS RUNS:
+  #   * the five gates that read safetensors headers, published JSON, and four 12-tap filter
+  #     buffers. Measured 2026-08-13 on nax-macos (same code, CPU device, release): 0.00 s each for
+  #     the four that existed then; `declared_encoder_shapes_match_the_published_checkpoint` landed
+  #     later (sc-19008, 2026-08-14) and is the same shape — `shard_shapes` reads the `vae/` headers
+  #     and nothing else, so it touches no device and needs no component this row does not fetch.
+  #     `--features cuda` is carried anyway because compiling this crate on the CUDA lane is itself
+  #     coverage nothing else provides — no existing job builds `candle-gen-minimax-h3` with it.
+  #   * the three f32 decode smokes (sc-19414). They were held out of the original wiring for one
+  #     stated reason — no VRAM figure for this box existed anywhere — and that reason is now
+  #     retired by measurement rather than by assumption or by a guessed constant.
+  #
+  # THE VRAM DECISION (sc-19414). Two independent numbers, and BOTH had to be measured; the first
+  # version of this paragraph measured only the supply side and inherited the demand side from a
+  # pre-existing comment that was wrong.
+  #
+  # SUPPLY. `CUDA_COMPUTE_CAP` names an architecture, never a capacity, so the number had to come
+  # off the hardware. It did, from `nvidia-smi` in the "Toolchain and hardware versions" step of
+  # OTHER jobs in this same `[self-hosted, windows, cuda, real-weights]` pool, in run 31353865709
+  # (the 2026-08-10 weekly): job 93349696046 on `cuda-windows` and job 93349696033 on
+  # `cuda-windows-2`. Both report `Machine name: 'MICHAEL-TRX50'` — the two `real-weights` CUDA
+  # listeners are two agents on ONE physical box, sharing one pair of GPUs:
+  #
+  #   GPU 0  NVIDIA RTX PRO 6000 Blackwell     19 MiB / 97887 MiB
+  #   GPU 1  NVIDIA RTX PRO 6000 Blackwell   1370 MiB / 97887 MiB     driver 596.36, CUDA 13.2
+  #
+  # 97887 MiB is 95.59 GiB per card, and `candle_gen::default_device()` is compile-time
+  # `Device::new_cuda(0)`, so every decode here lands on GPU 0 — the card with 19 MiB in use.
+  #
+  # DEMAND, measured from the published safetensors HEADERS of snapshot 939557dc (no weights read):
+  # **`vae/` is entirely F32** — 703 tensors, 0 of them bf16, 9.7002 GiB / 10.4155 GB. Loading it at
+  # f32 is therefore a NO-OP CAST, not a doubling. The bf16 component in this checkpoint is
+  # `transformer/` (626 of 638 tensors BF16, 61.73 GiB / 66.28 GB), which this row does not fetch.
+  # The two video decodes call `MiniMaxH3VideoVae::load_decode_only`, whose
+  # `["decoder.", "post_quant_conv."]` filter selects 585 of the 703 — **9.03 GiB / 9.69 GB** of
+  # parameters, not the ~19.4 GB the old comment claimed. `audio_vae/` is likewise all F32 (1087
+  # tensors, 0.5637 GiB); the audio test's `["dec_in_proj.", "decoder."]` filter selects 914 —
+  # **0.242 GiB / 0.26 GB**, not ~1.2 GB. `crates/.../candle-gen-minimax-h3/src/vae.rs` states the
+  # same split in its `load_decode_only` doc; the old figures contradicted the crate they described.
+  #
+  # AGAINST THE CARD, then: a video decode is 9.03 GiB of 95.59 GiB — **9.4% occupancy, 10.6x
+  # headroom** — and the audio decode is 0.242 GiB, 0.25%. Activations sit on top of those and are
+  # not included: the smokes decode a 2x3 latent grid to 17 frames at 32x48 px and a 12-token grid
+  # to 39 frames at 32x32 px, which is why the parameter figure is the one that governs here. Each
+  # selection runs in its own `cargo test` process, so the peak is one decode and not their sum, and
+  # even the pathological case — both listeners on this box driving a video decode at GPU 0 at the
+  # same time — is 18.1 GiB of 95.59 GiB. All three fit, with more room than the first sizing
+  # claimed; there was no partial-win tradeoff left to make.
+  #
+  # `Record the CUDA device inventory` below is KEPT, and is now a RECORD against the paragraph
+  # above rather than the errand that produces it. Read what it is and is not: it prints
+  # `memory.total` for whichever box claims this job, and NOTHING compares that against the 95.59
+  # GiB assumed here, so a shrunk or re-pointed pool yields the log line AND the OOM — it explains a
+  # failure after the fact, it does not prevent one. It has never fired — but the reason recorded
+  # here is now OUT OF DATE and the blocker it names is gone (sc-19455). This used to read that
+  # `Require operator-provided MiniMax-H3 snapshot` sits ABOVE it and exits 1 when
+  # `CANDLE_MINIMAX_H3_SNAPSHOT` is unset, "which it currently is (the variable does not exist on
+  # this repository)". It DOES exist: it was set 2026-08-15 to
+  # `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
+  # So that step would now PASS, and a dispatch of this workflow at `profile: minimax-h3` on this
+  # ref would reach the inventory step. Dispatching on a non-default ref is likewise routine — 176
+  # of the 204 `workflow_dispatch` runs on record used one, `feature/*` included — so the ref was
+  # never the obstacle either. Neither is now: the step has simply not fired because no dispatch
+  # selecting this job has been made (checked across the 40 most recent runs of this workflow, in
+  # none of which does this job appear at all). (The weekly `schedule` is a separate matter: that
+  # genuinely only fires from the default branch, so it cannot reach this lane until the epic
+  # merges.) The figures above come from jobs that DO exist on `main`, on the
+  # same pool, which is the only reason a number exists to read at all.
+  #
+  # WHAT THIS DOES NOT RUN. Seven of the fifteen `#[ignore]`d tests in `tests/real_weights.rs` (the
+  # other eight are selected by the two steps below), all seven named so none is rediscovered as an
+  # oversight:
+  #   * `real_weight_decode_matches_the_official_diffusers_vae` — needs the operator reference
+  #     artifact the macOS lane requires, which has never been placed on this box. It is the only
+  #     gate in either backend that can catch a LAYOUT error against real weights; its MLX twin IS
+  #     wired and green, so the sc-18740 class is covered — just not on candle.
+  #   * `real_weight_encode_matches_the_official_diffusers_vae` and `real_weight_tiling_changes_the_encode`
+  #     — same class, blocked on a second operator artifact (`MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE`).
+  #   * `real_weight_tiled_decode_matches_the_official_diffusers_vae` and
+  #     `real_weight_tiling_is_inert_below_one_tile` — same class again, blocked on a third
+  #     (`MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE`). All four are cheap in memory and unreachable here
+  #     only because the artifacts have only ever been produced on `nax-macos`.
+  #   * `declared_dit_tensor_names_match_the_published_checkpoint` and
+  #     `the_adaln_projections_are_the_documented_twenty_six_gigabytes` — header-only, but they need
+  #     the 62 GB `transformer/` component, which the `minimax-h3` row deliberately does not fetch.
+  candle-minimax-h3:
+    name: Candle MiniMax-H3 real weights (CUDA)
+    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    # There is no "house value" to appeal to and an earlier version of this comment invented one:
+    # of the 42 jobs in this file, 26 carry 120 and 16 do not (2x30, 4x60, 90, 150, 2x180, 300,
+    # 4x360, 480). 120 is the plurality, not the rule, so it has to be argued rather than cited.
+    #
+    # The argument is the observed cost of THIS pool, since this lane has never executed. Across the
+    # five scheduled runs on record, the largest CUDA real-weight job on this box is 52.0 min
+    # (`sa3-base-identity-cuda`, run 30787887176, 2026-08-03; the same job took 42.0 min in
+    # 30741567385 and failed at 23.2 min in 31353865709), and the closest analogue by shape —
+    # `candle-media`, a candle crate built with `--features cuda` on the same runner — is 15.3 min
+    # (run 30196371019; it was skipped in 31353865709, so that run yields no figure for it).
+    #
+    # The nearest sibling is `mlx-minimax-h3`, same model and same three decode names, and it
+    # carries 60. That is NOT the value to copy: its 60 was sized on a 5m36s cold Metal build plus
+    # ~3.0 s of measured test time, whereas this lane pays an nvcc/MSVC cold build for
+    # `candle-gen-minimax-h3` that has never been timed anywhere, on a box where a real-weight job
+    # has already been observed at 52.0 min. 60 would leave 1.15x over that observation; 120 leaves
+    # 2.3x. For a never-executed lane a `timeout-minutes` is a runaway guard, not a budget, so the
+    # slack is the point. Re-size it DOWN from the first run that actually completes here.
+    timeout-minutes: 120
+    env:
+      # Repository variables hold runner-local absolute paths, so the Windows box needs its own value
+      # — `vars.MINIMAX_H3_SNAPSHOT` is the macOS `~/`-relative one. The name on the LEFT is what the
+      # crate reads and what the manifest wiring gate counts; a bare `${{ vars.X }}` would not wire it.
+      # sc-18677 provisioned the snapshot here at
+      # `E:\huggingface\hub\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765`.
+      MINIMAX_H3_SNAPSHOT: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+      # sm_80 is Ampere, and MEASURED 2026-08-10 this pool's box is 2x RTX PRO 6000 Blackwell —
+      # sm_120 — so the old "80 on the Ampere runner" reading of this value described hardware that
+      # is not here (see the VRAM paragraph above). The value is left at "80" deliberately: it is
+      # what every CUDA job in this repository sets, and the jobs that set it pass on this exact
+      # hardware today. Raising it is a repo-wide change owed its own measurement on this box, not
+      # something for one lane to do unilaterally as a side effect of wiring three tests.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Require operator-provided MiniMax-H3 snapshot
+        shell: cmd
+        run: |
+          if "%MINIMAX_H3_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MINIMAX_H3_SNAPSHOT for the Windows CUDA runner.
+            exit /b 1
+          )
+      # Report-only, and report-only is the whole of it. It was added (sc-18932) to RETIRE the
+      # "unmeasured constant" that kept the decode smokes out; sc-19414 retired it from the pool's
+      # existing run logs instead, so what is left is a RECORD next to the sizing paragraph above:
+      # it prints `memory.total` for whichever box claims this job. It does NOT compare that against
+      # the 95.59 GiB that paragraph assumes, and it could not act on the comparison if it did —
+      # `continue-on-error: true` means this step cannot red the lane. A pool change that breaks the
+      # assumption therefore produces this log line AND, later, a mid-decode OOM; the line explains
+      # the OOM after the fact rather than heading it off. That is deliberate: a threshold here
+      # would be a Windows-`cmd` assertion on a lane that has never run, unexercisable anywhere it
+      # could be proven to fire, and an unverified guard is worth less than an honest record.
+      # `continue-on-error` because a step that only produces a record must never red a lane, and
+      # `where` first because `nvidia-smi` is not on PATH on every CUDA host.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
+      - name: Materialize and verify immutable snapshot
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
+          rem allow-list so only the 11.638 GB the tests below read is fetched.
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+          rem sc-19558 — the DiT component, on its OWN key so the shared row above stays 11.640 GB
+          rem for every lane that does not read it. 132.6 GB for both partitions on a cold box;
+          rem sc-18677 provisioned the full upstream snapshot on THIS runner, so here it verifies
+          rem rather than fetches. It is what makes the two DiT header gates below reachable at all —
+          rem they read headers only, and were unreachable purely because the bytes were in no row.
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-dit --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+      # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, for the reasons the
+      # `candle-mmaudio` job above spells out: `--exact` before the `--` is rejected by cargo and the
+      # rejection is reported as exit 0, and without the count a rename yields "0 passed; N filtered
+      # out" and still exits 0.
+      - name: Run MiniMax-H3 header and config gates
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one declared_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one declared_encoder_shapes_match_the_published_checkpoint || exit /b 1
+          call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
+          call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
+          rem sc-19558 — the two DiT header gates. Header-only and device-free, so they cost the
+          rem materialize step above and nothing else; they were listed as NOT COVERED for exactly
+          rem one reason, that `transformer/` was in no row, and `minimax-h3-dit` is that row.
+          call :run_one declared_dit_tensor_names_match_the_published_checkpoint || exit /b 1
+          call :run_one the_adaln_projections_are_the_documented_twenty_six_gigabytes || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
+
+      # sc-19414 — the f32 decodes, wired on the VRAM measurement recorded in this job's header.
+      # A SEPARATE step from the header gates above, for two reasons: a decode failure then reads as
+      # a decode failure rather than as one entry in a list of eight, and an operator gets the five
+      # cheap verdicts before the expensive ones start (the same ordering `mlx-minimax-h3` uses).
+      #
+      # Same `run_one` shape and the same traps: `--exact` AFTER the `--`, because cargo rejects it
+      # in its own argument position and reports the rejection as exit 0; plus the run-count
+      # assertion, because a renamed test yields "0 passed; N filtered out" and cargo exits 0 for
+      # that too. One `cargo test` invocation and one `findstr` per selection is also what
+      # `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count` counts.
+      #
+      # WHAT THESE ACTUALLY COST (headers of snapshot 939557dc, measured — see the job header). The
+      # `vae/` component ships **F32, all 703 tensors**, so asking for `DType::F32` here is a no-op
+      # cast and NOT the doubling an earlier version of this comment described: the two video
+      # decodes load the 585-tensor decode half, 9.03 GiB / 9.69 GB, and the audio decode loads the
+      # 914-tensor half of the likewise-all-F32 `audio_vae/`, 0.242 GiB / 0.26 GB. With
+      # `--features cuda` that is device memory on GPU 0, against 95.59 GiB — 9.4% for a video
+      # decode. f32 is still the deliberate choice, because it is the dtype the committed-fixture
+      # lane compares against; it is simply free here rather than expensive. NEVER EXECUTED ANYWHERE
+      # YET on candle: the twin numbers quoted on sc-18932 (289 ms video, 73 ms audio) are the MLX
+      # lane's, on Metal.
+      - name: Run MiniMax-H3 VAE decode smokes
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          call :run_one real_weight_decode_produces_a_plausible_video || exit /b 1
+          call :run_one real_weight_multi_chunk_decode_blends_the_seam || exit /b 1
+          call :run_one real_weight_audio_decode_produces_a_plausible_stereo_track || exit /b 1
+          exit /b 0
+
+          :run_one
+          set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          exit /b 0
+      # ---------------------------------------------------------------------------------------
+      # sc-17156 — THE MEASURED `vramGbByTier` DATUM.
+      #
+      # Everything above this line reads HEADERS. This runs a real render, and the story's
+      # acceptance criterion is a MEASURED number, so it is wired here rather than left to be
+      # produced by hand on someone's desk.
+      #
+      # WHY IT IS GATED ON ITS OWN INPUT AND NOT ON A `profile`:
+      #   1. The pool `[self-hosted, windows, cuda, real-weights]` is ONE physical box
+      #      (`MICHAEL-TRX50`, 2x RTX PRO 6000 Blackwell @ 95.6 GiB) exposed as TWO listeners,
+      #      `cuda-windows` and `cuda-windows-2`. `candle_gen::default_device()` hardcodes
+      #      `cuda:0`, so both listeners contend on the SAME card while GPU 1 idles. This render
+      #      sequentially stages a 66.7 GB conditioner and a 66.3 GB DiT; a co-tenant job would
+      #      contaminate the high-water. `VramProbe::assert_trustworthy(1.0)` makes that a RED
+      #      rather than a quiet lie, but a red costs the whole multi-hour render.
+      #   2. The shipped 1344x768 canvas at the 124-frame lattice floor and `DEFAULT_STEPS = 50` is
+      #      measured in HOURS. That has no business inside a weekly sweep.
+      #
+      # ⚠️ THIS INPUT GATE IS A NARROWING, NOT EXCLUSIVITY, and the difference is load-bearing.
+      # It guarantees the probe never rides a bulk `all` / `media` sweep — the likeliest in-workflow
+      # co-tenant — and nothing more. It does NOT hold the box:
+      #   * this workflow's `concurrency` group is keyed on `${{ inputs.profile }}`, so a dispatch of
+      #     a DIFFERENT profile is a different group and runs concurrently; and
+      #   * it does not scope `ci.yml` at all, whose `Candle CUDA compile check (Windows)` lands on
+      #     the same two listeners. On 2026-08-14 two such compile jobs (PRs #608 and #610) running
+      #     together CRASHED THE COMPILER on this box, which is the proof that "the card is big
+      #     enough" is not the same claim as "the box is free".
+      # So this lane must be dispatched when the box is known idle, and a run that reds on
+      # `assert_trustworthy` should be read as contention rather than as a model fact. Giving it real
+      # exclusivity means one concurrency group shared by EVERY CUDA-consuming job across `ci.yml`
+      # and this file, or a dedicated listener/label for the probe. Both serialize CUDA CI
+      # repo-wide, which is a throughput decision for the box owner and is deliberately NOT taken
+      # here as a side effect of landing a probe.
+      #
+      # THE WEEKLY CANNOT REACH THIS STEP. GitHub runs `schedule:` only from the DEFAULT branch, so
+      # while epic 17137 lives on `feature/sc-17137-minimax-h3` the entire job is dispatch-only.
+      # Stated here so nobody waits on a Monday run that cannot fire.
+      #
+      # THE COMPUTE CAP IS NOT A HAZARD FOR THIS NUMBER, and sc-19545 has now established WHY --
+      # the earlier wording here ("a known latent hazard") was reasoning from the number's name and
+      # was wrong. `CUDA_COMPUTE_CAP: "80"` does not describe the hardware and is not supposed to:
+      # it is the bottom rung of the arch ladder, and `vendor/candle-kernels/build.rs` appends
+      # sm_90, sm_120 and `compute_120` PTX above it (sc-7544), so the Blackwell card IS covered.
+      # The silent-zeros class was retired then, not merely deferred.
+      #
+      # The q4 and q8 probes below now exercise the packed kernels too. Their `spec.quantize`
+      # assertions reject a mis-staged tier before rendering, and the probe's
+      # `DEGENERATE_STD_FLOOR` middle-frame check rejects an all-zeros render. sc-19545 deliberately
+      # added no general CUDA-quant smoke gate, so that broader check remains only in
+      # `candle-gen/tests/cuda_quant_smoke.rs`; the three real-weight records here are specifically
+      # the MiniMax-H3 shipped-geometry measurements.
+      - name: Require real MiniMax-H3 files and staged tier inputs before measuring
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        run: |
+          rem Validate every index-resolved file before Cargo creates a CUDA context. The live
+          rem CANDLE_MINIMAX_H3_SNAPSHOT is an HF cache tree, whose reparse-point blob links candle
+          rem cannot memmap; this requires hardlink/copy-staged real files instead.
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q4 --dit "${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q8 --dit "${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}" --te "${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier bf16 --dit "%MINIMAX_H3_SNAPSHOT%\transformer" --te "%MINIMAX_H3_SNAPSHOT%\text_encoder" || exit /b 1
+      - name: Measure candle vramGbByTier (q4, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          set "name=minimax_h3_vram_q4"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-q4.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q4 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q4 --out "%RUNNER_TEMP%\minimax-h3-vram-q4.json" || exit /b 1
+          type "%RUNNER_TEMP%\minimax-h3-vram-q4.json"
+      - name: Measure candle vramGbByTier (q8, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          set "name=minimax_h3_vram_q8"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-q8.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_q8 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier q8 --out "%RUNNER_TEMP%\minimax-h3-vram-q8.json" || exit /b 1
+          type "%RUNNER_TEMP%\minimax-h3-vram-q8.json"
+      - name: Measure candle vramGbByTier (bf16, shipped geometry)
+        if: inputs.minimax_h3_vram_probe
+        shell: cmd
+        env:
+          MINIMAX_H3_VRAM_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+          MINIMAX_H3_VRAM_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}\transformer
+          MINIMAX_H3_VRAM_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}\text_encoder
+          # Belt-and-braces: the provider FORCES `OffloadPolicy::Sequential` regardless (pinned by
+          # `the_offload_policy_is_forced_sequential_even_when_resident_is_requested`). Set anyway so
+          # the invocation matches the Wan runbook line for line.
+          CANDLE_GEN_OFFLOAD: sequential
+        run: |
+          call "%VCVARS%"
+          rem Record the card state IMMEDIATELY before the render: the probe's 1 GB idle-baseline
+          rem assertion is what rejects a contaminated number, and this is the evidence for why.
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
+          rem `name=` is the single-selection vocabulary
+          rem `test_minimax_h3_lanes_select_tests_that_exist_and_pin_their_run_count` binds against,
+          rem so this selection is checked to name a test that still EXISTS and is still `#[ignore]`d.
+          set "name=minimax_h3_vram_bf16"
+          set "log=%RUNNER_TEMP%\minimax-h3-vram-bf16.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration vram_probe::%name% -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+          type "%log%"
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::minimax_h3_vram_bf16 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+          rem The machine-parseable datum is the whole point of the run; a green step that produced
+          rem no `[[H3_VRAM]]` line has measured nothing anyone can transcribe into the manifest.
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_receipt.py --log "%log%" --tier bf16 --out "%RUNNER_TEMP%\minimax-h3-vram-bf16.json" || exit /b 1
+          type "%RUNNER_TEMP%\minimax-h3-vram-bf16.json"
+      - name: Keep the VRAM evidence
+        if: inputs.minimax_h3_vram_probe && !cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-candle-vram-bf16
+          path: |
+            ${{ runner.temp }}/minimax-h3-vram-q4.log
+            ${{ runner.temp }}/minimax-h3-vram-q4.json
+            ${{ runner.temp }}/minimax-h3-vram-q8.log
+            ${{ runner.temp }}/minimax-h3-vram-q8.json
+            ${{ runner.temp }}/minimax-h3-vram-bf16.log
+            ${{ runner.temp }}/minimax-h3-vram-bf16.json
+          if-no-files-found: error

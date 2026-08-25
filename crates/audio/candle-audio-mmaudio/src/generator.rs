@@ -34,7 +34,7 @@ use candle_audio::candle_core::{Device, Result as CResult, Tensor};
 use candle_audio::gen_core::{
     self, reject_unknown_components, require_component, AudioTrack, Capabilities, Conditioning,
     ConditioningKind, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    ModelDescriptor, Progress, StepSupport, WeightsSource,
 };
 use candle_audio::{AudioError, Result as AudioResult};
 use rand::rngs::StdRng;
@@ -107,42 +107,24 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supports_negative_prompt: true,
             supports_guidance: true,
-            supports_true_cfg: false,
             // The one video→audio conditioning: a silent clip's RGB frames (the Foley condition).
             conditioning: vec![ConditioningKind::VideoSync],
-            supports_lora: false,
-            supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec![],
-            supported_guidance_methods: vec![],
             // Pure audio: no visual size floor (the audio descriptor sweep exempts Audio, sc-13314).
             min_size: 0,
-            max_size: 0,
             // One clip per request (GenerationOutput::Audio carries a single track).
             max_count: 1,
-            mac_only: false,
+            // The Euler flow-matching ladder's 500-step bound, advertised rather than hidden
+            // (sc-19559).
+            supported_steps: StepSupport::Range {
+                min: 1,
+                max: MAX_STEPS,
+            },
             audio_sample_rates: vec![SAMPLE_RATE],
             max_audio_duration_secs: Some(MAX_DURATION_SECS),
             // No voice / edit-mode / speaker surface — this is video-conditioned Foley.
             audio_voices: vec![],
             audio_languages: LANGUAGES.to_vec(),
-            audio_edit_modes: vec![],
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
-            supports_sequential_offload: false,
-            unconditionally_engages_staged_residency: false,
-            supports_preview: false,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

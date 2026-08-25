@@ -3,14 +3,14 @@
 //!
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot in the HF cache
 //! (or `SDXL_SNAPSHOT`). Run:
-//!   cargo test -p mlx-gen-sdxl --release --test trainer_e2e -- --ignored --nocapture
+//!   cargo test -p mlx-gen-sdxl --release --test integration trainer_e2e:: -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
 //! VAE/dual-CLIP-encoded and cached, AdamW training drives the epsilon flow down, and an adapter is
 //! written that reloads through the REAL SDXL inference path (`apply_sdxl_adapters[_with]`) onto a
 //! fresh U-Net — merging into every trained target and forwarding finite.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
@@ -349,7 +349,7 @@ fn forward_finite(unet: &mlx_gen_sdxl::UNet2DConditionModel) {
 /// `TrainingProgress::Sample` events at the cadence, each a real decoded RGB bitmap (SDXL renders
 /// previews with real CFG). Proves the SDXL render path (install in-progress adapter → CFG denoise →
 /// VAE decode → `Image`) on real weights. Run:
-///   cargo test -p mlx-gen-sdxl --release --test trainer_e2e -- --ignored --nocapture sdxl_trainer_emits_preview_samples
+///   cargo test -p mlx-gen-sdxl --release --test integration -- --ignored --nocapture trainer_e2e::sdxl_trainer_emits_preview_samples
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_emits_preview_samples() {

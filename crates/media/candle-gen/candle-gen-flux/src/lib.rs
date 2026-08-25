@@ -116,7 +116,7 @@ mod ip_validate;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, SizeFloor, WeightsSource,
+    ModelDescriptor, Progress, WeightsSource,
 };
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
@@ -359,7 +359,6 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // which this txt2img slice does not wire — so neither is advertised on either variant.
             supports_negative_prompt: false,
             supports_guidance: variant.supports_guidance(),
-            supports_true_cfg: false,
             // txt2img only in sc-3694 — Reference/IP-adapter lands later; an empty list means the
             // shared `validate_request` rejects any conditioning and the worker keeps those shapes on
             // the Python path.
@@ -374,39 +373,17 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // Euler path (N1). FLUX had no legacy sampler/scheduler aliases, so no `menu_with_aliases`.
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
-            // candle is the Windows/CUDA backend — NOT Mac-only (the MLX provider sets this true).
-            mac_only: false,
-            supported_quants: &[],
-            component_precision_floors: &[],
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             // Per-step latent previews (epic 16948, sc-16956): the registered txt2img route hands
             // `crate::preview::hook` to the shared flow driver, projecting the unpacked 16-channel
             // latent through the reused epic-16624 fit. Both variants share one render lane, so both
             // advertise. `candle-gen-catalog`'s `preview_advertising` guard derives this from the
             // sources and fails if the flag and the wiring ever disagree.
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

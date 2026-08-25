@@ -5,7 +5,8 @@
 use crate::audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 use crate::audio_transform::{AudioTransform, AudioTransformDescriptor, AudioTransformKind};
 use crate::caption::{Captioner, CaptionerDescriptor};
-use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
+use crate::checkpoint_codec::{CheckpointCodecRegistration, CheckpointCodecRegistry};
+use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor, StepSupport};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::memory_strategy::{
     MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
@@ -147,10 +148,654 @@ pub enum ImportedModelOperation {
     MultiPhase,
 }
 
+/// A platform backend that may bind a portable checkpoint adapter to a real generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckpointBackend {
+    Mlx,
+    Candle,
+}
+
+impl CheckpointBackend {
+    fn descriptor_label(self) -> &'static str {
+        match self {
+            Self::Mlx => "mlx",
+            Self::Candle => "candle",
+        }
+    }
+}
+
+/// One named on-disk dialect accepted by a family checkpoint adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointDialectRegistration {
+    pub id: &'static str,
+    pub source: ImportedModelSource,
+}
+
+/// Header-only tensor evidence that identifies one registered dialect.
+///
+/// The inspector owns wildcard/cardinality evaluation; the adapter owns the stable signature id
+/// and the exact tensor names that must all be present before that signature can claim a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointSignatureRegistration {
+    pub id: &'static str,
+    pub dialect: &'static str,
+    pub required_tensor_names: &'static [&'static str],
+}
+
+/// A component role and its accepted cardinality in the portable checkpoint graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointComponentRegistration {
+    pub role: &'static str,
+    pub min_count: u16,
+    pub max_count: u16,
+}
+
+/// Families that may satisfy one component role's resident/base dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointBaseCompatibilityRegistration {
+    pub component_role: &'static str,
+    pub compatible_families: &'static [&'static str],
+}
+
+/// Stable canonical key-mapping authority for one checkpoint dialect.
+///
+/// The mapping id names the provider-owned exhaustive mapper exercised by family migration tests;
+/// callers never infer a mapper from a family allow-list.
+///
+/// # `plan_driven_backends`: which declarations are backed by code
+///
+/// A `mapping_id` is a *declaration*. Whether some crate actually ships a
+/// [`LogicalKeyMapping`](crate::checkpoint_codec::LogicalKeyMapping) with that id is a separate
+/// fact, and for most shipped families the answer is **no**: their loaders read the checkpoint on
+/// their own native path and never compile a
+/// [`LogicalWeightPlan`](crate::checkpoint_codec::LogicalWeightPlan). Declaring that difference
+/// here is what lets each catalog's conformance test prove reachability in both directions —
+/// a backend listed here **must** ship the impl, and a backend not listed **must not**, so neither
+/// an unbacked declaration nor an undeclared plan route can appear silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointCanonicalMappingRegistration {
+    pub dialect: &'static str,
+    pub mapping_id: &'static str,
+    /// Backends that ship a real `LogicalKeyMapping` implementation whose `mapping_id()` equals
+    /// [`mapping_id`](Self::mapping_id). Empty = **loader-native**: no backend routes this dialect
+    /// through the plan compiler today, and the id names the correspondence only. Must be a
+    /// duplicate-free subset of the adapter's
+    /// [`eligible_backends`](CheckpointAdapterRegistration::eligible_backends).
+    pub plan_driven_backends: &'static [CheckpointBackend],
+}
+
+/// Stable config-recovery authority for one semantic config field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointConfigRecoveryRegistration {
+    pub field: &'static str,
+    pub recovery_id: &'static str,
+}
+
+/// Portable capability policy for one imported operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointAdapterCapabilityRegistration {
+    pub operation: ImportedModelOperation,
+    /// The binding projects the real provider descriptor instead of copying a second capability
+    /// table into SceneWorks.
+    pub inherit_provider_capabilities: bool,
+    /// Whether a backend binding may inherit the provider's LoRA/LoKr support for this operation.
+    pub supports_adapter_inheritance: bool,
+}
+
+/// A real platform-provider binding for one portable family adapter route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointBackendBindingRegistration {
+    pub backend: CheckpointBackend,
+    pub source: ImportedModelSource,
+    pub operation: ImportedModelOperation,
+    pub provider_id: &'static str,
+    pub required_components: Option<&'static [&'static str]>,
+    pub inherit_adapters: bool,
+}
+
+/// The explicit temporary projection into the legacy imported-model family namespace.
+///
+/// [`CheckpointAdapterRegistration::family`] remains the provider-truth portable identity used
+/// for binding and cross-catalog conformance. This separate, validated field exists only so the
+/// derived [`ImportedModelRegistration`] view can remain byte-compatible while its consumers are
+/// migrated away from the legacy family spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedModelCompatibilityProjectionRegistration {
+    pub family: &'static str,
+}
+
+/// The complete portable checkpoint-adapter authority for one model family.
+///
+/// Platform catalogs register this metadata together with only the bindings they actually ship.
+/// [`ProviderRegistryBuilder::build`] validates the portable graph, refuses missing or dangling
+/// implementations, and derives the temporary [`ImportedModelRegistration`] compatibility view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointAdapterRegistration {
+    pub adapter_id: &'static str,
+    pub family: &'static str,
+    pub compatibility_projection: ImportedModelCompatibilityProjectionRegistration,
+    pub signatures: &'static [CheckpointSignatureRegistration],
+    pub dialects: &'static [CheckpointDialectRegistration],
+    pub component_topology: &'static [CheckpointComponentRegistration],
+    pub base_compatibility: &'static [CheckpointBaseCompatibilityRegistration],
+    pub canonical_mappings: &'static [CheckpointCanonicalMappingRegistration],
+    pub config_recovery: &'static [CheckpointConfigRecoveryRegistration],
+    pub eligible_backends: &'static [CheckpointBackend],
+    pub backend_bindings: &'static [CheckpointBackendBindingRegistration],
+    pub operations: &'static [ImportedModelOperation],
+    pub capabilities: &'static [CheckpointAdapterCapabilityRegistration],
+}
+
+impl CheckpointAdapterRegistration {
+    /// Whether two platform registrations describe the same portable checkpoint contract.
+    ///
+    /// Backend bindings are deliberately excluded: provider ids and supported operations may be
+    /// asymmetric between MLX and Candle, while every other field remains shared family authority.
+    pub fn has_same_portable_metadata(&self, other: &Self) -> bool {
+        self.adapter_id == other.adapter_id
+            && self.family == other.family
+            && self.compatibility_projection == other.compatibility_projection
+            && self.signatures == other.signatures
+            && self.dialects == other.dialects
+            && self.component_topology == other.component_topology
+            && self.base_compatibility == other.base_compatibility
+            && self.canonical_mappings == other.canonical_mappings
+            && self.config_recovery == other.config_recovery
+            && self.eligible_backends == other.eligible_backends
+            && self.operations == other.operations
+            && self.capabilities == other.capabilities
+    }
+}
+
+/// Portable Krea 2 adapter metadata shared by the MLX and Candle platform bindings.
+pub const KREA_2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
+    CheckpointAdapterRegistration {
+        adapter_id: "krea-2-v1",
+        family: "krea_2",
+        compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+            family: "krea_2",
+        },
+        signatures: &[
+            CheckpointSignatureRegistration {
+                id: "krea-2-native-v1",
+                dialect: "krea-native",
+                required_tensor_names: &["model.diffusion_model.blocks.0.attn.wq.weight"],
+            },
+            CheckpointSignatureRegistration {
+                id: "krea-2-diffusers-v1",
+                dialect: "diffusers",
+                required_tensor_names: &["transformer_blocks.0.attn.to_q.weight"],
+            },
+        ],
+        dialects: &[
+            CheckpointDialectRegistration {
+                id: "krea-native",
+                source: ImportedModelSource::TransformerFile,
+            },
+            CheckpointDialectRegistration {
+                id: "diffusers",
+                source: ImportedModelSource::TransformerFile,
+            },
+        ],
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["krea_2"],
+        }],
+        canonical_mappings: &[
+            CheckpointCanonicalMappingRegistration {
+                dialect: "krea-native",
+                mapping_id: "krea-native-to-diffusers-v1",
+                // BOTH engines: `mlx_gen_krea::KreaNativeToDiffusersMapping` and, since sc-20651,
+                // `candle_gen_krea::native_mapping::KreaNativeToDiffusersMapping`. One dialect, one
+                // canonical mapping id, two implementations — which is the shape this field exists
+                // to make checkable rather than assumed.
+                plan_driven_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+            },
+            // NOT `identity-v1`. A Krea 2 checkpoint may carry *undescribed* fp8, and
+            // `IdentityKeyMapping` accepts every on-disk key — including a scale companion under an
+            // unrecognised suffix, which then plans as a unit-scale fp8 weight and decodes silently
+            // wrong (see the `IdentityKeyMapping` doc comment). `krea-2-diffusers-v1` is identity
+            // over the keys the Krea 2 architecture actually contains and REFUSES everything else.
+            CheckpointCanonicalMappingRegistration {
+                dialect: "diffusers",
+                mapping_id: "krea-2-diffusers-v1",
+                plan_driven_backends: &[CheckpointBackend::Mlx],
+            },
+        ],
+        config_recovery: &[
+            CheckpointConfigRecoveryRegistration {
+                field: "architecture",
+                recovery_id: "krea-signature-v1",
+            },
+            CheckpointConfigRecoveryRegistration {
+                field: "hidden-size",
+                recovery_id: "krea-tensor-shape-v1",
+            },
+        ],
+        eligible_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+        backend_bindings: &[],
+        operations: &[
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Edit,
+            ImportedModelOperation::Pose,
+            ImportedModelOperation::MultiPhase,
+        ],
+        capabilities: &[
+            CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::Generate,
+                inherit_provider_capabilities: true,
+                supports_adapter_inheritance: true,
+            },
+            CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::Edit,
+                inherit_provider_capabilities: true,
+                supports_adapter_inheritance: true,
+            },
+            CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::Pose,
+                inherit_provider_capabilities: true,
+                supports_adapter_inheritance: true,
+            },
+            CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::MultiPhase,
+                inherit_provider_capabilities: true,
+                supports_adapter_inheritance: true,
+            },
+        ],
+    };
+
+/// Portable SDXL fused-checkpoint adapter metadata shared by both platform bindings.
+pub const SDXL_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
+    adapter_id: "sdxl-fused-v1",
+    family: "sdxl",
+    compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "sdxl" },
+    signatures: &[CheckpointSignatureRegistration {
+        id: "sdxl-ldm-v1",
+        dialect: "ldm",
+        required_tensor_names: &["model.diffusion_model.input_blocks.0.0.weight"],
+    }],
+    dialects: &[CheckpointDialectRegistration {
+        id: "ldm",
+        source: ImportedModelSource::FusedCheckpoint,
+    }],
+    component_topology: &[
+        CheckpointComponentRegistration {
+            role: "fused-checkpoint",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "text-encoders",
+            min_count: 1,
+            max_count: 2,
+        },
+    ],
+    base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+        component_role: "text-encoders",
+        compatible_families: &["sdxl"],
+    }],
+    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+        dialect: "ldm",
+        mapping_id: "sdxl-ldm-to-diffusers-v1",
+        // Loader-native: the SDXL LDM loaders do their own key translation and never compile a
+        // `LogicalWeightPlan`, so no crate ships a `LogicalKeyMapping` with this id.
+        plan_driven_backends: &[],
+    }],
+    config_recovery: &[
+        CheckpointConfigRecoveryRegistration {
+            field: "architecture",
+            recovery_id: "sdxl-signature-v1",
+        },
+        CheckpointConfigRecoveryRegistration {
+            field: "prediction-type",
+            recovery_id: "sdxl-metadata-or-default-v1",
+        },
+    ],
+    eligible_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+    backend_bindings: &[],
+    operations: &[
+        ImportedModelOperation::Generate,
+        ImportedModelOperation::Edit,
+    ],
+    capabilities: &[
+        CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: true,
+        },
+        CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Edit,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: true,
+        },
+    ],
+};
+
+/// Portable Mage-Flow fine-tune directory adapter metadata.
+pub const MAGE_FLOW_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
+    CheckpointAdapterRegistration {
+        adapter_id: "mage-flow-diffusers-v1",
+        family: "mage_flow",
+        compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+            family: "mage-flow",
+        },
+        signatures: &[CheckpointSignatureRegistration {
+            id: "mage-flow-diffusers-v1",
+            dialect: "diffusers",
+            required_tensor_names: &["transformer_blocks.0.attn.to_q.weight"],
+        }],
+        dialects: &[CheckpointDialectRegistration {
+            id: "diffusers",
+            source: ImportedModelSource::TransformerDirectory,
+        }],
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["mage_flow"],
+        }],
+        canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+            dialect: "diffusers",
+            mapping_id: "identity-v1",
+            // Loader-native: the Mage-Flow diffusers-directory loader reads the snapshot directly.
+            plan_driven_backends: &[],
+        }],
+        config_recovery: &[CheckpointConfigRecoveryRegistration {
+            field: "architecture",
+            recovery_id: "mage-config-json-v1",
+        }],
+        eligible_backends: &[CheckpointBackend::Mlx],
+        backend_bindings: &[],
+        operations: &[ImportedModelOperation::Generate],
+        capabilities: &[CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: false,
+        }],
+    };
+
+/// Portable Z-Image ComfyUI adapter metadata.
+pub const Z_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
+    CheckpointAdapterRegistration {
+        adapter_id: "z-image-comfyui-v1",
+        family: "z-image",
+        compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+            family: "z-image",
+        },
+        signatures: &[CheckpointSignatureRegistration {
+            id: "z-image-comfyui-v1",
+            dialect: "comfyui",
+            required_tensor_names: &["model.diffusion_model.x_embedder.weight"],
+        }],
+        dialects: &[CheckpointDialectRegistration {
+            id: "comfyui",
+            source: ImportedModelSource::ComfyUiTree,
+        }],
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["z-image"],
+        }],
+        canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+            dialect: "comfyui",
+            mapping_id: "z-image-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
+        }],
+        config_recovery: &[CheckpointConfigRecoveryRegistration {
+            field: "architecture",
+            recovery_id: "z-image-signature-v1",
+        }],
+        eligible_backends: &[CheckpointBackend::Candle],
+        backend_bindings: &[],
+        operations: &[ImportedModelOperation::Generate],
+        capabilities: &[CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: true,
+        }],
+    };
+
+/// Portable Qwen-Image ComfyUI adapter metadata.
+pub const QWEN_IMAGE_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration =
+    CheckpointAdapterRegistration {
+        adapter_id: "qwen-image-comfyui-v1",
+        family: "qwen-image",
+        compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+            family: "qwen-image",
+        },
+        signatures: &[CheckpointSignatureRegistration {
+            id: "qwen-image-comfyui-v1",
+            dialect: "comfyui",
+            required_tensor_names: &["model.diffusion_model.img_in.weight"],
+        }],
+        dialects: &[CheckpointDialectRegistration {
+            id: "comfyui",
+            source: ImportedModelSource::ComfyUiTree,
+        }],
+        component_topology: &[
+            CheckpointComponentRegistration {
+                role: "transformer",
+                min_count: 1,
+                max_count: 1,
+            },
+            CheckpointComponentRegistration {
+                role: "base-snapshot",
+                min_count: 1,
+                max_count: 1,
+            },
+        ],
+        base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+            component_role: "base-snapshot",
+            compatible_families: &["qwen-image"],
+        }],
+        canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+            dialect: "comfyui",
+            mapping_id: "qwen-image-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
+        }],
+        config_recovery: &[CheckpointConfigRecoveryRegistration {
+            field: "architecture",
+            recovery_id: "qwen-image-signature-v1",
+        }],
+        eligible_backends: &[CheckpointBackend::Candle],
+        backend_bindings: &[],
+        operations: &[ImportedModelOperation::Generate],
+        capabilities: &[CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: true,
+        }],
+    };
+
+/// Portable FLUX.2 ComfyUI adapter metadata.
+pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
+    adapter_id: "flux2-comfyui-v1",
+    family: "flux2",
+    compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "flux2" },
+    signatures: &[CheckpointSignatureRegistration {
+        id: "flux2-comfyui-v1",
+        dialect: "comfyui",
+        required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
+    }],
+    dialects: &[CheckpointDialectRegistration {
+        id: "comfyui",
+        source: ImportedModelSource::ComfyUiTree,
+    }],
+    component_topology: &[
+        CheckpointComponentRegistration {
+            role: "transformer",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "base-snapshot",
+            min_count: 1,
+            max_count: 1,
+        },
+    ],
+    base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+        component_role: "base-snapshot",
+        compatible_families: &["flux2"],
+    }],
+    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+        dialect: "comfyui",
+        mapping_id: "flux2-comfyui-to-diffusers-v1",
+        // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+        plan_driven_backends: &[],
+    }],
+    config_recovery: &[CheckpointConfigRecoveryRegistration {
+        field: "architecture",
+        recovery_id: "flux2-signature-v1",
+    }],
+    eligible_backends: &[CheckpointBackend::Candle],
+    backend_bindings: &[],
+    operations: &[ImportedModelOperation::Generate],
+    capabilities: &[CheckpointAdapterCapabilityRegistration {
+        operation: ImportedModelOperation::Generate,
+        inherit_provider_capabilities: true,
+        supports_adapter_inheritance: true,
+    }],
+};
+
+/// Portable Wan 2.2 ComfyUI adapter metadata (epic 20398, sc-20644).
+///
+/// # The dual-expert backbone this declares, and what it exposes
+///
+/// Wan 2.2's ComfyUI distribution is the one shipped family whose checkpoint has **two** backbones:
+/// a high-noise and a low-noise expert, both `blocks.N.{self_attn,cross_attn,ffn}` DiTs, selected
+/// per denoise step. That is why [`CheckpointAdapterRegistration::component_topology`] declares
+/// `transformer-high` and `transformer-low` as two distinct single-count roles rather than one
+/// `transformer` with `max_count: 2` — the two are not interchangeable, and a plan that recorded
+/// them as two instances of one role could not say which is which.
+///
+/// # Spelling: hyphens here, underscores in the plan
+///
+/// SceneWorks' `checkpoint_inspector` emits matching plan-layer roles for these two experts,
+/// spelled with UNDERSCORES (`transformer_high` / `transformer_low`) like every other layer role it
+/// emits. The hyphenated spelling here is this file's own topology convention — the same split that
+/// already exists between the `base-snapshot` topology role and the `base_snapshot` component id.
+/// The projection between the two vocabularies is `-` → `_`, and it is pinned from both sides in
+/// the `mapping_id` posture: the conformance test below asserts the projection of these roles, and
+/// SceneWorks asserts the projected literals are what its inspector actually emits. Nothing
+/// structural enforces the tie, so either side drifting alone would turn a compiled Wan plan into
+/// two roles no lane recognizes.
+///
+/// # One binding, and why not two
+///
+/// [`ImportedModelOperation`] has no video vocabulary: T2V and I2V are the same `Generate`
+/// operation distinguished by an `i2v` flag on the loader, not by the operation enum. So at most one
+/// binding is expressible for this (backend, source). Registering I2V as `Edit` would be a lie about
+/// what the enum means.
+pub const WAN_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAdapterRegistration {
+    adapter_id: "wan-comfyui-v1",
+    // The PORTABLE family is the generator's own (`wan`) — the registry build refuses an adapter
+    // whose family does not match the generator it binds. The PROJECTION is `wan-video`, which is
+    // what `checkpoint_inspector::normalize_family` records in a compiled plan and what SceneWorks
+    // keys its adapter lookup on. Wan is the second family after Mage-Flow whose two spellings
+    // differ, and for the same reason.
+    family: "wan",
+    compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+        family: "wan-video",
+    },
+    signatures: &[CheckpointSignatureRegistration {
+        id: "wan-comfyui-v1",
+        dialect: "comfyui",
+        // The pair that separates Wan from its neighbours: a `self_attn` DiT block WITH an `ffn`
+        // (Anima has adaln modulation; LTX has attn1/attn2 and no ffn). Mirrors SceneWorks'
+        // `base_weights::detect_transformer_family` so the inspector and the adapter agree.
+        required_tensor_names: &["blocks.0.self_attn.q.weight", "blocks.0.ffn.0.weight"],
+    }],
+    dialects: &[CheckpointDialectRegistration {
+        id: "comfyui",
+        source: ImportedModelSource::ComfyUiTree,
+    }],
+    component_topology: &[
+        CheckpointComponentRegistration {
+            role: "transformer-high",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "transformer-low",
+            min_count: 1,
+            max_count: 1,
+        },
+        CheckpointComponentRegistration {
+            role: "base-snapshot",
+            min_count: 1,
+            max_count: 1,
+        },
+    ],
+    base_compatibility: &[CheckpointBaseCompatibilityRegistration {
+        component_role: "base-snapshot",
+        compatible_families: &["wan"],
+    }],
+    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
+        dialect: "comfyui",
+        mapping_id: "wan-comfyui-to-diffusers-v1",
+        // Plan-driven on Candle: `candle_gen_wan::gguf::WanNativeToDiffusersMapping` is the
+        // refusing implementation of this id, and the GGUF DiT route (sc-20649) compiles its plan
+        // through it against the registered `gguf-container-v1` codec.
+        plan_driven_backends: &[CheckpointBackend::Candle],
+    }],
+    config_recovery: &[CheckpointConfigRecoveryRegistration {
+        field: "architecture",
+        recovery_id: "wan-signature-v1",
+    }],
+    eligible_backends: &[CheckpointBackend::Candle],
+    backend_bindings: &[],
+    operations: &[ImportedModelOperation::Generate],
+    capabilities: &[CheckpointAdapterCapabilityRegistration {
+        operation: ImportedModelOperation::Generate,
+        inherit_provider_capabilities: true,
+        // `load_from_comfyui_experts` takes no adapters: the ComfyUI expert pair loads in place with
+        // no LoRA seam, so inheriting the provider's adapter flags would advertise a capability the
+        // imported route does not have.
+        supports_adapter_inheritance: false,
+    }],
+};
+
 /// Provider-owned route from one imported source shape and operation to the ordinary generator
 /// registration that actually validates and loads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImportedModelRegistration {
+    /// Historical family spelling emitted by the adapter's explicit compatibility projection.
+    /// Portable code must use [`CheckpointAdapterRegistration::family`] instead.
     pub family: &'static str,
     pub source: ImportedModelSource,
     pub operation: ImportedModelOperation,
@@ -476,14 +1121,49 @@ pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurface
 pub struct MemoryBehaviorFixture {
     pub context: crate::MemoryRunContext,
     pub request: crate::GenerationRequest,
+    /// Exact provider-owned load identity used by executable conformance. `None` reuses the
+    /// catalog's common weights-free spec; providers with route/path-sensitive admission attach a
+    /// synthetic but canonical receipt so their positive control exercises production validation.
+    pub load_spec: Option<LoadSpec>,
 }
 
 impl MemoryBehaviorFixture {
+    /// Build a fixture whose request mirrors `context.geometry`.
+    ///
+    /// All five geometry axes are carried across: width, height, batch (as
+    /// [`count`](crate::GenerationRequest::count)), reference count (as that many
+    /// [`Conditioning::Reference`](crate::Conditioning::Reference) entries) and
+    /// [`frames`](crate::GenerationRequest::frames). The fixture is therefore self-consistent by
+    /// construction — a provider re-grading the request against the geometry it just admitted sees
+    /// the same numbers on both sides.
+    ///
+    /// **The `frames` mapping is `u32` → `Option<u32>` (sc-19591).**
+    /// [`MemoryGeometry::frames`](crate::MemoryGeometry) is a concrete frame count, while
+    /// [`GenerationRequest::frames`](crate::GenerationRequest::frames) is optional, where `None`
+    /// means *unstated* and delegates to the provider's own default clip length — every consumer
+    /// resolves it as `request.frames.unwrap_or(<that provider's default>)`, which is
+    /// `default_frames` in `MlxRequestScopeCore::configure_request` and
+    /// `CandleRequestScopeCore::configure_request`, and `1` in, for example,
+    /// `candle_gen_flux2::memory_strategy`. A shared builder cannot know that per-provider default,
+    /// so it *states* the geometry's count instead of delegating: `Some(frames)` re-reads as the
+    /// admitted geometry for every provider, whereas `None` would only do so for one whose default
+    /// happens to equal the geometry. A geometry of zero frames states no clip length at all and no
+    /// provider can render zero frames, so it maps back to the unstated `None` rather than to an
+    /// explicit zero-frame request.
+    ///
+    /// Providers whose frame lattice excludes 1 — `mlx-gen-minimax-h3` (`17n+5`, minimum 124
+    /// frames) is the first — need only declare the frame count on `context.geometry`; no post-hoc
+    /// override of `fixture.request.frames` is required. Guarded in `memory_strategy.rs`'s tests,
+    /// alongside `behavior_fixture_preserves_exact_reference_cardinality`, by
+    /// `behavior_fixture_propagates_a_multi_frame_geometry`,
+    /// `behavior_fixture_propagates_a_single_frame_geometry` and
+    /// `behavior_fixture_leaves_a_zero_frame_geometry_unstated`.
     pub fn new(context: crate::MemoryRunContext) -> Self {
         let mut request = crate::GenerationRequest {
             width: context.geometry.width,
             height: context.geometry.height,
             count: context.geometry.batch,
+            frames: (context.geometry.frames > 0).then_some(context.geometry.frames),
             use_pid: context.use_pid,
             ..Default::default()
         };
@@ -497,7 +1177,17 @@ impl MemoryBehaviorFixture {
                 strength: Some(1.0),
             });
         }
-        Self { context, request }
+        Self {
+            context,
+            request,
+            load_spec: None,
+        }
+    }
+
+    /// Bind this positive-control fixture to its provider-owned exact load identity.
+    pub fn with_load_spec(mut self, load_spec: LoadSpec) -> Self {
+        self.load_spec = Some(load_spec);
+        self
     }
 }
 
@@ -611,7 +1301,8 @@ pub struct AudioEmbedderRegistration {
 #[derive(Default)]
 pub struct ProviderRegistryBuilder {
     generators: Vec<ModelRegistration>,
-    imported_models: Vec<ImportedModelRegistration>,
+    checkpoint_adapters: Vec<CheckpointAdapterRegistration>,
+    checkpoint_codecs: Vec<CheckpointCodecRegistration>,
     encoder_contract_routes: Vec<EncoderContractRouteRegistration>,
     memory_strategy: Vec<MemoryRegistration>,
     memory_contract_fixture: Vec<MemoryContractFixtureRegistration>,
@@ -641,6 +1332,437 @@ macro_rules! builder_registration_method {
     };
 }
 
+fn validate_checkpoint_adapters(
+    adapters: &[CheckpointAdapterRegistration],
+    generators: &[ModelRegistration],
+) -> Result<Vec<ImportedModelRegistration>> {
+    fn require_surface(
+        adapter: &CheckpointAdapterRegistration,
+        name: &str,
+        present: bool,
+    ) -> Result<()> {
+        if present {
+            Ok(())
+        } else {
+            Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' {name} must not be empty",
+                adapter.adapter_id
+            )))
+        }
+    }
+
+    let mut adapter_ids = std::collections::BTreeSet::new();
+    let mut families = std::collections::BTreeMap::new();
+    let mut compatibility_families = std::collections::BTreeMap::new();
+    let mut projected_routes = std::collections::BTreeSet::new();
+    let mut imported_models = Vec::new();
+
+    for adapter in adapters {
+        if !is_registry_ident(adapter.adapter_id) || !is_registry_ident(adapter.family) {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter identity {:?}/{:?} must use non-empty lowercase registry identifiers",
+                adapter.adapter_id, adapter.family
+            )));
+        }
+        if !is_registry_ident(adapter.compatibility_projection.family) {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' compatibility family {:?} must use a non-empty lowercase registry identifier",
+                adapter.adapter_id, adapter.compatibility_projection.family
+            )));
+        }
+        if !adapter_ids.insert(adapter.adapter_id) {
+            return Err(Error::Msg(format!(
+                "duplicate checkpoint-adapter id '{}'",
+                adapter.adapter_id
+            )));
+        }
+        if families
+            .insert(adapter.family, adapter.adapter_id)
+            .is_some()
+        {
+            return Err(Error::Msg(format!(
+                "duplicate checkpoint-adapter family '{}'",
+                adapter.family
+            )));
+        }
+        if compatibility_families
+            .insert(adapter.compatibility_projection.family, adapter.adapter_id)
+            .is_some()
+        {
+            return Err(Error::Msg(format!(
+                "duplicate checkpoint-adapter compatibility family '{}'",
+                adapter.compatibility_projection.family
+            )));
+        }
+    }
+    for (compatibility_family, adapter_id) in &compatibility_families {
+        if let Some(portable_owner) = families.get(compatibility_family) {
+            if portable_owner != adapter_id {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter compatibility family '{}' for '{}' collides with portable family owned by '{}'",
+                    compatibility_family, adapter_id, portable_owner
+                )));
+            }
+        }
+    }
+
+    for adapter in adapters {
+        require_surface(adapter, "signatures", !adapter.signatures.is_empty())?;
+        require_surface(adapter, "dialects", !adapter.dialects.is_empty())?;
+        require_surface(
+            adapter,
+            "component topology",
+            !adapter.component_topology.is_empty(),
+        )?;
+        require_surface(
+            adapter,
+            "base compatibility",
+            !adapter.base_compatibility.is_empty(),
+        )?;
+        require_surface(
+            adapter,
+            "canonical mappings",
+            !adapter.canonical_mappings.is_empty(),
+        )?;
+        require_surface(
+            adapter,
+            "config recovery",
+            !adapter.config_recovery.is_empty(),
+        )?;
+        require_surface(
+            adapter,
+            "eligible backends",
+            !adapter.eligible_backends.is_empty(),
+        )?;
+        if adapter.backend_bindings.is_empty() {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' has no backend bindings",
+                adapter.adapter_id
+            )));
+        }
+        require_surface(adapter, "operations", !adapter.operations.is_empty())?;
+        require_surface(adapter, "capabilities", !adapter.capabilities.is_empty())?;
+
+        let mut dialect_ids = std::collections::BTreeSet::new();
+        for dialect in adapter.dialects {
+            if !is_registry_ident(dialect.id) || !dialect_ids.insert(dialect.id) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed or duplicate dialect '{}'",
+                    adapter.adapter_id, dialect.id
+                )));
+            }
+        }
+
+        let mut signature_ids = std::collections::BTreeSet::new();
+        let mut signature_dialects = std::collections::BTreeSet::new();
+        for signature in adapter.signatures {
+            if !is_registry_ident(signature.id) || !signature_ids.insert(signature.id) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed or duplicate signature '{}'",
+                    adapter.adapter_id, signature.id
+                )));
+            }
+            if !dialect_ids.contains(signature.dialect) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' signature '{}' targets unknown dialect '{}'",
+                    adapter.adapter_id, signature.id, signature.dialect
+                )));
+            }
+            if signature.required_tensor_names.is_empty() {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' signature '{}' has no required tensor names",
+                    adapter.adapter_id, signature.id
+                )));
+            }
+            let mut tensor_names = std::collections::BTreeSet::new();
+            for name in signature.required_tensor_names {
+                if name.is_empty()
+                    || name.chars().any(char::is_whitespace)
+                    || !tensor_names.insert(*name)
+                {
+                    return Err(Error::Msg(format!(
+                        "checkpoint-adapter '{}' signature '{}' has an empty, whitespace-containing, or duplicate tensor name",
+                        adapter.adapter_id, signature.id
+                    )));
+                }
+            }
+            signature_dialects.insert(signature.dialect);
+        }
+        for dialect in adapter.dialects {
+            if !signature_dialects.contains(dialect.id) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' dialect '{}' has no signature",
+                    adapter.adapter_id, dialect.id
+                )));
+            }
+        }
+
+        let mut component_roles = std::collections::BTreeSet::new();
+        for component in adapter.component_topology {
+            if !is_registry_ident(component.role)
+                || !component_roles.insert(component.role)
+                || component.min_count == 0
+                || component.max_count < component.min_count
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed or duplicate component role '{}'",
+                    adapter.adapter_id, component.role
+                )));
+            }
+        }
+        let mut base_roles = std::collections::BTreeSet::new();
+        for base in adapter.base_compatibility {
+            if !component_roles.contains(base.component_role)
+                || !base_roles.insert(base.component_role)
+                || base.compatible_families.is_empty()
+                || base
+                    .compatible_families
+                    .iter()
+                    .any(|family| !is_registry_ident(family))
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed, duplicate, or dangling base compatibility for role '{}'",
+                    adapter.adapter_id, base.component_role
+                )));
+            }
+            let unique: std::collections::BTreeSet<_> =
+                base.compatible_families.iter().copied().collect();
+            if unique.len() != base.compatible_families.len() {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' repeats a compatible base family for role '{}'",
+                    adapter.adapter_id, base.component_role
+                )));
+            }
+        }
+
+        let mut mapped_dialects = std::collections::BTreeSet::new();
+        for mapping in adapter.canonical_mappings {
+            if !dialect_ids.contains(mapping.dialect)
+                || !is_registry_ident(mapping.mapping_id)
+                || !mapped_dialects.insert(mapping.dialect)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed, duplicate, or dangling canonical mapping for dialect '{}'",
+                    adapter.adapter_id, mapping.dialect
+                )));
+            }
+        }
+        if mapped_dialects.len() != dialect_ids.len() {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' must map every declared dialect",
+                adapter.adapter_id
+            )));
+        }
+
+        let mut recovery_fields = std::collections::BTreeSet::new();
+        for recovery in adapter.config_recovery {
+            if !is_registry_ident(recovery.field)
+                || !is_registry_ident(recovery.recovery_id)
+                || !recovery_fields.insert(recovery.field)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has malformed or duplicate config recovery for field '{}'",
+                    adapter.adapter_id, recovery.field
+                )));
+            }
+        }
+
+        let eligible_backends: std::collections::BTreeSet<_> =
+            adapter.eligible_backends.iter().copied().collect();
+        if eligible_backends.len() != adapter.eligible_backends.len() {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' repeats an eligible backend",
+                adapter.adapter_id
+            )));
+        }
+        // A dialect cannot be plan-driven on a backend the adapter is not eligible for, and cannot
+        // name the same backend twice: the catalog conformance tests read this list as the exact
+        // set of backends that must ship an implementation of `mapping_id`.
+        for mapping in adapter.canonical_mappings {
+            let plan_driven: std::collections::BTreeSet<_> =
+                mapping.plan_driven_backends.iter().copied().collect();
+            if plan_driven.len() != mapping.plan_driven_backends.len()
+                || !plan_driven.is_subset(&eligible_backends)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' canonical mapping for dialect '{}' declares a repeated or ineligible plan-driven backend",
+                    adapter.adapter_id, mapping.dialect
+                )));
+            }
+        }
+
+        let operations: std::collections::BTreeSet<_> =
+            adapter.operations.iter().copied().collect();
+        if operations.len() != adapter.operations.len() {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' repeats an operation",
+                adapter.adapter_id
+            )));
+        }
+        let mut capability_operations = std::collections::BTreeSet::new();
+        for capability in adapter.capabilities {
+            if !operations.contains(&capability.operation)
+                || !capability_operations.insert(capability.operation)
+                || !capability.inherit_provider_capabilities
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has a duplicate, undeclared, or non-projectable capability for {:?}",
+                    adapter.adapter_id, capability.operation
+                )));
+            }
+        }
+        if capability_operations != operations {
+            return Err(Error::Msg(format!(
+                "checkpoint-adapter '{}' must own capability policy for every operation",
+                adapter.adapter_id
+            )));
+        }
+
+        let mut binding_keys = std::collections::BTreeSet::new();
+        let mut binding_backends = std::collections::BTreeSet::new();
+        for binding in adapter.backend_bindings {
+            if !adapter
+                .dialects
+                .iter()
+                .any(|dialect| dialect.source == binding.source)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding {:?}/{:?} has no dialect for its source shape",
+                    adapter.adapter_id, binding.backend, binding.operation
+                )));
+            }
+            if !eligible_backends.contains(&binding.backend)
+                || !operations.contains(&binding.operation)
+            {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding {:?}/{:?} is not declared portable metadata",
+                    adapter.adapter_id, binding.backend, binding.operation
+                )));
+            }
+            let capability = adapter
+                .capabilities
+                .iter()
+                .find(|capability| capability.operation == binding.operation)
+                .expect("capability-operation equality validated above");
+            if binding.inherit_adapters && !capability.supports_adapter_inheritance {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding {:?}/{:?} inherits adapters contrary to capability policy",
+                    adapter.adapter_id, binding.backend, binding.operation
+                )));
+            }
+            let binding_key = (binding.backend, binding.source, binding.operation);
+            if !binding_keys.insert(binding_key) {
+                return Err(Error::Msg(format!(
+                    "duplicate checkpoint-adapter binding '{}' ({:?}/{:?}/{:?})",
+                    adapter.adapter_id, binding.backend, binding.source, binding.operation
+                )));
+            }
+            binding_backends.insert(binding.backend);
+            let projected_key = (
+                adapter.compatibility_projection.family,
+                binding.source,
+                binding.operation,
+            );
+            if !projected_routes.insert(projected_key) {
+                return Err(Error::Msg(format!(
+                    "duplicate imported-model route for family '{}' ({:?}/{:?})",
+                    adapter.compatibility_projection.family, binding.source, binding.operation
+                )));
+            }
+            if !is_registry_ident(binding.provider_id) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding provider id is malformed",
+                    adapter.adapter_id
+                )));
+            }
+            if let Some(required) = binding.required_components {
+                if required.is_empty() {
+                    return Err(Error::Msg(format!(
+                        "checkpoint-adapter '{}' binding {:?}/{:?} declares an empty required-components override; use None instead",
+                        adapter.adapter_id, binding.source, binding.operation
+                    )));
+                }
+                let mut component_ids = std::collections::BTreeSet::new();
+                for component in required {
+                    if !is_registry_ident(component) || !component_ids.insert(*component) {
+                        return Err(Error::Msg(format!(
+                            "checkpoint-adapter '{}' binding {:?}/{:?} has a malformed or duplicate required component",
+                            adapter.adapter_id, binding.source, binding.operation
+                        )));
+                    }
+                }
+            }
+            let Some(descriptor) = generators
+                .iter()
+                .map(|generator| (generator.descriptor)())
+                .find(|descriptor| descriptor.id == binding.provider_id)
+            else {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding {:?}/{:?} targets unregistered generator '{}'",
+                    adapter.adapter_id, binding.source, binding.operation, binding.provider_id
+                )));
+            };
+            if descriptor.backend != binding.backend.descriptor_label() {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' binding backend '{}' does not match generator backend '{}'",
+                    adapter.adapter_id,
+                    binding.backend.descriptor_label(),
+                    descriptor.backend
+                )));
+            }
+            if descriptor.family != adapter.family {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' family '{}' does not match generator '{}' family '{}'",
+                    adapter.adapter_id, adapter.family, binding.provider_id, descriptor.family
+                )));
+            }
+            imported_models.push(ImportedModelRegistration {
+                family: adapter.compatibility_projection.family,
+                source: binding.source,
+                operation: binding.operation,
+                provider_id: binding.provider_id,
+                required_components: binding.required_components,
+                inherit_adapters: binding.inherit_adapters,
+            });
+        }
+        if let [sole_backend] = adapter.eligible_backends {
+            for operation in adapter.operations {
+                if !adapter.backend_bindings.iter().any(|binding| {
+                    binding.backend == *sole_backend && binding.operation == *operation
+                }) {
+                    return Err(Error::Msg(format!(
+                        "checkpoint-adapter '{}' operation {:?} has no binding on sole eligible backend '{}'",
+                        adapter.adapter_id,
+                        operation,
+                        sole_backend.descriptor_label()
+                    )));
+                }
+            }
+        }
+        let shipped_family_backends: std::collections::BTreeSet<_> = generators
+            .iter()
+            .map(|generator| (generator.descriptor)())
+            .filter(|descriptor| descriptor.family == adapter.family)
+            .filter_map(|descriptor| match descriptor.backend {
+                "mlx" => Some(CheckpointBackend::Mlx),
+                "candle" => Some(CheckpointBackend::Candle),
+                _ => None,
+            })
+            .filter(|backend| eligible_backends.contains(backend))
+            .collect();
+        for backend in shipped_family_backends {
+            if !binding_backends.contains(&backend) {
+                return Err(Error::Msg(format!(
+                    "checkpoint-adapter '{}' has no binding for shipped eligible backend '{}'",
+                    adapter.adapter_id,
+                    backend.descriptor_label()
+                )));
+            }
+        }
+    }
+    Ok(imported_models)
+}
+
 impl ProviderRegistryBuilder {
     /// Start an empty explicit registry.
     pub fn new() -> Self {
@@ -649,10 +1771,19 @@ impl ProviderRegistryBuilder {
 
     builder_registration_method!(register_generator, generators, ModelRegistration);
     builder_registration_method!(
-        register_imported_model,
-        imported_models,
-        ImportedModelRegistration
+        register_checkpoint_adapter,
+        checkpoint_adapters,
+        CheckpointAdapterRegistration
     );
+    /// Register one portable checkpoint codec row. Codecs are engine-level: a platform catalog
+    /// registers its backend's baseline table exactly once, and a family adapter never carries a
+    /// codec table of its own. `build` refuses duplicate ids and two codecs claiming one stored
+    /// encoding, so a composed catalog that registers the same row twice fails closed instead of
+    /// silently shipping duplicate rows.
+    pub fn register_checkpoint_codec(mut self, registration: CheckpointCodecRegistration) -> Self {
+        self.checkpoint_codecs.push(registration);
+        self
+    }
     builder_registration_method!(
         register_encoder_contract_route,
         encoder_contract_routes,
@@ -814,67 +1945,8 @@ impl ProviderRegistryBuilder {
                 }
             }
         }
-        {
-            let mut routes = std::collections::BTreeSet::new();
-            for registration in &self.imported_models {
-                if !is_registry_ident(registration.family) {
-                    return Err(Error::Msg(
-                        "imported-model route family must be a non-empty lowercase registry identifier"
-                            .to_owned(),
-                    ));
-                }
-                if let Some(required) = registration.required_components {
-                    if required.is_empty() {
-                        return Err(Error::Msg(format!(
-                            "imported-model route '{}'/{:?}/{:?} declares an empty required-components override; use None instead",
-                            registration.family, registration.source, registration.operation
-                        )));
-                    }
-                    let mut component_ids = std::collections::BTreeSet::new();
-                    for component in required {
-                        if component.is_empty() || component.chars().any(char::is_whitespace) {
-                            return Err(Error::Msg(format!(
-                                "imported-model route '{}'/{:?}/{:?} has an empty or whitespace-padded required component",
-                                registration.family, registration.source, registration.operation
-                            )));
-                        }
-                        if !component_ids.insert(*component) {
-                            return Err(Error::Msg(format!(
-                                "imported-model route '{}'/{:?}/{:?} repeats required component '{}'",
-                                registration.family,
-                                registration.source,
-                                registration.operation,
-                                component
-                            )));
-                        }
-                    }
-                }
-                let key = (
-                    registration.family,
-                    registration.source,
-                    registration.operation,
-                );
-                if !routes.insert(key) {
-                    return Err(Error::Msg(format!(
-                        "duplicate imported-model route for family '{}' ({:?}/{:?})",
-                        registration.family, registration.source, registration.operation
-                    )));
-                }
-                if !self
-                    .generators
-                    .iter()
-                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
-                {
-                    return Err(Error::Msg(format!(
-                        "imported-model route '{}'/{:?}/{:?} targets unregistered generator '{}'",
-                        registration.family,
-                        registration.source,
-                        registration.operation,
-                        registration.provider_id
-                    )));
-                }
-            }
-        }
+        let imported_models =
+            validate_checkpoint_adapters(&self.checkpoint_adapters, &self.generators)?;
         {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
@@ -1023,10 +2095,14 @@ impl ProviderRegistryBuilder {
         ensure_unique!(text_embedders, "text embedder");
         ensure_unique!(voice_embedders, "voice embedder");
         ensure_unique!(audio_embedders, "audio embedder");
+        let checkpoint_codecs =
+            CheckpointCodecRegistry::new(self.checkpoint_codecs.iter().copied())?;
 
         Ok(ProviderRegistry {
             generators: self.generators.into_boxed_slice(),
-            imported_models: self.imported_models.into_boxed_slice(),
+            checkpoint_adapters: self.checkpoint_adapters.into_boxed_slice(),
+            checkpoint_codecs,
+            imported_models: imported_models.into_boxed_slice(),
             encoder_contract_routes: self.encoder_contract_routes.into_boxed_slice(),
             memory_strategy: self.memory_strategy.into_boxed_slice(),
             memory_contract_fixture: self.memory_contract_fixture.into_boxed_slice(),
@@ -1054,6 +2130,8 @@ impl ProviderRegistryBuilder {
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     generators: Box<[ModelRegistration]>,
+    checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
+    checkpoint_codecs: CheckpointCodecRegistry,
     imported_models: Box<[ImportedModelRegistration]>,
     encoder_contract_routes: Box<[EncoderContractRouteRegistration]>,
     memory_strategy: Box<[MemoryRegistration]>,
@@ -1101,6 +2179,235 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Every validated portable family checkpoint adapter in this platform catalog.
+    pub fn checkpoint_adapters(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &CheckpointAdapterRegistration> {
+        self.checkpoint_adapters.iter()
+    }
+
+    /// The validated codec table this platform catalog registered (engine-level, registered once).
+    pub fn checkpoint_codecs(&self) -> &CheckpointCodecRegistry {
+        &self.checkpoint_codecs
+    }
+
+    /// Check that two platform catalogs agree on the stable family/adapter-id mapping and portable
+    /// checkpoint metadata, and collectively bind every backend and operation they actually ship.
+    ///
+    /// A family that declares only MLX eligibility is allowed to be absent from a Candle catalog
+    /// (and vice versa). A family eligible for both must be present in both platform catalogs and
+    /// retain at least one real binding for each backend. Per-platform provider ids and operation
+    /// subsets remain intentionally asymmetric.
+    pub fn checkpoint_adapter_catalog_conformance_errors(&self, other: &Self) -> Vec<String> {
+        fn catalog_backends(
+            registry: &ProviderRegistry,
+        ) -> std::collections::BTreeSet<CheckpointBackend> {
+            registry
+                .generators
+                .iter()
+                .filter_map(|registration| match (registration.descriptor)().backend {
+                    "mlx" => Some(CheckpointBackend::Mlx),
+                    "candle" => Some(CheckpointBackend::Candle),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn ordered_pair<'a>(left: &'a str, right: &'a str) -> (&'a str, &'a str) {
+            if left <= right {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        }
+
+        let self_backends = catalog_backends(self);
+        let other_backends = catalog_backends(other);
+        let catalog_backends: std::collections::BTreeSet<_> =
+            self_backends.union(&other_backends).copied().collect();
+        let self_adapters_by_id: std::collections::BTreeMap<_, _> = self
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.adapter_id, adapter))
+            .collect();
+        let other_adapters_by_id: std::collections::BTreeMap<_, _> = other
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.adapter_id, adapter))
+            .collect();
+        let adapter_ids: std::collections::BTreeSet<_> = self_adapters_by_id
+            .keys()
+            .chain(other_adapters_by_id.keys())
+            .copied()
+            .collect();
+        let self_adapters_by_family: std::collections::BTreeMap<_, _> = self
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.family, adapter))
+            .collect();
+        let other_adapters_by_family: std::collections::BTreeMap<_, _> = other
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.family, adapter))
+            .collect();
+        let families: std::collections::BTreeSet<_> = self_adapters_by_family
+            .keys()
+            .chain(other_adapters_by_family.keys())
+            .copied()
+            .collect();
+        let self_adapters_by_compatibility_family: std::collections::BTreeMap<_, _> = self
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.compatibility_projection.family, adapter))
+            .collect();
+        let other_adapters_by_compatibility_family: std::collections::BTreeMap<_, _> = other
+            .checkpoint_adapters
+            .iter()
+            .map(|adapter| (adapter.compatibility_projection.family, adapter))
+            .collect();
+        let compatibility_families: std::collections::BTreeSet<_> =
+            self_adapters_by_compatibility_family
+                .keys()
+                .chain(other_adapters_by_compatibility_family.keys())
+                .copied()
+                .collect();
+        let mut errors = Vec::new();
+
+        for compatibility_family in compatibility_families {
+            let left = self_adapters_by_compatibility_family
+                .get(compatibility_family)
+                .copied();
+            let right = other_adapters_by_compatibility_family
+                .get(compatibility_family)
+                .copied();
+            if let (Some(left), Some(right)) = (left, right) {
+                if left.family != right.family && left.adapter_id != right.adapter_id {
+                    let (first, second) =
+                        if (left.family, left.adapter_id) <= (right.family, right.adapter_id) {
+                            (left, right)
+                        } else {
+                            (right, left)
+                        };
+                    errors.push(format!(
+                        "checkpoint-adapter compatibility family '{compatibility_family}' maps to different portable authorities '{}' (id '{}') and '{}' (id '{}') across catalogs",
+                        first.family, first.adapter_id, second.family, second.adapter_id
+                    ));
+                }
+            }
+        }
+
+        for adapter_id in adapter_ids {
+            let left = self_adapters_by_id.get(adapter_id).copied();
+            let right = other_adapters_by_id.get(adapter_id).copied();
+            if let (Some(left), Some(right)) = (left, right) {
+                if left.family != right.family {
+                    let (first_family, second_family) = ordered_pair(left.family, right.family);
+                    errors.push(format!(
+                        "checkpoint-adapter id '{adapter_id}' maps to different families '{}' and '{}' across catalogs",
+                        first_family, second_family
+                    ));
+                }
+            }
+        }
+
+        for family in families {
+            let left = self_adapters_by_family.get(family).copied();
+            let right = other_adapters_by_family.get(family).copied();
+            let authority = left.or(right).expect("family came from one catalog");
+
+            match (left, right) {
+                (Some(left), Some(right)) if left.adapter_id != right.adapter_id => {
+                    let (first_id, second_id) = ordered_pair(left.adapter_id, right.adapter_id);
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' maps to different adapter ids '{}' and '{}' across catalogs",
+                        first_id, second_id
+                    ));
+                    continue;
+                }
+                (Some(left), Some(right)) if !left.has_same_portable_metadata(right) => {
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' (id '{}') portable metadata differs across catalogs",
+                        left.adapter_id
+                    ));
+                    continue;
+                }
+                (Some(left), None)
+                    if other_adapters_by_id
+                        .get(left.adapter_id)
+                        .is_some_and(|right| right.family != family) =>
+                {
+                    continue;
+                }
+                (None, Some(right))
+                    if self_adapters_by_id
+                        .get(right.adapter_id)
+                        .is_some_and(|left| left.family != family) =>
+                {
+                    continue;
+                }
+                (Some(_), None)
+                    if authority
+                        .eligible_backends
+                        .iter()
+                        .any(|backend| other_backends.contains(backend)) =>
+                {
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' (id '{}') is missing from a catalog that ships an eligible backend",
+                        authority.adapter_id
+                    ));
+                }
+                (None, Some(_))
+                    if authority
+                        .eligible_backends
+                        .iter()
+                        .any(|backend| self_backends.contains(backend)) =>
+                {
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' (id '{}') is missing from a catalog that ships an eligible backend",
+                        authority.adapter_id
+                    ));
+                }
+                _ => {}
+            }
+
+            for backend in authority
+                .eligible_backends
+                .iter()
+                .copied()
+                .filter(|backend| catalog_backends.contains(backend))
+            {
+                let bound = left
+                    .into_iter()
+                    .chain(right)
+                    .flat_map(|adapter| adapter.backend_bindings)
+                    .any(|binding| binding.backend == backend);
+                if !bound {
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' (id '{}') has no binding for shipped eligible backend '{}'",
+                        authority.adapter_id,
+                        backend.descriptor_label()
+                    ));
+                }
+            }
+
+            for operation in authority.operations {
+                let bound = left
+                    .into_iter()
+                    .chain(right)
+                    .flat_map(|adapter| adapter.backend_bindings)
+                    .any(|binding| binding.operation == *operation);
+                if !bound {
+                    errors.push(format!(
+                        "checkpoint-adapter family '{family}' (id '{}') operation {:?} has no binding across eligible catalogs",
+                        authority.adapter_id, operation
+                    ));
+                }
+            }
+        }
+
+        errors
+    }
+
     /// Resolve the encoder contract for an ordinary generator or an explicitly registered bespoke
     /// route. Unknown routes, and ordinary generators that do not support substitution, return
     /// `None`; aliases are validated at registry construction and cannot target another alias or a
@@ -1133,7 +2440,10 @@ impl ProviderRegistry {
         self.encoder_contract_routes.iter()
     }
 
-    /// Every provider-owned imported-source route in this explicit platform catalog.
+    /// Compatibility projection of every adapter-owned imported route in this platform catalog.
+    ///
+    /// New code consumes [`Self::checkpoint_adapters`]. Existing SceneWorks consumers can continue
+    /// using this view until their family migration moves them to persisted import plans.
     pub fn imported_models(&self) -> impl ExactSizeIterator<Item = &ImportedModelRegistration> {
         self.imported_models.iter()
     }
@@ -1562,10 +2872,12 @@ fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[
 ///   native sampler names alongside the gen-core curated set),
 /// - `conditioning` is duplicate-free, and the video-frame kinds
 ///   ([`Keyframe`](ConditioningKind::Keyframe) / [`VideoClip`](ConditioningKind::VideoClip) /
-///   [`ControlClip`](ConditioningKind::ControlClip) / [`VideoSync`](ConditioningKind::VideoSync)) are
+///   [`ControlClip`](ConditioningKind::ControlClip) / [`VideoSync`](ConditioningKind::VideoSync) /
+///   [`ReferenceVideo`](ConditioningKind::ReferenceVideo)) are
 ///   not advertised by `Image`-modality models — an `Image` model cannot consume video frames (the LTX
 ///   clip kinds ride `Video`/`Both`; the `VideoSync` Foley condition rides a `Modality::Audio`
-///   video→audio model, sc-13436).
+///   video→audio model, sc-13436; the `ReferenceVideo` motion reference rides a video model whose
+///   *references* need not share the output modality, sc-17149).
 ///
 /// Returns one message per violation (empty = conformant). Public so a provider's own tests can
 /// target a single descriptor; [`ProviderRegistry::descriptor_conformance_errors`] sweeps a catalog.
@@ -1620,6 +2932,46 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
             ));
         }
     }
+    // The advertised step surface must be satisfiable (sc-19559). Each of these declares a
+    // constraint that refuses EVERY step count, which the shared floor would then enforce on every
+    // request — the descriptor mistake is silent otherwise, because `Unconstrained` (the common
+    // case) never reaches here.
+    match &caps.supported_steps {
+        StepSupport::Unconstrained => {}
+        StepSupport::Exact(counts) => {
+            if counts.is_empty() {
+                errs.push(format!(
+                    "{ctx}: supported_steps is an EMPTY exact menu — no step count would be \
+                     admitted; use StepSupport::Unconstrained for 'no constraint'"
+                ));
+            }
+            if counts.contains(&0) {
+                errs.push(format!(
+                    "{ctx}: supported_steps advertises 0 steps, which the shared floor always \
+                     refuses (an explicit 0 renders undenoised noise)"
+                ));
+            }
+            for (i, c) in counts.iter().enumerate() {
+                if counts[..i].contains(c) {
+                    errs.push(format!("{ctx}: duplicate supported step count {c}"));
+                }
+            }
+        }
+        StepSupport::Range { min, max } => {
+            if *min == 0 {
+                errs.push(format!(
+                    "{ctx}: supported_steps range starts at 0, which the shared floor always \
+                     refuses (an explicit 0 renders undenoised noise)"
+                ));
+            }
+            if min > max {
+                errs.push(format!(
+                    "{ctx}: supported_steps range {min}..={max} is empty — no step count would be \
+                     admitted"
+                ));
+            }
+        }
+    }
     check_name_list(&mut errs, &ctx, "sampler", &caps.samplers);
     check_name_list(&mut errs, &ctx, "scheduler", &caps.schedulers);
     check_name_list(
@@ -1638,6 +2990,7 @@ pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
                 | ConditioningKind::VideoClip
                 | ConditioningKind::ControlClip
                 | ConditioningKind::VideoSync
+                | ConditioningKind::ReferenceVideo
         );
         if is_video_kind && d.modality == Modality::Image {
             errs.push(format!(
@@ -2069,6 +3422,58 @@ mod tests {
 
     crate::register_generators! {
         const DUMMY_GENERATOR_REGISTRATION = dummy_descriptor => dummy_load
+    }
+
+    fn dummy_candle_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_candle_test_model",
+            backend: "candle",
+            ..dummy_descriptor()
+        }
+    }
+
+    crate::register_generators! {
+        const DUMMY_CANDLE_GENERATOR_REGISTRATION = dummy_candle_descriptor => dummy_load
+    }
+
+    fn dummy_other_candle_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_other_candle_model",
+            family: "other",
+            backend: "candle",
+            ..dummy_descriptor()
+        }
+    }
+
+    crate::register_generators! {
+        const DUMMY_OTHER_CANDLE_GENERATOR_REGISTRATION = dummy_other_candle_descriptor => dummy_load
+    }
+
+    fn dummy_mage_mlx_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "mage_flow_base",
+            family: "mage_flow",
+            backend: "mlx",
+            ..dummy_descriptor()
+        }
+    }
+
+    crate::register_generators! {
+        const DUMMY_MAGE_MLX_GENERATOR_REGISTRATION = dummy_mage_mlx_descriptor => dummy_load
+    }
+
+    fn dummy_legacy_mage_candle_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_legacy_mage_candle_model",
+            family: "mage-flow",
+            backend: "candle",
+            ..dummy_descriptor()
+        }
+    }
+
+    crate::register_generators! {
+        const DUMMY_LEGACY_MAGE_CANDLE_GENERATOR_REGISTRATION =
+            dummy_legacy_mage_candle_descriptor => dummy_load
     }
 
     struct DummyDelegatedGen {
@@ -3131,17 +4536,61 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_codecs_register_once_per_catalog_and_duplicate_rows_fail_closed() {
+        use crate::checkpoint_codec::{WeightEncoding, DENSE_BF16_CODEC};
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .build()
+            .expect("one baseline codec row builds");
+        assert_eq!(
+            registry
+                .checkpoint_codecs()
+                .codecs()
+                .copied()
+                .collect::<Vec<_>>(),
+            [DENSE_BF16_CODEC]
+        );
+        assert_eq!(
+            registry
+                .checkpoint_codecs()
+                .for_encoding(WeightEncoding::DenseBf16),
+            Some(&DENSE_BF16_CODEC)
+        );
+        assert!(registry
+            .checkpoint_codecs()
+            .for_encoding(WeightEncoding::Fp8E4M3)
+            .is_none());
+
+        // A composed catalog that registers the same portable row twice (the withdrawn sc-20638
+        // draft's duplicate codec-suite rows) is refused at build, not deduplicated silently.
+        let duplicated = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .register_checkpoint_codec(DENSE_BF16_CODEC)
+            .build();
+        assert!(
+            duplicated
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("duplicate checkpoint codec id")),
+            "duplicate codec rows must fail the build: {:?}",
+            duplicated.as_ref().err().map(ToString::to_string)
+        );
+
+        let empty = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .expect("a catalog without codecs still builds");
+        assert!(empty.checkpoint_codecs().is_empty());
+    }
+
+    #[test]
     fn imported_routes_are_exact_and_project_the_selected_provider() {
         let registry = ProviderRegistryBuilder::new()
             .register_generator(DUMMY_GENERATOR_REGISTRATION)
-            .register_imported_model(ImportedModelRegistration {
-                family: "test",
-                source: ImportedModelSource::TransformerFile,
-                operation: ImportedModelOperation::Generate,
-                provider_id: "dummy_test_model",
-                required_components: Some(&["imported_component"]),
-                inherit_adapters: true,
-            })
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
             .build()
             .expect("exact imported route");
 
@@ -3185,20 +4634,31 @@ mod tests {
             }))
         }
 
+        const RESTRICTED_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                backend: CheckpointBackend::Mlx,
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_adapter_model",
+                required_components: None,
+                inherit_adapters: false,
+            }];
+        const RESTRICTED_CAPABILITIES: &[CheckpointAdapterCapabilityRegistration] =
+            &[CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::Generate,
+                inherit_provider_capabilities: true,
+                supports_adapter_inheritance: false,
+            }];
+        let mut adapter = fixture_adapter(RESTRICTED_BINDING);
+        adapter.capabilities = RESTRICTED_CAPABILITIES;
+
         let registry = ProviderRegistryBuilder::new()
             .register_generator(ModelRegistration {
                 descriptor: adapter_descriptor,
                 load: adapter_load,
                 footprint: None,
             })
-            .register_imported_model(ImportedModelRegistration {
-                family: "test",
-                source: ImportedModelSource::TransformerDirectory,
-                operation: ImportedModelOperation::Generate,
-                provider_id: "dummy_adapter_model",
-                required_components: None,
-                inherit_adapters: false,
-            })
+            .register_checkpoint_adapter(adapter)
             .build()
             .expect("structurally restricted imported route");
 
@@ -3208,7 +4668,7 @@ mod tests {
         let imported = registry
             .imported_model_descriptor(
                 "test",
-                ImportedModelSource::TransformerDirectory,
+                ImportedModelSource::TransformerFile,
                 ImportedModelOperation::Generate,
             )
             .unwrap();
@@ -3216,70 +4676,1084 @@ mod tests {
         assert!(!imported.capabilities.supports_lokr);
     }
 
-    #[test]
-    fn imported_routes_reject_duplicates_and_unknown_targets() {
-        let route = ImportedModelRegistration {
-            family: "test",
+    const FIXTURE_DIALECTS: &[CheckpointDialectRegistration] = &[CheckpointDialectRegistration {
+        id: "fixture-diffusers",
+        source: ImportedModelSource::TransformerFile,
+    }];
+    const FIXTURE_SIGNATURES: &[CheckpointSignatureRegistration] =
+        &[CheckpointSignatureRegistration {
+            id: "fixture-transformer-v1",
+            dialect: "fixture-diffusers",
+            required_tensor_names: &["transformer.weight"],
+        }];
+    const FIXTURE_COMPONENTS: &[CheckpointComponentRegistration] =
+        &[CheckpointComponentRegistration {
+            role: "transformer",
+            min_count: 1,
+            max_count: 1,
+        }];
+    const FIXTURE_BASES: &[CheckpointBaseCompatibilityRegistration] =
+        &[CheckpointBaseCompatibilityRegistration {
+            component_role: "transformer",
+            compatible_families: &["test"],
+        }];
+    const FIXTURE_MAPPINGS: &[CheckpointCanonicalMappingRegistration] =
+        &[CheckpointCanonicalMappingRegistration {
+            dialect: "fixture-diffusers",
+            mapping_id: "fixture-identity-v1",
+            plan_driven_backends: &[],
+        }];
+    const FIXTURE_RECOVERY: &[CheckpointConfigRecoveryRegistration] =
+        &[CheckpointConfigRecoveryRegistration {
+            field: "hidden-size",
+            recovery_id: "fixture-tensor-shape-v1",
+        }];
+    const FIXTURE_OPERATIONS: &[ImportedModelOperation] = &[ImportedModelOperation::Generate];
+    const FIXTURE_CAPABILITIES: &[CheckpointAdapterCapabilityRegistration] =
+        &[CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Generate,
+            inherit_provider_capabilities: true,
+            supports_adapter_inheritance: true,
+        }];
+    const FIXTURE_MLX_BINDINGS: &[CheckpointBackendBindingRegistration] =
+        &[CheckpointBackendBindingRegistration {
+            backend: CheckpointBackend::Mlx,
             source: ImportedModelSource::TransformerFile,
             operation: ImportedModelOperation::Generate,
             provider_id: "dummy_test_model",
-            required_components: None,
+            required_components: Some(&["imported_component"]),
             inherit_adapters: true,
-        };
-        let duplicate = ProviderRegistryBuilder::new()
-            .register_generator(DUMMY_GENERATOR_REGISTRATION)
-            .register_imported_model(route)
-            .register_imported_model(route)
-            .build()
-            .err()
-            .expect("duplicate route must fail")
-            .to_string();
-        assert!(
-            duplicate.contains("duplicate imported-model route"),
-            "{duplicate}"
-        );
+        }];
+    const FIXTURE_CANDLE_BINDINGS: &[CheckpointBackendBindingRegistration] =
+        &[CheckpointBackendBindingRegistration {
+            backend: CheckpointBackend::Candle,
+            provider_id: "dummy_candle_test_model",
+            ..FIXTURE_MLX_BINDINGS[0]
+        }];
+    const FIXTURE_TWO_OPERATIONS: &[ImportedModelOperation] = &[
+        ImportedModelOperation::Generate,
+        ImportedModelOperation::Edit,
+    ];
+    const FIXTURE_TWO_CAPABILITIES: &[CheckpointAdapterCapabilityRegistration] = &[
+        FIXTURE_CAPABILITIES[0],
+        CheckpointAdapterCapabilityRegistration {
+            operation: ImportedModelOperation::Edit,
+            ..FIXTURE_CAPABILITIES[0]
+        },
+    ];
+    const FIXTURE_CANDLE_GENERATE_AND_EDIT_BINDINGS: &[CheckpointBackendBindingRegistration] = &[
+        FIXTURE_CANDLE_BINDINGS[0],
+        CheckpointBackendBindingRegistration {
+            operation: ImportedModelOperation::Edit,
+            ..FIXTURE_CANDLE_BINDINGS[0]
+        },
+    ];
+    const FIXTURE_OTHER_CANDLE_BINDINGS: &[CheckpointBackendBindingRegistration] =
+        &[CheckpointBackendBindingRegistration {
+            provider_id: "dummy_other_candle_model",
+            ..FIXTURE_CANDLE_BINDINGS[0]
+        }];
+    const FIXTURE_MAGE_MLX_BINDINGS: &[CheckpointBackendBindingRegistration] =
+        &[CheckpointBackendBindingRegistration {
+            backend: CheckpointBackend::Mlx,
+            source: ImportedModelSource::TransformerDirectory,
+            operation: ImportedModelOperation::Generate,
+            provider_id: "mage_flow_base",
+            required_components: Some(&["base_snapshot"]),
+            inherit_adapters: false,
+        }];
+    const FIXTURE_LEGACY_MAGE_CANDLE_BINDINGS: &[CheckpointBackendBindingRegistration] =
+        &[CheckpointBackendBindingRegistration {
+            backend: CheckpointBackend::Candle,
+            provider_id: "dummy_legacy_mage_candle_model",
+            ..FIXTURE_MLX_BINDINGS[0]
+        }];
 
-        let unknown = ProviderRegistryBuilder::new()
-            .register_imported_model(route)
+    fn fixture_adapter(
+        bindings: &'static [CheckpointBackendBindingRegistration],
+    ) -> CheckpointAdapterRegistration {
+        CheckpointAdapterRegistration {
+            adapter_id: "fixture-family-v1",
+            family: "test",
+            compatibility_projection: ImportedModelCompatibilityProjectionRegistration {
+                family: "test",
+            },
+            signatures: FIXTURE_SIGNATURES,
+            dialects: FIXTURE_DIALECTS,
+            component_topology: FIXTURE_COMPONENTS,
+            base_compatibility: FIXTURE_BASES,
+            canonical_mappings: FIXTURE_MAPPINGS,
+            config_recovery: FIXTURE_RECOVERY,
+            eligible_backends: &[CheckpointBackend::Mlx],
+            backend_bindings: bindings,
+            operations: FIXTURE_OPERATIONS,
+            capabilities: FIXTURE_CAPABILITIES,
+        }
+    }
+
+    fn cross_platform_fixture_adapter(
+        bindings: &'static [CheckpointBackendBindingRegistration],
+    ) -> CheckpointAdapterRegistration {
+        CheckpointAdapterRegistration {
+            eligible_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+            backend_bindings: bindings,
+            ..fixture_adapter(bindings)
+        }
+    }
+
+    fn two_operation_cross_platform_fixture_adapter(
+        bindings: &'static [CheckpointBackendBindingRegistration],
+    ) -> CheckpointAdapterRegistration {
+        CheckpointAdapterRegistration {
+            operations: FIXTURE_TWO_OPERATIONS,
+            capabilities: FIXTURE_TWO_CAPABILITIES,
+            ..cross_platform_fixture_adapter(bindings)
+        }
+    }
+
+    #[test]
+    fn checkpoint_adapter_is_the_authority_and_projects_legacy_import_routes() {
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
             .build()
-            .err()
-            .expect("unknown target must fail")
-            .to_string();
-        assert!(
-            unknown.contains("targets unregistered generator"),
-            "{unknown}"
+            .expect("one adapter registration is a complete fixture-family addition");
+
+        let adapter = registry.checkpoint_adapters().next().unwrap();
+        assert_eq!(adapter.adapter_id, "fixture-family-v1");
+        assert_eq!(adapter.signatures, FIXTURE_SIGNATURES);
+        assert_eq!(adapter.dialects, FIXTURE_DIALECTS);
+        assert_eq!(adapter.component_topology, FIXTURE_COMPONENTS);
+        assert_eq!(adapter.base_compatibility, FIXTURE_BASES);
+        assert_eq!(adapter.canonical_mappings, FIXTURE_MAPPINGS);
+        assert_eq!(adapter.config_recovery, FIXTURE_RECOVERY);
+        assert_eq!(adapter.operations, FIXTURE_OPERATIONS);
+        assert_eq!(adapter.capabilities, FIXTURE_CAPABILITIES);
+
+        let projected: Vec<_> = registry.imported_models().copied().collect();
+        assert_eq!(
+            projected,
+            [ImportedModelRegistration {
+                family: "test",
+                source: ImportedModelSource::TransformerFile,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "dummy_test_model",
+                required_components: Some(&["imported_component"]),
+                inherit_adapters: true,
+            }]
+        );
+        assert_eq!(
+            registry
+                .imported_model_descriptor(
+                    "test",
+                    ImportedModelSource::TransformerFile,
+                    ImportedModelOperation::Generate,
+                )
+                .unwrap()
+                .id,
+            "dummy_test_model"
         );
     }
 
     #[test]
-    fn imported_routes_reject_malformed_family_and_component_metadata() {
-        let route = |family, required_components| ImportedModelRegistration {
-            family,
-            source: ImportedModelSource::TransformerFile,
-            operation: ImportedModelOperation::Generate,
-            provider_id: "dummy_test_model",
-            required_components,
-            inherit_adapters: true,
+    fn mage_adapter_binds_provider_truth_and_preserves_the_exact_legacy_family() {
+        let adapter = CheckpointAdapterRegistration {
+            backend_bindings: FIXTURE_MAGE_MLX_BINDINGS,
+            ..MAGE_FLOW_CHECKPOINT_ADAPTER
         };
-        for malformed in [
-            route("", None),
-            route(" test", None),
-            route("Krea", None),
-            route("krea 2", None),
-            route("test", Some(&[])),
-            route("test", Some(&[""])),
-            route("test", Some(&["base snapshot"])),
-            route("test", Some(&["base_snapshot", "base_snapshot"])),
-        ] {
+        assert_eq!(adapter.family, "mage_flow");
+
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_MAGE_MLX_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(adapter)
+            .build()
+            .expect("provider-truth Mage family must bind the real MLX route");
+
+        assert_eq!(
+            registry.imported_models().copied().collect::<Vec<_>>(),
+            [ImportedModelRegistration {
+                family: "mage-flow",
+                source: ImportedModelSource::TransformerDirectory,
+                operation: ImportedModelOperation::Generate,
+                provider_id: "mage_flow_base",
+                required_components: Some(&["base_snapshot"]),
+                inherit_adapters: false,
+            }]
+        );
+    }
+
+    /// sc-20644 Wan row — the dual-expert backbone is DECLARED, distinctly, and the declaration is
+    /// what a later inspector/plan-layer change has to satisfy.
+    ///
+    /// The two experts are two single-count roles, not one role with `max_count: 2`. That
+    /// distinction is the whole point: a high-noise and a low-noise expert are selected per denoise
+    /// step and are not interchangeable, so a plan that recorded them as two instances of one role
+    /// could not say which is which — which is exactly the state SceneWorks' inspector is in today
+    /// (both map to the single path role `transformer`).
+    ///
+    /// Also pins the two things about this family that are easy to get wrong: it is Candle-only, and
+    /// it does NOT inherit adapter flags, because `load_from_comfyui_experts` has no LoRA seam.
+    ///
+    /// Failing mutations: collapse the two roles into one `transformer` with `max_count: 2`; set
+    /// `supports_adapter_inheritance: true`; add `CheckpointBackend::Mlx`.
+    #[test]
+    fn the_wan_adapter_declares_two_distinct_single_count_experts() {
+        let topology = WAN_CHECKPOINT_ADAPTER.component_topology;
+        let backbones: Vec<&CheckpointComponentRegistration> = topology
+            .iter()
+            .filter(|component| component.role.starts_with("transformer"))
+            .collect();
+        assert_eq!(
+            backbones.len(),
+            2,
+            "Wan declares TWO backbones; got {:?}",
+            topology.iter().map(|c| c.role).collect::<Vec<_>>()
+        );
+        for component in &backbones {
+            assert_eq!(
+                (component.min_count, component.max_count),
+                (1, 1),
+                "{}: each expert is exactly one artifact, not one role holding two",
+                component.role
+            );
+        }
+        let mut roles: Vec<&str> = backbones.iter().map(|c| c.role).collect();
+        roles.sort_unstable();
+        assert_eq!(roles, ["transformer-high", "transformer-low"]);
+
+        assert_eq!(
+            WAN_CHECKPOINT_ADAPTER.eligible_backends,
+            [CheckpointBackend::Candle],
+            "the ComfyUI Wan expert pair loads on Candle only"
+        );
+
+        // The inference half of the cross-repo spelling tie (sc-20644 review minor 8). These
+        // topology roles are hyphenated; SceneWorks' plan-layer roles are underscored, and the two
+        // are joined by one projection that nothing structural enforces. Pinned in the `mapping_id`
+        // posture: this asserts the projection, SceneWorks asserts the projected literals are what
+        // its inspector emits. Either side drifting alone turns a Wan plan into two unrecognized
+        // roles.
+        let project = |topology_role: &str| topology_role.replace('-', "_");
+        assert_eq!(project("transformer-high"), "transformer_high");
+        assert_eq!(project("transformer-low"), "transformer_low");
+        assert_ne!(
+            "transformer-high", "transformer_high",
+            "fixture check: the two spellings genuinely differ, so the projection is not vacuous"
+        );
+        // The precedent this follows rather than invents — the component id both repos already
+        // share is spelled the same two ways.
+        assert_eq!(
+            project("base-snapshot"),
+            crate::runtime::BASE_SNAPSHOT_COMPONENT
+        );
+        assert_eq!(
+            WAN_CHECKPOINT_ADAPTER
+                .dialects
+                .iter()
+                .map(|dialect| dialect.source)
+                .collect::<Vec<_>>(),
+            [ImportedModelSource::ComfyUiTree]
+        );
+        let generate = WAN_CHECKPOINT_ADAPTER
+            .capabilities
+            .iter()
+            .find(|capability| capability.operation == ImportedModelOperation::Generate)
+            .expect("Wan binds Generate");
+        assert!(
+            !generate.supports_adapter_inheritance,
+            "`load_from_comfyui_experts` takes no adapters, so the imported route must not \
+             advertise the provider's LoRA flags"
+        );
+    }
+
+    #[test]
+    fn portable_adapter_families_and_legacy_projections_are_explicit_for_every_family() {
+        let identities = [
+            (&KREA_2_CHECKPOINT_ADAPTER, "krea_2", "krea_2"),
+            (&SDXL_CHECKPOINT_ADAPTER, "sdxl", "sdxl"),
+            (&MAGE_FLOW_CHECKPOINT_ADAPTER, "mage_flow", "mage-flow"),
+            (&Z_IMAGE_CHECKPOINT_ADAPTER, "z-image", "z-image"),
+            (&QWEN_IMAGE_CHECKPOINT_ADAPTER, "qwen-image", "qwen-image"),
+            (&FLUX2_CHECKPOINT_ADAPTER, "flux2", "flux2"),
+            (&WAN_CHECKPOINT_ADAPTER, "wan", "wan-video"),
+        ];
+
+        for (adapter, portable_family, legacy_family) in identities {
+            assert_eq!(adapter.family, portable_family, "{}", adapter.adapter_id);
+            assert_eq!(
+                adapter.compatibility_projection.family, legacy_family,
+                "{}",
+                adapter.adapter_id
+            );
+        }
+        assert_eq!(
+            MAGE_FLOW_CHECKPOINT_ADAPTER.base_compatibility,
+            [CheckpointBaseCompatibilityRegistration {
+                component_role: "base-snapshot",
+                compatible_families: &["mage_flow"],
+            }]
+        );
+    }
+
+    #[test]
+    fn compatibility_projection_rejects_alias_collisions_and_duplicate_legacy_families() {
+        let mage = CheckpointAdapterRegistration {
+            backend_bindings: FIXTURE_MAGE_MLX_BINDINGS,
+            ..MAGE_FLOW_CHECKPOINT_ADAPTER
+        };
+        let mut legacy_family_owner = fixture_adapter(FIXTURE_LEGACY_MAGE_CANDLE_BINDINGS);
+        legacy_family_owner.adapter_id = "legacy-mage-family-v1";
+        legacy_family_owner.family = "mage-flow";
+        legacy_family_owner.compatibility_projection.family = "legacy-mage";
+        legacy_family_owner.eligible_backends = &[CheckpointBackend::Candle];
+
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_MAGE_MLX_GENERATOR_REGISTRATION)
+            .register_generator(DUMMY_LEGACY_MAGE_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(mage)
+            .register_checkpoint_adapter(legacy_family_owner)
+            .build()
+            .err()
+            .expect("an explicit legacy alias cannot shadow another portable authority")
+            .to_string();
+        assert_eq!(
+            error,
+            "checkpoint-adapter compatibility family 'mage-flow' for 'mage-flow-diffusers-v1' collides with portable family owned by 'legacy-mage-family-v1'"
+        );
+
+        let first = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        let mut second = fixture_adapter(FIXTURE_OTHER_CANDLE_BINDINGS);
+        second.adapter_id = "other-family-v1";
+        second.family = "other";
+        second.eligible_backends = &[CheckpointBackend::Candle];
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_generator(DUMMY_OTHER_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(first)
+            .register_checkpoint_adapter(second)
+            .build()
+            .err()
+            .expect("legacy compatibility families must be unique")
+            .to_string();
+        assert_eq!(
+            error,
+            "duplicate checkpoint-adapter compatibility family 'test'"
+        );
+    }
+
+    #[test]
+    fn checkpoint_adapter_registry_rejects_duplicate_malformed_and_implementation_free_entries() {
+        let duplicate = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .err()
+            .expect("duplicate adapters fail")
+            .to_string();
+        assert!(
+            duplicate.contains("duplicate checkpoint-adapter id"),
+            "{duplicate}"
+        );
+
+        let implementation_free = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(&[]))
+            .build()
+            .err()
+            .expect("implementation-free adapters fail")
+            .to_string();
+        assert!(
+            implementation_free.contains("has no backend bindings"),
+            "{implementation_free}"
+        );
+
+        let mut malformed = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        malformed.signatures = &[];
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(malformed)
+            .build()
+            .err()
+            .expect("signature-free adapter fails")
+            .to_string();
+        assert!(error.contains("signatures must not be empty"), "{error}");
+
+        let malformed_surfaces: [fn(&mut CheckpointAdapterRegistration); 8] = [
+            |adapter| adapter.dialects = &[],
+            |adapter| adapter.component_topology = &[],
+            |adapter| adapter.base_compatibility = &[],
+            |adapter| adapter.canonical_mappings = &[],
+            |adapter| adapter.config_recovery = &[],
+            |adapter| adapter.eligible_backends = &[],
+            |adapter| adapter.operations = &[],
+            |adapter| adapter.capabilities = &[],
+        ];
+        for mutate in malformed_surfaces {
+            let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+            mutate(&mut adapter);
             assert!(
                 ProviderRegistryBuilder::new()
                     .register_generator(DUMMY_GENERATOR_REGISTRATION)
-                    .register_imported_model(malformed)
+                    .register_checkpoint_adapter(adapter)
                     .build()
                     .is_err(),
-                "malformed imported metadata must fail registry construction"
+                "removing a required portable adapter surface must fail"
             );
         }
+
+        let mut same_family = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        same_family.adapter_id = "fixture-family-v2";
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .register_checkpoint_adapter(same_family)
+            .build()
+            .err()
+            .expect("two adapter ids must not claim one family")
+            .to_string();
+        assert!(
+            error.contains("duplicate checkpoint-adapter family 'test'"),
+            "{error}"
+        );
+
+        let mut orphan_operation = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        orphan_operation.operations = FIXTURE_TWO_OPERATIONS;
+        orphan_operation.capabilities = FIXTURE_TWO_CAPABILITIES;
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(orphan_operation)
+            .build()
+            .err()
+            .expect("a sole-backend operation without a binding must fail")
+            .to_string();
+        assert_eq!(
+            error,
+            "checkpoint-adapter 'fixture-family-v1' operation Edit has no binding on sole eligible backend 'mlx'"
+        );
+    }
+
+    #[test]
+    fn checkpoint_adapter_registry_rejects_mutated_metadata_and_provider_routes() {
+        const EMPTY_COMPONENTS_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                required_components: Some(&[]),
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const DUPLICATE_COMPONENTS_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                required_components: Some(&["same", "same"]),
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const MALFORMED_PROVIDER_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                provider_id: "Bad Provider",
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const UNKNOWN_SOURCE_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                source: ImportedModelSource::FusedCheckpoint,
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const WHITESPACE_TENSOR_SIGNATURE: &[CheckpointSignatureRegistration] =
+            &[CheckpointSignatureRegistration {
+                required_tensor_names: &["transformer bad.weight"],
+                ..FIXTURE_SIGNATURES[0]
+            }];
+        const INVALID_CARDINALITY: &[CheckpointComponentRegistration] =
+            &[CheckpointComponentRegistration {
+                min_count: 0,
+                ..FIXTURE_COMPONENTS[0]
+            }];
+        const DUPLICATE_OPERATIONS: &[ImportedModelOperation] = &[
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Generate,
+        ];
+        const DUPLICATE_BACKENDS: &[CheckpointBackend] =
+            &[CheckpointBackend::Mlx, CheckpointBackend::Mlx];
+        const NON_PROJECTABLE_CAPABILITY: &[CheckpointAdapterCapabilityRegistration] =
+            &[CheckpointAdapterCapabilityRegistration {
+                inherit_provider_capabilities: false,
+                ..FIXTURE_CAPABILITIES[0]
+            }];
+        const NON_INHERITING_CAPABILITY: &[CheckpointAdapterCapabilityRegistration] =
+            &[CheckpointAdapterCapabilityRegistration {
+                supports_adapter_inheritance: false,
+                ..FIXTURE_CAPABILITIES[0]
+            }];
+
+        type AdapterMutation = (&'static str, fn(&mut CheckpointAdapterRegistration));
+        let mutations: [AdapterMutation; 11] = [
+            ("identity", |adapter| adapter.family = "Bad Family"),
+            ("compatibility projection", |adapter| {
+                adapter.compatibility_projection.family = "Bad Legacy Family"
+            }),
+            ("tensor name", |adapter| {
+                adapter.signatures = WHITESPACE_TENSOR_SIGNATURE
+            }),
+            ("cardinality", |adapter| {
+                adapter.component_topology = INVALID_CARDINALITY
+            }),
+            ("eligible backend", |adapter| {
+                adapter.eligible_backends = DUPLICATE_BACKENDS
+            }),
+            ("operation", |adapter| {
+                adapter.operations = DUPLICATE_OPERATIONS
+            }),
+            ("capability projection", |adapter| {
+                adapter.capabilities = NON_PROJECTABLE_CAPABILITY
+            }),
+            ("source dialect", |adapter| {
+                adapter.backend_bindings = UNKNOWN_SOURCE_BINDING
+            }),
+            ("provider id", |adapter| {
+                adapter.backend_bindings = MALFORMED_PROVIDER_BINDING
+            }),
+            ("empty required components", |adapter| {
+                adapter.backend_bindings = EMPTY_COMPONENTS_BINDING
+            }),
+            ("duplicate required components", |adapter| {
+                adapter.backend_bindings = DUPLICATE_COMPONENTS_BINDING
+            }),
+        ];
+        for (surface, mutate) in mutations {
+            let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+            mutate(&mut adapter);
+            assert!(
+                ProviderRegistryBuilder::new()
+                    .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                    .register_checkpoint_adapter(adapter)
+                    .build()
+                    .is_err(),
+                "mutating {surface} must fail registry construction"
+            );
+        }
+
+        let mut wrong_family = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        wrong_family.family = "other";
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(wrong_family)
+            .build()
+            .err()
+            .expect("a provider from another family must fail")
+            .to_string();
+        assert!(error.contains("does not match generator"), "{error}");
+
+        let mut contradictory_inheritance = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        contradictory_inheritance.capabilities = NON_INHERITING_CAPABILITY;
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(contradictory_inheritance)
+            .build()
+            .err()
+            .expect("binding inheritance must obey portable capability policy")
+            .to_string();
+        assert!(
+            error.contains("inherits adapters contrary to capability policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_adapter_registry_rejects_dangling_or_contradictory_metadata() {
+        const UNKNOWN_PROVIDER: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                provider_id: "not_registered",
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const WRONG_BACKEND: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                backend: CheckpointBackend::Candle,
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+        const DUPLICATE_BINDINGS: &[CheckpointBackendBindingRegistration] =
+            &[FIXTURE_MLX_BINDINGS[0], FIXTURE_MLX_BINDINGS[0]];
+
+        for (bindings, expected) in [
+            (UNKNOWN_PROVIDER, "targets unregistered generator"),
+            (DUPLICATE_BINDINGS, "duplicate checkpoint-adapter binding"),
+        ] {
+            let error = ProviderRegistryBuilder::new()
+                .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                .register_checkpoint_adapter(fixture_adapter(bindings))
+                .build()
+                .err()
+                .expect("contradictory binding fails")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got: {error}"
+            );
+        }
+        let mut wrong_backend = fixture_adapter(WRONG_BACKEND);
+        wrong_backend.eligible_backends = &[CheckpointBackend::Mlx, CheckpointBackend::Candle];
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(wrong_backend)
+            .build()
+            .err()
+            .expect("backend/provider mismatch fails")
+            .to_string();
+        assert!(
+            error.contains("does not match generator backend"),
+            "{error}"
+        );
+
+        const UNKNOWN_DIALECT_SIGNATURE: &[CheckpointSignatureRegistration] =
+            &[CheckpointSignatureRegistration {
+                dialect: "missing",
+                ..FIXTURE_SIGNATURES[0]
+            }];
+        const UNKNOWN_DIALECT_MAPPING: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                dialect: "missing",
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        const UNKNOWN_COMPONENT_BASE: &[CheckpointBaseCompatibilityRegistration] =
+            &[CheckpointBaseCompatibilityRegistration {
+                component_role: "missing",
+                ..FIXTURE_BASES[0]
+            }];
+        const UNDECLARED_OPERATION_BINDING: &[CheckpointBackendBindingRegistration] =
+            &[CheckpointBackendBindingRegistration {
+                operation: ImportedModelOperation::Edit,
+                ..FIXTURE_MLX_BINDINGS[0]
+            }];
+
+        let mutations: [fn(&mut CheckpointAdapterRegistration); 4] = [
+            |adapter| adapter.signatures = UNKNOWN_DIALECT_SIGNATURE,
+            |adapter| adapter.canonical_mappings = UNKNOWN_DIALECT_MAPPING,
+            |adapter| adapter.base_compatibility = UNKNOWN_COMPONENT_BASE,
+            |adapter| adapter.backend_bindings = UNDECLARED_OPERATION_BINDING,
+        ];
+        for mutate in mutations {
+            let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+            mutate(&mut adapter);
+            assert!(
+                ProviderRegistryBuilder::new()
+                    .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                    .register_checkpoint_adapter(adapter)
+                    .build()
+                    .is_err(),
+                "dangling portable metadata must fail"
+            );
+        }
+
+        let error = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(cross_platform_fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .err()
+            .expect("a shipped eligible backend without a family binding must fail")
+            .to_string();
+        assert!(
+            error.contains("no binding for shipped eligible backend 'candle'"),
+            "{error}"
+        );
+    }
+
+    /// A canonical mapping may only claim a plan-driven backend the adapter is eligible for, and
+    /// may not claim one twice. Each catalog's conformance test reads
+    /// `plan_driven_backends` as the exact set of backends that must ship a `LogicalKeyMapping`
+    /// with that id, so an ineligible or repeated entry would make the reachability proof
+    /// unsatisfiable (or vacuous) rather than merely untidy.
+    #[test]
+    fn canonical_mapping_plan_driven_backends_must_be_eligible_and_unique() {
+        const INELIGIBLE: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                // The fixture adapter is MLX-eligible only.
+                plan_driven_backends: &[CheckpointBackend::Candle],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        const REPEATED: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                plan_driven_backends: &[CheckpointBackend::Mlx, CheckpointBackend::Mlx],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        for mapping in [INELIGIBLE, REPEATED] {
+            let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+            adapter.canonical_mappings = mapping;
+            let error = ProviderRegistryBuilder::new()
+                .register_generator(DUMMY_GENERATOR_REGISTRATION)
+                .register_checkpoint_adapter(adapter)
+                .build()
+                .err()
+                .expect("a repeated or ineligible plan-driven backend must fail the build")
+                .to_string();
+            assert!(
+                error.contains("repeated or ineligible plan-driven backend"),
+                "{error}"
+            );
+        }
+
+        // And the honest declaration still builds.
+        const ELIGIBLE: &[CheckpointCanonicalMappingRegistration] =
+            &[CheckpointCanonicalMappingRegistration {
+                plan_driven_backends: &[CheckpointBackend::Mlx],
+                ..FIXTURE_MAPPINGS[0]
+            }];
+        let mut adapter = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        adapter.canonical_mappings = ELIGIBLE;
+        ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(adapter)
+            .build()
+            .expect("an eligible plan-driven backend builds");
+    }
+
+    /// The shipped posture, pinned per (adapter, dialect): which mapping id is the authority and
+    /// which backends actually implement it. Two facts this guards, both of which were live
+    /// defects before sc-20651:
+    ///
+    /// * the Krea 2 `diffusers` dialect must NOT be `identity-v1` — that mapping accepts every
+    ///   on-disk key and decodes undescribed fp8 at unit scale, silently wrong (its own doc comment
+    ///   forbids the use); and
+    /// * a `mapping_id` with no implementation anywhere must say so (`plan_driven_backends: &[]`)
+    ///   rather than reading like a backed route. The catalog tests then prove the non-empty
+    ///   entries resolve and the empty ones have nothing masquerading behind them.
+    #[test]
+    fn shipped_canonical_mapping_posture_is_pinned_per_dialect() {
+        use crate::checkpoint_codec::IdentityKeyMapping;
+
+        /// One pinned mapping row: `(dialect, mapping_id, plan_driven_backends)`.
+        type MappingRow = (&'static str, &'static str, &'static [CheckpointBackend]);
+
+        let expected: &[(&str, &[MappingRow])] = &[
+            (
+                KREA_2_CHECKPOINT_ADAPTER.adapter_id,
+                &[
+                    (
+                        // Implemented on BOTH engines since sc-20651 — one dialect, one canonical
+                        // mapping id, two implementations.
+                        "krea-native",
+                        "krea-native-to-diffusers-v1",
+                        &[CheckpointBackend::Mlx, CheckpointBackend::Candle],
+                    ),
+                    (
+                        "diffusers",
+                        "krea-2-diffusers-v1",
+                        &[CheckpointBackend::Mlx],
+                    ),
+                ],
+            ),
+            (
+                SDXL_CHECKPOINT_ADAPTER.adapter_id,
+                &[("ldm", "sdxl-ldm-to-diffusers-v1", &[])],
+            ),
+            (
+                MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id,
+                &[("diffusers", "identity-v1", &[])],
+            ),
+            (
+                Z_IMAGE_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "z-image-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                QWEN_IMAGE_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "qwen-image-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                FLUX2_CHECKPOINT_ADAPTER.adapter_id,
+                &[("comfyui", "flux2-comfyui-to-diffusers-v1", &[])],
+            ),
+            (
+                WAN_CHECKPOINT_ADAPTER.adapter_id,
+                &[(
+                    "comfyui",
+                    "wan-comfyui-to-diffusers-v1",
+                    &[CheckpointBackend::Candle],
+                )],
+            ),
+        ];
+        let shipped: &[&CheckpointAdapterRegistration] = &[
+            &KREA_2_CHECKPOINT_ADAPTER,
+            &SDXL_CHECKPOINT_ADAPTER,
+            &MAGE_FLOW_CHECKPOINT_ADAPTER,
+            &Z_IMAGE_CHECKPOINT_ADAPTER,
+            &QWEN_IMAGE_CHECKPOINT_ADAPTER,
+            &FLUX2_CHECKPOINT_ADAPTER,
+            &WAN_CHECKPOINT_ADAPTER,
+        ];
+        assert_eq!(
+            shipped.len(),
+            expected.len(),
+            "every shipped adapter's mapping posture must be pinned here"
+        );
+        for (adapter, (adapter_id, rows)) in shipped.iter().zip(expected) {
+            assert_eq!(adapter.adapter_id, *adapter_id);
+            let actual: Vec<_> = adapter
+                .canonical_mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        mapping.dialect,
+                        mapping.mapping_id,
+                        mapping.plan_driven_backends,
+                    )
+                })
+                .collect();
+            let expected_rows: Vec<_> = rows.to_vec();
+            assert_eq!(actual, expected_rows, "adapter {adapter_id}");
+            assert!(
+                !adapter
+                    .canonical_mappings
+                    .iter()
+                    .any(
+                        |mapping| mapping.mapping_id == IdentityKeyMapping::MAPPING_ID
+                            && !mapping.plan_driven_backends.is_empty()
+                    ),
+                "adapter {adapter_id} routes a plan through `identity-v1`, which decodes \
+                 undescribed fp8 at unit scale — silently wrong rather than refused"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_adapter_catalog_conformance_preserves_truthful_backend_asymmetry() {
+        let mlx = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(cross_platform_fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .unwrap();
+        let candle = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(cross_platform_fixture_adapter(FIXTURE_CANDLE_BINDINGS))
+            .build()
+            .unwrap();
+        assert_eq!(
+            mlx.checkpoint_adapter_catalog_conformance_errors(&candle),
+            Vec::<String>::new()
+        );
+
+        let mlx_only = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .unwrap();
+        let candle_without_adapter = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            mlx_only.checkpoint_adapter_catalog_conformance_errors(&candle_without_adapter),
+            Vec::<String>::new(),
+            "an explicitly MLX-only family must not fabricate a Candle route"
+        );
+
+        let mlx_generate_only = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(two_operation_cross_platform_fixture_adapter(
+                FIXTURE_MLX_BINDINGS,
+            ))
+            .build()
+            .unwrap();
+        let candle_generate_only = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(two_operation_cross_platform_fixture_adapter(
+                FIXTURE_CANDLE_BINDINGS,
+            ))
+            .build()
+            .unwrap();
+        assert_eq!(
+            mlx_generate_only
+                .checkpoint_adapter_catalog_conformance_errors(&candle_generate_only),
+            ["checkpoint-adapter family 'test' (id 'fixture-family-v1') operation Edit has no binding across eligible catalogs"]
+        );
+
+        let candle_implements_edit = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(two_operation_cross_platform_fixture_adapter(
+                FIXTURE_CANDLE_GENERATE_AND_EDIT_BINDINGS,
+            ))
+            .build()
+            .unwrap();
+        assert_eq!(
+            mlx_generate_only
+                .checkpoint_adapter_catalog_conformance_errors(&candle_implements_edit),
+            Vec::<String>::new(),
+            "one eligible backend may omit an operation when another real binding implements it"
+        );
+    }
+
+    #[test]
+    fn checkpoint_adapter_catalog_conformance_rejects_family_id_drift_deterministically() {
+        let mlx = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .unwrap();
+
+        let mut different_id = fixture_adapter(FIXTURE_CANDLE_BINDINGS);
+        different_id.adapter_id = "fixture-family-v2";
+        different_id.eligible_backends = &[CheckpointBackend::Candle];
+        let candle_different_id = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(different_id)
+            .build()
+            .unwrap();
+        let expected_id_drift = ["checkpoint-adapter family 'test' maps to different adapter ids 'fixture-family-v1' and 'fixture-family-v2' across catalogs"];
+        assert_eq!(
+            mlx.checkpoint_adapter_catalog_conformance_errors(&candle_different_id),
+            expected_id_drift
+        );
+        assert_eq!(
+            candle_different_id.checkpoint_adapter_catalog_conformance_errors(&mlx),
+            expected_id_drift,
+            "family/id drift diagnostics must not depend on catalog argument order"
+        );
+
+        let mut different_family = fixture_adapter(FIXTURE_OTHER_CANDLE_BINDINGS);
+        different_family.family = "other";
+        different_family.eligible_backends = &[CheckpointBackend::Candle];
+        let candle_different_family = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_OTHER_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(different_family)
+            .build()
+            .unwrap();
+        let expected_family_drift = ["checkpoint-adapter id 'fixture-family-v1' maps to different families 'other' and 'test' across catalogs"];
+        assert_eq!(
+            mlx.checkpoint_adapter_catalog_conformance_errors(&candle_different_family),
+            expected_family_drift
+        );
+        assert_eq!(
+            candle_different_family.checkpoint_adapter_catalog_conformance_errors(&mlx),
+            expected_family_drift,
+            "adapter-id/family drift diagnostics must not depend on catalog argument order"
+        );
+
+        let mage_mlx = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_MAGE_MLX_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(CheckpointAdapterRegistration {
+                backend_bindings: FIXTURE_MAGE_MLX_BINDINGS,
+                ..MAGE_FLOW_CHECKPOINT_ADAPTER
+            })
+            .build()
+            .unwrap();
+        let mut normalized_legacy_family = fixture_adapter(FIXTURE_LEGACY_MAGE_CANDLE_BINDINGS);
+        normalized_legacy_family.adapter_id = MAGE_FLOW_CHECKPOINT_ADAPTER.adapter_id;
+        normalized_legacy_family.family = "mage-flow";
+        normalized_legacy_family.compatibility_projection.family = "mage-flow";
+        normalized_legacy_family.eligible_backends = &[CheckpointBackend::Candle];
+        let mage_candle_with_normalized_family = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_LEGACY_MAGE_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(normalized_legacy_family)
+            .build()
+            .unwrap();
+        let expected_normalization_drift = ["checkpoint-adapter id 'mage-flow-diffusers-v1' maps to different families 'mage-flow' and 'mage_flow' across catalogs"];
+        assert_eq!(
+            mage_mlx
+                .checkpoint_adapter_catalog_conformance_errors(&mage_candle_with_normalized_family),
+            expected_normalization_drift,
+            "hyphen/underscore normalization must not hide portable-family drift"
+        );
+        assert_eq!(
+            mage_candle_with_normalized_family
+                .checkpoint_adapter_catalog_conformance_errors(&mage_mlx),
+            expected_normalization_drift,
+            "normalization-drift diagnostics must not depend on catalog argument order"
+        );
+
+        let mut mlx_shared_projection = fixture_adapter(FIXTURE_MLX_BINDINGS);
+        mlx_shared_projection.compatibility_projection.family = "shared-legacy-family";
+        let mlx_shared_projection = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(mlx_shared_projection)
+            .build()
+            .unwrap();
+        let mut candle_shared_projection = fixture_adapter(FIXTURE_OTHER_CANDLE_BINDINGS);
+        candle_shared_projection.adapter_id = "other-family-v1";
+        candle_shared_projection.family = "other";
+        candle_shared_projection.compatibility_projection.family = "shared-legacy-family";
+        candle_shared_projection.eligible_backends = &[CheckpointBackend::Candle];
+        let candle_shared_projection = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_OTHER_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(candle_shared_projection)
+            .build()
+            .unwrap();
+        let expected_alias_ownership_drift = ["checkpoint-adapter compatibility family 'shared-legacy-family' maps to different portable authorities 'other' (id 'other-family-v1') and 'test' (id 'fixture-family-v1') across catalogs"];
+        assert_eq!(
+            mlx_shared_projection
+                .checkpoint_adapter_catalog_conformance_errors(&candle_shared_projection),
+            expected_alias_ownership_drift
+        );
+        assert_eq!(
+            candle_shared_projection
+                .checkpoint_adapter_catalog_conformance_errors(&mlx_shared_projection),
+            expected_alias_ownership_drift,
+            "compatibility-family ownership diagnostics must not depend on catalog argument order"
+        );
+    }
+
+    #[test]
+    fn checkpoint_adapter_catalog_conformance_detects_metadata_and_binding_mutations() {
+        const MUTATED_RECOVERY: &[CheckpointConfigRecoveryRegistration] =
+            &[CheckpointConfigRecoveryRegistration {
+                field: "hidden-size",
+                recovery_id: "mutated-tensor-shape-v1",
+            }];
+
+        let mlx = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(cross_platform_fixture_adapter(FIXTURE_MLX_BINDINGS))
+            .build()
+            .unwrap();
+        let mut mutated = cross_platform_fixture_adapter(FIXTURE_CANDLE_BINDINGS);
+        mutated.config_recovery = MUTATED_RECOVERY;
+        let candle_with_metadata_drift = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(mutated)
+            .build()
+            .unwrap();
+        let expected_metadata_drift = vec![
+            "checkpoint-adapter family 'test' (id 'fixture-family-v1') portable metadata differs across catalogs"
+                .to_owned(),
+        ];
+        assert_eq!(
+            mlx.checkpoint_adapter_catalog_conformance_errors(&candle_with_metadata_drift),
+            expected_metadata_drift
+        );
+        assert_eq!(
+            candle_with_metadata_drift.checkpoint_adapter_catalog_conformance_errors(&mlx),
+            expected_metadata_drift
+        );
+
+        let mut mutated_projection = cross_platform_fixture_adapter(FIXTURE_CANDLE_BINDINGS);
+        mutated_projection.compatibility_projection.family = "test-legacy";
+        let candle_with_projection_drift = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .register_checkpoint_adapter(mutated_projection)
+            .build()
+            .unwrap();
+        assert_eq!(
+            mlx.checkpoint_adapter_catalog_conformance_errors(&candle_with_projection_drift),
+            expected_metadata_drift,
+            "legacy projection drift is portable-metadata drift"
+        );
+        assert_eq!(
+            candle_with_projection_drift.checkpoint_adapter_catalog_conformance_errors(&mlx),
+            expected_metadata_drift,
+            "projection-drift diagnostics must not depend on catalog argument order"
+        );
+
+        let candle_without_adapter = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_CANDLE_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        let errors = mlx.checkpoint_adapter_catalog_conformance_errors(&candle_without_adapter);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("missing from a catalog")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("no binding for shipped eligible backend 'candle'")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -4202,6 +6676,58 @@ mod tests {
         assert!(unmeasured
             .activation_memory_bytes_1024("no_such_model")
             .is_err());
+    }
+
+    /// sc-19559 — an unsatisfiable step declaration is a descriptor mistake, not a runtime
+    /// surprise. Each shape refuses EVERY step count, and the shared floor would enforce it on
+    /// every request, so the sweep has to name it before a catalog ships.
+    ///
+    /// Each case is built and asserted individually: a single descriptor carrying all of them at
+    /// once would pass even if only one check fired.
+    #[test]
+    fn model_descriptor_errors_flags_an_unsatisfiable_step_declaration() {
+        let with = |steps: StepSupport| ModelDescriptor {
+            capabilities: Capabilities {
+                supported_steps: steps,
+                ..dummy_descriptor().capabilities
+            },
+            ..dummy_descriptor()
+        };
+        let errs = |steps: StepSupport| model_descriptor_errors(&with(steps));
+
+        // The baseline: the coherent descriptor this varies from is clean, so every message below
+        // is attributable to the step declaration alone.
+        assert!(errs(StepSupport::Unconstrained).is_empty());
+        assert!(errs(StepSupport::Exact(vec![8])).is_empty());
+        assert!(errs(StepSupport::Range { min: 1, max: 200 }).is_empty());
+
+        let empty_menu = errs(StepSupport::Exact(Vec::new()));
+        assert!(
+            empty_menu.iter().any(|e| e.contains("EMPTY exact menu")),
+            "{empty_menu:?}"
+        );
+        let zero_menu = errs(StepSupport::Exact(vec![0, 8]));
+        assert!(
+            zero_menu.iter().any(|e| e.contains("advertises 0 steps")),
+            "{zero_menu:?}"
+        );
+        let dupe_menu = errs(StepSupport::Exact(vec![8, 8]));
+        assert!(
+            dupe_menu
+                .iter()
+                .any(|e| e.contains("duplicate supported step count 8")),
+            "{dupe_menu:?}"
+        );
+        let zero_range = errs(StepSupport::Range { min: 0, max: 200 });
+        assert!(
+            zero_range.iter().any(|e| e.contains("range starts at 0")),
+            "{zero_range:?}"
+        );
+        let inverted = errs(StepSupport::Range { min: 30, max: 8 });
+        assert!(
+            inverted.iter().any(|e| e.contains("30..=8 is empty")),
+            "{inverted:?}"
+        );
     }
 
     /// Each per-descriptor invariant fires: identity shape, zero/inverted bounds, duplicate or

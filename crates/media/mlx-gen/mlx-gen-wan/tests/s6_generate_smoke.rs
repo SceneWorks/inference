@@ -11,7 +11,7 @@
 //! ```text
 //! WAN_A14B_MODEL_DIR=~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16 \
 //! WAN_A14B_OUT=/tmp/wan_a14b_smoke \
-//!   cargo test -p mlx-gen-wan --test s6_generate_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-wan --test integration s6_generate_smoke:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

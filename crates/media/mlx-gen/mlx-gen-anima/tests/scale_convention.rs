@@ -3,7 +3,7 @@
 //! These are `#[ignore]`d + real-weights-gated (they need the `circlestone-labs/Anima` base snapshot
 //! and, for the DiT legs, the `Anima-Official-LoRAs` snapshot, plus Metal). CI runs NONE of them. Run
 //! this binary alone with:
-//!   cargo test -p mlx-gen-anima --release --test scale_convention -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration scale_convention:: -- --ignored --nocapture
 //! It is also covered by the full documented invocation `cargo test -p mlx-gen-anima --release --
 //! --ignored`, which runs every `tests/*.rs` binary.
 //!
@@ -35,7 +35,7 @@
 //! anchor that the *applied* residual is exactly `base + B·A` at scale 1.0 (and `base + 0.5·B·A` at
 //! scale 0.5), on both a DiT and a **non-zero** conditioner target.
 
-mod common;
+use crate::common;
 
 use mlx_rs::Dtype;
 

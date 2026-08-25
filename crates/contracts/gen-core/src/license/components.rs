@@ -600,6 +600,31 @@ pub const LTX_2_3: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// `MiniMaxAI/MiniMax-H3` — one repository holding the DiT (`transformer/` and `transformer_ref/`),
+/// the video VAE, the audio VAE and the tokenizer. One declaration, so one row.
+///
+/// **Not Apache-2.0.** The model card declares `license: other` /
+/// `minimax-h3-community-license-agreement`, and that agreement is **territorially exclusive**: its
+/// "Applicable Territory" is worldwide *excluding* the European Union, the United Kingdom, the
+/// Republic of Korea and the United States of America. See
+/// [`MINIMAX_H3_COMMUNITY`](super::families::MINIMAX_H3_COMMUNITY).
+///
+/// The `text_encoder/` partition is deliberately **not** covered here: it is a byte-identical copy
+/// of upstream Qwen3-VL-32B-Instruct under Apache-2.0, which the LICENSE itself says
+/// ([`QWEN3_VL_32B_INSTRUCT`]).
+pub const MINIMAX_H3: ComponentLicense = ComponentLicense {
+    component: "minimax_h3",
+    source_url: "https://huggingface.co/MiniMaxAI/MiniMax-H3",
+    gated: false,
+    declared: "minimax-h3-community-license-agreement",
+    family: "minimax-h3-community",
+    attribution: Some(
+        "MiniMax H3 is licensed under the MiniMax H3 Community License Agreement, Copyright \u{a9} \
+         2026 MiniMax. All Rights Reserved.",
+    ),
+    retrieved: "2026-08-12",
+};
+
 /// `genmo/mochi-1-preview`.
 pub const MOCHI_1_PREVIEW: ComponentLicense = ComponentLicense {
     component: "mochi_1_preview",
@@ -634,6 +659,23 @@ pub const NVIDIA_PID_STUDENTS: ComponentLicense = ComponentLicense {
     family: "nvidia-nsclv1",
     attribution: Some("PiD © NVIDIA Corporation — licensed under the NVIDIA License (NSCLv1)"),
     retrieved: "2026-08-02",
+};
+
+/// `Qwen/Qwen3-VL-32B-Instruct` — the condition encoder MiniMax-H3 ships inside its own repository.
+///
+/// sc-17143 established that all 14 `text_encoder/` shards are byte-identical (LFS SHA-256) to the
+/// upstream repository, so the upstream declaration governs them. The MiniMax H3 LICENSE says the
+/// same in its closing note: *"the encoder of MiniMax H3 uses Qwen3-VL-32B, which is licensed under
+/// Apache 2.0 License"*. Rowed separately from [`MINIMAX_H3`] because the two halves of one
+/// on-disk snapshot really do carry different licences.
+pub const QWEN3_VL_32B_INSTRUCT: ComponentLicense = ComponentLicense {
+    component: "qwen3_vl_32b_instruct",
+    source_url: "https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Qwen3-VL-32B-Instruct \u{a9} Alibaba Cloud — licensed under Apache-2.0"),
+    retrieved: "2026-08-12",
 };
 
 /// `guozinan/PuLID` → `pulid_flux_v0.9.1.safetensors`.
@@ -1173,9 +1215,11 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     KREA_2_TURBO,
     KREA_REALTIME_VIDEO,
     LTX_2_3,
+    MINIMAX_H3,
     MOCHI_1_PREVIEW,
     NVIDIA_PID_STUDENTS,
     PULID,
+    QWEN3_VL_32B_INSTRUCT,
     QWEN_IMAGE,
     QWEN_IMAGE_2512,
     QWEN_IMAGE_2512_FUN_CONTROLNET_UNION,
@@ -1226,7 +1270,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 71);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 73);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1608,11 +1652,17 @@ mod tests {
     /// assertion can be unconditional.
     #[test]
     fn provenance_fields_are_re_readable() {
+        // Every row must name the date of an evidence pass that actually happened. The original
+        // sweep is 2026-08-02; sc-17147 added the MiniMax-H3 pair after reading that repository's
+        // own LICENSE, so its date is the second entry. A row carrying any other date is a row
+        // whose provenance nobody can re-read.
+        const EVIDENCE_PACK_DATES: &[&str] = &["2026-08-02", "2026-08-12"];
         for row in MEDIA_COMPONENT_LICENSES {
-            assert_eq!(
-                row.retrieved, "2026-08-02",
-                "component {:?} carries a retrieval date neither evidence pack records",
-                row.component
+            assert!(
+                EVIDENCE_PACK_DATES.contains(&row.retrieved),
+                "component {:?} carries a retrieval date ({:?}) that no evidence pack records",
+                row.component,
+                row.retrieved
             );
             assert!(
                 row.source_url.starts_with("https://"),

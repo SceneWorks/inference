@@ -29,7 +29,7 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     AcceptedControlKinds, Capabilities, ConditioningKind, ControlBranch, ControlKind,
     FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, Residency, Result, SizeFloor,
+    ModelDescriptor, Progress, Quant, Residency, Result,
 };
 
 use crate::model::validate_request;
@@ -63,7 +63,6 @@ pub fn descriptor() -> ModelDescriptor {
             // paying for a load. Same expression the `ControlBranch` override
             // returns, so the two cannot drift.
             supported_quants: &[Quant::Q4, Quant::Q8],
-            component_precision_floors: &[],
             // Base is undistilled → full classifier-free guidance + negative prompting (mirrors the
             // base `z_image` descriptor), unlike the guidance-distilled Turbo control variant.
             supports_negative_prompt: true,
@@ -77,32 +76,14 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base variant — static-shift default.
             schedulers: curated_scheduler_names(),
-            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,
             mac_only: true,
-            supports_kv_cache: false,
-            requires_sigma_shift: false,
             // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
             supports_sequential_offload: true,
-            unconditionally_engages_staged_residency: false,
             supports_preview: true,
-            supports_prompt_enhancement: false,
-            supports_streaming: false,
-            supports_multi_speaker: false,
-            supports_conversation_history: false,
-            supports_conversation_session: false,
-            max_speakers: None,
-            // No audio surface (sc-12834): pure image/video model.
-            audio_sample_rates: vec![],
-            max_audio_duration_secs: None,
-            audio_voices: vec![],
-            audio_languages: vec![],
-            audio_edit_modes: vec![],
-            size_floor: SizeFloor::RangeChecked,
-            execution: Default::default(),
-            approximation: Default::default(),
+            ..Default::default()
         },
     }
 }

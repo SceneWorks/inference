@@ -3,7 +3,7 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
-    ModelDescriptor, Quant, SizeFloor,
+    ModelDescriptor, Quant,
 };
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
@@ -79,9 +79,7 @@ impl FluxVariant {
             backend: "mlx",
             modality: Modality::Image,
             capabilities: Capabilities {
-                supports_negative_prompt: false,
                 supports_guidance: self.supports_guidance(),
-                supports_true_cfg: false,
                 // FLUX.1 reference-image conditioning is the XLabs IP-Adapter (epic 3621): a single
                 // `Reference` rides `Conditioning::Reference { image, strength=ipAdapterScale }`,
                 // exactly as SDXL exposes its IP-Adapter. Only wired when a `LoadSpec::ip_adapter`
@@ -90,7 +88,6 @@ impl FluxVariant {
                 // The Redux/Depth/Fill/Control variants remain later ports.
                 conditioning: vec![ConditioningKind::Reference],
                 supported_quants: &[Quant::Q4, Quant::Q8],
-                component_precision_floors: &[],
                 supports_lora: true,
                 supports_lokr: true,
                 // The curated unified-framework integrator menu (epic 7114 P3) + the legacy
@@ -114,34 +111,17 @@ impl FluxVariant {
                     s.push("linear");
                     s
                 },
-                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
                 mac_only: true,
-                supports_kv_cache: false,
                 requires_sigma_shift: self.requires_sigma_shift(),
                 // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
                 // drops the T5-XXL + CLIP-L text encoders after the prompt encode so peak unified
                 // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
                 supports_sequential_offload: true,
-                unconditionally_engages_staged_residency: false,
                 supports_preview: true,
-                supports_prompt_enhancement: false,
-                supports_streaming: false,
-                supports_multi_speaker: false,
-                supports_conversation_history: false,
-                supports_conversation_session: false,
-                max_speakers: None,
-                // No audio surface (sc-12834): pure image/video model.
-                audio_sample_rates: vec![],
-                max_audio_duration_secs: None,
-                audio_voices: vec![],
-                audio_languages: vec![],
-                audio_edit_modes: vec![],
-                size_floor: SizeFloor::RangeChecked,
-                execution: Default::default(),
-                approximation: Default::default(),
+                ..Default::default()
             },
         }
     }

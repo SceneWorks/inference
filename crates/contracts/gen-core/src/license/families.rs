@@ -65,6 +65,82 @@ pub const APACHE_2_0: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// `MiniMaxAI/MiniMax-H3` — the **MiniMax H3 Community License Agreement**, dated 2 August 2026.
+///
+/// # The term this vocabulary cannot express: the licence is TERRITORIALLY EXCLUSIVE
+///
+/// §I.3 defines the "Applicable Territory" as **worldwide excluding** the "Excluded Territories",
+/// and §I.5 names those as **the European Union, the United Kingdom, the Republic of Korea and the
+/// United States of America**. §V.4: *"You may not use, reproduce, modify, distribute, or display
+/// the MiniMax H3 Works or any of their Outputs or results outside the Applicable Territory."*
+/// Exhibit A item 1 repeats it as a use restriction. §II offers a bespoke licence to anyone in an
+/// Excluded Territory who contacts MiniMax.
+///
+/// [`LicenseTerm`] has **no territorial-restriction variant**, so the clause is carried below as a
+/// [`LicenseTerm::DeployerObligation`] quoting §V.4 verbatim rather than being dropped — a term this
+/// consequential must appear in a derived term union even if it appears under an imprecise kind. A
+/// first-class variant is tracked separately; until it exists, read this doc comment.
+///
+/// # The encoder is a different licence
+///
+/// The LICENSE's own closing note: *"the encoder of MiniMax H3 uses Qwen3-VL-32B, which is licensed
+/// under Apache 2.0 License"*. sc-17143 established that the shipped `text_encoder/` shards are
+/// byte-identical to `Qwen/Qwen3-VL-32B-Instruct`, so that is a **separate component**
+/// ([`QWEN3_VL_32B_INSTRUCT`](super::components::QWEN3_VL_32B_INSTRUCT)) and not covered by
+/// this family.
+///
+/// Text read at <https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE> on 2026-08-12.
+pub const MINIMAX_H3_COMMUNITY: LicenseFamily = LicenseFamily {
+    id: "minimax-h3-community",
+    spdx_id: "LicenseRef-MiniMax-H3-Community",
+    name: "MiniMax H3 Community License Agreement",
+    text_url: "https://huggingface.co/MiniMaxAI/MiniMax-H3/raw/main/LICENSE",
+    terms: &[
+        // §IV.1 "if your commercial products and services generate MORE THAN 20 million US dollars
+        // (or equivalent in other currencies) in yearly revenue" — "more than", so the amount itself
+        // is below the threshold and the boundary is Exclusive (LTX's "at least" is Inclusive).
+        LicenseTerm::RevenueCeiling {
+            amount_usd: 20_000_000,
+            boundary: CeilingBoundary::Exclusive,
+        },
+        // §IV.1 names the address and the subject line, unlike LTX's contactless clause.
+        LicenseTerm::RegistrationRequired {
+            contact: Some("api@minimax.io"),
+        },
+        // §V.2 "you must bind each recipient or user to enforceable terms at least as protective as
+        // the use restrictions in this Section V and Exhibit A".
+        LicenseTerm::DownstreamRestrictions {
+            family: "minimax-h3-community",
+        },
+        // §III.1 "You must provide a copy of this Agreement to all such Third Parties".
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "minimax-h3-community",
+        },
+        // §IV.2 "You shall prominently display 'MiniMax H3' on the user interface of commercial
+        // product or service that uses MiniMax H3". Mandatory, unlike §III.3's encouraged
+        // "Powered by MiniMax H3" notice.
+        LicenseTerm::AttributionRequired,
+        // §III.4 "must be accompanied by a 'NOTICE' text file containing the following notice".
+        LicenseTerm::NoticeFileRequired,
+        // §V.4, the territorial restriction. See the type docs: this is the wrong KIND for the
+        // clause, and it is recorded here anyway so it cannot vanish from a derived union.
+        LicenseTerm::DeployerObligation {
+            text: "You may not use, reproduce, modify, distribute, or display the MiniMax H3 \
+                   Works or any of their Outputs or results outside the Applicable Territory \
+                   (worldwide EXCLUDING the European Union, the United Kingdom, the Republic of \
+                   Korea and the United States of America)",
+        },
+        // §V.5, the safeguards obligation on anyone offering generation to a third party.
+        LicenseTerm::DeployerObligation {
+            text: "you must implement, maintain, test, and periodically review reasonable and \
+                   proportionate technical and organizational safeguards designed to prevent and \
+                   mitigate access, uses, and Outputs that violate this Section V or Exhibit A",
+        },
+        // Exhibit A is inside the LICENSE itself, so there is no separate URL to cite.
+        LicenseTerm::AcceptableUsePolicy { url: None },
+    ],
+};
+
 /// MIT License.
 ///
 /// Text read at <https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt> on
@@ -898,6 +974,7 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     LLAMA_3_1_COMMUNITY,
     LTX_2_COMMUNITY,
     META_SAM_LICENSE,
+    MINIMAX_H3_COMMUNITY,
     MIT,
     NVIDIA_NSCLV1,
     NVIDIA_OPEN_MODEL,
@@ -932,12 +1009,13 @@ mod tests {
             LLAMA_3_1_COMMUNITY,
             LTX_2_COMMUNITY,
             META_SAM_LICENSE,
+            MINIMAX_H3_COMMUNITY,
             MIT,
             NVIDIA_NSCLV1,
             NVIDIA_OPEN_MODEL,
             STABILITY_AI_COMMUNITY,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 19);
+        assert_eq!(LICENSE_FAMILIES.len(), 20);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -1072,6 +1150,7 @@ mod tests {
             vec![
                 "krea-2-community",
                 "ltx-2-community",
+                "minimax-h3-community",
                 "stability-ai-community"
             ]
         );
@@ -1099,6 +1178,7 @@ mod tests {
                 "ideogram-4-non-commercial",
                 "ltx-2-community",
                 "meta-sam-license",
+                "minimax-h3-community",
                 "nvidia-nsclv1",
             ],
             "restrictions-as-enforceable-provisions is the heavier duty and only these state it"
@@ -1117,6 +1197,7 @@ mod tests {
                 "llama-3-1-community",
                 "ltx-2-community",
                 "meta-sam-license",
+                "minimax-h3-community",
                 "nvidia-nsclv1",
                 "nvidia-open-model",
                 "stability-ai-community",
@@ -1186,6 +1267,7 @@ mod tests {
                 "creativeml-openrail-pp-m",
                 "flux-1-dev-non-commercial",
                 "ltx-2-community",
+                "minimax-h3-community",
             ]
         );
         assert_eq!(registration_without_contact, vec!["ltx-2-community"]);
@@ -1439,6 +1521,21 @@ mod tests {
                     // `attribution_required`: the typed term would assert an unconditional duty —
                     // U8's shape, applied. See META_SAM_LICENSE's doc comment.
                     "deployer_obligation:If you submit for publication the results of res",
+                ],
+            ),
+            (
+                "minimax-h3-community",
+                vec![
+                    "revenue_ceiling:20000000:exclusive",
+                    "registration_required:api@minimax.io",
+                    "downstream_restrictions:minimax-h3-community",
+                    "downstream_license_copy:minimax-h3-community",
+                    "attribution_required",
+                    "notice_file_required",
+                    // §V.4, the territorial exclusion (EU / UK / Republic of Korea / USA).
+                    "deployer_obligation:You may not use, reproduce, modify, distribute, ",
+                    "deployer_obligation:you must implement, maintain, test, and periodic",
+                    "acceptable_use_policy:<none>",
                 ],
             ),
             ("mit", vec!["attribution_required"]),

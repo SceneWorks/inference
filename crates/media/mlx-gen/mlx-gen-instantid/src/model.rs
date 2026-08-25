@@ -12,12 +12,18 @@
 //! `Resampler(zeros)` — the zero embedding run through the Resampler, NOT literal zero tokens — exactly
 //! as the reference `_encode_prompt_image_emb` does it.
 
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use mlx_rs::ops::{concatenate_axis, multiply, zeros};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::{
+    GenerationRequest, MemoryGeometry, MemoryNumericTier, MemoryPhase, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemoryStrategy,
+};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -36,9 +42,9 @@ use mlx_gen_sdxl::unet::{ControlNet, UNet2DConditionModel};
 use mlx_gen_sdxl::vae::Autoencoder;
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise_curated, denoise_ip_multi_control,
-    encode_conditioning, load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
-    load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image, seeded_prior,
-    text_time_ids, ControlContext, Denoiser, LoraCoverage, PID_BACKBONE,
+    encode_conditioning_windows, load_controlnet, load_text_encoder_1_dtype,
+    load_text_encoder_2_dtype, load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image,
+    seeded_prior, text_time_ids, ControlContext, Denoiser, LoraCoverage, PID_BACKBONE,
 };
 
 use mlx_gen::image::resize_lanczos_u8;
@@ -90,6 +96,7 @@ pub const FACE_RESTORE_PROMPT: &str =
 const FACE_RESTORE_CROP_PAD: f32 = 1.9;
 
 /// Paths to the InstantID checkpoints.
+#[derive(Clone)]
 pub struct InstantIdPaths {
     /// SDXL base snapshot dir (`unet/`, `text_encoder{,_2}/`, `vae/`, `tokenizer/`).
     pub sdxl_base: PathBuf,
@@ -164,15 +171,15 @@ impl Default for InstantIdRequest {
 /// Loaded InstantID model: the SDXL backbone (UNet with the face IP K/V pairs installed) + the
 /// IdentityNet + the face Resampler, plus an optional native face-analysis stack.
 pub struct InstantId {
-    tokenizer: ClipBpeTokenizer,
-    te1: ClipTextEncoder,
-    te2: ClipTextEncoder,
-    unet: UNet2DConditionModel,
-    identitynet: ControlNet,
+    tokenizer: Option<ClipBpeTokenizer>,
+    te1: Option<ClipTextEncoder>,
+    te2: Option<ClipTextEncoder>,
+    unet: Option<UNet2DConditionModel>,
+    identitynet: Option<ControlNet>,
     /// The OpenPose ControlNet for pose mode (sc-3117), attached via [`with_openpose`](Self::with_openpose).
     openpose: Option<ControlNet>,
-    resampler: Resampler,
-    vae: Autoencoder,
+    resampler: Option<Resampler>,
+    vae: Option<Autoencoder>,
     sampler: EulerSampler,
     /// SDXL ε-prediction α-cumprod schedule (`scaled_linear`), built once at load — the
     /// `DiscreteModelSampling` source for the curated unified-sampler path (epic 7114, sc-7297).
@@ -187,9 +194,315 @@ pub struct InstantId {
     /// can reject a requested-vs-packed tier mismatch (F-144, sc-11129) — `quantize()` no-ops on an
     /// already-packed U-Net, so a Q4 request over a pre-quantized Q8 snapshot would otherwise serve Q8.
     sdxl_root: PathBuf,
+    reload: InstantIdReload,
+    staged_residency: bool,
+    memory_contract: Option<mlx_gen::gen_core::MemoryProviderContract>,
+    memory_tier: Option<MemoryNumericTier>,
+    memory_identity: Option<crate::memory_strategy::InstantIdMemoryIdentity>,
+    active_memory_scope: RefCell<Option<Rc<SharedMemoryScope>>>,
+}
+
+struct SharedMemoryScope {
+    inner: RefCell<Box<dyn MemoryRequestScope>>,
+    active: Cell<bool>,
+    phase: Cell<Option<MemoryPhase>>,
+}
+
+struct MemoryScopeHandle {
+    shared: Rc<SharedMemoryScope>,
+}
+
+fn drop_resident_component<T>(slot: &mut Option<T>) {
+    drop(slot.take());
+}
+
+fn reload_resident_component<T, E>(
+    slot: &mut Option<T>,
+    load: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<(), E> {
+    if slot.is_none() {
+        *slot = Some(load()?);
+    }
+    Ok(())
+}
+
+fn transition_shared_memory_scope(
+    active_scope: &RefCell<Option<Rc<SharedMemoryScope>>>,
+    next: Option<MemoryPhase>,
+) -> Result<()> {
+    let Some(shared) = active_scope.borrow().as_ref().cloned() else {
+        return Ok(());
+    };
+    if !shared.active.get() || shared.phase.get() == next {
+        return Ok(());
+    }
+    let current = shared.phase.get();
+    let mut scope = shared.inner.borrow_mut();
+    if let Some(phase) = current {
+        scope.leave_phase(phase)?;
+    }
+    if let Some(phase) = next {
+        scope.enter_phase(phase)?;
+    }
+    drop(scope);
+    shared.phase.set(next);
+    Ok(())
+}
+
+impl Drop for MemoryScopeHandle {
+    fn drop(&mut self) {
+        self.shared.active.set(false);
+        self.shared.phase.set(None);
+    }
+}
+
+impl MemoryRequestScope for MemoryScopeHandle {
+    fn configure_request(
+        &mut self,
+        request: &mut GenerationRequest,
+    ) -> mlx_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().configure_request(request)
+    }
+
+    fn enter_phase(&mut self, phase: MemoryPhase) -> mlx_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().enter_phase(phase)?;
+        self.shared.phase.set(Some(phase));
+        Ok(())
+    }
+
+    fn leave_phase(&mut self, phase: MemoryPhase) -> mlx_gen::gen_core::Result<()> {
+        self.shared.inner.borrow_mut().leave_phase(phase)?;
+        self.shared.phase.set(None);
+        Ok(())
+    }
+
+    fn configure_decode(
+        &mut self,
+        tile_edge: u32,
+        overlap: u32,
+        geometry: MemoryGeometry,
+    ) -> mlx_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .configure_decode(tile_edge, overlap, geometry)
+    }
+
+    fn configure_attention(&mut self, chunk_size: u32) -> mlx_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .configure_attention(chunk_size)
+    }
+
+    fn materialize_transformer_window(
+        &mut self,
+        first_block: u32,
+        block_count: u32,
+    ) -> mlx_gen::gen_core::Result<()> {
+        self.shared
+            .inner
+            .borrow_mut()
+            .materialize_transformer_window(first_block, block_count)
+    }
+
+    fn finish(&mut self, outcome: MemoryRunOutcome) -> mlx_gen::gen_core::Result<()> {
+        let result = self.shared.inner.borrow_mut().finish(outcome);
+        self.shared.active.set(false);
+        self.shared.phase.set(None);
+        result
+    }
+}
+
+#[derive(Clone)]
+struct InstantIdReload {
+    paths: InstantIdPaths,
+    openpose: Option<WeightsSource>,
+    face_paths: Option<(PathBuf, PathBuf)>,
+    pid: Option<PidWeights>,
+    quant_bits: Option<i32>,
+}
+
+impl InstantIdReload {
+    fn new(paths: &InstantIdPaths) -> Self {
+        Self {
+            paths: paths.clone(),
+            openpose: None,
+            face_paths: None,
+            pid: None,
+            quant_bits: None,
+        }
+    }
 }
 
 impl InstantId {
+    fn transition_memory_phase(&self, next: Option<MemoryPhase>) -> Result<()> {
+        transition_shared_memory_scope(&self.active_memory_scope, next)
+    }
+
+    fn require<'a, T>(value: &'a Option<T>, component: &str) -> Result<&'a T> {
+        value.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "instantid: {component} is not resident in the active memory phase"
+            ))
+        })
+    }
+
+    fn load_conditioning_components(&mut self) -> Result<()> {
+        if self.tokenizer.is_some() {
+            return Ok(());
+        }
+        let root = self.reload.paths.sdxl_base.as_path();
+        let tokenizer = load_tokenizer(root)?;
+        let mut te1 = load_text_encoder_1_dtype(root, DTYPE)?;
+        let mut te2 = load_text_encoder_2_dtype(root, DTYPE)?;
+        if let Some(bits) = self.reload.quant_bits {
+            te1.quantize(bits)?;
+            te2.quantize(bits)?;
+        }
+        let mut ipa = Weights::from_file(&self.reload.paths.ip_adapter).map_err(|e| {
+            Error::Msg(format!(
+                "instantid: load ip-adapter {:?} (run tools/convert_instantid.py): {e}",
+                self.reload.paths.ip_adapter
+            ))
+        })?;
+        ipa.cast_all(DTYPE)?;
+        let resampler =
+            Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::instantid_face())?;
+        let face = match &self.reload.face_paths {
+            Some((scrfd, arcface)) => Some(FaceAnalysis::load(
+                &Weights::from_file(scrfd)?,
+                &Weights::from_file(arcface)?,
+            )?),
+            None => None,
+        };
+        self.tokenizer = Some(tokenizer);
+        self.te1 = Some(te1);
+        self.te2 = Some(te2);
+        self.resampler = Some(resampler);
+        self.face = face;
+        Ok(())
+    }
+
+    fn load_denoise_components(&mut self) -> Result<()> {
+        if self.unet.is_some() {
+            return Ok(());
+        }
+        let root = self.reload.paths.sdxl_base.as_path();
+        let mut unet = load_unet_dtype(root, DTYPE)?;
+        if !self.reload.paths.adapters.is_empty() {
+            let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
+                LoraCoverage::Vendored
+            } else {
+                LoraCoverage::Complete
+            };
+            apply_sdxl_adapters_with(&mut unet, &self.reload.paths.adapters, coverage)?;
+        }
+        let mut ipa = Weights::from_file(&self.reload.paths.ip_adapter).map_err(|e| {
+            Error::Msg(format!(
+                "instantid: load ip-adapter {:?} (run tools/convert_instantid.py): {e}",
+                self.reload.paths.ip_adapter
+            ))
+        })?;
+        ipa.cast_all(DTYPE)?;
+        unet.install_ip_adapter(load_ip_kv_pairs(&ipa)?)?;
+        let mut identitynet = load_controlnet(&self.reload.paths.identitynet, DTYPE)?;
+        let mut openpose = match &self.reload.openpose {
+            Some(source) => Some(load_controlnet(source, DTYPE)?),
+            None => None,
+        };
+        if let Some(bits) = self.reload.quant_bits {
+            unet.quantize(bits)?;
+            identitynet.quantize(bits)?;
+            if let Some(value) = &mut openpose {
+                value.quantize(bits)?;
+            }
+        }
+        self.unet = Some(unet);
+        self.identitynet = Some(identitynet);
+        self.openpose = openpose;
+        Ok(())
+    }
+
+    fn load_decode_components(&mut self, use_pid: bool) -> Result<()> {
+        let sdxl_base = self.reload.paths.sdxl_base.clone();
+        reload_resident_component(&mut self.vae, || load_vae(&sdxl_base))?;
+        if use_pid && self.pid.is_none() {
+            let pid = self.reload.pid.as_ref().ok_or_else(|| {
+                Error::Msg(
+                    "instantid: use_pid was requested but no PiD decoder is configured (call with_pid)"
+                        .into(),
+                )
+            })?;
+            self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE)?);
+        }
+        Ok(())
+    }
+
+    fn release_conditioning_components(&mut self) {
+        if self.staged_residency {
+            drop_resident_component(&mut self.tokenizer);
+            drop_resident_component(&mut self.te1);
+            drop_resident_component(&mut self.te2);
+            drop_resident_component(&mut self.resampler);
+            drop_resident_component(&mut self.face);
+            mlx_gen::residency::drain_allocator_cache();
+        }
+    }
+
+    fn release_denoise_components(&mut self) {
+        if self.staged_residency {
+            drop_resident_component(&mut self.unet);
+            drop_resident_component(&mut self.identitynet);
+            drop_resident_component(&mut self.openpose);
+            mlx_gen::residency::drain_allocator_cache();
+        }
+    }
+
+    fn release_decode_components(&mut self) -> Result<()> {
+        if self.staged_residency {
+            drop_resident_component(&mut self.vae);
+            drop_resident_component(&mut self.pid);
+            mlx_gen::residency::drain_allocator_cache();
+        }
+        self.transition_memory_phase(None)
+    }
+
+    fn release_all_staged_components(&mut self) -> Result<()> {
+        self.release_conditioning_components();
+        self.release_denoise_components();
+        self.release_decode_components()
+    }
+
+    fn prepare_conditioning_phase(&mut self) -> Result<()> {
+        self.transition_memory_phase(Some(MemoryPhase::Conditioning))?;
+        if self.staged_residency {
+            self.release_denoise_components();
+            self.release_decode_components()?;
+        }
+        self.load_conditioning_components()
+    }
+
+    fn finish_conditioning_phase(&mut self, arrays: &[&Array]) -> Result<()> {
+        if self.staged_residency {
+            mlx_rs::transforms::eval(arrays.iter().copied())?;
+            self.release_conditioning_components();
+            self.load_denoise_components()?;
+        }
+        self.transition_memory_phase(Some(MemoryPhase::Denoise))?;
+        Ok(())
+    }
+
+    fn finish_denoise_phase(&mut self, latents: &Array, use_pid: bool) -> Result<()> {
+        if self.staged_residency {
+            mlx_rs::transforms::eval([latents])?;
+            self.release_denoise_components();
+            self.load_decode_components(use_pid)?;
+        }
+        self.transition_memory_phase(Some(MemoryPhase::Decode))?;
+        Ok(())
+    }
+
     /// Load the SDXL backbone + IdentityNet + face Resampler, installing the decoupled-cross-attn
     /// K/V pairs into the UNet. The face-analysis stack is attached separately via
     /// [`with_face`](Self::with_face) (it needs the converted SCRFD + ArcFace weights).
@@ -238,14 +551,14 @@ impl InstantId {
 
         let cfg = DiffusionConfig::sdxl_base();
         Ok(Self {
-            tokenizer,
-            te1,
-            te2,
-            unet,
-            identitynet,
+            tokenizer: Some(tokenizer),
+            te1: Some(te1),
+            te2: Some(te2),
+            unet: Some(unet),
+            identitynet: Some(identitynet),
             openpose: None,
-            resampler,
-            vae,
+            resampler: Some(resampler),
+            vae: Some(vae),
             sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
             alpha_schedule: AlphaSchedule::scaled_linear(
                 cfg.num_train_steps,
@@ -255,7 +568,136 @@ impl InstantId {
             face: None,
             pid: None,
             sdxl_root: root.to_path_buf(),
+            reload: InstantIdReload::new(paths),
+            staged_residency: false,
+            memory_contract: None,
+            memory_tier: None,
+            memory_identity: None,
+            active_memory_scope: RefCell::new(None),
         })
+    }
+
+    /// Load and retain the exact request-scoped admission identity for the bespoke MLX route.
+    pub fn load_with_memory_context(
+        paths: &InstantIdPaths,
+        tier: MemoryNumericTier,
+        identity: crate::memory_strategy::InstantIdMemoryIdentity,
+        context: MemoryRunContext,
+    ) -> Result<Self> {
+        let contract = crate::memory_strategy::provider_contract(tier);
+        crate::memory_strategy::validate_context(&contract, tier, &identity, &context)?;
+        let staged_residency = context.selection.strategy == MemoryStrategy::StagedResidency;
+        let mut model = if staged_residency {
+            let cfg = DiffusionConfig::sdxl_base();
+            Self {
+                tokenizer: None,
+                te1: None,
+                te2: None,
+                unet: None,
+                identitynet: None,
+                openpose: None,
+                resampler: None,
+                vae: None,
+                sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
+                alpha_schedule: AlphaSchedule::scaled_linear(
+                    cfg.num_train_steps,
+                    cfg.beta_start,
+                    cfg.beta_end,
+                ),
+                face: None,
+                pid: None,
+                sdxl_root: paths.sdxl_base.clone(),
+                reload: InstantIdReload::new(paths),
+                staged_residency: true,
+                memory_contract: None,
+                memory_tier: None,
+                memory_identity: None,
+                active_memory_scope: RefCell::new(None),
+            }
+        } else {
+            Self::load(paths)?
+        };
+        model.memory_contract = Some(contract);
+        model.memory_tier = Some(tier);
+        model.memory_identity = Some(identity);
+        Ok(model)
+    }
+
+    /// Revalidate the exact route/geometry handshake and create the cleanup-owning Metal scope.
+    /// Its `Drop` path evaluates pending work and clears request-local MLX allocations.
+    pub fn begin_memory_request(
+        &mut self,
+        context: &MemoryRunContext,
+        identity: &crate::memory_strategy::InstantIdMemoryIdentity,
+        req: &InstantIdRequest,
+        route: crate::memory_strategy::InstantIdRoute,
+    ) -> Result<Box<dyn MemoryRequestScope>> {
+        let loaded_identity = self.memory_identity.as_ref().ok_or_else(|| {
+            Error::Msg("instantid: model was not loaded with a memory context".into())
+        })?;
+        let tier = self
+            .memory_tier
+            .ok_or_else(|| Error::Msg("instantid: loaded model lost its numeric tier".into()))?;
+        let contract = self
+            .memory_contract
+            .clone()
+            .ok_or_else(|| Error::Msg("instantid: loaded model lost its memory contract".into()))?;
+        if loaded_identity != identity || identity.route != route {
+            return Err(Error::Msg(
+                "instantid: request crossed its admitted route/composition context".into(),
+            ));
+        }
+        if (req.width, req.height, req.use_pid)
+            != (
+                context.geometry.width,
+                context.geometry.height,
+                context.use_pid,
+            )
+        {
+            return Err(Error::Msg(
+                "instantid: request geometry/PiD route changed after admission".into(),
+            ));
+        }
+        crate::memory_strategy::validate_context(&contract, tier, identity, context)?;
+        let staged = context.selection.strategy == MemoryStrategy::StagedResidency;
+        if staged != self.staged_residency {
+            if staged {
+                self.staged_residency = true;
+                self.release_all_staged_components()?;
+            } else {
+                let load = (|| {
+                    self.load_conditioning_components()?;
+                    self.load_denoise_components()?;
+                    self.load_decode_components(req.use_pid)
+                })();
+                if let Err(error) = load {
+                    self.release_all_staged_components()?;
+                    return Err(error);
+                }
+                self.staged_residency = false;
+            }
+        }
+        let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+            crate::memory_strategy::PROVIDER_ID,
+            context.geometry,
+            contract.generation_memory(&context.selection),
+            req.use_pid,
+            0,
+            |_pid, _edge, _overlap| {
+                Err(mlx_gen::gen_core::Error::Unsupported(
+                    "instantid: bounded decode is Missing".into(),
+                ))
+            },
+        )?;
+        let shared = Rc::new(SharedMemoryScope {
+            inner: RefCell::new(Box::new(mlx_gen::request_scope::MlxRequestScopeCore::new(
+                config,
+            ))),
+            active: Cell::new(true),
+            phase: Cell::new(None),
+        });
+        *self.active_memory_scope.borrow_mut() = Some(Rc::clone(&shared));
+        Ok(Box::new(MemoryScopeHandle { shared }))
     }
 
     /// Attach the OpenPose ControlNet for pose mode (sc-3117) — a stock diffusers SDXL ControlNet
@@ -263,14 +705,38 @@ impl InstantId {
     /// IdentityNet (no conversion). Required by [`generate_pose`](Self::generate_pose). Call after
     /// [`load`](Self::load); call before [`quantize`](Self::quantize) so it quantizes with the stack.
     pub fn with_openpose(mut self, openpose: &WeightsSource) -> Result<Self> {
-        self.openpose = Some(load_controlnet(openpose, DTYPE)?);
+        self.reload.openpose = Some(openpose.clone());
+        if !self.staged_residency {
+            self.openpose = Some(load_controlnet(openpose, DTYPE)?);
+        }
         Ok(self)
     }
 
     /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so [`Self::generate`] can
     /// take a raw reference image. Weights come from `tools/convert_scrfd.py` / `convert_glintr100.py`.
     pub fn with_face(mut self, scrfd: &Weights, arcface: &Weights) -> Result<Self> {
+        if self.staged_residency {
+            return Err(Error::Msg(
+                "instantid: staged residency requires with_face_paths so the face stack is reloadable"
+                    .into(),
+            ));
+        }
         self.face = Some(FaceAnalysis::load(scrfd, arcface)?);
+        Ok(self)
+    }
+
+    /// Attach reloadable face-analysis sources. This is the required seam for staged residency.
+    pub fn with_face_paths(
+        mut self,
+        scrfd: &std::path::Path,
+        arcface: &std::path::Path,
+    ) -> Result<Self> {
+        self.reload.face_paths = Some((scrfd.to_path_buf(), arcface.to_path_buf()));
+        if !self.staged_residency {
+            let scrfd_weights = Weights::from_file(scrfd)?;
+            let arcface_weights = Weights::from_file(arcface)?;
+            self.face = Some(FaceAnalysis::load(&scrfd_weights, &arcface_weights)?);
+        }
         Ok(self)
     }
 
@@ -282,7 +748,10 @@ impl InstantId {
     /// `use_pid = true` decodes through the student (4× SR → 2K/4K) instead of the native VAE; without
     /// it, `use_pid` errors loudly (the engine never silently falls back). Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
-        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE)?);
+        self.reload.pid = Some(pid.clone());
+        if !self.staged_residency {
+            self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE)?);
+        }
         Ok(self)
     }
 
@@ -330,10 +799,26 @@ impl InstantId {
         // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check on the base snapshot
         // (the U-Net `unet/config.json` is the representative heavy component).
         mlx_gen::quant::needs_load_time_quant(&self.sdxl_root, "unet", bits, "instantid")?;
-        self.unet.quantize(bits)?;
-        self.te1.quantize(bits)?;
-        self.te2.quantize(bits)?;
-        self.identitynet.quantize(bits)?;
+        self.reload.quant_bits = Some(bits);
+        if self.staged_residency {
+            return Ok(self);
+        }
+        self.unet
+            .as_mut()
+            .ok_or_else(|| Error::Msg("instantid: UNet is not resident".into()))?
+            .quantize(bits)?;
+        self.te1
+            .as_mut()
+            .ok_or_else(|| Error::Msg("instantid: CLIP-L is not resident".into()))?
+            .quantize(bits)?;
+        self.te2
+            .as_mut()
+            .ok_or_else(|| Error::Msg("instantid: CLIP-bigG is not resident".into()))?
+            .quantize(bits)?;
+        self.identitynet
+            .as_mut()
+            .ok_or_else(|| Error::Msg("instantid: IdentityNet is not resident".into()))?
+            .quantize(bits)?;
         if let Some(op) = &mut self.openpose {
             op.quantize(bits)?;
         }
@@ -342,14 +827,17 @@ impl InstantId {
 
     /// Detect the largest face in `img` (RGB `u8` HWC, `h×w`) and return it (bbox + 5 kps + 512-d
     /// embedding). Requires [`with_face`](Self::with_face).
-    pub fn largest_face(&self, img: &[u8], h: usize, w: usize) -> Result<Face> {
-        largest_face_from(self.face.as_ref(), img, h, w)
+    pub fn largest_face(&mut self, img: &[u8], h: usize, w: usize) -> Result<Face> {
+        self.prepare_conditioning_phase()?;
+        let result = largest_face_from(self.face.as_ref(), img, h, w);
+        self.release_conditioning_components();
+        result
     }
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
     /// the largest face, then generate. Requires [`with_face`](Self::with_face).
     pub fn generate(
-        &self,
+        &mut self,
         req: &InstantIdRequest,
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
@@ -367,7 +855,7 @@ impl InstantId {
     /// kps-distortion rule). `req.height` is ignored (forced to the side). Requires
     /// [`with_face`](Self::with_face); errors on an unknown `view_angle`.
     pub fn generate_angle(
-        &self,
+        &mut self,
         req: &InstantIdRequest,
         reference: &Image,
         view_angle: &str,
@@ -400,7 +888,7 @@ impl InstantId {
     /// pose/framing. The canvas is **square** (`req.width` is the side; `req.height` is forced to the
     /// side, per the sc-2009 kps-distortion rule). Requires [`with_face`](Self::with_face).
     pub fn generate_with_kps(
-        &self,
+        &mut self,
         req: &InstantIdRequest,
         reference: &Image,
         kps_norm: &[(f32, f32)],
@@ -454,7 +942,19 @@ impl InstantId {
     /// coords) — the face-stack-independent path (also the engine seam: `ip_adapter_scale = 0` +
     /// `controlnet_scale = 0` reduces to plain SDXL txt2img).
     pub fn generate_with(
-        &self,
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        kps: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let result = self.generate_with_loaded(req, embedding, kps, on_progress);
+        self.release_all_staged_components()?;
+        result
+    }
+
+    fn generate_with_loaded(
+        &mut self,
         req: &InstantIdRequest,
         embedding: &[f32],
         kps: &[(f32, f32)],
@@ -472,48 +972,62 @@ impl InstantId {
             )));
         }
         validate_kps(kps)?;
+        self.prepare_conditioning_phase()?;
         let cfg_on = req.guidance > 1.0;
 
         // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
         mlx_rs::random::seed(req.seed)?;
-        let tokens = self
-            .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
-        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
+        // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
+        // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
+        // which is the pre-sc-20528 encoding unchanged.
+        let tokens = Self::require(&self.tokenizer, "tokenizer")?
+            .tokenize_windows(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning_windows(
+            Self::require(&self.te1, "CLIP-L")?,
+            Self::require(&self.te2, "CLIP-bigG")?,
+            &tokens,
+        )?;
         let time_ids = text_time_ids(pooled.shape()[0]);
 
         // Face tokens via the Resampler (CFG positive-first; uncond = Resampler(zeros)).
         let face_tokens = self.face_tokens(embedding, cfg_on)?; // [B, 16, 2048]
 
+        self.finish_conditioning_phase(&[&conditioning, &pooled, &time_ids, &face_tokens])?;
+
         // kps control image (sc-3111) → IdentityNet ControlContext.
         let kps_image = kps::draw_kps(req.width, req.height, kps)?;
-        let control_ctx = self.control_ctx(
-            &self.identitynet,
-            &kps_image,
-            req.width,
-            req.height,
-            req.controlnet_scale,
-            cfg_on,
-        )?;
-
-        let latents = self.run_identity_denoise(
-            req,
-            req.width,
-            req.height,
-            std::slice::from_ref(&control_ctx),
-            &conditioning,
-            &pooled,
-            &time_ids,
-            &face_tokens,
-            req.ip_adapter_scale,
-            on_progress,
-        )?;
+        let latents = {
+            let control_ctx = self.control_ctx(
+                Self::require(&self.identitynet, "IdentityNet")?,
+                &kps_image,
+                req.width,
+                req.height,
+                req.controlnet_scale,
+                cfg_on,
+            )?;
+            self.run_identity_denoise(
+                req,
+                req.width,
+                req.height,
+                std::slice::from_ref(&control_ctx),
+                &conditioning,
+                &pooled,
+                &time_ids,
+                &face_tokens,
+                req.ip_adapter_scale,
+                on_progress,
+            )?
+        };
+        self.finish_denoise_phase(&latents, req.use_pid)?;
         on_progress(Progress::Decoding);
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8370).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        let image = decode_image(Self::require(&self.vae, "VAE")?, &latents, pid_ref)?;
+        self.release_decode_components()?;
+        Ok(image)
     }
 
     /// Run the InstantID dual-conditioning denoise — the bespoke ancestral default (byte-exact N1) or,
@@ -567,7 +1081,7 @@ impl InstantId {
             let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
             let init = multiply(&noise, scalar(sigmas[0]))?;
             denoise_curated(
-                &self.unet,
+                Self::require(&self.unet, "UNet")?,
                 Some(sampler_name),
                 &ms,
                 &sigmas,
@@ -588,7 +1102,7 @@ impl InstantId {
             // seeded prior, dual conditioning via `denoise_ip_multi_control`.
             let prior = seeded_prior(&self.sampler, req.seed, width, height)?;
             let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
-            let d = Denoiser::new(&self.unet, &ancestral);
+            let d = Denoiser::new(Self::require(&self.unet, "UNet")?, &ancestral);
             denoise_ip_multi_control(
                 &d,
                 prior,
@@ -619,7 +1133,8 @@ impl InstantId {
         } else {
             embed
         };
-        self.resampler.forward(&resampler_input) // [B, 16, 2048]
+        Self::require(&self.resampler, "face resampler")?.forward(&resampler_input)
+        // [B, 16, 2048]
     }
 
     /// Build a [`ControlContext`] for a control image: rasterized image → `[0,1]` NHWC, cast to the
@@ -657,7 +1172,7 @@ impl InstantId {
     /// square-canonical, the kps-distortion rule). Requires [`with_face`](Self::with_face) +
     /// [`with_openpose`](Self::with_openpose). The face-restoration pass (sc-3380) is a separate step.
     pub fn generate_pose(
-        &self,
+        &mut self,
         req: &InstantIdRequest,
         reference: &Image,
         keypoints: &[BodyPoint],
@@ -724,7 +1239,21 @@ impl InstantId {
     /// `instantid_adapter.py:424-426`. `req.width` is the square side; requires
     /// [`with_openpose`](Self::with_openpose).
     pub fn generate_pose_with(
-        &self,
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        face_kps: Option<&[(f32, f32)]>,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let result =
+            self.generate_pose_with_loaded(req, embedding, face_kps, keypoints, on_progress);
+        self.release_all_staged_components()?;
+        result
+    }
+
+    fn generate_pose_with_loaded(
+        &mut self,
         req: &InstantIdRequest,
         embedding: &[f32],
         face_kps: Option<&[(f32, f32)]>,
@@ -745,20 +1274,31 @@ impl InstantId {
         if let Some(kps) = face_kps {
             validate_kps(kps)?;
         }
-        let openpose = self.openpose.as_ref().ok_or_else(|| {
-            Error::Msg("instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into())
-        })?;
+        self.prepare_conditioning_phase()?;
         let side = req.width;
         let cfg_on = req.guidance > 1.0;
 
         // Seed up front so the first RNG draw is the prior (conditioning draws no RNG).
         mlx_rs::random::seed(req.seed)?;
-        let tokens = self
-            .tokenizer
-            .tokenize_batch(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
-        let (conditioning, pooled) = encode_conditioning(&self.te1, &self.te2, &tokens)?;
+        // sc-20528: a prompt past CLIP's 77-token context is split into windows (one request-wide
+        // count, both CFG rows aligned), not truncated — the same path `mlx_gen_sdxl::Sdxl::generate`
+        // and the candle `SdxlConditioner` take. A request whose rows both fit is a single window,
+        // which is the pre-sc-20528 encoding unchanged.
+        let tokens = Self::require(&self.tokenizer, "tokenizer")?
+            .tokenize_windows(&req.prompt, if cfg_on { Some(&req.negative) } else { None })?;
+        let (conditioning, pooled) = encode_conditioning_windows(
+            Self::require(&self.te1, "CLIP-L")?,
+            Self::require(&self.te2, "CLIP-bigG")?,
+            &tokens,
+        )?;
         let time_ids = text_time_ids(pooled.shape()[0]);
         let face_tokens = self.face_tokens(embedding, cfg_on)?;
+
+        self.finish_conditioning_phase(&[&conditioning, &pooled, &time_ids, &face_tokens])?;
+
+        let openpose = self.openpose.as_ref().ok_or_else(|| {
+            Error::Msg("instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into())
+        })?;
 
         // OpenPose skeleton control image (sc-3379), always at the requested pose scale.
         let skeleton = openpose::draw_bodypose(side, side, keypoints, STICKWIDTH);
@@ -784,29 +1324,39 @@ impl InstantId {
             ),
         };
         // MultiControlNet branch order matches the reference: [IdentityNet(kps), OpenPose(skeleton)].
-        let id_ctx =
-            self.control_ctx(&self.identitynet, &face_image, side, side, id_scale, cfg_on)?;
-        let op_ctx = self.control_ctx(openpose, &skeleton, side, side, op_scale, cfg_on)?;
-        let controls = [id_ctx, op_ctx];
-
-        let latents = self.run_identity_denoise(
-            req,
-            side,
-            side,
-            &controls,
-            &conditioning,
-            &pooled,
-            &time_ids,
-            &face_tokens,
-            ip_scale,
-            on_progress,
-        )?;
+        let latents = {
+            let id_ctx = self.control_ctx(
+                Self::require(&self.identitynet, "IdentityNet")?,
+                &face_image,
+                side,
+                side,
+                id_scale,
+                cfg_on,
+            )?;
+            let op_ctx = self.control_ctx(openpose, &skeleton, side, side, op_scale, cfg_on)?;
+            let controls = [id_ctx, op_ctx];
+            self.run_identity_denoise(
+                req,
+                side,
+                side,
+                &controls,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                &face_tokens,
+                ip_scale,
+                on_progress,
+            )?
+        };
+        self.finish_denoise_phase(&latents, req.use_pid)?;
         on_progress(Progress::Decoding);
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8370).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        decode_image(&self.vae, &latents, pid_ref)
+        let image = decode_image(Self::require(&self.vae, "VAE")?, &latents, pid_ref)?;
+        self.release_decode_components()?;
+        Ok(image)
     }
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
@@ -821,7 +1371,7 @@ impl InstantId {
     /// other request fields (negative, steps, guidance, scales, seed) drive the crop re-render.
     /// Requires [`with_face`](Self::with_face).
     pub fn restore_face(
-        &self,
+        &mut self,
         req: &InstantIdRequest,
         base: &Image,
         embedding: &[f32],
@@ -833,7 +1383,10 @@ impl InstantId {
         }
         // Only the box/landmarks are used here (the identity embedding is a separate parameter), so
         // detect without embedding any face (F-090).
-        let dets = restore_face_detections(self.face.as_ref(), base)?;
+        self.prepare_conditioning_phase()?;
+        let dets = restore_face_detections(self.face.as_ref(), base);
+        self.release_conditioning_components();
+        let dets = dets?;
         if dets.is_empty() {
             return Ok(base.clone()); // no face to restore — leave the base untouched
         }
@@ -943,6 +1496,169 @@ fn restored_image_dims(image: &Image) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingScope(Rc<RefCell<Vec<String>>>);
+
+    impl MemoryRequestScope for RecordingScope {
+        fn configure_request(
+            &mut self,
+            _request: &mut GenerationRequest,
+        ) -> mlx_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn enter_phase(&mut self, phase: MemoryPhase) -> mlx_gen::gen_core::Result<()> {
+            self.0.borrow_mut().push(format!("enter:{phase:?}"));
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: MemoryPhase) -> mlx_gen::gen_core::Result<()> {
+            self.0.borrow_mut().push(format!("leave:{phase:?}"));
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _tile_edge: u32,
+            _overlap: u32,
+            _geometry: MemoryGeometry,
+        ) -> mlx_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn configure_attention(&mut self, _chunk_size: u32) -> mlx_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _first_block: u32,
+            _block_count: u32,
+        ) -> mlx_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self, _outcome: MemoryRunOutcome) -> mlx_gen::gen_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn provider_scope_tracks_conditioning_denoise_decode_and_terminal_cleanup() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let shared = Rc::new(SharedMemoryScope {
+            inner: RefCell::new(Box::new(RecordingScope(Rc::clone(&events)))),
+            active: Cell::new(true),
+            phase: Cell::new(None),
+        });
+        let active = RefCell::new(Some(shared));
+        for phase in [
+            Some(MemoryPhase::Conditioning),
+            Some(MemoryPhase::Denoise),
+            Some(MemoryPhase::Decode),
+            None,
+        ] {
+            transition_shared_memory_scope(&active, phase).unwrap();
+        }
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "enter:Conditioning",
+                "leave:Conditioning",
+                "enter:Denoise",
+                "leave:Denoise",
+                "enter:Decode",
+                "leave:Decode",
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_component_primitive_drops_reloads_and_cleans_up_after_error() {
+        #[derive(Clone)]
+        struct DropProbe(Rc<Cell<usize>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let loads = Cell::new(0);
+        let mut slot = Some(DropProbe(Rc::clone(&drops)));
+        drop_resident_component(&mut slot);
+        assert!(slot.is_none());
+        assert_eq!(drops.get(), 1, "conditioning owner must physically drop");
+
+        reload_resident_component(&mut slot, || {
+            loads.set(loads.get() + 1);
+            Ok::<_, &'static str>(DropProbe(Rc::clone(&drops)))
+        })
+        .unwrap();
+        assert!(slot.is_some());
+        assert_eq!(loads.get(), 1, "the next request reloads the component");
+        drop_resident_component(&mut slot);
+        assert_eq!(drops.get(), 2, "terminal cleanup drops the reloaded owner");
+
+        let error = reload_resident_component(&mut slot, || Err::<DropProbe, _>("load failed"));
+        assert_eq!(error, Err("load failed"));
+        assert!(
+            slot.is_none(),
+            "a failed reload cannot leave a partial resident"
+        );
+    }
+
+    #[test]
+    fn staged_to_resident_switch_is_transactional_when_reload_fails() {
+        use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
+
+        let tier = crate::memory_strategy::dense_numeric_tier();
+        let identity = crate::memory_strategy::InstantIdMemoryIdentity {
+            route: crate::memory_strategy::InstantIdRoute::Identity,
+            adapter_count: 0,
+            use_pid: false,
+            face_restore: false,
+            artifact_fingerprint: "fixture".into(),
+        };
+        let contract = crate::memory_strategy::provider_contract(tier);
+        let make_context = |strategy| {
+            let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+                &contract,
+                strategy,
+                tier,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("character_image".into()),
+                    reference_count: 1,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: Some(identity.overlay_key()),
+                },
+            )
+            .unwrap();
+            context.evidence_revision = crate::memory_strategy::REQUEST_EVIDENCE_REVISION.into();
+            context
+        };
+        let missing = PathBuf::from("/definitely-missing/instantid");
+        let paths = InstantIdPaths {
+            sdxl_base: missing.clone(),
+            identitynet: WeightsSource::Dir(missing.clone()),
+            ip_adapter: missing,
+            adapters: Vec::new(),
+        };
+        let mut model = InstantId::load_with_memory_context(
+            &paths,
+            tier,
+            identity.clone(),
+            make_context(MemoryStrategy::StagedResidency),
+        )
+        .expect("staged construction must not touch weights");
+        assert!(model.staged_residency);
+        assert!(model.tokenizer.is_none() && model.unet.is_none() && model.vae.is_none());
+
+        let error = model.begin_memory_request(
+            &make_context(MemoryStrategy::Resident),
+            &identity,
+            &InstantIdRequest::default(),
+            crate::memory_strategy::InstantIdRoute::Identity,
+        );
+        assert!(error.is_err(), "resident switch must attempt a real reload");
+        assert!(model.staged_residency, "failed switch rolls back strategy");
+        assert!(model.tokenizer.is_none() && model.unet.is_none() && model.vae.is_none());
+    }
 
     #[test]
     fn restore_resize_uses_generated_image_dimensions() {

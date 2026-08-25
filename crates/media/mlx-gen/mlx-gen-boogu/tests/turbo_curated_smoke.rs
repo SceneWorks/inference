@@ -7,7 +7,7 @@
 //!
 //! `#[ignore]`d — needs the real Boogu Turbo snapshot (`mllm/ transformer/ vae/`), env `BOOGU_TURBO_DIR`:
 //!   BOOGU_TURBO_DIR=/path/to/models--SceneWorks--boogu-image-mlx/snapshots/<rev>/turbo \
-//!     cargo test -p mlx-gen-boogu --release --test turbo_curated_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-gen-boogu --release --test integration turbo_curated_smoke:: -- --ignored --nocapture
 
 use std::path::PathBuf;
 

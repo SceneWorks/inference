@@ -2,7 +2,7 @@
 //!
 //! `#[ignore]`d — needs the licensed `circlestone-labs/Anima` snapshot in the HF cache (its
 //! `split_files/` tree) and Metal. Run:
-//!   cargo test -p mlx-gen-anima --release --test sequential_residency_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-anima --release --test integration sequential_residency_real_weights:: -- --ignored --nocapture
 //!
 //! Same two claims as the SD3 / SANA / Lens A/Bs: (1) `Sequential` peaks LOWER than `Resident` because
 //! the Qwen3-0.6B text encoder is dropped (+ `clear_cache()`) before the DiT + bundled conditioner +

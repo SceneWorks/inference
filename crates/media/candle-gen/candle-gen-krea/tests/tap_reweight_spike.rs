@@ -13,7 +13,7 @@
 //! `#[ignore]` — needs the real Turbo snapshot (bf16 ≈ 34 GB resident). Run on the Windows/CUDA GPU:
 //! ```sh
 //! KREA_TURBO_DIR=E:\huggingface\hub\models--SceneWorks--krea-2-turbo-mlx\snapshots\<rev>\bf16 \
-//!   cargo test -p candle-gen-krea --release --features cuda --test tap_reweight_spike -- --ignored --nocapture
+//!   cargo test -p candle-gen-krea --release --features cuda --test integration tap_reweight_spike:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

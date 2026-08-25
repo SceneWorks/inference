@@ -13,7 +13,7 @@
 //!   KOLORS_CONTROLNET=<Kolors-ControlNet-Pose snapshot dir> \
 //!   KOLORS_IP_ADAPTER=<Kolors-IP-Adapter-Plus snapshot dir> \
 //!   [KOLORS_POSE=<pose/control image>] [KOLORS_REF=<reference/identity image>] \
-//!   cargo test -p mlx-gen-kolors --release --test conditioned_curated_smoke -- --ignored --nocapture
+//!   cargo test -p mlx-gen-kolors --release --test integration conditioned_curated_smoke:: -- --ignored --nocapture
 //!
 //! Gate (directional): for each conditioned mode and each curated solver —
 //!   (1) the render is **coherent** (not collapsed to noise/flat — the destabilization failure mode), and
