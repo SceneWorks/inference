@@ -86,10 +86,11 @@ pub use comfy_quant::{
     decode_int8_per_row, decode_mxfp8, decode_nvfp4, descriptor_from_json, e2m1_to_f32,
     e8m0_to_f32, fp8_e4m3fn_to_f32, fp8_e5m2_to_f32, mxfp8_padded_shape, mxfp8_scale_shape,
     mxfp8_swizzled_scale_index, nvfp4_padded_shape, nvfp4_scale_shape, nvfp4_swizzled_scale_index,
-    parse_comfy_quant_descriptor, parse_quantization_metadata, validate_mxfp8_geometry,
-    validate_nvfp4_geometry, ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat,
-    Mxfp8GeometryError, Nvfp4GeometryError, QuantizationMetadataError, E2M1_LUT, MXFP8_BLOCK,
-    NVFP4_BLOCK, NVFP4_PAD,
+    parse_comfy_quant_descriptor, parse_quantization_metadata, partial_descriptor_from_json,
+    validate_mxfp8_geometry, validate_nvfp4_geometry, ComfyQuantDescriptor,
+    ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError, Nvfp4GeometryError,
+    PartialComfyQuantDescriptor, QuantizationMetadataError, E2M1_LUT, MXFP8_BLOCK, NVFP4_BLOCK,
+    NVFP4_PAD,
 };
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,

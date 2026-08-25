@@ -1312,6 +1312,102 @@ mod tests {
         );
     }
 
+    /// Real-weight regression for the sc-20651 campaign refusal: a published KreaMania int8
+    /// artifact that declares every projection through **both** routes at once, with the file-level
+    /// entry a strict SUBSET of the authoritative per-tensor blob.
+    ///
+    /// `kreamania_variant1.safetensors` (958 tensors: 264 `I8` weights, 264 F32 `.weight_scale`,
+    /// 264 `.comfy_quant`, plus 159 BF16 + 7 F32 dense rows) carries a
+    /// `__metadata__._quantization_metadata` table whose 264 entries are all a bare
+    /// `{"format": "int8_tensorwise"}`, while all 264 blobs say
+    /// `{"format": "int8_tensorwise", "per_row": true}`. Completing the file-level entry first made
+    /// the whole checkpoint refuse with `int8_tensorwise must declare per_row: true` — with the
+    /// authority that says `per_row: true` sitting unread next to the weight.
+    ///
+    /// `KREA_NATIVE_DIT_INT8_BOTH_FORMS` points at the file. Header plus a lazy open: no GPU render.
+    ///
+    /// Mutation: restore blind file-level-first parsing (complete the table's entries before the
+    /// blobs are read) in `compile_logical_weight_plan_with_metadata` and this test refuses again.
+    #[test]
+    #[ignore = "needs real weights: set KREA_NATIVE_DIT_INT8_BOTH_FORMS to a KreaMania int8 checkpoint carrying BOTH declaration routes"]
+    fn kreamania_int8_plans_when_both_declaration_routes_describe_every_layer() {
+        let Some(dit) = std::env::var_os("KREA_NATIVE_DIT_INT8_BOTH_FORMS") else {
+            panic!(
+                "set KREA_NATIVE_DIT_INT8_BOTH_FORMS to a KreaMania int8 checkpoint carrying \
+                    both `.comfy_quant` tensors and `__metadata__._quantization_metadata`"
+            );
+        };
+        let dit = std::path::PathBuf::from(dit);
+        assert!(dit.is_file(), "{} is not a file", dit.display());
+
+        // The fixture must actually exercise BOTH routes, or this test proves nothing: a
+        // blob-only file would pass it unchanged even with the defect restored.
+        let metadata = mlx_gen::gen_core::safetensors_path_quantization_metadata(&dit)
+            .expect("header read")
+            .expect("this fixture must carry `__metadata__._quantization_metadata`");
+        let table = mlx_gen::gen_core::parse_quantization_metadata(&metadata)
+            .expect("the file-level table parses");
+        assert_eq!(table.len(), 264, "264 file-level layer declarations");
+        assert!(
+            table.values().all(|entry| entry.per_row.is_none()
+                && entry.full_precision_matrix_mult.is_none()
+                && entry.format
+                    == mlx_gen::gen_core::ComfyQuantFormat::Int8TensorwisePerRow),
+            "every file-level entry is the bare `{{\"format\": \"int8_tensorwise\"}}` real ComfyUI \
+             writes — a strict subset of its blob"
+        );
+        let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|header| header.name.ends_with(".comfy_quant"))
+                .count(),
+            264,
+            "and every one of those layers ALSO carries its authoritative per-tensor blob"
+        );
+
+        // The subset entry corroborates the blob instead of refusing it.
+        let plan = mlx_gen::logical_weights::plan_logical_weights(
+            &dit,
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+        )
+        .expect("the authoritative blob decides the layer; the subset entry must not refuse");
+        assert_eq!(
+            plan.codec_ids(),
+            ["dense-bf16-v1", "dense-f32-v1", "int8-per-row-v1"]
+        );
+        let int8_rows = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id == "int8-per-row-v1")
+            .count();
+        assert_eq!(int8_rows, 264, "all 264 int8 projections plan per-row");
+        assert_eq!(
+            plan.companions.len(),
+            264 * 2,
+            "each projection still consumes its weight_scale and comfy_quant companions"
+        );
+        let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
+        assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+
+        let (lazy, receipt) =
+            normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
+                .expect("deferred read through the seam");
+        assert!(lazy.get("transformer_blocks.0.attn.to_q.weight").is_some());
+        assert_eq!(
+            receipt.materialization,
+            mlx_gen::gen_core::LogicalReadMaterialization::Deferred
+        );
+        eprintln!(
+            "RESULT kreamania-int8-both-forms tensors={} int8_rows={int8_rows} \
+             file_level_entries={} source_bytes={} resident_bytes={}",
+            plan.tensor_count(),
+            table.len(),
+            plan.source_bytes,
+            plan.resident_bytes()
+        );
+    }
+
     /// Real-weight check of the **published KreaMania V1/V2 fp8** artifacts (sc-20385 AC3): these
     /// are descriptor-gated **scaled** fp8, not the plain cast — 942 tensors carrying 256
     /// `F8_E4M3` weights, 256 F32 `.weight_scale` companions with real per-tensor values, and 256
@@ -1375,6 +1471,65 @@ mod tests {
         let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(&dit).unwrap();
         let declared: u64 = headers.iter().map(|header| header.data_bytes).sum();
         assert_eq!(plan.source_bytes, declared, "every byte is accounted for");
+
+        // ---- the whole dense-fallback residency sum, term by term (sc-20651) -------------------
+        //
+        // The sc-20651 campaign's FP8 admission refusal was diagnosed as this model omitting the 96
+        // `full_precision_matrix_mult: true` layers. It does not omit them, and this arithmetic is
+        // the disproof: every fp8 layer — fpmm or not — is decoded to bf16 by
+        // `mlx_gen::logical_weights::decode`'s `ScalarFp8` arm and priced at 2 bytes/element here,
+        // and the four terms below sum to the plan's own total with nothing left over.
+        //
+        // On `kreamania_variant1_fp8` the terms are:
+        //   96 fpmm fp8 layers      5_055_709_184 stored → ×2 → 10_111_418_368
+        //  160 plain fp8 layers     7_442_792_448 stored → ×2 → 14_885_584_896
+        //  174 dense bf16 rows                                     643_142_808  (byte-preserving)
+        //  256 weight_scale + 256 comfy_quant companions                     0  (consumed)
+        //                                                     = 25_640_146_072
+        //
+        // Mutation: drop the fpmm term (price those 96 layers at their stored fp8 bytes instead of
+        // the bf16 the decode materializes) and the total falls 5_055_709_184 short — this
+        // assertion reds, as does `receipt.resident_bytes() == plan.resident_bytes()`.
+        let group_source = |fpmm_wanted: bool| -> u64 {
+            fp8.iter()
+                .filter(|tensor| tensor.codec.full_precision_matrix_mult() == fpmm_wanted)
+                .map(|tensor| tensor.source_bytes)
+                .sum()
+        };
+        let (fpmm_source, plain_fp8_source) = (group_source(true), group_source(false));
+        let dense_source: u64 = plan
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.codec_id != "fp8-e4m3-scalar-v1")
+            .map(|tensor| tensor.source_bytes)
+            .sum();
+        let companion_resident: u64 = plan
+            .companions
+            .iter()
+            .map(|companion| companion.resident_bytes)
+            .sum();
+        assert_eq!(
+            plan.resident_bytes(),
+            2 * fpmm_source + 2 * plain_fp8_source + dense_source + companion_resident,
+            "the fpmm layers are priced at the bf16 the dense fallback materializes, exactly like \
+             the plain fp8 ones — nothing about the flag removes the widening"
+        );
+        assert_eq!(
+            companion_resident, 0,
+            "scale companions are consumed, not retained"
+        );
+        // Per-layer, not just in aggregate: every fpmm layer's own residency is 2× its stored bytes.
+        assert!(
+            fp8.iter()
+                .filter(|tensor| tensor.codec.full_precision_matrix_mult())
+                .all(|tensor| tensor.residency.resident_bytes == 2 * tensor.source_bytes),
+            "each of the 96 fpmm layers doubles individually"
+        );
+        eprintln!(
+            "RESULT kreamania-scaled-fp8-residency fpmm_source={fpmm_source} \
+             plain_fp8_source={plain_fp8_source} dense_source={dense_source} total={}",
+            plan.resident_bytes()
+        );
 
         let (lazy, receipt) =
             normalized_native_weights_lazy_with_receipt(&dit, DeclaredLogicalShapes::NotInScope)
