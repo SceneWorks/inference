@@ -14,8 +14,29 @@
 #[path = "conformance.rs"]
 mod conformance;
 
+#[path = "connector_parity.rs"]
+mod connector_parity;
+
+#[path = "duration_head_golden.rs"]
+mod duration_head_golden;
+
+#[path = "ltx_2_5_vae_conformance.rs"]
+mod ltx_2_5_vae_conformance;
+
+#[path = "ltx_2_5_vae_real_weights.rs"]
+mod ltx_2_5_vae_real_weights;
+
 #[path = "packed_tier_validate.rs"]
 mod packed_tier_validate;
+
+#[path = "sc18758_ff_bias_keyframes_conformance.rs"]
+mod sc18758_ff_bias_keyframes_conformance;
+
+#[path = "split_checkpoint.rs"]
+mod split_checkpoint;
+
+#[path = "te_parity.rs"]
+mod te_parity;
 
 #[path = "trainer_conformance.rs"]
 mod trainer_conformance;

@@ -47,6 +47,9 @@ mod descriptor_conformance;
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
+#[path = "duration_head_golden.rs"]
+mod duration_head_golden;
+
 #[path = "e2e_parity.rs"]
 mod e2e_parity;
 
@@ -56,6 +59,9 @@ mod enhance_parity;
 #[path = "gemma_parity.rs"]
 mod gemma_parity;
 
+#[path = "gemma_tokenizer.rs"]
+mod gemma_tokenizer;
+
 #[path = "i2v_parity.rs"]
 mod i2v_parity;
 
@@ -64,6 +70,15 @@ mod keyframe_cond_parity;
 
 #[path = "lora_real_weights.rs"]
 mod lora_real_weights;
+
+#[path = "ltx_2_5_diffvae_parity.rs"]
+mod ltx_2_5_diffvae_parity;
+
+#[path = "ltx_2_5_vae_conformance.rs"]
+mod ltx_2_5_vae_conformance;
+
+#[path = "ltx_2_5_vae_real_weights.rs"]
+mod ltx_2_5_vae_real_weights;
 
 #[path = "perf.rs"]
 mod perf;
@@ -80,8 +95,14 @@ mod replace_mask_parity;
 #[path = "s0_parity.rs"]
 mod s0_parity;
 
+#[path = "sc18758_ff_bias_keyframes_conformance.rs"]
+mod sc18758_ff_bias_keyframes_conformance;
+
 #[path = "sequential_residency_real_weights.rs"]
 mod sequential_residency_real_weights;
+
+#[path = "split_checkpoint.rs"]
+mod split_checkpoint;
 
 #[path = "te_parity.rs"]
 mod te_parity;
