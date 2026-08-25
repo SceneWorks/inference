@@ -376,9 +376,11 @@ pub enum QuantizationMetadataError {
     NotAnObject,
     /// `format_version` present but not the `"1.0"` this workspace models. An absent key is
     /// accepted as v1 (sc-21482): the real pinned `Comfy-Org/Krea-2` NVFP4 export writes no
-    /// version key at all.
+    /// version key at all — so "absent" never reaches this variant, and `found` is always a value
+    /// that WAS on disk, already rendered so a JSON string is distinguishable from a JSON number
+    /// that stringifies the same way (`"1.0"` vs `non-string 1.0`).
     FormatVersion {
-        found: Option<String>,
+        found: String,
     },
     /// `layers` absent or not a JSON object.
     Layers,
@@ -405,7 +407,7 @@ impl fmt::Display for QuantizationMetadataError {
             ),
             Self::FormatVersion { found } => write!(
                 f,
-                "`_quantization_metadata.format_version` must be the string \"1.0\", got {found:?}"
+                "`_quantization_metadata.format_version` must be the string \"1.0\", got {found}"
             ),
             Self::Layers => write!(
                 f,
@@ -453,13 +455,14 @@ pub fn parse_quantization_metadata(
     // format's ground truth, not a producer defect.
     if let Some(version) = object.get("format_version") {
         if version.as_str() != Some("1.0") {
+            // A JSON *number* `1.0` stringifies to the same characters as the string `"1.0"`, so
+            // rendering it bare would produce the self-contradictory `must be the string "1.0",
+            // got "1.0"`. Quote the string case and label the non-string case as what it is.
             return Err(QuantizationMetadataError::FormatVersion {
-                found: Some(
-                    version
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| version.to_string()),
-                ),
+                found: match version.as_str() {
+                    Some(text) => format!("{text:?}"),
+                    None => format!("non-string {version}"),
+                },
             });
         }
     }
@@ -978,11 +981,35 @@ pub fn validate_nvfp4_geometry(
 /// dense decode ([`decode_nvfp4`] calls it) and a backend's packed-native repack must refuse the
 /// same corrupted scale surface the same way, before the bad multiplier reaches any weight or any
 /// GEMM.
+///
+/// # Grid self-checks (sc-21482 review)
+///
+/// The function is `pub` and callable standalone, so it validates the grid it was handed rather
+/// than trusting the caller: a `stored` whose axes are not 16-aligned would make `stored[1] /
+/// `[`NVFP4_BLOCK`] truncate and silently skip the trailing block, and a `logical` wider or taller
+/// than `stored` would silently narrow the swept region. Both refuse as
+/// [`Nvfp4GeometryError::LogicalDoesNotPadToStored`].
+///
+/// It deliberately does **not** require `stored == `[`nvfp4_padded_shape`]`(logical)`: an
+/// *over*-padded stored grid is decodable (blocks past the logical width are pure padding, which
+/// the sweep skips), and refusing exact-pad drift is [`validate_nvfp4_geometry`]'s job at plan
+/// time, where the header is the thing being judged.
 pub fn validate_nvfp4_block_scale_payload(
     scales: &[u8],
     stored: [usize; 2],
     logical: [usize; 2],
 ) -> Result<(), Nvfp4GeometryError> {
+    if !stored[0].is_multiple_of(NVFP4_PAD)
+        || !stored[1].is_multiple_of(NVFP4_PAD)
+        || logical[0] > stored[0]
+        || logical[1] > stored[1]
+    {
+        return Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+            logical,
+            stored,
+            expected_stored: nvfp4_padded_shape(logical),
+        });
+    }
     let scale_shape = nvfp4_scale_shape(stored);
     let expected_scales = scale_shape[0] * scale_shape[1];
     if scales.len() != expected_scales {
@@ -1557,6 +1584,14 @@ mod tests {
             decode_nvfp4(&packed, &nan_scales, global, stored, logical, &mut out),
             Err(Nvfp4GeometryError::BlockScaleNaN { row: 3, block: 1 })
         );
+        // …and a SIGN-BIT block scale (E4M3 −1.0) refuses as its own variant rather than silently
+        // negating 16 weights: an NVFP4 block scale is a magnitude (sc-21482).
+        let mut negative_scales = scales.clone();
+        negative_scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0xB8;
+        assert_eq!(
+            decode_nvfp4(&packed, &negative_scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::BlockScaleNegative { row: 3, block: 1 })
+        );
         // A non-zero padding element refuses rather than being trimmed away.
         let mut padded = packed.clone();
         // Row 0, column 41 — an odd column, so the low nibble of byte 20.
@@ -1578,6 +1613,76 @@ mod tests {
                 col: 0,
                 code: 5
             })
+        );
+    }
+
+    /// [`validate_nvfp4_block_scale_payload`] is `pub` and documented as callable directly by a
+    /// backend's packed repack (Candle's `Packed` arm calls it exactly that way, sc-21482), so it
+    /// is tested directly rather than only through [`decode_nvfp4`]: a truncated buffer, a grid
+    /// whose axes are not 16-aligned, and an over-wide `logical` must all refuse instead of
+    /// sweeping a silently narrowed region and returning `Ok`.
+    #[test]
+    fn nvfp4_block_scale_payload_validates_its_own_grid() {
+        let stored = [16_usize, 64];
+        let logical = [10_usize, 40];
+        let scale_shape = nvfp4_scale_shape(stored);
+        let mut scales = vec![0x38_u8; scale_shape[0] * scale_shape[1]]; // E4M3 1.0 everywhere.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Ok(())
+        );
+
+        // A truncated companion is a payload-length refusal, named for the tensor it governs.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales[..10], stored, logical),
+            Err(Nvfp4GeometryError::PayloadLength {
+                what: "weight_scale",
+                expected: scale_shape[0] * scale_shape[1],
+                actual: 10,
+            })
+        );
+
+        // A stored width that is not 16-aligned would make `stored[1] / NVFP4_BLOCK` truncate and
+        // skip the trailing block; refuse rather than validate a prefix of the grid.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, [16, 40], logical),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                logical,
+                stored: [16, 40],
+                expected_stored: [16, 48],
+            })
+        );
+        // …same for a non-16-aligned row count, and for a `logical` that overruns storage.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, [10, 64], logical),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                logical,
+                stored: [10, 64],
+                expected_stored: [16, 48],
+            })
+        );
+        assert!(matches!(
+            validate_nvfp4_block_scale_payload(&scales, stored, [10, 65]),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored { .. })
+        ));
+
+        // The value sweep itself: sign bit and NaN, each named by (row, block).
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0xB8;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Err(Nvfp4GeometryError::BlockScaleNegative { row: 3, block: 1 })
+        );
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0x7F;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Err(Nvfp4GeometryError::BlockScaleNaN { row: 3, block: 1 })
+        );
+        // A corrupt scale governing only PADDING is not a defect — nothing reads it.
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0x38;
+        scales[nvfp4_swizzled_scale_index(stored, 3, 3)] = 0xFF;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Ok(())
         );
     }
 
@@ -1642,20 +1747,32 @@ mod tests {
         // `Comfy-Org/Krea-2` NVFP4 export writes `{"layers": {…}}` with no version key, and
         // ComfyUI's own reader never consults one. Only a present-but-different version refuses.
         assert!(parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#).is_ok());
+        // A JSON NUMBER `1.0` is not the string `"1.0"` — and the message must say so instead of
+        // reading `must be the string "1.0", got "1.0"`.
+        let numeric = parse_quantization_metadata(r#"{"format_version": 1.0, "layers": {}}"#);
         assert_eq!(
-            parse_quantization_metadata(r#"{"format_version": 1.0, "layers": {}}"#),
+            numeric,
             Err(QuantizationMetadataError::FormatVersion {
-                found: Some("1.0".to_owned())
+                found: "non-string 1.0".to_owned()
             })
         );
+        assert!(
+            numeric
+                .unwrap_err()
+                .to_string()
+                .contains("got non-string 1.0"),
+            "a non-string version must not render as the string it would stringify to"
+        );
+        let wrong = parse_quantization_metadata(
+            r#"{"format_version": "2.0", "layers": {"a": {"format": "nvfp4"}}}"#,
+        );
         assert_eq!(
-            parse_quantization_metadata(
-                r#"{"format_version": "2.0", "layers": {"a": {"format": "nvfp4"}}}"#
-            ),
+            wrong,
             Err(QuantizationMetadataError::FormatVersion {
-                found: Some("2.0".to_owned())
+                found: "\"2.0\"".to_owned()
             })
         );
+        assert!(wrong.unwrap_err().to_string().contains("got \"2.0\""));
         assert_eq!(
             parse_quantization_metadata(r#"{"format_version": "1.0"}"#),
             Err(QuantizationMetadataError::Layers)
@@ -1691,7 +1808,9 @@ mod tests {
             QuantizationMetadataError::NotAnObject,
             QuantizationMetadataError::Layers,
             QuantizationMetadataError::NoLayers,
-            QuantizationMetadataError::FormatVersion { found: None },
+            QuantizationMetadataError::FormatVersion {
+                found: "\"2.0\"".to_owned(),
+            },
         ] {
             assert!(!error.to_string().is_empty());
         }

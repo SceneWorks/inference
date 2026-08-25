@@ -460,6 +460,12 @@ pub struct LogicalWeightReader {
     st: MmapedSafetensors,
     plan: LogicalWeightPlan,
     device: Device,
+    /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
+    ///
+    /// Without it [`Self::planned`] is a linear scan, and a whole-file read (or Krea's trunk,
+    /// which resolves the same key three times per projection) turns the load into O(n²) over a
+    /// ~2600-tensor plan (sc-21482 review).
+    by_logical_key: BTreeMap<String, usize>,
     /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
     /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
     measured: std::sync::Mutex<BTreeMap<String, u64>>,
@@ -498,10 +504,17 @@ impl LogicalWeightReader {
                 path.display(),
             )));
         }
+        let by_logical_key = plan
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (tensor.logical_key.clone(), index))
+            .collect();
         Ok(Self {
             st,
             plan,
             device: device.clone(),
+            by_logical_key,
             measured: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
@@ -512,11 +525,12 @@ impl LogicalWeightReader {
     }
 
     /// The planned entry for one **logical** key, or `None` when the plan has no such tensor.
+    ///
+    /// O(log n) through the index built at [`Self::open`] — the hot path of a whole-plan read.
     pub fn planned(&self, logical_key: &str) -> Option<&LogicalTensorPlan> {
-        self.plan
-            .tensors
-            .iter()
-            .find(|tensor| tensor.logical_key == logical_key)
+        self.by_logical_key
+            .get(logical_key)
+            .map(|index| &self.plan.tensors[*index])
     }
 
     /// Materialize one planned logical tensor through its codec and record what it keeps resident.

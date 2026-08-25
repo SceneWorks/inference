@@ -642,6 +642,29 @@ impl Weights {
     /// descriptor-quantized row asked for densely (e.g. a `full_precision_matrix_mult` projection
     /// through [`linear`]) comes back as the codec's exact dense decode instead of raw stored
     /// bytes reinterpreted at the component dtype.
+    ///
+    /// # A row the plan priced `Packed` refuses here (sc-21482 review)
+    ///
+    /// On an eligible device (`sm_120`) the plan prices NVFP4 projections `Packed`, and this
+    /// accessor refuses them by name rather than serving one. Two reasons it refuses instead of
+    /// quietly re-decoding the row densely:
+    ///
+    /// * The plan/receipt pair is this story's contract — everything resident was priced. A dense
+    ///   back-door read would leave `logical_weight_receipt()` reporting a residency the plan never
+    ///   priced, which is exactly the drift the receipt exists to catch.
+    /// * The old behaviour was **not** a working escape hatch: before sc-21482 this same call
+    ///   returned the stored `U8` nibble buffer at shape `[rows, cols / 2]`, cast to the component
+    ///   dtype — silently wrong weights, not a dense decode. Refusing is strictly better.
+    ///
+    /// Production reachability was audited: the only non-`linear_detect_planned` reads of a
+    /// projection `.weight` on a native file are `KreaTrainDit::load_inference`'s `lora_proj`
+    /// (reached from [`crate::control_provider`]'s `ControlDitSource::Native`, which does not yet
+    /// support an NVFP4 control DiT) and [`crate::control`]'s `ControlBranch::from_base` — whose
+    /// every production caller sources `Weights::from_dir`, the directory/packed-tier path, which
+    /// compiles no plan at all and so cannot reach this arm. The refusal names the escape hatch
+    /// for anything new: re-open the checkpoint under a `CandleCodecResidency` whose
+    /// `nvfp4_native` is `false`, so the plan prices — and the receipt reports — the dense
+    /// fallback the caller wants.
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
@@ -662,7 +685,10 @@ impl Weights {
                 LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
                     Err(Error::Msg(format!(
                         "krea: `{name}` was planned packed-native; construct it through \
-                         `linear_detect_planned`, not a dense read"
+                         `linear_detect_planned`, not a dense read — or re-open the checkpoint \
+                         under a residency whose `nvfp4_native` is false, so the plan prices this \
+                         row `CandleCodecResidency::DENSE` and the receipt reports what a dense \
+                         read costs"
                     )))
                 }
             };
@@ -709,7 +735,10 @@ impl Weights {
                 LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
                     Err(Error::Msg(format!(
                         "krea: `{name}` was planned packed-native; construct it through \
-                         `linear_detect_planned`, not a dense read"
+                         `linear_detect_planned`, not a dense read — or re-open the checkpoint \
+                         under a residency whose `nvfp4_native` is false, so the plan prices this \
+                         row `CandleCodecResidency::DENSE` and the receipt reports what a dense \
+                         read costs"
                     )))
                 }
             };
@@ -2686,6 +2715,15 @@ mod tests {
     /// **Corrupted scale payloads refuse before any projection is served (sc-21482).** The
     /// provider-owned whole-file scale scan is gone; the refusal is now the CODEC's, at the shared
     /// reader's materialization — same fixture, one block-scale byte given the E4M3 sign bit.
+    ///
+    /// Each corruption is run through **both** residency arms, because they are two different
+    /// call sites of the same codec-owned check and only one of them lives inside `decode_nvfp4`:
+    ///
+    /// * `Dense` (a plain CPU open) — the refusal comes from inside `decode_nvfp4`.
+    /// * `Packed` (residency forced on) — the repack copies scale bytes **verbatim**, so the only
+    ///   thing between a sign-bit/NaN E4M3 scale and the FP4 GEMM is the explicit
+    ///   `validate_nvfp4_block_scale_payload` call in `logical_weights.rs`'s `Packed` arm. Delete
+    ///   that call and this half goes red (sc-21482 review).
     #[test]
     fn nvfp4_negative_block_scale_refuses_at_materialization() {
         for (corrupt_byte, expected) in [(0xB8u8, "sign bit"), (0x7Fu8, "NaN")] {
@@ -2696,26 +2734,249 @@ mod tests {
             // Corrupt the first (real, element-governing) block scale in place.
             corrupt_first_block_scale(&path, corrupt_byte);
             let cfg = kitchen_nvfp4_config();
+            let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+
+            // ── the dense-fallback arm (an ineligible device) ──
             // Header-level planning still succeeds — the plan never reads payload bytes…
-            let w = Weights::from_native_file_for(
+            let dense = Weights::from_native_file_for(
                 &path,
                 &dev,
                 DType::F32,
                 DeclaredLogicalShapes::FromConfig(&cfg),
             )
             .expect("planning is header-level; payload corruption is a materialization refusal");
-            // …but materializing the projection refuses, dense fallback and packed route alike.
-            let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+            assert_eq!(
+                dense
+                    .logical_plan()
+                    .unwrap()
+                    .tensors
+                    .iter()
+                    .find(|t| t.logical_key == "transformer_blocks.0.attn.to_q.weight")
+                    .unwrap()
+                    .residency
+                    .mode,
+                candle_gen::gen_core::checkpoint_codec::ResidencyMode::Dense,
+                "this half must exercise the DENSE arm"
+            );
+            // …but materializing the projection refuses.
             let error =
-                match linear_detect_planned(&w, "transformer_blocks.0.attn.to_q", false, &plan) {
-                    Ok(_) => panic!("a corrupted block scale must refuse"),
+                match linear_detect_planned(&dense, "transformer_blocks.0.attn.to_q", false, &plan)
+                {
+                    Ok(_) => panic!("a corrupted block scale must refuse on the dense arm"),
                     Err(error) => error.to_string(),
                 };
             assert!(
                 error.contains(expected),
-                "the refusal must name the corruption ({expected}): {error}"
+                "the dense refusal must name the corruption ({expected}): {error}"
+            );
+
+            // ── the packed-native arm (an `sm_120`-eligible device, forced on here) ──
+            let packed = Weights::from_native_file_forcing_packed_nvfp4(
+                &path,
+                &dev,
+                DType::F32,
+                DeclaredLogicalShapes::FromConfig(&cfg),
+            )
+            .expect("planning is header-level on the packed arm too");
+            assert_eq!(
+                packed
+                    .logical_plan()
+                    .unwrap()
+                    .tensors
+                    .iter()
+                    .find(|t| t.logical_key == "transformer_blocks.0.attn.to_q.weight")
+                    .unwrap()
+                    .residency
+                    .mode,
+                candle_gen::gen_core::checkpoint_codec::ResidencyMode::Packed,
+                "this half must exercise the PACKED arm — otherwise it witnesses nothing new"
+            );
+            let error = match linear_detect_planned(
+                &packed,
+                "transformer_blocks.0.attn.to_q",
+                false,
+                &plan,
+            ) {
+                Ok(_) => panic!(
+                    "a corrupted block scale must refuse on the packed arm too — the repack \
+                     copies scale bytes verbatim into the GEMM's operand"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(expected),
+                "the packed refusal must name the corruption ({expected}): {error}"
+            );
+            // The container must not have materialized at all: nothing corrupt is resident.
+            assert!(
+                packed
+                    .logical_weight_receipt()
+                    .expect("the plan yields a receipt")
+                    .residency
+                    .iter()
+                    .all(|row| row.codec_id != NVFP4_CODEC.codec_id),
+                "a refused packed row must leave no measured NVFP4 residency behind"
             );
         }
+    }
+
+    /// **AC1, inference half: a LINKED copy and a MANAGED copy compile the same plan and
+    /// materialize the same values (sc-21482).**
+    ///
+    /// The real-artifact half of AC1 needs weights and hardware and lives in the `#[ignore]`d
+    /// `nvfp4_shared_reader_real_weights` matrix. The *plan-equality* half needs neither: a
+    /// hard link is exactly what "the same bytes reached by a second path" means, and the plan is
+    /// compiled from the file's own header and descriptors. So it is asserted here, on the
+    /// synthetic fixture, in milliseconds — and it would catch any path-dependence (a mapping keyed
+    /// off the file name, a residency probed from the directory, a pin that varies by route) that
+    /// the terminal lane would otherwise be the first to see.
+    ///
+    /// AC1's *semantic import plan* (`ImportPlanV1`) clause has no artifact in this repo — it is
+    /// SceneWorks-side and is asserted at the epic's terminal story.
+    #[test]
+    fn linked_and_managed_copies_compile_the_same_plan_and_read_the_same_values() -> Result<()> {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("managed/kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&managed);
+        // The "linked" route: the identical bytes reached through a second path in the same
+        // filesystem. `hard_link` (not a copy) so there is genuinely one artifact, two names.
+        let linked = tmp.path().join("linked/kreamania_variant7.safetensors");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::hard_link(&managed, &linked).expect("same-volume hard link");
+
+        let cfg = kitchen_nvfp4_config();
+        let managed_w = Weights::from_native_file_for(
+            &managed,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        let linked_w = Weights::from_native_file_for(
+            &linked,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+
+        // The whole compiled plan, not a summary: mapping id, every tensor's codec/companions/
+        // geometry/residency pricing, every companion row, and the source-byte total.
+        assert_eq!(
+            managed_w.logical_plan(),
+            linked_w.logical_plan(),
+            "the same artifact reached by two paths must compile one plan"
+        );
+
+        // …and the reader materializes identical values through both, for the NVFP4 projection
+        // and the dense sibling alike.
+        for key in ["transformer_blocks.0.attn.to_q.weight", "img_in.weight"] {
+            let a = managed_w.get(key)?.flatten_all()?.to_vec1::<f32>()?;
+            let b = linked_w.get(key)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(a, b, "`{key}` must read identically through both paths");
+        }
+        // The projection really is the NVFP4 one (a fixture that stopped being quantized would
+        // make the equality above vacuous).
+        assert!(managed_w.is_native_nvfp4());
+        assert_eq!(
+            managed_w
+                .get("transformer_blocks.0.attn.to_q.weight")?
+                .flatten_all()?
+                .to_vec1::<f32>()?[..2],
+            [1.0, 2.0]
+        );
+        Ok(())
+    }
+
+    /// **AC2: refusal happens before a generator is returned — which only holds while trunk
+    /// construction materializes EVERY planned row (sc-21482 review).**
+    ///
+    /// The deleted `validate_native_nvfp4` scanned the whole file at open, so a payload defect in
+    /// a layer nothing read still refused. The shared reader is incremental instead: a defect is
+    /// found when its row materializes. That is equivalent *only* because the trunk reads the
+    /// plan's whole surface. This asserts exactly that equivalence on the host, so a future read
+    /// path that bypasses the reader for some row (and would silently stop payload-checking it) is
+    /// caught here rather than by the terminal real-weight lane.
+    #[test]
+    fn constructing_every_projection_materializes_the_plans_whole_surface() -> Result<()> {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+        let cfg = kitchen_nvfp4_config();
+        let w = Weights::from_native_file_for(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        // Nothing read yet: the receipt is honest about the instant, not about the plan.
+        assert_eq!(
+            w.logical_weight_receipt().unwrap().tensor_count,
+            0,
+            "an unread import must report zero materialized tensors"
+        );
+
+        let dit_plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(1);
+        // Construct the fixture's whole surface exactly as the trunk does — every projection
+        // through `linear_detect_planned`.
+        for base in ["transformer_blocks.0.attn.to_q", "img_in"] {
+            linear_detect_planned(&w, base, false, &dit_plan)?;
+        }
+
+        let plan_count = w.logical_plan().unwrap().tensor_count();
+        assert_eq!(
+            w.logical_weight_receipt().unwrap().tensor_count,
+            plan_count,
+            "constructing every projection must materialize every PLANNED row — otherwise a row \
+             the trunk skips is never payload-checked and AC2's \"refuses before a generator is \
+             returned\" no longer holds"
+        );
+        assert!(plan_count >= 2, "the fixture must plan more than one row");
+        Ok(())
+    }
+
+    /// **The `Packed`-plan dense-read refusal is reachable and names its escape hatch
+    /// (sc-21482 review).** On `sm_120` the plan prices NVFP4 projections `Packed`, and a dense
+    /// `get`/`get_f32` of such a row refuses rather than serving stored nibbles reinterpreted at
+    /// the component dtype (which is what it silently did before this story). Forcing the packed
+    /// residency makes that arm reachable on a CPU lane.
+    #[test]
+    fn dense_read_of_a_packed_planned_row_refuses_and_names_the_escape_hatch() -> Result<()> {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kreamania_variant7.safetensors");
+        write_kitchen_nvfp4_native_file(&path);
+        let cfg = kitchen_nvfp4_config();
+        let packed = Weights::from_native_file_forcing_packed_nvfp4(
+            &path,
+            &dev,
+            DType::F32,
+            DeclaredLogicalShapes::FromConfig(&cfg),
+        )?;
+        for error in [
+            packed
+                .get("transformer_blocks.0.attn.to_q.weight")
+                .expect_err("a packed-planned row has no dense read"),
+            packed
+                .get_f32("transformer_blocks.0.attn.to_q.weight")
+                .expect_err("…and `get_f32` refuses identically"),
+        ] {
+            let error = error.to_string();
+            assert!(
+                error.contains("planned packed-native"),
+                "the refusal must say why: {error}"
+            );
+            assert!(
+                error.contains("nvfp4_native") && error.contains("DENSE"),
+                "the refusal must name the escape hatch — re-plan the row dense: {error}"
+            );
+        }
+        // The dense sibling still reads normally through the same accessor.
+        assert_eq!(
+            packed.get("img_in.weight")?.dims(),
+            [cfg.hidden_size, cfg.in_channels]
+        );
+        Ok(())
     }
 
     /// Overwrite the byte of the block-scale companion that governs (row 0, block 0) — the swizzled
