@@ -28,7 +28,8 @@
 //! | `model.embed_tokens` | no | 2.01 GB | an embedding **lookup**, not a matmul — mlx-llm has no quantized-embedding read path, and the weight is tied to an LM head LTX never runs |
 //! | the Gemma vision tower / audio + multimodal projectors | no | 0.08 GB | not on the LTX text path at all; carried verbatim so the pack stays self-contained |
 //! | conv video VAE, audio VAE, vocoder, both latent upsamplers | no | 3.07 GB | **zero** rank-2 Linear weights between them — every weight is a Conv1d/2d/3d kernel, a norm, or a per-channel statistic, and MLX has no quantized convolution |
-//! | the DiffVAE `NADiffusionDecoder` | no | 0.83 GB | its MLX port is sc-18766; quantizing a decoder no test in this crate can run would ship unverified weights |
+//! | the DiffVAE `NADiffusionDecoder`'s Linears (137) | **yes** | 0.83 GB | [`crate::diff_vae::NaDiffusionDecoder`] (sc-18766's port; `.scales` predicate) |
+//! | the DiffVAE decoder's `conv_in_x_t` | no | 0.00005 GB | its input axis is 48, which the affine group width 64 does not divide — the one Linear in the component with no grid to quantize over |
 //! | duration head | no | 0.004 GB | no MLX port exists yet (sc-18777); same reasoning, and it is 0.02 % of the smallest tier |
 //! | biases, norms, `layer_scalar`, `scale_shift_table`s, learnable registers | no | — | not matmul weights; the affine grid is defined over a Linear's input axis |
 //!
@@ -53,9 +54,10 @@
 //!   `model_version`, the transformer's `gemma_source_checkpoint`, the text encoder's `gemma_config`,
 //!   and the embedded licence text) rather than being re-emitted bare. The loader reads config from
 //!   metadata; a converter that drops it produces a bundle that loads as garbage or not at all;
-//! * the text encoder's `gemma_config` gains a top-level `quantization` block in the quantized tiers,
-//!   which is exactly the trigger `mlx_llm::config::ModelConfig::from_json` reads to bind
-//!   pre-quantized projections.
+//! * the text encoder's `gemma_config` gains a `quantization` block in the quantized tiers, which is
+//!   exactly the trigger `mlx_llm::config::ModelConfig::from_json` reads to bind pre-quantized
+//!   projections. It is stamped **inside `text_config`** for the Gemma 4 wrapper the LTX-2.5 encoder
+//!   ships — see [`stamp_gemma_quantization`].
 //!
 //! # Traps this module is written around
 //!
@@ -252,6 +254,43 @@ fn is_text_encoder_quantizable(key: &str) -> bool {
         return false;
     }
     matches_quant_suffix(key, GEMMA_QUANT_SUFFIXES)
+}
+
+/// The DiffVAE decoder Linears [`crate::diff_vae::NaDiffusionDecoder`] binds through
+/// `ProjWeight::load` — the exact set for which a `{key}.scales` sibling is read.
+///
+/// `.proj` covers three distinct sites at once (`{block}.attn.proj`, `shared_adaln.proj`,
+/// `upsamples.N.proj`); `.context_proj` is listed separately because it ends in `_proj`, not
+/// `.proj`, and a suffix match would miss it.
+///
+/// **`conv_in_x_t` is deliberately absent**, and it is the only rank-2 Linear in the component that
+/// is: its weight is `[256, 48]`, and 48 is not a multiple of the affine group width (64), so MLX
+/// has no grid to quantize it over. Leaving it out here is what makes that dense — not a shape
+/// check inside the emitter, which would silently swallow any *other* Linear that stopped dividing.
+/// [`quantize_selected`] still hard-errors on anything listed here whose input axis does not divide
+/// the group, so the two halves cannot drift into agreeing on a skip.
+///
+/// Before sc-18766 landed the MLX decoder this whole component was
+/// [`DenseReason::NoMlxPort`]-exempt: there was no port that could *run* a packed decoder, so
+/// quantizing it would have shipped weights no test could exercise. That port exists now, and the
+/// exemption went with it — 137 of the component's 138 rank-2 Linears carry 99.96 % of its
+/// parameters.
+const DIFF_VAE_DECODER_QUANT_SUFFIXES: &[&str] = &[
+    ".attn.qkv",
+    ".proj",
+    ".context_proj",
+    ".mlp.w_gate",
+    ".mlp.w_up",
+    ".mlp.w_down",
+    "t_embedder.mlp.0",
+    "t_embedder.mlp.2",
+    "conv_in",
+    "conv_out",
+];
+
+/// The DiffVAE decoder's quantized set. See [`DIFF_VAE_DECODER_QUANT_SUFFIXES`].
+pub(crate) fn is_diff_vae_decoder_quantizable(key: &str) -> bool {
+    matches_quant_suffix(key, DIFF_VAE_DECODER_QUANT_SUFFIXES)
 }
 
 // =================================================================================================
@@ -650,6 +689,16 @@ fn derived_metadata(
 /// explicitly refuses that state ("snapshot stores quantized tensor … but config.json has no
 /// `quantization` block") rather than silently loading a dense weight — so this is the difference
 /// between a tier that loads and one that fails loudly.
+///
+/// **Where the block goes is load-bearing.** The LTX-2.5 encoder ships the *multimodal* Gemma 4
+/// wrapper, whose decoder fields (`hidden_size`, `num_hidden_layers`, …) live under `text_config`.
+/// `ModelConfig::from_json` descends into `text_config` for every architecture whose
+/// `nests_text_config()` is true — Gemma 4 among them — **before** it looks for `quantization`, so a
+/// block written at the wrapper's top level is invisible to it. Stamping only the top level built
+/// tiers whose packed text encoder could not be loaded at all: `mlx_llm` refused them with the very
+/// error above (measured on sc-18775's first `ltx_2_5_te_tier_quality` run against the tiers built at
+/// the 2026-08-19 pause). The block is therefore written into the object the decoder fields were read
+/// from — `text_config` when the wrapper nests, the top level otherwise.
 fn stamp_gemma_quantization(
     metadata: &mut BTreeMap<String, String>,
     tier: LtxTier,
@@ -679,7 +728,19 @@ fn stamp_gemma_quantization(
             source.display()
         ))
     })?;
-    object.insert(
+    // The wrapper's `text_config` is where the decoder fields — and therefore the reader — live.
+    // Descend into it when it is an object; a config that carries a non-object `text_config` is
+    // malformed and must not be papered over by falling back to the top level.
+    let target = match object.get_mut("text_config") {
+        Some(nested) => nested.as_object_mut().ok_or_else(|| {
+            Error::Msg(format!(
+                "ltx tiers: {key} in {} has a `text_config` that is not a JSON object",
+                source.display()
+            ))
+        })?,
+        None => object,
+    };
+    target.insert(
         "quantization".to_string(),
         serde_json::json!({ "group_size": group_size, "bits": bits, "mode": "affine" }),
     );
@@ -934,14 +995,14 @@ pub fn convert_2_5_tier(
             components.push(emit_component(
                 out,
                 Emit {
-                    name: "vae_diffusion_decoder",
+                    name: crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
                     weights: decoder,
                     metadata: component_metadata(resolved, tier),
-                    exempt: Some(DenseReason::NoMlxPort("sc-18766")),
+                    exempt: None,
                 },
                 tier,
                 group_size,
-                |_| false,
+                is_diff_vae_decoder_quantizable,
             )?);
         }
         drop(raw);

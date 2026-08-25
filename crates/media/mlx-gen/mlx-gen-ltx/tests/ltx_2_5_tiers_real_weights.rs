@@ -54,6 +54,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
 use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use mlx_gen_ltx::connector::Connector;
+use mlx_gen_ltx::diff_vae::{
+    DiffVaeQuant, NaDiffusionDecoder, NaDiffusionDecoderConfig, DIFFUSION_DECODER_COMPONENT,
+};
 use mlx_gen_ltx::tiers::{convert_2_5_tiers, DenseReason, LtxTier, DEFAULT_GROUP_SIZE};
 use mlx_gen_ltx::transformer::{Precision, VideoBlock};
 use mlx_gen_ltx::upsampler::LatentUpsampler;
@@ -675,6 +678,58 @@ fn every_component_loads_and_forwards_at_every_tier() {
                 "{tier}: conv VAE round-trip PSNR {psnr:.2} dB is too low"
             );
             drop(vae);
+            clear_cache();
+        }
+
+        // ---- DiffVAE diffusion decoder -------------------------------------------------------------
+        {
+            // The one non-conv VAE component a tier packs (sc-18775, on sc-18766's port): 137 of its
+            // 138 rank-2 Linears become triples, so this is the load path a q4/q8 tier's DiffVAE
+            // depends on and the one that would go unexercised if the tier silently emitted it dense.
+            let cfg = NaDiffusionDecoderConfig::from_model_dir(&dir)
+                .unwrap_or_else(|e| panic!("{tier}: embedded_config.json vae.decoder: {e}"));
+            let path = dir.join(format!("{DIFFUSION_DECODER_COMPONENT}.safetensors"));
+            let w = Weights::from_file(&path).expect("the tier's diffusion decoder");
+            // The geometry comes from the tier's own manifest, exactly as production would read it;
+            // `None` for the dense tier is a claim the loader checks against the tensors, not a
+            // default that would quietly accept a packed file.
+            let quant = split.quantized.then_some(DiffVaeQuant {
+                bits: split.bits,
+                group: split.group,
+            });
+            reset_peak_memory();
+            let t = Instant::now();
+            let decoder = NaDiffusionDecoder::from_weights(&w, &cfg, quant)
+                .unwrap_or_else(|e| panic!("{tier}: build NaDiffusionDecoder: {e}"));
+            let load_s = t.elapsed().as_secs_f64();
+            drop(w);
+            clear_cache();
+
+            let (f, h, wid) = (2, 4, 4);
+            let latent = Array::ones::<f32>(&[1, cfg.in_channels, f, h, wid]).unwrap();
+            let shape5 = cfg.noise_shape(f, h, wid);
+            let noise = Array::zeros::<f32>(&[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]])
+                .unwrap();
+            let t = Instant::now();
+            let out = decoder
+                .decode(&latent, &noise)
+                .unwrap_or_else(|e| panic!("{tier}: DiffVAE decode: {e}"));
+            out.eval().unwrap();
+            let m = max_abs(&out);
+            eprintln!(
+                "[{tier}] DiffVAE decode {f}x{h}x{wid}: load {load_s:.1}s forward {:.2}s peak \
+                 {:.2} GiB out {:?} max|v| {m:.4}",
+                t.elapsed().as_secs_f64(),
+                gib(get_peak_memory()),
+                out.shape()
+            );
+            // A decoder whose packed projections were mis-bound returns NaN or a flat zero volume;
+            // both are what this pins, on the tensor the tier actually changed.
+            assert!(
+                m.is_finite() && m > 1e-4,
+                "{tier}: the DiffVAE decode is degenerate (max|v| = {m})"
+            );
+            drop(decoder);
             clear_cache();
         }
 

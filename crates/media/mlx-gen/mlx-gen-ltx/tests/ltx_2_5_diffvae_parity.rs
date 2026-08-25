@@ -144,7 +144,7 @@ fn decoder() -> Option<(
         NaDiffusionDecoderConfig::from_model_dir(&dir).expect("embedded_config.json vae.decoder");
     let w = Weights::from_file(dir.join(format!("{DIFFUSION_DECODER_COMPONENT}.safetensors")))
         .expect("the converted diffusion decoder");
-    let decoder = NaDiffusionDecoder::from_weights(&w, &cfg).expect("build NaDiffusionDecoder");
+    let decoder = NaDiffusionDecoder::from_weights(&w, &cfg, None).expect("build NaDiffusionDecoder");
     let golden =
         Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx25_diffvae_golden.py)");
     Some((decoder, cfg, golden, guard))

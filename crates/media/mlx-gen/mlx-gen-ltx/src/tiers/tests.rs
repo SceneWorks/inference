@@ -415,6 +415,92 @@ fn write_upsampler(root: &Path, temporal: bool) -> PathBuf {
     path
 }
 
+/// The DiffVAE: a conv encoder half plus the `NADiffusionDecoder` half whose 99.96 %-of-parameters
+/// Linear population is what makes it the one non-conv VAE component a tier quantizes (sc-18775,
+/// on sc-18766's port).
+///
+/// The shapes are the real component's in miniature, including the one that matters most:
+/// `conv_in_x_t`'s input axis is 48, which the group width 64 does not divide, so it is the Linear
+/// the quantized set must leave out.
+fn write_diff_vae(root: &Path) -> PathBuf {
+    /// The DiffVAE decoder's latent width — `conv_out`'s output and `conv_in_x_t`'s input, and
+    /// deliberately **not** a multiple of [`DEFAULT_GROUP_SIZE`], exactly as upstream's 48 is not.
+    const LATENT: i32 = 48;
+    let hidden = DIM * 2;
+    let mut t: Vec<(String, Array)> = Vec::new();
+
+    // The encoder half — conv kernels only, which is why `diffusion_vae_encoder` keeps its
+    // `no-linear-weights` exemption while the decoder loses its `no-mlx-port` one.
+    t.push((
+        "encoder.conv_in.conv.weight".into(),
+        ones(&[8, 4, 3, 3, 3]),
+    ));
+    t.push(("encoder.conv_in.conv.bias".into(), ones(&[8])));
+    t.push(("encoder.norm_out.weight".into(), ones(&[8])));
+
+    fn linear(t: &mut Vec<(String, Array)>, name: &str, out: i32, inp: i32) {
+        t.push((format!("decoder.{name}.weight"), ones(&[out, inp])));
+        t.push((format!("decoder.{name}.bias"), ones(&[out])));
+    }
+    linear(&mut t, "conv_in", DIM, DIM);
+    linear(&mut t, "conv_in_x_t", DIM, LATENT);
+    linear(&mut t, "conv_out", LATENT, DIM);
+    linear(&mut t, "shared_adaln.proj", 7 * DIM, DIM);
+    linear(&mut t, "t_embedder.mlp.0", DIM, DIM);
+    linear(&mut t, "t_embedder.mlp.2", DIM, DIM);
+    linear(&mut t, "upsamples.0.proj", DIM * 8, DIM);
+    for (stage, diffusion) in [("det_stages.0.0", false), ("diff_blocks.0", true)] {
+        linear(&mut t, &format!("{stage}.attn.qkv"), 3 * DIM, DIM);
+        linear(&mut t, &format!("{stage}.attn.proj"), DIM, DIM);
+        if diffusion {
+            linear(&mut t, &format!("{stage}.context_proj"), DIM, DIM);
+            t.push((
+                format!("decoder.{stage}.scale_shift_table"),
+                ones(&[7, DIM]),
+            ));
+        }
+        for (proj, out, inp) in [
+            ("w_gate", hidden, DIM),
+            ("w_up", hidden, DIM),
+            ("w_down", DIM, hidden),
+        ] {
+            // The SwiGLU projections are biasless upstream, and the tier must keep them that way.
+            t.push((
+                format!("decoder.{stage}.mlp.{proj}.weight"),
+                ones(&[out, inp]),
+            ));
+        }
+        for norm in ["norm1", "norm2", "attn.q_norm", "attn.k_norm"] {
+            t.push((format!("decoder.{stage}.{norm}.weight"), ones(&[DIM])));
+        }
+    }
+    t.push(("decoder.norm_out.weight".into(), ones(&[DIM])));
+    t.push(("per_channel_statistics.mean-of-means".into(), ones(&[LATENT])));
+    t.push(("per_channel_statistics.std-of-means".into(), ones(&[LATENT])));
+
+    let path = root.join("vae/ltx-2.5-video-vae-diffusion-bf16.safetensors");
+    write_file(
+        &path,
+        t,
+        &[
+            ("model_version", LTX_2_5_MODEL_VERSION),
+            (
+                "config",
+                &serde_json::json!({
+                    "vae": {
+                        "_class_name": "CausalDiffusionVAE",
+                        "dims": 3, "in_channels": 3, "out_channels": 3,
+                        "latent_channels": LATENT, "patch_size": 4,
+                        "latent_log_var": "constant",
+                    }
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    path
+}
+
 fn write_duration_head(root: &Path) -> PathBuf {
     let t: Vec<(String, Array)> = vec![
         (
@@ -451,6 +537,7 @@ fn fixture_bundle(root: &Path) -> mlx_gen::gen_core::ltx_checkpoint::LtxBundle {
         .with_component(LtxComponent::Transformer, write_transformer(root))
         .with_component(LtxComponent::TextEncoder, write_text_encoder(root))
         .with_component(LtxComponent::ConvVideoVae, write_conv_vae(root))
+        .with_component(LtxComponent::DiffusionVideoVae, write_diff_vae(root))
         .with_component(LtxComponent::AudioVae, write_audio_vae(root))
         .with_component(LtxComponent::SpatialUpsampler, write_upsampler(root, false))
         .with_component(LtxComponent::TemporalUpsampler, write_upsampler(root, true))
@@ -684,6 +771,79 @@ fn tier_sizes_are_ordered_and_the_exempt_components_do_not_move() {
     }
 }
 
+/// **The DiffVAE decoder is packed like any other Linear-bearing component**, and the one Linear the
+/// affine grid cannot describe is the only one left dense.
+///
+/// Until sc-18766 landed the MLX `NADiffusionDecoder` this component was exempt under
+/// [`DenseReason::NoMlxPort`] — an exemption that was correct when written and false the moment the
+/// port merged, with nothing in the tree to notice. This test is what notices: it reads the produced
+/// files and asserts on the exact tensors, so a decoder that silently reverts to dense inside a q4
+/// tier fails here rather than shipping as a 4x-oversized "q4".
+///
+/// `conv_in_x_t` is checked by name and by dtype, not by "some tensor stayed dense": its input axis
+/// is 48 and the group width is 64, so it is the single Linear with no grid — and pinning it by name
+/// is what stops the exclusion list from quietly growing.
+#[test]
+fn the_diff_vae_decoder_is_packed_except_the_linear_no_affine_group_divides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = fixture_bundle(&tmp.path().join("src"));
+    let out = tmp.path().join("tiers");
+    convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+
+    let component = crate::diff_vae::DIFFUSION_DECODER_COMPONENT;
+    let dense = tier_header(&out, LtxTier::Bf16, component);
+    for tier in [LtxTier::Q4, LtxTier::Q8] {
+        let packed = tier_header(&out, tier, component);
+        // Every Linear the loader binds through `.scales` must have become a triple.
+        let mut triples = 0;
+        for (key, header) in &dense.tensors {
+            let Some(base) = key.strip_suffix(".weight") else {
+                continue;
+            };
+            if !is_diff_vae_decoder_quantizable(key) {
+                continue;
+            }
+            triples += 1;
+            assert_eq!(
+                packed.tensors[key].dtype, "U32",
+                "{tier}: {key} must be packed"
+            );
+            for part in ["scales", "biases"] {
+                assert!(
+                    packed.tensors.contains_key(&format!("{base}.{part}")),
+                    "{tier}: {key} is packed but carries no `{part}` — `quantized_matmul` cannot \
+                     decode it"
+                );
+            }
+            assert_eq!(
+                header.dtype, "BF16",
+                "the dense tier must keep {key} a float weight"
+            );
+        }
+        assert!(
+            triples >= 10,
+            "{tier}: the fixture must exercise more than a token Linear or two, got {triples}"
+        );
+        // …and the one that cannot be, is not.
+        assert_eq!(
+            packed.tensors["conv_in_x_t.weight"].dtype, "BF16",
+            "{tier}: conv_in_x_t's input axis is 48, which the group width \
+             {DEFAULT_GROUP_SIZE} does not divide — it has no affine grid and must stay dense"
+        );
+        assert!(
+            !packed.tensors.contains_key("conv_in_x_t.scales"),
+            "{tier}: a dense weight must not carry a scales grid"
+        );
+        // The SwiGLU projections are biasless upstream; packing must not invent an output bias.
+        assert!(
+            !packed
+                .tensors
+                .contains_key("diff_blocks.0.mlp.w_gate.bias"),
+            "{tier}: the SwiGLU projections carry no output bias in any tier"
+        );
+    }
+}
+
 /// Every dense component of a quantized tier declares **why**, and the structural reason is checked
 /// against the weights rather than trusted.
 #[test]
@@ -842,14 +1002,25 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
         let te = tier_header(&out, *tier, "text_encoder");
         let gemma: serde_json::Value = serde_json::from_str(&te.metadata["gemma_config"]).unwrap();
         assert_eq!(gemma["gemma_version"], "gemma4-12b-ltx-v1");
+        // Read the block from the exact object `mlx_llm::config::ModelConfig::from_json` reads it
+        // from. Gemma 4 `nests_text_config()`, so `from_json` rebinds to `text_config` *before* it
+        // looks for `quantization`; a block at the wrapper's top level is invisible to it and the
+        // tier's packed encoder then fails to load at all. Asserting on the top level is the
+        // convergence-point mistake that let that ship — this reads `text_config` and pins the top
+        // level empty so the block has exactly one home.
+        let nested = &gemma["text_config"];
+        assert!(
+            gemma.get("quantization").is_none(),
+            "{tier}: the `quantization` block belongs in `text_config`, not the wrapper's top level"
+        );
         match tier.bits() {
             Some(bits) => {
-                assert_eq!(gemma["quantization"]["bits"], bits);
-                assert_eq!(gemma["quantization"]["group_size"], DEFAULT_GROUP_SIZE);
-                assert_eq!(gemma["quantization"]["mode"], "affine");
+                assert_eq!(nested["quantization"]["bits"], bits);
+                assert_eq!(nested["quantization"]["group_size"], DEFAULT_GROUP_SIZE);
+                assert_eq!(nested["quantization"]["mode"], "affine");
             }
             None => assert!(
-                gemma.get("quantization").is_none(),
+                nested.get("quantization").is_none(),
                 "the dense tier must not claim a quantization block"
             ),
         }
