@@ -22,7 +22,7 @@
 //! [`dequant_packed_base`] is the reconstruction the merge uses to build a mergeable dense base off the
 //! packed triple.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -576,10 +576,15 @@ impl Weights {
     pub(crate) fn native_nvfp4_projection_count(&self) -> usize {
         self.logical_plan()
             .map(|plan| {
+                // Distinct PHYSICAL keys: `plan.tensors` is "not a set" (sc-21547) — an
+                // adapter-declared transform contributes one entry per logical output, all naming
+                // the same physical tensor, and the caller is accounting for on-disk companions.
                 plan.tensors
                     .iter()
                     .filter(|tensor| tensor.codec_id == NVFP4_CODEC.codec_id)
-                    .count()
+                    .map(|tensor| tensor.physical_key.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len()
             })
             .unwrap_or(0)
     }
