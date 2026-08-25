@@ -39,7 +39,7 @@
 //! The receipt's measured bytes equal the plan's `resident_bytes()`; that pair is the
 //! packed-vs-dense pricing seam admission reads.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -164,6 +164,25 @@ pub fn read_logical_weights(
     plan: &LogicalWeightPlan,
     mode: LogicalReadMode<'_>,
 ) -> Result<LogicalWeights> {
+    // Adapter-declared logical transforms (sc-21547) are a Candle-side capability today: this
+    // reader removes each physical tensor from the map as it decodes, so a one-to-many entry would
+    // find its source already taken. Refuse by name rather than fail as a missing tensor — a
+    // transformed plan is not a plan this engine can honour, and silently reading only the first
+    // output would hand the model a fused matrix under a split key's name.
+    if let Some(transformed) = plan
+        .tensors
+        .iter()
+        .find(|tensor| tensor.transform.is_some())
+    {
+        return Err(Error::Msg(format!(
+            "logical weight read of {}: logical key {:?} is a declared transform of physical \
+             tensor {:?}, which this engine's reader does not implement; plan this checkpoint with \
+             a mapping that declares no logical transforms",
+            path.display(),
+            transformed.logical_key,
+            transformed.physical_key,
+        )));
+    }
     let mut physical = load_planned_file(path)?;
     let mut on_disk: Vec<&str> = physical.keys().map(String::as_str).collect();
     on_disk.sort_unstable();
@@ -567,16 +586,15 @@ fn measure_residency(
 ) -> Result<Vec<CodecResidencyReport>> {
     let mut by_codec: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
     let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
-    // Source bytes are attributed per **distinct physical key**, matching
-    // `gen_core::checkpoint_facts::SourceCodecSummary`'s rule. A fused stored tensor feeding
-    // several logical outputs (sc-21547) must contribute its bytes once, or the row exceeds its
-    // own source-inventory entry and `CheckpointWeightFacts` refuses a valid load (sc-21484
-    // review). Tensor counts and resident bytes stay per-logical: each output is separately
-    // decoded and separately occupies memory.
-    let mut counted_physical: BTreeSet<&str> = BTreeSet::new();
+    // A transformed tensor contributes one plan entry per logical output, all naming the same
+    // physical key (sc-21547), and exactly one of them carries `source_bytes` while its siblings
+    // carry zero — the plan compiler's convention. So a plain sum totals the file once, and
+    // de-duplicating by physical key here would be wrong: `plan.tensors` is sorted by logical key,
+    // so the byte-carrying output is not generally the first sighting of a fused key. Tensor
+    // counts and resident bytes stay per-logical: each output is separately decoded and separately
+    // occupies memory.
     for tensor in &plan.tensors {
         codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
-        let first_sighting = counted_physical.insert(tensor.physical_key.as_str());
         let array = logical.require(&tensor.logical_key)?;
         let resident_bytes = u64::try_from(array.nbytes()).map_err(|_| {
             Error::Msg(format!(
@@ -598,9 +616,7 @@ fn measure_residency(
                 resident_bytes: 0,
             });
         report.tensor_count += 1;
-        if first_sighting {
-            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
-        }
+        report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
         report.resident_bytes = report.resident_bytes.saturating_add(resident_bytes);
     }
     for companion in &plan.companions {
@@ -614,8 +630,8 @@ fn measure_residency(
         // packed policy ever reaches this backend, the read refuses rather than silently
         // agreeing with a residency it never measured.
         //
-        // Checked BEFORE the distinct-key dedup below, so a companion whose bytes are already
-        // attributed still cannot smuggle a retained residency past this refusal.
+        // Checked outside the `by_codec` lookup below, so a companion whose owner's row is absent
+        // still cannot smuggle a retained residency past this refusal.
         if companion.resident_bytes != 0 {
             return Err(Error::Msg(format!(
                 "companion {:?} (codec {codec_id}) was planned to retain {} resident bytes, but \
@@ -624,9 +640,6 @@ fn measure_residency(
                  `measure_residency` to measure the retained form",
                 companion.physical_key, companion.resident_bytes
             )));
-        }
-        if !counted_physical.insert(companion.physical_key.as_str()) {
-            continue;
         }
         if let Some(report) = by_codec.get_mut(codec_id) {
             report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
@@ -2215,6 +2228,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: Vec::new(),
             source_bytes: 4,
@@ -2263,6 +2277,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: vec![CompanionTensorPlan {
                 physical_key: "model.w.weight_scale".to_owned(),
@@ -2327,6 +2342,7 @@ mod tests {
                     mode: ResidencyMode::Dense,
                     resident_bytes: 2,
                 },
+                transform: None,
             }],
             companions: Vec::new(),
             source_bytes: 2,

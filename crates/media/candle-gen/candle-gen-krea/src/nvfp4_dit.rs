@@ -17,32 +17,42 @@
 //! 1. [`DitPlan`] — how to serve the trunk's projections: the byte-unchanged default (dense/packed via
 //!    `linear_detect`), or NVFP4 under a [`Nvfp4Quant`] regime (the sc-11038 per-layer mixed policy, or
 //!    a blanket W4A4/W4A16 for a controlled bench).
-//! 2. [`LayerRole`] — the structural facts about a projection that its dotted key cannot carry,
-//!    threaded from the loader (which knows the trunk's topology) into the shared substring policy.
+//! 2. [`KreaSite`] / [`LayerRole`] / [`ExecutionRole`] — the provider-owned **role table**: an
+//!    exhaustive structural classification of every projection the lane serves, the structural facts
+//!    that classification implies, and the execution role (packed W4A4 or dense BF16) those facts
+//!    select. [`DitPlan::representation`] is the whole decision table, capability facts included.
 //! 3. [`ActProbe`] — a per-layer, per-step **activation-outlier sparsity** recorder, so the
 //!    benign→W4A4 / outlier→W4A16 partition can be re-derived against **Krea's** naming from live
 //!    activations rather than inherited from SANA's.
 //!
-//! # Why Krea needs [`LayerRole`] more than SANA did
+//! # Why Krea owns its role table outright (sc-12121)
 //!
-//! The shared policy ([`candle_gen::quant::ActPrecision::for_outlier_layer_with`]) is substring-based and was tuned on
-//! SANA's diffusers naming. **Three of its anchors do not exist in Krea's checkpoint**, and every gap
-//! fails in the *unsafe* direction (an outlier-carrying layer silently landing on W4A4):
+//! The shared policy (`candle_gen::quant::ActPrecision::for_outlier_layer_with`) is substring-based and
+//! was tuned on SANA's diffusers naming. **Every one of its anchors misses on Krea's checkpoint**, and
+//! every gap fails in the *unsafe* direction (an outlier-carrying layer silently landing on W4A4):
 //!
 //! * **`attn2` / `cross_att*`** — Krea has **no cross-attention at all**. It is a *single-stream* DiT:
 //!   the fused text context is **concatenated onto the image token sequence** (`combined = [ctx ; img]`)
 //!   and read by ordinary self-attention. There is no projection named `attn2` to guard.
 //! * **`caption_projection`** — Krea's text→DiT ingest is named `txt_in.linear_{1,2}`, fed by the
 //!   `text_fusion` stack that aggregates the raw Qwen3-VL hidden states. Neither matches.
-//! * **`proj_out`** — Krea's trunk head is `final_layer.linear`. `names_final_proj` cannot fire on it.
-//!   (Krea's *only* `proj_out` is a control-branch layer nested under `blocks.{i}`, which the anchor
-//!   correctly declines — verified, and the reason the anchor is safe to leave alone here.)
+//! * **`proj_out`** — Krea's trunk head is `final_layer.linear`, so the shared crate's name-only
+//!   `proj_out` anchor cannot fire on it.
+//!   (Krea's *only* `proj_out` is a control-branch layer nested under `blocks.{i}`, which that anchor
+//!   correctly declines — verified, and the reason it is safe to leave alone in its own crate.)
 //!
-//! So Krea states these facts explicitly through [`LayerRole`] rather than sharpening substrings
-//! until they happen to fit a second provider — the seam sc-11045 built for exactly this, and the lesson
-//! sc-12140 records. **Measured vindication:** `final_layer.linear` really does measure
-//! [`candle_gen::quant::OutlierClass::Dense`] on real activations (crush **909×**). It is guarded *only* because the loader
-//! states [`LayerRole::final_proj`]; the name-only anchor would have left it on W4A4.
+//! sc-12110 threaded Krea's facts *into* that policy through [`LayerRole`]. **sc-12121 removes the
+//! policy from the Krea path entirely**: production Krea selection calls neither the shared substring
+//! heuristic nor its `names_final_proj` fallback. A dotted key is classified into an exhaustive
+//! [`KreaSite`] role table, and the role — not the spelling — selects the execution role. A name the
+//! table does not recognise is **not** silently an interior W4A4 projection any more: it resolves to
+//! [`DenseReason::Unclassified`] and takes the dense BF16 fallback, because "a guard that quietly
+//! failed to fire" is the exact defect class (sc-12140) this story exists to delete.
+//!
+//! **Measured vindication:** `final_layer.linear` really does measure
+//! [`candle_gen::quant::OutlierClass::Dense`] on real activations (crush **909×**). It is guarded
+//! because the role table names it [`KreaSite::TrunkHead`]; no name-only anchor in any crate would
+//! have fired on it.
 //!
 //! # The finding that is not about naming at all (sc-12110)
 //!
@@ -85,16 +95,17 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::lock_recover;
 use candle_gen::quant::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Regime, OutlierClass, OutlierSparsity,
+    ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Regime, OutlierClass,
+    OutlierSparsity, NVFP4_BLOCK, NVFP4_K_ALIGN, NVFP4_N_ALIGN,
 };
 
 /// How the trunk should serve one projection's activations when running NVFP4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nvfp4Quant {
     /// The **sc-11038 mixed-precision policy** (the shipping default): the outlier-carrying class runs
-    /// W4A16 (bf16 activation), the benign compute-bulk runs W4A4. Classified by
-    /// [`ActPrecision::for_outlier_layer_with`] on the projection's dotted key, plus the structural
-    /// facts Krea's loader threads through [`LayerRole`] — see [`DitPlan::act_for`].
+    /// W4A16 (bf16 activation), the benign compute-bulk runs W4A4. Classified **entirely** by Krea's
+    /// own role table — [`KreaSite`] → [`LayerRole`] → [`ExecutionRole`] — with no substring
+    /// heuristic anywhere in the path (sc-12121); see [`DitPlan::execution_role`].
     Mixed,
     /// Blanket W4A4 on every eligible projection — ignores the outlier policy. For a controlled
     /// throughput/stability bench of the FP4 compute path, **not** a shipping regime.
@@ -104,13 +115,384 @@ pub enum Nvfp4Quant {
     BlanketW4A16,
 }
 
-/// The **structural facts** about a Krea projection that its dotted key cannot carry, threaded from the
-/// loader — which knows the trunk's topology — into the shared substring policy (sc-11045 pattern,
-/// sc-12110 for Krea).
+/// One of the eight GEMM leaves a Krea attention + SwiGLU block exposes to the NVFP4 lane
+/// (sc-12121). Both the single-stream `transformer_blocks.{i}` and the `text_fusion` blocks are built
+/// from the same `GatedAttention` + `SwiGlu` modules, so both carry exactly this leaf set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockLeaf {
+    /// `attn.to_q` — reads the RMSNorm'd block input.
+    AttnQ,
+    /// `attn.to_k` — reads the RMSNorm'd block input.
+    AttnK,
+    /// `attn.to_v` — reads the RMSNorm'd block input.
+    AttnV,
+    /// `attn.to_gate` — reads the RMSNorm'd block input (Krea's gate branch; no SANA analogue).
+    AttnGate,
+    /// `attn.to_out.0` — reads `attn_out · sigmoid(gate(x))`, a **post-nonlinearity** intermediate.
+    AttnOut,
+    /// `ff.gate` — reads the RMSNorm'd block input. `[16384 ← 6144]`, one of the two widest GEMMs.
+    FfGate,
+    /// `ff.up` — reads the RMSNorm'd block input. `[16384 ← 6144]`.
+    FfUp,
+    /// `ff.down` — reads `silu(gate(x)) · up(x)`, a **post-nonlinearity** intermediate.
+    FfDown,
+}
+
+/// Define [`BlockLeaf`]'s key accessors from **one** list of `(variant, module, module-relative
+/// suffix, ordinal)` rows (sc-12121).
 ///
-/// This is the seam that keeps the policy honest across providers. Rather than widen a substring until
-/// it happens to fit Krea too (and mis-fire on a third provider), the provider states the fact. Every
-/// flag defaults to `false`, i.e. "an ordinary interior compute-bulk projection".
+/// The point is that there is exactly one place the eight loader strings are spelled: `attn`/`ff`
+/// `load_planned` call [`BlockLeaf::module_leaf`] rather than passing literals of their own, so the
+/// role table and the loader cannot drift apart. Every generated body is an **exhaustive** `match`
+/// with no wildcard arm, so a leaf added to the enum without a row here does not compile.
+macro_rules! block_leaf_table {
+    ($( $variant:ident => $module:literal, $leaf:literal, $ordinal:literal );* $(;)?) => {
+        impl BlockLeaf {
+            /// The module this leaf is loaded by — `attn` (`GatedAttention`) or `ff` (`SwiGlu`),
+            /// spelled as the block's `join(prefix, ..)` segment.
+            pub fn module(self) -> &'static str {
+                match self { $( Self::$variant => $module, )* }
+            }
+
+            /// The dotted suffix this leaf is loaded under **relative to its module's prefix** — the
+            /// exact literal `GatedAttention::load_planned` / `SwiGlu::load_planned` hand to
+            /// `linear_detect_planned`, because those loaders read it from here.
+            pub fn module_leaf(self) -> &'static str {
+                match self { $( Self::$variant => $leaf, )* }
+            }
+
+            /// The dotted suffix this leaf is loaded under relative to its **block** prefix —
+            /// [`Self::module`] and [`Self::module_leaf`] composed at compile time.
+            pub fn leaf_key(self) -> &'static str {
+                match self { $( Self::$variant => concat!($module, ".", $leaf), )* }
+            }
+
+            /// A dense index for this leaf, by exhaustive match — the count source
+            /// `block_leaf_all_is_every_variant` crosses against [`Self::ALL`]'s length.
+            #[cfg(test)]
+            fn ordinal(self) -> usize {
+                match self { $( Self::$variant => $ordinal, )* }
+            }
+
+            /// The leaf with the given [`Self::ordinal`], if any — the inverse the anchor test walks
+            /// to reconstruct [`Self::ALL`] without reading the array literal.
+            #[cfg(test)]
+            fn from_ordinal(i: usize) -> Option<Self> {
+                $( if i == $ordinal { return Some(Self::$variant); } )*
+                None
+            }
+        }
+    };
+}
+
+block_leaf_table! {
+    AttnQ    => "attn", "to_q",     0;
+    AttnK    => "attn", "to_k",     1;
+    AttnV    => "attn", "to_v",     2;
+    AttnGate => "attn", "to_gate",  3;
+    AttnOut  => "attn", "to_out.0", 4;
+    FfGate   => "ff",   "gate",     5;
+    FfUp     => "ff",   "up",       6;
+    FfDown   => "ff",   "down",     7;
+}
+
+impl BlockLeaf {
+    /// Every leaf, in the order a block loads them — the coverage test's enumeration source.
+    ///
+    /// Anchored by `block_leaf_all_is_every_variant`: an array literal is not an exhaustive
+    /// construct, so the test reconstructs this list from the exhaustive `ordinal` / `from_ordinal`
+    /// pair (test-only, hence not linkable here) and asserts the two agree.
+    pub const ALL: [Self; 8] = [
+        Self::AttnQ,
+        Self::AttnK,
+        Self::AttnV,
+        Self::AttnGate,
+        Self::AttnOut,
+        Self::FfGate,
+        Self::FfUp,
+        Self::FfDown,
+    ];
+
+    /// The leaves `GatedAttention::load_planned` loads, in load order — the loader's own enumeration,
+    /// so its five projection keys come from this table too.
+    pub const ATTN: [Self; 5] = [
+        Self::AttnQ,
+        Self::AttnK,
+        Self::AttnV,
+        Self::AttnGate,
+        Self::AttnOut,
+    ];
+
+    /// The leaves `SwiGlu::load_planned` loads, in load order.
+    pub const FF: [Self; 3] = [Self::FfGate, Self::FfUp, Self::FfDown];
+
+    /// The leaf named by a block-relative dotted suffix, or `None` for a suffix that is not one of the
+    /// lane's eight GEMM leaves.
+    fn from_leaf_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|leaf| leaf.leaf_key() == key)
+    }
+
+    /// True iff this leaf's **input** is a post-nonlinearity intermediate rather than a normalized
+    /// block input — see [`LayerRole::is_post_nonlinearity`], sc-12110's central partition finding.
+    ///
+    /// Deliberately an **exhaustive** `match` rather than a `matches!`: a `matches!` would silently
+    /// default a newly-added leaf to `false`, i.e. route an unexamined post-nonlinearity projection
+    /// straight into the packed W4A4 lane — the unsafe direction. Written this way, adding a leaf
+    /// without answering this question does not compile.
+    pub fn reads_post_nonlinearity(self) -> bool {
+        match self {
+            Self::AttnOut | Self::FfDown => true,
+            Self::AttnQ
+            | Self::AttnK
+            | Self::AttnV
+            | Self::AttnGate
+            | Self::FfGate
+            | Self::FfUp => false,
+        }
+    }
+}
+
+/// **The Krea role table** (sc-12121): every site in the trunk the NVFP4 lane serves, named
+/// structurally rather than by substring.
+///
+/// [`Self::classify`] is the single parse from a dotted key to a site, and it is **total by
+/// refusal**: a key that is not one of these sites returns `None`, which
+/// [`LayerRole::for_krea_layer`] turns into [`DenseReason::Unclassified`] — the dense BF16 fallback.
+/// Nothing reaches the packed W4A4 lane by failing to match a guard.
+///
+/// The sites deliberately mirror the loader's call graph (`Krea2Transformer::load_front`,
+/// `TextFusionTransformer::load_planned`, `Krea2Block::load_planned`), which is why the coverage test
+/// can enumerate the whole 260-projection surface from this enum and assert it round-trips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KreaSite {
+    /// `img_in` — the image-token ingest. Measured perfectly Benign (1.00000, crush 0.0).
+    ImageIngest,
+    /// `txt_in.linear_{1,2}` — the fused-context ingest into DiT width, Krea's `caption_projection`
+    /// analogue.
+    ContextIngest,
+    /// `text_fusion.{layerwise,refiner}_blocks.{i}.{leaf}` — the stack that aggregates the **raw**
+    /// Qwen3-VL hidden states, i.e. the massive-activation source itself.
+    TextFusion {
+        /// Which of the block's eight GEMM leaves this projection is.
+        leaf: BlockLeaf,
+    },
+    /// `transformer_blocks.{index}.{leaf}` — the single-stream compute bulk.
+    Block {
+        /// The block index as spelled in the key.
+        index: usize,
+        /// Which of the block's eight GEMM leaves this projection is.
+        leaf: BlockLeaf,
+    },
+    /// `final_layer.linear` — the trunk head `[6144 → 64]`. Measured Dense, crush 909×.
+    TrunkHead,
+}
+
+impl KreaSite {
+    /// The site `name` denotes, or `None` when the role table does not name it.
+    ///
+    /// Structural throughout: fixed keys are matched whole, and block keys are **parsed** (prefix,
+    /// then an integer index, then one of the eight leaf suffixes) rather than sniffed for
+    /// substrings. `transformer_blocks.27.attn.to_q` and `transformer_blocks.2.attn.to_q` are
+    /// different sites because the parse says so, not because a trailing dot happened to be in the
+    /// pattern.
+    pub fn classify(name: &str) -> Option<Self> {
+        match name {
+            "img_in" => return Some(Self::ImageIngest),
+            "txt_in.linear_1" | "txt_in.linear_2" => return Some(Self::ContextIngest),
+            "final_layer.linear" => return Some(Self::TrunkHead),
+            _ => {}
+        }
+        if let Some(rest) = name.strip_prefix("transformer_blocks.") {
+            let (index, leaf) = rest.split_once('.')?;
+            return Some(Self::Block {
+                index: index.parse().ok()?,
+                leaf: BlockLeaf::from_leaf_key(leaf)?,
+            });
+        }
+        let rest = name.strip_prefix("text_fusion.")?;
+        for kind in ["layerwise_blocks.", "refiner_blocks."] {
+            let Some(rest) = rest.strip_prefix(kind) else {
+                continue;
+            };
+            let (index, leaf) = rest.split_once('.')?;
+            index.parse::<usize>().ok()?;
+            return Some(Self::TextFusion {
+                leaf: BlockLeaf::from_leaf_key(leaf)?,
+            });
+        }
+        None
+    }
+}
+
+/// The **execution role** a Krea projection is assigned: which of the two representations the trunk
+/// actually serves it as (sc-12121, epic E5).
+///
+/// There are only two, because there are only two things `Nvfp4Linear` can be: the packed W4A4
+/// FP4-tensor-core path, or a dense BF16 weight. **W4A16 is dense BF16** — it dequantizes the packed
+/// weight once at construction and holds the full dense footprint — so it is reported here as
+/// [`Self::DenseBf16`], never as "native NVFP4".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionRole {
+    /// Packed W4A4: the weight stays in its NVFP4 container on-device and the cuBLASLt FP4 GEMM runs.
+    PackedW4A4,
+    /// Dense BF16, for the stated reason. Covers both the W4A16 outlier override and every
+    /// capability fallback — they hold the same bytes and run the same GEMM.
+    DenseBf16(DenseReason),
+}
+
+impl ExecutionRole {
+    /// True iff this role is the packed W4A4 lane.
+    pub fn is_packed_w4a4(self) -> bool {
+        matches!(self, Self::PackedW4A4)
+    }
+
+    /// The activation precision this role asks [`Nvfp4Linear`] for.
+    pub fn act_precision(self) -> ActPrecision {
+        match self {
+            Self::PackedW4A4 => ActPrecision::W4A4,
+            Self::DenseBf16(_) => ActPrecision::W4A16,
+        }
+    }
+}
+
+/// Why a projection is served dense BF16 rather than packed W4A4 (sc-12121).
+///
+/// The variants are listed in the order [`DitPlan::representation`] settles them, which is the order
+/// the real pipeline settles them: the checkpoint's own declaration and geometry first (they are
+/// answered at *plan* time by the residency policy), then the device floor, then the plan's requested
+/// regime, then the structural role, then the construction-time fused-quantizer probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseReason {
+    /// The producer marked the layer `full_precision_matrix_mult` — "do not run a quantized matmul
+    /// here". Answered by the residency policy at plan time.
+    FullPrecisionDeclared,
+    /// The checkpoint does not offer this projection as NVFP4 at all: Kitchen's Krea profile
+    /// deliberately exports sensitive layers as dense BF16 and the import preserves that.
+    PreservedDense,
+    /// ComfyUI padded the stored grid (`logical_shape != stored_shape`). The packed container has
+    /// nowhere to record the unpad, so the repacked operand would contract over padding.
+    PaddedStorage,
+    /// The stored/packed grid is not one the cuBLASLt FP4 GEMM accepts (padded K not a multiple of
+    /// `NVFP4_K_ALIGN`, or N not a multiple of `NVFP4_N_ALIGN`).
+    ShapeIneligible,
+    /// The bound device is not at the NVFP4 `sm_120` floor (CPU, a pre-Blackwell GPU, or a non-cuda
+    /// build).
+    NoNvfp4Hardware,
+    /// The plan does not serve this trunk through NVFP4, or asks for blanket W4A16 — the NVFP4
+    /// *storage* tier, which is dense BF16 resident by construction.
+    DenseRegimeRequested,
+    /// The role table does not name this projection, so nothing structural is known about its
+    /// activations. The fallback is dense BF16 on purpose: an unrecognised key must never reach the
+    /// packed lane by default (sc-12140).
+    Unclassified,
+    /// The trunk head (`final_layer.linear`) — measured Dense, crush 909×.
+    TrunkHead,
+    /// Reads text-encoder-derived context (`text_fusion.*`, `txt_in.*`) — measured Dense, crush up
+    /// to 40145×.
+    ContextRead,
+    /// Reads a post-nonlinearity intermediate (`attn.to_out.0`, `ff.down`) — sc-12110's central
+    /// finding, Dense in 28/28 blocks for `ff.down`.
+    PostNonlinearity,
+    /// Sits in a leading (`0..4`) or the trailing single-stream block, where the caption's massive
+    /// activations still reach the *block inputs*.
+    EdgeBlock,
+    /// The fused NVFP4 activation quantizer will not compile on this device. W4A4 through the
+    /// unfused reference chain measured **0.01×** vs dense bf16, so the honest answer is W4A16
+    /// (sc-12078) — settled at construction, never per forward.
+    NoFusedQuantizer,
+    /// The trunk's shared cuBLASLt context is bound to a **different** device than this projection
+    /// (`Nvfp4Fallback::DeviceMismatch`). A runtime accident of context sharing, **not** predictable
+    /// from any per-key capability fact — [`Nvfp4Capability`] cannot model it, so the prediction is
+    /// reconciled against the constructed layer's own reported cause instead (sc-12121 review fix).
+    DeviceMismatch,
+    /// Staging the FP4 weight onto the device failed (allocation/driver accident,
+    /// `Nvfp4Fallback::StagingFailed`). Like [`Self::DeviceMismatch`], invisible to a plan-time
+    /// probe and reconciled from the constructed layer.
+    StagingFailed,
+}
+
+/// The [`DenseReason`] a construction-time [`Nvfp4Fallback`] corresponds to, or `None` when the cause
+/// is one [`DitPlan::representation`] already predicts from [`Nvfp4Capability`] (sc-12121 review fix).
+///
+/// This exists for exactly the two causes no capability fact can see — a shared-context/device
+/// mismatch and a weight-staging failure. Both are legitimate transparent degradations that predate
+/// this story; without this mapping `check_representation` would abort a whole trunk load and blame
+/// the role table for a driver accident. Every other cause stays `None`, so a genuine
+/// prediction/construction disagreement is still a hard error.
+pub fn dense_reason_for_fallback(cause: Nvfp4Fallback) -> Option<DenseReason> {
+    match cause {
+        Nvfp4Fallback::DeviceMismatch => Some(DenseReason::DeviceMismatch),
+        Nvfp4Fallback::StagingFailed => Some(DenseReason::StagingFailed),
+        // Predicted by `Nvfp4Capability`: `nvfp4_device`, `layout_native`, `fused_quantizer`, and the
+        // plan's own regime. A disagreement on any of these is a real defect, not an accident.
+        Nvfp4Fallback::W4A16Requested
+        | Nvfp4Fallback::NotCudaDevice
+        | Nvfp4Fallback::ShapeIneligible
+        | Nvfp4Fallback::NoDeviceHandle
+        | Nvfp4Fallback::NoFusedQuantizer => None,
+    }
+}
+
+/// The device- and checkpoint-level facts that can force dense BF16 **regardless of the structural
+/// role** (sc-12121). Every field is read off something real — the compiled logical plan, the probed
+/// device residency, the shared cuBLASLt context — never guessed from a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nvfp4Capability {
+    /// The checkpoint offers this projection as NVFP4 (false for Kitchen's preserved-dense layers).
+    pub checkpoint_offers_nvfp4: bool,
+    /// The producer declared `full_precision_matrix_mult` for this layer.
+    pub full_precision_declared: bool,
+    /// The stored grid is the layer itself (`logical_shape == stored_shape`).
+    pub storage_unpadded: bool,
+    /// The grid is one the cuBLASLt FP4 GEMM accepts.
+    pub layout_native: bool,
+    /// The bound device is at the NVFP4 `sm_120` floor.
+    pub nvfp4_device: bool,
+    /// The fused NVFP4 activation quantizer compiled on this device.
+    pub fused_quantizer: bool,
+}
+
+/// True iff a **dense** `[out, in]` projection packs to a grid the cuBLASLt FP4 GEMM accepts
+/// (sc-12121) — the NVFP4 *validation* lane's twin of
+/// [`candle_gen::logical_weights::nvfp4_layout_is_native`], which answers the same question for a
+/// checkpoint's already-stored grid.
+///
+/// The two differ in exactly one place and it matters: `Nvfp4Tensor::pack` pads the contraction to
+/// [`NVFP4_BLOCK`] (16), and `Nvfp4Linear`'s shape gate then tests that **padded** width against
+/// [`NVFP4_K_ALIGN`] (32). So `in_features = 48` is eligible while `in_features = 16` is not, and
+/// reading the raw `cols` here would have disagreed with the layer it is predicting.
+pub fn dense_shape_is_fp4_eligible(rows: usize, cols: usize) -> bool {
+    let cols_padded = cols.div_ceil(NVFP4_BLOCK) * NVFP4_BLOCK;
+    cols_padded.is_multiple_of(NVFP4_K_ALIGN) && rows.is_multiple_of(NVFP4_N_ALIGN)
+}
+
+impl Nvfp4Capability {
+    /// Everything available — the **only** combination that can reach the packed W4A4 lane.
+    pub const ELIGIBLE: Self = Self {
+        checkpoint_offers_nvfp4: true,
+        full_precision_declared: false,
+        storage_unpadded: true,
+        layout_native: true,
+        nvfp4_device: true,
+        fused_quantizer: true,
+    };
+
+    /// [`Self::ELIGIBLE`] on a device below the NVFP4 floor — a CPU lane, a pre-Blackwell GPU, or a
+    /// non-cuda build (which also has no fused quantizer).
+    pub const NO_HARDWARE: Self = Self {
+        nvfp4_device: false,
+        fused_quantizer: false,
+        ..Self::ELIGIBLE
+    };
+}
+
+/// The **structural facts** about a Krea projection, derived from the role table
+/// ([`KreaSite`]) — the form the loader and the validation harness both consume (sc-11045 pattern,
+/// sc-12110 for Krea, made role-table-derived and total by sc-12121).
+///
+/// Every flag defaults to `false`, i.e. "an ordinary interior compute-bulk projection". The one flag
+/// that is *not* a fact about the trunk is [`Self::is_unclassified`]: it records that the role table
+/// did not name the key at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayerRole {
     /// This projection lives in Krea's **first or last** single-stream transformer block — the edges the
@@ -121,10 +503,11 @@ pub struct LayerRole {
     /// This projection is the trunk's **final output projection** (the head) — Krea's
     /// `final_layer.linear` `[6144 → 64]`.
     ///
-    /// **Krea cannot rely on the name-only fallback here** (`names_final_proj` anchors on a trailing
-    /// `proj_out` segment, and Krea's head is not spelled that way), so the loader threads this
-    /// explicitly. That is precisely the defect class sc-12140 records: a name-only anchor that silently
-    /// does not fire leaves the trunk head — measured Dense on SANA, crush 438× — on W4A4.
+    /// **No name-only anchor in any crate fires on this key** (the shared crate's fallback anchors on
+    /// a trailing `proj_out` segment, and Krea's head is not spelled that way), which is why the role
+    /// table names [`KreaSite::TrunkHead`] outright. That is precisely the defect class sc-12140
+    /// records: a name-only anchor that silently does not fire leaves the trunk head — measured Dense
+    /// on SANA, crush 438×, and on Krea, crush 909× — on W4A4.
     pub is_final_proj: bool,
     /// This projection **reads text-encoder-derived context** — Krea's analogue of the class the shared
     /// policy names `caption_projection` + `attn2`, neither of which exists here (see the [module
@@ -176,12 +559,27 @@ pub struct LayerRole {
     /// the ones the ~1/N quantizer-amortization argument depends on. The partition removes the layers
     /// that would have collapsed while keeping the ones the throughput case rests on.
     pub is_post_nonlinearity: bool,
+    /// The role table ([`KreaSite::classify`]) does not name this projection's key.
+    ///
+    /// This is not a fact about the trunk; it is the absence of one, and it is recorded rather than
+    /// defaulted away. Before sc-12121 an unrecognised key fell through every guard and landed on
+    /// W4A4 — the same silent-miss failure mode as a substring anchor that does not fire. Now it
+    /// selects [`DenseReason::Unclassified`], i.e. dense BF16.
+    pub is_unclassified: bool,
 }
 
 impl LayerRole {
     /// An interior compute-bulk projection: not an edge block, not the head, not context-reading.
     pub fn interior() -> Self {
         Self::default()
+    }
+
+    /// A projection the role table does not name — dense BF16 by [`DenseReason::Unclassified`].
+    pub fn unclassified() -> Self {
+        Self {
+            is_unclassified: true,
+            ..Self::default()
+        }
     }
 
     /// An interior projection in Krea's first/last single-stream transformer block.
@@ -216,33 +614,63 @@ impl LayerRole {
         }
     }
 
-    /// True iff `leaf` names a projection whose **input** is a post-nonlinearity intermediate rather
-    /// than a normalized block input — see [`Self::is_post_nonlinearity`].
-    ///
-    /// Structural, so it holds for the `text_fusion` blocks as well as the single-stream ones (both are
-    /// built from the same `GatedAttention` + `SwiGlu` modules).
-    fn names_post_nonlinearity(name: &str) -> bool {
-        name.ends_with(".attn.to_out.0") || name.ends_with(".ff.down")
-    }
-
     /// The role the shipping loader assigns `name` on a Krea trunk of `num_layers` single-stream blocks
     /// — the **single source of truth** for the trunk's topology facts.
     ///
     /// Shared by [`crate::transformer::Krea2Transformer::load_planned`] and the validation harness, so a
     /// report can never cross the measured class against a *different* partition than the one the loader
     /// actually built (the drift sc-11045's Sana harness invited by re-deriving roles inline).
+    ///
+    /// A key the role table does not name yields [`Self::unclassified`], **not** an interior
+    /// projection (sc-12121).
     pub fn for_krea_layer(name: &str, num_layers: usize) -> Self {
-        let leading_edge = (0..KREA_LEADING_EDGE_BLOCKS)
-            .any(|i| name.starts_with(&format!("transformer_blocks.{i}.")));
-        Self {
-            is_edge_block: leading_edge
-                || name.starts_with(&format!(
-                    "transformer_blocks.{}.",
-                    num_layers.saturating_sub(1)
-                )),
-            is_final_proj: name == "final_layer.linear",
-            is_context_read: name.starts_with("text_fusion.") || name.starts_with("txt_in."),
-            is_post_nonlinearity: Self::names_post_nonlinearity(name),
+        match KreaSite::classify(name) {
+            Some(site) => Self::for_site(site, num_layers),
+            None => Self::unclassified(),
+        }
+    }
+
+    /// The structural facts a [`KreaSite`] implies on a trunk of `num_layers` single-stream blocks —
+    /// the role table proper (sc-12121). Exhaustive over the enum, so adding a site is a compile
+    /// error until its facts are stated.
+    pub fn for_site(site: KreaSite, num_layers: usize) -> Self {
+        match site {
+            // The image ingest measured perfectly Benign (1.00000, crush 0.0): compute bulk.
+            KreaSite::ImageIngest => Self::interior(),
+            KreaSite::ContextIngest => Self::context_read(),
+            KreaSite::TextFusion { leaf } => Self {
+                is_context_read: true,
+                is_post_nonlinearity: leaf.reads_post_nonlinearity(),
+                ..Self::default()
+            },
+            KreaSite::Block { index, leaf } => Self {
+                is_edge_block: index < KREA_LEADING_EDGE_BLOCKS || index + 1 == num_layers.max(1),
+                is_post_nonlinearity: leaf.reads_post_nonlinearity(),
+                ..Self::default()
+            },
+            KreaSite::TrunkHead => Self::final_proj(),
+        }
+    }
+
+    /// The [`ExecutionRole`] these structural facts select, **before** any device or checkpoint
+    /// capability fact (sc-12121). The capability-aware form is [`DitPlan::representation`].
+    ///
+    /// The precedence is the reporting order only — the facts are not mutually exclusive (a
+    /// `text_fusion` `ff.down` is both context-reading and post-nonlinearity), and every one of them
+    /// selects dense BF16, so which is named cannot change the representation.
+    pub fn execution_role(&self) -> ExecutionRole {
+        if self.is_unclassified {
+            ExecutionRole::DenseBf16(DenseReason::Unclassified)
+        } else if self.is_final_proj {
+            ExecutionRole::DenseBf16(DenseReason::TrunkHead)
+        } else if self.is_context_read {
+            ExecutionRole::DenseBf16(DenseReason::ContextRead)
+        } else if self.is_post_nonlinearity {
+            ExecutionRole::DenseBf16(DenseReason::PostNonlinearity)
+        } else if self.is_edge_block {
+            ExecutionRole::DenseBf16(DenseReason::EdgeBlock)
+        } else {
+            ExecutionRole::PackedW4A4
         }
     }
 }
@@ -350,7 +778,13 @@ impl DitPlan {
     /// The activation precision this plan assigns `name`, deriving the [`LayerRole`] from the trunk
     /// topology — **the form the loader uses**, so the role is never stated twice.
     pub fn act_for_layer(&self, name: &str) -> ActPrecision {
-        self.act_for(name, self.role_for(name))
+        self.act_for(self.role_for(name))
+    }
+
+    /// The [`ExecutionRole`] this plan assigns `name` from its structural role alone — the
+    /// capability-blind half of [`Self::representation`].
+    pub fn execution_role_for_layer(&self, name: &str) -> ExecutionRole {
+        self.execution_role(self.role_for(name))
     }
 
     /// Serve every eligible projection through [`Nvfp4Linear`] under `quant`.
@@ -389,41 +823,86 @@ impl DitPlan {
         self.probe.as_ref()
     }
 
-    /// The activation precision this plan assigns `name`, given the structural facts Krea's loader knows
-    /// and a dotted key cannot carry.
+    /// The [`ExecutionRole`] this plan assigns a projection with structural role `role`
+    /// (sc-12121) — **the production Krea selection**, and the reason no substring heuristic reaches
+    /// it: `role` is the only input, so a dotted key cannot participate in the decision at all.
     ///
-    /// [`ActPrecision::for_outlier_layer_with`] carries the shared substring policy; the three Krea
-    /// facts are threaded in here because **only the provider knows them** and all three of the shared
-    /// policy's corresponding anchors miss on Krea's naming (see the [module docs](self)):
+    /// Each structural fact was verified against real Krea activations (sc-12110) — none is inherited
+    /// belief:
     ///
-    /// * `is_edge_block` — Krea's **last** block (`transformer_blocks.27.`), which the shared policy's
-    ///   `last_block`/`final_block` markers do not match.
-    /// * `is_final_proj` — Krea's head is `final_layer.linear`; `names_final_proj` anchors on a
-    ///   trailing `proj_out` segment and will **not** fire (sc-12140).
-    /// * `is_context_read` — Krea's `text_fusion.*` / `txt_in.*`; the shared policy's `caption_projection`
-    ///   and `attn2` / `cross_att*` anchors have no Krea counterpart (it is a single-stream DiT with no
-    ///   cross-attention).
+    /// * `is_edge_block` — blocks 0..3 and the last measured Dense on their block **inputs** (crush
+    ///   686×); the shared crate's `last_block`/`final_block` markers never matched
+    ///   `transformer_blocks.27.` anyway.
+    /// * `is_context_read` — `text_fusion` `to_out.0` measured Dense at crush 40145×; the shared
+    ///   crate's `caption_projection` / `attn2` / `cross_att*` anchors have no Krea counterpart (it
+    ///   is a single-stream DiT with no cross-attention).
+    /// * `is_post_nonlinearity` — `ff.down` measured Dense in 28/28 blocks.
+    /// * `is_final_proj` — `final_layer.linear`, measured Dense at crush 909×, which no name-only
+    ///   anchor fires on (sc-12140).
+    /// * `is_unclassified` — a key the role table does not name, which must not reach the packed lane
+    ///   by default.
+    pub fn execution_role(&self, role: LayerRole) -> ExecutionRole {
+        match self.quant {
+            Some(Nvfp4Quant::BlanketW4A4) => ExecutionRole::PackedW4A4,
+            Some(Nvfp4Quant::BlanketW4A16) | None => {
+                ExecutionRole::DenseBf16(DenseReason::DenseRegimeRequested)
+            }
+            Some(Nvfp4Quant::Mixed) => role.execution_role(),
+        }
+    }
+
+    /// The activation precision this plan assigns a projection with structural role `role`.
     ///
     /// Public so a validation harness can ask what the shipping policy *would* assign a layer while
     /// probing a **baseline** trunk (sc-12110's partition gate measures unquantized activations, then
     /// crosses the measured class against this assumed one).
-    pub fn act_for(&self, name: &str, role: LayerRole) -> ActPrecision {
-        match self.quant {
-            Some(Nvfp4Quant::BlanketW4A4) => ActPrecision::W4A4,
-            Some(Nvfp4Quant::BlanketW4A16) => ActPrecision::W4A16,
-            // Mixed: the shared policy, plus the structural facts only the loader knows. Each of these
-            // three was verified against real Krea activations (sc-12110) — none is inherited belief:
-            //   * is_edge_block      → blocks 0..3 measured Dense on their block INPUTS (crush 686×);
-            //   * is_context_read    → text_fusion `to_out.0` measured Dense at crush 40145×;
-            //   * is_post_nonlinearity → `ff.down` measured Dense in 28/28 blocks.
-            Some(Nvfp4Quant::Mixed) => {
-                if role.is_edge_block || role.is_context_read || role.is_post_nonlinearity {
-                    ActPrecision::W4A16
-                } else {
-                    ActPrecision::for_outlier_layer_with(name, role.is_final_proj)
-                }
+    pub fn act_for(&self, role: LayerRole) -> ActPrecision {
+        self.execution_role(role).act_precision()
+    }
+
+    /// **The decision table** (sc-12121): the representation `name` actually resolves to under the
+    /// checkpoint and device facts `cap` carries.
+    ///
+    /// Precedence is the order the real pipeline settles these questions, so the reported
+    /// [`DenseReason`] names the stage that actually decided:
+    ///
+    /// 1. `full_precision_matrix_mult`, a preserved-dense layer, padded storage, an ineligible grid,
+    ///    and a device below the `sm_120` floor are all settled at **plan** time by
+    ///    `CandleCodecResidency` — such a row is priced (and materialized) dense, so no packed
+    ///    container ever reaches `Nvfp4Linear`.
+    /// 2. The plan's requested regime (baseline / blanket W4A16 → dense BF16 by request).
+    /// 3. The **structural role** — the outlier-sensitive classes, which run W4A16, i.e. dense BF16.
+    /// 4. The construction-time fused-quantizer probe inside `Nvfp4Linear` (sc-12078).
+    ///
+    /// Only a projection that clears every one of them is served [`ExecutionRole::PackedW4A4`].
+    pub fn representation(&self, name: &str, cap: Nvfp4Capability) -> ExecutionRole {
+        self.representation_for_role(self.role_for(name), cap)
+    }
+
+    /// [`Self::representation`] over an already-derived structural role.
+    pub fn representation_for_role(&self, role: LayerRole, cap: Nvfp4Capability) -> ExecutionRole {
+        let dense = |reason| ExecutionRole::DenseBf16(reason);
+        if cap.full_precision_declared {
+            return dense(DenseReason::FullPrecisionDeclared);
+        }
+        if !cap.checkpoint_offers_nvfp4 {
+            return dense(DenseReason::PreservedDense);
+        }
+        if !cap.storage_unpadded {
+            return dense(DenseReason::PaddedStorage);
+        }
+        if !cap.layout_native {
+            return dense(DenseReason::ShapeIneligible);
+        }
+        if !cap.nvfp4_device {
+            return dense(DenseReason::NoNvfp4Hardware);
+        }
+        match self.execution_role(role) {
+            ExecutionRole::DenseBf16(reason) => dense(reason),
+            ExecutionRole::PackedW4A4 if !cap.fused_quantizer => {
+                dense(DenseReason::NoFusedQuantizer)
             }
-            None => ActPrecision::W4A16,
+            ExecutionRole::PackedW4A4 => ExecutionRole::PackedW4A4,
         }
     }
 }
@@ -764,6 +1243,147 @@ pub fn summarize(records: &[ActRecord]) -> Vec<LayerSparsitySummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// **`ALL` is every variant** (sc-12121 review fix). `pub const ALL: [Self; 8]` is an array
+    /// literal, not an exhaustive construct: a leaf added to the enum but left out of it would be
+    /// invisible to the coverage walk while still classifying — the "no leaf without a role-table
+    /// row" claim would quietly stop holding.
+    ///
+    /// So `ALL` is crossed against the exhaustive [`BlockLeaf::ordinal`] match (which a new variant
+    /// cannot compile without extending) in both directions: every ordinal `0..ALL.len()` names a
+    /// leaf, and every leaf's ordinal is its position in `ALL`. Add a ninth variant and the macro
+    /// forces it an ordinal; whatever ordinal it gets, either it collides (RED here) or it is
+    /// `ALL.len()`, and `from_ordinal(ALL.len())` then returns `Some` — also RED.
+    #[test]
+    fn block_leaf_all_is_every_variant() {
+        for (i, leaf) in BlockLeaf::ALL.iter().enumerate() {
+            assert_eq!(leaf.ordinal(), i, "{leaf:?} is not at its ordinal in ALL");
+            assert_eq!(BlockLeaf::from_ordinal(i), Some(*leaf));
+        }
+        assert_eq!(
+            BlockLeaf::from_ordinal(BlockLeaf::ALL.len()),
+            None,
+            "the exhaustive ordinal match names more leaves than `BlockLeaf::ALL` lists — a variant \
+             was added to the enum without being added to ALL"
+        );
+        // Every key round-trips, and the eight keys are distinct.
+        for leaf in BlockLeaf::ALL {
+            assert_eq!(BlockLeaf::from_leaf_key(leaf.leaf_key()), Some(leaf));
+            assert_eq!(
+                leaf.leaf_key(),
+                format!("{}.{}", leaf.module(), leaf.module_leaf()),
+                "leaf_key must be module + module_leaf composed"
+            );
+        }
+        let keys: BTreeSet<&str> = BlockLeaf::ALL.iter().map(|l| l.leaf_key()).collect();
+        assert_eq!(keys.len(), BlockLeaf::ALL.len(), "duplicate leaf keys");
+        // ATTN + FF partition ALL, and each sub-list is one module.
+        let split: Vec<BlockLeaf> = BlockLeaf::ATTN
+            .into_iter()
+            .chain(BlockLeaf::FF)
+            .collect::<Vec<_>>();
+        assert_eq!(split, BlockLeaf::ALL.to_vec());
+        assert!(BlockLeaf::ATTN.iter().all(|l| l.module() == "attn"));
+        assert!(BlockLeaf::FF.iter().all(|l| l.module() == "ff"));
+        // The post-nonlinearity partition is the sc-12110 finding, pinned.
+        let post: BTreeSet<&str> = BlockLeaf::ALL
+            .iter()
+            .filter(|l| l.reads_post_nonlinearity())
+            .map(|l| l.leaf_key())
+            .collect();
+        assert_eq!(
+            post,
+            BTreeSet::from(["attn.to_out.0", "ff.down"]),
+            "the post-nonlinearity class moved"
+        );
+    }
+
+    /// **The loader's leaf strings ARE the role table's** (sc-12121 review fix).
+    ///
+    /// The original review found the coverage walk building block keys from `BlockLeaf::leaf_key`
+    /// while claiming to spell them the way the loader does — the table checked against itself. The
+    /// fix made `GatedAttention::load_planned` / `SwiGlu::load_planned` read their suffixes from
+    /// [`BlockLeaf::module_leaf`], so there is one source. This test proves the loop closes against
+    /// something the table does **not** own:
+    ///
+    /// 1. `testfix::tiny_transformer` writes a real safetensors file whose keys are spelled by hand
+    ///    (`{prefix}.attn.to_q`, `{prefix}.ff.down`, …) and loads a real trunk through the real
+    ///    loader — so a table typo makes the load fail outright.
+    /// 2. `native_mapping::BLOCK_DIFFUSERS_LEAVES` is the checkpoint namespace's own independent
+    ///    enumeration of per-block leaves; the eight GEMM leaves must each appear there.
+    ///
+    /// Mutate any one of the eight `module_leaf` literals and both halves go RED.
+    #[test]
+    fn loader_leaf_literals_match_the_role_table() {
+        // (2) — the checkpoint namespace's list, which nothing in `nvfp4_dit` produces.
+        let checkpoint: BTreeSet<&str> = crate::native_mapping::BLOCK_DIFFUSERS_LEAVES
+            .iter()
+            .copied()
+            .collect();
+        for leaf in BlockLeaf::ALL {
+            let weight_key = format!("{}.weight", leaf.leaf_key());
+            assert!(
+                checkpoint.contains(weight_key.as_str()),
+                "{weight_key} is not a per-block leaf the Krea checkpoint namespace names — the \
+                 role table and the checkpoint's key spelling have drifted"
+            );
+        }
+
+        // (1) — a real load through the real loader, keys spelled independently by the fixture.
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, _cfg) = crate::testfix::tiny_transformer(&tmp);
+        let loaded: BTreeSet<String> = dit
+            .nvfp4_layer_names()
+            .into_iter()
+            .filter_map(|n| n.strip_prefix("transformer_blocks.0.").map(str::to_string))
+            .collect();
+        let table: BTreeSet<String> = BlockLeaf::ALL
+            .iter()
+            .map(|l| l.leaf_key().to_string())
+            .collect();
+        assert_eq!(
+            loaded, table,
+            "the block's loaded projection keys and `BlockLeaf::ALL` disagree — a key that stops \
+             classifying silently downgrades to DenseReason::Unclassified"
+        );
+    }
+
+    /// **Only the two unpredictable causes are excused** (sc-12121 review fix).
+    ///
+    /// `dense_reason_for_fallback` is the whole width of the hole `check_representation` allows in
+    /// its refusal, so the set of causes it maps must be exactly the two `Nvfp4Capability` cannot
+    /// model. Widen it to a cause the capability facts DO model — say `NoFusedQuantizer`, which
+    /// `Nvfp4Capability::fused_quantizer` predicts — and a real prediction defect stops being an
+    /// error, which is the coverage lie this story exists to delete.
+    #[test]
+    fn only_the_unpredictable_fallback_causes_are_excused() {
+        let excused: Vec<Nvfp4Fallback> = [
+            Nvfp4Fallback::W4A16Requested,
+            Nvfp4Fallback::NotCudaDevice,
+            Nvfp4Fallback::ShapeIneligible,
+            Nvfp4Fallback::NoDeviceHandle,
+            Nvfp4Fallback::DeviceMismatch,
+            Nvfp4Fallback::NoFusedQuantizer,
+            Nvfp4Fallback::StagingFailed,
+        ]
+        .into_iter()
+        .filter(|c| dense_reason_for_fallback(*c).is_some())
+        .collect();
+        assert_eq!(
+            excused,
+            vec![Nvfp4Fallback::DeviceMismatch, Nvfp4Fallback::StagingFailed],
+            "exactly the two runtime accidents no per-key capability probe can see may be excused"
+        );
+        assert_eq!(
+            dense_reason_for_fallback(Nvfp4Fallback::DeviceMismatch),
+            Some(DenseReason::DeviceMismatch)
+        );
+        assert_eq!(
+            dense_reason_for_fallback(Nvfp4Fallback::StagingFailed),
+            Some(DenseReason::StagingFailed)
+        );
+    }
 
     #[test]
     fn baseline_plan_is_not_nvfp4_and_blanket_plans_force_their_regime() {
@@ -771,17 +1391,10 @@ mod tests {
         let w4a4 = DitPlan::nvfp4(Nvfp4Quant::BlanketW4A4);
         assert!(w4a4.is_nvfp4());
         // A blanket plan ignores the outlier policy — even for a role the policy would flag.
+        assert_eq!(w4a4.act_for(LayerRole::context_read()), ActPrecision::W4A4);
+        assert_eq!(w4a4.act_for(LayerRole::final_proj()), ActPrecision::W4A4);
         assert_eq!(
-            w4a4.act_for("txt_in.linear_1", LayerRole::context_read()),
-            ActPrecision::W4A4
-        );
-        assert_eq!(
-            w4a4.act_for("final_layer.linear", LayerRole::final_proj()),
-            ActPrecision::W4A4
-        );
-        assert_eq!(
-            DitPlan::nvfp4(Nvfp4Quant::BlanketW4A16)
-                .act_for("transformer_blocks.7.attn.to_q", LayerRole::interior()),
+            DitPlan::nvfp4(Nvfp4Quant::BlanketW4A16).act_for(LayerRole::interior()),
             ActPrecision::W4A16
         );
     }
@@ -861,46 +1474,42 @@ mod tests {
     ///
     /// This is the arithmetic behind the run's `139/260 fp4-lit`: 23 interior blocks (4..=26) × 6 benign
     /// leaves + `img_in`. If someone widens or narrows a guard, this count moves and the test says so.
-    #[test]
-    fn measured_partition_yields_the_expected_w4a4_surface() {
-        let p = DitPlan::nvfp4(Nvfp4Quant::Mixed);
-        let n = DEFAULT_NUM_LAYERS;
+    /// Every dotted key the NVFP4 lane serves on a Krea trunk of `n` single-stream blocks — built
+    /// from the role table's own leaf enumeration, in the order the loader visits them.
+    ///
+    /// **This is the table's inverse, and says so.** The per-block suffixes come from
+    /// [`BlockLeaf::leaf_key`], not from a second copy of the loader's literals — because since
+    /// sc-12121's review fix the loader has no literals of its own: `GatedAttention::load_planned`
+    /// and `SwiGlu::load_planned` call [`BlockLeaf::module_leaf`] and [`BlockLeaf::module`]. There is
+    /// one source of the eight strings, so "the loader's surface" and "the table's inverse" are the
+    /// same set by construction. What crosses the two is
+    /// `loader_leaf_literals_match_the_role_table`, which walks a real loaded block's projection keys
+    /// and asserts they are exactly `BlockLeaf::ALL.map(leaf_key)`; this helper then supplies the
+    /// non-block keys (`img_in`, `txt_in.*`, `final_layer.linear`) the same way.
+    fn krea_lane_surface(n: usize) -> Vec<String> {
+        let leaves = || BlockLeaf::ALL.into_iter().map(BlockLeaf::leaf_key);
         let mut names: Vec<String> = vec![
             "img_in".into(),
             "txt_in.linear_1".into(),
             "txt_in.linear_2".into(),
         ];
         for i in 0..n {
-            for leaf in [
-                "attn.to_q",
-                "attn.to_k",
-                "attn.to_v",
-                "attn.to_gate",
-                "attn.to_out.0",
-                "ff.gate",
-                "ff.up",
-                "ff.down",
-            ] {
-                names.push(format!("transformer_blocks.{i}.{leaf}"));
-            }
+            names.extend(leaves().map(|leaf| format!("transformer_blocks.{i}.{leaf}")));
         }
         for kind in ["layerwise_blocks", "refiner_blocks"] {
             for i in 0..2 {
-                for leaf in [
-                    "attn.to_q",
-                    "attn.to_k",
-                    "attn.to_v",
-                    "attn.to_gate",
-                    "attn.to_out.0",
-                    "ff.gate",
-                    "ff.up",
-                    "ff.down",
-                ] {
-                    names.push(format!("text_fusion.{kind}.{i}.{leaf}"));
-                }
+                names.extend(leaves().map(|leaf| format!("text_fusion.{kind}.{i}.{leaf}")));
             }
         }
         names.push("final_layer.linear".into());
+        names
+    }
+
+    #[test]
+    fn measured_partition_yields_the_expected_w4a4_surface() {
+        let p = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        let n = DEFAULT_NUM_LAYERS;
+        let names = krea_lane_surface(n);
         assert_eq!(names.len(), 260, "the lane's surface");
 
         let w4a4: Vec<&String> = names
@@ -927,24 +1536,214 @@ mod tests {
         }
     }
 
-    /// **The sc-12140 defect, pinned for Krea.** The shared name-only fallback anchors on a trailing
-    /// `proj_out` segment. Krea's head is `final_layer.linear`, so the fallback does **not** fire — the
-    /// loader MUST thread `LayerRole::final_proj()`. If someone ever drops that threading, this test
-    /// fails rather than the trunk head silently landing on W4A4.
+    /// **The sc-12140 defect, pinned for Krea — now as a role-table property (sc-12121).** The head is
+    /// guarded because [`KreaSite::classify`] names it [`KreaSite::TrunkHead`], not because any name
+    /// anchor fires on it. If someone ever drops that row from the table, the key stops classifying
+    /// and this test fails — rather than the trunk head silently landing on W4A4.
     #[test]
-    fn final_head_is_only_guarded_because_the_loader_states_it() {
+    fn final_head_is_guarded_by_the_role_table_not_by_its_name() {
         let p = DitPlan::nvfp4(Nvfp4Quant::Mixed);
-        // Without the explicit role, the name alone leaves Krea's head on the compute path.
         assert_eq!(
-            p.act_for("final_layer.linear", LayerRole::interior()),
+            KreaSite::classify("final_layer.linear"),
+            Some(KreaSite::TrunkHead)
+        );
+        assert_eq!(p.act_for_layer("final_layer.linear"), ActPrecision::W4A16);
+        assert_eq!(
+            p.execution_role_for_layer("final_layer.linear"),
+            ExecutionRole::DenseBf16(DenseReason::TrunkHead)
+        );
+        // Hand the plan a role that does NOT state the head, and the same key rides W4A4 — proof the
+        // decision comes from the role, not from the spelling.
+        assert_eq!(
+            p.act_for(LayerRole::interior()),
             ActPrecision::W4A4,
-            "precondition: Krea's head name is NOT inferable by the shared anchor"
+            "no name anchor participates: an interior role is an interior projection"
         );
-        // With it, guarded.
+    }
+
+    /// **AC1 coverage: the role table names every projection the lane serves, and nothing else
+    /// reaches the packed lane** (sc-12121).
+    ///
+    /// The surface is enumerated from the enum itself ([`BlockLeaf::ALL`] × the block sites plus the
+    /// three fixed sites), so a leaf added to a block without a role-table row cannot compile, and a
+    /// key the loader passes that the table does not name cannot classify.
+    #[test]
+    fn every_krea_projection_receives_an_explicit_role() {
+        let n = DEFAULT_NUM_LAYERS;
+        let plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(n);
+        for name in krea_lane_surface(n) {
+            let site = KreaSite::classify(&name).unwrap_or_else(|| {
+                panic!("`{name}` is served by the lane but has no role-table row")
+            });
+            let role = LayerRole::for_krea_layer(&name, n);
+            assert!(
+                !role.is_unclassified,
+                "`{name}` classified as {site:?} but produced an unclassified role"
+            );
+            assert_eq!(
+                role,
+                LayerRole::for_site(site, n),
+                "`{name}`: the key-parse and the site-table must agree"
+            );
+            // Every projection gets one of exactly two execution roles — no third state, no default.
+            let got = plan.execution_role_for_layer(&name);
+            assert!(
+                got.is_packed_w4a4() || matches!(got, ExecutionRole::DenseBf16(_)),
+                "`{name}` has no execution role"
+            );
+            assert_eq!(got.act_precision(), plan.act_for_layer(&name));
+        }
+        // Every site variant and every leaf is exercised by that enumeration (an exhaustive match
+        // here is what makes "exhaustive" a compile-time property rather than a claim).
+        for leaf in BlockLeaf::ALL {
+            for site in [
+                KreaSite::Block { index: 7, leaf },
+                KreaSite::TextFusion { leaf },
+            ] {
+                match site {
+                    KreaSite::Block { .. } | KreaSite::TextFusion { .. } => {}
+                    KreaSite::ImageIngest | KreaSite::ContextIngest | KreaSite::TrunkHead => {}
+                }
+                assert_eq!(
+                    LayerRole::for_site(site, DEFAULT_NUM_LAYERS).is_post_nonlinearity,
+                    leaf.reads_post_nonlinearity()
+                );
+            }
+        }
+    }
+
+    /// **An unrecognised key takes the dense BF16 fallback, never the packed lane** (sc-12121).
+    ///
+    /// This is the failure mode the substring anchors had: a guard that does not fire leaves an
+    /// outlier-carrying layer on W4A4. The role table's answer to "I do not know this key" is dense.
+    #[test]
+    fn an_unclassified_key_falls_back_to_dense_bf16() {
+        let p = DitPlan::nvfp4(Nvfp4Quant::Mixed);
+        for name in [
+            // Plausible-looking keys that are NOT lane sites: the excluded embedders, the
+            // `text_fusion` projector, a control-branch `proj_out`, a leaf that does not exist.
+            "time_embed.linear_1",
+            "time_mod_proj",
+            "text_fusion.projector",
+            "transformer_blocks.3.control.proj_out",
+            "transformer_blocks.3.attn.to_out",
+            "transformer_blocks.x.attn.to_q",
+            "text_fusion.layerwise_blocks.q.ff.up",
+            "",
+        ] {
+            assert_eq!(KreaSite::classify(name), None, "`{name}` must not classify");
+            assert!(LayerRole::for_krea_layer(name, DEFAULT_NUM_LAYERS).is_unclassified);
+            assert_eq!(
+                p.execution_role_for_layer(name),
+                ExecutionRole::DenseBf16(DenseReason::Unclassified),
+                "`{name}` is unknown and must fall back to dense bf16"
+            );
+            assert_eq!(p.act_for_layer(name), ActPrecision::W4A16);
+        }
+    }
+
+    /// **AC2: the packed-versus-dense decision table.** Each capability miss selects dense BF16 with
+    /// the reason that names the stage which actually decided, and only the fully eligible row on a
+    /// benign structural role reaches packed W4A4.
+    #[test]
+    fn capability_misses_each_select_dense_bf16_with_their_own_reason() {
+        let p = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(DEFAULT_NUM_LAYERS);
+        let benign = "transformer_blocks.7.attn.to_q";
+        // The one row that reaches the packed lane.
         assert_eq!(
-            p.act_for("final_layer.linear", LayerRole::final_proj()),
-            ActPrecision::W4A16
+            p.representation(benign, Nvfp4Capability::ELIGIBLE),
+            ExecutionRole::PackedW4A4
         );
+
+        let cases: [(Nvfp4Capability, DenseReason); 6] = [
+            (
+                Nvfp4Capability {
+                    full_precision_declared: true,
+                    ..Nvfp4Capability::ELIGIBLE
+                },
+                DenseReason::FullPrecisionDeclared,
+            ),
+            (
+                Nvfp4Capability {
+                    checkpoint_offers_nvfp4: false,
+                    ..Nvfp4Capability::ELIGIBLE
+                },
+                DenseReason::PreservedDense,
+            ),
+            (
+                Nvfp4Capability {
+                    storage_unpadded: false,
+                    ..Nvfp4Capability::ELIGIBLE
+                },
+                DenseReason::PaddedStorage,
+            ),
+            (
+                Nvfp4Capability {
+                    layout_native: false,
+                    ..Nvfp4Capability::ELIGIBLE
+                },
+                DenseReason::ShapeIneligible,
+            ),
+            (Nvfp4Capability::NO_HARDWARE, DenseReason::NoNvfp4Hardware),
+            (
+                Nvfp4Capability {
+                    fused_quantizer: false,
+                    ..Nvfp4Capability::ELIGIBLE
+                },
+                DenseReason::NoFusedQuantizer,
+            ),
+        ];
+        for (cap, reason) in cases {
+            assert_eq!(
+                p.representation(benign, cap),
+                ExecutionRole::DenseBf16(reason),
+                "{cap:?} must select dense bf16 as {reason:?}"
+            );
+        }
+
+        // The outlier-sensitive structural classes select dense BF16 even on a fully eligible device.
+        for (name, reason) in [
+            ("final_layer.linear", DenseReason::TrunkHead),
+            ("txt_in.linear_1", DenseReason::ContextRead),
+            (
+                "text_fusion.refiner_blocks.0.attn.to_q",
+                DenseReason::ContextRead,
+            ),
+            (
+                "transformer_blocks.7.ff.down",
+                DenseReason::PostNonlinearity,
+            ),
+            ("transformer_blocks.0.attn.to_q", DenseReason::EdgeBlock),
+            ("transformer_blocks.27.ff.up", DenseReason::EdgeBlock),
+            ("nothing.the.table.names", DenseReason::Unclassified),
+        ] {
+            assert_eq!(
+                p.representation(name, Nvfp4Capability::ELIGIBLE),
+                ExecutionRole::DenseBf16(reason),
+                "{name} is outlier-sensitive by structure and must not ride W4A4"
+            );
+        }
+
+        // A blanket-W4A4 bench ignores the ROLE but never the capability facts…
+        let blanket = DitPlan::nvfp4(Nvfp4Quant::BlanketW4A4);
+        assert_eq!(
+            blanket.representation("final_layer.linear", Nvfp4Capability::ELIGIBLE),
+            ExecutionRole::PackedW4A4
+        );
+        assert_eq!(
+            blanket.representation("final_layer.linear", Nvfp4Capability::NO_HARDWARE),
+            ExecutionRole::DenseBf16(DenseReason::NoNvfp4Hardware)
+        );
+        // …and the storage tier / baseline are dense bf16 by request, on any device.
+        for plan in [
+            DitPlan::nvfp4(Nvfp4Quant::BlanketW4A16),
+            DitPlan::baseline(),
+        ] {
+            assert_eq!(
+                plan.representation(benign, Nvfp4Capability::ELIGIBLE),
+                ExecutionRole::DenseBf16(DenseReason::DenseRegimeRequested)
+            );
+        }
     }
 
     /// The role assignment is derived from the trunk's topology in ONE place, so the loader and the

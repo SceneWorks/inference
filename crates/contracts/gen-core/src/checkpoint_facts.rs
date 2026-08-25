@@ -38,9 +38,10 @@
 //!   native, because there is no capability to license the label and no planned packed pricing to
 //!   measure against.
 //! * Nothing may exceed the plan: the receipt is measured over what has materialized *so far*, so
-//!   every count and byte total is `<=` the plan's — including **per codec row**, where a row's
-//!   `source_bytes` may not exceed its own inventory entry's (the bound that catches a receipt
-//!   double-counting a fused physical tensor even when the file-wide total still fits).
+//!   every count and byte total is `<=` the plan's — including **per codec**, where the receipt's
+//!   rows for one codec may not together exceed that codec's inventory entry (the bound that
+//!   catches a receipt double-counting a fused physical tensor even when the file-wide total still
+//!   fits).
 //! * **And equal once the load is complete.** When the receipt is
 //!   [`LogicalReadMaterialization::Materialized`] and covers the plan's whole tensor surface
 //!   ([`CheckpointWeightFacts::is_complete`]), `<=` is upgraded to `==`: every planned
@@ -60,11 +61,19 @@
 //!
 //! # Why the source inventory counts a physical tensor once
 //!
-//! [`SourceCodecEntry::source_bytes`] sums each **distinct physical key** once, while
-//! `tensor_count` counts **logical** tensors. Those differ whenever one stored tensor feeds several
-//! logical outputs (a fused QKV projection split at read time), and summing per logical row would
-//! report a file larger than it is. Resident bytes stay attributed per logical row, because that
-//! is what actually occupies memory.
+//! `tensor_count` counts **logical** tensors, while [`SourceCodecEntry::source_bytes`] totals the
+//! file exactly once. Those differ whenever one stored tensor feeds several logical outputs (a
+//! fused QKV projection split at read time, sc-21547).
+//!
+//! The rule that reconciles them lives in the **plan compiler**, not here: a transformed tensor
+//! contributes one plan entry per logical output, exactly one of which carries `source_bytes`
+//! while its siblings carry zero
+//! ([`crate::checkpoint_codec::LogicalTensorPlan::transform`]). So this summary — and every
+//! receipt producer — simply *sums*, and the sum is the file. De-duplicating by physical key would
+//! be actively wrong, because `plan.tensors` is sorted by logical key and the byte-carrying output
+//! is not generally the first sighting of a fused key.
+//!
+//! Resident bytes stay attributed per logical row, because that is what actually occupies memory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -320,16 +329,15 @@ impl SourceCodecSummary {
     /// its source bytes belong to, and picking one by iteration order would attribute them
     /// silently and unrepeatably.
     pub fn of(plan: &LogicalWeightPlan) -> Result<Self, CheckpointWeightFactsError> {
-        // Codec row → accumulator. Source bytes are accumulated over *distinct physical keys*, so
-        // a fused physical tensor feeding several logical outputs is counted once.
-        //
-        // `counted_physical` is global across codec rows rather than per row, which is only sound
-        // because a physical key belongs to exactly one codec — the invariant the collision check
-        // immediately below *enforces* rather than assumes. Without it, a key carrying two codec
-        // ids would have its bytes attributed to whichever row this loop reached first.
+        // Codec row → accumulator. Source bytes are a plain **sum** over plan entries, and that is
+        // what counts a fused physical tensor once: a transformed tensor contributes one entry per
+        // logical output, exactly one of which carries `source_bytes` while its siblings carry zero
+        // (the plan compiler's convention, sc-21547). De-duplicating by physical key here would be
+        // actively WRONG — `plan.tensors` is sorted by logical key, so for outputs `q`(bytes),
+        // `k`(0), `v`(0) the first sighting of the fused key is `k`, and a dedup would count its
+        // zero and discard the real bytes.
         let mut entries: BTreeMap<&'static str, SourceCodecEntry> = BTreeMap::new();
         let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
-        let mut counted_physical: BTreeSet<&str> = BTreeSet::new();
         for tensor in &plan.tensors {
             if let Some(previous) =
                 codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id)
@@ -353,9 +361,7 @@ impl SourceCodecSummary {
                     planned_dense_resident_bytes: 0,
                 });
             entry.tensor_count += 1;
-            if counted_physical.insert(tensor.physical_key.as_str()) {
-                entry.source_bytes = entry.source_bytes.saturating_add(tensor.source_bytes);
-            }
+            entry.source_bytes = entry.source_bytes.saturating_add(tensor.source_bytes);
             match tensor.residency.mode {
                 ResidencyMode::Packed => {
                     entry.planned_native_packed_tensors += 1;
@@ -385,9 +391,7 @@ impl SourceCodecSummary {
             let Some(entry) = entries.get_mut(codec_id) else {
                 continue;
             };
-            if counted_physical.insert(companion.physical_key.as_str()) {
-                entry.source_bytes = entry.source_bytes.saturating_add(companion.source_bytes);
-            }
+            entry.source_bytes = entry.source_bytes.saturating_add(companion.source_bytes);
             if packed_owners.contains(companion.owner_physical_key.as_str()) {
                 entry.planned_native_packed_resident_bytes = entry
                     .planned_native_packed_resident_bytes
@@ -875,6 +879,7 @@ mod tests {
                 mode,
                 resident_bytes: resident,
             },
+            transform: None,
         }
     }
 
@@ -892,6 +897,7 @@ mod tests {
                 mode: ResidencyMode::Dense,
                 resident_bytes: 128,
             },
+            transform: None,
         }
     }
 
@@ -1218,21 +1224,43 @@ mod tests {
         );
     }
 
-    /// One stored tensor feeding several logical outputs is counted **once** in source bytes and
-    /// several times in tensor/resident counts — the invariant a declarative fused-tensor transform
-    /// (sc-21547) needs from this summary.
-    #[test]
-    fn a_fused_physical_tensor_contributes_its_source_bytes_once() {
-        let mut fused_a = nvfp4_tensor("fused.q", ResidencyMode::Dense, 8192);
-        fused_a.physical_key = "fused.qkv".to_owned();
-        let mut fused_b = nvfp4_tensor("fused.k", ResidencyMode::Dense, 8192);
-        fused_b.physical_key = "fused.qkv".to_owned();
-        let plan = LogicalWeightPlan {
+    /// A fused plan in the shape the sc-21547 compiler emits: two logical outputs of one stored
+    /// tensor, sorted by logical key, with the **byte-carrying output second**.
+    ///
+    /// `fused.k` sorts before `fused.q`, and it is `fused.q` that carries the physical tensor's
+    /// source bytes (declaration position 0), so the first sighting of the fused physical key
+    /// carries ZERO. That ordering is deliberate: it is what makes this fixture able to catch a
+    /// de-dup-by-physical-key implementation, which would count the leading zero and discard the
+    /// real bytes.
+    fn fused_plan() -> LogicalWeightPlan {
+        let mut carries_bytes = nvfp4_tensor("fused.q", ResidencyMode::Dense, 8192);
+        carries_bytes.physical_key = "fused.qkv".to_owned();
+        let mut sibling = nvfp4_tensor("fused.k", ResidencyMode::Dense, 8192);
+        sibling.physical_key = "fused.qkv".to_owned();
+        // The compiler's convention: siblings of the byte-carrier carry zero.
+        sibling.source_bytes = 0;
+        LogicalWeightPlan {
             mapping_id: MAPPING,
-            tensors: vec![fused_a, fused_b],
+            // Sorted by logical key, as the compiler emits: `fused.k` (0 bytes) then `fused.q`.
+            tensors: vec![sibling, carries_bytes],
             companions: vec![],
             source_bytes: 2048,
-        };
+        }
+    }
+
+    /// One stored tensor feeding several logical outputs is counted **once** in source bytes and
+    /// several times in tensor/resident counts — the invariant the declarative fused-tensor
+    /// transforms (sc-21547) need from this summary.
+    ///
+    /// # Mutation
+    ///
+    /// De-duplicate by physical key in `SourceCodecSummary::of` (`if counted_physical.insert(..)`,
+    /// as an earlier draft of this story did): the first sighting is the zero-carrying `fused.k`,
+    /// so `entry.source_bytes` becomes 0 and this test goes red. That is the trap this fixture's
+    /// key ordering exists to spring.
+    #[test]
+    fn a_fused_physical_tensor_contributes_its_source_bytes_once() {
+        let plan = fused_plan();
         let entry = SourceCodecSummary::of(&plan)
             .expect("one codec per physical key")
             .entry(NVFP4_CODEC.codec_id)
@@ -1261,22 +1289,13 @@ mod tests {
     /// plan hit before the fix.
     #[test]
     fn a_fused_plans_receipt_validates_rather_than_exceeding_the_source() {
-        let mut fused_a = nvfp4_tensor("fused.q", ResidencyMode::Dense, 8192);
-        fused_a.physical_key = "fused.qkv".to_owned();
-        let mut fused_b = nvfp4_tensor("fused.k", ResidencyMode::Dense, 8192);
-        fused_b.physical_key = "fused.qkv".to_owned();
-        let plan = LogicalWeightPlan {
-            mapping_id: MAPPING,
-            tensors: vec![fused_a, fused_b],
-            companions: vec![],
-            // The file holds ONE 2048-byte tensor, however many logical outputs read it.
-            source_bytes: 2048,
-        };
+        let plan = fused_plan();
         let receipt = LogicalWeightReceipt {
             mapping_id: MAPPING,
             // Two LOGICAL outputs materialized…
             tensor_count: 2,
-            // …from one PHYSICAL tensor's bytes.
+            // …totalling the ONE physical tensor's bytes, because the producer summed plan entries
+            // and only the byte-carrying output contributed a non-zero number.
             source_bytes: 2048,
             materialization: LogicalReadMaterialization::Materialized,
             residency: vec![row(
@@ -1297,7 +1316,8 @@ mod tests {
         assert!(facts.is_complete());
         assert_eq!(facts.resident_bytes(), plan.resident_bytes());
 
-        // And the pre-fix producer's output is refused, by name.
+        // A producer that ignored the zero-sibling convention and re-added the physical tensor's
+        // bytes for every logical output is refused, by name.
         let mut double_counted = receipt;
         double_counted.source_bytes = 2048 + 2048;
         double_counted.residency[0].source_bytes = 2048 + 2048;
@@ -1404,9 +1424,11 @@ mod tests {
     }
 
     /// **One physical tensor may not be claimed by two codecs.** `codec_by_owner` was
-    /// last-write-wins and `counted_physical` is global across codec rows, so such a plan would
-    /// have attributed the tensor's source bytes to whichever row the loop reached first —
-    /// silently, and unrepeatably if the plan's tensor order ever changed.
+    /// last-write-wins, so a companion whose owner carried two codec ids would have had its source
+    /// bytes attributed to whichever row the loop reached last — silently, and unrepeatably if the
+    /// plan's tensor order ever changed. A fused tensor legitimately repeats a physical key, but
+    /// always under **one** codec; two codec ids on one key is a different thing entirely and has
+    /// no single right answer.
     ///
     /// # Mutation
     ///

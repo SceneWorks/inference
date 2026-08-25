@@ -214,7 +214,7 @@ const TOP_LEVEL_DIFFUSERS_KEYS: &[&str] = &[
 
 /// Every per-block diffusers leaf the architecture contains — the domain the block arms invert the
 /// forward map over.
-const BLOCK_DIFFUSERS_LEAVES: &[&str] = &[
+pub(crate) const BLOCK_DIFFUSERS_LEAVES: &[&str] = &[
     "attn.norm_q.weight",
     "attn.norm_k.weight",
     "attn.to_q.weight",
