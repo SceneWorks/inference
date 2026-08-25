@@ -162,6 +162,11 @@ mod cuda_impl {
         /// scaffolding); the NVFP4 path is a shipping compute lane so it does.
         nvfp4_algos:
             std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), CachedNvfp4Algo>>,
+        /// Number of cuBLASLt heuristic selections performed for each NVFP4 shape by this handle.
+        /// This is intentionally per-handle state, rather than a process-global test hook: it makes
+        /// cache reuse observable without coupling independent devices or test processes.
+        nvfp4_heuristic_selection_counts:
+            std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), usize>>,
         /// Cached device-resident **gather index** (`U32`) for the on-device NVFP4 activation
         /// quantizer (sc-11044), keyed by `(rows, n_blocks)`. For each byte offset in cuBLASLt's
         /// row-major scale-factor-atom layout it holds the source index into the row-major
@@ -216,6 +221,78 @@ mod cuda_impl {
     struct CachedNvfp4Algo {
         algo: sys::cublasLtMatmulAlgo_t,
         identity: Nvfp4AlgorithmIdentity,
+    }
+
+    /// RAII wrappers keep cuBLASLt resources balanced on every error path after descriptor creation.
+    /// The raw handles are only borrowed for cuBLASLt calls; their destructors run at scope exit.
+    struct MatmulDesc(sys::cublasLtMatmulDesc_t);
+
+    impl MatmulDesc {
+        fn new(
+            compute_type: sys::cublasComputeType_t,
+            scale_type: sys::cudaDataType_t,
+        ) -> Result<Self> {
+            lt::create_matmul_desc(compute_type, scale_type)
+                .map(Self)
+                .map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatmulDesc_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatmulDesc {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matmul_desc` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matmul_desc(self.0);
+            }
+        }
+    }
+
+    struct MatrixLayout(sys::cublasLtMatrixLayout_t);
+
+    impl MatrixLayout {
+        fn new(dtype: sys::cudaDataType_t, rows: u64, cols: u64, leading_dim: i64) -> Result<Self> {
+            lt::create_matrix_layout(dtype, rows, cols, leading_dim)
+                .map(Self)
+                .map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatrixLayout_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatrixLayout {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matrix_layout` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matrix_layout(self.0);
+            }
+        }
+    }
+
+    struct MatmulPreference(sys::cublasLtMatmulPreference_t);
+
+    impl MatmulPreference {
+        fn new() -> Result<Self> {
+            lt::create_matmul_pref().map(Self).map_err(cublas_err)
+        }
+
+        fn raw(&self) -> sys::cublasLtMatmulPreference_t {
+            self.0
+        }
+    }
+
+    impl Drop for MatmulPreference {
+        fn drop(&mut self) {
+            // Safety: `self.0` came from `create_matmul_pref` and is destroyed exactly once here.
+            unsafe {
+                let _ = lt::destroy_matmul_pref(self.0);
+            }
+        }
     }
 
     /// The two nvrtc-compiled kernels of the fused activation quantizer, cached on the handle. The
@@ -332,6 +409,16 @@ mod cuda_impl {
                 .map(|cached| cached.identity)
         }
 
+        /// Returns how often this handle has invoked cuBLASLt's NVFP4 heuristic for `(m, k, n)`.
+        /// A successful cache-backed repeat must leave this at one, so device tests can prove cache
+        /// reuse without relying on driver-specific algorithm IDs.
+        pub fn nvfp4_heuristic_selection_count(&self, m: usize, k: usize, n: usize) -> usize {
+            crate::lock_recover(&self.nvfp4_heuristic_selection_counts)
+                .get(&(m, k, n))
+                .copied()
+                .unwrap_or(0)
+        }
+
         pub fn new(dev: &Device) -> Result<Self> {
             let device = match dev {
                 Device::Cuda(c) => c.clone(),
@@ -347,6 +434,9 @@ mod cuda_impl {
                 workspace,
                 workspace_size: Self::WORKSPACE,
                 nvfp4_algos: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nvfp4_heuristic_selection_counts: std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
                 nvfp4_act_scale_gather_idx: std::sync::Mutex::new(std::collections::HashMap::new()),
                 nvfp4_quant_kernels: std::sync::Mutex::new(None),
             })
@@ -1270,21 +1360,20 @@ mod cuda_impl {
         ) -> Result<()> {
             let io_dtype = sys::cudaDataType_t::CUDA_R_4F_E2M1;
             let out_dtype = sys::cudaDataType_t::CUDA_R_16BF;
-            let desc = lt::create_matmul_desc(
+            let desc = MatmulDesc::new(
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 sys::cudaDataType_t::CUDA_R_32F,
-            )
-            .map_err(cublas_err)?;
+            )?;
 
             let transa: i32 = 1; // CUBLAS_OP_T  (A = W declared (K,N) col-major == our row-major (N,K))
             let transb: i32 = 0; // CUBLAS_OP_N  (B = X declared (K,M) col-major == our row-major (M,K))
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
                 &transa,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
                 &transb,
             )?;
@@ -1294,22 +1383,22 @@ mod cuda_impl {
             let scale_mode =
                 sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
                 &scale_mode,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
                 &scale_mode,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                 &sa_ptr,
             )?;
             set_attr(
-                desc,
+                desc.raw(),
                 sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
                 &sb_ptr,
             )?;
@@ -1317,12 +1406,9 @@ mod cuda_impl {
             // Layouts (see [`Self::run`] doc): A=(K,N) ld=K, B=(K,M) ld=K, D=(N,M) ld=N. For FP4 the
             // leading dim is in *elements* (K / N), not bytes — cuBLASLt handles the 2-nibbles/byte
             // packing internally from the `CUDA_R_4F_E2M1` dtype.
-            let a_layout = lt::create_matrix_layout(io_dtype, k as u64, n as u64, k as i64)
-                .map_err(cublas_err)?;
-            let b_layout = lt::create_matrix_layout(io_dtype, k as u64, m as u64, k as i64)
-                .map_err(cublas_err)?;
-            let d_layout = lt::create_matrix_layout(out_dtype, n as u64, m as u64, n as i64)
-                .map_err(cublas_err)?;
+            let a_layout = MatrixLayout::new(io_dtype, k as u64, n as u64, k as i64)?;
+            let b_layout = MatrixLayout::new(io_dtype, k as u64, m as u64, k as i64)?;
+            let d_layout = MatrixLayout::new(out_dtype, n as u64, m as u64, n as i64)?;
 
             // Algo: reuse the cached pick for this shape if present (the heuristic search is a host-side
             // cost that otherwise dominates a small FP4 GEMM); else run the heuristic once and cache it.
@@ -1335,9 +1421,9 @@ mod cuda_impl {
             let algo = match cached {
                 Some(cached) => cached.algo,
                 None => {
-                    let pref = lt::create_matmul_pref().map_err(cublas_err)?;
+                    let pref = MatmulPreference::new()?;
                     lt::set_matmul_pref_attribute(
-                        pref,
+                        pref.raw(),
                         sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                         &self.workspace_size as *const _ as *const c_void,
                         size_of::<usize>(),
@@ -1345,23 +1431,19 @@ mod cuda_impl {
                     .map_err(cublas_err)?;
                     let heuristic = lt::get_matmul_algo_heuristic(
                         self.handle,
-                        desc,
-                        a_layout,
-                        b_layout,
-                        d_layout,
-                        d_layout,
-                        pref,
+                        desc.raw(),
+                        a_layout.raw(),
+                        b_layout.raw(),
+                        d_layout.raw(),
+                        d_layout.raw(),
+                        pref.raw(),
                     );
-                    let _ = lt::destroy_matmul_pref(pref);
+                    *crate::lock_recover(&self.nvfp4_heuristic_selection_counts)
+                        .entry((m, k, n))
+                        .or_default() += 1;
                     let algo = match heuristic {
                         Ok(h) => h.algo,
-                        Err(e) => {
-                            let _ = lt::destroy_matrix_layout(a_layout);
-                            let _ = lt::destroy_matrix_layout(b_layout);
-                            let _ = lt::destroy_matrix_layout(d_layout);
-                            let _ = lt::destroy_matmul_desc(desc);
-                            return Err(cublas_err(e));
-                        }
+                        Err(e) => return Err(cublas_err(e)),
                     };
                     let identity = nvfp4_algorithm_identity(&algo)?;
                     crate::lock_recover(&self.nvfp4_algos)
@@ -1375,27 +1457,23 @@ mod cuda_impl {
             let (ws_ptr, _gw) = self.workspace.device_ptr(&self.stream);
             let res = lt::matmul(
                 self.handle,
-                desc,
+                desc.raw(),
                 &alpha as *const f32 as *const c_void,
                 &beta as *const f32 as *const c_void,
                 a_ptr as *const c_void,
-                a_layout,
+                a_layout.raw(),
                 b_ptr as *const c_void,
-                b_layout,
+                b_layout.raw(),
                 d_ptr as *const c_void,
-                d_layout,
+                d_layout.raw(),
                 d_ptr as *mut c_void,
-                d_layout,
+                d_layout.raw(),
                 &algo as *const _,
                 ws_ptr as *mut c_void,
                 self.workspace_size,
                 self.stream.cu_stream() as sys::cudaStream_t,
             );
 
-            let _ = lt::destroy_matrix_layout(a_layout);
-            let _ = lt::destroy_matrix_layout(b_layout);
-            let _ = lt::destroy_matrix_layout(d_layout);
-            let _ = lt::destroy_matmul_desc(desc);
             res.map_err(cublas_err)
         }
     }

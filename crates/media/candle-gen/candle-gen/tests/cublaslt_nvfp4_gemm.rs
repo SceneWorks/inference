@@ -224,6 +224,11 @@ fn nvfp4_gemm_throughput_vs_bf16() {
     );
     let _ = lt.matmul_nvfp4_staged(&w_stg, &x_stg).unwrap();
     assert_eq!(
+        lt.nvfp4_heuristic_selection_count(m, k, n),
+        1,
+        "repeated staged FP4 GEMM must reuse the cached cuBLASLt heuristic selection"
+    );
+    assert_eq!(
         lt.selected_nvfp4_algorithm_identity(m, k, n),
         Some(selected),
         "repeated staged FP4 GEMM must reuse the exact selected cuBLASLt configuration"
