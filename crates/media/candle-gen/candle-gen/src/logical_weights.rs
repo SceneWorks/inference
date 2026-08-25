@@ -425,82 +425,191 @@ pub fn read_logical_weights(
     plan: &LogicalWeightPlan,
     device: &Device,
 ) -> Result<LogicalWeights> {
-    // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-    let st = unsafe { MmapedSafetensors::new(path)? };
-    let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
-    on_disk.sort_unstable();
-    let mut planned: Vec<&str> = plan.all_physical_keys().collect();
-    planned.sort_unstable();
-    if on_disk
-        .iter()
-        .map(String::as_str)
-        .ne(planned.iter().copied())
-    {
-        let missing = planned
-            .iter()
-            .filter(|key| {
-                on_disk
-                    .binary_search_by(|name| name.as_str().cmp(key))
-                    .is_err()
-            })
-            .count();
-        let unplanned = on_disk
-            .iter()
-            .filter(|name| planned.binary_search(&name.as_str()).is_err())
-            .count();
-        return Err(CandleError::Msg(format!(
-            "logical weight read of {}: tensor set changed since planning ({missing} planned \
-             tensor(s) missing, {unplanned} unplanned tensor(s) present); refusing to load a \
-             different checkpoint",
-            path.display(),
-        )));
-    }
-
+    let reader = LogicalWeightReader::open(path, plan.clone(), device)?;
     let mut tensors = HashMap::new();
-    let mut residency: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
-    let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
     for tensor in &plan.tensors {
-        codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
-        let decoded = decode(&st, tensor, device)?;
-        let report = residency
-            .entry(tensor.codec_id)
-            .or_insert(CodecResidencyReport {
-                codec_id: tensor.codec_id,
-                tensor_count: 0,
-                source_bytes: 0,
-                resident_bytes: 0,
-            });
-        report.tensor_count += 1;
-        report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
-        // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] reads it
-        // off the decoded value itself — including the scale companions a packed load retained,
-        // which the packed variant *owns* (it holds them as f32 values, not as file rows). The
-        // companion loop below therefore attributes source bytes only. Reading the retained half
-        // back off `plan.companions` would make `receipt == plan` self-referential on exactly the
-        // packed row the pair exists to cross-check.
-        report.resident_bytes = report
-            .resident_bytes
-            .saturating_add(decoded.resident_bytes());
-        tensors.insert(tensor.logical_key.clone(), decoded);
-    }
-    for companion in &plan.companions {
-        let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
-            continue;
-        };
-        if let Some(report) = residency.get_mut(codec_id) {
-            report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
-        }
+        tensors.insert(
+            tensor.logical_key.clone(),
+            reader.read(&tensor.logical_key)?,
+        );
     }
     Ok(LogicalWeights {
         tensors,
-        receipt: LogicalWeightReceipt {
-            mapping_id: plan.mapping_id,
-            tensor_count: plan.tensors.len(),
-            source_bytes: plan.source_bytes,
+        receipt: reader.receipt(),
+    })
+}
+
+/// The engine's **incremental** shared logical-weight reader (sc-21482): the same plan-driven,
+/// codec-dispatched decode as [`read_logical_weights`], exposed one logical tensor at a time so a
+/// provider that constructs its model layer-by-layer (Krea's trunk, ~260 projections) can
+/// materialize each planned tensor exactly when its layer is built — without a whole-file
+/// intermediate map and without owning any decode or classification logic of its own.
+///
+/// * **Opening** validates the on-disk tensor set against the plan's full physical-key surface
+///   (weights **and** companions); any difference is source drift and refuses before a single
+///   tensor is materialized. Per-tensor drift after opening (shape/dtype changes under the mmap)
+///   is still refused by the decode's stored-header guards.
+/// * **Reading** dispatches the one shared per-layer decode — the same code path
+///   [`read_logical_weights`] uses — and records what the codec actually left resident.
+/// * **The receipt** ([`Self::receipt`]) is measured over the tensors materialized *so far*: each
+///   codec row's `resident_bytes` comes off the decoded values themselves
+///   ([`LogicalTensor::resident_bytes`]), never copied from the plan's pricing, so plan and
+///   receipt remain the independent pair the contract requires. A companion's source bytes are
+///   attributed to its owner's codec row only once that owner has materialized.
+pub struct LogicalWeightReader {
+    st: MmapedSafetensors,
+    plan: LogicalWeightPlan,
+    device: Device,
+    /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
+    ///
+    /// Without it [`Self::planned`] is a linear scan, and a whole-file read (or Krea's trunk,
+    /// which resolves the same key three times per projection) turns the load into O(n²) over a
+    /// ~2600-tensor plan (sc-21482 review).
+    by_logical_key: BTreeMap<String, usize>,
+    /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
+    /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
+    measured: std::sync::Mutex<BTreeMap<String, u64>>,
+}
+
+impl LogicalWeightReader {
+    /// mmap `path` and verify its tensor surface equals the plan's before anything materializes.
+    pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> Result<Self> {
+        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
+        let st = unsafe { MmapedSafetensors::new(path)? };
+        let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
+        on_disk.sort_unstable();
+        let mut planned: Vec<&str> = plan.all_physical_keys().collect();
+        planned.sort_unstable();
+        if on_disk
+            .iter()
+            .map(String::as_str)
+            .ne(planned.iter().copied())
+        {
+            let missing = planned
+                .iter()
+                .filter(|key| {
+                    on_disk
+                        .binary_search_by(|name| name.as_str().cmp(key))
+                        .is_err()
+                })
+                .count();
+            let unplanned = on_disk
+                .iter()
+                .filter(|name| planned.binary_search(&name.as_str()).is_err())
+                .count();
+            return Err(CandleError::Msg(format!(
+                "logical weight read of {}: tensor set changed since planning ({missing} planned \
+                 tensor(s) missing, {unplanned} unplanned tensor(s) present); refusing to load a \
+                 different checkpoint",
+                path.display(),
+            )));
+        }
+        let by_logical_key = plan
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (tensor.logical_key.clone(), index))
+            .collect();
+        Ok(Self {
+            st,
+            plan,
+            device: device.clone(),
+            by_logical_key,
+            measured: std::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// The plan this reader materializes.
+    pub fn plan(&self) -> &LogicalWeightPlan {
+        &self.plan
+    }
+
+    /// The planned entry for one **logical** key, or `None` when the plan has no such tensor.
+    ///
+    /// O(log n) through the index built at [`Self::open`] — the hot path of a whole-plan read.
+    pub fn planned(&self, logical_key: &str) -> Option<&LogicalTensorPlan> {
+        self.by_logical_key
+            .get(logical_key)
+            .map(|index| &self.plan.tensors[*index])
+    }
+
+    /// Materialize one planned logical tensor through its codec and record what it keeps resident.
+    pub fn read(&self, logical_key: &str) -> Result<LogicalTensor> {
+        let tensor = self.planned(logical_key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "logical weight read: `{logical_key}` has no entry in the compiled plan \
+                 (mapping {})",
+                self.plan.mapping_id
+            ))
+        })?;
+        let decoded = decode(&self.st, tensor, &self.device)?;
+        self.measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(logical_key.to_owned(), decoded.resident_bytes());
+        Ok(decoded)
+    }
+
+    /// The receipt **measured** over everything materialized through [`Self::read`] so far.
+    ///
+    /// A reader none of whose tensors has materialized yet reports zero rows — the truth about
+    /// this instant, not a claim that the load was free. Once every planned tensor has been read,
+    /// the receipt covers the plan's whole surface: its per-codec `resident_bytes` are directly
+    /// comparable to the plan's pricing and its `source_bytes` total the plan's
+    /// (weights + companions + descriptor payloads all attributed).
+    pub fn receipt(&self) -> LogicalWeightReceipt {
+        let measured = self
+            .measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut residency: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
+        let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
+        let mut tensor_count = 0usize;
+        let mut source_bytes = 0u64;
+        for tensor in &self.plan.tensors {
+            let Some(resident) = measured.get(&tensor.logical_key) else {
+                continue;
+            };
+            codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
+            tensor_count += 1;
+            source_bytes = source_bytes.saturating_add(tensor.source_bytes);
+            let report = residency
+                .entry(tensor.codec_id)
+                .or_insert(CodecResidencyReport {
+                    codec_id: tensor.codec_id,
+                    tensor_count: 0,
+                    source_bytes: 0,
+                    resident_bytes: 0,
+                });
+            report.tensor_count += 1;
+            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+            // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] read
+            // it off the decoded value itself — including the scale companions a packed load
+            // retained, which the packed variant *owns* (it holds them as f32 values, not as file
+            // rows). The companion loop below therefore attributes source bytes only. Reading the
+            // retained half back off `plan.companions` would make `receipt == plan`
+            // self-referential on exactly the packed row the pair exists to cross-check.
+            report.resident_bytes = report.resident_bytes.saturating_add(*resident);
+        }
+        // A companion's source bytes belong to the codec row of the layer that owns it, and only
+        // once that layer has actually materialized.
+        for companion in &self.plan.companions {
+            let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
+                continue;
+            };
+            source_bytes = source_bytes.saturating_add(companion.source_bytes);
+            if let Some(report) = residency.get_mut(codec_id) {
+                report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
+            }
+        }
+        LogicalWeightReceipt {
+            mapping_id: self.plan.mapping_id,
+            tensor_count,
+            source_bytes,
             materialization: LogicalReadMaterialization::Materialized,
             residency: residency.into_values().collect(),
-        },
-    })
+        }
+    }
 }
 
 fn guard_stored(
@@ -743,6 +852,21 @@ fn decode(
                             tensor.codec_id, tensor.physical_key, tensor.shape
                         )));
                     }
+                    // Codec-owned scale-payload value check (sc-21482): the dense arm gets this
+                    // inside `decode_nvfp4`; the packed repack preserves scale bytes verbatim, so
+                    // a NaN or sign-bit E4M3 block scale must be refused here or it reaches the
+                    // GEMM as a corrupted multiplier no later stage re-examines.
+                    gen_core::validate_nvfp4_block_scale_payload(
+                        scales,
+                        *stored_shape,
+                        [tensor.shape[0], tensor.shape[1]],
+                    )
+                    .map_err(|error| {
+                        CandleError::Msg(format!(
+                            "codec {}: tensor {:?}: {error}",
+                            tensor.codec_id, tensor.physical_key
+                        ))
+                    })?;
                     let tensor_packed = Nvfp4Tensor::from_kitchen_parts(
                         view.data(),
                         scales,
