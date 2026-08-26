@@ -338,7 +338,9 @@ pub fn denoise_av_conditioned(
     let mut alat = audio.clone();
     // The conditioned state owns its final geometry (including appended clip tokens), so prepare
     // RoPE only after that state is complete and retain it for every denoise step.
-    let prepared_rope = dit.prepare_rope(&state.positions, audio_grid)?;
+    let audio_request = flatten_audio_latent(&alat)?;
+    let prepared_rope =
+        dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     for (step, window) in sigmas.windows(2).enumerate() {
         if cancel.is_cancelled() {
@@ -355,6 +357,8 @@ pub fn denoise_av_conditioned(
             sigma as f64,
             video_ctx,
             audio_ctx,
+            &state.positions,
+            audio_grid,
             &prepared_rope,
         )?;
         let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;

@@ -7,9 +7,10 @@
 //! block by full (segment-masked) attention + interleaved 3D MRoPE.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, DeviceLocation, Result, Tensor, TensorId, D};
 use candle_gen::gen_core::{AdapterSpec, CancelFlag};
 
 use super::block::Ideogram4Block;
@@ -27,6 +28,52 @@ const LLM_TOKEN_INDICATOR: i64 = 3;
 const COND_NORM_EPS: f64 = 1e-6;
 const FINAL_NORM_EPS: f64 = 1e-6;
 
+static NEXT_IDEOGRAM_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_IDEOGRAM_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_ideogram_load_id() -> u64 {
+    NEXT_IDEOGRAM_LOAD_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn host_slice_fingerprint(values: &[i64]) -> u64 {
+    values.iter().fold(0xcbf29ce484222325, |hash, value| {
+        value.to_le_bytes().iter().fold(hash, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    })
+}
+
+/// O(1) denoise-loop identity for the immutable host-owned role and segment packing. Construct this
+/// only after `Packing` is complete, then pass the same value to preparation and every prepared
+/// forward. A new request always receives a new nonce, even when its host arrays have identical data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostConditioningIdentity {
+    request_id: u64,
+    indicator_len: usize,
+    segment_len: usize,
+    indicator_fingerprint: u64,
+    segment_fingerprint: u64,
+}
+
+impl HostConditioningIdentity {
+    pub(crate) fn new(indicator: &[i64], segment_ids: &[i64]) -> Self {
+        Self {
+            request_id: NEXT_IDEOGRAM_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            indicator_len: indicator.len(),
+            segment_len: segment_ids.len(),
+            indicator_fingerprint: host_slice_fingerprint(indicator),
+            segment_fingerprint: host_slice_fingerprint(segment_ids),
+        }
+    }
+
+    fn matches_host(&self, indicator: &[i64], segment_ids: &[i64]) -> bool {
+        self.indicator_len == indicator.len()
+            && self.segment_len == segment_ids.len()
+            && self.indicator_fingerprint == host_slice_fingerprint(indicator)
+            && self.segment_fingerprint == host_slice_fingerprint(segment_ids)
+    }
+}
+
 pub struct Ideogram4Transformer {
     input_proj: QLinear,
     llm_cond_norm: Tensor,
@@ -42,6 +89,7 @@ pub struct Ideogram4Transformer {
     /// Sinusoidal frequencies for the `t` embedding (`[1, emb_dim/2]`, f32).
     t_freqs: Tensor,
     dtype: DType,
+    load_id: u64,
 }
 
 enum TransformerLayers {
@@ -70,10 +118,116 @@ impl Drop for MaterializedWindow {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSpec {
+    shape: Vec<usize>,
+    dtype: DType,
+    device: DeviceLocation,
+}
+
+impl TensorSpec {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            shape: tensor.dims().to_vec(),
+            dtype: tensor.dtype(),
+            device: tensor.device().location(),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.dims() == self.shape
+            && tensor.dtype() == self.dtype
+            && tensor.device().location() == self.device
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorIdentity {
+    id: TensorId,
+    spec: TensorSpec,
+}
+
+impl TensorIdentity {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            id: tensor.id(),
+            spec: TensorSpec::new(tensor),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.id() == self.id && self.spec.matches(tensor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedConditioningRequest {
+    model_load_id: u64,
+    host: HostConditioningIdentity,
+    input: TensorSpec,
+    llm_features: TensorIdentity,
+    position_ids: TensorIdentity,
+}
+
+impl PreparedConditioningRequest {
+    fn new(
+        model_load_id: u64,
+        host: HostConditioningIdentity,
+        input: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<Self> {
+        let (b, l, _) = input.dims3()?;
+        let (llm_b, llm_l, _) = llm_features.dims3()?;
+        let (position_b, position_l, axes) = position_ids.dims3()?;
+        if (llm_b, llm_l) != (b, l) || (position_b, position_l, axes) != (b, l, 3) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: conditioning geometry does not match input [batch={b}, tokens={l}]"
+            )));
+        }
+        let device = input.device().location();
+        if llm_features.device().location() != device || position_ids.device().location() != device
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: conditioning tensors and input must share a device".into(),
+            ));
+        }
+        Ok(Self {
+            model_load_id,
+            host,
+            input: TensorSpec::new(input),
+            llm_features: TensorIdentity::new(llm_features),
+            position_ids: TensorIdentity::new(position_ids),
+        })
+    }
+
+    fn validate(
+        &self,
+        model_load_id: u64,
+        host: HostConditioningIdentity,
+        input: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<()> {
+        if model_load_id != self.model_load_id
+            || host != self.host
+            || !self.input.matches(input)
+            || !self.llm_features.matches(llm_features)
+            || !self.position_ids.matches(position_ids)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: prepared conditioning request identity does not match model, geometry, position grid, dtype, or device".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The step-invariant conditioning tensors prepared once per render (sc-11280). `seg_mask = None` when
 /// every token shares a segment id — the additive mask is provably all-zeros, so the per-block add is
 /// skipped entirely (softmax over `scores + 0` == softmax over `scores`, so the step is byte-identical).
 pub(crate) struct PreparedConditioning {
+    request: PreparedConditioningRequest,
     img_mask: Tensor,
     cos: Tensor,
     sin: Tensor,
@@ -124,6 +278,7 @@ impl Ideogram4Transformer {
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
+            load_id: next_ideogram_load_id(),
         })
     }
 
@@ -189,6 +344,7 @@ impl Ideogram4Transformer {
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
+            load_id: next_ideogram_load_id(),
         })
     }
 
@@ -296,9 +452,18 @@ impl Ideogram4Transformer {
         attention_budget: usize,
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let prepared = self.prepare(llm_features, indicator, segment_ids, position_ids, b, l)?;
-        self.forward_prepared(x, t, &prepared, attention_budget, cancel)
+        let prepared = self.prepare(llm_features, x, indicator, segment_ids, position_ids)?;
+        let host = prepared.request.host;
+        self.forward_prepared(
+            x,
+            t,
+            llm_features,
+            position_ids,
+            host,
+            &prepared,
+            attention_budget,
+            cancel,
+        )
     }
 
     /// Materialize request-scoped geometry conditioning. The caller owns the handle, rather than the
@@ -307,12 +472,34 @@ impl Ideogram4Transformer {
     pub(crate) fn prepare_from_host(
         &self,
         llm_features: &Tensor,
+        input: &Tensor,
         indicator: &[i64],
         segment_ids: &[i64],
         position_ids: &Tensor,
-        b: usize,
-        l: usize,
+        host: HostConditioningIdentity,
     ) -> Result<PreparedConditioning> {
+        let (b, l, _) = input.dims3()?;
+        if indicator.len() != b * l || segment_ids.len() != b * l {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ideogram: host conditioning lengths ({}, {}) must equal batch*tokens {}",
+                indicator.len(),
+                segment_ids.len(),
+                b * l
+            )));
+        }
+        if !host.matches_host(indicator, segment_ids) {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ideogram: host conditioning identity does not match role or segment packing"
+                    .into(),
+            ));
+        }
+        let request = PreparedConditioningRequest::new(
+            self.load_id,
+            host,
+            input,
+            llm_features,
+            position_ids,
+        )?;
         let (llm_mask, img_mask, img_idx) =
             role_tensors(indicator, b, l, self.dtype, position_ids.device())?;
         let (cos, sin) = self.rotary_emb.forward(position_ids)?;
@@ -324,6 +511,7 @@ impl Ideogram4Transformer {
         let llm = self.llm_cond_proj.forward(&llm)?.broadcast_mul(&llm_mask)?;
         let indicator_emb = self.embed_image_indicator.forward(&img_idx)?;
         Ok(PreparedConditioning {
+            request,
             img_mask,
             cos,
             sin,
@@ -339,11 +527,10 @@ impl Ideogram4Transformer {
     fn prepare(
         &self,
         llm_features: &Tensor,
+        input: &Tensor,
         indicator: &Tensor,
         segment_ids: &Tensor,
         position_ids: &Tensor,
-        b: usize,
-        l: usize,
     ) -> Result<PreparedConditioning> {
         let ind = indicator
             .to_dtype(DType::I64)?
@@ -353,18 +540,26 @@ impl Ideogram4Transformer {
             .to_dtype(DType::I64)?
             .flatten_all()?
             .to_vec1::<i64>()?;
-        self.prepare_from_host(llm_features, &ind, &seg, position_ids, b, l)
+        let host = HostConditioningIdentity::new(&ind, &seg);
+        self.prepare_from_host(llm_features, input, &ind, &seg, position_ids, host)
     }
 
     /// Run one denoise forward against request-scoped prepared conditioning.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared(
         &self,
         x: &Tensor,
         t: &Tensor,
+        llm_features: &Tensor,
+        position_ids: &Tensor,
+        host: HostConditioningIdentity,
         prepared: &PreparedConditioning,
         attention_budget: usize,
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
+        prepared
+            .request
+            .validate(self.load_id, host, x, llm_features, position_ids)?;
         let img_mask = &prepared.img_mask;
         let cos = &prepared.cos;
         let sin = &prepared.sin;
@@ -624,6 +819,59 @@ mod tests {
         assert_eq!(at(2, 3), 0.0);
         assert!(at(0, 2).is_infinite() && at(0, 2) < 0.0);
         assert!(at(3, 1).is_infinite() && at(3, 1) < 0.0);
+    }
+
+    #[test]
+    fn prepared_conditioning_request_reuses_once_and_rejects_stale_identity() -> Result<()> {
+        let device = Device::Cpu;
+        let input = Tensor::zeros((1, 4, 8), DType::F32, &device)?;
+        let llm = Tensor::zeros((1, 4, 12), DType::F32, &device)?;
+        let positions = Tensor::zeros((1, 4, 3), DType::I64, &device)?;
+        let host = HostConditioningIdentity::new(&[3, 3, 2, 2], &[0, 0, 0, 0]);
+        let prepared = PreparedConditioningRequest::new(23, host, &input, &llm, &positions)?;
+
+        // The latent value changes each step, but the prepared request remains valid.
+        for _ in 0..2 {
+            let next = Tensor::ones((1, 4, 8), DType::F32, &device)?;
+            prepared.validate(23, host, &next, &llm, &positions)?;
+        }
+
+        // Tensor identity catches a changed same-shape position grid; rebuilding accepts it.
+        let changed_positions = Tensor::ones((1, 4, 3), DType::I64, &device)?;
+        assert!(prepared
+            .validate(23, host, &input, &llm, &changed_positions)
+            .is_err());
+        let rebuilt = PreparedConditioningRequest::new(23, host, &input, &llm, &changed_positions)?;
+        rebuilt.validate(23, host, &input, &llm, &changed_positions)?;
+
+        let changed_llm = Tensor::ones((1, 4, 12), DType::F32, &device)?;
+        assert!(prepared
+            .validate(23, host, &input, &changed_llm, &positions)
+            .is_err());
+        let wrong_geometry = Tensor::zeros((1, 5, 8), DType::F32, &device)?;
+        assert!(prepared
+            .validate(23, host, &wrong_geometry, &llm, &positions)
+            .is_err());
+        let wrong_dtype = input.to_dtype(DType::F16)?;
+        assert!(prepared
+            .validate(23, host, &wrong_dtype, &llm, &positions)
+            .is_err());
+        let mut wrong_device = prepared.clone();
+        wrong_device.input.device = DeviceLocation::Cuda { gpu_id: 9 };
+        assert!(wrong_device
+            .validate(23, host, &input, &llm, &positions)
+            .is_err());
+        let new_host = HostConditioningIdentity::new(&[3, 2, 2, 2], &[0, 0, 0, 0]);
+        assert!(prepared
+            .validate(23, new_host, &input, &llm, &positions)
+            .is_err());
+        let rebuilt_host =
+            PreparedConditioningRequest::new(23, new_host, &input, &llm, &positions)?;
+        rebuilt_host.validate(23, new_host, &input, &llm, &positions)?;
+        assert!(prepared
+            .validate(24, host, &input, &llm, &positions)
+            .is_err());
+        Ok(())
     }
 
     #[test]

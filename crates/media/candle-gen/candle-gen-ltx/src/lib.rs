@@ -608,7 +608,14 @@ impl Pipeline {
                 audio,
             )
         } else {
-            let stage1_rope = comps.avdit.prepare_rope(&video_grid, &audio_grid)?;
+            let stage1_video_request = pipeline::flatten_latent(&vnoise)?;
+            let stage1_audio_request = pipeline::flatten_audio_latent(&anoise)?;
+            let stage1_rope = comps.avdit.prepare_rope(
+                &stage1_video_request,
+                &stage1_audio_request,
+                &video_grid,
+                &audio_grid,
+            )?;
             let out = run_av_curated_sampler(
                 req.sampler.as_deref(),
                 &STAGE1_SIGMAS[..],
@@ -628,6 +635,8 @@ impl Pipeline {
                         sigma as f64,
                         &video_ctx,
                         &audio_ctx,
+                        &video_grid,
+                        &audio_grid,
                         &stage1_rope,
                     )?;
                     Ok(AvLatents {
@@ -688,7 +697,14 @@ impl Pipeline {
             }
         };
         let stage2 = if stage2_keyframes.is_empty() {
-            let stage2_rope = comps.avdit.prepare_rope(&stage2_grid, &audio_grid)?;
+            let stage2_video_request = pipeline::flatten_latent(&stage2_initial.video)?;
+            let stage2_audio_request = pipeline::flatten_audio_latent(&stage2_initial.audio)?;
+            let stage2_rope = comps.avdit.prepare_rope(
+                &stage2_video_request,
+                &stage2_audio_request,
+                &stage2_grid,
+                &audio_grid,
+            )?;
             run_av_curated_sampler(
                 req.sampler.as_deref(),
                 &STAGE2_SIGMAS,
@@ -706,6 +722,8 @@ impl Pipeline {
                             sigma as f64,
                             &video_ctx,
                             &audio_ctx,
+                            &stage2_grid,
+                            &audio_grid,
                             &stage2_rope,
                         )?;
                         Ok(AvLatents {
