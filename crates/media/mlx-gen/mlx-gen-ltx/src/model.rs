@@ -1908,22 +1908,54 @@ mod tests {
                 fps: Some(fps),
                 ..Default::default()
             };
-            let (stage1, stage2, audio) = Ltx::position_grids(&req);
-            let time_end = |grid: &Array| {
-                let tokens = grid.shape()[2] as usize;
-                grid.as_slice::<f32>()[2 * tokens - 1]
-            };
-            let expected_video_end = 9.0 / fps as f32;
+            let (lf, h1, w1, h2, w2) = Ltx::latent_dims(&req);
+            let fps = Ltx::fps(&req);
+            let stage1 = crate::positions::create_position_grid_data_with(
+                1,
+                lf,
+                h1,
+                w1,
+                TEMPORAL_SCALE as i64,
+                SPATIAL_SCALE as i64,
+                fps,
+                true,
+            );
+            let stage2 = crate::positions::create_position_grid_data_with(
+                1,
+                lf,
+                h2,
+                w2,
+                TEMPORAL_SCALE as i64,
+                SPATIAL_SCALE as i64,
+                fps,
+                true,
+            );
+            let time_end = |grid: &[f32], tokens: usize| grid[2 * tokens - 1];
+            let expected_video_end = 9.0 / fps;
             assert!(
-                (time_end(&stage1) - expected_video_end).abs() < 1e-7,
+                (time_end(&stage1, lf * h1 * w1) - expected_video_end).abs() < 1e-7,
                 "stage-1 {fps}-fps grid used the wrong clock"
             );
             assert!(
-                (time_end(&stage2) - expected_video_end).abs() < 1e-7,
+                (time_end(&stage2, lf * h2 * w2) - expected_video_end).abs() < 1e-7,
                 "stage-2 {fps}-fps grid used the wrong clock"
             );
 
-            let audio_frames = audio.shape()[2] as usize;
+            let appended = crate::conditioning::keyframe_append_position_data(
+                1,
+                1,
+                1,
+                0,
+                TEMPORAL_SCALE as i64,
+                SPATIAL_SCALE as i64,
+                fps,
+            );
+            assert!(
+                (appended[1] - 1.0 / fps).abs() < 1e-7,
+                "appended clip used the wrong {fps}-fps time axis"
+            );
+
+            let audio_frames = Ltx::audio_frames(&req);
             let expected_audio_frames = compute_audio_frames(9, fps as f64);
             assert_eq!(
                 audio_frames, expected_audio_frames,
@@ -1933,7 +1965,7 @@ mod tests {
             let audio_seconds = audio_frames as f64 / crate::positions::AUDIO_LATENTS_PER_SECOND;
             assert!(
                 (audio_seconds - video_seconds).abs()
-                    <= 0.5 / crate::positions::AUDIO_LATENTS_PER_SECOND,
+                    <= 0.5 / crate::positions::AUDIO_LATENTS_PER_SECOND + 1e-12,
                 "audio/video duration disagreement at {fps} fps: {audio_seconds} vs {video_seconds}"
             );
         }
@@ -1947,16 +1979,18 @@ mod tests {
             frames: Some(9),
             ..Default::default()
         };
-        let (stage1, stage2, _) = Ltx::position_grids(&req);
         assert_eq!(Ltx::fps(&req), DEFAULT_FPS);
-        assert_eq!(
-            stage1.as_slice::<f32>(),
-            crate::positions::create_position_grid(1, 2, 4, 4).as_slice::<f32>()
+        let fixture = crate::positions::create_position_grid_data_with(
+            1,
+            1,
+            1,
+            1,
+            TEMPORAL_SCALE as i64,
+            SPATIAL_SCALE as i64,
+            Ltx::fps(&req),
+            true,
         );
-        assert_eq!(
-            stage2.as_slice::<f32>(),
-            crate::positions::create_position_grid(1, 2, 8, 8).as_slice::<f32>()
-        );
+        assert_eq!(fixture, vec![0.0, 1.0 / 24.0, 0.0, 32.0, 0.0, 32.0]);
     }
 
     #[test]

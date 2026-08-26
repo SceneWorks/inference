@@ -53,6 +53,41 @@ pub fn create_position_grid_with(
     fps: f32,
     causal_fix: bool,
 ) -> Array {
+    let data = create_position_grid_data_with(
+        batch_size,
+        num_frames,
+        height,
+        width,
+        temporal_scale,
+        spatial_scale,
+        fps,
+        causal_fix,
+    );
+    Array::from_slice(
+        &data,
+        &[
+            batch_size as i32,
+            3,
+            (num_frames * height * width) as i32,
+            2,
+        ],
+    )
+}
+
+/// Host-only position-grid values in the same C-order layout as [`create_position_grid_with`].
+/// Keeping the time-base construction free of MLX allocation lets the request-clock contract be
+/// tested without initializing Metal or loading model weights.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_position_grid_data_with(
+    batch_size: usize,
+    num_frames: usize,
+    height: usize,
+    width: usize,
+    temporal_scale: i64,
+    spatial_scale: i64,
+    fps: f32,
+    causal_fix: bool,
+) -> Vec<f32> {
     let hw = height * width;
     let num_patches = num_frames * hw;
     // C-order (batch, 3, num_patches, 2).
@@ -86,7 +121,7 @@ pub fn create_position_grid_with(
         }
     }
 
-    Array::from_slice(&data, &[batch_size as i32, 3, num_patches as i32, 2])
+    data
 }
 
 // --- Audio (sc-2684) ---------------------------------------------------------------------------

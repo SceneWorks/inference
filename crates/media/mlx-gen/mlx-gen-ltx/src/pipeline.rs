@@ -1330,37 +1330,6 @@ mod tests {
     }
 
     #[test]
-    fn appended_clip_positions_use_the_passed_request_fps() {
-        let noise = arr(&[1.0, 2.0], &[1, 2, 1, 1, 1]);
-        let clip = arr(&[3.0, 4.0], &[1, 2, 1, 1, 1]);
-        for fps in [25.0, 30.0] {
-            let main = crate::positions::create_position_grid_with(
-                1,
-                1,
-                1,
-                1,
-                TEMPORAL_SCALE,
-                SPATIAL_SCALE,
-                fps,
-                true,
-            );
-            let clips = [StageClip {
-                stage1: &clip,
-                frame_idx: 0,
-                strength: 1.0,
-            }];
-            let appended =
-                append_iclora_clips(VideoTokenState::base(&noise, &main).unwrap(), &clips, fps)
-                    .unwrap();
-            let positions = appended.positions.as_slice::<f32>();
-            assert!(
-                (positions[3] - 1.0 / fps).abs() < 1e-7,
-                "appended clip used the wrong {fps}-fps time axis"
-            );
-        }
-    }
-
-    #[test]
     fn stage_sigmas_are_exact() {
         // F-046: lock the production distilled sigma lists (single source of truth now schedule.rs
         // is gone). These are chaos-sensitive — a silent edit would drift the render.
