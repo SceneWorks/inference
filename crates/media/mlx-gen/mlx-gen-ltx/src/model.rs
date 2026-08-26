@@ -534,12 +534,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     // The small components (each ≪ the TE / DiT) stay resident. The VAE *decoder* + audio VAE + vocoder
     // load here; the VAE *encoder* is still lazy on first I2V encode (F-048).
-    let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
     let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
     let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
 
-    let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
+    // Loaded through the path constructor, so a stamped checkpoint's declared config is
+    // cross-checked against the structure the weights imply instead of the rank silently winning.
+    let upsampler = LatentUpsampler::from_checkpoint(root.join("upsampler.safetensors"))?;
     // The VAE encoder serves I2V conditioning (sc-2685) but pure-T2V+A requests never touch it, so it
     // is loaded **lazily** on first encode — `vae_encoder.safetensors` (hundreds of MB) stays off the
     // resident set for T2V (F-048). `generate_av.py` supports I2V+Audio (image-conditioned video).
@@ -597,7 +598,11 @@ impl Ltx {
             GemmaConfig::gemma_3_12b(),
             self.gemma_quant,
             &self.config,
-            Dtype::Bfloat16,
+            // The DiT's own checkpoint geometry re-targeted at bf16 activations: the connector and
+            // the feature-extractor Linear are packed on an LTX-2.5 `q4`/`q8` tier (sc-18775) and
+            // dense on LTX-2.3, decided per tensor by whether `.scales` is present — so one
+            // `Precision` serves both without a per-generation branch.
+            self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
         )
     }
 

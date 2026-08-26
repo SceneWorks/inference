@@ -36,10 +36,14 @@ const RMS_EPS: f64 = 1e-6;
 
 /// The audio text head (sc-5495): a separate aggregate projection (188160 → 2048) + rescale +
 /// `audio_embeddings_connector`, sharing the same Gemma hidden states as the video head.
-struct AudioHead {
-    aggregate: QLinear, // [2048, 188160] + bias (packed-detected, sc-9417)
-    rescale: f64,       // √(2048 / 3840)
-    connector: Connector,
+///
+/// `pub(crate)` so [`crate::gemma4_te`] (LTX-2.5, sc-18770) builds the SAME head off the SAME keys
+/// rather than duplicating the projection math. The head is backbone-agnostic — it consumes the
+/// per-token-RMS `normed` tensor and knows nothing about which Gemma generation produced it.
+pub(crate) struct AudioHead {
+    pub(crate) aggregate: QLinear, // [2048, 188160] + bias (packed-detected, sc-9417)
+    pub(crate) rescale: f64,       // √(2048 / 3840)
+    pub(crate) connector: Connector,
 }
 
 pub struct LtxTextEncoder {
@@ -129,18 +133,10 @@ impl LtxTextEncoder {
     /// `norm_and_concat_per_token_rms`: stack the 49 hidden states `[1,L,3840,49]`, RMS-normalize each
     /// `(token, layer)` slice over the 3840 hidden dim, flatten dim-major/layer-minor `[1,L,188160]`,
     /// zero the padded positions.
+    /// The math itself lives in [`per_token_rms_normed_hidden`], shared with LTX-2.5's Gemma 4
+    /// encoder (sc-18770) — same caption feature version, same extractor.
     fn normed_hidden(&self, hiddens: &[Tensor], mask01: &[u32]) -> Result<Tensor> {
-        let refs: Vec<&Tensor> = hiddens.iter().collect();
-        let enc = Tensor::stack(&refs, 3)?; // (1, L, 3840, 49)
-        let (b, l, _, n) = enc.dims4()?;
-        let var = enc.sqr()?.mean_keepdim(2)?; // (1, L, 1, 49)
-        let inv = (var + RMS_EPS)?.sqrt()?.recip()?;
-        let normed = enc.broadcast_mul(&inv)?;
-        let normed = normed.reshape((b, l, self.hidden_size * n))?; // (1, L, 188160)
-                                                                    // Zero padded token positions.
-        let mask: Vec<f32> = mask01.iter().map(|&m| m as f32).collect();
-        let mask = Tensor::from_vec(mask, (1, l, 1), &self.device)?.to_dtype(DType::BF16)?;
-        normed.broadcast_mul(&mask)
+        per_token_rms_normed_hidden(hiddens, mask01, self.hidden_size, &self.device)
     }
 
     /// Encode `input_ids` `[1,L]` (u32) + `mask01` (1 for valid, left-padded) → `video_embeddings`
@@ -214,7 +210,17 @@ impl LtxTextEncoder {
 /// noticing), just not a per-checkpoint one yet. Do not describe this as "config-driven" the way
 /// the mlx backend's genuinely-JSON-driven check is (sc-18763 coordinator review).
 fn require_v2() -> Result<()> {
-    let version = AvConfig::ltx_2_3().caption_feature_version;
+    require_v2_version(AvConfig::ltx_2_3().caption_feature_version)
+}
+
+/// The gate itself, over a caption-feature version the caller supplies.
+///
+/// Split out (sc-18770) so LTX-2.5 runs the SAME gate rather than a parallel copy of it — and, on
+/// the 2.5 path, feeds it a **genuinely per-checkpoint** value (`AvConfig::from_bundle`'s
+/// `caption_feature_version`, resolved by the shared detector off the loaded transformer config)
+/// instead of the compile-time constant `require_v2` above is stuck with. LTX-2.3's behavior is
+/// unchanged: it still passes the constant, and still catches only constant drift.
+pub(crate) fn require_v2_version(version: CaptionFeatureVersion) -> Result<()> {
     if version != CaptionFeatureVersion::V2 {
         return Err(candle_gen::candle_core::Error::Msg(format!(
             "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \
@@ -222,6 +228,48 @@ fn require_v2() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `norm_and_concat_per_token_rms`: stack the hidden states `[1,L,hidden,n]`, RMS-normalize each
+/// `(token, layer)` slice over the hidden dim, flatten dim-major/layer-minor `[1,L,hidden×n]`, zero
+/// the padded positions.
+///
+/// This is the V2 (`PER_TOKEN_RMS`) caption feature extractor, shared verbatim by LTX-2.3's Gemma 3
+/// encoder and LTX-2.5's Gemma 4 encoder (sc-18770): the math is a property of the caption feature
+/// version, not of the backbone, and both checkpoints declare V2. Generic over the state count — it
+/// reads `n` off the stacked tensor — so a backbone with a different depth flows through unchanged.
+pub(crate) fn per_token_rms_normed_hidden(
+    hiddens: &[Tensor],
+    mask01: &[u32],
+    hidden_size: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let refs: Vec<&Tensor> = hiddens.iter().collect();
+    let enc = Tensor::stack(&refs, 3)?; // (1, L, hidden, n)
+    let (b, l, _, n) = enc.dims4()?;
+    let var = enc.sqr()?.mean_keepdim(2)?; // (1, L, 1, n)
+    let inv = (var + RMS_EPS)?.sqrt()?.recip()?;
+    let normed = enc.broadcast_mul(&inv)?;
+    let normed = normed.reshape((b, l, hidden_size * n))?; // (1, L, hidden × n)
+                                                           // Zero padded token positions.
+    let mask: Vec<f32> = mask01.iter().map(|&m| m as f32).collect();
+    let mask = Tensor::from_vec(mask, (1, l, 1), device)?.to_dtype(DType::BF16)?;
+    normed.broadcast_mul(&mask)
+}
+
+/// The `aggregate_embed` projection plus its `rescale_norm` scalar, packed-detected per tensor.
+///
+/// `out_dim` comes from the connector config rather than a weight-shape probe, because the packed
+/// path has no dense weight to probe (the same reason [`LtxTextEncoder::new`] reads it that way).
+pub(crate) fn load_aggregate(
+    proj_vb: &VarBuilder,
+    key: &str,
+    out_dim: usize,
+    hidden_size: usize,
+) -> Result<(QLinear, f64)> {
+    let aggregate = qlinear(proj_vb, key, true)?;
+    let rescale = (out_dim as f64 / hidden_size as f64).sqrt();
+    Ok((aggregate, rescale))
 }
 
 #[cfg(test)]

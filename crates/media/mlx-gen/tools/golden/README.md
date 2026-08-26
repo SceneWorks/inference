@@ -473,6 +473,18 @@ tests; the e2e/i2v/av goldens gate the full pipeline. Several scripts also write
 | `ltx_av_lora_e2e_golden.safetensors` | `dump_ltx_av_lora_e2e_golden.py` | `tests/av_lora_e2e_parity.rs` | AV e2e with LoRA (sc-2687). |
 | `ltx_vocoder_golden.safetensors` | `dump_ltx_vocoder_golden.py` | `tests/vocoder_parity.rs` | audio vocoder. |
 
+### LTX-2.5 video (`mlx-gen-ltx` + `candle-gen-ltx`, epic 18755)
+
+Dumped from **upstream** rather than the mflux fork: Lightricks/LTX-2 v1.2.0 at
+`d151147788a9284cca791edc6ce898007e727fe6`, via `tools/_ltx25_diffvae_ref.py`'s shared loader
+(`LTX2_SRC` = `packages/ltx-core/src` of that checkout). Backend-neutral by construction — every
+tensor is f32 and each fixture carries its own inputs — so `candle-gen-ltx` asserts against the same
+file by relative path instead of a second dump.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `ltx25_te_connector_golden.safetensors` | `dump_ltx25_te_connector_golden.py` | `mlx-gen-ltx` + `candle-gen-ltx` `tests/ltx_2_5_te_connector_inputs.rs` | sc-18770 LTX-2.5 text encoder → connector. Reference `LTXGemmaTextEncoder` + `EmbeddingsProcessor` (f32) on the **unquantized** `gemma4-12b-with-proj-ltx-2.5-bf16` encoder and the bf16 DiT's `{video,audio}_embeddings_connector`; needs `LTX25_TE_DIR` (the LTX-2.5 snapshot root) and `transformers>=5.8,<5.15` for `gemma4_unified`. One fixed prompt, tokenized once by the reference tokenizer at `MAX_LEN=256` (18 valid, 238 left-pad) and shipped as `input_ids`/`mask01` so neither backend re-tokenizes. Bundles `video_features` `[1,256,4096]` / `audio_features` `[1,256,2048]` (the connector **inputs**, in the tokenizer's left-padded order) and `video_embeddings`/`audio_embeddings` (the RAW connector output — register-reordered, valid rows first). `normed` (~192 MB) deliberately omitted. Bars are the 2.3 TE sibling's: `1.5e-2` on the features, `6e-2` after the connector, each asserted globally **and** over the valid rows alone. Run against the **bf16** tier, not `q8`, so tier quantization stays out of a correctness gate. Measured: `video_features 2.282e-3`, `audio_features 1.432e-3` — and the connector-output half is currently RED (`1.275e0` / `1.771e0`) on a `crate::connector` defect this golden surfaced (sc-21663); see the test's doc comment. |
+
 ### Wan-VACE video (`mlx-gen-wan`, sc-3388)
 
 Wan/VACE controllable-video goldens (the broader Wan converter/quant goldens live in `tests/fixtures/`

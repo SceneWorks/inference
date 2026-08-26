@@ -197,12 +197,11 @@ impl TierPaths {
     /// Learned spatial refinement weights co-located with the packed tier,
     /// accepting either upstream staged filename without silently choosing an
     /// ambiguous directory.
-    pub fn upsampler_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
-        candle_gen::mmap_var_builder(
-            &[crate::canonical_upsampler_file(&self.tier_dir)?],
-            dtype,
-            device,
-        )
+    ///
+    /// Returns the **path**, not a `VarBuilder`: `LatentUpsampler::from_checkpoint` must read the
+    /// file's `__metadata__` as well as its tensors, and a builder has already discarded it.
+    pub fn upsampler_file(&self) -> CResult<PathBuf> {
+        crate::canonical_upsampler_file(&self.tier_dir)
     }
 
     /// The Gemma-3-12B encoder VarBuilder rooted at `language_model.model.` over the tier's sibling

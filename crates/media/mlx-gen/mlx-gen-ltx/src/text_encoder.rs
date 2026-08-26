@@ -26,34 +26,39 @@ use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
-use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
 use crate::connector::Connector;
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
+use crate::transformer::{Linear, Precision};
 
 const RMS_EPS: f32 = 1e-6;
 
 /// One modality's feature-extractor head: the `aggregate_embed` Linear (188160 → out_dim) + its
 /// `rescale_norm` scalar + the `Embeddings1DConnector`.
-struct FeatureHead {
-    aggregate_w: Array, // (out_dim, 188160)
-    aggregate_b: Array, // (out_dim,)
-    rescale: Array,     // √(out_dim / hidden) scalar in `dtype`
+///
+/// `pub(crate)` so [`crate::gemma4_te`] (LTX-2.5, sc-18770) builds the SAME head off the SAME
+/// `connector.safetensors` keys rather than duplicating the projection math. The head is
+/// backbone-agnostic — it consumes the per-token-RMS `normed` tensor and knows nothing about which
+/// Gemma generation produced the hidden states.
+pub(crate) struct FeatureHead {
+    /// The `aggregate_embed` Linear (188160 → out_dim). A [`Linear`] rather than a bare weight so
+    /// the LTX-2.5 tiers can pack it: at 4096×188160 and 2048×188160 the two heads are 2.31 GB of
+    /// bf16 between them (sc-18775), and a `Linear` binds the packed triple or a dense weight from
+    /// the same call, keyed on whether `{prefix}.scales` is present. LTX-2.3's dense
+    /// `connector.safetensors` therefore loads exactly as before.
+    aggregate: Linear,
+    rescale: Array, // √(out_dim / hidden) scalar in `dtype`
     connector: Connector,
 }
 
 impl FeatureHead {
     /// `rescale_norm(normed) → aggregate_embed → connector`. `normed` is the shared masked
     /// per-token-RMS `(1, L, 188160)`; `mask01` the `(1, L)` 1/0 attention mask.
-    fn forward(&self, normed: &Array, mask01: &Array) -> Result<(Array, Array)> {
-        let features = linear(
-            &multiply(normed, &self.rescale)?,
-            &self.aggregate_w,
-            &self.aggregate_b,
-        )?;
+    pub(crate) fn forward(&self, normed: &Array, mask01: &Array) -> Result<(Array, Array)> {
+        let features = self.aggregate.forward(&multiply(normed, &self.rescale)?)?;
         let embeddings = self.connector.forward(&features, mask01)?;
         Ok((features, embeddings))
     }
@@ -70,26 +75,29 @@ pub struct LtxTextEncoder {
 
 impl LtxTextEncoder {
     /// Build the **video-only** encoder from the Gemma weights + the LTX `connector.safetensors`.
-    /// `dtype` = the compute dtype (bf16 to match the reference). `gemma_quant` selectively quantizes
-    /// the Gemma backbone (from its snapshot `config.json`; `None` ⇒ dense bf16 — the default
-    /// `…-bf16` snapshot); the connector + feature-extractor Linear always run dense bf16 (they ship
-    /// dense in `connector.safetensors`).
+    ///
+    /// `prec` carries the compute dtype (bf16 to match the reference) **and** the checkpoint's quant
+    /// geometry. `gemma_quant` selectively quantizes the Gemma backbone (from its snapshot
+    /// `config.json`; `None` ⇒ dense bf16 — the default `…-bf16` snapshot). The connector and the
+    /// feature-extractor Linear are dense-or-quantized per tensor: LTX-2.3 ships them dense in
+    /// `connector.safetensors` and takes the dense arm, while an LTX-2.5 `q4`/`q8` tier packs them
+    /// (sc-18775) and takes the quantized arm — the same `{prefix}.scales` predicate the DiT uses.
     pub fn from_weights(
         gemma_w: &Weights,
         connector_w: &Weights,
         gemma_cfg: GemmaConfig,
         gemma_quant: Option<GemmaQuant>,
         ltx_cfg: &LtxConfig,
-        dtype: Dtype,
+        prec: Precision,
     ) -> Result<Self> {
         require_v2(ltx_cfg)?;
         let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
-        let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
+        let video = load_video_head(connector_w, gemma_cfg.hidden_size, ltx_cfg, prec)?;
         Ok(Self {
             gemma,
             video,
             audio: None,
-            dtype,
+            dtype: prec.dtype(),
         })
     }
 
@@ -101,96 +109,17 @@ impl LtxTextEncoder {
         gemma_cfg: GemmaConfig,
         gemma_quant: Option<GemmaQuant>,
         ltx_cfg: &LtxConfig,
-        dtype: Dtype,
+        prec: Precision,
     ) -> Result<Self> {
         require_v2(ltx_cfg)?;
         let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
-        let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
-        let audio = Self::audio_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
+        let video = load_video_head(connector_w, gemma_cfg.hidden_size, ltx_cfg, prec)?;
+        let audio = load_audio_head(connector_w, gemma_cfg.hidden_size, ltx_cfg, prec)?;
         Ok(Self {
             gemma,
             video,
             audio: Some(audio),
-            dtype,
-        })
-    }
-
-    fn aggregate(
-        connector_w: &Weights,
-        key_prefix: &str,
-        gemma_cfg: GemmaConfig,
-        dtype: Dtype,
-    ) -> Result<(Array, Array, Array)> {
-        let load = |key: &str| -> Result<Array> {
-            connector_w
-                .get(key)
-                .ok_or_else(|| Error::MissingTensor(key.into()))?
-                .as_dtype(dtype)
-                .map_err(Error::from)
-        };
-        let aggregate_w = load(&format!("{key_prefix}.weight"))?;
-        let aggregate_b = load(&format!("{key_prefix}.bias"))?;
-        let out_dim = aggregate_w.shape()[0];
-        let rescale = Array::from_slice(
-            &[(out_dim as f32 / gemma_cfg.hidden_size as f32).sqrt()],
-            &[1],
-        )
-        .as_dtype(dtype)?;
-        Ok((aggregate_w, aggregate_b, rescale))
-    }
-
-    fn video_head(
-        connector_w: &Weights,
-        gemma_cfg: GemmaConfig,
-        ltx_cfg: &LtxConfig,
-        dtype: Dtype,
-    ) -> Result<FeatureHead> {
-        let (aggregate_w, aggregate_b, rescale) = Self::aggregate(
-            connector_w,
-            "text_embedding_projection.video_aggregate_embed",
-            gemma_cfg,
-            dtype,
-        )?;
-        let connector =
-            Connector::from_weights(connector_w, "video_embeddings_connector.", ltx_cfg, dtype)?;
-        Ok(FeatureHead {
-            aggregate_w,
-            aggregate_b,
-            rescale,
-            connector,
-        })
-    }
-
-    fn audio_head(
-        connector_w: &Weights,
-        gemma_cfg: GemmaConfig,
-        ltx_cfg: &LtxConfig,
-        dtype: Dtype,
-    ) -> Result<FeatureHead> {
-        let (aggregate_w, aggregate_b, rescale) = Self::aggregate(
-            connector_w,
-            "text_embedding_projection.audio_aggregate_embed",
-            gemma_cfg,
-            dtype,
-        )?;
-        // The audio connector shares the checkpoint's layer count / theta / register max-pos but
-        // runs at the audio connector dims (32 × 64 = 2048).
-        let connector = Connector::from_weights_dims(
-            connector_w,
-            "audio_embeddings_connector.",
-            ltx_cfg.connector_num_layers,
-            ltx_cfg.audio_connector_num_attention_heads,
-            ltx_cfg.audio_connector_attention_head_dim,
-            ltx_cfg.positional_embedding_theta,
-            ltx_cfg.connector_positional_embedding_max_pos,
-            ltx_cfg.connector_ff_bias,
-            dtype,
-        )?;
-        Ok(FeatureHead {
-            aggregate_w,
-            aggregate_b,
-            rescale,
-            connector,
+            dtype: prec.dtype(),
         })
     }
 
@@ -246,26 +175,132 @@ impl LtxTextEncoder {
     /// Each `(token, layer)` slice over the 3840 hidden dim is RMS-normalized independently, the 49
     /// layers are concatenated **dim-major / layer-minor** (`d*49 + layer`, via stack+reshape), and
     /// padded positions are zeroed. The video / audio heads then rescale + aggregate this off it.
+    ///
+    /// The math itself lives in [`per_token_rms_normed_hidden`], shared with LTX-2.5's Gemma 4
+    /// encoder (sc-18770) — same caption feature version, same extractor.
     fn normed_hidden(&self, hiddens: &[Array], attention_mask: &Array) -> Result<Array> {
-        let refs: Vec<&Array> = hiddens.iter().collect();
-        let encoded = stack_axis(&refs, 3)?; // (1, L, 3840, 49)
-        let sh = encoded.shape();
-        let (b, l) = (sh[0], sh[1]);
-        // per-token RMS over the hidden dim (axis 2), per layer.
-        let var = mean_axes(&multiply(&encoded, &encoded)?, &[2], true)?; // (1, L, 1, 49)
-        let eps = Array::from_slice(&[RMS_EPS], &[1]).as_dtype(self.dtype)?;
-        let normed = multiply(&encoded, &rsqrt(&add(&var, &eps)?)?)?;
-        let normed = normed.reshape(&[b, l, -1])?; // (1, L, 188160), dim-major/layer-minor
-                                                   // zero padded token positions (multiply by the 0/1 mask == where(mask, x, 0)).
-        let mask = attention_mask.reshape(&[b, l, 1])?.as_dtype(self.dtype)?;
-        Ok(multiply(&normed, &mask)?)
+        per_token_rms_normed_hidden(hiddens, attention_mask, self.dtype)
     }
+}
+
+/// The `aggregate_embed` Linear plus its `rescale_norm` scalar.
+///
+/// `out_dim` comes from the **bias**, not the weight: a quantized `aggregate_embed` stores its
+/// weight packed as U32 with the input axis folded into the packing, so reading `shape()[0]` off
+/// the packed tensor would still be right but reading it off the bias is right in both layouts
+/// and needs no knowledge of the packing.
+///
+/// `hidden_size` is the backbone's hidden dim (Gemma 3 and Gemma 4 both ship 3840 here, but the
+/// rescale is derived rather than assumed) — taken as a scalar rather than a `GemmaConfig` so
+/// LTX-2.5's Gemma 4 path (sc-18770), whose config comes from `mlx_llm::ModelConfig`, shares this
+/// loader instead of copying it.
+pub(crate) fn load_aggregate(
+    connector_w: &Weights,
+    key_prefix: &str,
+    hidden_size: i32,
+    prec: Precision,
+) -> Result<(Linear, Array)> {
+    let bias_key = format!("{key_prefix}.bias");
+    let out_dim = connector_w
+        .get(&bias_key)
+        .ok_or_else(|| Error::MissingTensor(bias_key.clone()))?
+        .shape()[0];
+    let aggregate = Linear::load(connector_w, key_prefix, prec)?;
+    let rescale = Array::from_slice(&[(out_dim as f32 / hidden_size as f32).sqrt()], &[1])
+        .as_dtype(prec.dtype())?;
+    Ok((aggregate, rescale))
+}
+
+/// The video feature head: `text_embedding_projection.video_aggregate_embed` + the
+/// `video_embeddings_connector` at the checkpoint's declared connector dims.
+pub(crate) fn load_video_head(
+    connector_w: &Weights,
+    hidden_size: i32,
+    ltx_cfg: &LtxConfig,
+    prec: Precision,
+) -> Result<FeatureHead> {
+    let (aggregate, rescale) = load_aggregate(
+        connector_w,
+        "text_embedding_projection.video_aggregate_embed",
+        hidden_size,
+        prec,
+    )?;
+    let connector =
+        Connector::from_weights(connector_w, "video_embeddings_connector.", ltx_cfg, prec)?;
+    Ok(FeatureHead {
+        aggregate,
+        rescale,
+        connector,
+    })
+}
+
+/// The audio feature head: `text_embedding_projection.audio_aggregate_embed` + the
+/// `audio_embeddings_connector`, which shares the checkpoint's layer count / theta / register
+/// max-pos but runs at the audio connector dims (32 × 64 = 2048).
+pub(crate) fn load_audio_head(
+    connector_w: &Weights,
+    hidden_size: i32,
+    ltx_cfg: &LtxConfig,
+    prec: Precision,
+) -> Result<FeatureHead> {
+    let (aggregate, rescale) = load_aggregate(
+        connector_w,
+        "text_embedding_projection.audio_aggregate_embed",
+        hidden_size,
+        prec,
+    )?;
+    let connector = Connector::from_weights_dims(
+        connector_w,
+        "audio_embeddings_connector.",
+        ltx_cfg.connector_num_layers,
+        ltx_cfg.audio_connector_num_attention_heads,
+        ltx_cfg.audio_connector_attention_head_dim,
+        ltx_cfg.positional_embedding_theta,
+        ltx_cfg.connector_positional_embedding_max_pos,
+        ltx_cfg.connector_ff_bias,
+        prec,
+    )?;
+    Ok(FeatureHead {
+        aggregate,
+        rescale,
+        connector,
+    })
+}
+
+/// `norm_and_concat_per_token_rms` — the shared masked per-token RMS `(1, L, hidden × n_states)`.
+///
+/// Each `(token, layer)` slice over the hidden dim is RMS-normalized independently, the states are
+/// concatenated **dim-major / layer-minor** (`d*n + layer`, via stack+reshape), and padded positions
+/// are zeroed.
+///
+/// This is the V2 (`PER_TOKEN_RMS`) caption feature extractor, shared verbatim by LTX-2.3's Gemma 3
+/// encoder and LTX-2.5's Gemma 4 encoder (sc-18770): the math is a property of the caption feature
+/// version, not of the backbone, and both checkpoints declare V2. Generic over the state count and
+/// hidden size — it reads both off the stacked tensor — so a backbone with a different depth flows
+/// through unchanged.
+pub(crate) fn per_token_rms_normed_hidden(
+    hiddens: &[Array],
+    attention_mask: &Array,
+    dtype: Dtype,
+) -> Result<Array> {
+    let refs: Vec<&Array> = hiddens.iter().collect();
+    let encoded = stack_axis(&refs, 3)?; // (1, L, hidden, n)
+    let sh = encoded.shape();
+    let (b, l) = (sh[0], sh[1]);
+    // per-token RMS over the hidden dim (axis 2), per layer.
+    let var = mean_axes(&multiply(&encoded, &encoded)?, &[2], true)?; // (1, L, 1, n)
+    let eps = Array::from_slice(&[RMS_EPS], &[1]).as_dtype(dtype)?;
+    let normed = multiply(&encoded, &rsqrt(&add(&var, &eps)?)?)?;
+    let normed = normed.reshape(&[b, l, -1])?; // (1, L, hidden × n), dim-major/layer-minor
+                                               // zero padded token positions (multiply by the 0/1 mask == where(mask, x, 0)).
+    let mask = attention_mask.reshape(&[b, l, 1])?.as_dtype(dtype)?;
+    Ok(multiply(&normed, &mask)?)
 }
 
 /// sc-18763: reject construction against anything but a V2-selected config. `normed_hidden` above
 /// is the V2 math unconditionally — running it against a V1-shaped checkpoint would silently
 /// produce plausible-looking, wrong conditioning (the exact failure mode the story called out).
-fn require_v2(ltx_cfg: &LtxConfig) -> Result<()> {
+pub(crate) fn require_v2(ltx_cfg: &LtxConfig) -> Result<()> {
     if ltx_cfg.caption_feature_version != CaptionFeatureVersion::V2 {
         return Err(Error::Msg(format!(
             "ltx: text encoder requires the V2 (PER_TOKEN_RMS) caption feature extractor; config \

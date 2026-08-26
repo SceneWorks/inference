@@ -721,9 +721,208 @@ fn tiny_decoder() -> (NaDiffusionDecoder, NaDiffusionDecoderConfig) {
     let cfg = tiny_config();
     let w = tiny_weights(&cfg);
     (
-        NaDiffusionDecoder::from_weights(&w, &cfg).expect("build the tiny decoder"),
+        NaDiffusionDecoder::from_weights(&w, &cfg, None).expect("build the tiny decoder"),
         cfg,
     )
+}
+
+/// **A tier directory carries both video VAEs**, so the diffusion decoder's config must be read from
+/// the section that actually holds it.
+///
+/// `crate::tiers` writes the conv VAE's block under `vae` and the DiffVAE's under `diffusion_vae` —
+/// one key cannot name two autoencoders. Reading `vae` there hands the diffusion decoder the *conv*
+/// VAE's config: a block that parses as JSON, is not corrupt, and is simply the wrong autoencoder.
+/// Nothing before this test read `diffusion_vae` at all, so a tier's DiffVAE could not be configured
+/// by the shipped loader (sc-18775).
+#[test]
+fn the_decoder_config_comes_from_the_diffusion_section_when_a_tier_carries_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let diffusion: serde_json::Value = serde_json::from_str(RELEASED_VAE).unwrap();
+    // A conv `CausalVideoAutoencoder` — no `decoder._class_name: NADiffusionDecoder` anywhere in it.
+    let conv = serde_json::json!({
+        "_class_name": "CausalVideoAutoencoder",
+        "dims": 3, "latent_channels": 128, "patch_size": 4,
+    });
+
+    let tier = tmp.path().join("tier");
+    std::fs::create_dir_all(&tier).unwrap();
+    std::fs::write(
+        tier.join("embedded_config.json"),
+        serde_json::json!({"vae": conv, "diffusion_vae": diffusion}).to_string(),
+    )
+    .unwrap();
+    let from_tier = NaDiffusionDecoderConfig::from_model_dir(&tier)
+        .expect("a tier must resolve through its `diffusion_vae` section");
+    assert_eq!(
+        from_tier,
+        NaDiffusionDecoderConfig::from_embedded_vae(&serde_json::from_str(RELEASED_VAE).unwrap())
+            .unwrap(),
+        "the tier must yield the DiffVAE's own geometry, not the conv VAE's"
+    );
+
+    // The single-VAE shape `crate::convert` emits still resolves through `vae`.
+    let single = tmp.path().join("single");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::write(
+        single.join("embedded_config.json"),
+        serde_json::json!({"vae": serde_json::from_str::<serde_json::Value>(RELEASED_VAE).unwrap()})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        NaDiffusionDecoderConfig::from_model_dir(&single).unwrap(),
+        from_tier,
+        "both directory shapes must describe the same decoder"
+    );
+
+    // A tier whose diffusion section is absent must say so rather than silently reading the conv
+    // block — the failure this ordering exists to prevent, made visible.
+    let conv_only = tmp.path().join("conv-only");
+    std::fs::create_dir_all(&conv_only).unwrap();
+    std::fs::write(
+        conv_only.join("embedded_config.json"),
+        serde_json::json!({"vae": conv}).to_string(),
+    )
+    .unwrap();
+    let err = NaDiffusionDecoderConfig::from_model_dir(&conv_only)
+        .expect_err("a conv-only bundle has no diffusion decoder to configure")
+        .to_string();
+    assert!(
+        err.contains("decoder"),
+        "the refusal must name what is missing, got: {err}"
+    );
+}
+
+/// The shipped tiers' group width, and the one used here. MLX's `quantize` implements exactly three
+/// group sizes — 32, 64, 128 — so this is not a free fixture parameter: [`packable_config`] is sized
+/// around it rather than the other way round.
+const TINY_GROUP: i32 = 64;
+/// 8-bit: the packed/dense agreement below is a numeric claim, and q8's error is small enough that a
+/// *mis-bound* projection is unmistakable against it rather than lost in q4's noise floor.
+const TINY_BITS: i32 = 8;
+
+/// Pack every Linear a `q4`/`q8` tier packs, using the converter's **own** predicate rather than a
+/// second copy of it — the two must not be able to disagree about which keys become triples.
+/// A miniature decoder whose every quantizable input axis is a multiple of [`TINY_GROUP`].
+///
+/// [`tiny_config`]'s 8–32-wide stages cannot be packed at all — MLX supports no group below 32 — so
+/// the packed-tier tests need their own geometry. Everything else about it is [`tiny_config`]: the
+/// same stage count, depths, and upsample ladder.
+fn packable_config() -> NaDiffusionDecoderConfig {
+    NaDiffusionDecoderConfig::from_embedded_vae(&serde_json::json!({
+        "model_output_type": "x0",
+        "decoder": {
+            "_class_name": "NADiffusionDecoder",
+            "in_channels": 64,
+            "out_channels": 3,
+            "patch_size": 2,
+            "head_dim": 16,
+            "t_emb_dim": 64,
+            "stage_channels": [64, 64, 64, 64, 64],
+            "stage_depths": [1, 1, 1, 1, 2],
+            "stage_kernels": [[3,3,3],[3,3,3],[3,3,3],[3,3,3],[3,3,3]],
+            "upsamples": [[[1,2,2],1],[[2,1,1],2],[[2,2,2],1],[[2,2,2],1]],
+            "stage5_kernel": [3,3,3],
+            "timestep_scale_multiplier": 1000.0,
+            "default_num_inference_steps": 1
+        }
+    }))
+    .expect("packable config")
+}
+
+fn tiny_weights_packed(cfg: &NaDiffusionDecoderConfig) -> Weights {
+    let dense = tiny_weights(cfg);
+    let mut map: HashMap<String, Array> = HashMap::new();
+    let mut packed = 0usize;
+    for key in dense.keys() {
+        let value = dense.require(key).unwrap();
+        if !crate::tiers::is_diff_vae_decoder_quantizable(key) {
+            map.insert(key.to_string(), value.clone());
+            continue;
+        }
+        let shape = value.shape();
+        assert_eq!(
+            shape.len(),
+            2,
+            "{key} is selected for quantization but is not rank-2"
+        );
+        assert_eq!(
+            shape[1] % TINY_GROUP,
+            0,
+            "{key}'s input axis {} does not divide the fixture group {TINY_GROUP}",
+            shape[1]
+        );
+        let base = key.strip_suffix(".weight").unwrap().to_string();
+        let (q, scales, biases) =
+            mlx_rs::ops::quantize(value, TINY_GROUP, TINY_BITS).expect("quantize");
+        map.insert(format!("{base}.weight"), q);
+        map.insert(format!("{base}.scales"), scales);
+        map.insert(format!("{base}.biases"), biases);
+        packed += 1;
+    }
+    assert!(
+        packed > 10,
+        "the fixture must pack a real population, got {packed}"
+    );
+    Weights::from_map(map)
+}
+
+/// **A packed decoder loads and decodes**, and lands where 8-bit affine quantization puts it — not
+/// at zero (which would mean the packed weights were never bound) and not adrift (which would mean
+/// they were bound wrong).
+///
+/// This is the load path sc-18775's q4/q8 tiers depend on: before it existed the whole component was
+/// emitted dense under a `no-mlx-port` exemption, and the tier's 834 MB stayed bf16 inside a "q4".
+#[test]
+fn a_packed_decoder_binds_its_triples_and_tracks_the_dense_one() {
+    let cfg = packable_config();
+    let dense = NaDiffusionDecoder::from_weights(&tiny_weights(&cfg), &cfg, None).unwrap();
+    let quant = Some(DiffVaeQuant {
+        bits: TINY_BITS,
+        group: TINY_GROUP,
+    });
+    let packed = NaDiffusionDecoder::from_weights(&tiny_weights_packed(&cfg), &cfg, quant).unwrap();
+
+    let latent = probe(&[1, cfg.in_channels, 3, 4, 4], 42, 0.8);
+    let shape5 = cfg.noise_shape(3, 4, 4);
+    let noise = probe(
+        &[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]],
+        43,
+        1.0,
+    );
+    let a = dense.decode(&latent, &noise).unwrap();
+    let b = packed.decode(&latent, &noise).unwrap();
+    assert_eq!(a.shape(), b.shape());
+
+    let delta = mean_abs(&subtract(&a, &b).unwrap());
+    let scale = mean_abs(&a);
+    assert!(
+        delta > 0.0,
+        "identical output means the packed triples were never bound — the loader read the dense \
+         `.weight` and ignored `.scales`"
+    );
+    assert!(
+        delta < 0.25 * scale,
+        "8-bit quantization moved the decode by {delta} against a mean magnitude of {scale} — that \
+         is a mis-bound projection, not quantization error"
+    );
+}
+
+/// Declaring the file dense while it carries `.scales` is refused, by name.
+///
+/// The alternative — reading the `U32` payload as a float weight — produces a decoder that builds,
+/// runs, and returns noise. Nothing downstream could tell that apart from a bad checkpoint.
+#[test]
+fn a_packed_file_loaded_as_dense_is_refused_rather_than_misread() {
+    let cfg = packable_config();
+    let err = match NaDiffusionDecoder::from_weights(&tiny_weights_packed(&cfg), &cfg, None) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a packed checkpoint must not load as dense"),
+    };
+    assert!(
+        err.contains(".scales is present") && err.contains("DiffVaeQuant"),
+        "the refusal must name the packed sibling and what to pass, got: {err}"
+    );
 }
 
 #[test]
@@ -753,7 +952,7 @@ fn a_width_disagreement_between_config_and_weights_is_a_load_error() {
     let mut wrong = cfg.clone();
     wrong.stage_channels[0] = 64;
     let w = tiny_weights(&cfg);
-    let err = match NaDiffusionDecoder::from_weights(&w, &wrong) {
+    let err = match NaDiffusionDecoder::from_weights(&w, &wrong, None) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("a config that disagrees with the weights must not load"),
     };
@@ -1049,7 +1248,7 @@ fn the_euler_loop_runs_for_a_multi_step_velocity_checkpoint() {
     cfg.model_output_type = ModelOutputType::Velocity;
     cfg.default_num_inference_steps = 3;
     let w = tiny_weights(&cfg);
-    let decoder = NaDiffusionDecoder::from_weights(&w, &cfg).unwrap();
+    let decoder = NaDiffusionDecoder::from_weights(&w, &cfg, None).unwrap();
     let schedule = decoder.timesteps();
     assert_eq!(schedule.len(), 3);
     for (got, want) in schedule.iter().zip([1.0f32, 2.0 / 3.0, 1.0 / 3.0]) {
@@ -1070,7 +1269,7 @@ fn the_euler_loop_runs_for_a_multi_step_velocity_checkpoint() {
     // The x0 schedule of the same length must differ — the two parameterisations are not aliases.
     let mut x0_cfg = cfg.clone();
     x0_cfg.model_output_type = ModelOutputType::X0;
-    let x0 = NaDiffusionDecoder::from_weights(&w, &x0_cfg).unwrap();
+    let x0 = NaDiffusionDecoder::from_weights(&w, &x0_cfg, None).unwrap();
     let other = x0.decode(&latent, &noise).unwrap();
     assert!(max_abs(&subtract(&out, &other).unwrap()) > 1e-6);
 }
@@ -1119,9 +1318,9 @@ fn swiglu_token_tiling_changes_nothing() {
     let dim = 16;
     let hidden = 64;
     let mlp = SwiGlu {
-        w_gate: probe(&[hidden, dim], 61, 0.3),
-        w_up: probe(&[hidden, dim], 62, 0.3),
-        w_down: probe(&[dim, hidden], 63, 0.3),
+        w_gate: ProjWeight::Dense(probe(&[hidden, dim], 61, 0.3)),
+        w_up: ProjWeight::Dense(probe(&[hidden, dim], 62, 0.3)),
+        w_down: ProjWeight::Dense(probe(&[dim, hidden], 63, 0.3)),
     };
     let tokens = SWIGLU_TILE_TOKENS + 37;
     let x = probe(&[1, tokens, dim], 64, 0.5);
@@ -1161,7 +1360,7 @@ fn the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin() {
         map.insert("up.proj.bias".into(), probe(&[8 * 4], 82, 0.1));
         Weights::from_map(map)
     };
-    let up = PixelShuffleUpsample::load(&w, "up", [2, 2, 2]).unwrap();
+    let up = PixelShuffleUpsample::load(&w, "up", [2, 2, 2], None).unwrap();
     assert_eq!(up.out_channels(), 4);
     let x = probe(&[1, 3, 2, 2, 4], 83, 0.5);
     assert_eq!(up.forward(&x, true).unwrap().shape(), &[1, 5, 4, 4, 4]);
@@ -1178,7 +1377,7 @@ fn the_pixel_shuffle_upsample_drops_the_duplicate_frame_only_at_the_origin() {
         map.insert("up.proj.bias".into(), probe(&[4 * 4], 85, 0.1));
         Weights::from_map(map)
     };
-    let spatial = PixelShuffleUpsample::load(&w2, "up", [1, 2, 2]).unwrap();
+    let spatial = PixelShuffleUpsample::load(&w2, "up", [1, 2, 2], None).unwrap();
     assert_eq!(spatial.forward(&x, true).unwrap().shape(), &[1, 3, 4, 4, 4]);
 }
 

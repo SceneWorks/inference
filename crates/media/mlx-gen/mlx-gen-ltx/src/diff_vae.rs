@@ -73,7 +73,7 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, divide, matmul, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::{linear, silu, timestep_sincos};
+use mlx_gen::nn::{linear, quantized_matmul_with_bias, silu, timestep_sincos};
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
@@ -322,18 +322,31 @@ impl NaDiffusionDecoderConfig {
         cfg.validated()
     }
 
-    /// Load from a converted model directory's `embedded_config.json` (`vae` block).
+    /// Load from a converted model directory's `embedded_config.json`.
+    ///
+    /// **Two section names, because two directory shapes exist.** A bundle converted from a
+    /// DiffVAE-only checkpoint ([`crate::convert`]) puts its `CausalDiffusionVAE` block under `vae`,
+    /// the single VAE it has. An LTX-2.5 **tier** ([`crate::tiers`]) carries *both* video VAEs — the
+    /// conv one under `vae` and this one under `diffusion_vae` — because one key cannot name two
+    /// different autoencoders. This reads `diffusion_vae` when it is present and `vae` otherwise,
+    /// which is the only order that resolves a tier correctly: preferring `vae` there would hand the
+    /// diffusion decoder the *conv* VAE's config, and `from_embedded_vae` would then reject a block
+    /// that is not wrong, merely the wrong one (sc-18775).
     pub fn from_model_dir(root: &Path) -> Result<Self> {
+        const SECTIONS: [&str; 2] = ["diffusion_vae", "vae"];
         let path = root.join("embedded_config.json");
         let text = std::fs::read_to_string(&path)?;
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx diffvae: parse {}: {e}", path.display())))?;
-        let vae = root_cfg.get("vae").ok_or_else(|| {
-            Error::Msg(format!(
-                "ltx diffvae: {} has no `vae` block",
-                path.display()
-            ))
-        })?;
+        let vae = SECTIONS
+            .iter()
+            .find_map(|section| root_cfg.get(section).filter(|v| !v.is_null()))
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "ltx diffvae: {} has none of the {SECTIONS:?} blocks",
+                    path.display()
+                ))
+            })?;
         Self::from_embedded_vae(vae)
     }
 
@@ -550,35 +563,155 @@ fn ceil_div(a: i32, b: i32) -> i32 {
 // Small layers
 // ---------------------------------------------------------------------------------------------
 
-/// `y = x Wᵀ` — the SwiGLU projections carry no bias.
-fn linear_nobias(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, w.t())?)
-}
-
 fn weight(w: &Weights, key: &str) -> Result<Array> {
     to_dtype(w.require(key)?, Dtype::Float32)
 }
 
-/// `[out, in]` weight + `[out]` bias.
+/// The affine-quant geometry a packed checkpoint was written at — `quantization_bits` /
+/// `quantization_group_size` from the tier's `split_model.json` (`crate::config::SplitModel`), the
+/// same two numbers the DiT reads through [`crate::transformer::Precision`].
+///
+/// Passed to [`NaDiffusionDecoder::from_weights`] as `Option`: `None` declares "this file is dense".
+/// It is **not** inferred from the tensors — a packed `[out, in·bits/32]` `U32` weight plus an
+/// `[out, in/group]` scales grid is two equations in three unknowns (`in`, `bits`, `group`), so any
+/// inference would have to guess one. The loader instead refuses a `.scales` sibling it was not told
+/// to expect, rather than guessing a geometry and decoding the weights into noise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffVaeQuant {
+    /// Bits per packed weight (4 or 8).
+    pub bits: i32,
+    /// The affine group width along the input axis.
+    pub group: i32,
+}
+
+/// One projection's stored weight: dense `[out, in]` f32, or the packed affine triple a quantized
+/// tier ships (sc-18775). The DiffVAE decoder is 99.96 % rank-2 Linear by parameter count, so this is
+/// where a q4/q8 tier's 834 MB → ~230 MB actually comes from.
+enum ProjWeight {
+    Dense(Array),
+    Quant {
+        /// `[out, in·bits/32]` `U32` — never cast; the payload is bit-packed, not numeric.
+        q: Array,
+        /// `[out, in/group]`, cast to the f32 compute dtype so `quantized_matmul` matches the dense
+        /// path's activations rather than re-introducing a bf16 rounding the tier did not intend.
+        scales: Array,
+        biases: Array,
+        group: i32,
+        bits: i32,
+    },
+}
+
+impl ProjWeight {
+    /// Bind `{prefix}.weight`, packed or dense, keyed on whether `{prefix}.scales` is present —
+    /// the same per-Linear predicate [`crate::transformer::Linear`] uses, so a tier that leaves one
+    /// Linear dense (the 48-wide `conv_in_x_t`) loads beside its packed siblings.
+    ///
+    /// A `.scales` sibling with `quant == None` is a **hard error**: that combination means the
+    /// caller believes the file is dense while the file says otherwise, and loading the packed `U32`
+    /// payload as a float weight would produce a decoder that runs and returns garbage.
+    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
+        let key = format!("{prefix}.weight");
+        let Some(scales) = w.get(&format!("{prefix}.scales")) else {
+            return Ok(ProjWeight::Dense(weight(w, &key)?));
+        };
+        let Some(DiffVaeQuant { bits, group }) = quant else {
+            return Err(Error::Msg(format!(
+                "ltx diffvae: {prefix}.scales is present but the caller declared the checkpoint \
+                 dense — pass the tier's `DiffVaeQuant` (bits/group from split_model.json)"
+            )));
+        };
+        Ok(ProjWeight::Quant {
+            q: w.require(&key)?.clone(),
+            scales: to_dtype(scales, Dtype::Float32)?,
+            biases: to_dtype(w.require(&format!("{prefix}.biases"))?, Dtype::Float32)?,
+            group,
+            bits,
+        })
+    }
+
+    /// `y = x Wᵀ (+ b)`. The SwiGLU projections pass `None` — they carry no bias.
+    fn apply(&self, x: &Array, b: Option<&Array>) -> Result<Array> {
+        match self {
+            ProjWeight::Dense(w) => match b {
+                Some(b) => linear(x, w, b),
+                None => Ok(matmul(x, w.t())?),
+            },
+            ProjWeight::Quant {
+                q,
+                scales,
+                biases,
+                group,
+                bits,
+            } => quantized_matmul_with_bias(x, q, scales, biases, b, *group, *bits),
+        }
+    }
+
+    /// Rows of the stored `[out, …]` weight. Packing runs along the **input** axis, so `out` is
+    /// axis 0 of the packed `U32` weight exactly as it is of the dense one.
+    fn out_features(&self) -> i32 {
+        match self {
+            ProjWeight::Dense(w) => w.shape()[0],
+            ProjWeight::Quant { q, .. } => q.shape()[0],
+        }
+    }
+
+    /// The logical input width. The packed `U32` weight's axis 1 is `in·bits/32`, which loses the
+    /// distinction between (say) 4-bit/128-wide and 8-bit/64-wide, so `in` is recovered from the
+    /// scales grid (`[out, in/group]`) times the group — the same reconstruction
+    /// `crate::transformer::LinearKind::base_shape` does, and the one [`check_widths`] needs to
+    /// cross-check the config against a packed file rather than skipping the check for one.
+    ///
+    /// [`check_widths`]: NaDiffusionDecoder::check_widths
+    fn in_features(&self) -> i32 {
+        match self {
+            ProjWeight::Dense(w) => w.shape()[1],
+            ProjWeight::Quant { scales, group, .. } => scales.shape()[1] * group,
+        }
+    }
+
+    /// Rows `[start, end)` of the output axis, as an independent projection — the fused `qkv` split.
+    /// Valid for the packed form for the same reason [`out_features`](Self::out_features) is: the
+    /// packing and the scales grid both run along the input axis, so every row is self-contained.
+    fn slice_out(&self, start: i32, end: i32) -> Result<Self> {
+        Ok(match self {
+            ProjWeight::Dense(w) => ProjWeight::Dense(contiguous(&slice_axis(w, 0, start, end)?)?),
+            ProjWeight::Quant {
+                q,
+                scales,
+                biases,
+                group,
+                bits,
+            } => ProjWeight::Quant {
+                q: contiguous(&slice_axis(q, 0, start, end)?)?,
+                scales: contiguous(&slice_axis(scales, 0, start, end)?)?,
+                biases: contiguous(&slice_axis(biases, 0, start, end)?)?,
+                group: *group,
+                bits: *bits,
+            },
+        })
+    }
+}
+
+/// `[out, in]` weight (dense or packed) + `[out]` bias.
 struct Linear {
-    w: Array,
+    w: ProjWeight,
     b: Array,
 }
 
 impl Linear {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
         Ok(Self {
-            w: weight(w, &format!("{prefix}.weight"))?,
+            w: ProjWeight::load(w, prefix, quant)?,
             b: weight(w, &format!("{prefix}.bias"))?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        linear(x, &self.w, &self.b)
+        self.w.apply(x, Some(&self.b))
     }
 
     fn out_features(&self) -> i32 {
-        self.w.shape()[0]
+        self.w.out_features()
     }
 }
 
@@ -586,17 +719,17 @@ impl Linear {
 /// stays bounded (upstream `swiglu_tiled`). Tiling changes nothing numerically — each token's
 /// result depends only on itself.
 struct SwiGlu {
-    w_gate: Array,
-    w_up: Array,
-    w_down: Array,
+    w_gate: ProjWeight,
+    w_up: ProjWeight,
+    w_down: ProjWeight,
 }
 
 impl SwiGlu {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
         Ok(Self {
-            w_gate: weight(w, &format!("{prefix}.w_gate.weight"))?,
-            w_up: weight(w, &format!("{prefix}.w_up.weight"))?,
-            w_down: weight(w, &format!("{prefix}.w_down.weight"))?,
+            w_gate: ProjWeight::load(w, &format!("{prefix}.w_gate"), quant)?,
+            w_up: ProjWeight::load(w, &format!("{prefix}.w_up"), quant)?,
+            w_down: ProjWeight::load(w, &format!("{prefix}.w_down"), quant)?,
         })
     }
 
@@ -622,9 +755,9 @@ impl SwiGlu {
     }
 
     fn tile(&self, flat: &Array) -> Result<Array> {
-        let gate = silu(&linear_nobias(flat, &self.w_gate)?)?;
-        let up = linear_nobias(flat, &self.w_up)?;
-        linear_nobias(&multiply(&gate, &up)?, &self.w_down)
+        let gate = silu(&self.w_gate.apply(flat, None)?)?;
+        let up = self.w_up.apply(flat, None)?;
+        self.w_down.apply(&multiply(&gate, &up)?, None)
     }
 }
 
@@ -960,10 +1093,16 @@ struct NaAttention {
 impl NaAttention {
     /// The checkpoint ships one fused `qkv` Linear; upstream splits it into three at load, and so
     /// does this — three narrow GEMMs never materialise a `3*dim`-wide intermediate.
-    fn load(w: &Weights, prefix: &str, kernel: [i32; 3], head_dim: i32) -> Result<Self> {
-        let fused_w = weight(w, &format!("{prefix}.qkv.weight"))?;
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        kernel: [i32; 3],
+        head_dim: i32,
+        quant: Option<DiffVaeQuant>,
+    ) -> Result<Self> {
+        let fused_w = ProjWeight::load(w, &format!("{prefix}.qkv"), quant)?;
         let fused_b = weight(w, &format!("{prefix}.qkv.bias"))?;
-        let rows = fused_w.shape()[0];
+        let rows = fused_w.out_features();
         if rows % 3 != 0 {
             return Err(Error::Msg(format!(
                 "ltx diffvae: {prefix}.qkv.weight has {rows} rows, not divisible by 3"
@@ -977,7 +1116,7 @@ impl NaAttention {
         }
         let part = |i: i32| -> Result<Linear> {
             Ok(Linear {
-                w: contiguous(&slice_axis(&fused_w, 0, i * dim, (i + 1) * dim)?)?,
+                w: fused_w.slice_out(i * dim, (i + 1) * dim)?,
                 b: contiguous(&slice_axis(&fused_b, 0, i * dim, (i + 1) * dim)?)?,
             })
         };
@@ -986,7 +1125,7 @@ impl NaAttention {
             to_q: part(0)?,
             to_k: part(1)?,
             to_v: part(2)?,
-            proj: Linear::load(w, &format!("{prefix}.proj"))?,
+            proj: Linear::load(w, &format!("{prefix}.proj"), quant)?,
             q_norm: weight(w, &format!("{prefix}.q_norm.weight"))?,
             k_norm: weight(w, &format!("{prefix}.k_norm.weight"))?,
             inv: [
@@ -1056,12 +1195,18 @@ struct NaBlock {
 }
 
 impl NaBlock {
-    fn load(w: &Weights, prefix: &str, kernel: [i32; 3], head_dim: i32) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        kernel: [i32; 3],
+        head_dim: i32,
+        quant: Option<DiffVaeQuant>,
+    ) -> Result<Self> {
         Ok(Self {
             norm1: weight(w, &format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim)?,
+            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
             norm2: weight(w, &format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"))?,
+            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"), quant)?,
         })
     }
 
@@ -1090,7 +1235,13 @@ struct DiffusionBlock {
 const ADALN_CHUNKS: i32 = 7;
 
 impl DiffusionBlock {
-    fn load(w: &Weights, prefix: &str, kernel: [i32; 3], head_dim: i32) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        kernel: [i32; 3],
+        head_dim: i32,
+        quant: Option<DiffVaeQuant>,
+    ) -> Result<Self> {
         let table = weight(w, &format!("{prefix}.scale_shift_table"))?;
         if table.ndim() != 2 || table.shape()[0] != ADALN_CHUNKS {
             return Err(Error::Msg(format!(
@@ -1099,12 +1250,12 @@ impl DiffusionBlock {
             )));
         }
         Ok(Self {
-            context_proj: Linear::load(w, &format!("{prefix}.context_proj"))?,
+            context_proj: Linear::load(w, &format!("{prefix}.context_proj"), quant)?,
             scale_shift_table: table,
             norm1: weight(w, &format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim)?,
+            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
             norm2: weight(w, &format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"))?,
+            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"), quant)?,
         })
     }
 
@@ -1149,9 +1300,14 @@ struct PixelShuffleUpsample {
 }
 
 impl PixelShuffleUpsample {
-    fn load(w: &Weights, prefix: &str, stride: [i32; 3]) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        stride: [i32; 3],
+        quant: Option<DiffVaeQuant>,
+    ) -> Result<Self> {
         Ok(Self {
-            proj: Linear::load(w, &format!("{prefix}.proj"))?,
+            proj: Linear::load(w, &format!("{prefix}.proj"), quant)?,
             stride,
         })
     }
@@ -1389,7 +1545,19 @@ impl NaDiffusionDecoder {
     const TIME_PROJ_DIM: usize = 256;
 
     /// Build from a converted `vae_diffusion_decoder.safetensors` weight map.
-    pub fn from_weights(w: &Weights, cfg: &NaDiffusionDecoderConfig) -> Result<Self> {
+    ///
+    /// `quant` declares the file's affine-quant geometry: `None` for a dense checkpoint (upstream's,
+    /// and the `bf16` tier's), `Some` for a `q4`/`q8` tier, carrying that tier's
+    /// `quantization_bits` / `quantization_group_size`. It is a declaration, not a request — every
+    /// Linear binds packed or dense according to whether its own `.scales` sibling exists, so the
+    /// one Linear a tier leaves dense (`conv_in_x_t`, input axis 48) loads correctly under
+    /// `Some(..)`. Declaring `None` against a packed file is a hard error rather than a silent
+    /// mis-read of the `U32` payload; see [`DiffVaeQuant`].
+    pub fn from_weights(
+        w: &Weights,
+        cfg: &NaDiffusionDecoderConfig,
+        quant: Option<DiffVaeQuant>,
+    ) -> Result<Self> {
         let stages = cfg.stage_channels.len();
         let det = stages - 1;
         let mut det_stages = Vec::with_capacity(det);
@@ -1403,6 +1571,7 @@ impl NaDiffusionDecoder {
                     &format!("det_stages.{stage}.{i}"),
                     kernel,
                     cfg.head_dim,
+                    quant,
                 )?);
             }
             det_stages.push(blocks);
@@ -1410,6 +1579,7 @@ impl NaDiffusionDecoder {
                 w,
                 &format!("upsamples.{stage}"),
                 cfg.upsamples[stage].0,
+                quant,
             )?);
         }
         let mut diff_blocks =
@@ -1420,6 +1590,7 @@ impl NaDiffusionDecoder {
                 &format!("diff_blocks.{i}"),
                 cfg.stage5_kernel,
                 cfg.head_dim,
+                quant,
             )?);
         }
 
@@ -1439,16 +1610,18 @@ impl NaDiffusionDecoder {
             cfg: cfg.clone(),
             stat_mean: stat("per_channel_statistics.mean")?,
             stat_std: stat("per_channel_statistics.std")?,
-            conv_in: Linear::load(w, "conv_in")?,
+            conv_in: Linear::load(w, "conv_in", quant)?,
             det_stages,
             upsamples,
-            t_linear1: Linear::load(w, "t_embedder.mlp.0")?,
-            t_linear2: Linear::load(w, "t_embedder.mlp.2")?,
-            shared_adaln: Linear::load(w, "shared_adaln.proj")?,
-            conv_in_x_t: Linear::load(w, "conv_in_x_t")?,
+            t_linear1: Linear::load(w, "t_embedder.mlp.0", quant)?,
+            t_linear2: Linear::load(w, "t_embedder.mlp.2", quant)?,
+            shared_adaln: Linear::load(w, "shared_adaln.proj", quant)?,
+            // Deliberately *not* passed a packed weight by the tier emitter: its input axis is 48,
+            // which no affine group of 64 divides. See `tiers::DIFF_VAE_DECODER_QUANT_SUFFIXES`.
+            conv_in_x_t: Linear::load(w, "conv_in_x_t", quant)?,
             diff_blocks,
             norm_out: weight(w, "norm_out.weight")?,
-            conv_out: Linear::load(w, "conv_out")?,
+            conv_out: Linear::load(w, "conv_out", quant)?,
         };
         decoder.check_widths()?;
         Ok(decoder)
@@ -1492,7 +1665,7 @@ impl NaDiffusionDecoder {
         )?;
         expect(
             "conv_in_x_t input width",
-            self.conv_in_x_t.w.shape()[1],
+            self.conv_in_x_t.w.in_features(),
             cfg.out_channels * cfg.patch_size * cfg.patch_size,
         )?;
         expect(
@@ -1509,7 +1682,7 @@ impl NaDiffusionDecoder {
             expect(&format!("diff block {i} width"), block.attn.width(), c5)?;
             expect(
                 &format!("diff block {i} context width"),
-                block.context_proj.w.shape()[1],
+                block.context_proj.w.in_features(),
                 *cfg.stage_channels.last().expect("validated"),
             )?;
         }
@@ -1524,7 +1697,7 @@ impl NaDiffusionDecoder {
             let dim = cfg.stage_channels[stage];
             expect(
                 &format!("det stage {stage} mlp hidden"),
-                blocks[0].mlp.w_gate.shape()[0],
+                blocks[0].mlp.w_gate.out_features(),
                 mlp_hidden(dim),
             )?;
         }
@@ -2094,6 +2267,12 @@ fn push_block_keys(keys: &mut Vec<String>, prefix: &str, diffusion: bool) {
 }
 
 /// Every weight key [`NaDiffusionDecoder::from_weights`] reads for `cfg`, for loader audits.
+///
+/// This is the **dense** key set — upstream's checkpoint and the `bf16` tier. A `q4`/`q8` tier
+/// replaces each quantized Linear's `{prefix}.weight` with the `{prefix}.{weight,scales,biases}`
+/// triple, so this list is not the key set of a packed file. The audit for a packed tier is the
+/// loader itself: `from_weights` requires every key it reads, so a tier that dropped or misnamed one
+/// fails to build rather than loading a partial decoder.
 pub fn expected_weight_keys(cfg: &NaDiffusionDecoderConfig) -> Vec<String> {
     let mut keys = vec![
         "per_channel_statistics.mean".to_string(),
@@ -2126,9 +2305,23 @@ pub fn expected_weight_keys(cfg: &NaDiffusionDecoderConfig) -> Vec<String> {
 /// Classify a `Weights` map as an `NADiffusionDecoder` — used by the converter and by loaders that
 /// must tell the two 2.5 video decoders apart from the tensors alone.
 pub fn looks_like_diffusion_decoder(w: &Weights) -> bool {
+    keys_look_like_diffusion_decoder(w.keys())
+}
+
+/// [`looks_like_diffusion_decoder`] over bare keys, for the converters that classify a tensor map
+/// they have not wrapped in a [`Weights`] yet (`crate::tiers`, `crate::convert`).
+///
+/// One predicate, two callers: a converter deciding whether to emit the component and a loader
+/// deciding whether to read it must never disagree about what a diffusion decoder is — the
+/// disagreement ships as a tier whose `embedded_config.json` declares a `diffusion_vae` section with
+/// no decoder file beside it.
+///
+/// "Not empty" is deliberately not the test: `sanitize_vae_decoder_component` also sweeps in the two
+/// `per_channel_statistics` tensors, so a file with no decoder at all still yields a non-empty map.
+pub fn keys_look_like_diffusion_decoder<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
     let mut det = false;
     let mut diff = false;
-    for key in w.keys() {
+    for key in keys {
         det |= key.starts_with("det_stages.");
         diff |= key.starts_with("diff_blocks.");
     }
