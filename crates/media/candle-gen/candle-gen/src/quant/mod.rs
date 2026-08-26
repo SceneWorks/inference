@@ -918,15 +918,13 @@ impl Module for QLinear {
 pub enum QEmbedding {
     Dense(Embedding),
     Quantized {
-        /// The GGUF-quantized `[vocab, hidden]` table; unique selected rows are dequantized to
-        /// `out_dtype` per forward, then duplicate positions are restored.
-        table: QTensor,
-        /// A compact, host-resident row directory captured once at installation. Candle's `QTensor`
-        /// API has whole-table dequantization but no row view; retaining the quantized bytes lets a
-        /// forward copy only selected rows into its temporary QTensor instead of reading the entire
-        /// device table back on every prompt.
+        /// The one long-lived representation: host-resident quantized table bytes. Candle's
+        /// `QTensor` API has whole-table dequantization but no row view, so a forward copies only
+        /// selected rows from these bytes into a temporary device `QTensor`.
         row_data: Vec<u8>,
+        vocab_size: usize,
         hidden_size: usize,
+        quant_dtype: GgmlDType,
         /// The dtype the dequantized table is cast to before index-select — the dense embedding
         /// table's dtype (i.e. `vb.dtype()`). Mirrors how [`QLinear::forward`] casts its dequantized
         /// weight to the activation dtype, so a packed bf16 text-encoder embedding yields bf16 rows
@@ -946,6 +944,19 @@ pub struct QEmbeddingWork {
     pub selected_rows: usize,
     /// Dense output bytes transiently dequantized before duplicate restoration.
     pub dequantized_bytes: usize,
+}
+
+/// The long-lived packed representation retained by an installed [`QEmbedding`].
+///
+/// Row-selective lookup retains one host byte table and recreates a device-format `QTensor` only
+/// for the rows requested by a forward. `device_table_bytes` is therefore zero: retaining both
+/// representations would defeat the residency saving this path provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QEmbeddingStorage {
+    /// Bytes in the host-resident quantized row source.
+    pub host_packed_bytes: usize,
+    /// Long-lived bytes in a device-format full-vocabulary table.
+    pub device_table_bytes: usize,
 }
 
 impl QEmbedding {
@@ -1030,6 +1041,19 @@ impl QEmbedding {
         })
     }
 
+    /// Returns the retained quantized storage for a packed embedding, if any. This deterministic
+    /// probe is intentionally about long-lived representation rather than temporary forward work;
+    /// use [`Self::lookup_work`] for the latter.
+    pub fn resident_storage(&self) -> Option<QEmbeddingStorage> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Quantized { row_data, .. } => Some(QEmbeddingStorage {
+                host_packed_bytes: row_data.len(),
+                device_table_bytes: 0,
+            }),
+        }
+    }
+
     /// Index-select the embedding rows for `indexes`. Dense delegates to `candle_nn::Embedding`.
     /// The packed path first deduplicates the requested token IDs, constructs a temporary quantized
     /// table containing only those rows, dequantizes that bounded table, then restores duplicate
@@ -1038,11 +1062,19 @@ impl QEmbedding {
         match self {
             Self::Dense(e) => e.forward(indexes),
             Self::Quantized {
-                table,
                 row_data,
+                vocab_size,
                 hidden_size,
+                quant_dtype,
                 out_dtype,
-            } => forward_quantized_embedding(table, row_data, *hidden_size, *out_dtype, indexes),
+            } => forward_quantized_embedding(
+                row_data,
+                *vocab_size,
+                *hidden_size,
+                *quant_dtype,
+                *out_dtype,
+                indexes,
+            ),
         }
     }
 
@@ -1058,15 +1090,17 @@ impl QEmbedding {
                 table.shape()
             );
         }
+        let vocab_size = dims[0];
         let hidden_size = dims[1];
+        let quant_dtype = table.dtype();
         let row_bytes = hidden_size
-            .checked_div(table.dtype().block_size())
-            .and_then(|blocks| blocks.checked_mul(table.dtype().type_size()))
+            .checked_div(quant_dtype.block_size())
+            .and_then(|blocks| blocks.checked_mul(quant_dtype.type_size()))
             .ok_or_else(|| {
                 candle_core::Error::Msg("invalid quantized embedding row layout".into())
             })?;
         let row_data = table.data()?.into_owned();
-        let expected_bytes = dims[0].checked_mul(row_bytes).ok_or_else(|| {
+        let expected_bytes = vocab_size.checked_mul(row_bytes).ok_or_else(|| {
             candle_core::Error::Msg("quantized embedding storage size overflow".into())
         })?;
         if row_data.len() != expected_bytes {
@@ -1077,9 +1111,10 @@ impl QEmbedding {
             );
         }
         Ok(Self::Quantized {
-            table,
             row_data,
+            vocab_size,
             hidden_size,
+            quant_dtype,
             out_dtype,
         })
     }
@@ -1124,9 +1159,10 @@ fn unique_embedding_indexes(indexes: &Tensor) -> Result<(Vec<usize>, Vec<u32>)> 
 }
 
 fn forward_quantized_embedding(
-    table: &QTensor,
     row_data: &[u8],
+    vocab: usize,
     hidden_size: usize,
+    quant_dtype: GgmlDType,
     out_dtype: DType,
     indexes: &Tensor,
 ) -> Result<Tensor> {
@@ -1137,10 +1173,9 @@ fn forward_quantized_embedding(
         return Tensor::zeros(output_shape, out_dtype, indexes.device());
     }
 
-    let vocab = table.shape().dim(0)?;
     let row_bytes = hidden_size
-        .checked_div(table.dtype().block_size())
-        .and_then(|blocks| blocks.checked_mul(table.dtype().type_size()))
+        .checked_div(quant_dtype.block_size())
+        .and_then(|blocks| blocks.checked_mul(quant_dtype.type_size()))
         .ok_or_else(|| candle_core::Error::Msg("invalid quantized embedding row layout".into()))?;
     let mut selected = Vec::with_capacity(unique.len().saturating_mul(row_bytes));
     for row in unique {
@@ -1161,7 +1196,7 @@ fn forward_quantized_embedding(
     let selected = QTensor::new(
         // `QStorage::from_data`'s typed view borrows from its Cow while cloning the blocks. Keep
         // this row-only byte buffer alive across that call; an owned Cow would drop it too early.
-        QStorage::from_data(Cow::Borrowed(&selected), indexes.device(), table.dtype())?,
+        QStorage::from_data(Cow::Borrowed(&selected), indexes.device(), quant_dtype)?,
         (
             inverse.iter().copied().max().unwrap_or_default() as usize + 1,
             hidden_size,
@@ -1514,6 +1549,41 @@ mod tests {
         let (p, d) = (packed.forward(&idx)?, dense.forward(&idx)?);
         let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "packed embedding deviates from dense grid");
+        Ok(())
+    }
+
+    /// Both packed installation routes retain exactly one full-vocabulary representation: the host
+    /// byte table used for future row reads. The temporary device `QTensor` built by a lookup is not
+    /// retained after installation.
+    #[test]
+    fn packed_qembedding_resident_storage_is_host_rows_only() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (32, 128);
+        let (wq, s, b, _) = q4_fixture(vocab, hidden);
+        let packed =
+            QEmbedding::from_packed_dtype_gs(&wq, &s, &b, &dev, DType::BF16, MLX_GROUP_SIZE)?;
+        assert_eq!(
+            packed.resident_storage(),
+            Some(QEmbeddingStorage {
+                host_packed_bytes: vocab * hidden / GgmlDType::Q4_1.block_size()
+                    * GgmlDType::Q4_1.type_size(),
+                device_table_bytes: 0,
+            }),
+            "repacked MLX rows must not leave a duplicate device table resident"
+        );
+
+        let table = Tensor::randn(0f32, 1f32, (vocab, hidden), &dev)?;
+        let qtensor = QTensor::quantize(&table, GgmlDType::Q4_0)?;
+        let host_packed_bytes = qtensor.data()?.len();
+        let packed = QEmbedding::from_qtensor(qtensor, DType::F32)?;
+        assert_eq!(
+            packed.resident_storage(),
+            Some(QEmbeddingStorage {
+                host_packed_bytes,
+                device_table_bytes: 0,
+            }),
+            "already-device-format rows must also release their source table after installation"
+        );
         Ok(())
     }
 
