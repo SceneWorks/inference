@@ -165,6 +165,40 @@ struct Attention {
     eps: f64,
 }
 
+/// Request-scoped K/V heads for one block's cross-attention.  These depend only on the projected
+/// text context, never on the noisy latent or timestep, so the denoise loop must reuse them.
+pub(crate) struct PreparedBlockCrossKv {
+    key: Tensor,
+    value: Tensor,
+}
+
+/// Request-scoped cross-attention K/V heads for every base Wan block.
+pub(crate) struct PreparedWanCrossKv {
+    blocks: Vec<PreparedBlockCrossKv>,
+}
+
+#[cfg(test)]
+static CROSS_KV_PREPARATION_PAIRS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static CROSS_KV_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_cross_kv_probe() -> std::sync::MutexGuard<'static, ()> {
+    CROSS_KV_PROBE_LOCK.lock().expect("cross K/V probe lock")
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cross_kv_preparation_pairs() {
+    CROSS_KV_PREPARATION_PAIRS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn cross_kv_preparation_pairs() -> usize {
+    CROSS_KV_PREPARATION_PAIRS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Attention {
     /// Build this attention's projections + qk-norms from `src` — the dense (`WeightSrc::Dense`) and
     /// native-GGUF k-quant (`WeightSrc::Gguf`, sc-12735) paths share this ONE builder, so the resident-
@@ -208,37 +242,61 @@ impl Attention {
         Ok(())
     }
 
-    /// `hidden`: `[B, S, dim]`; `context`: cross-attn K/V source (= hidden for self-attn). RoPE is
-    /// applied only when `cos`/`sin` are given (self-attn).
+    /// Project a step-invariant cross-attention source into K/V heads once per request conditioning
+    /// payload.  The resulting tensors remain owned by the caller's request scope.
+    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        let (b, s_kv, _) = context.dims3()?;
+        let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
+        let v = self.to_v.forward(context)?;
+        let to_heads = |t: &Tensor| -> Result<Tensor> {
+            t.reshape((b, s_kv, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        Ok(PreparedBlockCrossKv {
+            key: to_heads(&k)?,
+            value: to_heads(&v)?,
+        })
+    }
+
+    /// `hidden`: `[B, S, dim]`; `kv`: preprojected K/V heads. RoPE is applied only when
+    /// `cos`/`sin` are given (self-attention).
+    fn forward_prepared(
+        &self,
+        hidden: &Tensor,
+        kv: &PreparedBlockCrossKv,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
+        let (b, s, _) = hidden.dims3()?;
+        let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
+        let to_heads = |t: &Tensor| -> Result<Tensor> {
+            t.reshape((b, s, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        let mut q = to_heads(&q)?; // [B,H,S,d]
+        let mut k = kv.key.clone();
+        if let Some((cos, sin)) = rope {
+            q = apply_rope(&q, cos, sin)?;
+            k = apply_rope(&k, cos, sin)?;
+        }
+        let scale = (self.head_dim as f64).powf(-0.5);
+        let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, s, self.num_heads * self.head_dim))?;
+        self.to_out.forward(&out)
+    }
+
+    /// Compatibility path for self-attention and one-off callers. Request render paths use
+    /// [`Self::prepare_kv`] outside the step loop instead.
     fn forward(
         &self,
         hidden: &Tensor,
         context: &Tensor,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        let (b, s, _) = hidden.dims3()?;
-        let s_kv = context.dim(1)?;
-        let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
-        let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
-        let v = self.to_v.forward(context)?;
-        let to_heads = |t: &Tensor, len: usize| -> Result<Tensor> {
-            t.reshape((b, len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?
-                .contiguous()
-        };
-        let mut q = to_heads(&q, s)?; // [B,H,S,d]
-        let mut k = to_heads(&k, s_kv)?;
-        let v = to_heads(&v, s_kv)?;
-        if let Some((cos, sin)) = rope {
-            q = apply_rope(&q, cos, sin)?;
-            k = apply_rope(&k, cos, sin)?;
-        }
-        let scale = (self.head_dim as f64).powf(-0.5);
-        let out = sdpa(&q, &k, &v, scale)?; // [B,H,S,d]
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, s, self.num_heads * self.head_dim))?;
-        self.to_out.forward(&out)
+        self.forward_prepared(hidden, &self.prepare_kv(context)?, rope)
     }
 }
 
@@ -321,12 +379,19 @@ impl Block {
         })
     }
 
-    /// `hidden`: `[B,S,dim]` (bf16); `temb6`: `[B,6,dim]` (f32); `context`: `[B,S_ctx,dim]` (bf16).
-    pub(crate) fn forward(
+    pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        #[cfg(test)]
+        CROSS_KV_PREPARATION_PAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.attn2.prepare_kv(context)
+    }
+
+    /// `hidden`: `[B,S,dim]` (bf16); `temb6`: `[B,6,dim]` (f32); `cross_kv`: request-scoped
+    /// prepared text K/V for this block.
+    pub(crate) fn forward_prepared(
         &self,
         hidden: &Tensor,
         temb6: &Tensor,
-        context: &Tensor,
+        cross_kv: &PreparedBlockCrossKv,
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
@@ -364,7 +429,7 @@ impl Block {
             .broadcast_mul(&self.norm2_w)?
             .broadcast_add(&self.norm2_b)?
             .to_dtype(dt)?;
-        let a = self.attn2.forward(&n, context, None)?;
+        let a = self.attn2.forward_prepared(&n, cross_kv, None)?;
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
         // 3. feed-forward
@@ -543,6 +608,19 @@ impl WanTransformer {
         self.text_l2.forward(&self.text_l1.forward(&x)?.gelu()?)
     }
 
+    /// Prepare all step-invariant text cross-attention K/V heads for one projected conditioning
+    /// payload. The returned cache is intentionally request-scoped: callers create it after the DiT
+    /// loads and retain it only for the matching denoise branch.
+    pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedWanCrossKv> {
+        Ok(PreparedWanCrossKv {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|block| block.prepare_cross_kv(context))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
     /// One DiT forward: `latents [B,in_c,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t`,
     /// RoPE `cos`/`sin [L,64]` → predicted velocity `[B,out_c,F,Hl,Wl]`.
     ///
@@ -559,7 +637,22 @@ impl WanTransformer {
         sin: &Tensor,
     ) -> Result<Tensor> {
         let (tokens, grid) = self.patch_embed_tokens(latents)?;
-        let out = self.forward_packed(&tokens, t, context, cos, sin)?;
+        let cross_kv = self.prepare_cross_kv(context)?;
+        let out = self.forward_packed_prepared(&tokens, t, &cross_kv, cos, sin)?;
+        self.unpatchify_tokens(&out, grid)
+    }
+
+    /// Denoise one scalar-timestep latent against request-scoped prepared text K/V.
+    pub(crate) fn forward_prepared(
+        &self,
+        latents: &Tensor,
+        t: f64,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (tokens, grid) = self.patch_embed_tokens(latents)?;
+        let out = self.forward_packed_prepared(&tokens, t, cross_kv, cos, sin)?;
         self.unpatchify_tokens(&out, grid)
     }
 
@@ -606,7 +699,27 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let cross_kv = self.prepare_cross_kv(context)?;
+        self.forward_packed_prepared(tokens, t, &cross_kv, cos, sin)
+    }
+
+    /// Run the block stack + head with preprojected request-scoped text K/V.
+    pub(crate) fn forward_packed_prepared(
+        &self,
+        tokens: &Tensor,
+        t: f64,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
         let (b, _l, _dim) = tokens.dims3()?;
+        if cross_kv.blocks.len() != self.blocks.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan prepared cross K/V has {} blocks; transformer has {}",
+                cross_kv.blocks.len(),
+                self.blocks.len()
+            )));
+        }
         // Time embedding → temb [B,dim], and the per-block 6-vector temb6 [B,6,dim] (f32).
         let sinus =
             timestep_sinusoid(t, self.cfg.freq_dim, b, &self.device)?.to_dtype(self.dtype)?;
@@ -620,8 +733,8 @@ impl WanTransformer {
             .to_dtype(DType::F32)?;
 
         let mut hidden = tokens.clone();
-        for blk in &self.blocks {
-            hidden = blk.forward(&hidden, &temb6, context, cos, sin)?;
+        for (blk, kv) in self.blocks.iter().zip(&cross_kv.blocks) {
+            hidden = blk.forward_prepared(&hidden, &temb6, kv, cos, sin)?;
             // sc-12768: on the sequential-offload path, drain the stream after each block so the deep
             // async denoise pipeline cannot race candle's churned cudarc caching pool (the freed TE /
             // inactive-expert pages the next expert's weights + full-res activations reuse) — the
@@ -656,8 +769,28 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let cross_kv = self.prepare_cross_kv(context)?;
+        self.forward_tokens_prepared(latents, timestep_tokens, &cross_kv, cos, sin)
+    }
+
+    /// TI2V mask-blend forward with request-scoped prepared text K/V.
+    pub(crate) fn forward_tokens_prepared(
+        &self,
+        latents: &Tensor,
+        timestep_tokens: &Tensor,
+        cross_kv: &PreparedWanCrossKv,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
         let (tokens, grid) = self.patch_embed_tokens(latents)?;
         let (b, l, _dim) = tokens.dims3()?;
+        if cross_kv.blocks.len() != self.blocks.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "wan prepared cross K/V has {} blocks; transformer has {}",
+                cross_kv.blocks.len(),
+                self.blocks.len()
+            )));
+        }
         let (tb, tl) = timestep_tokens.dims2()?;
         if (tb, tl) != (b, l) {
             return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -676,8 +809,8 @@ impl WanTransformer {
             .to_dtype(DType::F32)?;
 
         let mut hidden = tokens;
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, &temb6, context, cos, sin)?;
+        for (block, kv) in self.blocks.iter().zip(&cross_kv.blocks) {
+            hidden = block.forward_prepared(&hidden, &temb6, kv, cos, sin)?;
             if self.bounded_offload {
                 self.device.synchronize()?;
             }
@@ -948,6 +1081,61 @@ mod tests {
             max_abs(&got, &want),
             0.0,
             "seam composition must equal forward"
+        );
+    }
+
+    /// The Candle work-count probe for SC-21692. Each projected text payload gets one K/V pair per
+    /// block; scalar and TI2V-token denoise forwards reuse that request-scoped cache without another
+    /// text K/V projection. The prepared result remains exactly pinned to the prior small CPU fixture.
+    #[test]
+    fn prepared_cross_kv_runs_once_per_payload_and_preserves_small_fixture_output() {
+        let _probe_lock = lock_cross_kv_probe();
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let pos = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let neg = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(2, 2, 2, &dev).unwrap();
+        let timestep = 833.0;
+
+        let prior = dit.forward(&latents, &pos, timestep, &cos, &sin).unwrap();
+        reset_cross_kv_preparation_pairs();
+        let pos_kv = dit.prepare_cross_kv(&pos).unwrap();
+        let neg_kv = dit.prepare_cross_kv(&neg).unwrap();
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            cfg.num_layers * 2,
+            "one K/V pair per block and conditioning payload"
+        );
+
+        let prepared = dit
+            .forward_prepared(&latents, timestep, &pos_kv, &cos, &sin)
+            .unwrap();
+        assert_eq!(
+            max_abs(&prior, &prepared),
+            0.0,
+            "prepared scalar forward must preserve the prior fixture"
+        );
+        let tokens = Tensor::full(timestep as f32, (1, 8), &dev).unwrap();
+        let tokenized = dit
+            .forward_tokens_prepared(&latents, &tokens, &pos_kv, &cos, &sin)
+            .unwrap();
+        assert!(
+            max_abs(&prepared, &tokenized) < 1e-5,
+            "prepared TI2V-token forward must retain scalar parity"
+        );
+        // Repeat both CFG branches across multiple denoise steps. Only Q changes; text K/V is untouched.
+        for step in [700.0, 500.0, 250.0] {
+            dit.forward_prepared(&latents, step, &pos_kv, &cos, &sin)
+                .unwrap();
+            dit.forward_prepared(&latents, step, &neg_kv, &cos, &sin)
+                .unwrap();
+        }
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            cfg.num_layers * 2,
+            "denoise repetition must not reproject text K/V"
         );
     }
 
