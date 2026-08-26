@@ -30,6 +30,15 @@
 //! by the caller through the **`LoadSpec::text_encoder`** slot (or co-located at `<root>/text_encoder`).
 //! As of sc-13749 there is no environment side-channel or HF-cache scan — an absent encoder is a
 //! load-time, actionable error naming the slot (epic 13657; the candle sibling of sc-13664).
+//!
+//! **LTX-2.5 (sc-18767):** the `CausalDiffusionVAE` video decoder — five stages of 3-D
+//! neighborhood attention + SwiGLU feeding an eight-block single-step diffusion stage — is
+//! [`diff_vae`], the candle twin of `mlx_gen_ltx::diff_vae`. It reads the released
+//! `vae/ltx-2.5-video-vae-bf16.safetensors` **verbatim** (no conversion: every tensor it wants is
+//! already a PyTorch `[out, in]` matrix), implements the neighborhood-attention operator itself
+//! rather than taking a NATTEN/CUTLASS dependency, and is asserted against the *same* committed
+//! goldens the MLX port uses. The conv decoder ([`vae`]) is untouched and still the selectable
+//! decode path for a conv-VAE checkpoint.
 
 pub mod adapters;
 pub mod audio_vae;
@@ -38,6 +47,7 @@ pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
+pub mod diff_vae;
 pub mod dit_train;
 pub mod duration_head;
 pub mod gemma;

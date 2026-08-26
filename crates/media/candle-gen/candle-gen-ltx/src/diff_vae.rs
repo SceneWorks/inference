@@ -1,13 +1,15 @@
-//! LTX-2.5 **DiffVAE** video decoder — `NADiffusionDecoder` on MLX (sc-18766).
+//! LTX-2.5 **DiffVAE** video decoder — `NADiffusionDecoder` on candle/CUDA (sc-18767).
 //!
-//! `vae/ltx-2.5-video-vae-bf16.safetensors` declares `_class_name: CausalDiffusionVAE`: the same
-//! conv `Encoder` the conv VAE uses (see [`crate::vae::LtxVideoVae::encoder_only`]) paired with a
-//! decoder that is not a conv stack at all. This module is that decoder.
+//! The candle twin of `mlx_gen_ltx::diff_vae` (sc-18766, inference PR #696). Same operator, same
+//! window rule, same tiling arithmetic, and the **same committed absolute-error goldens** — this
+//! crate's parity test loads `mlx-gen-ltx/tests/fixtures/ltx25_diffvae_golden.safetensors` by path
+//! rather than re-recording it, which is what makes a cross-backend divergence a red test rather
+//! than two independently plausible pictures.
 //!
 //! ## Shape of the thing
 //!
 //! Five stages, all **channels-last** `(B, T, H, W, C)` — the reference's own layout, and the one
-//! MLX wants:
+//! every projection here is a plain `[out, in]` GEMM against:
 //!
 //! | | stage 1 | stage 2 | stage 3 | stage 4 | stage 5 |
 //! | --- | --- | --- | --- | --- | --- |
@@ -17,67 +19,62 @@
 //!
 //! Stages 1-4 are **deterministic**: pre-norm blocks of 3-D neighborhood attention + SwiGLU, each
 //! followed by a `Linear` + channels-last pixel-shuffle upsample (strides `1x2x2`, `2x1x1`,
-//! `2x2x2`, `2x2x2`). Their output is the *context* volume, at pixel resolution divided by the
-//! patch size. Stage 5 is the **diffusion** stage: eight blocks that denoise patchified noisy
-//! pixels `x_t`, injecting the context through a per-block `context_proj` and modulating on a
-//! shared AdaLN-Zero built from the timestep. `model_output_type: x0` with
-//! `default_num_inference_steps: 1` means the shipped checkpoint runs exactly one step and returns
-//! its prediction — but the Euler loop is implemented, so a `v`-parameterised or multi-step
-//! checkpoint runs correctly rather than silently wrongly.
+//! `2x2x2`, `2x2x2`). Their output is the *context* volume. Stage 5 is the **diffusion** stage:
+//! eight blocks that denoise patchified noisy pixels `x_t`, injecting the context through a
+//! per-block `context_proj` and modulating on a shared AdaLN-Zero built from the timestep.
+//! `model_output_type: x0` with `default_num_inference_steps: 1` means the shipped checkpoint runs
+//! exactly one step and returns its prediction — the Euler loop is implemented anyway, so a
+//! `v`-parameterised or multi-step checkpoint runs correctly rather than silently wrongly.
 //!
-//! ## Neighborhood attention without NATTEN
+//! ## Loading: no conversion step
 //!
-//! Upstream backs the 3-D windows with NATTEN/CUTLASS-FNA, which is CUDA-only. [`na3d`] is this
-//! port's own implementation of the same operator: for each query the attended window is
-//! `[clamp(i - k/2, 0, L - k), + k)` per axis — NATTEN's rule of **shifting the window inward** at
-//! the border rather than clamping and masking, which is also what upstream's vendored
-//! `fallback_na.eager` backend implements and therefore what the committed goldens encode. Queries
-//! are tiled; every tile of a tile-row shares one additive mask assembled from three tiny per-axis
-//! masks, and each tile is one `scaled_dot_product_attention` call, so the `[Nq, Nk]` score matrix
-//! is never materialized.
+//! Unlike the MLX port — whose weights are channels-last and whose loader therefore needs
+//! `convert_vae_components` — every tensor this decoder reads is a PyTorch-layout `[out, in]`
+//! matrix or a 1-D norm/bias, so the released `vae/ltx-2.5-video-vae-bf16.safetensors` is consumed
+//! **verbatim**: a [`VarBuilder`] rooted at `decoder.` plus the file-root
+//! `per_channel_statistics.{mean,std}-of-means`. That is the same "no remap on candle" property
+//! sc-18765 established for the conv VAE, and [`NaDiffusionDecoder::load`] is where it is asserted
+//! (a checkpoint missing any key is a load error, never a default).
+//!
+//! ## Neighborhood attention: implemented here, no kernel library
+//!
+//! Upstream backs the 3-D windows with NATTEN/CUTLASS-FNA. That is a PyTorch CUDA extension with
+//! no Rust binding, and vendoring its kernels would put a second CUDA build system and a second
+//! licence inside a crate whose only other GPU code is candle's own. [`na3d`] is therefore this
+//! port's own implementation of the same operator, mirroring the MLX one so the two backends agree
+//! **by construction** rather than by two independent readings of NATTEN's border rule: for each
+//! query the attended window is `[clamp(i - k/2, 0, L - k), + k)` per axis — the window **slides
+//! inward** at the border and keeps its full size, instead of being clipped and renormalised.
+//! That is NATTEN's rule, it is what upstream's own vendored `fallback_na.eager` backend
+//! implements, and it is therefore what the committed goldens encode.
+//!
+//! Queries are tiled; every tile shares one additive mask assembled from three tiny per-axis masks.
+//! candle has no fused SDPA on the paths this crate builds for, so unlike MLX the `[Nq, Nk]` score
+//! matrix **does** land — [`NA_SCORE_BUDGET`] bounds it by additionally chunking the head axis,
+//! which is the one place this port's memory schedule legitimately differs from the MLX one.
 //!
 //! ## Memory
 //!
-//! Everything runs **f32** — the crate's VAE convention, and the pmetal bf16 SDPA/GEMM hazards
-//! (`tests/bf16_sdpa_bug.rs`) are exactly the kind of thing a 22-block attention stack amplifies.
-//! The lever for large geometries is therefore [`NaDiffusionDecoder::decode_tiled`], not precision:
-//! stages 1-3 run once over the whole volume, and stages 4-5 run per tile with a separable
-//! trapezoidal pixel blend. The temporal axis is tiled with the **same halo discipline** as the
+//! Everything runs **f32**, the crate's VAE convention. The lever for large geometries is
+//! [`NaDiffusionDecoder::decode_tiled`], not precision: stages 1-3 run once over the whole volume,
+//! and stages 4-5 run per tile with a separable trapezoidal pixel blend normalised by the
+//! accumulated weight profile. The temporal axis is tiled with the **same halo discipline** as the
 //! spatial ones — a tiler that starves time produces a plausible-looking but temporally smeared
-//! clip instead of an error, which is the failure mode `tests/vae_decode_tiling_parity.rs` was
-//! written for on the conv decoder.
-//!
-//! Measured on this Mac (M-series, f32, real weights, 2026-08-19 —
-//! `tests/ltx_2_5_diffvae_parity.rs::peak_memory_and_quality_at_production_geometries`):
-//!
-//! | geometry | untiled | tiled (stage-4 tile / overlap) |
-//! | --- | --- | --- |
-//! | 768x512x25 | 6.5 s, **12.29 GiB** | 16.3 s, **5.43 GiB** — `[13, 32, 48]` / `[20, 20, 20]` |
-//! | 1280x704x25 | 14.6 s, **26.15 GiB** | 24.3 s, **9.77 GiB** — `[13, 44, 80]` / `[20, 20, 20]` |
-//!
-//! Peak tracks pixel area almost exactly (2.13x the area, 2.13x the peak), so the untiled path is
-//! the one that runs out first; tiling trades ~1.6x the time for ~2.5x less memory and lands within
-//! 65-69 dB of the untiled decode. The temporal axis usually cannot be split at these lengths — the
-//! stage-5 halo is 20 stage-4 cells, which is more frames than a 25-frame clip has — so the tile
-//! above is spatial, and an unsplit axis' overlap is not held to the `overlap < tile` rule.
+//! clip instead of an error.
 //!
 //! Reference: `Lightricks/LTX-2` v1.2.0, commit `d151147788a9284cca791edc6ce898007e727fe6`,
 //! `packages/ltx-core/src/ltx_core/model/video_vae/{diffusion_video_decoder,diffusion_tiling}.py`
-//! and `.../video_vae/transformer/*`. Goldens: `tools/dump_ltx25_diffvae_golden.py`.
+//! and `.../video_vae/transformer/*`. Goldens: `mlx-gen/tools/dump_ltx25_diffvae_golden.py`.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, divide, matmul, multiply, subtract};
-use mlx_rs::{Array, Dtype};
+use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
+use candle_gen::candle_nn::ops::{rms_norm, silu, softmax_last_dim};
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
 
-use mlx_gen::nn::{linear, quantized_matmul_with_bias, silu, timestep_sincos};
-use mlx_gen::weights::{to_dtype, Weights};
-use mlx_gen::{Error, Result};
-
-use crate::contiguous;
 use crate::vae::{patchify, unpatchify};
 
 /// `nn.RMSNorm(..., eps=1e-6)` — every norm in the decoder, deterministic and diffusion alike.
@@ -92,26 +89,33 @@ const ROPE_BASE: f64 = 10_000.0;
 /// strides multiply out to exactly this (asserted in the unit tests); the decoder derives its scale
 /// from the ladder rather than reading the constant, so a differently-shaped checkpoint is decoded
 /// at its own geometry instead of at 2.3's.
-pub const VIDEO_SCALE_FACTORS: [i32; 3] = [8, 32, 32];
+pub const VIDEO_SCALE_FACTORS: [usize; 3] = [8, 32, 32];
 
 /// SwiGLU `mlp_ratio` (`NABlock` / `DiffusionNABlock`): `hidden = round_up(4 * dim, 16)`.
-const MLP_RATIO: i32 = 4;
+const MLP_RATIO: usize = 4;
 
 /// The SwiGLU hidden width a block of `dim` channels declares.
-fn mlp_hidden(dim: i32) -> i32 {
-    (MLP_RATIO * dim + 15) / 16 * 16
+fn mlp_hidden(dim: usize) -> usize {
+    (MLP_RATIO * dim).div_ceil(16) * 16
 }
 
 /// Token-tile for the SwiGLU hidden buffer (upstream `DEFAULT_SWIGLU_TILE_SIZE`). Bounds the
 /// `[tokens, 4*dim]` intermediate, which at stage-5 production geometry would otherwise be the
 /// single largest allocation in the decoder.
-const SWIGLU_TILE_TOKENS: i32 = 16_384;
+const SWIGLU_TILE_TOKENS: usize = 16_384;
 
-/// Per-tile `Nq * Nk` budget for [`na3d`]. The score matrix itself never lands (SDPA is fused), but
-/// the additive mask does, so this caps one mask at 64 MiB of f32 while keeping tiles large enough
-/// that the attention is still a real GEMM. Upstream's eager backend uses `2**25` for the same
-/// knob; the tighter value here trades a little recompute for a smaller transient.
-const NA_TILE_BUDGET: i64 = 1 << 24;
+/// Per-tile `Nq * Nk` budget for [`na3d`]'s **mask**, mirroring the MLX port: one additive mask is
+/// capped at 64 MiB of f32 while tiles stay large enough that the attention is still a real GEMM.
+const NA_TILE_BUDGET: usize = 1 << 24;
+
+/// Per-chunk `heads * Nq * Nk` budget for [`na3d`]'s **scores**.
+///
+/// This has no MLX counterpart on purpose. MLX's `scaled_dot_product_attention` is fused, so there
+/// the `[Nq, Nk]` scores never land and only the mask needs bounding. candle materialises
+/// `q @ kᵀ` for every head at once, so without a second bound a stage-1 tile (32 heads) would
+/// allocate 32x the mask. Chunking the head axis keeps that buffer at ~256 MiB of f32 and changes
+/// nothing numerically — each head's softmax is independent.
+pub const NA_SCORE_BUDGET: usize = 1 << 26;
 
 /// One masked-out score, per axis. Three of these sum to about -3e30 — still finite in f32, so the
 /// softmax sees a hard zero rather than a NaN.
@@ -150,61 +154,60 @@ impl ModelOutputType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NaDiffusionDecoderConfig {
     /// Latent channels entering `conv_in` (128).
-    pub in_channels: i32,
+    pub in_channels: usize,
     /// RGB channels leaving `conv_out` after unpatchify (3).
-    pub out_channels: i32,
+    pub out_channels: usize,
     /// Spatial patch size of the stage-5 pixel grid (4).
-    pub patch_size: i32,
+    pub patch_size: usize,
     /// Attention head width; every stage channel count must be a multiple of it (64).
-    pub head_dim: i32,
+    pub head_dim: usize,
     /// Per-stage channels, stages 1..=5.
-    pub stage_channels: Vec<i32>,
+    pub stage_channels: Vec<usize>,
     /// Per-stage block depths, stages 1..=5.
-    pub stage_depths: Vec<i32>,
+    pub stage_depths: Vec<usize>,
     /// Per-stage 3-D window `(K_t, K_h, K_w)` for the deterministic stages.
-    pub stage_kernels: Vec<[i32; 3]>,
+    pub stage_kernels: Vec<[usize; 3]>,
     /// `(stride, out-channel reduction)` per upsample hop — one fewer than the stage count.
-    pub upsamples: Vec<([i32; 3], i32)>,
+    pub upsamples: Vec<([usize; 3], usize)>,
     /// The diffusion stage's own window, which is wider than any deterministic stage's.
-    pub stage5_kernel: [i32; 3],
+    pub stage5_kernel: [usize; 3],
     /// Explicit stage-5 width; `None` means "the last stage channel count".
-    pub stage5_channels: Option<i32>,
+    pub stage5_channels: Option<usize>,
     /// Timestep-embedding width feeding the shared AdaLN-Zero (384).
-    pub t_emb_dim: i32,
+    pub t_emb_dim: usize,
     /// Steps the shipped schedule runs (`linspace(1, 1/N, N)`); 1 for the released checkpoint.
-    pub default_num_inference_steps: i32,
+    pub default_num_inference_steps: usize,
     /// Timesteps are multiplied by this before the sinusoidal embedding (1000.0).
-    pub timestep_scale_multiplier: f32,
+    pub timestep_scale_multiplier: f64,
     /// What the stage-5 blocks predict.
     pub model_output_type: ModelOutputType,
 }
 
-fn get_i32(v: &Value, key: &str, default: i32) -> i32 {
+fn get_usize(v: &Value, key: &str, default: usize) -> usize {
     v.get(key)
-        .and_then(Value::as_i64)
-        .map_or(default, |x| x as i32)
+        .and_then(Value::as_u64)
+        .map_or(default, |x| x as usize)
 }
 
-fn triple(v: &Value, what: &str) -> Result<[i32; 3]> {
+fn triple(v: &Value, what: &str) -> Result<[usize; 3]> {
     let arr = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
         Error::Msg(format!(
             "ltx diffvae: {what} must be a 3-element array, got {v}"
         ))
     })?;
-    let mut out = [0i32; 3];
+    let mut out = [0usize; 3];
     for (slot, item) in out.iter_mut().zip(arr) {
-        *slot = item.as_i64().ok_or_else(|| {
+        *slot = item.as_u64().ok_or_else(|| {
             Error::Msg(format!(
-                "ltx diffvae: {what} entries must be integers, got {v}"
+                "ltx diffvae: {what} entries must be non-negative integers, got {v}"
             ))
-        })? as i32;
+        })? as usize;
     }
     Ok(out)
 }
 
 impl NaDiffusionDecoderConfig {
-    /// Parse the `vae` block of an `embedded_config.json` (or a component checkpoint's
-    /// `__metadata__.config.vae`, which is the same shape).
+    /// Parse the `vae` block of a checkpoint's `__metadata__["config"]`.
     ///
     /// Every architecture field is **required** — the stage ladder, and also the two fields that
     /// parameterise the sampler rather than the shape (`vae.model_output_type` and
@@ -213,8 +216,7 @@ impl NaDiffusionDecoderConfig {
     /// answer — there has never been a default `NADiffusionDecoder`, and inventing one would build
     /// a differently-shaped or differently-sampled decoder against real weights: defaulting
     /// `model_output_type` to `v` against the released `x0` checkpoint, or the scale multiplier to
-    /// `1.0` against the released `1000.0`, decodes silently wrongly rather than failing. Mirrors
-    /// `candle_gen_ltx::diff_vae::NaDiffusionDecoderConfig::from_embedded_vae` (sc-18767).
+    /// `1.0` against the released `1000.0`, decodes silently wrongly rather than failing.
     pub fn from_embedded_vae(v: &Value) -> Result<Self> {
         let dec = v.get("decoder").filter(|d| d.is_object()).ok_or_else(|| {
             Error::Msg("ltx diffvae: config.vae has no `decoder` block".to_string())
@@ -229,7 +231,7 @@ impl NaDiffusionDecoderConfig {
             dec.get(key)
                 .ok_or_else(|| Error::Msg(format!("ltx diffvae: vae.decoder has no `{key}`")))
         };
-        let list_of = |key: &str| -> Result<Vec<i64>> {
+        let list_of = |key: &str| -> Result<Vec<usize>> {
             require(key)?
                 .as_array()
                 .ok_or_else(|| {
@@ -237,49 +239,54 @@ impl NaDiffusionDecoderConfig {
                 })?
                 .iter()
                 .map(|x| {
-                    x.as_i64().ok_or_else(|| {
-                        Error::Msg(format!("ltx diffvae: vae.decoder.{key} must hold integers"))
+                    x.as_u64().map(|v| v as usize).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "ltx diffvae: vae.decoder.{key} must hold non-negative integers"
+                        ))
                     })
                 })
                 .collect()
         };
 
-        let stage_channels: Vec<i32> = list_of("stage_channels")?
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
-        let stage_depths: Vec<i32> = list_of("stage_depths")?.iter().map(|&x| x as i32).collect();
+        let stage_channels = list_of("stage_channels")?;
+        let stage_depths = list_of("stage_depths")?;
         let stage_kernels = require("stage_kernels")?
             .as_array()
             .ok_or_else(|| {
-                Error::Msg("ltx diffvae: vae.decoder.stage_kernels must be an array".into())
+                Error::Msg("ltx diffvae: vae.decoder.stage_kernels must be an array".to_string())
             })?
             .iter()
             .map(|k| triple(k, "vae.decoder.stage_kernels[]"))
             .collect::<Result<Vec<_>>>()?;
         let upsamples = require("upsamples")?
             .as_array()
-            .ok_or_else(|| Error::Msg("ltx diffvae: vae.decoder.upsamples must be an array".into()))?
+            .ok_or_else(|| {
+                Error::Msg("ltx diffvae: vae.decoder.upsamples must be an array".to_string())
+            })?
             .iter()
             .map(|entry| {
                 let pair = entry.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
                     Error::Msg(format!(
-                        "ltx diffvae: each vae.decoder.upsamples entry must be [stride, reduction], got {entry}"
+                        "ltx diffvae: each vae.decoder.upsamples entry must be \
+                         [stride, reduction], got {entry}"
                     ))
                 })?;
                 let stride = triple(&pair[0], "vae.decoder.upsamples[][0]")?;
-                let reduction = pair[1].as_i64().ok_or_else(|| {
-                    Error::Msg("ltx diffvae: upsample reduction must be an integer".to_string())
-                })? as i32;
+                let reduction = pair[1].as_u64().ok_or_else(|| {
+                    Error::Msg(
+                        "ltx diffvae: upsample reduction must be a non-negative integer"
+                            .to_string(),
+                    )
+                })? as usize;
                 Ok((stride, reduction))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let cfg = Self {
-            in_channels: get_i32(dec, "in_channels", 128),
-            out_channels: get_i32(dec, "out_channels", 3),
-            patch_size: get_i32(dec, "patch_size", 4),
-            head_dim: get_i32(dec, "head_dim", get_i32(dec, "na_head_dim", 64)),
+            in_channels: get_usize(dec, "in_channels", 128),
+            out_channels: get_usize(dec, "out_channels", 3),
+            patch_size: get_usize(dec, "patch_size", 4),
+            head_dim: get_usize(dec, "head_dim", get_usize(dec, "na_head_dim", 64)),
             stage_channels,
             stage_depths,
             stage_kernels,
@@ -287,10 +294,10 @@ impl NaDiffusionDecoderConfig {
             stage5_kernel: triple(require("stage5_kernel")?, "vae.decoder.stage5_kernel")?,
             stage5_channels: dec
                 .get("stage5_channels")
-                .and_then(Value::as_i64)
-                .map(|x| x as i32),
-            t_emb_dim: get_i32(dec, "t_emb_dim", 384),
-            default_num_inference_steps: get_i32(dec, "default_num_inference_steps", 2),
+                .and_then(Value::as_u64)
+                .map(|x| x as usize),
+            t_emb_dim: get_usize(dec, "t_emb_dim", 384),
+            default_num_inference_steps: get_usize(dec, "default_num_inference_steps", 2),
             timestep_scale_multiplier: require("timestep_scale_multiplier")?.as_f64().ok_or_else(
                 || {
                     Error::Msg(
@@ -298,7 +305,7 @@ impl NaDiffusionDecoderConfig {
                             .to_string(),
                     )
                 },
-            )? as f32,
+            )?,
             model_output_type: ModelOutputType::parse(
                 v.get("model_output_type")
                     .and_then(Value::as_str)
@@ -322,31 +329,18 @@ impl NaDiffusionDecoderConfig {
         cfg.validated()
     }
 
-    /// Load from a converted model directory's `embedded_config.json`.
-    ///
-    /// **Two section names, because two directory shapes exist.** A bundle converted from a
-    /// DiffVAE-only checkpoint ([`crate::convert`]) puts its `CausalDiffusionVAE` block under `vae`,
-    /// the single VAE it has. An LTX-2.5 **tier** ([`crate::tiers`]) carries *both* video VAEs — the
-    /// conv one under `vae` and this one under `diffusion_vae` — because one key cannot name two
-    /// different autoencoders. This reads `diffusion_vae` when it is present and `vae` otherwise,
-    /// which is the only order that resolves a tier correctly: preferring `vae` there would hand the
-    /// diffusion decoder the *conv* VAE's config, and `from_embedded_vae` would then reject a block
-    /// that is not wrong, merely the wrong one (sc-18775).
-    pub fn from_model_dir(root: &Path) -> Result<Self> {
-        const SECTIONS: [&str; 2] = ["diffusion_vae", "vae"];
-        let path = root.join("embedded_config.json");
-        let text = std::fs::read_to_string(&path)?;
-        let root_cfg: Value = serde_json::from_str(&text)
-            .map_err(|e| Error::Msg(format!("ltx diffvae: parse {}: {e}", path.display())))?;
-        let vae = SECTIONS
-            .iter()
-            .find_map(|section| root_cfg.get(section).filter(|v| !v.is_null()))
-            .ok_or_else(|| {
-                Error::Msg(format!(
-                    "ltx diffvae: {} has none of the {SECTIONS:?} blocks",
-                    path.display()
-                ))
-            })?;
+    /// Read the structure straight out of a released component checkpoint's
+    /// `__metadata__["config"]["vae"]` — the candle path, with no conversion step in between.
+    pub fn from_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let meta =
+            LtxCheckpointMetadata::from_file(path).map_err(|e| Error::Msg(format!("{e}")))?;
+        let vae = meta.section("vae").ok_or_else(|| {
+            Error::Msg(format!(
+                "ltx diffvae: {} carries no __metadata__[\"config\"][\"vae\"] block",
+                path.display()
+            ))
+        })?;
         Self::from_embedded_vae(vae)
     }
 
@@ -369,7 +363,7 @@ impl NaDiffusionDecoderConfig {
                 self.upsamples.len()
             )));
         }
-        if self.head_dim < 2 || self.head_dim % 2 != 0 {
+        if self.head_dim < 2 || !self.head_dim.is_multiple_of(2) {
             return Err(Error::Msg(format!(
                 "ltx diffvae: head_dim must be a positive even number, got {}",
                 self.head_dim
@@ -380,7 +374,7 @@ impl NaDiffusionDecoderConfig {
             .iter()
             .chain(self.stage5_channels.iter())
         {
-            if c <= 0 || c % self.head_dim != 0 {
+            if c == 0 || c % self.head_dim != 0 {
                 return Err(Error::Msg(format!(
                     "ltx diffvae: stage width {c} is not a positive multiple of head_dim {}",
                     self.head_dim
@@ -406,36 +400,35 @@ impl NaDiffusionDecoderConfig {
             }
         }
         if self.default_num_inference_steps < 1 {
-            return Err(Error::Msg(format!(
-                "ltx diffvae: default_num_inference_steps must be >= 1, got {}",
-                self.default_num_inference_steps
-            )));
+            return Err(Error::Msg(
+                "ltx diffvae: default_num_inference_steps must be >= 1, got 0".to_string(),
+            ));
         }
         if self.patch_size < 1 || self.out_channels < 1 || self.in_channels < 1 {
             return Err(Error::Msg(
-                "ltx diffvae: patch_size / in_channels / out_channels must be >= 1".into(),
+                "ltx diffvae: patch_size / in_channels / out_channels must be >= 1".to_string(),
             ));
         }
         Ok(self)
     }
 
     /// Stage-5 feature width: explicit if declared, else the last stage's channels.
-    pub fn stage5_width(&self) -> i32 {
+    pub fn stage5_width(&self) -> usize {
         self.stage5_channels
             .unwrap_or_else(|| *self.stage_channels.last().expect("validated: >= 2 stages"))
     }
 
     /// Latent frames replicated at the tail before stages 1-4, to keep the last real frame off the
     /// neighborhood window's shifted border. `(stage_kernels[0].t / 2) * 2`, per upstream.
-    pub fn ghost_latent_frames(&self) -> i32 {
+    pub fn ghost_latent_frames(&self) -> usize {
         (self.stage_kernels[0][0] / 2) * 2
     }
 
     /// Per-axis latent floor so every stage's window fits its grid
     /// (`diffusion_tiling.all_stages_min_tile_size`).
-    pub fn min_latent_shape(&self) -> [i32; 3] {
-        let mut cumulative = [1i32; 3];
-        let mut mins = [1i32; 3];
+    pub fn min_latent_shape(&self) -> [usize; 3] {
+        let mut cumulative = [1usize; 3];
+        let mut mins = [1usize; 3];
         for (stage, kernel) in self
             .stage_kernels
             .iter()
@@ -443,7 +436,7 @@ impl NaDiffusionDecoderConfig {
             .take(self.upsamples.len())
         {
             for axis in 0..3 {
-                mins[axis] = mins[axis].max(ceil_div(kernel[axis], cumulative[axis]));
+                mins[axis] = mins[axis].max(kernel[axis].div_ceil(cumulative[axis]));
             }
             let stride = self.upsamples[stage].0;
             for (axis, slot) in cumulative.iter_mut().enumerate() {
@@ -451,36 +444,36 @@ impl NaDiffusionDecoderConfig {
             }
         }
         for axis in 0..3 {
-            mins[axis] = mins[axis].max(ceil_div(self.stage5_kernel[axis], cumulative[axis]));
+            mins[axis] = mins[axis].max(self.stage5_kernel[axis].div_ceil(cumulative[axis]));
         }
         mins
     }
 
     /// Minimum stage-4-input extent so stages 4 and 5 each see at least their window
     /// (`diffusion_tiling.compute_tile_min_size`).
-    pub fn min_tile_shape(&self) -> [i32; 3] {
+    pub fn min_tile_shape(&self) -> [usize; 3] {
         let last = self.upsamples.len() - 1;
         let stride = self.upsamples[last].0;
         let kernel4 = self.stage_kernels[last];
-        let mut out = [0i32; 3];
+        let mut out = [0usize; 3];
         for axis in 0..3 {
-            out[axis] = kernel4[axis].max(ceil_div(self.stage5_kernel[axis], stride[axis]));
+            out[axis] = kernel4[axis].max(self.stage5_kernel[axis].div_ceil(stride[axis]));
         }
         out
     }
 
     /// One-sided stage-4/5 halos in stage-4-input units (`diffusion_tiling.compute_tile_halos`),
     /// reduced to the dominant per-axis halo — the minimum overlap a tiling may use.
-    pub fn tile_halo(&self) -> [i32; 3] {
+    pub fn tile_halo(&self) -> [usize; 3] {
         let last = self.upsamples.len() - 1;
         let stride = self.upsamples[last].0;
         let kernel4 = self.stage_kernels[last];
         let depth4 = self.stage_depths[last];
         let depth5 = *self.stage_depths.last().expect("validated");
-        let mut out = [0i32; 3];
+        let mut out = [0usize; 3];
         for axis in 0..3 {
             let halo4 = depth4 * (kernel4[axis] / 2);
-            let halo5 = ceil_div(depth5 * (self.stage5_kernel[axis] / 2), stride[axis]);
+            let halo5 = (depth5 * (self.stage5_kernel[axis] / 2)).div_ceil(stride[axis]);
             out[axis] = halo4.max(halo5);
         }
         out
@@ -489,8 +482,8 @@ impl NaDiffusionDecoderConfig {
     /// Pixels (and frames) per latent cell, from the ladder's own hops: the product of the upsample
     /// strides, spatially times the patch size. Equals [`VIDEO_SCALE_FACTORS`] for the released
     /// checkpoint.
-    pub fn pixel_scale(&self) -> [i32; 3] {
-        let mut scale = [1i32; 3];
+    pub fn pixel_scale(&self) -> [usize; 3] {
+        let mut scale = [1usize; 3];
         for (stride, _) in &self.upsamples {
             for axis in 0..3 {
                 scale[axis] *= stride[axis];
@@ -504,7 +497,7 @@ impl NaDiffusionDecoderConfig {
     }
 
     /// Stage-4-input `(T, H, W)` for a latent extent, after the first `n-1` upsample hops.
-    pub fn stage4_shape(&self, latent_t: i32, latent_h: i32, latent_w: i32) -> [i32; 3] {
+    pub fn stage4_shape(&self, latent_t: usize, latent_h: usize, latent_w: usize) -> [usize; 3] {
         let mut out = [latent_t, latent_h, latent_w];
         for (stride, _) in self.upsamples.iter().take(self.upsamples.len() - 1) {
             for axis in 0..3 {
@@ -520,10 +513,10 @@ impl NaDiffusionDecoderConfig {
     /// Stage-5 pixel `(F, H, W)` a stage-4 extent expands to — the shape the noise must have.
     pub fn stage5_pixel_shape(
         &self,
-        stage4: [i32; 3],
+        stage4: [usize; 3],
         drop_leading_frame: bool,
         pad_trailing: bool,
-    ) -> [i32; 3] {
+    ) -> [usize; 3] {
         let last = self.upsamples.len() - 1;
         let stride = self.upsamples[last].0;
         let mut frames = stage4[0] * stride[0];
@@ -543,7 +536,7 @@ impl NaDiffusionDecoderConfig {
     /// Stage-5 noise geometry for an untiled decode of a `(T, H, W)` latent — the shape
     /// [`NaDiffusionDecoder::decode`] requires. Applies the latent size floor first, exactly as
     /// decode does, so a below-floor latent reports the geometry it will actually be run at.
-    pub fn noise_shape(&self, latent_t: i32, latent_h: i32, latent_w: i32) -> [i32; 3] {
+    pub fn noise_shape(&self, latent_t: usize, latent_h: usize, latent_w: usize) -> [usize; 3] {
         let min = self.min_latent_shape();
         let stage4 = self.stage4_shape(
             latent_t.max(min[0]),
@@ -554,219 +547,106 @@ impl NaDiffusionDecoderConfig {
     }
 }
 
-fn ceil_div(a: i32, b: i32) -> i32 {
-    debug_assert!(b > 0);
-    (a + b - 1) / b
-}
-
 // ---------------------------------------------------------------------------------------------
 // Small layers
 // ---------------------------------------------------------------------------------------------
 
-fn weight(w: &Weights, key: &str) -> Result<Array> {
-    to_dtype(w.require(key)?, Dtype::Float32)
+/// `y = x Wᵀ (+ b)` over a channels-last tensor of any rank: the trailing axis is the feature axis
+/// and every leading axis is a token. Flattened to one `[tokens, in]` GEMM rather than a broadcast
+/// matmul, which candle would otherwise expand into `tokens / T` separate calls.
+fn affine(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let in_features = *dims.last().expect("rank >= 1");
+    let tokens: usize = dims[..dims.len() - 1].iter().product();
+    let flat = x.contiguous()?.reshape((tokens, in_features))?;
+    let y = flat.matmul(&w.t()?.contiguous()?)?;
+    let y = match b {
+        Some(bias) => y.broadcast_add(&bias.reshape((1, bias.elem_count()))?)?,
+        None => y,
+    };
+    let mut out_dims = dims;
+    *out_dims.last_mut().expect("rank >= 1") = w.dim(0)?;
+    y.reshape(out_dims)
 }
 
-/// The affine-quant geometry a packed checkpoint was written at — `quantization_bits` /
-/// `quantization_group_size` from the tier's `split_model.json` (`crate::config::SplitModel`), the
-/// same two numbers the DiT reads through [`crate::transformer::Precision`].
-///
-/// Passed to [`NaDiffusionDecoder::from_weights`] as `Option`: `None` declares "this file is dense".
-/// It is **not** inferred from the tensors — a packed `[out, in·bits/32]` `U32` weight plus an
-/// `[out, in/group]` scales grid is two equations in three unknowns (`in`, `bits`, `group`), so any
-/// inference would have to guess one. The loader instead refuses a `.scales` sibling it was not told
-/// to expect, rather than guessing a geometry and decoding the weights into noise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DiffVaeQuant {
-    /// Bits per packed weight (4 or 8).
-    pub bits: i32,
-    /// The affine group width along the input axis.
-    pub group: i32,
-}
-
-/// One projection's stored weight: dense `[out, in]` f32, or the packed affine triple a quantized
-/// tier ships (sc-18775). The DiffVAE decoder is 99.96 % rank-2 Linear by parameter count, so this is
-/// where a q4/q8 tier's 834 MB → ~230 MB actually comes from.
-enum ProjWeight {
-    Dense(Array),
-    Quant {
-        /// `[out, in·bits/32]` `U32` — never cast; the payload is bit-packed, not numeric.
-        q: Array,
-        /// `[out, in/group]`, cast to the f32 compute dtype so `quantized_matmul` matches the dense
-        /// path's activations rather than re-introducing a bf16 rounding the tier did not intend.
-        scales: Array,
-        biases: Array,
-        group: i32,
-        bits: i32,
-    },
-}
-
-impl ProjWeight {
-    /// Bind `{prefix}.weight`, packed or dense, keyed on whether `{prefix}.scales` is present —
-    /// the same per-Linear predicate [`crate::transformer::Linear`] uses, so a tier that leaves one
-    /// Linear dense (the 48-wide `conv_in_x_t`) loads beside its packed siblings.
-    ///
-    /// A `.scales` sibling with `quant == None` is a **hard error**: that combination means the
-    /// caller believes the file is dense while the file says otherwise, and loading the packed `U32`
-    /// payload as a float weight would produce a decoder that runs and returns garbage.
-    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
-        let key = format!("{prefix}.weight");
-        let Some(scales) = w.get(&format!("{prefix}.scales")) else {
-            return Ok(ProjWeight::Dense(weight(w, &key)?));
-        };
-        let Some(DiffVaeQuant { bits, group }) = quant else {
-            return Err(Error::Msg(format!(
-                "ltx diffvae: {prefix}.scales is present but the caller declared the checkpoint \
-                 dense — pass the tier's `DiffVaeQuant` (bits/group from split_model.json)"
-            )));
-        };
-        Ok(ProjWeight::Quant {
-            q: w.require(&key)?.clone(),
-            scales: to_dtype(scales, Dtype::Float32)?,
-            biases: to_dtype(w.require(&format!("{prefix}.biases"))?, Dtype::Float32)?,
-            group,
-            bits,
-        })
-    }
-
-    /// `y = x Wᵀ (+ b)`. The SwiGLU projections pass `None` — they carry no bias.
-    fn apply(&self, x: &Array, b: Option<&Array>) -> Result<Array> {
-        match self {
-            ProjWeight::Dense(w) => match b {
-                Some(b) => linear(x, w, b),
-                None => Ok(matmul(x, w.t())?),
-            },
-            ProjWeight::Quant {
-                q,
-                scales,
-                biases,
-                group,
-                bits,
-            } => quantized_matmul_with_bias(x, q, scales, biases, b, *group, *bits),
-        }
-    }
-
-    /// Rows of the stored `[out, …]` weight. Packing runs along the **input** axis, so `out` is
-    /// axis 0 of the packed `U32` weight exactly as it is of the dense one.
-    fn out_features(&self) -> i32 {
-        match self {
-            ProjWeight::Dense(w) => w.shape()[0],
-            ProjWeight::Quant { q, .. } => q.shape()[0],
-        }
-    }
-
-    /// The logical input width. The packed `U32` weight's axis 1 is `in·bits/32`, which loses the
-    /// distinction between (say) 4-bit/128-wide and 8-bit/64-wide, so `in` is recovered from the
-    /// scales grid (`[out, in/group]`) times the group — the same reconstruction
-    /// `crate::transformer::LinearKind::base_shape` does, and the one [`check_widths`] needs to
-    /// cross-check the config against a packed file rather than skipping the check for one.
-    ///
-    /// [`check_widths`]: NaDiffusionDecoder::check_widths
-    fn in_features(&self) -> i32 {
-        match self {
-            ProjWeight::Dense(w) => w.shape()[1],
-            ProjWeight::Quant { scales, group, .. } => scales.shape()[1] * group,
-        }
-    }
-
-    /// Rows `[start, end)` of the output axis, as an independent projection — the fused `qkv` split.
-    /// Valid for the packed form for the same reason [`out_features`](Self::out_features) is: the
-    /// packing and the scales grid both run along the input axis, so every row is self-contained.
-    fn slice_out(&self, start: i32, end: i32) -> Result<Self> {
-        Ok(match self {
-            ProjWeight::Dense(w) => ProjWeight::Dense(contiguous(&slice_axis(w, 0, start, end)?)?),
-            ProjWeight::Quant {
-                q,
-                scales,
-                biases,
-                group,
-                bits,
-            } => ProjWeight::Quant {
-                q: contiguous(&slice_axis(q, 0, start, end)?)?,
-                scales: contiguous(&slice_axis(scales, 0, start, end)?)?,
-                biases: contiguous(&slice_axis(biases, 0, start, end)?)?,
-                group: *group,
-                bits: *bits,
-            },
-        })
-    }
-}
-
-/// `[out, in]` weight (dense or packed) + `[out]` bias.
+/// `[out, in]` weight + `[out]` bias.
+#[derive(Debug)]
 struct Linear {
-    w: ProjWeight,
-    b: Array,
+    w: Tensor,
+    b: Tensor,
 }
 
 impl Linear {
-    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
+    fn load(vb: &VarBuilder, prefix: &str) -> Result<Self> {
+        let w = vb.get_unchecked(&format!("{prefix}.weight"))?;
+        let (out, _) = w.dims2()?;
         Ok(Self {
-            w: ProjWeight::load(w, prefix, quant)?,
-            b: weight(w, &format!("{prefix}.bias"))?,
+            b: vb.get(out, &format!("{prefix}.bias"))?,
+            w,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        self.w.apply(x, Some(&self.b))
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        affine(x, &self.w, Some(&self.b))
     }
 
-    fn out_features(&self) -> i32 {
-        self.w.out_features()
+    fn out_features(&self) -> usize {
+        self.w.dims()[0]
+    }
+
+    fn in_features(&self) -> usize {
+        self.w.dims()[1]
     }
 }
 
 /// `w_down(silu(x W_gateᵀ) * (x W_upᵀ))`, tiled over tokens so the `[tokens, hidden]` intermediate
 /// stays bounded (upstream `swiglu_tiled`). Tiling changes nothing numerically — each token's
 /// result depends only on itself.
+#[derive(Debug)]
 struct SwiGlu {
-    w_gate: ProjWeight,
-    w_up: ProjWeight,
-    w_down: ProjWeight,
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
 }
 
 impl SwiGlu {
-    fn load(w: &Weights, prefix: &str, quant: Option<DiffVaeQuant>) -> Result<Self> {
+    fn load(vb: &VarBuilder, prefix: &str) -> Result<Self> {
         Ok(Self {
-            w_gate: ProjWeight::load(w, &format!("{prefix}.w_gate"), quant)?,
-            w_up: ProjWeight::load(w, &format!("{prefix}.w_up"), quant)?,
-            w_down: ProjWeight::load(w, &format!("{prefix}.w_down"), quant)?,
+            w_gate: vb.get_unchecked(&format!("{prefix}.w_gate.weight"))?,
+            w_up: vb.get_unchecked(&format!("{prefix}.w_up.weight"))?,
+            w_down: vb.get_unchecked(&format!("{prefix}.w_down.weight"))?,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let shape = x.shape().to_vec();
-        let dim = *shape.last().expect("rank >= 1");
-        let tokens: i32 = shape[..shape.len() - 1].iter().product();
-        let flat = contiguous(x)?.reshape(&[tokens, dim])?;
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let dim = *dims.last().expect("rank >= 1");
+        let tokens: usize = dims[..dims.len() - 1].iter().product();
+        let flat = x.contiguous()?.reshape((tokens, dim))?;
         if tokens <= SWIGLU_TILE_TOKENS {
-            return Ok(self.tile(&flat)?.reshape(&shape)?);
+            return self.tile(&flat)?.reshape(dims);
         }
-        let mut parts: Vec<Array> = Vec::new();
+        let mut parts: Vec<Tensor> = Vec::new();
         let mut start = 0;
         while start < tokens {
-            let end = (start + SWIGLU_TILE_TOKENS).min(tokens);
-            let part = self.tile(&slice_axis(&flat, 0, start, end)?)?;
-            part.eval()?;
-            parts.push(part);
-            start = end;
+            let len = SWIGLU_TILE_TOKENS.min(tokens - start);
+            parts.push(self.tile(&flat.narrow(0, start, len)?)?);
+            start += len;
         }
-        let refs: Vec<&Array> = parts.iter().collect();
-        Ok(concatenate_axis(&refs, 0)?.reshape(&shape)?)
+        Tensor::cat(&parts, 0)?.reshape(dims)
     }
 
-    fn tile(&self, flat: &Array) -> Result<Array> {
-        let gate = silu(&self.w_gate.apply(flat, None)?)?;
-        let up = self.w_up.apply(flat, None)?;
-        self.w_down.apply(&multiply(&gate, &up)?, None)
+    fn tile(&self, flat: &Tensor) -> Result<Tensor> {
+        let gate = silu(&affine(flat, &self.w_gate, None)?)?;
+        let up = affine(flat, &self.w_up, None)?;
+        affine(&(gate * up)?, &self.w_down, None)
     }
 }
 
 /// Slice `x` along `axis` to `[start, end)`.
-fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let rank = x.ndim() as i32;
-    let axis = if axis < 0 { axis + rank } else { axis };
-    let len = x.shape()[axis as usize];
-    if start < 0 || end > len || start >= end {
+fn slice_axis(x: &Tensor, axis: usize, start: usize, end: usize) -> Result<Tensor> {
+    let len = x.dims()[axis];
+    if end > len || start >= end {
         return Err(Error::Msg(format!(
             "ltx diffvae: slice [{start}, {end}) is out of range for axis {axis} of length {len}"
         )));
@@ -774,21 +654,23 @@ fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
     if start == 0 && end == len {
         return Ok(x.clone());
     }
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), axis)?)
+    x.narrow(axis, start, end - start)
 }
 
 /// Pad or crop `axis` to `size`. `symmetric` splits the difference across both edges
 /// (`before = need / 2`), replicating the edge slice; otherwise the tail is repeated or dropped.
-/// Returns the resized array and the `(before, after)` element counts, in that axis's units.
-fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Array, (i32, i32))> {
-    let rank = x.ndim() as i32;
-    let axis = if axis < 0 { axis + rank } else { axis };
-    let len = x.shape()[axis as usize];
+/// Returns the resized tensor and the `(before, after)` element counts, in that axis's units.
+fn resize_axis(
+    x: &Tensor,
+    axis: usize,
+    size: usize,
+    symmetric: bool,
+) -> Result<(Tensor, (usize, usize))> {
+    let len = x.dims()[axis];
     if size < 1 {
-        return Err(Error::Msg(format!(
-            "ltx diffvae: resize target must be >= 1, got {size}"
-        )));
+        return Err(Error::Msg(
+            "ltx diffvae: resize target must be >= 1, got 0".to_string(),
+        ));
     }
     if len == size {
         return Ok((x.clone(), (0, 0)));
@@ -800,24 +682,17 @@ fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Arra
         } else {
             (0, need)
         };
-        let mut parts: Vec<Array> = Vec::new();
+        let mut parts: Vec<Tensor> = Vec::new();
         if before > 0 {
-            parts.push(Array::repeat_axis::<f32>(
-                slice_axis(x, axis, 0, 1)?,
-                before,
-                axis,
-            )?);
+            let edge = slice_axis(x, axis, 0, 1)?;
+            parts.extend(std::iter::repeat_n(edge, before));
         }
         parts.push(x.clone());
         if after > 0 {
-            parts.push(Array::repeat_axis::<f32>(
-                slice_axis(x, axis, len - 1, len)?,
-                after,
-                axis,
-            )?);
+            let edge = slice_axis(x, axis, len - 1, len)?;
+            parts.extend(std::iter::repeat_n(edge, after));
         }
-        let refs: Vec<&Array> = parts.iter().collect();
-        return Ok((concatenate_axis(&refs, axis)?, (before, after)));
+        return Ok((Tensor::cat(&parts, axis)?, (before, after)));
     }
     let need = len - size;
     let (before, after) = if symmetric {
@@ -835,25 +710,26 @@ fn resize_axis(x: &Array, axis: i32, size: i32, symmetric: bool) -> Result<(Arra
 /// Per-index window start along one axis: `clamp(i - k/2, 0, L - k)` with `k = min(kernel, L)`.
 /// This is NATTEN's shifted-window rule — near the border the window slides inward and keeps its
 /// full size, instead of being clipped and renormalised.
-fn window_starts(len: i32, kernel: i32) -> Vec<i32> {
+fn window_starts(len: usize, kernel: usize) -> Vec<usize> {
     let k = kernel.min(len);
     let lo = len - k;
     let half = k / 2;
-    (0..len).map(|i| (i - half).clamp(0, lo)).collect()
+    (0..len).map(|i| i.saturating_sub(half).min(lo)).collect()
 }
 
-/// Query-tile extents keeping one tile's `Nq * Nk` under [`NA_TILE_BUDGET`]. Halves the axis with
-/// the largest tile-to-window ratio, which is the one paying the most for its halo.
-fn pick_tiles(dims: [i32; 3], kernels: [i32; 3]) -> [i32; 3] {
+/// Query-tile extents keeping one tile's `Nq * Nk` under `tile_budget` (production:
+/// [`NA_TILE_BUDGET`]). Halves the axis with the largest tile-to-window ratio, which is the one
+/// paying the most for its halo.
+fn pick_tiles(dims: [usize; 3], kernels: [usize; 3], tile_budget: usize) -> [usize; 3] {
     let mut tiles = dims;
-    let cost = |t: [i32; 3]| -> i64 {
-        let nq: i64 = t.iter().map(|&x| x as i64).product();
-        let nk: i64 = (0..3)
-            .map(|a| dims[a].min(t[a] + kernels[a] - 1) as i64)
+    let cost = |t: [usize; 3]| -> u128 {
+        let nq: u128 = t.iter().map(|&x| x as u128).product();
+        let nk: u128 = (0..3)
+            .map(|a| dims[a].min(t[a] + kernels[a] - 1) as u128)
             .product();
         nq.saturating_mul(nk)
     };
-    while cost(tiles) > NA_TILE_BUDGET && tiles.iter().any(|&t| t > 1) {
+    while cost(tiles) > tile_budget as u128 && tiles.iter().any(|&t| t > 1) {
         let mut best = 0usize;
         let mut best_ratio = f64::NEG_INFINITY;
         for axis in 0..3 {
@@ -866,49 +742,75 @@ fn pick_tiles(dims: [i32; 3], kernels: [i32; 3]) -> [i32; 3] {
         if tiles[best] <= 1 {
             break;
         }
-        tiles[best] = ((tiles[best] + 1) / 2).max(1);
+        tiles[best] = tiles[best].div_ceil(2).max(1);
     }
     tiles
 }
 
-/// Additive `[n, nk]` visibility mask for one axis of one tile: `0` inside the window, [`MASK_NEG`]
-/// outside.
+/// Additive `[n, key_len]` visibility mask for one axis of one tile: `0` inside the window,
+/// [`MASK_NEG`] outside.
 fn axis_mask(
-    starts: &[i32],
-    q0: i32,
-    q1: i32,
-    kernel_eff: i32,
-    key_start: i32,
-    key_len: i32,
-) -> Array {
-    let n = (q1 - q0) as usize;
-    let mut data = vec![MASK_NEG; n * key_len as usize];
-    for (j, row) in data.chunks_mut(key_len as usize).enumerate() {
-        let lo = starts[q0 as usize + j] - key_start;
-        for slot in row.iter_mut().skip(lo as usize).take(kernel_eff as usize) {
+    starts: &[usize],
+    q0: usize,
+    q1: usize,
+    kernel_eff: usize,
+    key_start: usize,
+    key_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let n = q1 - q0;
+    let mut data = vec![MASK_NEG; n * key_len];
+    for (j, row) in data.chunks_mut(key_len).enumerate() {
+        let lo = starts[q0 + j] - key_start;
+        for slot in row.iter_mut().skip(lo).take(kernel_eff) {
             *slot = 0.0;
         }
     }
-    Array::from_slice(&data, &[n as i32, key_len])
+    Tensor::from_vec(data, (n, key_len), device)
 }
 
 /// 3-D neighborhood attention over `(B, T, H, W, NH, HD)` tensors, returning
 /// `(B, T, H, W, NH * HD)`.
 ///
-/// `q` must already carry the `head_dim^-0.5` scale (the SDPA call runs at `scale = 1.0`), and both
-/// `q` and `k` their rotary positions. Semantics are NATTEN `na3d`'s: each query attends
-/// `[clamp(i - k/2, 0, L - k), + k)` on every axis, so at the border the window slides inward and
-/// keeps its full size instead of being clipped and renormalised.
-pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> {
-    let sh = q.shape().to_vec();
+/// `q` must already carry the `head_dim^-0.5` scale, and both `q` and `k` their rotary positions.
+/// Semantics are NATTEN `na3d`'s: each query attends `[clamp(i - k/2, 0, L - k), + k)` on every
+/// axis, so at the border the window slides inward and keeps its full size instead of being clipped
+/// and renormalised — the same rule `mlx_gen_ltx::diff_vae::na3d` implements, which is what makes
+/// the two backends comparable against one set of goldens.
+pub fn na3d(q: &Tensor, k: &Tensor, v: &Tensor, kernel: [usize; 3]) -> Result<Tensor> {
+    na3d_with_budgets(q, k, v, kernel, NA_TILE_BUDGET, NA_SCORE_BUDGET)
+}
+
+/// How many of the `heads` flattened `(batch, head)` rows one score matmul may carry, given that
+/// each row materialises `per_head` scores and the whole chunk must stay under `score_budget`.
+fn head_chunk(per_head: usize, score_budget: usize, heads: usize) -> usize {
+    (score_budget / per_head.max(1)).clamp(1, heads)
+}
+
+/// [`na3d`] with its two schedule budgets supplied rather than read from the consts.
+///
+/// Production always takes [`na3d`]. The budgets are a parameter so a test can force the
+/// query-tiled / head-chunked schedule — the one real geometry takes, and the only place the
+/// candle and MLX ports differ in *how* they compute the same operator — at a size a CPU unit test
+/// can also brute-force.
+fn na3d_with_budgets(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    kernel: [usize; 3],
+    tile_budget: usize,
+    score_budget: usize,
+) -> Result<Tensor> {
+    let sh = q.dims().to_vec();
     if sh.len() != 6 {
         return Err(Error::Msg(format!(
             "ltx diffvae: na3d expects (B, T, H, W, NH, HD), got {sh:?}"
         )));
     }
     let (b, t, h, w, nh, hd) = (sh[0], sh[1], sh[2], sh[3], sh[4], sh[5]);
+    let device = q.device().clone();
     let dims = [t, h, w];
-    let mut kernels = [0i32; 3];
+    let mut kernels = [0usize; 3];
     for axis in 0..3 {
         if dims[axis] < kernel[axis] {
             return Err(Error::Msg(format!(
@@ -918,18 +820,18 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
         }
         kernels[axis] = kernel[axis].min(dims[axis]);
     }
-    let starts: Vec<Vec<i32>> = (0..3).map(|a| window_starts(dims[a], kernels[a])).collect();
-    let tiles = pick_tiles(dims, kernels);
+    let starts: Vec<Vec<usize>> = (0..3).map(|a| window_starts(dims[a], kernels[a])).collect();
+    let tiles = pick_tiles(dims, kernels, tile_budget);
 
     // Key extent covering a query tile: from the first query's window start to the last query's
     // window end.
-    let key_range = |axis: usize, q0: i32, q1: i32| -> (i32, i32) {
-        let lo = starts[axis][q0 as usize];
-        let hi = starts[axis][(q1 - 1) as usize] + kernels[axis];
+    let key_range = |axis: usize, q0: usize, q1: usize| -> (usize, usize) {
+        let lo = starts[axis][q0];
+        let hi = starts[axis][q1 - 1] + kernels[axis];
         (lo, hi - lo)
     };
 
-    let mut t_parts: Vec<Array> = Vec::new();
+    let mut t_parts: Vec<Tensor> = Vec::new();
     let mut t0 = 0;
     while t0 < t {
         let t1 = (t0 + tiles[0]).min(t);
@@ -937,9 +839,9 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
         let qt = slice_axis(q, 1, t0, t1)?;
         let kt = slice_axis(k, 1, kt0, kt0 + ktn)?;
         let vt = slice_axis(v, 1, kt0, kt0 + ktn)?;
-        let mt = axis_mask(&starts[0], t0, t1, kernels[0], kt0, ktn);
+        let mt = axis_mask(&starts[0], t0, t1, kernels[0], kt0, ktn, &device)?;
 
-        let mut h_parts: Vec<Array> = Vec::new();
+        let mut h_parts: Vec<Tensor> = Vec::new();
         let mut h0 = 0;
         while h0 < h {
             let h1 = (h0 + tiles[1]).min(h);
@@ -947,68 +849,75 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
             let qth = slice_axis(&qt, 2, h0, h1)?;
             let kth = slice_axis(&kt, 2, kh0, kh0 + khn)?;
             let vth = slice_axis(&vt, 2, kh0, kh0 + khn)?;
-            let mh = axis_mask(&starts[1], h0, h1, kernels[1], kh0, khn);
+            let mh = axis_mask(&starts[1], h0, h1, kernels[1], kh0, khn, &device)?;
 
-            let mut w_parts: Vec<Array> = Vec::new();
+            let mut w_parts: Vec<Tensor> = Vec::new();
             let mut w0 = 0;
             while w0 < w {
                 let w1 = (w0 + tiles[2]).min(w);
                 let (kw0, kwn) = key_range(2, w0, w1);
-                let mw = axis_mask(&starts[2], w0, w1, kernels[2], kw0, kwn);
+                let mw = axis_mask(&starts[2], w0, w1, kernels[2], kw0, kwn, &device)?;
 
                 let (nt, nhq, nw) = (t1 - t0, h1 - h0, w1 - w0);
                 let nq = nt * nhq * nw;
                 let nk = ktn * khn * kwn;
                 // Separable additive mask: `[nq, nk]` assembled by broadcasting three small
                 // per-axis masks, so the only 2-D allocation is the result.
-                let mask = add(
-                    &add(
-                        &mt.reshape(&[nt, 1, 1, ktn, 1, 1])?,
-                        &mh.reshape(&[1, nhq, 1, 1, khn, 1])?,
-                    )?,
-                    &mw.reshape(&[1, 1, nw, 1, 1, kwn])?,
-                )?
-                .reshape(&[1, 1, nq, nk])?;
+                let mask = mt
+                    .reshape((nt, 1, 1, ktn, 1, 1))?
+                    .broadcast_add(&mh.reshape((1, nhq, 1, 1, khn, 1))?)?
+                    .broadcast_add(&mw.reshape((1, 1, nw, 1, 1, kwn))?)?
+                    .reshape((1, nq, nk))?;
 
-                let qs = contiguous(&slice_axis(&qth, 3, w0, w1)?)?
-                    .reshape(&[b, nq, nh, hd])?
-                    .transpose_axes(&[0, 2, 1, 3])?;
-                let ks = contiguous(&slice_axis(&kth, 3, kw0, kw0 + kwn)?)?
-                    .reshape(&[b, nk, nh, hd])?
-                    .transpose_axes(&[0, 2, 1, 3])?;
-                let vs = contiguous(&slice_axis(&vth, 3, kw0, kw0 + kwn)?)?
-                    .reshape(&[b, nk, nh, hd])?
-                    .transpose_axes(&[0, 2, 1, 3])?;
+                // `(B, nq, NH, HD)` -> `(B * NH, nq, HD)`: one flat batch of per-head attentions.
+                let flatten = |x: &Tensor, n: usize| -> Result<Tensor> {
+                    x.contiguous()?
+                        .reshape((b, n, nh, hd))?
+                        .permute((0usize, 2, 1, 3))?
+                        .contiguous()?
+                        .reshape((b * nh, n, hd))
+                };
+                let qs = flatten(&slice_axis(&qth, 3, w0, w1)?, nq)?;
+                let ks = flatten(&slice_axis(&kth, 3, kw0, kw0 + kwn)?, nk)?;
+                let vs = flatten(&slice_axis(&vth, 3, kw0, kw0 + kwn)?, nk)?;
+                let kt_s = ks.transpose(1, 2)?.contiguous()?;
 
-                let out = scaled_dot_product_attention(
-                    &contiguous(&qs)?,
-                    &contiguous(&ks)?,
-                    &contiguous(&vs)?,
-                    1.0,
-                    &mask,
-                    None,
-                )?;
+                // candle materialises the scores, so the head axis is chunked as well as the query
+                // axis — see `NA_SCORE_BUDGET`.
+                let per_head = nq * nk;
+                let chunk = head_chunk(per_head, score_budget, b * nh);
+                let mut head_parts: Vec<Tensor> = Vec::new();
+                let mut head0 = 0;
+                while head0 < b * nh {
+                    let n_heads = chunk.min(b * nh - head0);
+                    let scores = qs
+                        .narrow(0, head0, n_heads)?
+                        .matmul(&kt_s.narrow(0, head0, n_heads)?)?
+                        .broadcast_add(&mask)?;
+                    let probs = softmax_last_dim(&scores)?;
+                    head_parts.push(probs.matmul(&vs.narrow(0, head0, n_heads)?)?);
+                    head0 += n_heads;
+                }
+                let out = if head_parts.len() == 1 {
+                    head_parts.remove(0)
+                } else {
+                    Tensor::cat(&head_parts, 0)?
+                };
                 let out = out
-                    .transpose_axes(&[0, 2, 1, 3])?
-                    .reshape(&[b, nt, nhq, nw, nh * hd])?;
-                let out = contiguous(&out)?;
-                // Evaluate per tile: forcing one lazy graph over every tile of a production-sized
-                // stage-5 volume is the shape that fails as
-                // `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored` (sc-18760).
-                out.eval()?;
+                    .reshape((b, nh, nq, hd))?
+                    .permute((0usize, 2, 1, 3))?
+                    .contiguous()?
+                    .reshape((b, nt, nhq, nw, nh * hd))?;
                 w_parts.push(out);
                 w0 = w1;
             }
-            let refs: Vec<&Array> = w_parts.iter().collect();
-            h_parts.push(concatenate_axis(&refs, 3)?);
+            h_parts.push(Tensor::cat(&w_parts, 3)?);
             h0 = h1;
         }
-        let refs: Vec<&Array> = h_parts.iter().collect();
-        t_parts.push(concatenate_axis(&refs, 2)?);
+        t_parts.push(Tensor::cat(&h_parts, 2)?);
         t0 = t1;
     }
-    let refs: Vec<&Array> = t_parts.iter().collect();
-    Ok(concatenate_axis(&refs, 1)?)
+    Tensor::cat(&t_parts, 1)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1016,15 +925,16 @@ pub fn na3d(q: &Array, k: &Array, v: &Array, kernel: [i32; 3]) -> Result<Array> 
 // ---------------------------------------------------------------------------------------------
 
 /// Split `head_dim` across the `(T, H, W)` rotary chunks — upstream `default_rope_dim_split`.
-fn rope_dim_split(head_dim: i32) -> Result<[i32; 3]> {
-    if head_dim % 8 != 0 {
+fn rope_dim_split(head_dim: usize) -> Result<[usize; 3]> {
+    if !head_dim.is_multiple_of(8) {
         return Err(Error::Msg(format!(
-            "ltx diffvae: head_dim must be a multiple of 8 for the default rope split, got {head_dim}"
+            "ltx diffvae: head_dim must be a multiple of 8 for the default rope split, got \
+             {head_dim}"
         )));
     }
     let mut d_t = (head_dim / 4) / 2 * 2;
     let mut d_hw = (head_dim - d_t) / 2;
-    if d_hw % 2 != 0 {
+    if !d_hw.is_multiple_of(2) {
         d_t -= 2;
         d_hw = (head_dim - d_t) / 2;
     }
@@ -1033,76 +943,70 @@ fn rope_dim_split(head_dim: i32) -> Result<[i32; 3]> {
 
 /// `1 / base^(i / dim)` for even `i` — the rotary inverse frequencies, built in f64 as upstream
 /// does before the single cast to f32.
-fn rope_inv_freqs(dim: i32, base: f64) -> Array {
+fn rope_inv_freqs(dim: usize, base: f64, device: &Device) -> Result<Tensor> {
     let values: Vec<f32> = (0..dim)
         .step_by(2)
         .map(|i| (1.0 / base.powf(i as f64 / dim as f64)) as f32)
         .collect();
-    Array::from_slice(&values, &[dim / 2])
+    Tensor::from_vec(values, dim / 2, device)
 }
 
 /// Rotate one axis chunk of `(B, T, H, W, NH, D)` by absolute positions along `axis`
 /// (1 = T, 2 = H, 3 = W). Pairs are adjacent (`[x0, x1], [x2, x3], ...`).
-fn rotate_axis(x: &Array, inv: &Array, axis: usize) -> Result<Array> {
-    let sh = x.shape().to_vec();
+fn rotate_axis(x: &Tensor, inv: &Tensor, axis: usize) -> Result<Tensor> {
+    let sh = x.dims().to_vec();
     let d = *sh.last().expect("rank >= 1");
     let half = d / 2;
-    let pairs = contiguous(x)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half, 2])?;
-    let xe = slice_axis(&pairs, 6, 0, 1)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
-    let xo = slice_axis(&pairs, 6, 1, 2)?.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half])?;
+    let split = [sh[0], sh[1], sh[2], sh[3], sh[4], half];
+    let paired = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 2];
+    let stack = [sh[0], sh[1], sh[2], sh[3], sh[4], half, 1];
+    let pairs = x.contiguous()?.reshape(&paired[..])?;
+    let xe = pairs.narrow(6, 0, 1)?.reshape(&split[..])?;
+    let xo = pairs.narrow(6, 1, 1)?.reshape(&split[..])?;
 
     let len = sh[axis];
     let positions: Vec<f32> = (0..len).map(|i| i as f32).collect();
-    let pos = Array::from_slice(&positions, &[len, 1]);
-    let mut ang_shape = [1i32, 1, 1, 1, 1, half];
+    let pos = Tensor::from_vec(positions, (len, 1), x.device())?;
+    let mut ang_shape = [1usize, 1, 1, 1, 1, half];
     ang_shape[axis] = len;
-    let ang = multiply(&pos, &inv.reshape(&[1, half])?)?.reshape(&ang_shape)?;
+    let ang = pos
+        .broadcast_mul(&inv.reshape((1, half))?)?
+        .reshape(&ang_shape[..])?;
     let (cos, sin) = (ang.cos()?, ang.sin()?);
 
-    let re = subtract(&multiply(&xe, &cos)?, &multiply(&xo, &sin)?)?;
-    let ro = add(&multiply(&xe, &sin)?, &multiply(&xo, &cos)?)?;
-    let stacked = concatenate_axis(
-        &[
-            &re.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half, 1])?,
-            &ro.reshape(&[sh[0], sh[1], sh[2], sh[3], sh[4], half, 1])?,
-        ],
-        6,
-    )?;
-    Ok(stacked.reshape(&sh)?)
+    let re = (xe.broadcast_mul(&cos)? - xo.broadcast_mul(&sin)?)?;
+    let ro = (xe.broadcast_mul(&sin)? + xo.broadcast_mul(&cos)?)?;
+    let stacked = Tensor::cat(&[re.reshape(&stack[..])?, ro.reshape(&stack[..])?], 6)?;
+    stacked.contiguous()?.reshape(sh)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Attention / blocks
 // ---------------------------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct NaAttention {
     to_q: Linear,
     to_k: Linear,
     to_v: Linear,
     proj: Linear,
-    q_norm: Array,
-    k_norm: Array,
-    inv: [Array; 3],
-    split: [i32; 3],
-    kernel: [i32; 3],
-    num_heads: i32,
-    head_dim: i32,
-    scale: f32,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    inv: [Tensor; 3],
+    split: [usize; 3],
+    kernel: [usize; 3],
+    num_heads: usize,
+    head_dim: usize,
+    scale: f64,
 }
 
 impl NaAttention {
     /// The checkpoint ships one fused `qkv` Linear; upstream splits it into three at load, and so
     /// does this — three narrow GEMMs never materialise a `3*dim`-wide intermediate.
-    fn load(
-        w: &Weights,
-        prefix: &str,
-        kernel: [i32; 3],
-        head_dim: i32,
-        quant: Option<DiffVaeQuant>,
-    ) -> Result<Self> {
-        let fused_w = ProjWeight::load(w, &format!("{prefix}.qkv"), quant)?;
-        let fused_b = weight(w, &format!("{prefix}.qkv.bias"))?;
-        let rows = fused_w.out_features();
+    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
+        let fused_w = vb.get_unchecked(&format!("{prefix}.qkv.weight"))?;
+        let (rows, _) = fused_w.dims2()?;
+        let fused_b = vb.get(rows, &format!("{prefix}.qkv.bias"))?;
         if rows % 3 != 0 {
             return Err(Error::Msg(format!(
                 "ltx diffvae: {prefix}.qkv.weight has {rows} rows, not divisible by 3"
@@ -1114,45 +1018,46 @@ impl NaAttention {
                 "ltx diffvae: {prefix} width {dim} is not a multiple of head_dim {head_dim}"
             )));
         }
-        let part = |i: i32| -> Result<Linear> {
+        let part = |i: usize| -> Result<Linear> {
             Ok(Linear {
-                w: fused_w.slice_out(i * dim, (i + 1) * dim)?,
-                b: contiguous(&slice_axis(&fused_b, 0, i * dim, (i + 1) * dim)?)?,
+                w: fused_w.narrow(0, i * dim, dim)?.contiguous()?,
+                b: fused_b.narrow(0, i * dim, dim)?.contiguous()?,
             })
         };
         let split = rope_dim_split(head_dim)?;
+        let device = fused_w.device();
         Ok(Self {
             to_q: part(0)?,
             to_k: part(1)?,
             to_v: part(2)?,
-            proj: Linear::load(w, &format!("{prefix}.proj"), quant)?,
-            q_norm: weight(w, &format!("{prefix}.q_norm.weight"))?,
-            k_norm: weight(w, &format!("{prefix}.k_norm.weight"))?,
+            proj: Linear::load(vb, &format!("{prefix}.proj"))?,
+            q_norm: vb.get(head_dim, &format!("{prefix}.q_norm.weight"))?,
+            k_norm: vb.get(head_dim, &format!("{prefix}.k_norm.weight"))?,
             inv: [
-                rope_inv_freqs(split[0], ROPE_BASE),
-                rope_inv_freqs(split[1], ROPE_BASE),
-                rope_inv_freqs(split[2], ROPE_BASE),
+                rope_inv_freqs(split[0], ROPE_BASE, device)?,
+                rope_inv_freqs(split[1], ROPE_BASE, device)?,
+                rope_inv_freqs(split[2], ROPE_BASE, device)?,
             ],
             split,
             kernel,
             num_heads: dim / head_dim,
             head_dim,
-            scale: (head_dim as f32).powf(-0.5),
+            scale: (head_dim as f64).powf(-0.5),
         })
     }
 
-    fn width(&self) -> i32 {
+    fn width(&self) -> usize {
         self.num_heads * self.head_dim
     }
 
     /// Q/K/V as `(B, T, H, W, NH, HD)`.
-    fn project(&self, x: &Array) -> Result<(Array, Array, Array)> {
-        let sh = x.shape().to_vec();
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let sh = x.dims().to_vec();
         let heads = [sh[0], sh[1], sh[2], sh[3], self.num_heads, self.head_dim];
         Ok((
-            self.to_q.forward(x)?.reshape(&heads)?,
-            self.to_k.forward(x)?.reshape(&heads)?,
-            self.to_v.forward(x)?.reshape(&heads)?,
+            self.to_q.forward(x)?.reshape(&heads[..])?,
+            self.to_k.forward(x)?.reshape(&heads[..])?,
+            self.to_v.forward(x)?.reshape(&heads[..])?,
         ))
     }
 
@@ -1161,158 +1066,141 @@ impl NaAttention {
     /// Positions are the tile's own `0..len`, not a global origin. Upstream does the same and
     /// documents why it is exact under tiling: every window is local, and a shared phase offset
     /// cancels inside that window's softmax.
-    fn rope(&self, x: &Array) -> Result<Array> {
+    fn rope(&self, x: &Tensor) -> Result<Tensor> {
         let [d_t, d_h, _] = self.split;
         let d = self.head_dim;
         let xt = rotate_axis(&slice_axis(x, 5, 0, d_t)?, &self.inv[0], 1)?;
         let xh = rotate_axis(&slice_axis(x, 5, d_t, d_t + d_h)?, &self.inv[1], 2)?;
         let xw = rotate_axis(&slice_axis(x, 5, d_t + d_h, d)?, &self.inv[2], 3)?;
-        Ok(concatenate_axis(&[&xt, &xh, &xw], 5)?)
+        Tensor::cat(&[xt, xh, xw], 5)
     }
 
     /// `proj(na3d(rope(norm(qkv(x)))))` for a channels-last `(B, T, H, W, C)` input.
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (q, k, v) = self.project(x)?;
-        let q = multiply(
-            &rms_norm(&q, &self.q_norm, NORM_EPS)?,
-            Array::from_f32(self.scale),
-        )?;
-        let k = rms_norm(&k, &self.k_norm, NORM_EPS)?;
-        let q = contiguous(&self.rope(&q)?)?;
-        let k = contiguous(&self.rope(&k)?)?;
-        let v = contiguous(&v)?;
+        let q = (rms_norm(&q.contiguous()?, &self.q_norm, NORM_EPS)? * self.scale)?;
+        let k = rms_norm(&k.contiguous()?, &self.k_norm, NORM_EPS)?;
+        let q = self.rope(&q)?.contiguous()?;
+        let k = self.rope(&k)?.contiguous()?;
+        let v = v.contiguous()?;
         let out = na3d(&q, &k, &v, self.kernel)?;
         self.proj.forward(&out)
     }
 }
 
 /// Deterministic (stages 1-4) block: `x + attn(norm1(x))`, then `x + swiglu(norm2(x))`.
+#[derive(Debug)]
 struct NaBlock {
-    norm1: Array,
+    norm1: Tensor,
     attn: NaAttention,
-    norm2: Array,
+    norm2: Tensor,
     mlp: SwiGlu,
 }
 
 impl NaBlock {
-    fn load(
-        w: &Weights,
-        prefix: &str,
-        kernel: [i32; 3],
-        head_dim: i32,
-        quant: Option<DiffVaeQuant>,
-    ) -> Result<Self> {
+    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
         Ok(Self {
-            norm1: weight(w, &format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
-            norm2: weight(w, &format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"), quant)?,
+            norm1: vb.get_unchecked(&format!("{prefix}.norm1.weight"))?,
+            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim)?,
+            norm2: vb.get_unchecked(&format!("{prefix}.norm2.weight"))?,
+            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"))?,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let y = rms_norm(x, &self.norm1, NORM_EPS)?;
-        let x = add(x, &self.attn.forward(&y)?)?;
-        let y = rms_norm(&x, &self.norm2, NORM_EPS)?;
-        Ok(add(&x, &self.mlp.forward(&y)?)?)
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let y = rms_norm(&x.contiguous()?, &self.norm1, NORM_EPS)?;
+        let x = (x + self.attn.forward(&y)?)?;
+        let y = rms_norm(&x.contiguous()?, &self.norm2, NORM_EPS)?;
+        &x + self.mlp.forward(&y)?
     }
-}
-
-/// Stage-5 block: inject context, then AdaLN-modulated attention and MLP residuals.
-struct DiffusionBlock {
-    context_proj: Linear,
-    /// `[7, dim]`, added to the shared AdaLN chunks before use.
-    scale_shift_table: Array,
-    norm1: Array,
-    attn: NaAttention,
-    norm2: Array,
-    mlp: SwiGlu,
 }
 
 /// The seven AdaLN-Zero chunks (`AdaLNZero.NUM_CHUNKS`). The three gate slots exist for checkpoint
 /// shape compatibility and are unused by the block — the released checkpoint carries no `gate_*`
 /// parameters at all, so there is nothing folded into the projections either.
-const ADALN_CHUNKS: i32 = 7;
+const ADALN_CHUNKS: usize = 7;
+
+/// Stage-5 block: inject context, then AdaLN-modulated attention and MLP residuals.
+#[derive(Debug)]
+struct DiffusionBlock {
+    context_proj: Linear,
+    /// `[7, dim]`, added to the shared AdaLN chunks before use.
+    scale_shift_table: Tensor,
+    norm1: Tensor,
+    attn: NaAttention,
+    norm2: Tensor,
+    mlp: SwiGlu,
+}
 
 impl DiffusionBlock {
-    fn load(
-        w: &Weights,
-        prefix: &str,
-        kernel: [i32; 3],
-        head_dim: i32,
-        quant: Option<DiffVaeQuant>,
-    ) -> Result<Self> {
-        let table = weight(w, &format!("{prefix}.scale_shift_table"))?;
-        if table.ndim() != 2 || table.shape()[0] != ADALN_CHUNKS {
+    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
+        let table = vb.get_unchecked(&format!("{prefix}.scale_shift_table"))?;
+        if table.rank() != 2 || table.dims()[0] != ADALN_CHUNKS {
             return Err(Error::Msg(format!(
                 "ltx diffvae: {prefix}.scale_shift_table must be [{ADALN_CHUNKS}, dim], got {:?}",
-                table.shape()
+                table.dims()
             )));
         }
         Ok(Self {
-            context_proj: Linear::load(w, &format!("{prefix}.context_proj"), quant)?,
+            context_proj: Linear::load(vb, &format!("{prefix}.context_proj"))?,
             scale_shift_table: table,
-            norm1: weight(w, &format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(w, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
-            norm2: weight(w, &format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(w, &format!("{prefix}.mlp"), quant)?,
+            norm1: vb.get_unchecked(&format!("{prefix}.norm1.weight"))?,
+            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim)?,
+            norm2: vb.get_unchecked(&format!("{prefix}.norm2.weight"))?,
+            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"))?,
         })
     }
 
     /// `modulation` holds the seven shared AdaLN chunks, each `(1, 1, 1, 1, dim)`.
-    fn forward(&self, context: &Array, x: &Array, modulation: &[Array]) -> Result<Array> {
-        let chunk = |i: i32| -> Result<Array> {
-            let row =
-                slice_axis(&self.scale_shift_table, 0, i, i + 1)?.reshape(&[1, 1, 1, 1, -1])?;
-            Ok(add(&modulation[i as usize], &row)?)
+    fn forward(&self, context: &Tensor, x: &Tensor, modulation: &[Tensor]) -> Result<Tensor> {
+        let width = self.scale_shift_table.dims()[1];
+        let chunk = |i: usize| -> Result<Tensor> {
+            let row = self
+                .scale_shift_table
+                .narrow(0, i, 1)?
+                .reshape((1, 1, 1, 1, width))?;
+            &modulation[i] + row
         };
         let (scale_msa, shift_msa) = (chunk(0)?, chunk(1)?);
         let (scale_mlp, shift_mlp) = (chunk(3)?, chunk(4)?);
 
-        let x = add(x, &self.context_proj.forward(context)?)?;
+        let x = (x + self.context_proj.forward(context)?)?;
         let y = modulate(
-            &rms_norm(&x, &self.norm1, NORM_EPS)?,
+            &rms_norm(&x.contiguous()?, &self.norm1, NORM_EPS)?,
             &scale_msa,
             &shift_msa,
         )?;
-        let x = add(&x, &self.attn.forward(&y)?)?;
+        let x = (&x + self.attn.forward(&y)?)?;
         let y = modulate(
-            &rms_norm(&x, &self.norm2, NORM_EPS)?,
+            &rms_norm(&x.contiguous()?, &self.norm2, NORM_EPS)?,
             &scale_mlp,
             &shift_mlp,
         )?;
-        Ok(add(&x, &self.mlp.forward(&y)?)?)
+        &x + self.mlp.forward(&y)?
     }
 }
 
 /// `x * (1 + scale) + shift` (upstream `layers.modulate`).
-fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
-    Ok(add(
-        &multiply(x, &add(scale, Array::from_f32(1.0))?)?,
-        shift,
-    )?)
+fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
+    x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
 }
 
 /// `Linear` + channels-last pixel shuffle (upstream `LinearPixelShuffleUpsample`).
+#[derive(Debug)]
 struct PixelShuffleUpsample {
     proj: Linear,
-    stride: [i32; 3],
+    stride: [usize; 3],
 }
 
 impl PixelShuffleUpsample {
-    fn load(
-        w: &Weights,
-        prefix: &str,
-        stride: [i32; 3],
-        quant: Option<DiffVaeQuant>,
-    ) -> Result<Self> {
+    fn load(vb: &VarBuilder, prefix: &str, stride: [usize; 3]) -> Result<Self> {
         Ok(Self {
-            proj: Linear::load(w, &format!("{prefix}.proj"), quant)?,
+            proj: Linear::load(vb, &format!("{prefix}.proj"))?,
             stride,
         })
     }
 
-    fn out_channels(&self) -> i32 {
+    fn out_channels(&self) -> usize {
         self.proj.out_features() / (self.stride[0] * self.stride[1] * self.stride[2])
     }
 
@@ -1321,27 +1209,27 @@ impl PixelShuffleUpsample {
     /// A temporal stride of 2 duplicates the leading frame; dropping it preserves the causal 1:2
     /// (composed 1:8) frame mapping. `drop_leading_frame` must be true **only** for the chunk
     /// holding the tensor's true `t = 0` — a later tile has no duplicate of its own to drop.
-    fn forward(&self, x: &Array, drop_leading_frame: bool) -> Result<Array> {
-        let sh = x.shape().to_vec();
+    fn forward(&self, x: &Tensor, drop_leading_frame: bool) -> Result<Tensor> {
+        let sh = x.dims().to_vec();
         let (b, t, h, w) = (sh[0], sh[1], sh[2], sh[3]);
         let [p1, p2, p3] = self.stride;
         let c = self.out_channels();
         let y = self
             .proj
             .forward(x)?
-            .reshape(&[b, t, h, w, c, p1, p2, p3])?;
+            .reshape([b, t, h, w, c, p1, p2, p3].as_slice())?;
         // (b, t, p1, h, p2, w, p3, c)
-        let y = y.transpose_axes(&[0, 1, 5, 2, 6, 3, 7, 4])?;
-        let y = contiguous(&y)?.reshape(&[b, t * p1, h * p2, w * p3, c])?;
+        let y = y.permute([0usize, 1, 5, 2, 6, 3, 7, 4].as_slice())?;
+        let y = y.contiguous()?.reshape((b, t * p1, h * p2, w * p3, c))?;
         if p1 == 2 && drop_leading_frame {
-            return slice_axis(&y, 1, 1, y.shape()[1]);
+            return slice_axis(&y, 1, 1, y.dims()[1]);
         }
         Ok(y)
     }
 }
 
 // ---------------------------------------------------------------------------------------------
-// The decoder
+// Tiling
 // ---------------------------------------------------------------------------------------------
 
 /// Tiling for [`NaDiffusionDecoder::decode_tiled`], in **stage-4-input** units.
@@ -1354,14 +1242,14 @@ impl PixelShuffleUpsample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiffVaeTiling {
     /// Tile extent per axis, in stage-4-input cells.
-    pub tile: [i32; 3],
+    pub tile: [usize; 3],
     /// Overlap between neighbouring tiles per axis, in stage-4-input cells.
-    pub overlap: [i32; 3],
+    pub overlap: [usize; 3],
 }
 
 impl DiffVaeTiling {
     /// A tiling with the minimum legal overlap for `cfg` and the given per-axis tile extents.
-    pub fn with_min_overlap(cfg: &NaDiffusionDecoderConfig, tile: [i32; 3]) -> Self {
+    pub fn with_min_overlap(cfg: &NaDiffusionDecoderConfig, tile: [usize; 3]) -> Self {
         Self {
             tile,
             overlap: cfg.tile_halo(),
@@ -1397,10 +1285,10 @@ impl DiffVaeTiling {
 /// One tile's interval along one axis, with the linear ramps that blend it into its neighbours.
 #[derive(Clone, Copy, Debug)]
 struct Interval {
-    start: i32,
-    end: i32,
-    left_ramp: i32,
-    right_ramp: i32,
+    start: usize,
+    end: usize,
+    left_ramp: usize,
+    right_ramp: usize,
 }
 
 /// Split `[0, len)` into `size`-long intervals overlapping by `overlap` (upstream `split_by_size`).
@@ -1408,7 +1296,7 @@ struct Interval {
 /// A short trailing tile is **grown leftward** to `min_tile`, widening its neighbour's right ramp
 /// to match — an axis that divides unevenly would otherwise end in a sliver too narrow for stage 4
 /// or 5 to attend over.
-fn split_by_size(len: i32, size: i32, overlap: i32, min_tile: i32) -> Vec<Interval> {
+fn split_by_size(len: usize, size: usize, overlap: usize, min_tile: usize) -> Vec<Interval> {
     if len <= size {
         return vec![Interval {
             start: 0,
@@ -1419,7 +1307,7 @@ fn split_by_size(len: i32, size: i32, overlap: i32, min_tile: i32) -> Vec<Interv
     }
     let step = size - overlap;
     let count = (len + size - 2 * overlap - 1) / step;
-    let mut out = Vec::with_capacity(count as usize);
+    let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * step;
         let end = if i == count - 1 { len } else { start + size };
@@ -1433,9 +1321,9 @@ fn split_by_size(len: i32, size: i32, overlap: i32, min_tile: i32) -> Vec<Interv
     if out.len() >= 2 {
         let last = *out.last().expect("len >= 2");
         if last.end - last.start < min_tile {
-            let new_start = (last.end - min_tile).max(0);
+            let new_start = last.end.saturating_sub(min_tile);
             let prev = out[out.len() - 2];
-            let new_overlap = prev.end - new_start;
+            let new_overlap = prev.end.saturating_sub(new_start);
             let n = out.len();
             out[n - 2].right_ramp = new_overlap;
             out[n - 1].start = new_start;
@@ -1446,7 +1334,7 @@ fn split_by_size(len: i32, size: i32, overlap: i32, min_tile: i32) -> Vec<Interv
 }
 
 /// Coverage / ramp consistency for a split, so a bad layout is an error rather than a dim seam.
-fn validate_split(intervals: &[Interval], len: i32, min_tile: i32, axis: usize) -> Result<()> {
+fn validate_split(intervals: &[Interval], len: usize, min_tile: usize, axis: usize) -> Result<()> {
     let bad = |why: String| {
         Err(Error::Msg(format!(
             "ltx diffvae: axis {axis} tiling — {why}"
@@ -1457,6 +1345,9 @@ fn validate_split(intervals: &[Interval], len: i32, min_tile: i32, axis: usize) 
         return bad(format!("tiles must cover [0, {len})"));
     }
     for (i, iv) in intervals.iter().enumerate() {
+        if iv.end < iv.start {
+            return bad(format!("tile {i} runs backwards"));
+        }
         let length = iv.end - iv.start;
         if length < min_tile.min(len) {
             return bad(format!(
@@ -1467,15 +1358,18 @@ fn validate_split(intervals: &[Interval], len: i32, min_tile: i32, axis: usize) 
         // the blend is no longer a partition of unity — which is why the driver always normalises
         // by the accumulated weight profile instead of assuming one. A ramp longer than the tile
         // itself is still nonsense.
-        if iv.left_ramp < 0 || iv.right_ramp < 0 || iv.left_ramp > length || iv.right_ramp > length
-        {
+        if iv.left_ramp > length || iv.right_ramp > length {
             return bad(format!(
                 "tile {i} has ramps that do not fit its length {length}"
             ));
         }
         if i > 0 {
-            let overlap = intervals[i - 1].end - iv.start;
-            if overlap < 0 || intervals[i - 1].right_ramp != overlap || iv.left_ramp != overlap {
+            let previous = intervals[i - 1];
+            if previous.end < iv.start {
+                return bad(format!("tiles {}/{i} leave a gap", i - 1));
+            }
+            let overlap = previous.end - iv.start;
+            if previous.right_ramp != overlap || iv.left_ramp != overlap {
                 return bad(format!("tiles {}/{i} disagree about their overlap", i - 1));
             }
         }
@@ -1485,7 +1379,7 @@ fn validate_split(intervals: &[Interval], len: i32, min_tile: i32, axis: usize) 
 
 /// Propagate an interval through one upsample hop. `causal` applies the pixel-shuffle
 /// duplicate-frame drop that `PixelShuffleUpsample` performs on the temporal axis.
-fn propagate(interval: Interval, stride: i32, causal: bool) -> Interval {
+fn propagate(interval: Interval, stride: usize, causal: bool) -> Interval {
     let mut out = Interval {
         start: interval.start * stride,
         end: interval.end * stride,
@@ -1503,30 +1397,35 @@ fn propagate(interval: Interval, stride: i32, causal: bool) -> Interval {
 
 /// Linear-ramp trapezoid of `length`, matching upstream `compute_trapezoidal_mask_1d` with
 /// `left_starts_from_0=False`. Two neighbouring tiles' ramps sum to exactly 1 over their overlap.
-fn trapezoid(length: i32, left_ramp: i32, right_ramp: i32) -> Vec<f32> {
-    let left = left_ramp.clamp(0, length);
-    let right = right_ramp.clamp(0, length);
-    let mut mask = vec![1.0f32; length as usize];
-    for (i, slot) in mask.iter_mut().take(left as usize).enumerate() {
+fn trapezoid(length: usize, left_ramp: usize, right_ramp: usize) -> Vec<f32> {
+    let left = left_ramp.min(length);
+    let right = right_ramp.min(length);
+    let mut mask = vec![1.0f32; length];
+    for (i, slot) in mask.iter_mut().take(left).enumerate() {
         *slot *= (i + 1) as f32 / (left + 1) as f32;
     }
-    for (i, slot) in mask.iter_mut().rev().take(right as usize).enumerate() {
+    for (i, slot) in mask.iter_mut().rev().take(right).enumerate() {
         *slot *= (i + 1) as f32 / (right + 1) as f32;
     }
     mask
 }
 
+// ---------------------------------------------------------------------------------------------
+// The decoder
+// ---------------------------------------------------------------------------------------------
+
 /// A latent grown to the stage floors and carrying its trailing ghost frames, plus the
 /// `(before, after)` spatial pads — in latent cells — that decode must crop back off.
-type PreparedLatent = (Array, (i32, i32), (i32, i32));
+type PreparedLatent = (Tensor, (usize, usize), (usize, usize));
 
-/// The LTX-2.5 `NADiffusionDecoder`.
+/// The LTX-2.5 `NADiffusionDecoder`, on candle.
+#[derive(Debug)]
 pub struct NaDiffusionDecoder {
     cfg: NaDiffusionDecoderConfig,
     /// `per_channel_statistics`, `(1, C, 1, 1, 1)` — the encoder normalises its latent, so the
     /// decoder un-normalises before `conv_in`.
-    stat_mean: Array,
-    stat_std: Array,
+    stat_mean: Tensor,
+    stat_std: Tensor,
     conv_in: Linear,
     det_stages: Vec<Vec<NaBlock>>,
     upsamples: Vec<PixelShuffleUpsample>,
@@ -1535,8 +1434,9 @@ pub struct NaDiffusionDecoder {
     shared_adaln: Linear,
     conv_in_x_t: Linear,
     diff_blocks: Vec<DiffusionBlock>,
-    norm_out: Array,
+    norm_out: Tensor,
     conv_out: Linear,
+    device: Device,
 }
 
 impl NaDiffusionDecoder {
@@ -1544,84 +1444,69 @@ impl NaDiffusionDecoder {
     /// downscale_freq_shift=0)`).
     const TIME_PROJ_DIM: usize = 256;
 
-    /// Build from a converted `vae_diffusion_decoder.safetensors` weight map.
+    /// Build from a released `CausalDiffusionVAE` checkpoint, **verbatim**.
     ///
-    /// `quant` declares the file's affine-quant geometry: `None` for a dense checkpoint (upstream's,
-    /// and the `bf16` tier's), `Some` for a `q4`/`q8` tier, carrying that tier's
-    /// `quantization_bits` / `quantization_group_size`. It is a declaration, not a request — every
-    /// Linear binds packed or dense according to whether its own `.scales` sibling exists, so the
-    /// one Linear a tier leaves dense (`conv_in_x_t`, input axis 48) loads correctly under
-    /// `Some(..)`. Declaring `None` against a packed file is a hard error rather than a silent
-    /// mis-read of the `U32` payload; see [`DiffVaeQuant`].
-    pub fn from_weights(
-        w: &Weights,
-        cfg: &NaDiffusionDecoderConfig,
-        quant: Option<DiffVaeQuant>,
-    ) -> Result<Self> {
+    /// `vb` is rooted at the decoder (`decoder.` on the released file); `stats` is rooted where
+    /// `per_channel_statistics.{mean,std}-of-means` live (the file root). Both are separate
+    /// arguments for the same reason [`crate::vae::LtxVideoVae`] takes them separately: on LTX-2.3
+    /// the statistics sit beside the decoder under `vae.`, on LTX-2.5 they sit above it.
+    pub fn load(vb: VarBuilder, stats: VarBuilder, cfg: &NaDiffusionDecoderConfig) -> Result<Self> {
         let stages = cfg.stage_channels.len();
         let det = stages - 1;
         let mut det_stages = Vec::with_capacity(det);
         let mut upsamples = Vec::with_capacity(det);
         for stage in 0..det {
             let kernel = cfg.stage_kernels[stage];
-            let mut blocks = Vec::with_capacity(cfg.stage_depths[stage] as usize);
+            let mut blocks = Vec::with_capacity(cfg.stage_depths[stage]);
             for i in 0..cfg.stage_depths[stage] {
                 blocks.push(NaBlock::load(
-                    w,
+                    &vb,
                     &format!("det_stages.{stage}.{i}"),
                     kernel,
                     cfg.head_dim,
-                    quant,
                 )?);
             }
             det_stages.push(blocks);
             upsamples.push(PixelShuffleUpsample::load(
-                w,
+                &vb,
                 &format!("upsamples.{stage}"),
                 cfg.upsamples[stage].0,
-                quant,
             )?);
         }
-        let mut diff_blocks =
-            Vec::with_capacity(*cfg.stage_depths.last().expect("validated") as usize);
-        for i in 0..*cfg.stage_depths.last().expect("validated") {
+        let depth5 = *cfg.stage_depths.last().expect("validated");
+        let mut diff_blocks = Vec::with_capacity(depth5);
+        for i in 0..depth5 {
             diff_blocks.push(DiffusionBlock::load(
-                w,
+                &vb,
                 &format!("diff_blocks.{i}"),
                 cfg.stage5_kernel,
                 cfg.head_dim,
-                quant,
             )?);
         }
 
         let latent_c = cfg.in_channels;
-        let stat = |key: &str| -> Result<Array> {
-            let a = weight(w, key)?;
-            if a.size() as i32 != latent_c {
-                return Err(Error::Msg(format!(
-                    "ltx diffvae: {key} has {} entries, expected {latent_c}",
-                    a.size()
-                )));
-            }
-            Ok(a.reshape(&[1, latent_c, 1, 1, 1])?)
+        let stat = |key: &str| -> Result<Tensor> {
+            stats
+                .get(latent_c, key)?
+                .reshape((1, latent_c, 1, 1, 1))?
+                .to_dtype(DType::F32)
         };
 
         let decoder = Self {
+            device: vb.device().clone(),
             cfg: cfg.clone(),
-            stat_mean: stat("per_channel_statistics.mean")?,
-            stat_std: stat("per_channel_statistics.std")?,
-            conv_in: Linear::load(w, "conv_in", quant)?,
+            stat_mean: stat(STAT_MEAN_KEY)?,
+            stat_std: stat(STAT_STD_KEY)?,
+            conv_in: Linear::load(&vb, "conv_in")?,
             det_stages,
             upsamples,
-            t_linear1: Linear::load(w, "t_embedder.mlp.0", quant)?,
-            t_linear2: Linear::load(w, "t_embedder.mlp.2", quant)?,
-            shared_adaln: Linear::load(w, "shared_adaln.proj", quant)?,
-            // Deliberately *not* passed a packed weight by the tier emitter: its input axis is 48,
-            // which no affine group of 64 divides. See `tiers::DIFF_VAE_DECODER_QUANT_SUFFIXES`.
-            conv_in_x_t: Linear::load(w, "conv_in_x_t", quant)?,
+            t_linear1: Linear::load(&vb, "t_embedder.mlp.0")?,
+            t_linear2: Linear::load(&vb, "t_embedder.mlp.2")?,
+            shared_adaln: Linear::load(&vb, "shared_adaln.proj")?,
+            conv_in_x_t: Linear::load(&vb, "conv_in_x_t")?,
             diff_blocks,
-            norm_out: weight(w, "norm_out.weight")?,
-            conv_out: Linear::load(w, "conv_out", quant)?,
+            norm_out: vb.get_unchecked("norm_out.weight")?,
+            conv_out: Linear::load(&vb, "conv_out")?,
         };
         decoder.check_widths()?;
         Ok(decoder)
@@ -1632,7 +1517,7 @@ impl NaDiffusionDecoder {
     /// numbers happen to line up — as a plausible but wrong picture.
     fn check_widths(&self) -> Result<()> {
         let cfg = &self.cfg;
-        let expect = |what: &str, got: i32, want: i32| -> Result<()> {
+        let expect = |what: &str, got: usize, want: usize| -> Result<()> {
             if got != want {
                 return Err(Error::Msg(format!(
                     "ltx diffvae: {what} is {got} in the weights but {want} in the config"
@@ -1665,7 +1550,7 @@ impl NaDiffusionDecoder {
         )?;
         expect(
             "conv_in_x_t input width",
-            self.conv_in_x_t.w.in_features(),
+            self.conv_in_x_t.in_features(),
             cfg.out_channels * cfg.patch_size * cfg.patch_size,
         )?;
         expect(
@@ -1682,7 +1567,7 @@ impl NaDiffusionDecoder {
             expect(&format!("diff block {i} width"), block.attn.width(), c5)?;
             expect(
                 &format!("diff block {i} context width"),
-                block.context_proj.w.in_features(),
+                block.context_proj.in_features(),
                 *cfg.stage_channels.last().expect("validated"),
             )?;
         }
@@ -1697,7 +1582,7 @@ impl NaDiffusionDecoder {
             let dim = cfg.stage_channels[stage];
             expect(
                 &format!("det stage {stage} mlp hidden"),
-                blocks[0].mlp.w_gate.out_features(),
+                blocks[0].mlp.w_gate.dims()[0],
                 mlp_hidden(dim),
             )?;
         }
@@ -1709,14 +1594,21 @@ impl NaDiffusionDecoder {
         &self.cfg
     }
 
+    /// The device its weights live on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// `(B, C, T, H, W) -> (B, T, H, W, C)` with the per-channel statistics undone.
-    fn un_normalize(&self, latent: &Array) -> Result<Array> {
-        let x = add(&multiply(latent, &self.stat_std)?, &self.stat_mean)?;
-        contiguous(&x.transpose_axes(&[0, 2, 3, 4, 1])?)
+    fn un_normalize(&self, latent: &Tensor) -> Result<Tensor> {
+        let x = latent
+            .broadcast_mul(&self.stat_std)?
+            .broadcast_add(&self.stat_mean)?;
+        x.permute((0usize, 2, 3, 4, 1))?.contiguous()
     }
 
     /// Stages 1..=3 over the whole (already ghost-padded) latent → the stage-4 input feature.
-    fn stages_1_to_3(&self, latent: &Array) -> Result<Array> {
+    fn stages_1_to_3(&self, latent: &Tensor) -> Result<Tensor> {
         let mut x = self.conv_in.forward(&self.un_normalize(latent)?)?;
         for stage in 0..self.upsamples.len() - 1 {
             x = self.run_det_stage(&x, stage, true)?;
@@ -1724,51 +1616,45 @@ impl NaDiffusionDecoder {
         Ok(x)
     }
 
-    fn run_det_stage(&self, x: &Array, stage: usize, drop_leading_frame: bool) -> Result<Array> {
+    fn run_det_stage(&self, x: &Tensor, stage: usize, drop_leading_frame: bool) -> Result<Tensor> {
         let mut x = x.clone();
         for block in &self.det_stages[stage] {
             x = block.forward(&x)?;
-            // Stage by stage rather than one lazy graph over the whole decoder (sc-18760).
-            x.eval()?;
         }
         self.upsamples[stage].forward(&x, drop_leading_frame)
     }
 
     /// Stage 4 → the stage-5 context, with the trailing ghost frames cropped back off.
-    fn stage_4(&self, x: &Array, drop_leading_frame: bool, pad_trailing: bool) -> Result<Array> {
+    fn stage_4(&self, x: &Tensor, drop_leading_frame: bool, pad_trailing: bool) -> Result<Tensor> {
         let last = self.upsamples.len() - 1;
         let x = self.run_det_stage(x, last, drop_leading_frame)?;
         if !pad_trailing {
             return Ok(x);
         }
         let ghost = self.cfg.ghost_latent_frames() * self.cfg.pixel_scale()[0];
-        if ghost <= 0 {
+        if ghost == 0 {
             return Ok(x);
         }
-        let frames = x.shape()[1];
-        let content = (frames - ghost).max(1);
+        let frames = x.dims()[1];
+        let content = frames.saturating_sub(ghost).max(1);
         let keep = frames.min(content.max(self.cfg.stage5_kernel[0]));
         Ok(resize_axis(&x, 1, keep, false)?.0)
     }
 
     /// The shared AdaLN-Zero chunks for one timestep.
-    fn modulation(&self, t: f32) -> Result<Vec<Array>> {
-        let scaled = Array::from_slice(&[t * self.cfg.timestep_scale_multiplier], &[1]);
-        let proj = timestep_sincos(&scaled, Self::TIME_PROJ_DIM, 10_000.0, 0.0)?;
-        let emb = self
-            .t_linear2
-            .forward(&silu(&self.t_linear1.forward(&proj)?)?)?;
+    fn modulation(&self, t: f64) -> Result<Vec<Tensor>> {
+        let emb = self.timestep_embedding(t)?;
         let h = self.shared_adaln.forward(&silu(&emb)?)?;
         let c5 = self.cfg.stage5_width();
         (0..ADALN_CHUNKS)
-            .map(|i| Ok(slice_axis(&h, 1, i * c5, (i + 1) * c5)?.reshape(&[1, 1, 1, 1, c5])?))
+            .map(|i| h.narrow(1, i * c5, c5)?.reshape((1, 1, 1, 1, c5)))
             .collect()
     }
 
     /// One deterministic block, in isolation. Exposed for parity work: a whole-decode mismatch says
     /// nothing about *where*, and the alternative — inferring it from the picture — is guesswork.
     /// `x` is channels-last `(B, T, H, W, C)` at that stage's width.
-    pub fn det_block(&self, stage: usize, index: usize, x: &Array) -> Result<Array> {
+    pub fn det_block(&self, stage: usize, index: usize, x: &Tensor) -> Result<Tensor> {
         let blocks = self.det_stages.get(stage).ok_or_else(|| {
             Error::Msg(format!(
                 "ltx diffvae: no deterministic stage {stage} (have {})",
@@ -1788,10 +1674,10 @@ impl NaDiffusionDecoder {
     pub fn diffusion_block(
         &self,
         index: usize,
-        context: &Array,
-        x: &Array,
-        t: f32,
-    ) -> Result<Array> {
+        context: &Tensor,
+        x: &Tensor,
+        t: f64,
+    ) -> Result<Tensor> {
         let block = self.diff_blocks.get(index).ok_or_else(|| {
             Error::Msg(format!(
                 "ltx diffvae: there are {} diffusion blocks, not {index}",
@@ -1804,94 +1690,100 @@ impl NaDiffusionDecoder {
     /// The two big intermediates of an untiled decode: the stage-1-3 feature and the stage-5
     /// context. Exposed for the same reason as [`Self::det_block`] — so a parity failure names a
     /// stage instead of a picture.
-    pub fn stage_features(&self, latent: &Array) -> Result<(Array, Array)> {
+    pub fn stage_features(&self, latent: &Tensor) -> Result<(Tensor, Tensor)> {
         self.check_latent(latent)?;
-        let (padded, _, _) = self.prepare_latent(&to_dtype(latent, Dtype::Float32)?)?;
+        let (padded, _, _) = self.prepare_latent(&latent.to_dtype(DType::F32)?)?;
         let feature = self.stages_1_to_3(&padded)?;
-        feature.eval()?;
         let context = self.stage_4(&feature, true, true)?;
-        context.eval()?;
         Ok((feature, context))
     }
 
     /// The seven shared AdaLN-Zero chunks at `t`, concatenated into `(1, 7 * stage5_width)` in
     /// chunk order. The block-level modulation is this plus each block's `scale_shift_table`.
-    pub fn adaln_chunks(&self, t: f32) -> Result<Array> {
+    pub fn adaln_chunks(&self, t: f64) -> Result<Tensor> {
         let chunks = self.modulation(t)?;
-        let flat: Vec<Array> = chunks
+        let flat: Vec<Tensor> = chunks
             .iter()
-            .map(|c| c.reshape(&[1, -1]).map_err(Error::from))
+            .map(|c| c.reshape((1, c.elem_count())))
             .collect::<Result<Vec<_>>>()?;
-        let refs: Vec<&Array> = flat.iter().collect();
-        Ok(concatenate_axis(&refs, 1)?)
+        Tensor::cat(&flat, 1)
     }
 
     /// The timestep embedding itself — exposed so a port failure localises to the embedder rather
     /// than to whatever the eight stage-5 blocks did with it.
-    pub fn timestep_embedding(&self, t: f32) -> Result<Array> {
-        let scaled = Array::from_slice(&[t * self.cfg.timestep_scale_multiplier], &[1]);
-        let proj = timestep_sincos(&scaled, Self::TIME_PROJ_DIM, 10_000.0, 0.0)?;
+    ///
+    /// diffusers `get_timestep_embedding(..., flip_sin_to_cos=True, downscale_freq_shift=0)`,
+    /// i.e. `[cos, sin]`, then the two-layer SiLU MLP.
+    pub fn timestep_embedding(&self, t: f64) -> Result<Tensor> {
+        let half = Self::TIME_PROJ_DIM / 2;
+        let neg_log = -ROPE_BASE.ln();
+        let scaled = t * self.cfg.timestep_scale_multiplier;
+        let angles: Vec<f32> = (0..half)
+            .map(|i| (scaled * (neg_log * i as f64 / half as f64).exp()) as f32)
+            .collect();
+        let ang = Tensor::from_vec(angles, (1, half), &self.device)?;
+        let proj = Tensor::cat(&[ang.cos()?, ang.sin()?], 1)?;
         self.t_linear2
             .forward(&silu(&self.t_linear1.forward(&proj)?)?)
     }
 
     /// One stage-5 pass: patchified `x_t` + context → the model's pixel-space prediction.
-    fn diff_step(&self, context: &Array, x_t: &Array, t: f32) -> Result<Array> {
+    fn diff_step(&self, context: &Tensor, x_t: &Tensor, t: f64) -> Result<Tensor> {
         let modulation = self.modulation(t)?;
         let patched = patchify(x_t, self.cfg.patch_size)?;
-        let patched = contiguous(&patched.transpose_axes(&[0, 2, 3, 4, 1])?)?;
+        let patched = patched.permute((0usize, 2, 3, 4, 1))?.contiguous()?;
         let mut x = self.conv_in_x_t.forward(&patched)?;
         for block in &self.diff_blocks {
             x = block.forward(context, &x, &modulation)?;
-            x.eval()?;
         }
         let x = self
             .conv_out
-            .forward(&rms_norm(&x, &self.norm_out, NORM_EPS)?)?;
-        let x = contiguous(&x.transpose_axes(&[0, 4, 1, 2, 3])?)?;
+            .forward(&rms_norm(&x.contiguous()?, &self.norm_out, NORM_EPS)?)?;
+        let x = x.permute((0usize, 4, 1, 2, 3))?.contiguous()?;
         unpatchify(&x, self.cfg.patch_size)
     }
 
     /// The reverse-diffusion schedule: `linspace(1, 1/N, N)`, computed the way `torch.linspace`
     /// does (`start + i * step`) so a multi-step schedule lands on the same floats the reference
     /// samples at.
-    fn timesteps(&self) -> Vec<f32> {
+    fn timesteps(&self) -> Vec<f64> {
         let n = self.cfg.default_num_inference_steps;
         if n == 1 {
             return vec![1.0];
         }
-        let step = (1.0 / n as f32 - 1.0) / (n - 1) as f32;
-        (0..n).map(|i| 1.0 + i as f32 * step).collect()
+        let step = (1.0 / n as f64 - 1.0) / (n - 1) as f64;
+        (0..n).map(|i| 1.0 + i as f64 * step).collect()
     }
 
     /// One Euler update: advance `x_t` from `t_now` to `t_next` given the model's prediction.
-    fn euler_step(&self, x_t: &Array, model_out: &Array, t_now: f32, t_next: f32) -> Result<Array> {
+    fn euler_step(
+        &self,
+        x_t: &Tensor,
+        model_out: &Tensor,
+        t_now: f64,
+        t_next: f64,
+    ) -> Result<Tensor> {
         let velocity = match self.cfg.model_output_type {
             ModelOutputType::Velocity => model_out.clone(),
-            ModelOutputType::X0 => divide(&subtract(x_t, model_out)?, Array::from_f32(t_now))?,
+            ModelOutputType::X0 => ((x_t - model_out)? / t_now)?,
         };
-        Ok(subtract(
-            x_t,
-            &multiply(&velocity, Array::from_f32(t_now - t_next))?,
-        )?)
+        x_t - (velocity * (t_now - t_next))?
     }
 
     /// Stages 4-5 for one stage-4 feature extent.
     fn decode_one_tile(
         &self,
-        feature: &Array,
-        x_t_init: &Array,
+        feature: &Tensor,
+        x_t_init: &Tensor,
         is_origin: bool,
         pad_trailing: bool,
-    ) -> Result<Array> {
+    ) -> Result<Tensor> {
         let context = self.stage_4(feature, is_origin, pad_trailing)?;
-        context.eval()?;
         let schedule = self.timesteps();
         let mut x_t = x_t_init.clone();
         for i in 0..schedule.len() - 1 {
             let out = self.diff_step(&context, &x_t, schedule[i])?;
             x_t = self.euler_step(&x_t, &out, schedule[i], schedule[i + 1])?;
-            x_t.eval()?;
         }
         let last = *schedule.last().expect("schedule holds >= 1 step");
         let out = self.diff_step(&context, &x_t, last)?;
@@ -1903,14 +1795,14 @@ impl NaDiffusionDecoder {
 
     /// Apply the latent size floor and the trailing ghost frames, returning the padded latent plus
     /// the `(before, after)` spatial pads that decode must crop back off.
-    fn prepare_latent(&self, latent: &Array) -> Result<PreparedLatent> {
+    fn prepare_latent(&self, latent: &Tensor) -> Result<PreparedLatent> {
         let min = self.cfg.min_latent_shape();
-        let (x, _) = resize_axis(latent, 2, latent.shape()[2].max(min[0]), false)?;
-        let (x, h_pad) = resize_axis(&x, 3, x.shape()[3].max(min[1]), true)?;
-        let (x, w_pad) = resize_axis(&x, 4, x.shape()[4].max(min[2]), true)?;
+        let (x, _) = resize_axis(latent, 2, latent.dims()[2].max(min[0]), false)?;
+        let (x, h_pad) = resize_axis(&x, 3, x.dims()[3].max(min[1]), true)?;
+        let (x, w_pad) = resize_axis(&x, 4, x.dims()[4].max(min[2]), true)?;
         let ghost = self.cfg.ghost_latent_frames();
         let padded = if ghost > 0 {
-            resize_axis(&x, 2, x.shape()[2] + ghost, false)?.0
+            resize_axis(&x, 2, x.dims()[2] + ghost, false)?.0
         } else {
             x.clone()
         };
@@ -1920,13 +1812,13 @@ impl NaDiffusionDecoder {
     /// Crop a decoded pixel volume back to the content geometry the caller asked for.
     fn crop_to_content(
         &self,
-        pixels: &Array,
-        frames: i32,
-        height: i32,
-        width: i32,
-        h_pad: (i32, i32),
-        w_pad: (i32, i32),
-    ) -> Result<Array> {
+        pixels: &Tensor,
+        frames: usize,
+        height: usize,
+        width: usize,
+        h_pad: (usize, usize),
+        w_pad: (usize, usize),
+    ) -> Result<Tensor> {
         let (x, _) = resize_axis(pixels, 2, frames, false)?;
         let h_before = h_pad.0 * self.cfg.pixel_scale()[1];
         let x = if h_pad.0 + h_pad.1 > 0 {
@@ -1943,18 +1835,18 @@ impl NaDiffusionDecoder {
         Ok(x)
     }
 
-    fn check_latent(&self, latent: &Array) -> Result<()> {
-        if latent.ndim() != 5 || latent.shape()[1] != self.cfg.in_channels {
+    fn check_latent(&self, latent: &Tensor) -> Result<()> {
+        if latent.rank() != 5 || latent.dims()[1] != self.cfg.in_channels {
             return Err(Error::Msg(format!(
                 "ltx diffvae: expected a (B, {}, T, H, W) latent, got {:?}",
                 self.cfg.in_channels,
-                latent.shape()
+                latent.dims()
             )));
         }
         Ok(())
     }
 
-    fn check_noise(&self, noise: &Array, want: [i32; 3], latent_batch: i32) -> Result<()> {
+    fn check_noise(&self, noise: &Tensor, want: [usize; 3], latent_batch: usize) -> Result<()> {
         let want_shape = [
             latent_batch,
             self.cfg.out_channels,
@@ -1962,11 +1854,11 @@ impl NaDiffusionDecoder {
             want[1],
             want[2],
         ];
-        if noise.shape() != want_shape {
+        if noise.dims() != want_shape {
             return Err(Error::Msg(format!(
                 "ltx diffvae: stage-5 noise must be {want_shape:?}, got {:?} (see \
                  NaDiffusionDecoderConfig::noise_shape)",
-                noise.shape()
+                noise.dims()
             )));
         }
         Ok(())
@@ -1978,18 +1870,15 @@ impl NaDiffusionDecoder {
     /// The noise is an explicit argument rather than drawn internally so a decode is reproducible
     /// and comparable across backends; [`Self::decode_seeded`] is the convenience wrapper that
     /// draws it.
-    pub fn decode(&self, latent: &Array, noise: &Array) -> Result<Array> {
+    pub fn decode(&self, latent: &Tensor, noise: &Tensor) -> Result<Tensor> {
         self.check_latent(latent)?;
-        let sh = latent.shape().to_vec();
+        let sh = latent.dims().to_vec();
         let (b, lt, lh, lw) = (sh[0], sh[2], sh[3], sh[4]);
         self.check_noise(noise, self.cfg.noise_shape(lt, lh, lw), b)?;
 
-        let latent_f32 = to_dtype(latent, Dtype::Float32)?;
-        let (padded, h_pad, w_pad) = self.prepare_latent(&latent_f32)?;
+        let (padded, h_pad, w_pad) = self.prepare_latent(&latent.to_dtype(DType::F32)?)?;
         let feature = self.stages_1_to_3(&padded)?;
-        feature.eval()?;
-        let pixels =
-            self.decode_one_tile(&feature, &to_dtype(noise, Dtype::Float32)?, true, true)?;
+        let pixels = self.decode_one_tile(&feature, &noise.to_dtype(DType::F32)?, true, true)?;
         let scale = self.cfg.pixel_scale();
         let out = self.crop_to_content(
             &pixels,
@@ -1999,7 +1888,7 @@ impl NaDiffusionDecoder {
             h_pad,
             w_pad,
         )?;
-        contiguous(&out)
+        out.contiguous()
     }
 
     /// Tiled decode: stages 1-3 once over the whole volume, stages 4-5 per tile, blended in pixel
@@ -2010,26 +1899,24 @@ impl NaDiffusionDecoder {
     /// what makes the seam tests able to say anything at all.
     pub fn decode_tiled(
         &self,
-        latent: &Array,
-        noise: &Array,
+        latent: &Tensor,
+        noise: &Tensor,
         tiling: &DiffVaeTiling,
-    ) -> Result<Array> {
+    ) -> Result<Tensor> {
         self.check_latent(latent)?;
         let tiling = tiling.validated(&self.cfg)?;
-        let sh = latent.shape().to_vec();
+        let sh = latent.dims().to_vec();
         let (b, lt, lh, lw) = (sh[0], sh[2], sh[3], sh[4]);
         self.check_noise(noise, self.cfg.noise_shape(lt, lh, lw), b)?;
 
-        let latent_f32 = to_dtype(latent, Dtype::Float32)?;
-        let (padded, h_pad, w_pad) = self.prepare_latent(&latent_f32)?;
+        let (padded, h_pad, w_pad) = self.prepare_latent(&latent.to_dtype(DType::F32)?)?;
         let min = self.cfg.min_latent_shape();
         let work = [lt.max(min[0]), lh.max(min[1]), lw.max(min[2])];
         let stage4 = self.cfg.stage4_shape(work[0], work[1], work[2]);
         let canvas = self.cfg.stage5_pixel_shape(stage4, true, true);
 
         let feature = self.stages_1_to_3(&padded)?;
-        feature.eval()?;
-        let noise_f32 = to_dtype(noise, Dtype::Float32)?;
+        let noise_f32 = noise.to_dtype(DType::F32)?;
 
         let last = self.upsamples.len() - 1;
         let stride = self.cfg.upsamples[last].0;
@@ -2067,11 +1954,11 @@ impl NaDiffusionDecoder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut accumulator: Option<Array> = None;
+        let mut accumulator: Option<Tensor> = None;
         let mut weights: [Vec<f32>; 3] = [
-            vec![0.0; canvas[0] as usize],
-            vec![0.0; canvas[1] as usize],
-            vec![0.0; canvas[2] as usize],
+            vec![0.0; canvas[0]],
+            vec![0.0; canvas[1]],
+            vec![0.0; canvas[2]],
         ];
         let mut weight_seen = [false; 3];
 
@@ -2080,7 +1967,7 @@ impl NaDiffusionDecoder {
             let pad_trailing = t_s4.end == stage4[0];
             // The trailing tile keeps the ghost frames stages 1-3 produced; stage 4 crops them.
             let t_end = if pad_trailing {
-                feature.shape()[1]
+                feature.dims()[1]
             } else {
                 t_s4.end
             };
@@ -2089,7 +1976,7 @@ impl NaDiffusionDecoder {
                 let feature_th = slice_axis(&feature_t, 2, h_s4.start, h_s4.end)?;
                 for (w_s4, w_px) in &axes[2] {
                     let tile_feature =
-                        contiguous(&slice_axis(&feature_th, 3, w_s4.start, w_s4.end)?)?;
+                        slice_axis(&feature_th, 3, w_s4.start, w_s4.end)?.contiguous()?;
                     let content = [
                         t_s4.end - t_s4.start,
                         h_s4.end - h_s4.start,
@@ -2111,7 +1998,7 @@ impl NaDiffusionDecoder {
 
                     let tile = self.decode_one_tile(
                         &tile_feature,
-                        &contiguous(&x_t)?,
+                        &x_t.contiguous()?,
                         is_origin,
                         pad_trailing,
                     )?;
@@ -2122,34 +2009,19 @@ impl NaDiffusionDecoder {
                     let mt = trapezoid(t_px.end - t_px.start, t_px.left_ramp, t_px.right_ramp);
                     let mh = trapezoid(h_px.end - h_px.start, h_px.left_ramp, h_px.right_ramp);
                     let mw = trapezoid(w_px.end - w_px.start, w_px.left_ramp, w_px.right_ramp);
-                    let mask = multiply(
-                        &multiply(
-                            Array::from_slice(&mt, &[1, 1, mt.len() as i32, 1, 1]),
-                            Array::from_slice(&mh, &[1, 1, 1, mh.len() as i32, 1]),
-                        )?,
-                        Array::from_slice(&mw, &[1, 1, 1, 1, mw.len() as i32]),
-                    )?;
-                    let weighted = multiply(&tile, &mask)?;
+                    let mask = profile(&mt, 2, &self.device)?
+                        .broadcast_mul(&profile(&mh, 3, &self.device)?)?
+                        .broadcast_mul(&profile(&mw, 4, &self.device)?)?;
+                    let weighted = tile.broadcast_mul(&mask)?;
 
-                    let placed = mlx_rs::ops::pad(
-                        &weighted,
-                        &[
-                            (0, 0),
-                            (0, 0),
-                            (t_px.start, canvas[0] - t_px.end),
-                            (h_px.start, canvas[1] - h_px.end),
-                            (w_px.start, canvas[2] - w_px.end),
-                        ][..],
-                        Array::from_f32(0.0),
-                        None,
-                    )?;
+                    let placed = weighted
+                        .pad_with_zeros(2, t_px.start, canvas[0] - t_px.end)?
+                        .pad_with_zeros(3, h_px.start, canvas[1] - h_px.end)?
+                        .pad_with_zeros(4, w_px.start, canvas[2] - w_px.end)?;
                     accumulator = Some(match accumulator {
                         None => placed,
-                        Some(acc) => add(&acc, &placed)?,
+                        Some(acc) => (acc + placed)?,
                     });
-                    if let Some(acc) = accumulator.as_ref() {
-                        acc.eval()?;
-                    }
 
                     for (axis, (interval, mask_1d)) in [(*t_px, &mt), (*h_px, &mh), (*w_px, &mw)]
                         .iter()
@@ -2167,7 +2039,7 @@ impl NaDiffusionDecoder {
                         }
                         weight_seen[axis] = true;
                         for (i, value) in mask_1d.iter().enumerate() {
-                            weights[axis][interval.start as usize + i] += value;
+                            weights[axis][interval.start + i] += value;
                         }
                     }
                 }
@@ -2177,14 +2049,10 @@ impl NaDiffusionDecoder {
         let accumulator = accumulator
             .ok_or_else(|| Error::Msg("ltx diffvae: tiled decode produced no tiles".to_string()))?;
         debug_assert!(weight_seen.iter().all(|&s| s));
-        let weight_3d = multiply(
-            &multiply(
-                Array::from_slice(&weights[0], &[1, 1, canvas[0], 1, 1]),
-                Array::from_slice(&weights[1], &[1, 1, 1, canvas[1], 1]),
-            )?,
-            Array::from_slice(&weights[2], &[1, 1, 1, 1, canvas[2]]),
-        )?;
-        let blended = divide(&accumulator, &weight_3d)?;
+        let weight_3d = profile(&weights[0], 2, &self.device)?
+            .broadcast_mul(&profile(&weights[1], 3, &self.device)?)?
+            .broadcast_mul(&profile(&weights[2], 4, &self.device)?)?;
+        let blended = accumulator.broadcast_div(&weight_3d)?;
 
         let scale = self.cfg.pixel_scale();
         let out = self.crop_to_content(
@@ -2195,32 +2063,35 @@ impl NaDiffusionDecoder {
             h_pad,
             w_pad,
         )?;
-        contiguous(&out)
+        out.contiguous()
     }
 
-    /// [`Self::decode`] / [`Self::decode_tiled`] with the stage-5 noise drawn from `seed`.
+    /// [`Self::decode`] / [`Self::decode_tiled`] with the stage-5 noise drawn from `seed` on CPU
+    /// (`candle_gen::seed`'s `StdRng` + `StandardNormal`, the crate's own reproducible draw) and
+    /// moved to the weights' device.
     pub fn decode_seeded(
         &self,
-        latent: &Array,
+        latent: &Tensor,
         seed: u64,
         tiling: Option<&DiffVaeTiling>,
-    ) -> Result<Array> {
+    ) -> Result<Tensor> {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
         self.check_latent(latent)?;
-        let sh = latent.shape().to_vec();
+        let sh = latent.dims().to_vec();
         let shape5 = self.cfg.noise_shape(sh[2], sh[3], sh[4]);
-        let key = mlx_rs::random::key(seed)?;
-        let noise = mlx_rs::random::normal::<f32>(
-            &[
-                sh[0],
-                self.cfg.out_channels,
-                shape5[0],
-                shape5[1],
-                shape5[2],
-            ],
-            None,
-            None,
-            Some(&key),
-        )?;
+        let shape = (
+            sh[0],
+            self.cfg.out_channels,
+            shape5[0],
+            shape5[1],
+            shape5[2],
+        );
+        let n = shape.0 * shape.1 * shape.2 * shape.3 * shape.4;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let values = candle_gen::seed::seeded_normal_vec(&mut rng, n);
+        let noise = Tensor::from_vec(values, shape, &self.device)?;
         match tiling {
             Some(t) => self.decode_tiled(latent, &noise, t),
             None => self.decode(latent, &noise),
@@ -2228,21 +2099,34 @@ impl NaDiffusionDecoder {
     }
 }
 
+/// A 1-D blend profile broadcast along `axis` of a `(B, C, F, H, W)` volume.
+fn profile(values: &[f32], axis: usize, device: &Device) -> Result<Tensor> {
+    let mut shape = [1usize; 5];
+    shape[axis] = values.len();
+    Tensor::from_vec(values.to_vec(), &shape[..], device)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Loader plumbing
 // ---------------------------------------------------------------------------------------------
 
-/// The component name [`crate::convert::convert_vae_components`] writes an `NADiffusionDecoder`
-/// under. Deliberately **not** `vae_decoder`: that name is the conv decoder's, and a directory
-/// where the two were interchangeable is one where a mis-selected file renders garbage.
-pub const DIFFUSION_DECODER_COMPONENT: &str = "vae_diffusion_decoder";
+/// The released file's per-channel latent mean. LTX-2.5 keeps the LTX-2.3 `-of-means` spelling that
+/// [`crate::vae::LtxVideoVae`] already reads; the MLX port renames it during conversion, which is
+/// exactly the conversion this port does not need.
+pub const STAT_MEAN_KEY: &str = "per_channel_statistics.mean-of-means";
 
-/// Keys the converter carries through but the decoder never reads.
+/// The released file's per-channel latent standard deviation. See [`STAT_MEAN_KEY`].
+pub const STAT_STD_KEY: &str = "per_channel_statistics.std-of-means";
+
+/// The `decoder.` sub-tree of a `CausalDiffusionVAE` checkpoint — where [`NaDiffusionDecoder::load`]
+/// must be rooted.
+pub const DECODER_PREFIX: &str = "decoder";
+
+/// Keys the checkpoint carries under `decoder.` that the decoder never reads.
 ///
 /// `type_emb` is a 128-wide vector the checkpoint ships and no reference module consumes — the
-/// upstream loader drops it on a non-strict `load_state_dict`. It is listed here so the unused-key
-/// audit in `tests/ltx_2_5_vae_conformance.rs` distinguishes "known dead weight" from "the port
-/// forgot to load something".
+/// upstream loader drops it on a non-strict `load_state_dict`. It is listed here so a key audit
+/// distinguishes "known dead weight" from "the port forgot to load something".
 pub const UNUSED_DECODER_KEYS: &[&str] = &["type_emb"];
 
 fn push_linear_keys(keys: &mut Vec<String>, prefix: &str) {
@@ -2266,19 +2150,10 @@ fn push_block_keys(keys: &mut Vec<String>, prefix: &str, diffusion: bool) {
     }
 }
 
-/// Every weight key [`NaDiffusionDecoder::from_weights`] reads for `cfg`, for loader audits.
-///
-/// This is the **dense** key set — upstream's checkpoint and the `bf16` tier. A `q4`/`q8` tier
-/// replaces each quantized Linear's `{prefix}.weight` with the `{prefix}.{weight,scales,biases}`
-/// triple, so this list is not the key set of a packed file. The audit for a packed tier is the
-/// loader itself: `from_weights` requires every key it reads, so a tier that dropped or misnamed one
-/// fails to build rather than loading a partial decoder.
+/// Every weight key [`NaDiffusionDecoder::load`] reads for `cfg`, relative to the `decoder.` root
+/// (the two `per_channel_statistics` tensors sit above it and are not included).
 pub fn expected_weight_keys(cfg: &NaDiffusionDecoderConfig) -> Vec<String> {
-    let mut keys = vec![
-        "per_channel_statistics.mean".to_string(),
-        "per_channel_statistics.std".to_string(),
-        "norm_out.weight".to_string(),
-    ];
+    let mut keys = vec!["norm_out.weight".to_string()];
     for prefix in [
         "conv_in",
         "conv_in_x_t",
@@ -2302,26 +2177,14 @@ pub fn expected_weight_keys(cfg: &NaDiffusionDecoderConfig) -> Vec<String> {
     keys
 }
 
-/// Classify a `Weights` map as an `NADiffusionDecoder` — used by the converter and by loaders that
-/// must tell the two 2.5 video decoders apart from the tensors alone.
-pub fn looks_like_diffusion_decoder(w: &Weights) -> bool {
-    keys_look_like_diffusion_decoder(w.keys())
-}
-
-/// [`looks_like_diffusion_decoder`] over bare keys, for the converters that classify a tensor map
-/// they have not wrapped in a [`Weights`] yet (`crate::tiers`, `crate::convert`).
-///
-/// One predicate, two callers: a converter deciding whether to emit the component and a loader
-/// deciding whether to read it must never disagree about what a diffusion decoder is — the
-/// disagreement ships as a tier whose `embedded_config.json` declares a `diffusion_vae` section with
-/// no decoder file beside it.
-///
-/// "Not empty" is deliberately not the test: `sanitize_vae_decoder_component` also sweeps in the two
-/// `per_channel_statistics` tensors, so a file with no decoder at all still yields a non-empty map.
-pub fn keys_look_like_diffusion_decoder<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+/// Classify a key set as an `NADiffusionDecoder` — used by loaders that must tell the two LTX-2.5
+/// video decoders apart from the tensors alone. Keys are as they appear in the file, so the
+/// `decoder.` prefix is optional.
+pub fn looks_like_diffusion_decoder<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
     let mut det = false;
     let mut diff = false;
     for key in keys {
+        let key = key.strip_prefix("decoder.").unwrap_or(key);
         det |= key.starts_with("det_stages.");
         diff |= key.starts_with("diff_blocks.");
     }

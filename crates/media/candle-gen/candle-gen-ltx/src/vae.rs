@@ -124,7 +124,7 @@ const DECODER_BLOCKS: [DBlock; 9] = [
 ];
 
 /// `(B, C·p², F, H, W) -> (B, C, F, H·p, W·p)` (spatial-only unpatchify, patch_size_t = 1).
-fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c_packed, f, h, w) = x.dims5()?;
     let c = c_packed / (p * p);
     // (B, C, 1, p, p, F, H, W) -> transpose (0,1,5,2,6,4,7,3) -> (B, C, F, H·p, W·p).
@@ -134,7 +134,7 @@ fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
 }
 
 /// Spatial-only patchify (`patch_size_t = 1`) used at the encoder input.
-fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c, f, h, w) = x.dims5()?;
     if h % p != 0 || w % p != 0 {
         return Err(candle_gen::candle_core::Error::Msg(format!(
