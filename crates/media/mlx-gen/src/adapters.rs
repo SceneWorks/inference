@@ -1314,7 +1314,9 @@ mod tests {
                 crate::Error::Unsupported(reason) => {
                     panic!("{kind:?}: unexpected artifact-seal reason: {reason}")
                 }
-                other => panic!("{kind:?}: expected a typed artifact-seal rejection, got: {other:?}"),
+                other => {
+                    panic!("{kind:?}: expected a typed artifact-seal rejection, got: {other:?}")
+                }
             }
         }
     }
