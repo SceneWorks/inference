@@ -58,7 +58,13 @@ fn linked_and_managed_copies_share_plan_and_fixed_seed_output() {
         .tempdir_in(managed.parent().expect("checkpoint has a parent dir"))
         .expect("temp dir beside the managed copy");
     let linked = link_dir.path().join("krea2_turbo_nvfp4.safetensors");
-    std::fs::hard_link(&managed, &linked).expect("hard link on the same volume");
+    // Resolve the managed copy first: an HF-cache snapshot entry is a *symlink* whose relative
+    // target points into `blobs/`, and Windows `hard_link` links the reparse point itself — at
+    // the temp dir's depth the relative target dangles (os error 3). Linking the resolved file
+    // links the actual bytes, which is what a user's ComfyUI link amounts to.
+    let managed_real =
+        std::fs::canonicalize(&managed).expect("resolve the managed copy to its real file");
+    std::fs::hard_link(&managed_real, &linked).expect("hard link on the same volume");
 
     // Same semantic plan: the compiled logical-weight plan is a pure function of the bytes, so the
     // two source locations must compile the identical plan (codec rows, companions, residency).
