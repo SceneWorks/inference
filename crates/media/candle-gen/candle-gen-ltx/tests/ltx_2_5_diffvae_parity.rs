@@ -494,6 +494,12 @@ fn the_full_decode_matches_the_reference() {
         .decode(&(latent * -1.0).expect("negate"), &noise)
         .expect("negated decode");
     let moved = abs_err(&other, want);
+    // Reported, like the diffusion block's zeroed-context control, so a run's evidence carries the
+    // separation it achieved rather than only the fact that it cleared the bar.
+    eprintln!(
+        "[decode] latent negated -> max|delta| = {moved:.3e} ({:.0}x)",
+        moved / err
+    );
     assert!(
         moved > 50.0 * err,
         "negating the latent barely moved the picture ({moved:.3e} vs {err:.3e})"
