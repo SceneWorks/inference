@@ -106,6 +106,9 @@ fn structural_fields_are_required_not_defaulted() {
         "stage_kernels",
         "upsamples",
         "stage5_kernel",
+        // Not shape, but sampler: defaulting this to 1.0 against the released 1000.0 embeds every
+        // timestep at the wrong frequency and decodes silently wrongly (sc-18767).
+        "timestep_scale_multiplier",
     ] {
         let mut v: serde_json::Value = serde_json::from_str(RELEASED_VAE).unwrap();
         v["decoder"].as_object_mut().unwrap().remove(key);
@@ -117,6 +120,18 @@ fn structural_fields_are_required_not_defaulted() {
             "refusal for {key} must name it, got: {err}"
         );
     }
+
+    // `model_output_type` sits on the `vae` block rather than on `decoder`. Defaulting it to `v`
+    // against the released `x0` checkpoint changes what the stage-5 blocks are taken to predict.
+    let mut v: serde_json::Value = serde_json::from_str(RELEASED_VAE).unwrap();
+    v.as_object_mut().unwrap().remove("model_output_type");
+    let err = NaDiffusionDecoderConfig::from_embedded_vae(&v)
+        .expect_err("dropping model_output_type must be an error")
+        .to_string();
+    assert!(
+        err.contains("model_output_type"),
+        "refusal must name it, got: {err}"
+    );
 }
 
 #[test]

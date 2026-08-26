@@ -93,6 +93,9 @@ fn an_architecture_field_is_never_defaulted() {
         "stage_kernels",
         "upsamples",
         "stage5_kernel",
+        // Not shape, but sampler: defaulting this to 1.0 against the released 1000.0 embeds every
+        // timestep at the wrong frequency and decodes silently wrongly.
+        "timestep_scale_multiplier",
     ] {
         let mut v = released_vae_json();
         v["decoder"]
@@ -104,6 +107,17 @@ fn an_architecture_field_is_never_defaulted() {
             .to_string();
         assert!(err.contains(key), "{key}: {err}");
     }
+
+    // `model_output_type` sits on the `vae` block rather than on `decoder`. Defaulting it to `v`
+    // against the released `x0` checkpoint changes what the stage-5 blocks are taken to predict.
+    let mut v = released_vae_json();
+    v.as_object_mut()
+        .expect("vae object")
+        .remove("model_output_type");
+    let err = NaDiffusionDecoderConfig::from_embedded_vae(&v)
+        .expect_err("a missing model_output_type must be an error, never a default")
+        .to_string();
+    assert!(err.contains("model_output_type"), "{err}");
 }
 
 #[test]
@@ -289,11 +303,64 @@ fn na3d_is_tiling_invariant() {
     let q = probe(&shape, 4);
     let k = probe(&shape, 5);
     let v = probe(&shape, 6);
-    let tiles = pick_tiles([t, h, w], [3, 3, 3]);
+    let tiles = pick_tiles([t, h, w], [3, 3, 3], NA_TILE_BUDGET);
     assert_eq!(tiles, [t, h, w], "this geometry fits one tile");
     let got = na3d(&q, &k, &v, [3, 3, 3]).unwrap();
     let want = na3d_reference(&q, &k, &v, [3, 3, 3]);
     assert!(max_abs_diff(&got, &want) < 2e-6);
+}
+
+#[test]
+fn the_query_tiled_head_chunked_schedule_computes_the_same_operator() {
+    // Production geometry always splits: a released stage-5 tile is far past `NA_TILE_BUDGET`, and
+    // its score matrix is far past `NA_SCORE_BUDGET`. Nothing at a size a CPU test can brute-force
+    // reaches either budget, so the split schedule is forced here instead — the *only* committed
+    // test that runs it, and the schedule is the one documented candle-vs-MLX divergence.
+    const SMALL_TILE: usize = 1 << 10;
+    const SMALL_SCORE: usize = 1;
+
+    let (t, h, w, nh, hd) = (4usize, 5, 5, 2, 8);
+    let kernel = [3usize, 3, 3];
+    let shape = [1usize, t, h, w, nh, hd];
+    let q = probe(&shape, 4);
+    let k = probe(&shape, 5);
+    let v = probe(&shape, 6);
+
+    // Precondition 1: the query axis really tiles.
+    let tiles = pick_tiles([t, h, w], kernel, SMALL_TILE);
+    assert_ne!(
+        tiles,
+        [t, h, w],
+        "the forced budget must actually split the query grid"
+    );
+
+    // Precondition 2: the head axis really chunks. `head_chunk` is `score_budget / per_head`
+    // clamped into `[1, heads]`, so at `SMALL_SCORE = 1` it is 1 for *every* per-head score count
+    // — one head per matmul, and `1 < b * nh = 2` chunks of them.
+    let heads = shape[0] * nh;
+    assert!(heads > 1, "the head axis needs >= 2 rows to chunk");
+    for per_head in [1usize, 27, 1 << 20] {
+        assert_eq!(
+            head_chunk(per_head, SMALL_SCORE, heads),
+            1,
+            "per_head {per_head}: the forced score budget must chunk one head at a time"
+        );
+    }
+
+    let split = na3d_with_budgets(&q, &k, &v, kernel, SMALL_TILE, SMALL_SCORE).expect("split na3d");
+    let whole = na3d(&q, &k, &v, kernel).expect("unsplit na3d");
+    let want = na3d_reference(&q, &k, &v, kernel);
+
+    let err_ref = max_abs_diff(&split, &want);
+    assert!(
+        err_ref < 2e-6,
+        "the split schedule disagrees with the brute-force reference: max|delta| = {err_ref:.3e}"
+    );
+    let err_whole = max_abs_diff(&split, &whole);
+    assert!(
+        err_whole < 2e-6,
+        "the split schedule disagrees with the unsplit one: max|delta| = {err_whole:.3e}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -901,7 +968,7 @@ fn a_diffusion_checkpoints_keys_are_never_mistaken_for_a_conv_decoders() {
 }
 
 #[test]
-fn the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step() {
+fn the_schedule_is_torch_linspace_from_one_down_to_one_over_n() {
     let mut cfg = tiny_config();
     assert_eq!(cfg.model_output_type, ModelOutputType::X0);
     let decoder = tiny_decoder(&cfg);
@@ -914,5 +981,127 @@ fn the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step() {
     let ts = decoder.timesteps();
     assert_eq!(ts.len(), 3);
     assert!((ts[0] - 1.0).abs() < 1e-9);
+    assert!((ts[1] - 2.0 / 3.0).abs() < 1e-6, "{ts:?}");
     assert!((ts[2] - 1.0 / 3.0).abs() < 1e-6, "{ts:?}");
+}
+
+#[test]
+fn the_euler_update_is_the_literal_arithmetic_of_each_objective() {
+    // Closed form on literal tensors, at `t_now != 1` and `t_next != 0` so the two arms are
+    // distinguishable and neither `(t_now - t_next)` nor the `/ t_now` divide degenerates:
+    //   Velocity: x_t - v * (t_now - t_next)
+    //   X0:       x_t - ((x_t - out) / t_now) * (t_now - t_next)
+    const X: f32 = 2.0;
+    const OUT: f32 = 0.5;
+    const T_NOW: f64 = 0.6;
+    const T_NEXT: f64 = 0.25;
+
+    let x_t = Tensor::full(X, (1usize, 2, 2), &Device::Cpu).expect("x_t");
+    let model_out = Tensor::full(OUT, (1usize, 2, 2), &Device::Cpu).expect("model_out");
+    let host = |t: &Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+
+    let mut cfg = tiny_config();
+    cfg.model_output_type = ModelOutputType::Velocity;
+    let v_dec = tiny_decoder(&cfg);
+    let want_v = X - OUT * (T_NOW - T_NEXT) as f32;
+    for got in host(
+        &v_dec
+            .euler_step(&x_t, &model_out, T_NOW, T_NEXT)
+            .expect("v step"),
+    ) {
+        assert!((got - want_v).abs() < 1e-6, "v: got {got}, want {want_v}");
+    }
+
+    cfg.model_output_type = ModelOutputType::X0;
+    let x0_dec = tiny_decoder(&cfg);
+    let want_x0 = X - ((X - OUT) / T_NOW as f32) * (T_NOW - T_NEXT) as f32;
+    for got in host(
+        &x0_dec
+            .euler_step(&x_t, &model_out, T_NOW, T_NEXT)
+            .expect("x0 step"),
+    ) {
+        assert!(
+            (got - want_x0).abs() < 1e-6,
+            "x0: got {got}, want {want_x0}"
+        );
+    }
+    assert!(
+        (want_v - want_x0).abs() > 0.5,
+        "the two objectives must land somewhere different for this test to ask its question"
+    );
+}
+
+#[test]
+fn the_x0_schedule_returns_the_prediction_and_v_takes_a_final_euler_step() {
+    // At `t_next = 0` the X0 Euler step collapses to `out` itself, so the terminal `match` is only
+    // observable through the Velocity arm: `x_T - out * t_last`. With `N = 1` (`t_last = 1`) the
+    // two decoders share every weight and every intermediate, so the X0 decode *is* `crop(out)`
+    // and the Velocity decode must be `crop(noise) - crop(out)` exactly. Swapping the arms makes
+    // the Velocity decode `crop(out)`; flipping the step's sign makes it `crop(noise) + crop(out)`.
+    let mut cfg = tiny_config();
+    assert_eq!(cfg.model_output_type, ModelOutputType::X0);
+    assert_eq!(cfg.default_num_inference_steps, 1);
+
+    let (lt, lh, lw) = (3usize, 4, 4);
+    let latent = probe(&[1, cfg.in_channels, lt, lh, lw], 51);
+    let shape5 = cfg.noise_shape(lt, lh, lw);
+    let noise = probe(&[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]], 52);
+
+    let x0_dec = tiny_decoder(&cfg);
+    let x0_pixels = x0_dec.decode(&latent, &noise).expect("x0 decode");
+
+    cfg.model_output_type = ModelOutputType::Velocity;
+    let v_dec = tiny_decoder(&cfg);
+    let v_pixels = v_dec.decode(&latent, &noise).expect("v decode");
+
+    // The same crop the decode applies, so the comparison is in the returned geometry.
+    let scale = cfg.pixel_scale();
+    let (_, h_pad, w_pad) = x0_dec.prepare_latent(&latent).expect("prepare");
+    let cropped_noise = x0_dec
+        .crop_to_content(
+            &noise,
+            (lt - 1) * scale[0] + 1,
+            lh * scale[1],
+            lw * scale[2],
+            h_pad,
+            w_pad,
+        )
+        .expect("crop the noise the same way");
+
+    let want = (&cropped_noise - &x0_pixels).expect("x_T - out");
+    let err = max_abs_diff(&v_pixels, &want);
+    assert!(
+        err < 1e-5,
+        "the velocity decode is not `x_T - out * t_last`: max|delta| = {err:.3e}"
+    );
+    // And the two objectives really do land somewhere different, so the equality above is not
+    // being satisfied by a degenerate `out`.
+    assert!(
+        max_abs_diff(&v_pixels, &x0_pixels) > 1e-3,
+        "the two objectives decoded to the same picture"
+    );
+}
+
+#[test]
+fn a_multi_step_velocity_schedule_takes_every_intermediate_euler_step() {
+    // `N = 2` runs the in-loop Euler update once before the terminal one; `N = 1` runs none. A
+    // decoder that ignored the loop would return the same picture for both.
+    let mut cfg = tiny_config();
+    cfg.model_output_type = ModelOutputType::Velocity;
+    let one_step = tiny_decoder(&cfg);
+    cfg.default_num_inference_steps = 2;
+    let two_step = tiny_decoder(&cfg);
+    assert_eq!(two_step.timesteps().len(), 2);
+
+    let (lt, lh, lw) = (3usize, 4, 4);
+    let latent = probe(&[1, cfg.in_channels, lt, lh, lw], 61);
+    let shape5 = cfg.noise_shape(lt, lh, lw);
+    let noise = probe(&[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]], 62);
+
+    let a = one_step.decode(&latent, &noise).expect("1-step decode");
+    let b = two_step.decode(&latent, &noise).expect("2-step decode");
+    assert!(
+        max_abs_diff(&a, &b) > 1e-3,
+        "the second sampling step changed nothing"
+    );
 }

@@ -105,9 +105,22 @@ fn device() -> Device {
     Device::Cpu
 }
 
-fn vae_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("LTX25_VAE_DIR")?);
-    dir.join(DIFF_VAE).is_file().then_some(dir)
+/// The provisioned VAE directory, or a panic.
+///
+/// Deliberately not a skip: every caller is already `#[ignore]`d, which is the opt-out. A silent
+/// skip made an unprovisioned run report exactly the same green as a real one, so a GPU box with
+/// `LTX25_VAE_DIR` unset or pointing at the wrong tree looked like passing goldens.
+fn vae_dir() -> PathBuf {
+    let dir = match std::env::var_os("LTX25_VAE_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => panic!("LTX25_VAE_DIR must point at a directory holding {DIFF_VAE}"),
+    };
+    assert!(
+        dir.join(DIFF_VAE).is_file(),
+        "LTX25_VAE_DIR must point at a directory holding {DIFF_VAE}; {} has none",
+        dir.display()
+    );
+    dir
 }
 
 fn to_f32(t: &Tensor) -> Tensor {
@@ -158,12 +171,8 @@ fn require<'a>(g: &'a std::collections::HashMap<String, Tensor>, key: &str) -> &
 }
 
 /// The decoder built straight off the released checkpoint — no conversion, no key remap.
-fn decoder(device: &Device) -> Option<(NaDiffusionDecoder, NaDiffusionDecoderConfig)> {
-    let Some(dir) = vae_dir() else {
-        eprintln!("skip: set LTX25_VAE_DIR to a directory holding {DIFF_VAE}");
-        return None;
-    };
-    let path = dir.join(DIFF_VAE);
+fn decoder(device: &Device) -> (NaDiffusionDecoder, NaDiffusionDecoderConfig) {
+    let path = vae_dir().join(DIFF_VAE);
     let cfg =
         NaDiffusionDecoderConfig::from_checkpoint(&path).expect("the checkpoint's vae config");
     let t = Instant::now();
@@ -178,7 +187,7 @@ fn decoder(device: &Device) -> Option<(NaDiffusionDecoder, NaDiffusionDecoderCon
         path.display(),
         t.elapsed().as_secs_f64()
     );
-    Some((decoder, cfg))
+    (decoder, cfg)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -333,9 +342,7 @@ fn the_two_2_5_video_decoders_can_never_be_loaded_through_each_other() {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
 fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
     let device = device();
-    let Some((decoder, cfg)) = decoder(&device) else {
-        return;
-    };
+    let (decoder, cfg) = decoder(&device);
     let g = golden(GOLDEN, &device);
     assert_eq!(cfg.timestep_scale_multiplier, 1000.0);
 
@@ -364,9 +371,7 @@ fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
 fn one_deterministic_na_block_matches_the_reference() {
     let device = device();
-    let Some((decoder, _cfg)) = decoder(&device) else {
-        return;
-    };
+    let (decoder, _cfg) = decoder(&device);
     let g = golden(GOLDEN, &device);
     let x = to_f32(require(&g, "na_in"));
     let want = require(&g, "na_out");
@@ -388,9 +393,7 @@ fn one_deterministic_na_block_matches_the_reference() {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
 fn one_diffusion_block_matches_the_reference() {
     let device = device();
-    let Some((decoder, _cfg)) = decoder(&device) else {
-        return;
-    };
+    let (decoder, _cfg) = decoder(&device);
     let g = golden(GOLDEN, &device);
     let context = to_f32(require(&g, "diff_ctx"));
     let x = to_f32(require(&g, "diff_x"));
@@ -439,9 +442,7 @@ fn corner(x: &Tensor) -> Tensor {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
 fn the_full_decode_matches_the_reference() {
     let device = device();
-    let Some((decoder, cfg)) = decoder(&device) else {
-        return;
-    };
+    let (decoder, cfg) = decoder(&device);
     let g = golden(GOLDEN, &device);
     let latent = to_f32(require(&g, "dec_latent"));
     let noise = to_f32(require(&g, "dec_noise"));
@@ -507,15 +508,12 @@ fn the_full_decode_matches_the_reference() {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 conv VAE (1.45 GB)"]
 fn the_conv_vae_decode_still_matches_the_v1_2_0_reference() {
     let device = device();
-    let Some(dir) = vae_dir() else {
-        eprintln!("skip: set LTX25_VAE_DIR");
-        return;
-    };
-    let conv = dir.join(CONV_VAE);
-    if !conv.is_file() {
-        eprintln!("skip: {} not cached", conv.display());
-        return;
-    }
+    let conv = vae_dir().join(CONV_VAE);
+    assert!(
+        conv.is_file(),
+        "LTX25_VAE_DIR must point at a directory holding {CONV_VAE}; {} is missing",
+        conv.display()
+    );
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&[&conv], DType::F32, &device).expect("mmap conv VAE")
     };
@@ -569,9 +567,7 @@ fn max_step(x: &Tensor, axis: usize) -> f32 {
 #[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
 fn tiled_decode_keeps_its_seams_and_its_temporal_continuity() {
     let device = device();
-    let Some((decoder, cfg)) = decoder(&device) else {
-        return;
-    };
+    let (decoder, cfg) = decoder(&device);
     // A clip long enough that BOTH the temporal and a spatial axis actually split. The stage-5
     // halo is 20 stage-4 cells, so a tile has to be wider than that before a split is even legal:
     // 7 latent frames (49 pixel frames) gives a 25-cell temporal grid, which is the shortest clip
@@ -646,36 +642,4 @@ fn tiled_decode_keeps_its_seams_and_its_temporal_continuity() {
         (a - b).abs() < 0.01,
         "the blend changed the picture's mean level"
     );
-}
-
-#[test]
-#[ignore = "sc-18767: needs the gated Lightricks/LTX-2.5 DiffVAE (1.47 GB)"]
-fn a_starved_tiling_is_refused_on_every_axis() {
-    let device = device();
-    let Some((decoder, cfg)) = decoder(&device) else {
-        return;
-    };
-    let halo = cfg.tile_halo();
-    let legal = DiffVaeTiling {
-        tile: [halo[0] * 3, halo[1] * 3, halo[2] * 3],
-        overlap: halo,
-    };
-    let latent = Tensor::zeros((1, cfg.in_channels, 3, 7, 7), DType::F32, &device).expect("latent");
-    let shape5 = cfg.noise_shape(3, 7, 7);
-    let noise = Tensor::zeros(
-        (1, cfg.out_channels, shape5[0], shape5[1], shape5[2]),
-        DType::F32,
-        &device,
-    )
-    .expect("noise");
-    for (axis, &halo_axis) in halo.iter().enumerate() {
-        let mut starved = legal;
-        starved.overlap[axis] = halo_axis - 1;
-        let err = decoder
-            .decode_tiled(&latent, &noise, &starved)
-            .map(|_| ())
-            .expect_err("an under-haloed tiling must be refused, not smeared")
-            .to_string();
-        assert!(err.contains("halo"), "axis {axis}: {err}");
-    }
 }

@@ -209,10 +209,14 @@ fn triple(v: &Value, what: &str) -> Result<[usize; 3]> {
 impl NaDiffusionDecoderConfig {
     /// Parse the `vae` block of a checkpoint's `__metadata__["config"]`.
     ///
-    /// Every architecture field is **required**: unlike the conv VAE — where an absent block list
+    /// Every architecture field is **required** — the stage ladder, and also the two fields that
+    /// parameterise the sampler rather than the shape (`vae.model_output_type` and
+    /// `vae.decoder.timestep_scale_multiplier`). Unlike the conv VAE — where an absent block list
     /// means "a 2.3 tree that predates the embedded config", so the 2.3 defaults are the right
     /// answer — there has never been a default `NADiffusionDecoder`, and inventing one would build
-    /// a differently-shaped decoder against real weights.
+    /// a differently-shaped or differently-sampled decoder against real weights: defaulting
+    /// `model_output_type` to `v` against the released `x0` checkpoint, or the scale multiplier to
+    /// `1.0` against the released `1000.0`, decodes silently wrongly rather than failing.
     pub fn from_embedded_vae(v: &Value) -> Result<Self> {
         let dec = v.get("decoder").filter(|d| d.is_object()).ok_or_else(|| {
             Error::Msg("ltx diffvae: config.vae has no `decoder` block".to_string())
@@ -294,14 +298,24 @@ impl NaDiffusionDecoderConfig {
                 .map(|x| x as usize),
             t_emb_dim: get_usize(dec, "t_emb_dim", 384),
             default_num_inference_steps: get_usize(dec, "default_num_inference_steps", 2),
-            timestep_scale_multiplier: dec
-                .get("timestep_scale_multiplier")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0),
+            timestep_scale_multiplier: require("timestep_scale_multiplier")?.as_f64().ok_or_else(
+                || {
+                    Error::Msg(
+                        "ltx diffvae: vae.decoder.timestep_scale_multiplier must be a number"
+                            .to_string(),
+                    )
+                },
+            )?,
             model_output_type: ModelOutputType::parse(
                 v.get("model_output_type")
                     .and_then(Value::as_str)
-                    .unwrap_or("v"),
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "ltx diffvae: config.vae has no `model_output_type` (x0 | v); it \
+                             parameterises the sampler and must never be guessed"
+                                .to_string(),
+                        )
+                    })?,
             )?,
         };
         if let Some(mode) = dec.get("spatial_padding_mode").and_then(Value::as_str) {
@@ -703,9 +717,10 @@ fn window_starts(len: usize, kernel: usize) -> Vec<usize> {
     (0..len).map(|i| i.saturating_sub(half).min(lo)).collect()
 }
 
-/// Query-tile extents keeping one tile's `Nq * Nk` under [`NA_TILE_BUDGET`]. Halves the axis with
-/// the largest tile-to-window ratio, which is the one paying the most for its halo.
-fn pick_tiles(dims: [usize; 3], kernels: [usize; 3]) -> [usize; 3] {
+/// Query-tile extents keeping one tile's `Nq * Nk` under `tile_budget` (production:
+/// [`NA_TILE_BUDGET`]). Halves the axis with the largest tile-to-window ratio, which is the one
+/// paying the most for its halo.
+fn pick_tiles(dims: [usize; 3], kernels: [usize; 3], tile_budget: usize) -> [usize; 3] {
     let mut tiles = dims;
     let cost = |t: [usize; 3]| -> u128 {
         let nq: u128 = t.iter().map(|&x| x as u128).product();
@@ -714,7 +729,7 @@ fn pick_tiles(dims: [usize; 3], kernels: [usize; 3]) -> [usize; 3] {
             .product();
         nq.saturating_mul(nk)
     };
-    while cost(tiles) > NA_TILE_BUDGET as u128 && tiles.iter().any(|&t| t > 1) {
+    while cost(tiles) > tile_budget as u128 && tiles.iter().any(|&t| t > 1) {
         let mut best = 0usize;
         let mut best_ratio = f64::NEG_INFINITY;
         for axis in 0..3 {
@@ -763,6 +778,29 @@ fn axis_mask(
 /// and renormalised — the same rule `mlx_gen_ltx::diff_vae::na3d` implements, which is what makes
 /// the two backends comparable against one set of goldens.
 pub fn na3d(q: &Tensor, k: &Tensor, v: &Tensor, kernel: [usize; 3]) -> Result<Tensor> {
+    na3d_with_budgets(q, k, v, kernel, NA_TILE_BUDGET, NA_SCORE_BUDGET)
+}
+
+/// How many of the `heads` flattened `(batch, head)` rows one score matmul may carry, given that
+/// each row materialises `per_head` scores and the whole chunk must stay under `score_budget`.
+fn head_chunk(per_head: usize, score_budget: usize, heads: usize) -> usize {
+    (score_budget / per_head.max(1)).clamp(1, heads)
+}
+
+/// [`na3d`] with its two schedule budgets supplied rather than read from the consts.
+///
+/// Production always takes [`na3d`]. The budgets are a parameter so a test can force the
+/// query-tiled / head-chunked schedule — the one real geometry takes, and the only place the
+/// candle and MLX ports differ in *how* they compute the same operator — at a size a CPU unit test
+/// can also brute-force.
+fn na3d_with_budgets(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    kernel: [usize; 3],
+    tile_budget: usize,
+    score_budget: usize,
+) -> Result<Tensor> {
     let sh = q.dims().to_vec();
     if sh.len() != 6 {
         return Err(Error::Msg(format!(
@@ -783,7 +821,7 @@ pub fn na3d(q: &Tensor, k: &Tensor, v: &Tensor, kernel: [usize; 3]) -> Result<Te
         kernels[axis] = kernel[axis].min(dims[axis]);
     }
     let starts: Vec<Vec<usize>> = (0..3).map(|a| window_starts(dims[a], kernels[a])).collect();
-    let tiles = pick_tiles(dims, kernels);
+    let tiles = pick_tiles(dims, kernels, tile_budget);
 
     // Key extent covering a query tile: from the first query's window start to the last query's
     // window end.
@@ -847,7 +885,7 @@ pub fn na3d(q: &Tensor, k: &Tensor, v: &Tensor, kernel: [usize; 3]) -> Result<Te
                 // candle materialises the scores, so the head axis is chunked as well as the query
                 // axis — see `NA_SCORE_BUDGET`.
                 let per_head = nq * nk;
-                let chunk = (NA_SCORE_BUDGET / per_head.max(1)).clamp(1, b * nh);
+                let chunk = head_chunk(per_head, score_budget, b * nh);
                 let mut head_parts: Vec<Tensor> = Vec::new();
                 let mut head0 = 0;
                 while head0 < b * nh {

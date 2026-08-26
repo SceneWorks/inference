@@ -206,10 +206,15 @@ impl NaDiffusionDecoderConfig {
     /// Parse the `vae` block of an `embedded_config.json` (or a component checkpoint's
     /// `__metadata__.config.vae`, which is the same shape).
     ///
-    /// Every architecture field is **required**: unlike the conv VAE — where an absent block list
+    /// Every architecture field is **required** — the stage ladder, and also the two fields that
+    /// parameterise the sampler rather than the shape (`vae.model_output_type` and
+    /// `vae.decoder.timestep_scale_multiplier`). Unlike the conv VAE — where an absent block list
     /// means "a 2.3 tree that predates the embedded config", so the 2.3 defaults are the right
     /// answer — there has never been a default `NADiffusionDecoder`, and inventing one would build
-    /// a differently-shaped decoder against real weights.
+    /// a differently-shaped or differently-sampled decoder against real weights: defaulting
+    /// `model_output_type` to `v` against the released `x0` checkpoint, or the scale multiplier to
+    /// `1.0` against the released `1000.0`, decodes silently wrongly rather than failing. Mirrors
+    /// `candle_gen_ltx::diff_vae::NaDiffusionDecoderConfig::from_embedded_vae` (sc-18767).
     pub fn from_embedded_vae(v: &Value) -> Result<Self> {
         let dec = v.get("decoder").filter(|d| d.is_object()).ok_or_else(|| {
             Error::Msg("ltx diffvae: config.vae has no `decoder` block".to_string())
@@ -286,14 +291,24 @@ impl NaDiffusionDecoderConfig {
                 .map(|x| x as i32),
             t_emb_dim: get_i32(dec, "t_emb_dim", 384),
             default_num_inference_steps: get_i32(dec, "default_num_inference_steps", 2),
-            timestep_scale_multiplier: dec
-                .get("timestep_scale_multiplier")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32,
+            timestep_scale_multiplier: require("timestep_scale_multiplier")?.as_f64().ok_or_else(
+                || {
+                    Error::Msg(
+                        "ltx diffvae: vae.decoder.timestep_scale_multiplier must be a number"
+                            .to_string(),
+                    )
+                },
+            )? as f32,
             model_output_type: ModelOutputType::parse(
                 v.get("model_output_type")
                     .and_then(Value::as_str)
-                    .unwrap_or("v"),
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "ltx diffvae: config.vae has no `model_output_type` (x0 | v); it \
+                             parameterises the sampler and must never be guessed"
+                                .to_string(),
+                        )
+                    })?,
             )?,
         };
         if let Some(mode) = dec.get("spatial_padding_mode").and_then(Value::as_str) {
