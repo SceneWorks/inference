@@ -2007,6 +2007,17 @@ mod tests {
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
 
+    fn assert_artifact_seal_mismatch(error: crate::Error) {
+        match error {
+            crate::Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            crate::Error::Unsupported(reason) => {
+                panic!("expected the shared artifact-seal rejection, got: {reason}")
+            }
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn load_shape_declaration_result_defaults_clones_hashes_and_validates() {
         let spec = LoadSpec::new(WeightsSource::Dir("snapshot".into()));
@@ -2129,12 +2140,8 @@ mod tests {
             .expect("advance replacement stamp");
         let error = seal
             .verify_unchanged()
-            .expect_err("same-size replacement must fail closed")
-            .to_string();
-        assert!(
-            error.contains("artifact seal mismatch after load"),
-            "all backends must receive the shared seal grammar: {error}"
-        );
+            .expect_err("same-size replacement must fail closed");
+        assert_artifact_seal_mismatch(error);
         assert_eq!(
             seal.full_hash_work_count(),
             after_acquisition + 1,
@@ -2190,10 +2197,8 @@ mod tests {
             .expect("writer thread")
             .expect("replace the pinned source mid-read");
 
-        let error = outcome
-            .expect_err("a replacement between the two checks must fail")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+        let error = outcome.expect_err("a replacement between the two checks must fail");
+        assert_artifact_seal_mismatch(error);
     }
 
     #[cfg(unix)]
@@ -2472,9 +2477,8 @@ mod tests {
 
         let error = prepared
             .read_file_unchanged_if_prepared(&file, |_| Ok::<_, crate::Error>(()))
-            .expect_err("a prepared read must validate the caller-installed token")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("a prepared read must validate the caller-installed token");
+        assert_artifact_seal_mismatch(error);
     }
 
     #[test]
@@ -2718,9 +2722,8 @@ mod tests {
         );
         let error = spec
             .weights_file_pin()
-            .expect_err("the provider must reject the stale cache-key token")
-            .to_string();
-        assert!(error.contains("entry changed"), "got: {error}");
+            .expect_err("the provider must reject the stale cache-key token");
+        assert_artifact_seal_mismatch(error);
         assert_eq!(
             key_pin.loader_path(),
             selected.as_path(),
@@ -2819,12 +2822,8 @@ mod tests {
             );
             let error = spec
                 .file_pin_for(&selected)
-                .expect_err("provider must consume the stale prepared token")
-                .to_string();
-            assert!(
-                error.contains("entry changed"),
-                "{role} should fail on the prepared A token, got: {error}"
-            );
+                .expect_err("provider must consume the stale prepared token");
+            assert_artifact_seal_mismatch(error);
         }
     }
 

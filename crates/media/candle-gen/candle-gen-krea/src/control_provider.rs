@@ -750,11 +750,14 @@ mod tests {
         let progress_called = std::cell::Cell::new(false);
         let error = model
             .generate(&request, &control_image, &mut |_| progress_called.set(true))
-            .expect_err("mutated control must fail before the first deferred materializer")
-            .to_string();
+            .expect_err("mutated control must fail before the first deferred materializer");
         assert!(
-            error.contains("receipt changed") || error.contains("pinned weights"),
-            "unexpected mutation error: {error}"
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "the Candle bridge must preserve the shared artifact-seal rejection: {error:?}"
         );
         assert!(!progress_called.get(), "materialization emitted progress");
         assert!(
