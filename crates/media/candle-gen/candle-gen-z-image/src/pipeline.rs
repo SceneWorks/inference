@@ -123,7 +123,53 @@ pub(crate) enum DiT {
     Packed(Box<PackedDit>),
 }
 
+/// Per-request geometry conditioning. Dense stock models retain their compatibility path; every
+/// vendored packed DiT receives the explicit handle that removes repeated RoPE construction.
+pub(crate) enum PreparedDiT {
+    Dense,
+    Packed(crate::packed_dit::PreparedConditioning),
+}
+
 impl DiT {
+    pub(crate) fn prepare_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<PreparedDiT> {
+        match self {
+            Self::Dense(_) => Ok(PreparedDiT::Dense),
+            Self::Packed(m) => Ok(PreparedDiT::Packed(m.prepare_conditioning(
+                x,
+                cap_feats,
+                cap_mask,
+                attention_plan,
+            )?)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        prepared: &PreparedDiT,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
+        match (self, prepared) {
+            (Self::Dense(m), PreparedDiT::Dense) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
+            (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
+                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)
+            }
+            _ => Err(candle_gen::CandleError::Msg(
+                "z-image: prepared conditioning belongs to another DiT variant".into(),
+            )),
+        }
+    }
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -156,6 +202,7 @@ impl DiT {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn forward_with_memory(
         &self,
         x: &Tensor,
@@ -1342,6 +1389,12 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
+            let dit_prepared = transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter.
             let preview = crate::preview::hook(&req.preview);
@@ -1357,11 +1410,12 @@ impl Pipeline {
                 |latents, t| -> Result<Tensor> {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     Ok(transformer
-                        .forward_with_memory(
+                        .forward_prepared_with_memory(
                             latents,
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
+                            &dit_prepared,
                             request_attention_plan(req, attention_budget),
                             transformer_window,
                         )?
@@ -1427,6 +1481,21 @@ impl Pipeline {
                 }
                 None => None,
             };
+            let dit_prepared = transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
+            let uncond_prepared = match uncond.as_ref() {
+                Some((neg_feats, neg_mask)) => Some(transformer.prepare_conditioning(
+                    &prepared.latents,
+                    neg_feats,
+                    neg_mask,
+                    request_attention_plan(req, attention_budget),
+                )?),
+                None => None,
+            };
 
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
@@ -1445,23 +1514,25 @@ impl Pipeline {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     let plan = request_attention_plan(req, attention_budget);
                     let v_cond = transformer
-                        .forward_with_memory(
+                        .forward_prepared_with_memory(
                             latents,
                             &t_tensor,
                             &cap_feats,
                             &cap_mask,
+                            &dit_prepared,
                             plan,
                             transformer_window,
                         )?
                         .neg()?;
-                    match uncond.as_ref() {
-                        Some((neg_feats, neg_mask)) => {
+                    match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
                             let v_uncond = transformer
-                                .forward_with_memory(
+                                .forward_prepared_with_memory(
                                     latents,
                                     &t_tensor,
                                     neg_feats,
                                     neg_mask,
+                                    neg_prepared,
                                     plan,
                                     transformer_window,
                                 )?
@@ -1469,7 +1540,10 @@ impl Pipeline {
                             let delta = (&v_cond - &v_uncond)?;
                             Ok((v_uncond + (delta * guidance as f64)?)?)
                         }
-                        None => Ok(v_cond),
+                        (None, None) => Ok(v_cond),
+                        _ => Err(CandleError::Msg(
+                            "z-image: CFG conditioning preparation mismatch".into(),
+                        )),
                     }
                 },
             )
