@@ -881,14 +881,40 @@ impl CausalLm {
     /// of them into its feature extractor; only a language-model head wants logits).
     ///
     /// See [`CausalLm::hidden_states_from_embeds`] for the returned layout.
+    ///
+    /// Masks purely causally. A caller whose batch is **padded** must use
+    /// [`CausalLm::hidden_states_with_mask`] instead — see its docs for why causal-only masking is
+    /// silently wrong there.
     pub fn hidden_states(
         &self,
         input_ids: &Array,
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> Result<Vec<Array>> {
+        self.hidden_states_with_mask(input_ids, cache, offset, AttnMask::Causal)
+    }
+
+    /// [`CausalLm::hidden_states`] under an explicit attention `mask`.
+    ///
+    /// The reason this exists: a *text encoder* runs a **padded** sequence, and
+    /// [`AttnMask::Causal`] alone does not mask padding. Under causal-only masking every valid
+    /// token attends the pad run, so every returned hidden state — and every feature built from
+    /// them — is wrong, while staying finite, non-zero and correctly shaped. Pass
+    /// [`AttnMask::Additive`] carrying `valid(i, j) = j <= i && mask01[j] != 0` (LTX's
+    /// `causal_padding_mask`) to mask both at once; a `sliding_attention` layer still narrows it to
+    /// its own window on top (see `LlamaLayer::windowed`).
+    ///
+    /// The mask must be in the model's [`CausalLm::compute_dtype`] — MLX's fused kernel requires
+    /// the mask type to promote to the output type, and f32 does not promote to bf16.
+    pub fn hidden_states_with_mask(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Array>> {
         let embeds = self.embed(input_ids)?;
-        self.hidden_states_from_embeds(&embeds, cache, offset)
+        self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
     }
 
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
@@ -917,22 +943,32 @@ impl CausalLm {
     /// command buffer per layer and runs cleanly (52.8 s, 24.9 GB peak for that same forward). A
     /// consumer that streams the states — which is what a feature extractor does anyway — gets this
     /// for free; one that grabs `states.last()` does not.
+    ///
+    /// Masks purely causally; see [`CausalLm::hidden_states_from_embeds_with_mask`] for the padded
+    /// (text-encoder) case.
     pub fn hidden_states_from_embeds(
         &self,
         input_embeds: &Array,
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> Result<Vec<Array>> {
+        self.hidden_states_from_embeds_with_mask(input_embeds, cache, offset, AttnMask::Causal)
+    }
+
+    /// [`CausalLm::hidden_states_from_embeds`] under an explicit attention `mask` — the
+    /// pre-computed-embeddings twin of [`CausalLm::hidden_states_with_mask`], whose docs carry the
+    /// padded-sequence rationale and the dtype requirement.
+    pub fn hidden_states_from_embeds_with_mask(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Array>> {
         let s = input_embeds.shape()[1];
         let ropes = self.stack_rope(s, offset)?;
         let mut out = Vec::with_capacity(self.layers.len() + 1);
-        self.run_decoder_stack_collecting(
-            input_embeds,
-            cache,
-            &ropes,
-            AttnMask::Causal,
-            Some(&mut out),
-        )?;
+        self.run_decoder_stack_collecting(input_embeds, cache, &ropes, mask, Some(&mut out))?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
         }

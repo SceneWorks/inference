@@ -67,9 +67,9 @@ fn tier_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(root).join("q8")
 }
 
-/// `(seq, video_dim, audio_dim)` read off the committed reference fixture rather than hard-coded, so
-/// the contract this test enforces is the reference's, not this file's opinion. Also pins [`MAX_LEN`]
-/// to the fixture's own sequence length, so the two cannot drift apart silently.
+/// `(video_dim, audio_dim)` read off the committed reference fixture rather than hard-coded, so the
+/// contract this test enforces is the reference's, not this file's opinion. The sequence length is
+/// not returned but *asserted* against [`MAX_LEN`], so the two cannot drift apart silently.
 fn golden_connector_dims() -> (i32, i32) {
     let g = Weights::from_file(GOLDEN).expect("committed connector golden");
     let features = g.require("features").expect("features");
@@ -82,7 +82,17 @@ fn golden_connector_dims() -> (i32, i32) {
     (features.shape()[2], audio.shape()[2])
 }
 
-fn encoder(dir: &std::path::Path) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
+/// `(checkpoint, te_path, connector weights, config, precision)` — everything both constructors
+/// need, read off the tier once.
+fn tier_inputs(
+    dir: &std::path::Path,
+) -> (
+    LtxCheckpointMetadata,
+    std::path::PathBuf,
+    Weights,
+    LtxConfig,
+    Precision,
+) {
     let te_path = dir.join("text_encoder.safetensors");
     let cfg = LtxConfig::from_model_dir(dir).expect("embedded_config.json");
     let split = SplitModel::from_model_dir(dir).expect("split_model.json");
@@ -90,18 +100,21 @@ fn encoder(dir: &std::path::Path) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
         .expect("transformer metadata");
     let connector_w =
         Weights::from_file(dir.join("connector.safetensors")).expect("connector.safetensors");
-
-    let te = Ltx25TextEncoder::from_packed_av(
-        &checkpoint,
-        &te_path,
-        &connector_w,
-        &cfg,
+    (
+        checkpoint,
+        te_path,
+        connector_w,
+        cfg,
         // bf16 activations at the tier's declared quant geometry — the q8 tier packs both the
         // connector and the aggregate projections, so the quantized arm is the one exercised.
         Precision::quant_bf16(split.bits, split.group),
     )
-    .expect("build the LTX-2.5 text encoder");
+}
 
+fn encoder(dir: &std::path::Path) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
+    let (checkpoint, te_path, connector_w, cfg, prec) = tier_inputs(dir);
+    let te = Ltx25TextEncoder::from_packed_av(&checkpoint, &te_path, &connector_w, &cfg, prec)
+        .expect("build the LTX-2.5 text encoder");
     let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
     (te, tok)
 }
@@ -155,6 +168,41 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
         "ltx_2_5 connector inputs: video {:?} audio {:?}",
         vf.shape(),
         af.shape()
+    );
+}
+
+/// The video-only constructor is reachable and genuinely leaves the audio head absent.
+///
+/// Before the `from_packed_video` split, `audio` was `Some` on every constructed encoder and both
+/// `ok_or_else` arms in `encode_av*` were dead code. This is the test that makes them live: build
+/// video-only, check the video path still works, and check the AV path refuses by name rather than
+/// panicking or silently returning the video features twice.
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 tiers (LTX25_TIER_DIR); one ~14 GB encoder load"]
+fn the_video_only_constructor_omits_the_audio_head() {
+    let dir = tier_dir();
+    let (video_dim, _) = golden_connector_dims();
+    let (checkpoint, te_path, connector_w, cfg, prec) = tier_inputs(&dir);
+    let te = Ltx25TextEncoder::from_packed_video(&checkpoint, &te_path, &connector_w, &cfg, prec)
+        .expect("build the video-only LTX-2.5 text encoder");
+    let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
+
+    let (input_ids, mask) = tok.encode(PROMPT, MAX_LEN).expect("tokenize");
+    let (vf, ve) = te
+        .encode_with_features(&input_ids, &mask)
+        .expect("the video path must work without an audio head");
+    assert_eq!(vf.shape(), &[1, MAX_LEN as i32, video_dim]);
+    assert_eq!(ve.shape(), &[1, MAX_LEN as i32, video_dim]);
+    finite("video_features", &vf);
+    finite("video_embeddings", &ve);
+
+    let err = match te.encode_av_with_features(&input_ids, &mask) {
+        Ok(_) => panic!("the AV path must refuse a video-only encoder"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("from_packed_video"),
+        "the refusal must name the constructor that produced this encoder: {err}"
     );
 }
 

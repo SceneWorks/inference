@@ -22,7 +22,7 @@
 //! [`LtxTextEncoder`](crate::text_encoder::LtxTextEncoder) keep running 2.3 exactly as before;
 //! this module shares their feature-extractor math and head loaders rather than replacing them.
 //!
-//! # Two hazards this module exists to get right
+//! # Three hazards this module exists to get right
 //!
 //! 1. **MLX laziness on the hidden-state stack.** `hidden_states` returns 49 handles onto ONE
 //!    unevaluated graph. Forcing the last one submits every weight page-in and every layer's
@@ -34,6 +34,13 @@
 //! 2. **Cold mmapped weights.** `Weights::from_file` is lazy; the first graph over a cold tier drags
 //!    the whole file into one buffer and trips the watchdog. [`materialize_in_batches`] forces the
 //!    tensors resident in bounded submissions before anything builds a graph over them.
+//! 3. **The padding mask.** The tokenizer *left-pads* to `max_length`, and `CausalLm`'s default
+//!    masking is causal only — no padding component — so every valid token would attend the pad
+//!    run and all 49 hidden states, hence the video and audio features, would be wrong. Wrong but
+//!    finite, non-zero, correctly shaped and still prompt-separated, which is why only a numeric
+//!    oracle or an explicit pad-invariance test catches it. `causal_padding_mask` builds LTX-2.3's
+//!    `valid(i, j) = j <= i && mask01[j] != 0` rule as an additive mask and
+//!    `masked_hidden_states_in_order` threads it through `CausalLm::hidden_states_with_mask`.
 
 use std::path::Path;
 
@@ -50,7 +57,7 @@ use mlx_gen::weights::Weights as GenWeights;
 use mlx_gen::{Error, Result};
 
 use mlx_llm::config::ModelConfig;
-use mlx_llm::primitives::Weights as LlmWeights;
+use mlx_llm::primitives::{AttnMask, Weights as LlmWeights};
 use mlx_llm::CausalLm;
 
 use crate::config::LtxConfig;
@@ -65,6 +72,15 @@ use crate::transformer::Precision;
 /// measurement uses for its loads. Large enough that materialization is not dominated by submission
 /// overhead, small enough that every buffer stays well inside the GPU watchdog's budget.
 const EVAL_BATCH_BYTES: usize = 512 * 1024 * 1024;
+
+/// Additive-mask fill for a blocked `(query, key)` pair.
+///
+/// The same large finite negative `mlx-llm`'s own masks use, deliberately rather than LTX-2.3's
+/// bf16-min fill: a Gemma 4 `sliding_attention` layer **sums** this mask with its window band
+/// (`LlamaLayer::windowed`), and a bf16-min fill plus a band is one rounding step from `inf`. After
+/// the softmax the two are indistinguishable — `exp(-1e30)` is already exactly 0 — so this changes
+/// no number, only the composition headroom.
+const MASK_NEG: f32 = -1e30;
 
 /// Lift an `mlx-llm` engine error into this crate's error type, **preserving the typed variants**.
 ///
@@ -155,29 +171,7 @@ impl Ltx25TextEncoder {
         ltx_cfg: &LtxConfig,
         prec: Precision,
     ) -> Result<Self> {
-        // (1) The caption feature extractor must be the V2 (PER_TOKEN_RMS) one this port implements.
-        // Same genuinely config-driven gate LTX-2.3 runs, reading the loaded checkpoint's config.
-        require_v2(ltx_cfg)?;
-
-        // (2) R4: the encoder must be the one this checkpoint was trained against. A mismatch is a
-        // hard error from `gen_core`, never a warning and never a fallback.
-        assert_gemma_version_for(checkpoint, te_path)?;
-
-        // (3) The Gemma 4 config travels inside the packed encoder's `__metadata__.gemma_config`.
-        // `ModelConfig::from_json` rebinds to `text_config` for Gemma 4 (`nests_text_config`), which
-        // is also where the tier's `quantization` block is stamped — a block written above it would
-        // be invisible and the packed encoder would load as if dense.
-        let identity_config = gemma_config_value(te_path)?;
-        let cfg = ModelConfig::from_json(&identity_config).map_err(from_llm)?;
-
-        // (4) Load through the same seam the shipped tiers were validated on (sc-18775 / PR #820):
-        // `Weights::from_file` + `CausalLm::from_weights`, with a bounded materialization between
-        // them so the cold file never becomes one command buffer.
-        let weights = LlmWeights::from_file(te_path).map_err(from_llm)?;
-        materialize_in_batches(&weights)?;
-        let hidden_size = cfg.hidden_size;
-        let model = CausalLm::from_weights(&weights, "", cfg).map_err(from_llm)?;
-
+        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg)?;
         let video = load_video_head(connector_w, hidden_size, ltx_cfg, prec)?;
         let audio = load_audio_head(connector_w, hidden_size, ltx_cfg, prec)?;
         Ok(Self {
@@ -188,29 +182,46 @@ impl Ltx25TextEncoder {
         })
     }
 
+    /// The **video-only** encoder, mirroring LTX-2.3's [`from_weights`] vs [`from_weights_av`] split
+    /// (`crate::text_encoder::LtxTextEncoder`).
+    ///
+    /// A checkpoint whose transformer carries no `audio_embeddings_connector` / no
+    /// `audio_aggregate_embed` — a video-only 2.5 build — has no audio head to load, and
+    /// [`Self::from_packed_av`] would fail on the missing tensor rather than produce a usable
+    /// encoder. [`Self::encode`] / [`Self::encode_with_features`] work exactly as on the AV
+    /// encoder; [`Self::encode_av`] / [`Self::encode_av_with_features`] name this constructor in
+    /// their error.
+    ///
+    /// [`from_weights`]: crate::text_encoder::LtxTextEncoder::from_weights
+    /// [`from_weights_av`]: crate::text_encoder::LtxTextEncoder::from_weights_av
+    pub fn from_packed_video(
+        checkpoint: &LtxCheckpointMetadata,
+        te_path: &Path,
+        connector_w: &GenWeights,
+        ltx_cfg: &LtxConfig,
+        prec: Precision,
+    ) -> Result<Self> {
+        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg)?;
+        let video = load_video_head(connector_w, hidden_size, ltx_cfg, prec)?;
+        Ok(Self {
+            model,
+            video,
+            audio: None,
+            dtype: prec.dtype(),
+        })
+    }
+
     /// The Gemma 4 backbone, exposed so the LTX-2.5 prompt enhancer (sc-18764) can drive the
     /// **already-loaded** encoder as an autoregressive LM instead of loading a second 26 GB copy.
     pub fn model(&self) -> &CausalLm {
         &self.model
     }
 
-    /// The hidden-state stack, **evaluated in order**.
+    /// The hidden-state stack under the caller's padding mask, **evaluated in order**.
     ///
-    /// See the module docs, hazard 1: the returned handles are one lazy graph, and forcing the tail
-    /// alone submits the whole 48-layer stack as a single Metal command buffer. Walking the slice in
-    /// order splits it into one buffer per layer. A consumer that streams the states — which is what
-    /// a feature extractor does — gets this for free; this method makes it unconditional rather than
-    /// depending on how the caller happens to touch the result.
-    fn hidden_states_in_order(&self, input_ids: &Array) -> Result<Vec<Array>> {
-        let mut cache = self.model.new_cache();
-        let states = self
-            .model
-            .hidden_states(input_ids, &mut cache, 0)
-            .map_err(from_llm)?;
-        for state in &states {
-            eval([state])?;
-        }
-        Ok(states)
+    /// See the module docs, hazard 1 (evaluation order) and hazard 3 (the padding mask).
+    fn hidden_states_in_order(&self, input_ids: &Array, mask01: &Array) -> Result<Vec<Array>> {
+        masked_hidden_states_in_order(&self.model, input_ids, mask01)
     }
 
     /// Encode `(1, L)` token ids + `(1, L)` attention mask → `video_embeddings` `(1, L, 4096)`.
@@ -225,7 +236,7 @@ impl Ltx25TextEncoder {
         input_ids: &Array,
         attention_mask: &Array,
     ) -> Result<(Array, Array)> {
-        let hiddens = self.hidden_states_in_order(input_ids)?;
+        let hiddens = self.hidden_states_in_order(input_ids, attention_mask)?;
         let normed = per_token_rms_normed_hidden(&hiddens, attention_mask, self.dtype)?;
         self.video.forward(&normed, attention_mask)
     }
@@ -245,14 +256,116 @@ impl Ltx25TextEncoder {
         attention_mask: &Array,
     ) -> Result<(Array, Array, Array, Array)> {
         let audio = self.audio.as_ref().ok_or_else(|| {
-            Error::Msg("ltx_2_5: text encoder built without the audio head".into())
+            Error::Msg(
+                "ltx_2_5: text encoder built without the audio head — it was constructed with \
+                 from_packed_video, which is the video-only entry point; use from_bundle_av / \
+                 from_packed_av for the AudioVideo path"
+                    .into(),
+            )
         })?;
-        let hiddens = self.hidden_states_in_order(input_ids)?;
+        let hiddens = self.hidden_states_in_order(input_ids, attention_mask)?;
         let normed = per_token_rms_normed_hidden(&hiddens, attention_mask, self.dtype)?;
         let (vf, ve) = self.video.forward(&normed, attention_mask)?;
         let (af, ae) = audio.forward(&normed, attention_mask)?;
         Ok((vf, af, ve, ae))
     }
+}
+
+/// The gated, materialized Gemma 4 backbone plus its hidden size — everything both constructors do
+/// before they diverge on which feature heads to load.
+///
+/// Kept as one function so neither entry point can skip a gate: a video-only constructor that
+/// forgot [`require_v2`] or [`assert_gemma_version_for`] would be exactly the escape hatch R4
+/// forbids.
+fn load_backbone(
+    checkpoint: &LtxCheckpointMetadata,
+    te_path: &Path,
+    ltx_cfg: &LtxConfig,
+) -> Result<(CausalLm, i32)> {
+    // (1) The caption feature extractor must be the V2 (PER_TOKEN_RMS) one this port implements.
+    // Same genuinely config-driven gate LTX-2.3 runs, reading the loaded checkpoint's config.
+    require_v2(ltx_cfg)?;
+
+    // (2) R4: the encoder must be the one this checkpoint was trained against. A mismatch is a
+    // hard error from `gen_core`, never a warning and never a fallback.
+    assert_gemma_version_for(checkpoint, te_path)?;
+
+    // (3) The Gemma 4 config travels inside the packed encoder's `__metadata__.gemma_config`.
+    // `ModelConfig::from_json` rebinds to `text_config` for Gemma 4 (`nests_text_config`), which
+    // is also where the tier's `quantization` block is stamped — a block written above it would
+    // be invisible and the packed encoder would load as if dense.
+    let identity_config = gemma_config_value(te_path)?;
+    let cfg = ModelConfig::from_json(&identity_config).map_err(from_llm)?;
+
+    // (4) Load through the same seam the shipped tiers were validated on (sc-18775 / PR #820):
+    // `Weights::from_file` + `CausalLm::from_weights`, with a bounded materialization between
+    // them so the cold file never becomes one command buffer.
+    let weights = LlmWeights::from_file(te_path).map_err(from_llm)?;
+    materialize_in_batches(&weights)?;
+    let hidden_size = cfg.hidden_size;
+    let model = CausalLm::from_weights(&weights, "", cfg).map_err(from_llm)?;
+    Ok((model, hidden_size))
+}
+
+/// The additive **causal + left-padding** attention mask `[1, 1, L, L]`, in `dtype`.
+///
+/// `valid(i, j) = j <= i && mask01[j] != 0` keeps (`0`); everything else blocks ([`MASK_NEG`]) —
+/// byte-for-byte the rule LTX-2.3 applies on both backends (`crate::gemma`'s
+/// `causal_padding_mask`, and its candle twin).
+///
+/// See [`masked_hidden_states_in_order`] for why a causal-only mask is not enough.
+fn causal_padding_mask(mask01: &Array, dtype: Dtype) -> Result<Array> {
+    let sh = mask01.shape();
+    if sh.len() != 2 || sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: the attention mask must be (1, L), got {sh:?}"
+        )));
+    }
+    let l = sh[1];
+    let host = mask01.as_dtype(Dtype::Int32)?;
+    eval([&host])?;
+    let m = host.as_slice::<i32>();
+    let mut data = vec![0f32; (l * l) as usize];
+    for i in 0..l as usize {
+        for j in 0..l as usize {
+            let valid = j <= i && m[j] != 0;
+            data[i * l as usize + j] = if valid { 0.0 } else { MASK_NEG };
+        }
+    }
+    Array::from_slice(&data, &[1, 1, l, l])
+        .as_dtype(dtype)
+        .map_err(Error::from)
+}
+
+/// The `model`'s hidden-state stack for `input_ids` under `mask01`, **evaluated in order**.
+///
+/// Two things this gets right that the bare `CausalLm::hidden_states` does not:
+///
+/// 1. **Padding.** The tokenizer left-pads to `max_length`, so a purely causal mask lets every
+///    valid token attend the whole pad run and all 49 hidden states — hence the video and audio
+///    features — come out wrong. They also stay finite, non-zero, correctly shaped and
+///    prompt-separated, so nothing but a numeric oracle or a pad-invariance test notices. This
+///    threads the same additive causal+padding mask LTX-2.3 uses.
+/// 2. **Evaluation order.** The returned handles are one lazy graph; forcing the tail alone
+///    submits all 48 layers as a single Metal command buffer (module docs, hazard 1). Walking the
+///    slice in order splits it into one buffer per layer.
+///
+/// Free-standing rather than a method so the weights-free regression can drive it over a tiny
+/// synthetic [`CausalLm`], with no packed encoder and no feature heads.
+fn masked_hidden_states_in_order(
+    model: &CausalLm,
+    input_ids: &Array,
+    mask01: &Array,
+) -> Result<Vec<Array>> {
+    let mask = causal_padding_mask(mask01, model.compute_dtype())?;
+    let mut cache = model.new_cache();
+    let states = model
+        .hidden_states_with_mask(input_ids, &mut cache, 0, AttnMask::Additive(&mask))
+        .map_err(from_llm)?;
+    for state in &states {
+        eval([state])?;
+    }
+    Ok(states)
 }
 
 /// Read the packed encoder's `__metadata__.gemma_config` as JSON.
@@ -300,10 +413,243 @@ fn assert_gemma_version_for(checkpoint: &LtxCheckpointMetadata, te_path: &Path) 
     }
 }
 
+/// The padding-mask regression (sc-18770 review issue 1), weights-free.
+///
+/// The bug this exists to catch: `CausalLm::hidden_states` masks causally and nothing else, so
+/// under the tokenizer's *left* padding every valid token attends the pad run. The resulting
+/// hidden states — and every feature built from them — are wrong while remaining finite, non-zero,
+/// correctly shaped and prompt-separated, i.e. invisible to every other assertion in this crate.
+#[cfg(test)]
+mod padding_mask_tests {
+    use super::*;
+    use mlx_rs::ops::indexing::TryIndexOp;
+    use std::collections::HashMap;
+
+    const HIDDEN: i32 = 32;
+    const VOCAB: i32 = 48;
+    const HEAD_DIM: i32 = 8;
+    const LAYERS: usize = 3;
+    const HEADS: i32 = 4;
+    const KV_HEADS: i32 = 2;
+    const INTER: i32 = 64;
+
+    fn host(a: &Array) -> Vec<f32> {
+        let f = a.as_dtype(Dtype::Float32).expect("f32");
+        eval([&f]).expect("eval");
+        f.as_slice::<f32>().to_vec()
+    }
+
+    /// A tiny **real** `CausalLm` over synthetic weights — no packed encoder, no download, and the
+    /// same seam `from_packed_av` builds through, so the mask genuinely flows into attention.
+    fn tiny_model() -> CausalLm {
+        let cfg_json = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": LAYERS,
+            "num_attention_heads": HEADS, "num_key_value_heads": KV_HEADS, "head_dim": HEAD_DIM,
+            "vocab_size": VOCAB, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "tie_word_embeddings": true
+        });
+        let cfg = ModelConfig::from_json(&cfg_json).expect("tiny config");
+
+        // Deterministic, dependency-free PRNG: the values only need to be distinct and O(0.1).
+        let mut state = 0x5C1_8770_u64;
+        let mut randn = |shape: &[i32]| -> Array {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.4
+                })
+                .collect();
+            Array::from_slice(&data, shape)
+        };
+
+        let mut m: HashMap<String, Array> = HashMap::new();
+        m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN]));
+        m.insert(
+            "model.norm.weight".into(),
+            Array::ones::<f32>(&[HIDDEN]).expect("norm"),
+        );
+        for i in 0..LAYERS {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            m.insert(
+                p("self_attn.q_proj.weight"),
+                randn(&[HEADS * HEAD_DIM, HIDDEN]),
+            );
+            m.insert(
+                p("self_attn.k_proj.weight"),
+                randn(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+            );
+            m.insert(
+                p("self_attn.v_proj.weight"),
+                randn(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+            );
+            m.insert(
+                p("self_attn.o_proj.weight"),
+                randn(&[HIDDEN, HEADS * HEAD_DIM]),
+            );
+            m.insert(p("mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
+            m.insert(p("mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
+            m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
+            m.insert(
+                p("input_layernorm.weight"),
+                Array::ones::<f32>(&[HIDDEN]).expect("in ln"),
+            );
+            m.insert(
+                p("post_attention_layernorm.weight"),
+                Array::ones::<f32>(&[HIDDEN]).expect("post ln"),
+            );
+        }
+        CausalLm::from_weights(&LlmWeights::from_map(m), "", cfg).expect("tiny CausalLm")
+    }
+
+    fn ids(v: &[i32]) -> Array {
+        Array::from_slice(v, &[1, v.len() as i32])
+    }
+
+    /// The mask rule itself: `valid(i, j) = j <= i && mask01[j] != 0`, everything else blocked.
+    #[test]
+    fn the_mask_blocks_pad_columns_and_the_causal_upper_triangle() {
+        let mask01 = ids(&[0, 0, 1, 1]);
+        let m = causal_padding_mask(&mask01, Dtype::Float32).expect("mask");
+        assert_eq!(m.shape(), &[1, 1, 4, 4]);
+        let v = host(&m);
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let want_open = j <= i && j >= 2;
+                let got = v[i * 4 + j];
+                if want_open {
+                    assert_eq!(got, 0.0, "({i},{j}) must be attendable");
+                } else {
+                    assert!(got < -1e29, "({i},{j}) must be blocked, got {got}");
+                }
+            }
+        }
+        // The two pad *columns* are blocked for EVERY query row, including the pad rows themselves —
+        // this is the component `AttnMask::Causal` does not have, and the whole point of the fix.
+        for i in 0..4usize {
+            assert!(v[i * 4] < -1e29 && v[i * 4 + 1] < -1e29, "pad columns open");
+        }
+    }
+
+    /// **The regression.** Two sequences that differ *only* in their left-pad token ids must
+    /// produce bit-identical hidden states — and therefore bit-identical extractor output — at
+    /// every valid position.
+    ///
+    /// Replace `AttnMask::Additive(&mask)` in [`masked_hidden_states_in_order`] with
+    /// `AttnMask::Causal` and this fails: the valid tokens then attend the pad run, whose keys and
+    /// values differ between the two variants.
+    #[test]
+    fn left_pad_ids_do_not_reach_the_valid_positions() {
+        let model = tiny_model();
+        const PADS: usize = 3;
+        const LEN: usize = 8;
+
+        // Identical valid tail, different pad ids. `mask01` is the same for both.
+        let a = ids(&[0, 0, 0, 3, 9, 14, 2, 7]);
+        let b = ids(&[41, 17, 5, 3, 9, 14, 2, 7]);
+        let mask01 = ids(&[0, 0, 0, 1, 1, 1, 1, 1]);
+
+        let ha = masked_hidden_states_in_order(&model, &a, &mask01).expect("stack a");
+        let hb = masked_hidden_states_in_order(&model, &b, &mask01).expect("stack b");
+        assert_eq!(ha.len(), LAYERS + 1);
+
+        // Sanity: the pad rows themselves DO differ, or the two inputs would be indistinguishable
+        // and the assertion below would hold for a trivial reason.
+        let pad_delta = host(&ha[LAYERS])
+            .iter()
+            .zip(host(&hb[LAYERS]).iter())
+            .take(PADS * HIDDEN as usize)
+            .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(
+            pad_delta > 0.0,
+            "the two inputs must actually differ at the pad positions"
+        );
+
+        for (i, (sa, sb)) in ha.iter().zip(hb.iter()).enumerate() {
+            let va = host(sa);
+            let vb = host(sb);
+            for t in PADS..LEN {
+                let lo = t * HIDDEN as usize;
+                let hi = lo + HIDDEN as usize;
+                assert_eq!(
+                    &va[lo..hi],
+                    &vb[lo..hi],
+                    "hidden state {i}, valid position {t} must not depend on the pad ids — the \
+                     padding component of the attention mask was dropped"
+                );
+            }
+        }
+
+        // ...and the same through the extractor, which is what the feature heads consume.
+        let na = per_token_rms_normed_hidden(&ha, &mask01, Dtype::Float32).expect("normed a");
+        let nb = per_token_rms_normed_hidden(&hb, &mask01, Dtype::Float32).expect("normed b");
+        let width = HIDDEN as usize * (LAYERS + 1);
+        let (va, vb) = (host(&na), host(&nb));
+        for t in PADS..LEN {
+            assert_eq!(
+                &va[t * width..(t + 1) * width],
+                &vb[t * width..(t + 1) * width],
+                "extractor output at valid position {t} must not depend on the pad ids"
+            );
+        }
+    }
+
+    /// The mask is not a no-op dressed up as one: an encoder that attends the pad run produces
+    /// *different* valid-position states from one that does not. Without this, the test above would
+    /// also pass against a model whose attention ignored the mask entirely.
+    #[test]
+    fn attending_the_pad_run_actually_changes_the_valid_positions() {
+        let model = tiny_model();
+        let a = ids(&[0, 0, 0, 3, 9, 14, 2, 7]);
+        let mask01 = ids(&[0, 0, 0, 1, 1, 1, 1, 1]);
+
+        let masked = masked_hidden_states_in_order(&model, &a, &mask01).expect("masked");
+        let mut cache = model.new_cache();
+        let causal_only = model
+            .hidden_states(&a, &mut cache, 0)
+            .expect("causal-only stack");
+
+        let delta = host(&masked[LAYERS])
+            .iter()
+            .zip(host(&causal_only[LAYERS]).iter())
+            .skip(3 * HIDDEN as usize)
+            .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(
+            delta > 1e-4,
+            "causal-only masking must measurably differ from causal+padding at the valid \
+             positions (got {delta}) — otherwise the regression above proves nothing"
+        );
+    }
+
+    /// The `[0]` entry is the embeddings, so its pad rows differ by construction; the assertion
+    /// above is about every *later* entry. Pinned separately so a future "just compare entry 0"
+    /// simplification cannot quietly weaken it.
+    #[test]
+    fn the_embedding_entry_is_the_one_place_pad_ids_legitimately_show() {
+        let model = tiny_model();
+        let a = ids(&[0, 0, 0, 3, 9, 14, 2, 7]);
+        let b = ids(&[41, 17, 5, 3, 9, 14, 2, 7]);
+        let mask01 = ids(&[0, 0, 0, 1, 1, 1, 1, 1]);
+        let ha = masked_hidden_states_in_order(&model, &a, &mask01).expect("a");
+        let hb = masked_hidden_states_in_order(&model, &b, &mask01).expect("b");
+        let e0 = ha[0].try_index((0, 0)).expect("row");
+        let e1 = hb[0].try_index((0, 0)).expect("row");
+        let delta = host(&e0)
+            .iter()
+            .zip(host(&e1).iter())
+            .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(delta > 0.0, "different pad ids must embed differently");
+    }
+}
+
 #[cfg(test)]
 mod version_assertion_tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     const GEMMA4_VERSION: &str = "gemma4-12b-ltx-v1";
 
@@ -322,6 +668,28 @@ mod version_assertion_tests {
 
     fn gemma4_config(version: &str) -> String {
         serde_json::json!({ "model_type": "gemma4_unified", "gemma_version": version }).to_string()
+    }
+
+    /// A `__metadata__`-only transformer file: the `gemma_source_checkpoint` stamp the assertion
+    /// reads, plus a `config.transformer` section so the bundle builder classifies it correctly.
+    fn write_transformer(dir: &Path, model_version: &str, gemma_version: &str) -> PathBuf {
+        let path = dir.join("transformer.safetensors");
+        let header = serde_json::json!({
+            "__metadata__": {
+                "model_version": model_version,
+                "config": serde_json::json!({ "transformer": { "num_layers": 48 } }).to_string(),
+                "gemma_source_checkpoint": serde_json::json!({
+                    "ltx_version": model_version,
+                    "gemma_version": gemma_version,
+                })
+                .to_string(),
+            }
+        })
+        .to_string();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        std::fs::write(&path, bytes).expect("write transformer");
+        path
     }
 
     fn checkpoint(model_version: &str, gemma_version: Option<&str>) -> LtxCheckpointMetadata {
@@ -450,6 +818,57 @@ mod version_assertion_tests {
             flat[width..].iter().all(|v| (*v - 1.0).abs() < 1e-3),
             "each per-token-RMS slice must normalize to ~1, got {:?}",
             &flat[width..]
+        );
+    }
+
+    /// `from_bundle_av` — the documented production entry point — must actually reach the version
+    /// assertion through the bundle: resolve both components, take the *transformer's* metadata and
+    /// the *text encoder's* path, and hand them to the gate.
+    ///
+    /// Weights-free: both files are `__metadata__`-only safetensors, and the mismatch fires before
+    /// a single tensor is read. Mutating `from_bundle_av` to read the *encoder's* metadata instead
+    /// of the transformer's (or to pass the transformer's path as `te_path`) makes this fail.
+    #[test]
+    fn from_bundle_av_reaches_the_version_assertion_through_the_bundle() {
+        use mlx_gen::gen_core::ltx_checkpoint::LtxBundleBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The encoder declares a DIFFERENT Gemma 4 build than the transformer was trained against.
+        let te = write_te(
+            dir.path(),
+            "text_encoder.safetensors",
+            &gemma4_config("gemma4-12b-ltx-v2"),
+        );
+        let transformer = write_transformer(dir.path(), "2.5.0", GEMMA4_VERSION);
+
+        let bundle = LtxBundleBuilder::new()
+            .with_component(LtxComponent::TextEncoder, &te)
+            .with_component(LtxComponent::Transformer, &transformer)
+            .build()
+            .expect("synthetic 2.5 bundle");
+
+        let mut cfg = LtxConfig::video_only_defaults();
+        cfg.caption_feature_version = mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion::V2;
+
+        let msg = match Ltx25TextEncoder::from_bundle_av(
+            &bundle,
+            &GenWeights::empty(),
+            &cfg,
+            Precision::quant_bf16(8, 32),
+        ) {
+            Ok(_) => panic!(
+                "a gemma_version mismatch must be a hard error on the bundle path too, but \
+                 from_bundle_av returned an encoder"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("gemma4-12b-ltx-v1") && msg.contains("gemma4-12b-ltx-v2"),
+            "the bundle path must reach the same version assertion, naming both sides: {msg}"
+        );
+        assert!(
+            msg.contains("text_encoder.safetensors"),
+            "the assertion must be run against the ENCODER's path, not the transformer's: {msg}"
         );
     }
 

@@ -27,7 +27,7 @@
 #![cfg(feature = "cuda")]
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
-use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
+use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
 use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
 use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
 use candle_gen_ltx::tier::TierPaths;
@@ -96,7 +96,18 @@ fn finite(name: &str, t: &Tensor) {
     );
 }
 
-fn encoder(dir: &std::path::Path, device: &Device) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
+/// `(checkpoint, te_path, connector varbuilder, av config, video connector config, audio connector
+/// config)` — everything both constructors need, read off the tier once.
+type TierInputs = (
+    LtxCheckpointMetadata,
+    std::path::PathBuf,
+    candle_gen::candle_nn::VarBuilder<'static>,
+    AvConfig,
+    ConnectorConfig,
+    ConnectorConfig,
+);
+
+fn tier_inputs(dir: &std::path::Path, device: &Device) -> TierInputs {
     let te_path = dir.join("text_encoder.safetensors");
     let checkpoint = LtxCheckpointMetadata::from_file(dir.join("transformer.safetensors"))
         .expect("transformer metadata");
@@ -106,17 +117,40 @@ fn encoder(dir: &std::path::Path, device: &Device) -> (Ltx25TextEncoder, Ltx25To
         .expect("connector varbuilder")
         .pp("model.diffusion_model");
 
-    // The 2.5 gate is fed a real per-checkpoint caption-feature version, not a constant.
-    let av_cfg = AvConfig::ltx_2_3();
+    // Every config comes off THIS checkpoint's own `config.transformer` section — the candle
+    // equivalent of the MLX twin's `LtxConfig::from_model_dir`. Handing a 2.5 tier the 2.3
+    // constants would leave `require_v2_version`'s per-checkpoint wiring, the
+    // `caption_feature_version` detection, and `connector_ff_bias` unexercised on this backend,
+    // which is exactly the cross-backend asymmetry this file exists to rule out.
+    let transformer = checkpoint
+        .section("transformer")
+        .expect("the 2.5 transformer must carry a `config.transformer` section");
+    let av_cfg = AvConfig::from_transformer_config(transformer).expect("AvConfig from checkpoint");
+    let conn_cfg = ConnectorConfig::from_transformer_config(transformer);
+    let audio_conn_cfg = ConnectorConfig::audio_from_transformer_config(transformer);
 
+    // The V2 selection must have been *detected* off the checkpoint, not assumed: this is the value
+    // `require_v2_version` is fed, and a V1 answer here would mean the 2.5 path was running V2 math
+    // against a V1-shaped config.
+    assert_eq!(
+        av_cfg.caption_feature_version,
+        CaptionFeatureVersion::V2,
+        "the 2.5 checkpoint's own config must resolve to the V2 caption feature extractor"
+    );
+
+    (checkpoint, te_path, root, av_cfg, conn_cfg, audio_conn_cfg)
+}
+
+fn encoder(dir: &std::path::Path, device: &Device) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
+    let (checkpoint, te_path, root, av_cfg, conn_cfg, audio_conn_cfg) = tier_inputs(dir, device);
     let te = Ltx25TextEncoder::from_packed_av(
         &checkpoint,
         &te_path,
         root.clone(),
         root,
         &av_cfg,
-        &ConnectorConfig::ltx_2_3(),
-        &ConnectorConfig::ltx_2_3_audio(),
+        &conn_cfg,
+        &audio_conn_cfg,
     )
     .expect("build the LTX-2.5 text encoder");
 
@@ -159,6 +193,49 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
         "ltx_2_5 connector inputs (candle): video {:?} audio {:?}",
         vf.dims3().unwrap(),
         af.dims3().unwrap()
+    );
+}
+
+/// The video-only constructor is reachable and genuinely leaves the audio head absent — the candle
+/// twin of the MLX file's `the_video_only_constructor_omits_the_audio_head`.
+///
+/// Before the `from_packed_video` split, `audio` was `Some` on every constructed encoder and both
+/// `ok_or_else` arms in `encode_both*` were dead code.
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 tiers (LTX25_TIER_DIR) and a CUDA GPU"]
+fn the_video_only_constructor_omits_the_audio_head() {
+    let device = Device::new_cuda(0).expect("cuda device");
+    let dir = tier_dir();
+    let (video_dim, _) = golden_connector_dims(&device);
+    let (checkpoint, te_path, root, av_cfg, conn_cfg, _) = tier_inputs(&dir, &device);
+
+    let te = Ltx25TextEncoder::from_packed_video(
+        &checkpoint,
+        &te_path,
+        root.clone(),
+        root,
+        &av_cfg,
+        &conn_cfg,
+    )
+    .expect("build the video-only LTX-2.5 text encoder");
+    let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
+
+    let (input_ids, mask01) = tok.encode(PROMPT, MAX_LEN, &device).expect("tokenize");
+    let (vf, ve) = te
+        .encode_with_features(&input_ids, &mask01)
+        .expect("the video path must work without an audio head");
+    assert_eq!(vf.dims3().expect("rank 3"), (1, MAX_LEN, video_dim));
+    assert_eq!(ve.dims3().expect("rank 3"), (1, MAX_LEN, video_dim));
+    finite("video_features", &vf);
+    finite("video_embeddings", &ve);
+
+    let err = match te.encode_both_with_features(&input_ids, &mask01) {
+        Ok(_) => panic!("the AV path must refuse a video-only encoder"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("from_packed_video"),
+        "the refusal must name the constructor that produced this encoder: {err}"
     );
 }
 
