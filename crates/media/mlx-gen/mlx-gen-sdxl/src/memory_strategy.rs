@@ -30,48 +30,24 @@
 //!
 //! ## What this family actually buys, measured (`realvisxl`, Apple/Metal, 1024², 6 steps)
 //!
-//! | composition | tier | request peak | vs baseline | ms/step | output |
-//! |---|---|---:|---:|---:|---|
-//! | resident | bf16 | 20.513 GiB | — | — | — |
-//! | + rung 1 | bf16 | **19.003** | **−7.4%** | 780 | byte-identical |
-//! | staged (control) | q8 | 17.693 | — | 740-913 | — |
-//! | + rung 4, window 1 (default) | q8 | **15.516** | **−12.31%** | 3591-3790 | byte-identical |
-//! | + rung 4, window 10 (selectable) | q8 | **15.516** | **−12.31%** | **1318-1325** | byte-identical |
+//! | composition | tier | request peak | vs baseline | output |
+//! |---|---|---:|---:|---|
+//! | resident | bf16 | 20.513 GiB | — | — |
+//! | + rung 1 | bf16 | **19.003** | **−7.4%** | byte-identical |
+//! | staged (control) | q8 | 17.693 | — | — |
+//! | + rung 4, any published cadence | q8 | **15.516** | **−12.31%** | byte-identical |
 //!
-//! ## Rung 4's cost is time, and the CADENCE is the dial that sets it
+//! ## Rung 4's product evidence is allocation and correctness
 //!
-//! SC-16355 carried re-materialization latency as an explicit hazard — *"70 blocks across 11
-//! re-opens could be a severe regression on exactly the small Macs this rung exists for"* — and it
-//! was right. Nothing had measured it, and the first revision of this file published a single
-//! cadence of 1 without ever comparing it: at 1024² it costs **+310%** wall clock for a saving every
-//! other published cadence also achieves, and cadence 10 delivers the same −12.31% for **+51%**. The
-//! default is now **10** for the reason on [`TRANSFORMER_WINDOW_SIZE`] — the peak is flat wherever
-//! the instrument can resolve it, so the cheap end costs nothing — and a selector that wants the
-//! tightest weight bound can still choose 1, which it could not do while the domain had one value.
+//! The full sweep — peak and byte-identity per cadence, over three tiers and three output sizes —
+//! is on [`TRANSFORMER_WINDOW_SIZES`]. The resolved peak column is **flat** because phase separation
+//! puts the request high-water in decode, not in the windowed forward. The two cells that once looked
+//! non-flat (512² q8 and q4) were allocator noise indexed by execution position (SC-17679).
 //!
-//! The full sweep — peak, time and byte-identity per cadence, over three tiers and three output
-//! sizes — is on [`TRANSFORMER_WINDOW_SIZES`]. The short version is that the peak column is **flat**
-//! at every measured configuration the instrument can resolve, and the mechanism is **phase
-//! separation**: the peak is taken in the *decode*, not in the windowed forward, so cadence cannot
-//! move it. The two cells that once looked non-flat (512² q8 and q4) were allocator noise indexed by
-//! execution position — SC-17679 — which is why the default is the **widest** cadence: it costs no
-//! memory and renders 2.7-4.4x faster.
-//!
-//! Latency is quoted as a range because it is a wall clock and moves with thermal state and machine
-//! load (five runs of the window-1 row: 3591 / 3654 / 3674 / 3698 / 3790 ms/step, a ~5% spread). The
-//! *peak* rows agree to the millibyte across every run, which is why the peak assertions in the sweep
-//! are tight and the latency ones deliberately are not.
-//!
-//! None of this withholds the rung: on a host where the unwindowed composition does not fit, even
-//! +310% is the difference between a render and no render
-//! (`the_full_ladder_renders_under_a_memory_cap` runs the whole ladder under an 8 GiB cap). What it
-//! changes is that a selector can now pick the cheap end of the frontier instead of the expensive
-//! one — which it could not do while the domain had a single value.
-//!
-//! For contrast: the rung-2 geometry this family **withholds** would have bought −16.51% of the peak
-//! for ~7% wall clock. Rung 4 at its default cadence buys −12.31% for +310%; at cadence 10, where a
-//! selector may choose it, the same −12.31% costs +51%. Rung 2 would have been the better lever, and
-//! it is withheld on quality rather than on cost.
+//! Wall-clock timing is retained as diagnostic output only: it changes with host state even when
+//! peaks and pixels are identical. Rung 4 therefore publishes no time/memory frontier between
+//! cadences; the default remains the widest complete-sub-stack cadence for its deterministic block
+//! plan, while callers may select any admitted cadence.
 //!
 //! ## Per-entry coverage is NOT uniform — measured, per entry, per tier
 //!
@@ -441,9 +417,9 @@ pub const ATTENTION_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Miss
 /// **Read this table as an observation, not as a gated invariant.** Exactly one row of it is
 /// asserted — **q8 / 1024²**, the sweep's default tier and geometry. The others come from re-running
 /// the sweep under `SDXL_WINDOW_PROBE_TIER` / `SDXL_WINDOW_PROBE_SIZE`, and in that mode the
-/// flatness and wall-clock assertions are reported rather than asserted. (And even the asserted row
-/// is asserted by an `#[ignore]`d real-weight test, so it is gated by a human running it against
-/// cached weights, not by CI.)
+/// flatness is reported rather than asserted. Timing is diagnostic output only. (And even the
+/// asserted row is asserted by an `#[ignore]`d real-weight test, so it is gated by a human running
+/// it against cached weights, not by CI.)
 ///
 /// ### SC-17679: the 512² "non-flat" row was the instrument, not the family
 ///
@@ -520,25 +496,21 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 5, 10];
 /// negative control). Cadence has no measurable effect on the request peak anywhere in the
 /// advertised range.
 ///
-/// What is left is a clean dominance argument:
+/// What is left is a deterministic allocation and topology choice:
 ///
 /// * **Peak: identical.** At every cell where the instrument resolves better than the difference
 ///   being claimed — 1024² bf16/q8/q4, 768² q8, 512² bf16 — all four cadences read the same peak to
 ///   the millibyte, and re-running the sweep in a permuted execution order does not move it. At the
 ///   two cells that do not resolve (512² q8/q4, ~5.7% on unchanged input) nothing can be claimed in
 ///   either direction, so they support neither default.
-/// * **Wall clock: 2.7-4.4× better, and genuinely cadence-borne.** Cadence 10 renders at ~0.67 s/step
-///   against cadence 1's ~2.9-3.0 s/step at 512², and 1262 vs 3524 ms/step at 1024². Unlike the
-///   peak, this tracks the *cadence* in every execution order — the same experiment that showed the
-///   peak is positional showed the latency is not, which is what makes it trustworthy.
+/// * **Topology: widest complete sub-stack.** Cadence 10 holds a whole deep sub-stack, minimizing
+///   repeated materialization within the defined block plan without asserting a host-clock margin.
 /// * **The mechanism's worst cell is measured flat.** Flatness should break first where the weights
 ///   are largest and the output smallest (`bf16` at the advertised `min_size`); that cell reads
 ///   4.7422 GiB at all four cadences, 0.00% resolution.
 ///
-/// A default is what every caller who names nothing receives on every request. Shipping the tightest
-/// cadence charged all of them a **3-4× slower render for a memory saving that does not exist**, and
-/// rung 4's whole purpose is to make constrained hosts able to render at all — a rung that is
-/// usable-but-slow is worth much less than one that is usable.
+/// A default is what every caller who names nothing receives on every request. The widest complete
+/// sub-stack keeps the same resolved allocation evidence without claiming host-dependent timing.
 ///
 /// **The residual risk, stated so it is not rediscovered as a surprise.** The flat region is a
 /// measured property of six configurations, not a proof. If some unmeasured cell *is*
@@ -596,13 +568,11 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// cadence-2 peak of 5.095 GiB for a cadence with no distinguishable peak at all. Either fact alone
 /// justifies the bump.
 ///
-/// **The paired evidence must be keyed per cadence, not per rung.** The cadences differ by up to 4.4×
-/// in wall clock, so a selector weighing peak against time needs a row per candidate rather than one
-/// row for the rung. It must NOT be keyed per cadence on *peak* at a cell whose instrument resolution
-/// exceeds the differences being recorded — see `identical_requests_reproduce_once_the_allocator_has_settled`,
-/// which measures that resolution per cell.
-/// `MemoryFormulaVariable::TransformerWindowSize` is already declared on the formula for exactly
-/// this: the window is a variable of the cost, not a constant folded into it.
+/// Peak evidence must not invent per-cadence differences at a cell whose instrument resolution
+/// exceeds the difference being recorded — see
+/// `identical_requests_reproduce_once_the_allocator_has_settled`, which measures that resolution
+/// per cell. `MemoryFormulaVariable::TransformerWindowSize` remains declared because cadence is an
+/// executable request parameter, not because the flat rows form a time/memory frontier.
 ///
 /// **This fingerprint is coupled to rung 2.** The cadence rows above were all measured with
 /// [`DECODE_SUPPORT`] `Missing`, and the reason most of them are flat is that the *decode* carries the
@@ -710,6 +680,40 @@ pub(crate) fn weights_free_memory_strategy_contract(
     contract_with_asset_facts(provider_id, spec, 0, 0, 0)
 }
 
+/// Whether the registry surface this selector names leaves the U-Net blocks lazy.
+///
+/// [`load_leaves_blocks_lazy`] answers that by probing the packed-quant marker under the snapshot
+/// root, which a weights-free witness has no directory to read. The selector already names the
+/// *resolved* artifact tier, so a packed snapshot at that tier is exactly the shape it denotes and
+/// re-quantizes nothing. A witness carries no adapters, so [`adapters_are_replayable`] is vacuous.
+fn surface_streamable(surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec) -> bool {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    matches!(
+        surface.resolved_artifact_tier(),
+        MemoryContractSurfaceTier::Bf16
+            | MemoryContractSurfaceTier::Q4
+            | MemoryContractSurfaceTier::Q8
+    ) && matches!(surface.spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && adapters_are_replayable(&surface.spec)
+}
+
+/// Declaration-equivalent contract resolved from the explicit surface selector.
+pub(crate) fn weights_free_memory_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        &surface.spec,
+        surface_streamable(surface),
+        0,
+        0,
+        0,
+    )
+}
+
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -717,7 +721,24 @@ fn contract_with_asset_facts(
     transformer_bytes: u64,
     decoder_bytes: u64,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = streamable(spec);
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        spec,
+        streamable(spec),
+        conditioning_bytes,
+        transformer_bytes,
+        decoder_bytes,
+    )
+}
+
+fn contract_with_asset_facts_and_streamability(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    conditioning_bytes: u64,
+    transformer_bytes: u64,
+    decoder_bytes: u64,
+) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
         loaded_tier(spec),
@@ -1577,10 +1598,10 @@ mod tests {
              effect on the request peak anywhere in the advertised range — the 512² q8 'non-flat' \
              row that previously justified defaulting to the tightest is allocator noise on \
              unchanged input (5.67% across eight IDENTICAL requests) and its apparent cadence \
-             ordering follows execution position, not cadence. Latency does track cadence, 2.7-4.4x, \
-             so the widest is strictly dominant for a caller who names nothing. If a future \
-             measurement finds a cell where the peak really is cadence-dependent, change this back \
-             and say where — do not change it back on the withdrawn 512² row"
+             ordering follows execution position, not cadence. The widest is the deterministic \
+             complete-sub-stack choice, not a host-clock claim. If a future measurement finds a \
+             cell where the peak really is cadence-dependent, change this back and say where — do \
+             not change it back on the withdrawn 512² row"
         );
         for component in [
             TransformerComponent::TextEncoder,
