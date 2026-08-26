@@ -18,7 +18,9 @@
 //! spatial, 5 → Conv3d temporal), not from a file name and not from a config: SceneWorks-converted
 //! 2.3 trees carry no `__metadata__` at all. `gen_core::ltx_checkpoint::LatentUpsamplerConfig` reads
 //! the declared config where one exists, and
-//! [`LatentUpsampler::assert_matches_config`] cross-checks the two.
+//! [`LatentUpsampler::assert_matches_config`] cross-checks the two —
+//! [`LatentUpsampler::from_checkpoint`] is the path-taking constructor that runs both, so the
+//! cross-check is on the production load path rather than only in the parity tests.
 //!
 //! Sits between the two-stage distilled denoise (S5): stage-1 runs at half resolution, its latents
 //! are upsampled 2× spatially here, then stage-2 refines at full resolution. The reference loads the
@@ -51,7 +53,7 @@ use mlx_rs::ops::{add, divide, mean_axes, multiply, subtract, var_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{
-    upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode,
+    upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode, LtxCheckpointMetadata,
 };
 use mlx_gen::nn::{conv2d, conv3d, silu};
 use mlx_gen::weights::Weights;
@@ -138,6 +140,11 @@ impl GroupNorm {
 fn pixel_shuffle_2d(x: &Array, r: i32) -> Result<Array> {
     let sh = x.shape(); // (n, h, w, c)
     let (n, h, wd, c) = (sh[0], sh[1], sh[2], sh[3]);
+    if r == 0 || c % (r * r) != 0 {
+        return Err(Error::Msg(format!(
+            "ltx upsampler: PixelShuffle({r}) cannot divide {c} channels"
+        )));
+    }
     let out_c = c / (r * r);
     let x = x.reshape(&[n, h, wd, out_c, r, r])?;
     let x = x.transpose_axes(&[0, 1, 4, 2, 5, 3])?;
@@ -154,6 +161,11 @@ fn pixel_shuffle_2d(x: &Array, r: i32) -> Result<Array> {
 fn pixel_shuffle_1d_frames(x: &Array, r: i32) -> Result<Array> {
     let sh = x.shape(); // (n, f, h, w, c)
     let (n, f, h, wd, c) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
+    if r == 0 || c % r != 0 {
+        return Err(Error::Msg(format!(
+            "ltx upsampler: PixelShuffle1d({r}) cannot divide {c} channels"
+        )));
+    }
     let out_c = c / r;
     let x = x.reshape(&[n, f, h, wd, out_c, r])?;
     let x = x.transpose_axes(&[0, 1, 5, 2, 3, 4])?;
@@ -278,6 +290,9 @@ impl LatentUpsampler {
     /// Build from a loaded latent-upsampler checkpoint — LTX-2.3 `upsampler.safetensors`, LTX-2.5
     /// `…latent-spatial-upscaler-x2…`, or LTX-2.5 `…latent-temporal-upscaler-x2…`.
     pub fn from_weights(w: &Weights) -> Result<Self> {
+        // Structure-from-weights with a **floor**: a stage whose `.0` key is absent is a truncated
+        // checkpoint, not a zero-block network. Without this the `while` loop returns an empty
+        // `Vec` and a shallower model runs silently against real weights.
         let load_stage = |stem: &str| -> Result<Vec<ResBlock>> {
             let mut blocks = Vec::new();
             let mut i = 0;
@@ -285,16 +300,57 @@ impl LatentUpsampler {
                 blocks.push(ResBlock::load(w, &format!("{stem}.{i}"))?);
                 i += 1;
             }
+            if blocks.is_empty() {
+                return Err(Error::Msg(format!(
+                    "ltx latent upsampler: no residual blocks under {stem}.* — the checkpoint is \
+                     missing {stem}.0.conv1.weight"
+                )));
+            }
             Ok(blocks)
         };
+        let res_blocks = load_stage("res_blocks")?;
+        let post_upsample_res_blocks = load_stage("post_upsample_res_blocks")?;
+        // Upstream builds both stages from the one `num_blocks_per_stage`, so they are the same
+        // count by construction; a file where they differ has lost blocks from one side.
+        if res_blocks.len() != post_upsample_res_blocks.len() {
+            return Err(Error::Msg(format!(
+                "ltx latent upsampler: res_blocks has {} block(s) but post_upsample_res_blocks has \
+                 {} — both stages are built from the same num_blocks_per_stage",
+                res_blocks.len(),
+                post_upsample_res_blocks.len()
+            )));
+        }
         Ok(Self {
             initial_conv: Conv::load(w, "initial_conv", true)?,
             initial_norm: GroupNorm::load(w, "initial_norm")?,
-            res_blocks: load_stage("res_blocks")?,
+            res_blocks,
             upsampler: Resampler::load(w, "upsampler")?,
-            post_upsample_res_blocks: load_stage("post_upsample_res_blocks")?,
+            post_upsample_res_blocks,
             final_conv: Conv::load(w, "final_conv", true)?,
         })
+    }
+
+    /// Build from a latent-upsampler `.safetensors` **file**, cross-checking the declared config.
+    ///
+    /// This is the only path-taking constructor, and the one every production load site uses:
+    /// [`Self::from_weights`] reads the structure out of the tensors, and when the file carries a
+    /// `__metadata__["config"]` object this reads that too and runs
+    /// [`Self::assert_matches_config`] before returning. Loading through a bare `from_weights` on a
+    /// stamped file would let the rank silently win over a config that disagrees — which is the
+    /// whole point of having two authorities.
+    ///
+    /// A file with no `__metadata__["config"]` (every SceneWorks-converted LTX-2.3 tree) simply
+    /// skips the cross-check; that is a checkpoint that declares nothing, not one that disagrees.
+    pub fn from_checkpoint(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let w = Weights::from_file(path)?;
+        let up = Self::from_weights(&w)?;
+        let meta = LtxCheckpointMetadata::from_file(path)?;
+        if meta.config().is_some() {
+            let config = LatentUpsamplerConfig::from_metadata(path, &meta)?;
+            up.assert_matches_config(&config)?;
+        }
+        Ok(up)
     }
 
     /// Which axis this checkpoint rescales, as read from its weights.
@@ -320,6 +376,36 @@ impl LatentUpsampler {
                 "ltx latent upsampler: config declares {declared:?} but the weights are {:?}",
                 self.mode()
             )));
+        }
+        // Both stages are the same length by the time `from_weights` returns, so one comparison
+        // covers `num_blocks_per_stage`.
+        let mismatch = |what: &str, declared: u64, loaded: i64| -> Error {
+            Error::Msg(format!(
+                "ltx latent upsampler: config declares {what}={declared} but the weights carry \
+                 {loaded}"
+            ))
+        };
+        let loaded_blocks = self.res_blocks.len() as i64;
+        if config.num_blocks_per_stage as i64 != loaded_blocks {
+            return Err(mismatch(
+                "num_blocks_per_stage",
+                config.num_blocks_per_stage,
+                loaded_blocks,
+            ));
+        }
+        // `initial_conv` is MLX layout `[mid, D, H, W, in]` after the load transpose; `final_conv`
+        // is `[in, D, H, W, mid]`. Both are checked, so a swapped pair cannot cancel out.
+        let initial = self.initial_conv.w.shape();
+        let final_ = self.final_conv.w.shape();
+        for (what, declared, loaded) in [
+            ("in_channels", config.in_channels, i64::from(initial[4])),
+            ("in_channels", config.in_channels, i64::from(final_[0])),
+            ("mid_channels", config.mid_channels, i64::from(initial[0])),
+            ("mid_channels", config.mid_channels, i64::from(final_[4])),
+        ] {
+            if declared as i64 != loaded {
+                return Err(mismatch(what, declared, loaded));
+            }
         }
         Ok(())
     }

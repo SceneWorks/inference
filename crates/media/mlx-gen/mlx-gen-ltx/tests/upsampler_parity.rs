@@ -87,8 +87,9 @@ fn peak_abs(got: &Array, want: &Array) -> f32 {
 #[ignore = "needs ltx_2_3_base_q8 upsampler.safetensors (~1 GB)"]
 fn upsampler_matches_reference() {
     let dir = base_dir();
-    let w = Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler.safetensors");
-    let up = LatentUpsampler::from_weights(&w).expect("build LatentUpsampler");
+    // Same constructor `model.rs` uses for this exact file.
+    let up = LatentUpsampler::from_checkpoint(dir.join("upsampler.safetensors"))
+        .expect("build LatentUpsampler");
 
     let g = Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx_upsampler_golden.py)");
     let latent = g.require("latent").unwrap();
@@ -103,8 +104,14 @@ fn upsampler_matches_reference() {
         "upsampler peak_rel = {pr:.3e} mean_rel = {mr:.3e} shape={:?}",
         got.shape()
     );
-    assert!(mr < 5e-3, "upsampler mean_rel {mr:.3e} too high");
-    assert!(pr < 1e-2, "upsampler peak_rel {pr:.3e} too high");
+    // **Bit-identical**, not "close": the golden is mlx's own bf16 `upsample_latents` output and
+    // this port replays the same mlx ops at the same dtype in the same order, so there is no step
+    // that could round differently. Measured 2026-08-25 against
+    // `SceneWorks/ltx-2.3-mlx @ 01df27d3 q8/upsampler.safetensors`: `peak_rel = mean_rel = 0.0`
+    // exactly. A tolerance here would let a real op substitution (a different eps, a reassociated
+    // reduction, a dropped f32 island) pass as rounding.
+    assert_eq!(mr, 0.0, "upsampler mean_rel {mr:.3e} is not bit-identical");
+    assert_eq!(pr, 0.0, "upsampler peak_rel {pr:.3e} is not bit-identical");
 }
 
 // =================================================================================================
@@ -134,6 +141,10 @@ fn upsampler_dir_2_5() -> std::path::PathBuf {
 /// and cross-check the structure read from the weights against the config the file declares.
 fn load_2_5(checkpoint: &str, expected: LatentUpsamplerMode) -> LatentUpsampler {
     let path = upsampler_dir_2_5().join(checkpoint);
+    // `from_checkpoint` is the production constructor: it runs the config cross-check itself, so
+    // this exercises the same path production takes rather than a test-only variant.
+    LatentUpsampler::from_checkpoint(&path).expect("from_checkpoint");
+
     let mut w = Weights::from_file(&path).expect("2.5 upsampler weights");
     w.cast_all(Dtype::Float32).expect("cast to f32");
     let up = LatentUpsampler::from_weights(&w).expect("build LatentUpsampler");
@@ -242,6 +253,11 @@ fn ramp(shape: &[i32]) -> Array {
 /// channels per 32-group norm), one `ResBlock` per stage. Small enough to forward many geometries
 /// in a unit test, structurally identical to the shipped files.
 fn synthetic_upsampler(temporal: bool) -> LatentUpsampler {
+    LatentUpsampler::from_weights(&Weights::from_map(synthetic_map(temporal)))
+        .expect("synthetic upsampler")
+}
+
+fn synthetic_map(temporal: bool) -> std::collections::HashMap<String, Array> {
     const IN: i32 = 8;
     const MID: i32 = 64;
     fn conv3(map: &mut std::collections::HashMap<String, Array>, prefix: &str, out: i32, inp: i32) {
@@ -271,7 +287,224 @@ fn synthetic_upsampler(temporal: bool) -> LatentUpsampler {
         map.insert("upsampler.0.weight".into(), ramp(&[MID * 4, MID, 3, 3]));
         map.insert("upsampler.0.bias".into(), ramp(&[MID * 4]));
     }
-    LatentUpsampler::from_weights(&Weights::from_map(map)).expect("synthetic upsampler")
+    map
+}
+
+/// A checkpoint missing a whole res-block stage must be **refused**, not run shallower.
+///
+/// `while contains(stem.i)` returns an empty `Vec` for an absent stage, so without the floor a
+/// truncated file loads happily and silently runs a different network against real weights.
+#[test]
+fn a_truncated_res_block_stage_is_refused() {
+    // `LatentUpsampler` is not `Debug`, so `expect_err` is unavailable.
+    fn load_err(map: std::collections::HashMap<String, Array>, why: &str) -> String {
+        match LatentUpsampler::from_weights(&Weights::from_map(map)) {
+            Ok(_) => panic!("{why}"),
+            Err(e) => e.to_string(),
+        }
+    }
+    for stem in ["res_blocks", "post_upsample_res_blocks"] {
+        let mut map = synthetic_map(true);
+        map.retain(|k, _| !k.starts_with(&format!("{stem}.")));
+        let err = load_err(map, "a stage-less checkpoint must not load");
+        assert!(err.contains(stem), "error must name the stem: {err}");
+        assert!(
+            err.contains("no residual blocks"),
+            "error must say the stage is empty: {err}"
+        );
+    }
+
+    // Stages that are both present but of different lengths are equally impossible upstream.
+    let mut map = synthetic_map(true);
+    for prefix in ["conv1", "conv2", "norm1", "norm2"] {
+        for suffix in ["weight", "bias"] {
+            let src = format!("res_blocks.0.{prefix}.{suffix}");
+            let value = map.get(&src).expect("synthetic block key").clone();
+            map.insert(format!("res_blocks.1.{prefix}.{suffix}"), value);
+        }
+    }
+    let err = load_err(map, "lopsided stages must not load");
+    assert!(err.contains("res_blocks has 2"), "{err}");
+    assert!(err.contains("post_upsample_res_blocks has 1"), "{err}");
+}
+
+/// Serialize a synthetic upsampler to a real `.safetensors` file, optionally stamping a
+/// `__metadata__["config"]` — the only way to exercise the *file*-taking constructor without a
+/// gated 1 GB checkpoint.
+fn write_synthetic_checkpoint(path: &std::path::Path, temporal: bool, config: Option<&str>) {
+    let map = synthetic_map(temporal);
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut header = String::from("{");
+    if let Some(config) = config {
+        header.push_str(&format!(
+            "\"__metadata__\":{{\"config\":{}}},",
+            serde_json::json!(config)
+        ));
+    }
+    let mut blob: Vec<u8> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let a = &map[*key];
+        let values: Vec<f32> = a.as_slice::<f32>().to_vec();
+        let start = blob.len();
+        for v in &values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        if i > 0 {
+            header.push(',');
+        }
+        header.push_str(&format!(
+            "{}:{{\"dtype\":\"F32\",\"shape\":{:?},\"data_offsets\":[{},{}]}}",
+            serde_json::json!(key),
+            a.shape().to_vec(),
+            start,
+            blob.len()
+        ));
+    }
+    header.push('}');
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(&blob);
+    std::fs::write(path, bytes).expect("write synthetic checkpoint");
+}
+
+/// `from_checkpoint` — the constructor every production site uses — must run the config
+/// cross-check, not just load the tensors. Loading through `from_weights` alone lets the weight
+/// rank silently win over a config that disagrees, which is what this file's two authorities exist
+/// to catch.
+#[test]
+fn from_checkpoint_runs_the_config_cross_check_on_the_production_path() {
+    let dir = tempfile::tempdir().unwrap();
+    const TRUTH: &str = r#"{"_class_name":"LatentUpsampler","in_channels":8,"mid_channels":64,
+        "num_blocks_per_stage":1,"dims":3,"spatial_upsample":false,"temporal_upsample":true}"#;
+
+    // Agreeing config: loads.
+    let ok = dir.path().join("ok.safetensors");
+    write_synthetic_checkpoint(&ok, true, Some(TRUTH));
+    let up = LatentUpsampler::from_checkpoint(&ok).expect("agreeing config loads");
+    assert_eq!(up.mode(), LatentUpsamplerMode::Temporal2x);
+
+    // No `__metadata__` at all (every SceneWorks-converted LTX-2.3 tree): still loads.
+    let bare = dir.path().join("bare.safetensors");
+    write_synthetic_checkpoint(&bare, true, None);
+    assert_eq!(
+        LatentUpsampler::from_checkpoint(&bare)
+            .expect("an unstamped checkpoint still loads")
+            .mode(),
+        LatentUpsamplerMode::Temporal2x
+    );
+
+    // Each disagreement must be refused *by the path constructor*.
+    for (what, config) in [
+        (
+            "Spatial2x",
+            TRUTH
+                .replace(
+                    r#""temporal_upsample":true"#,
+                    r#""temporal_upsample":false"#,
+                )
+                .replace(r#""spatial_upsample":false"#, r#""spatial_upsample":true"#),
+        ),
+        (
+            "mid_channels",
+            TRUTH.replace(r#""mid_channels":64"#, r#""mid_channels":512"#),
+        ),
+        (
+            "num_blocks_per_stage",
+            TRUTH.replace(r#""num_blocks_per_stage":1"#, r#""num_blocks_per_stage":4"#),
+        ),
+    ] {
+        let path = dir.path().join("bad.safetensors");
+        write_synthetic_checkpoint(&path, true, Some(&config));
+        let err = match LatentUpsampler::from_checkpoint(&path) {
+            Ok(_) => panic!("{what}: a disagreeing config must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(what), "{what}: {err}");
+    }
+}
+
+/// The declared config must agree with the loaded structure on **every** field the two both know,
+/// not just on the mode: a config that says 1024 mid channels over a 64-channel file is describing
+/// a different checkpoint.
+#[test]
+fn assert_matches_config_compares_block_count_and_channels_not_just_the_mode() {
+    let up = synthetic_upsampler(true);
+    let truth = LatentUpsamplerConfig {
+        in_channels: 8,
+        mid_channels: 64,
+        num_blocks_per_stage: 1,
+        dims: 3,
+        spatial_upsample: false,
+        temporal_upsample: true,
+        spatial_scale: 1.0,
+        rational_resampler: false,
+    };
+    up.assert_matches_config(&truth)
+        .expect("the synthetic file's own config agrees");
+
+    for (what, config) in [
+        (
+            "num_blocks_per_stage",
+            LatentUpsamplerConfig {
+                num_blocks_per_stage: 4,
+                ..truth
+            },
+        ),
+        (
+            "in_channels",
+            LatentUpsamplerConfig {
+                in_channels: 128,
+                ..truth
+            },
+        ),
+        (
+            "mid_channels",
+            LatentUpsamplerConfig {
+                mid_channels: 512,
+                ..truth
+            },
+        ),
+    ] {
+        let err = up
+            .assert_matches_config(&config)
+            .expect_err("mismatch must be refused")
+            .to_string();
+        assert!(err.contains(what), "{what}: {err}");
+    }
+}
+
+/// `PixelShuffle1d(2)` over an odd channel count would otherwise reshape into a wrong-sized view.
+#[test]
+fn the_temporal_pixel_shuffle_refuses_an_indivisible_channel_count() {
+    let mut map = synthetic_map(true);
+    // 129 output channels: rank 5 (still the temporal branch) but not divisible by the shuffle
+    // factor 2.
+    map.insert("upsampler.0.weight".into(), ramp(&[129, 64, 3, 3, 3]));
+    map.insert("upsampler.0.bias".into(), ramp(&[129]));
+    let up = LatentUpsampler::from_weights(&Weights::from_map(map)).expect("loads");
+    let err = up
+        .forward(&ramp(&[1, 8, 9, 3, 3]))
+        .expect_err("odd channel count must be refused")
+        .to_string();
+    assert!(err.contains("PixelShuffle1d(2)"), "{err}");
+    assert!(err.contains("129"), "{err}");
+}
+
+/// The spatial twin of the guard above (the candle port has both).
+#[test]
+fn the_spatial_pixel_shuffle_refuses_an_indivisible_channel_count() {
+    let mut map = synthetic_map(false);
+    // 257 output channels: rank 4 (still the spatial branch) but not divisible by 2².
+    map.insert("upsampler.0.weight".into(), ramp(&[257, 64, 3, 3]));
+    map.insert("upsampler.0.bias".into(), ramp(&[257]));
+    let up = LatentUpsampler::from_weights(&Weights::from_map(map)).expect("loads");
+    let err = match up.forward(&ramp(&[1, 8, 9, 3, 3])) {
+        Ok(_) => panic!("an indivisible channel count must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("PixelShuffle(2)"), "{err}");
+    assert!(err.contains("257"), "{err}");
 }
 
 #[test]

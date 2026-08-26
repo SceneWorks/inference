@@ -544,6 +544,11 @@ impl LatentUpsamplerConfig {
     /// Parse a bare `config` object. The `_class_name`, when present, must be
     /// [`LATENT_UPSAMPLER_CLASS`] — a differently-classed bare config is a different model and is
     /// refused rather than silently read with upsampler defaults.
+    ///
+    /// Every field falls back to its upstream default **only when the key is absent** (or `null`).
+    /// A key that is present but not of the declared JSON type is an error naming the key, the
+    /// value and the expected type — defaulting there would answer a question the checkpoint did
+    /// try to answer, and get it wrong.
     pub fn from_value(source: &str, config: &Value) -> Result<Self> {
         if let Some(class) = string_field(config, "_class_name") {
             if class != LATENT_UPSAMPLER_CLASS {
@@ -554,24 +559,50 @@ impl LatentUpsamplerConfig {
             }
         }
         let d = LatentUpsamplerConfig::default();
-        let u64_field = |key: &str, fallback: u64| -> u64 {
-            config.get(key).and_then(Value::as_u64).unwrap_or(fallback)
+        // A key that is **absent** (or explicitly `null`, which this crate treats as absent
+        // everywhere — see `LtxCheckpointMetadata::section`) falls back to upstream's default. A key
+        // that is *present* with the wrong JSON type is an error, never a silent fallback:
+        // `{"temporal_upsample": "true"}` resolving to the spatial branch would run the wrong
+        // network against real weights, which is exactly what the default is there to avoid.
+        let field = |key: &str, expected: &str, parse: &dyn Fn(&Value) -> bool| -> Result<bool> {
+            match config.get(key) {
+                None | Some(Value::Null) => Ok(false),
+                Some(v) if parse(v) => Ok(true),
+                Some(v) => Err(Error::Msg(format!(
+                    "ltx latent upsampler: {source} config key {key:?} is {v}, expected {expected}"
+                ))),
+            }
         };
-        let bool_field = |key: &str, fallback: bool| -> bool {
-            config.get(key).and_then(Value::as_bool).unwrap_or(fallback)
+        let u64_field = |key: &str, fallback: u64| -> Result<u64> {
+            if field(key, "a non-negative integer", &|v| v.as_u64().is_some())? {
+                Ok(config[key].as_u64().expect("checked above"))
+            } else {
+                Ok(fallback)
+            }
+        };
+        let bool_field = |key: &str, fallback: bool| -> Result<bool> {
+            if field(key, "a boolean", &|v| v.as_bool().is_some())? {
+                Ok(config[key].as_bool().expect("checked above"))
+            } else {
+                Ok(fallback)
+            }
+        };
+        let f64_field = |key: &str, fallback: f64| -> Result<f64> {
+            if field(key, "a number", &|v| v.as_f64().is_some())? {
+                Ok(config[key].as_f64().expect("checked above"))
+            } else {
+                Ok(fallback)
+            }
         };
         Ok(LatentUpsamplerConfig {
-            in_channels: u64_field("in_channels", d.in_channels),
-            mid_channels: u64_field("mid_channels", d.mid_channels),
-            num_blocks_per_stage: u64_field("num_blocks_per_stage", d.num_blocks_per_stage),
-            dims: u64_field("dims", d.dims),
-            spatial_upsample: bool_field("spatial_upsample", d.spatial_upsample),
-            temporal_upsample: bool_field("temporal_upsample", d.temporal_upsample),
-            spatial_scale: config
-                .get("spatial_scale")
-                .and_then(Value::as_f64)
-                .unwrap_or(d.spatial_scale),
-            rational_resampler: bool_field("rational_resampler", d.rational_resampler),
+            in_channels: u64_field("in_channels", d.in_channels)?,
+            mid_channels: u64_field("mid_channels", d.mid_channels)?,
+            num_blocks_per_stage: u64_field("num_blocks_per_stage", d.num_blocks_per_stage)?,
+            dims: u64_field("dims", d.dims)?,
+            spatial_upsample: bool_field("spatial_upsample", d.spatial_upsample)?,
+            temporal_upsample: bool_field("temporal_upsample", d.temporal_upsample)?,
+            spatial_scale: f64_field("spatial_scale", d.spatial_scale)?,
+            rational_resampler: bool_field("rational_resampler", d.rational_resampler)?,
         })
     }
 
@@ -2788,6 +2819,61 @@ mod tests {
         ] {
             assert!(config.mode().is_err(), "{why} must be refused");
         }
+    }
+
+    #[test]
+    fn a_present_upsampler_key_of_the_wrong_json_type_is_refused_not_defaulted() {
+        // `"true"` is a string, not a boolean. Defaulting it would resolve `temporal_upsample` to
+        // `false` and hand the caller `Spatial2x` for a file that says it is temporal — the exact
+        // mis-selection the mode branch exists to prevent.
+        let value: Value =
+            serde_json::from_str(r#"{"_class_name":"LatentUpsampler","temporal_upsample":"true"}"#)
+                .unwrap();
+        let err = LatentUpsamplerConfig::from_value("f", &value).expect_err("string bool refused");
+        let text = err.to_string();
+        assert!(text.contains("temporal_upsample"), "{text}");
+        assert!(text.contains("expected a boolean"), "{text}");
+
+        // Same for the numeric fields, and for the float.
+        for (key, literal, expected) in [
+            (
+                "mid_channels",
+                r#""512""#,
+                "expected a non-negative integer",
+            ),
+            (
+                "num_blocks_per_stage",
+                "-4",
+                "expected a non-negative integer",
+            ),
+            ("dims", "3.5", "expected a non-negative integer"),
+            ("spatial_scale", r#""2.0""#, "expected a number"),
+        ] {
+            let value: Value = serde_json::from_str(&format!(
+                r#"{{"_class_name":"LatentUpsampler","{key}":{literal}}}"#
+            ))
+            .unwrap();
+            let err = LatentUpsamplerConfig::from_value("f", &value)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key) && err.contains(expected), "{key}: {err}");
+        }
+
+        // An absent key still falls back, and an explicit `null` is treated as absent (the
+        // convention `LtxCheckpointMetadata::section` already sets).
+        let bare: Value = serde_json::from_str(r#"{"_class_name":"LatentUpsampler"}"#).unwrap();
+        assert_eq!(
+            LatentUpsamplerConfig::from_value("f", &bare).unwrap(),
+            LatentUpsamplerConfig::default()
+        );
+        let nulls: Value = serde_json::from_str(
+            r#"{"_class_name":"LatentUpsampler","temporal_upsample":null,"dims":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LatentUpsamplerConfig::from_value("f", &nulls).unwrap(),
+            LatentUpsamplerConfig::default()
+        );
     }
 
     #[test]

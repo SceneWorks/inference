@@ -70,6 +70,12 @@ impl ZeroPaddedConv3d {
         })
     }
 
+    /// The checkpoint-native `[O, I, kt, kh, kw]` weight shape, for callers that must cross-check a
+    /// declared channel count against the tensor that actually loaded.
+    pub(crate) fn weight_dims(&self) -> &[usize] {
+        self.weight.dims()
+    }
+
     /// `[B,C,T,H,W]` -> `[B,O,T,H,W]`, using symmetric zero padding in every
     /// dimension (the upscaler checkpoint's native convention).
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {

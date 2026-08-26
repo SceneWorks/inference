@@ -17,12 +17,16 @@
 //! Variant selection reads the **rank of `upsampler.0.weight`** (4 → Conv2d, 5 → Conv3d), matching
 //! the MLX port exactly: SceneWorks-converted LTX-2.3 trees ship no `__metadata__` to read a config
 //! from. [`LatentUpsampler::assert_matches_config`] cross-checks the two authorities where the
-//! checkpoint does declare one.
+//! checkpoint does declare one, and [`LatentUpsampler::from_checkpoint`] is the path-taking
+//! constructor that runs it — so the cross-check sits on the production load path rather than only
+//! in the parity tests.
 
-use candle_gen::candle_core::{DType, Result, Tensor};
+use std::path::Path;
+
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::ltx_checkpoint::{
-    upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode,
+    upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode, LtxCheckpointMetadata,
 };
 
 use crate::conv3d::{chunked_conv2d, ZeroPaddedConv3d};
@@ -228,6 +232,10 @@ pub struct LatentUpsampler {
 
 impl LatentUpsampler {
     pub fn load(vb: VarBuilder) -> Result<Self> {
+        // Structure-from-weights with a **floor**: a stage whose `.0` key is absent is a truncated
+        // checkpoint, not a zero-block network. Without this the `while` loop returns an empty
+        // `Vec` and a shallower model runs silently — which the replaced hard-coded
+        // `(0..4).map(ResBlock::load)` could not do.
         let stage = |stem: &str| -> Result<Vec<ResBlock>> {
             let mut blocks = Vec::new();
             let mut i = 0;
@@ -235,16 +243,58 @@ impl LatentUpsampler {
                 blocks.push(ResBlock::load(vb.clone(), &format!("{stem}.{i}"))?);
                 i += 1;
             }
+            if blocks.is_empty() {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "ltx latent upsampler: no residual blocks under {stem}.* — the checkpoint is \
+                     missing {stem}.0.conv1.weight"
+                )));
+            }
             Ok(blocks)
         };
+        let res_blocks = stage("res_blocks")?;
+        let post_res_blocks = stage("post_upsample_res_blocks")?;
+        // Upstream builds both stages from the one `num_blocks_per_stage`, so they are the same
+        // count by construction; a file where they differ has lost blocks from one side.
+        if res_blocks.len() != post_res_blocks.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx latent upsampler: res_blocks has {} block(s) but post_upsample_res_blocks has \
+                 {} — both stages are built from the same num_blocks_per_stage",
+                res_blocks.len(),
+                post_res_blocks.len()
+            )));
+        }
         Ok(Self {
             initial_conv: ZeroPaddedConv3d::load(vb.clone(), "initial_conv")?,
             initial_norm: GroupNorm32::load(vb.clone(), "initial_norm")?,
-            res_blocks: stage("res_blocks")?,
+            res_blocks,
             resampler: Resampler::load(vb.clone(), "upsampler")?,
-            post_res_blocks: stage("post_upsample_res_blocks")?,
+            post_res_blocks,
             final_conv: ZeroPaddedConv3d::load(vb, "final_conv")?,
         })
+    }
+
+    /// Build from a latent-upsampler `.safetensors` **file**, cross-checking the declared config.
+    ///
+    /// This is the only path-taking constructor, and the one every production load site uses:
+    /// [`Self::load`] reads the structure out of the tensors, and when the file carries a
+    /// `__metadata__["config"]` object this reads that too and runs
+    /// [`Self::assert_matches_config`] before returning. Loading through a bare `load` on a stamped
+    /// file would let the rank silently win over a config that disagrees — which is the whole point
+    /// of having two authorities.
+    ///
+    /// A file with no `__metadata__["config"]` (every SceneWorks-converted LTX-2.3 tree) simply
+    /// skips the cross-check; that is a checkpoint that declares nothing, not one that disagrees.
+    pub fn from_checkpoint(path: &Path, dtype: DType, device: &Device) -> Result<Self> {
+        let msg = |e: &dyn std::fmt::Display| candle_gen::candle_core::Error::Msg(e.to_string());
+        let files = [path.to_path_buf()];
+        let vb = candle_gen::mmap_var_builder(&files, dtype, device).map_err(|e| msg(&e))?;
+        let up = Self::load(vb)?;
+        let meta = LtxCheckpointMetadata::from_file(path).map_err(|e| msg(&e))?;
+        if meta.config().is_some() {
+            let config = LatentUpsamplerConfig::from_metadata(path, &meta).map_err(|e| msg(&e))?;
+            up.assert_matches_config(&config)?;
+        }
+        Ok(up)
     }
 
     /// Which axis this checkpoint rescales, as read from its weights.
@@ -271,6 +321,36 @@ impl LatentUpsampler {
                 "ltx latent upsampler: config declares {declared:?} but the weights are {:?}",
                 self.mode()
             )));
+        }
+        // Both stages are the same length by the time `load` returns, so one comparison covers
+        // `num_blocks_per_stage`.
+        let mismatch = |what: &str, declared: u64, loaded: usize| {
+            candle_gen::candle_core::Error::Msg(format!(
+                "ltx latent upsampler: config declares {what}={declared} but the weights carry \
+                 {loaded}"
+            ))
+        };
+        if config.num_blocks_per_stage as usize != self.res_blocks.len() {
+            return Err(mismatch(
+                "num_blocks_per_stage",
+                config.num_blocks_per_stage,
+                self.res_blocks.len(),
+            ));
+        }
+        // Checkpoint-native PyTorch layout: `initial_conv` is `[mid, in, kt, kh, kw]` and
+        // `final_conv` is `[in, mid, kt, kh, kw]`. Both are checked, so a swapped pair cannot
+        // cancel out.
+        let initial = self.initial_conv.weight_dims();
+        let final_ = self.final_conv.weight_dims();
+        for (what, declared, loaded) in [
+            ("in_channels", config.in_channels, initial[1]),
+            ("in_channels", config.in_channels, final_[0]),
+            ("mid_channels", config.mid_channels, initial[0]),
+            ("mid_channels", config.mid_channels, final_[1]),
+        ] {
+            if declared as usize != loaded {
+                return Err(mismatch(what, declared, loaded));
+            }
         }
         Ok(())
     }
