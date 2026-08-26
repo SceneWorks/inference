@@ -2599,6 +2599,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
+ "rayon",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
