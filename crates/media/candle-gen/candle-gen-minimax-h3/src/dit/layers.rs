@@ -56,7 +56,7 @@
 
 use candle_gen::attention::AttentionBudget;
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::quant::AdaptLinear;
+use candle_gen::quant::{AdaptLinear, LokrFactors};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::config::MiniMaxH3DitConfig;
@@ -94,6 +94,19 @@ pub struct LoraResidual {
     scale: f64,
 }
 
+/// A structured LoKr residual installed on this family-local wrapper.
+///
+/// [`LokrFactors`] owns the allocation-free Kronecker vec-trick. MiniMax-H3 keeps the final output
+/// transform here because its ComfyUI/trainer `mlp.fc1` spelling is `[gate | value]` while the
+/// runtime projection is `[value | gate]`; swapping those halves after the structured contraction
+/// avoids ever materializing the full `[out, in]` adapter delta.
+#[derive(Debug, Clone)]
+struct LokrResidual {
+    factors: LokrFactors,
+    swap_output_halves: bool,
+    scale: f64,
+}
+
 impl LoraResidual {
     /// `a`'s dtype — the loaded factor dtype. Read by
     /// `adapters::tests::the_installed_fold_keeps_the_factor_dtype`, which is the **only** thing
@@ -119,7 +132,7 @@ impl LoraResidual {
 }
 
 /// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)` — plus any
-/// [`LoraResidual`] stacked onto it.
+/// low-rank LoRA or structured Kronecker LoKr residuals stacked onto it.
 ///
 /// # The base is the shared [`AdaptLinear`], so it may be DENSE **or PACKED** (sc-20267)
 ///
@@ -144,6 +157,9 @@ pub struct LinearNoBias {
     /// dtype/shape/strength introspection the shared seam does not expose. Empty on every
     /// un-adapted render, in which case [`Self::forward`] is byte-identical to the bare base.
     adapters: Vec<LoraResidual>,
+    /// Structured Kronecker residuals. Kept separate from `inner` so the family-specific FC1
+    /// half-order transform can run after the shared vec-trick without widening the shared seam.
+    lokr_adapters: Vec<LokrResidual>,
 }
 
 impl LinearNoBias {
@@ -154,6 +170,7 @@ impl LinearNoBias {
             inner: loaded.linear,
             base_bytes: loaded.base_bytes,
             adapters: Vec::new(),
+            lokr_adapters: Vec::new(),
         })
     }
 
@@ -181,9 +198,37 @@ impl LinearNoBias {
         let dims = x.dims().to_vec();
         let in_features = *dims.last().expect("LinearNoBias::forward: x has no axes");
         let rows = x.elem_count() / in_features;
-        let y = self
-            .inner
-            .forward_upcast(&x.reshape((rows, in_features))?)?;
+        let x = x.reshape((rows, in_features))?;
+        let mut y = self.inner.forward_upcast(&x)?;
+        for adapter in &self.lokr_adapters {
+            if adapter.scale == 0.0 {
+                continue;
+            }
+            let residual = adapter.factors.residual(&x)?;
+            let output_dtype = y.dtype();
+            let residual = residual.to_dtype(output_dtype)?;
+            if adapter.swap_output_halves {
+                let out = residual.dim(1)?;
+                if out == 0 || out % 2 != 0 {
+                    return Err(CandleError::Msg(format!(
+                        "minimax-h3 adapter: fused MLP LoKr output width {out} cannot be split into equal gate/value halves"
+                    )));
+                }
+                let half = out / 2;
+                // Add each source half directly to its destination half before concatenating the
+                // final output. This never allocates a second full-size reordered residual — peak
+                // temporaries stay at activation scale, never adapter-weight `[out, in]` scale.
+                y = Tensor::cat(
+                    &[
+                        &(y.narrow(1, 0, half)? + residual.narrow(1, half, half)?)?,
+                        &(y.narrow(1, half, half)? + residual.narrow(1, 0, half)?)?,
+                    ],
+                    1,
+                )?;
+            } else {
+                y = (y + residual)?;
+            }
+        }
         let mut out_dims = dims;
         *out_dims
             .last_mut()
@@ -224,10 +269,21 @@ impl LinearNoBias {
         Ok(())
     }
 
+    /// Attach one structured LoKr residual. The factors have already been built against this
+    /// projection's logical shape (or its fused-source output slice) by the strict installer.
+    pub(crate) fn push_lokr(&mut self, factors: LokrFactors, swap_output_halves: bool, scale: f64) {
+        self.lokr_adapters.push(LokrResidual {
+            factors,
+            swap_output_halves,
+            scale,
+        });
+    }
+
     /// Drop every attached residual, reverting to the bare base.
     pub fn clear_adapters(&mut self) {
         self.inner.clear_adapters();
         self.adapters.clear();
+        self.lokr_adapters.clear();
     }
 
     /// The residuals attached to this projection, in push order.
@@ -237,7 +293,7 @@ impl LinearNoBias {
 
     /// Whether any residual is attached.
     pub fn is_adapted(&self) -> bool {
-        !self.adapters.is_empty()
+        !self.adapters.is_empty() || !self.lokr_adapters.is_empty()
     }
 
     /// Whether the base loaded from a **packed** (pre-quantized) tier.
@@ -261,6 +317,11 @@ impl LinearNoBias {
                     ad.a.elem_count() * ad.a.dtype().size_in_bytes()
                         + ad.b.elem_count() * ad.b.dtype().size_in_bytes()
                 })
+                .sum::<usize>()
+            + self
+                .lokr_adapters
+                .iter()
+                .map(|ad| ad.factors.nbytes())
                 .sum::<usize>()
     }
 
@@ -936,6 +997,46 @@ mod tests {
             0.0,
             "clear_adapters must restore the bare base bit-for-bit"
         );
+    }
+
+    #[test]
+    fn a_structured_lokr_rides_a_packed_base_unmerged() {
+        let (out, in_) = (32usize, 128usize);
+        let mut map = std::collections::HashMap::new();
+        let grid = crate::quant::testkit::insert_packed(&mut map, "attn.to_q", out, in_, 31);
+        let mut packed =
+            LinearNoBias::from_weights(&Weights::from_map(map), "attn.to_q", DType::F32)
+                .expect("packed load");
+        let mut dense_map = std::collections::HashMap::new();
+        dense_map.insert("attn.to_q.weight".to_string(), grid);
+        let mut dense =
+            LinearNoBias::from_weights(&Weights::from_map(dense_map), "attn.to_q", DType::F32)
+                .expect("dense load");
+        let w1 = spread(&[4, 16], 0.23);
+        let w2 = spread(&[8, 8], 0.91);
+        let factors = LokrFactors::build(
+            0.42,
+            (out, in_),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("structured shape");
+        let x = spread(&[1, 5, in_], 0.49);
+        let packed_base = packed.forward(&x).unwrap();
+        let dense_base = dense.forward(&x).unwrap();
+        packed.push_lokr(factors.clone(), false, 0.42);
+        dense.push_lokr(factors, false, 0.42);
+        assert!(packed.is_packed(), "LoKr must not dequantize the base");
+        let packed_residual = (packed.forward(&x).unwrap() - packed_base).unwrap();
+        let dense_residual = (dense.forward(&x).unwrap() - dense_base).unwrap();
+        let drift = rel_max_abs(&packed_residual, &dense_residual);
+        assert!(drift < 1e-5, "packed-vs-dense LoKr residual {drift:.3e}");
     }
 
     /// A factor pair that does not compose is refused on a **packed** base too — the shape check

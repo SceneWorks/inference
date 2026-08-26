@@ -102,6 +102,45 @@ fn request(seconds: f32) -> GenerationRequest {
     }
 }
 
+/// Require the emitted chunks to be the returned track's exact ordered sample partition.
+#[track_caller]
+fn assert_chunks_reassemble_exact<'a>(chunks: impl IntoIterator<Item = &'a [f32]>, track: &[f32]) {
+    let reassembled: Vec<f32> = chunks.into_iter().flatten().copied().collect();
+    assert_eq!(
+        reassembled.len(),
+        track.len(),
+        "the chunks must reassemble to the returned track's exact sample count"
+    );
+    if let Some(index) = reassembled
+        .iter()
+        .zip(track)
+        .position(|(chunk, track)| chunk != track)
+    {
+        panic!(
+            "the chunks must reassemble sample-for-sample to exactly the returned track: sample \
+             {index} differs (chunk {}, track {})",
+            reassembled[index], track[index]
+        );
+    }
+}
+
+#[test]
+fn exact_chunk_reassembly_rejects_equal_length_sample_corruption() {
+    let first = [0.25, -0.5];
+    let second = [0.75, 1.0];
+    let track = [0.25, -0.5, 0.75, 1.0];
+    assert_chunks_reassemble_exact([first.as_slice(), second.as_slice()], &track);
+
+    let corrupted_first = [-0.25, -0.5];
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_chunks_reassemble_exact([corrupted_first.as_slice(), second.as_slice()], &track)
+        })
+        .is_err(),
+        "equal-length chunks with changed sample content must be rejected"
+    );
+}
+
 /// AR-stage gate: real weights decode valid, non-degenerate, deterministic RVQ frames.
 #[test]
 #[ignore = "real weights: needs the ~4.66 GB MOSS-TTS-Realtime snapshot; run with --ignored"]
@@ -321,10 +360,9 @@ fn moss_tts_realtime_streaming_gate() {
     );
     // The reassembly law (`check_audio_streaming` gates it too) is what makes the size comparison
     // above mean "a prefix" rather than "a differently-shaped buffer".
-    assert_eq!(
-        chunks.iter().map(|c| c.samples.len()).sum::<usize>(),
-        track.samples.len(),
-        "the chunks must reassemble to exactly the returned track"
+    assert_chunks_reassemble_exact(
+        chunks.iter().map(|chunk| chunk.samples.as_slice()),
+        &track.samples,
     );
 
     // (c) valid 24 kHz mono track, finite, non-empty.

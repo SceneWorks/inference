@@ -77,7 +77,15 @@ fn vae_with(
     map: std::collections::HashMap<String, Tensor>,
     cfg: &MiniMaxH3AudioVaeConfig,
 ) -> MiniMaxH3AudioVae {
-    MiniMaxH3AudioVae::from_weights(&weights(map), cfg, &Device::Cpu, DType::F32)
+    vae_with_dtype(map, cfg, DType::F32)
+}
+
+fn vae_with_dtype(
+    map: std::collections::HashMap<String, Tensor>,
+    cfg: &MiniMaxH3AudioVaeConfig,
+    dtype: DType,
+) -> MiniMaxH3AudioVae {
+    MiniMaxH3AudioVae::from_weights(&weights(map), cfg, &Device::Cpu, dtype)
         .expect("build the audio VAE")
 }
 
@@ -739,6 +747,34 @@ fn latent_denormalization_is_applied_per_channel() {
         peak > MUTATION_FLOOR,
         "decode ignored latents_mean/std ({peak:.3e})"
     );
+}
+
+/// The shipped decoder weights are bf16 while the joint denoiser's scheduler emits f32 latents.
+/// De-normalization must therefore follow the latent dtype without rounding the f32 configuration
+/// statistics down to the decoder's storage dtype.
+#[test]
+fn bf16_decoder_denormalizes_f32_latents_in_f32() {
+    let f = fixture();
+    let cfg = audio_fixture_config();
+    let vae = vae_with_dtype(model_map(&f), &cfg, DType::BF16);
+    let z = f
+        .tensor("in.stereo.z")
+        .to_dtype(DType::F32)
+        .expect("f32 latent");
+
+    let denorm = vae.denormalize(&z).expect("mixed-store denormalize");
+    assert_eq!(denorm.dtype(), DType::F32);
+    let raw = flat(&z);
+    let got = flat(&denorm);
+    for c in [0usize, 5, 31] {
+        let idx = c * 4 + 2;
+        let expected = raw[idx] * cfg.latents_std[c] + cfg.latents_mean[c];
+        assert!(
+            (got[idx] - expected).abs() < 1e-5,
+            "channel {c}: expected f32 z*std+mean = {expected}, got {}",
+            got[idx]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

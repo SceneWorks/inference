@@ -289,6 +289,13 @@ pub struct LokrFactors {
 }
 
 impl LokrFactors {
+    /// Device bytes retained by the structured residual. The shape metadata and scalar scale are
+    /// not allocations; the owned factor tensors are the complete LoKr storage payload.
+    pub fn nbytes(&self) -> usize {
+        self.w1.elem_count() * self.w1.dtype().size_in_bytes()
+            + self.w2.elem_count() * self.w2.dtype().size_in_bytes()
+    }
+
     /// Bytes retained by the structured residual after source factors are converted to f32 and any
     /// low-rank inner products are materialized. This is the device allocation installed on an
     /// [`AdaptLinear`], not the adapter container payload.

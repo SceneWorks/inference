@@ -62,6 +62,27 @@ use crate::vae::MiniMaxH3VideoVae;
 /// The published provider id.
 pub const MODEL_ID: &str = "minimax_h3";
 
+/// Stable worker-facing boundary for the FL2VA Qwen3-VL presentation. The wording is deliberately
+/// specific: SceneWorks uses the `MiniMax-H3 MLX I2V` prefix to distinguish this known
+/// process-poisoning path from T2VA, Ref2VA, other MLX families, and ordinary allocation errors.
+const FL2VA_GROUNDED_QWEN3_VL_PHASE: &str =
+    "MiniMax-H3 MLX I2V grounded Qwen3-VL vision/text conditioning";
+
+/// Stable worker-facing boundary for the FL2VA keyframe VAE presentation.
+const FL2VA_KEYFRAME_VAE_PHASE: &str = "MiniMax-H3 MLX I2V keyframe VAE conditioning";
+
+/// Attach an actionable FL2VA phase to device/loader failures without degrading the typed request
+/// outcomes the shared generator contract relies on. In particular, cancellation, unsupported
+/// conditioning, and geometry refusal must not become generic backend failures merely because the
+/// request carries a keyframe.
+fn in_fl2va_phase<T>(phase: &'static str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Mlx(exception) => Error::Msg(format!("{phase} failed: MLX op failed: {exception}")),
+        Error::Msg(message) => Error::Msg(format!("{phase} failed: {message}")),
+        typed => typed,
+    })
+}
+
 /// Model evaluations a request runs when it names no step count.
 ///
 /// The reference declares no default; 50 is what the sc-17242 spike rendered at and what the model
@@ -1226,7 +1247,10 @@ impl MiniMaxH3 {
             (context, tags)
         } else {
             let refs: Vec<&mlx_gen::media::Image> = fitted.iter().collect();
-            self.encode_prompt_grounded(&req.prompt, &refs, window, &req.cancel)?
+            in_fl2va_phase(
+                FL2VA_GROUNDED_QWEN3_VL_PHASE,
+                self.encode_prompt_grounded(&req.prompt, &refs, window, &req.cancel),
+            )?
         };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1238,25 +1262,30 @@ impl MiniMaxH3 {
         let condition_rows = if anchors.is_empty() {
             None
         } else {
-            let pixels: Vec<mlx_rs::Array> = fitted
-                .iter()
-                .map(crate::keyframe::keyframe_to_vae_pixels)
-                .collect::<Result<_>>()?;
-            let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?;
-            let rows = crate::conditioning::build_condition_rows(
-                &vae,
-                &pixels,
-                &anchors,
-                crate::pipeline::PATCH_SIZE,
-                &crate::conditioning::KeyframeNoise::Seeded,
-            )?;
-            if let Some(r) = &rows {
-                // Force before the VAE is dropped, for the same lazy-evaluation reason the context
-                // is forced above.
-                mlx_rs::transforms::eval([r])?;
-            }
-            release((vae, pixels));
-            rows
+            in_fl2va_phase(
+                FL2VA_KEYFRAME_VAE_PHASE,
+                (|| {
+                    let pixels: Vec<mlx_rs::Array> = fitted
+                        .iter()
+                        .map(crate::keyframe::keyframe_to_vae_pixels)
+                        .collect::<Result<_>>()?;
+                    let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?;
+                    let rows = crate::conditioning::build_condition_rows(
+                        &vae,
+                        &pixels,
+                        &anchors,
+                        crate::pipeline::PATCH_SIZE,
+                        &crate::conditioning::KeyframeNoise::Seeded,
+                    )?;
+                    if let Some(r) = &rows {
+                        // Force before the VAE is dropped, for the same lazy-evaluation reason the
+                        // context is forced above.
+                        mlx_rs::transforms::eval([r])?;
+                    }
+                    release((vae, pixels));
+                    Ok(rows)
+                })(),
+            )?
         };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1859,6 +1888,50 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::CancelFlag;
     use mlx_gen::runtime::{AdapterKind, MoeExpert};
+
+    #[test]
+    fn fl2va_phase_boundaries_preserve_the_actionable_metal_timeout() {
+        const TIMEOUT: &str = "[METAL] Command buffer execution failed: Caused GPU Timeout Error \
+             (00000002:kIOGPUCommandBufferCallbackErrorTimeout)";
+
+        for phase in [FL2VA_GROUNDED_QWEN3_VL_PHASE, FL2VA_KEYFRAME_VAE_PHASE] {
+            let error = in_fl2va_phase::<()>(phase, Err(Error::Msg(TIMEOUT.into())))
+                .expect_err("injected Metal timeout must remain a failure")
+                .to_string();
+            assert!(error.starts_with(phase), "missing FL2VA phase: {error}");
+            assert!(
+                error.contains("kIOGPUCommandBufferCallbackErrorTimeout"),
+                "the original driver classification was hidden: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fl2va_phase_boundaries_do_not_stringify_typed_request_outcomes() {
+        assert_eq!(
+            in_fl2va_phase(FL2VA_KEYFRAME_VAE_PHASE, Ok(3.25_f32))
+                .expect("a successful phase remains numerically transparent"),
+            3.25
+        );
+        assert!(matches!(
+            in_fl2va_phase::<()>(FL2VA_GROUNDED_QWEN3_VL_PHASE, Err(Error::Canceled)),
+            Err(Error::Canceled)
+        ));
+        assert!(matches!(
+            in_fl2va_phase::<()>(
+                FL2VA_KEYFRAME_VAE_PHASE,
+                Err(Error::Unsupported("fixture".into()))
+            ),
+            Err(Error::Unsupported(message)) if message == "fixture"
+        ));
+        assert!(matches!(
+            in_fl2va_phase::<()>(
+                FL2VA_KEYFRAME_VAE_PHASE,
+                Err(Error::MissingTensor("fixture.weight".into()))
+            ),
+            Err(Error::MissingTensor(key)) if key == "fixture.weight"
+        ));
+    }
 
     fn request(width: u32, height: u32) -> GenerationRequest {
         GenerationRequest {
