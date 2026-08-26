@@ -19,6 +19,7 @@
 //! live here too; they moved into candle-llm's `candle-llava` provider when this crate was repointed
 //! onto the unified engine (sc-7692). What remains is product content only.
 
+use candle_gen::gen_core;
 use candle_gen::gen_core::{CaptionCapabilities, CaptionOptions};
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
@@ -192,9 +193,9 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
         .replace("{word_count}", caption_length)
 }
 
-/// Compatibility export for Candle callers. The policy itself is backend-neutral and lives in
-/// `gen-core`, shared with MLX and the SceneWorks worker.
-pub use candle_gen::gen_core::apply_caption_trigger_words as apply_trigger_words;
+/// Compatibility export for backend callers. The policy itself is backend-neutral and lives in
+/// `gen-core`, shared with the SceneWorks worker.
+pub use gen_core::apply_caption_trigger_words as apply_trigger_words;
 
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES
