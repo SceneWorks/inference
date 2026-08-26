@@ -511,12 +511,14 @@ const COLORS: [[u8; 3]; 5] = [
 /// Render the InstantID kps control image: a `width × height` RGB [`Image`] from 5 landmarks
 /// `[left_eye, right_eye, nose, mouth_left, mouth_right]` (canvas-space pixel coords). Bit-exact to
 /// the vendored `draw_kps`.
-pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
-    assert!(
-        kps.len() >= 5,
-        "draw_kps needs 5 keypoints, got {}",
-        kps.len()
-    );
+pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Result<Image> {
+    if kps.len() < COLORS.len() {
+        return Err(CandleError::Msg(format!(
+            "instantid draw_kps: need {} keypoints, got {}",
+            COLORS.len(),
+            kps.len()
+        )));
+    }
     let (w, h) = (width as i32, height as i32);
     let mut canvas = vec![0u8; (w as usize) * (h as usize) * 3];
 
@@ -547,11 +549,11 @@ pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
         circle_filled(&mut canvas, w, h, (x as i32, y as i32), 10, COLORS[idx]);
     }
 
-    Image {
+    Ok(Image {
         width,
         height,
         pixels: canvas,
-    }
+    })
 }
 
 /// Resize `image` keeping aspect (PIL LANCZOS) and center-pad onto a black `width × height` canvas —
@@ -786,6 +788,19 @@ mod tests {
         let before = img.clone();
         hline(&mut img, w, 2, 4, 1, [99, 99, 99]);
         assert_eq!(img, before);
+    }
+
+    #[test]
+    fn draw_kps_rejects_fewer_than_five_keypoints() {
+        for len in 0..COLORS.len() {
+            let error = draw_kps(64, 64, &vec![(0.0, 0.0); len])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("need 5 keypoints, got {len}")),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     /// F-014 (sc-12466): a zero-dimension reference image (or target) must be a typed error instead

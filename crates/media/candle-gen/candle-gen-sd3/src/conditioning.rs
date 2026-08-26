@@ -426,10 +426,17 @@ impl Sd3TextEncoders {
     }
 }
 
-/// Resolve the single `model.safetensors` (or first sorted shard) in a snapshot component subdir.
+/// Resolve the single CLIP safetensors file in a snapshot component subdir.
 fn single_safetensors(root: &Path, sub: &str) -> CandleResult<std::path::PathBuf> {
     let files = safetensors_in(&root.join(sub))?;
-    Ok(files.into_iter().next().unwrap())
+    let [file] = files.as_slice() else {
+        return Err(CandleError::Msg(format!(
+            "sd3: {sub} CLIP encoder requires a single .safetensors file, found {} shards in {}",
+            files.len(),
+            root.join(sub).display()
+        )));
+    };
+    Ok(file.clone())
 }
 
 /// Sorted list of every `.safetensors` in `dir` (single-file or sharded), erroring if absent.
@@ -552,6 +559,24 @@ mod tests {
         cfg.clip_concat_dim = 999; // != 768 + 1280
         let enc = fixture(&cfg, 1);
         assert!(aggregate(&cfg, &enc).is_err());
+    }
+
+    #[test]
+    fn single_safetensors_rejects_sharded_clip_encoder() {
+        let root = tempfile::tempdir().unwrap();
+        let component = root.path().join("text_encoder");
+        std::fs::create_dir(&component).unwrap();
+        std::fs::write(component.join("model-00001-of-00002.safetensors"), []).unwrap();
+        std::fs::write(component.join("model-00002-of-00002.safetensors"), []).unwrap();
+
+        let error = single_safetensors(root.path(), "text_encoder")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("text_encoder CLIP encoder requires a single .safetensors file")
+                && error.contains("found 2 shards"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Build a tiny WordLevel [`Tokenizer`] whose vocab maps the given `(token, id)` pairs — enough to

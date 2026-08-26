@@ -975,7 +975,7 @@ impl InstantId {
         let face_tokens = self.face_tokens(embedding, cfg_on)?;
         self.synchronize_phase()?;
         self.finish_conditioning_phase()?;
-        let kps_image = kps::draw_kps(req.width, req.height, kps);
+        let kps_image = kps::draw_kps(req.width, req.height, kps)?;
         let id_cond_embed = self.cond_embed(
             Self::require(&self.identitynet, "IdentityNet")?,
             &kps_image,
@@ -1253,7 +1253,7 @@ impl InstantId {
         // zeroed, OpenPose boosted (the shared seed/prompt carry hair/wardrobe continuity).
         let (face_image, id_scale, op_scale, ip_scale) = match face_kps {
             Some(kps) => (
-                kps::draw_kps(side, side, kps),
+                kps::draw_kps(side, side, kps)?,
                 req.controlnet_scale as f64,
                 req.openpose_scale as f64,
                 req.ip_adapter_scale as f64,
