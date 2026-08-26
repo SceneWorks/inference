@@ -1024,7 +1024,10 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
         conditioning
             if conditioning
                 .iter()
-                .any(|value| matches!(value, Conditioning::Reference { .. })) =>
+                .any(|value| matches!(value, Conditioning::Reference { .. }))
+                && conditioning
+                    .iter()
+                    .any(|value| !matches!(value, Conditioning::Reference { .. })) =>
         {
             return Err(Error::Unsupported(format!(
                 "{}: FLUX.1 IP-Adapter Reference conditioning cannot be combined with pose/control or other conditioning",
