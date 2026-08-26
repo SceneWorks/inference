@@ -179,7 +179,7 @@ impl BooguGenerator {
         let reference = pipeline::resolve_reference(req, self.descriptor.id)?;
         let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
         let start_step = reference
-            .map(|(_, strength)| pipeline::init_time_step(steps, strength))
+            .map(|(_, strength)| pipeline::init_time_step(steps, Some(strength)))
             .unwrap_or(0);
         let clean = if start_step > 0 {
             let (image, _) = reference.expect("start_step > 0 implies a reference");
@@ -238,7 +238,7 @@ impl BooguGenerator {
                         |(_, strength)| {
                             pipeline::init_time_step(
                                 req.steps.map(|s| s as usize).unwrap_or(default_steps),
-                                strength,
+                                Some(strength),
                             ) > 0
                         },
                     );
@@ -1065,8 +1065,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reference_strength_falls_back_to_request() {
-        // sc-11786: a per-reference `strength` overrides `req.strength`; an unset one falls back to it.
+    fn resolve_reference_strength_has_a_shared_default() {
+        // sc-21678: a per-reference strength overrides req.strength, while a bare Reference receives
+        // the shared img2img default before a denoise path can classify it as inert/txt2img.
         let img = Image {
             width: 512,
             height: 512,
@@ -1086,7 +1087,22 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .1,
-            Some(0.4)
+            0.4
+        );
+        let default = GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: img,
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            pipeline::resolve_reference(&default, BOOGU_IMAGE_TURBO_ID)
+                .unwrap()
+                .unwrap()
+                .1,
+            pipeline::DEFAULT_IMG2IMG_STRENGTH
         );
         // No reference → None (pure txt2img).
         assert!(

@@ -1156,9 +1156,12 @@ impl MemoryRequestScope for BooguRequestScope {
                     .conditioning
                     .iter()
                     .find_map(|conditioning| match conditioning {
-                        gen_core::Conditioning::Reference { strength, .. } => {
-                            Some(strength.or(request.strength).unwrap_or_default() > 0.0)
-                        }
+                        gen_core::Conditioning::Reference { strength, .. } => Some(
+                            strength
+                                .or(request.strength)
+                                .unwrap_or(crate::pipeline::DEFAULT_IMG2IMG_STRENGTH)
+                                > 0.0,
+                        ),
                         _ => None,
                     })
                     .unwrap_or(false);
